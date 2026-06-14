@@ -105,6 +105,9 @@
 ## Current Status
 
 - Core runtime, macros, manifest, migration scaffold, checkpoint index, recovery, writer lock metadata, merge/compact, global and block-specific variable-block compression, mmap, zero-copy, read/write handles, property tests, compile tests, performance smoke tests, benchmark example, and practical guides are implemented.
+- User-facing docs now include quickstart, API reference, implementation model,
+  format-author, self-check, durability, recovery, migration, performance, and
+  requirements-boundary guides.
 - Matrix/preallocated storage now has a P0 implementation for dense direct
   addressing, commit bitmaps, same-size overwrite, generated DSL helpers, and
   performance smoke coverage. P1 matrix CRC is implemented for `integrity:

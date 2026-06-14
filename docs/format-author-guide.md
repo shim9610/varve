@@ -5,6 +5,12 @@ format contract. The primary API is format-first: declare the format, blocks,
 fields, and policies, and `varve_format!` generates the block structs plus typed
 reader/writer wrappers.
 
+If you are new to the crate, read this together with:
+
+- `docs/quickstart.md` for the shortest working example.
+- `docs/how-it-works.md` for the runtime model behind the generated API.
+- `docs/api-reference.md` for method names and public extension points.
+
 ## Define A Format
 
 ```rust
@@ -41,7 +47,8 @@ This generates `Point`, `User`, `AppFormatReader`, `AppFormatWriter`,
 `AppFormatRead`, and `AppFormatWrite`. Required record metadata such as block
 ids, field ids, wire types, payload lengths, commit marker handling, CRC checks
 when enabled, and offset-chain footers are handled by the generated code and
-runtime writer.
+runtime writer. Application code should not hand-build Varve record headers or
+offset chains in normal use.
 
 Choose `fixed` for records whose canonical encoded payload size should stay
 stable. Fixed blocks still use Varve's canonical field codec, not Rust memory
