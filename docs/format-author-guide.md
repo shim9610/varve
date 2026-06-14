@@ -153,11 +153,16 @@ Useful inspection helpers:
 let spec = AppFormat::spec();
 let computed = spec.computed_schema_hash();
 let dump = spec.schema_debug_dump();
+let diagnostics = AppFormat::diagnostics();
 ```
 
 `schema_hash: computed;` is the convenient default in format-first declarations.
 For release-pinned schemas, `computed_schema_hash()` can be used to decide what
 literal value to pin.
+
+For generated API and file sanity checks, use `AppFormat::self_test(path)` with
+representative sample values and `AppFormat::diagnose_file(path)` for existing
+files. See `docs/self-check-guide.md`.
 
 ## Variable Compression
 

@@ -1,6 +1,7 @@
 mod chunks;
 mod codec;
 mod collections;
+mod diagnostics;
 mod error;
 mod file;
 mod format;
@@ -14,6 +15,11 @@ pub use codec::{
     encode_to_vec, read_field_header, write_field,
 };
 pub use collections::{BlockIter, BlockVec, KeyedBlockVec};
+pub use diagnostics::{
+    Diagnostic, DiagnosticDomain, DiagnosticSeverity, FormatDiagnostics, FormatSelfTest,
+    FormatSelfTestReport, SelfTestStepReport, SelfTestStepStatus, classify_error, diagnose_file,
+    diagnose_spec, error_hint,
+};
 pub use error::{Error, Result};
 pub use file::{
     AppendInfo, BlockEvent, COMMIT_BLOCK_ID, FileMatrixDurabilityBarrier, INDEX_BLOCK_ID,

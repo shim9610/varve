@@ -114,6 +114,10 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - `key = "..."` must contain one or more valid Rust identifiers separated by commas. Empty key strings, empty segments, duplicates, and missing fields are compile errors.
 - `FormatSpec::computed_schema_hash()` computes a deterministic schema fingerprint from format version, endian, policies, block descriptors, and field descriptors. It intentionally excludes the pinned header `schema_hash` value.
 - `FormatSpec::schema_debug_dump()` emits a human-readable registered schema view for diagnostics.
+- `FormatSpec::diagnostics()`, `FormatSpec::diagnose_file(path)`, and
+  `FormatSpec::self_test(path)` provide user-facing sanity checks that classify
+  failures as format definition, caller usage, feature gate, file data,
+  environment, or library invariant issues.
 
 ## Acceptance Criteria
 

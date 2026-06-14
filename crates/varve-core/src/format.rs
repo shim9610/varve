@@ -538,6 +538,18 @@ impl FormatSpec {
         VarveFile::inspect_writer_lock(path)
     }
 
+    pub fn diagnostics(self) -> crate::FormatDiagnostics {
+        crate::diagnose_spec(self)
+    }
+
+    pub fn diagnose_file<P: AsRef<Path>>(self, path: P) -> crate::FormatDiagnostics {
+        crate::diagnose_file(self, path)
+    }
+
+    pub fn self_test<P: AsRef<Path>>(self, path: P) -> crate::FormatSelfTest {
+        crate::FormatSelfTest::new(self, path)
+    }
+
     pub fn block(self, id: u32) -> Option<BlockDescriptor> {
         self.blocks.iter().copied().find(|block| block.id == id)
     }

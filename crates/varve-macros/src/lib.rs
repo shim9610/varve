@@ -1603,6 +1603,22 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
             ) -> ::varve::__core::Result<(#writer_return, ::varve::__core::RecoveryReport)> {
                 #open_recover_writer_report_body
             }
+
+            pub fn diagnostics() -> ::varve::__core::FormatDiagnostics {
+                Self::spec().diagnostics()
+            }
+
+            pub fn diagnose_file<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::FormatDiagnostics {
+                Self::spec().diagnose_file(path)
+            }
+
+            pub fn self_test<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::FormatSelfTest {
+                Self::spec().self_test(path)
+            }
         }
 
         #(#duplicate_asserts)*
