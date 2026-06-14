@@ -1,0 +1,5 @@
+error: key list must not be empty
+ --> tests/ui/fail_inline_empty_key.rs:9:38
+  |
+9 |             variable BadUser(id = 1, key = []) {
+  |                                      ^^^

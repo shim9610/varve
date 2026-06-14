@@ -1,0 +1,5 @@
+error: varve key contains an empty field name
+ --> tests/ui/fail_empty_key_segment.rs:4:44
+  |
+4 | #[varve(id = 416, kind = "variable", key = "id,")]
+  |                                            ^^^^^

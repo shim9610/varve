@@ -1,0 +1,23 @@
+[package]
+name = "varve"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = []
+integrity = ["varve-core/integrity"]
+mmap = ["varve-core/mmap"]
+zero-copy = ["mmap", "varve-core/zero-copy"]
+compression-zstd = ["varve-core/compression-zstd"]
+
+[dependencies]
+varve-core = { path = "../varve-core", version = "0.1.0" }
+varve-macros = { path = "../varve-macros", version = "0.1.0" }
+
+[dev-dependencies]
+proptest.workspace = true
+trybuild.workspace = true
+zerocopy = { workspace = true, features = ["derive"] }

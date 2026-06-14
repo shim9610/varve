@@ -1,0 +1,11 @@
+error[E0080]: evaluation panicked: assertion failed: <A as ::varve::__core::VarveBlock>::ID !=
+                  <B as ::varve::__core::VarveBlock>::ID
+  --> tests/ui/fail_duplicate_id.rs:15:1
+   |
+15 | / varve_format! {
+16 | |     pub struct BadFormat {
+17 | |         magic: b"BAD";
+18 | |         version: 1;
+...  |
+22 | | }
+   | |_^ evaluation of `_` failed here

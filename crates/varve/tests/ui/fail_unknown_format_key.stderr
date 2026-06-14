@@ -1,0 +1,5 @@
+error: unsupported varve_format key
+  --> tests/ui/fail_unknown_format_key.rs:14:9
+   |
+14 |         cache: none;
+   |         ^^^^^

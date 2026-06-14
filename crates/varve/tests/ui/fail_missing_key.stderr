@@ -1,0 +1,5 @@
+error: key field does not exist
+ --> tests/ui/fail_missing_key.rs:4:44
+  |
+4 | #[varve(id = 404, kind = "variable", key = "missing")]
+  |                                            ^^^^^^^^^

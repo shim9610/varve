@@ -1,0 +1,5 @@
+error: invalid varve key field "id-number"; expected a Rust identifier
+ --> tests/ui/fail_invalid_key.rs:4:44
+  |
+4 | #[varve(id = 415, kind = "variable", key = "id-number")]
+  |                                            ^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: unsupported endian "middle"; use "little" or "big"
+ --> tests/ui/fail_unsupported_endian.rs:4:35
+  |
+4 | #[varve(id = 411, kind = "fixed", endian = "middle")]
+  |                                   ^^^^^^^^^^^^^^^^^
