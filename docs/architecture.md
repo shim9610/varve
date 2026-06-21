@@ -135,9 +135,10 @@
   changes expose obvious framing or scan regressions.
 - TDMS-style adapter feasibility is checked by optional Python harnesses: one
   opens a Varve-authored, two-channel, three-segment example file with
-  `npTDMS`, and the other generates a two-channel `npTDMS` file and parses it
-  through Varve-based example code. The harnesses also exercise adapter inspect
-  and byte-backed read paths.
+  `npTDMS` after Varve appends an additional segment, and the other generates a
+  two-channel `npTDMS` file, parses it through Varve-based example code,
+  appends a segment with Varve, and rechecks the result with npTDMS. The
+  harnesses also exercise adapter inspect and byte-backed read paths.
   Varve does not ship these examples as a TDMS reader/writer feature; see
   `docs/nptdms-adapter-boundary.md`.
 - Non-TDMS physical-format compatibility is checked by a BMP/Pillow harness:

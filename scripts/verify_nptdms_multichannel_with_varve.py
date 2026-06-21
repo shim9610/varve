@@ -33,8 +33,9 @@ def main() -> int:
 
     output = args.output or Path(tempfile.gettempdir()) / "nptdms-varve-multichannel.tdms"
     output = output.resolve()
-    if output.exists():
-        output.unlink()
+    for stale in [output, output.with_suffix(".vtidx"), Path(str(output) + "_index")]:
+        if stale.exists():
+            stale.unlink()
 
     with TdmsWriter(str(output)) as writer:
         writer.write_segment(
@@ -90,6 +91,67 @@ def main() -> int:
         ],
         check=True,
     )
+
+    subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-p",
+            "varve",
+            "--example",
+            "tdms_physical_adapter",
+            "--",
+            "append",
+            str(output),
+        ],
+        check=True,
+    )
+
+    appended = TdmsFile.read(output)
+    assert [float(value) for value in appended["Bench"]["Voltage"][:]] == [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+    ]
+    assert [float(value) for value in appended["Bench"]["Current"][:]] == [
+        0.10,
+        0.20,
+        0.30,
+        0.40,
+        0.50,
+    ]
+    assert appended["Bench"]["Voltage"].properties["append_source"] == "varve-open-layout-writer"
+
+    subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-p",
+            "varve",
+            "--example",
+            "tdms_physical_adapter",
+            "--",
+            "read",
+            str(output),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-p",
+            "varve",
+            "--example",
+            "tdms_physical_adapter",
+            "--",
+            "inspect",
+            str(output),
+        ],
+        check=True,
+    )
     subprocess.run(
         [
             "cargo",
@@ -105,7 +167,7 @@ def main() -> int:
         check=True,
     )
 
-    print(f"Varve example parsed npTDMS multichannel file {output}")
+    print(f"Varve example parsed and appended npTDMS multichannel file {output}")
     return 0
 
 

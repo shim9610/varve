@@ -11,16 +11,20 @@ fn main() -> varve::Result<()> {
     let command = args
         .next()
         .and_then(|value| value.into_string().ok())
-        .expect("usage: tdms_physical_adapter <write|read|read-bytes|inspect> <file.tdms>");
+        .expect("usage: tdms_physical_adapter <write|append|read|read-bytes|inspect> <file.tdms>");
     let path = args
         .next()
         .map(PathBuf::from)
-        .expect("usage: tdms_physical_adapter <write|read|read-bytes|inspect> <file.tdms>");
+        .expect("usage: tdms_physical_adapter <write|append|read|read-bytes|inspect> <file.tdms>");
 
     match command.as_str() {
         "write" => {
             common::write_example(&path)?;
             println!("{}", path.display());
+        }
+        "append" => {
+            common::append_example(&path)?;
+            println!("Varve-based adapter example appended {}", path.display());
         }
         "read" => {
             common::read_and_verify(&path)?;
@@ -47,7 +51,11 @@ fn main() -> varve::Result<()> {
                 );
             }
         }
-        _ => panic!("usage: tdms_physical_adapter <write|read|read-bytes|inspect> <file.tdms>"),
+        _ => {
+            panic!(
+                "usage: tdms_physical_adapter <write|append|read|read-bytes|inspect> <file.tdms>"
+            )
+        }
     }
     Ok(())
 }

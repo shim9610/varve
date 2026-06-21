@@ -208,29 +208,14 @@ pub fn read_and_verify(path: &Path) -> varve::Result<()> {
     }
 
     let input = AdapterInputFile::from_path(path);
-    let reader = TdmsCompatFormat::open_layout_reader(input.path())?;
-    let segments = reader.tdms_segments()?;
-    let mut reducer_input = Vec::new();
-
-    for (index, segment) in segments.iter().enumerate() {
-        assert_eq!(segment.tag()?, b"TDSm");
-        assert!(segment.toc_mask()? & TDMS_TOC_METADATA != 0);
-        assert!(segment.toc_mask()? & TDMS_TOC_RAW_DATA != 0);
-        assert_eq!(segment.toc_mask()? & TDMS_TOC_INTERLEAVED_DATA, 0);
-        let metadata = parse_tdms_metadata(&reader.read_tdms_segment_metadata(index)?)?;
-        let raw = reader.read_tdms_segment_raw(index)?;
-        reducer_input.push((
-            segment.as_layout_segment_info(),
-            TdmsSegmentPayload { metadata, raw },
-        ));
-    }
-
-    let report = reduce_segments_by_ref::<TdmsReducer, _>(reducer_input)?;
-    assert_eq!(report.segments_applied, segments.len());
-    let chunk_index = report.state.chunks.clone().finish()?;
+    let report = load_tdms_state(input.path())?;
     match report.state.property("/", "title") {
         TdmsPropertyValue::String(title) if title == "npTDMS multichannel smoke" => {
-            assert_eq!(chunk_index.entries().len(), 4);
+            let appended = report
+                .state
+                .property_opt("/'Bench'/'Voltage'", "append_source")
+                .is_some();
+            assert_eq!(report.chunk_count, if appended { 6 } else { 4 });
             assert_eq!(
                 report.state.property("/'Bench'", "operator"),
                 TdmsPropertyValue::String("Ada".to_string())
@@ -243,17 +228,25 @@ pub fn read_and_verify(path: &Path) -> varve::Result<()> {
                 report.state.property("/'Bench'/'Current'", "unit_string"),
                 TdmsPropertyValue::String("A".to_string())
             );
-            assert_eq!(
-                report.state.samples("/'Bench'/'Voltage'"),
-                vec![1.0, 2.0, 3.0, 4.0]
-            );
-            assert_eq!(
-                report.state.samples("/'Bench'/'Current'"),
-                vec![0.10, 0.20, 0.30, 0.40]
-            );
+            let mut voltage = vec![1.0, 2.0, 3.0, 4.0];
+            let mut current = vec![0.10, 0.20, 0.30, 0.40];
+            if appended {
+                voltage.push(5.0);
+                current.push(0.50);
+                assert_eq!(
+                    report.state.property("/'Bench'/'Voltage'", "append_source"),
+                    TdmsPropertyValue::String("varve-open-layout-writer".to_string())
+                );
+            }
+            assert_eq!(report.state.samples("/'Bench'/'Voltage'"), voltage);
+            assert_eq!(report.state.samples("/'Bench'/'Current'"), current);
         }
         TdmsPropertyValue::String(title) if title == "Varve TDMS adapter proof smoke" => {
-            assert_eq!(chunk_index.entries().len(), 6);
+            let appended = report
+                .state
+                .property_opt("/'Measured Data'/'Amplitude'", "append_source")
+                .is_some();
+            assert_eq!(report.chunk_count, if appended { 8 } else { 6 });
             assert_eq!(
                 report
                     .state
@@ -270,7 +263,7 @@ pub fn read_and_verify(path: &Path) -> varve::Result<()> {
                 report
                     .state
                     .property("/'Measured Data'/'Amplitude'", "sample_count"),
-                TdmsPropertyValue::I64(8)
+                TdmsPropertyValue::I64(if appended { 9 } else { 8 })
             );
             assert_eq!(
                 report
@@ -288,19 +281,117 @@ pub fn read_and_verify(path: &Path) -> varve::Result<()> {
                 report
                     .state
                     .property("/'Measured Data'/'Phase'", "sample_count"),
-                TdmsPropertyValue::I64(8)
+                TdmsPropertyValue::I64(if appended { 9 } else { 8 })
             );
+            let mut amplitude = vec![0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80];
+            let mut phase = vec![1.00, 1.10, 1.20, 1.30, 1.40, 1.50, 1.60, 1.70];
+            if appended {
+                amplitude.push(0.90);
+                phase.push(1.80);
+                assert_eq!(
+                    report
+                        .state
+                        .property("/'Measured Data'/'Amplitude'", "append_source"),
+                    TdmsPropertyValue::String("varve-open-layout-writer".to_string())
+                );
+            }
             assert_eq!(
                 report.state.samples("/'Measured Data'/'Amplitude'"),
-                vec![0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80]
+                amplitude
             );
-            assert_eq!(
-                report.state.samples("/'Measured Data'/'Phase'"),
-                vec![1.00, 1.10, 1.20, 1.30, 1.40, 1.50, 1.60, 1.70]
-            );
+            assert_eq!(report.state.samples("/'Measured Data'/'Phase'"), phase);
         }
         other => panic!("unexpected TDMS example title {other:?}"),
     }
+    Ok(())
+}
+
+pub fn append_example(path: &Path) -> varve::Result<()> {
+    let report = load_tdms_state(path)?;
+    let (metadata, raw, added_chunks) = match report.state.property("/", "title") {
+        TdmsPropertyValue::String(title) if title == "Varve TDMS adapter proof smoke" => {
+            let metadata = tdms_metadata(&[
+                TdmsObject {
+                    path: "/'Measured Data'/'Amplitude'",
+                    raw_data_index: RawDataIndex::New {
+                        data_type: TDMS_TYPE_DOUBLE_FLOAT,
+                        dimensions: 1,
+                        values: 1,
+                    },
+                    properties: vec![
+                        TdmsProperty {
+                            name: "sample_count",
+                            value: TdmsPropertyValue::I64(9),
+                        },
+                        TdmsProperty {
+                            name: "append_source",
+                            value: TdmsPropertyValue::String(
+                                "varve-open-layout-writer".to_string(),
+                            ),
+                        },
+                    ],
+                },
+                TdmsObject {
+                    path: "/'Measured Data'/'Phase'",
+                    raw_data_index: RawDataIndex::New {
+                        data_type: TDMS_TYPE_DOUBLE_FLOAT,
+                        dimensions: 1,
+                        values: 1,
+                    },
+                    properties: vec![TdmsProperty {
+                        name: "sample_count",
+                        value: TdmsPropertyValue::I64(9),
+                    }],
+                },
+            ])?;
+            (metadata, f64_bytes(&[0.90, 1.80])?, 2u32)
+        }
+        TdmsPropertyValue::String(title) if title == "npTDMS multichannel smoke" => {
+            let metadata = tdms_metadata(&[
+                TdmsObject {
+                    path: "/'Bench'/'Voltage'",
+                    raw_data_index: RawDataIndex::New {
+                        data_type: TDMS_TYPE_DOUBLE_FLOAT,
+                        dimensions: 1,
+                        values: 1,
+                    },
+                    properties: vec![TdmsProperty {
+                        name: "append_source",
+                        value: TdmsPropertyValue::String("varve-open-layout-writer".to_string()),
+                    }],
+                },
+                TdmsObject {
+                    path: "/'Bench'/'Current'",
+                    raw_data_index: RawDataIndex::New {
+                        data_type: TDMS_TYPE_DOUBLE_FLOAT,
+                        dimensions: 1,
+                        values: 1,
+                    },
+                    properties: Vec::new(),
+                },
+            ])?;
+            (metadata, f64_bytes(&[5.0, 0.50])?, 2u32)
+        }
+        other => panic!("unexpected TDMS example title for append {other:?}"),
+    };
+
+    let mut writer = TdmsCompatFormat::open_layout_writer(path)?;
+    writer.write_tdms_segment(TdmsCompatFormatTdmsSegmentLayoutWrite {
+        fields: TdmsCompatFormatTdmsSegmentLayoutFields {
+            toc_mask: TDMS_TOC_METADATA | TDMS_TOC_RAW_DATA,
+            version: report.append_version,
+        },
+        footer_fields: TdmsCompatFormatTdmsSegmentLayoutFooterFields,
+        metadata: &metadata,
+        raw: &raw,
+    })?;
+    writer.flush()?;
+
+    write_index_sidecar(
+        path,
+        (report.segments_applied + 1) as u32,
+        report.chunk_count as u32 + added_chunks,
+    )?;
     Ok(())
 }
 
@@ -376,6 +467,45 @@ pub fn inspect_example(path: &Path) -> varve::Result<AdapterCheckReport> {
     }
 
     Ok(report)
+}
+
+fn load_tdms_state(path: &Path) -> varve::Result<TdmsReadReport> {
+    let reader = TdmsCompatFormat::open_layout_reader(path)?;
+    let segments = reader.tdms_segments()?;
+    let mut reducer_input = Vec::new();
+    let mut append_version = TDMS_VERSION;
+
+    for (index, segment) in segments.iter().enumerate() {
+        assert_eq!(segment.tag()?, b"TDSm");
+        assert!(segment.toc_mask()? & TDMS_TOC_METADATA != 0);
+        assert!(segment.toc_mask()? & TDMS_TOC_RAW_DATA != 0);
+        assert_eq!(segment.toc_mask()? & TDMS_TOC_INTERLEAVED_DATA, 0);
+        append_version = segment.version()?;
+        let metadata = parse_tdms_metadata(&reader.read_tdms_segment_metadata(index)?)?;
+        let raw = reader.read_tdms_segment_raw(index)?;
+        reducer_input.push((
+            segment.as_layout_segment_info(),
+            TdmsSegmentPayload { metadata, raw },
+        ));
+    }
+
+    let report = reduce_segments_by_ref::<TdmsReducer, _>(reducer_input)?;
+    assert_eq!(report.segments_applied, segments.len());
+    let chunk_count = report.state.chunks.clone().finish()?.entries().len();
+    Ok(TdmsReadReport {
+        state: report.state,
+        segments_applied: report.segments_applied,
+        chunk_count,
+        append_version,
+    })
+}
+
+#[derive(Debug)]
+struct TdmsReadReport {
+    state: TdmsState,
+    segments_applied: usize,
+    chunk_count: usize,
+    append_version: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -635,12 +765,15 @@ struct TdmsState {
 }
 
 impl TdmsState {
-    fn property(&self, path: &str, name: &str) -> TdmsPropertyValue {
+    fn property_opt(&self, path: &str, name: &str) -> Option<TdmsPropertyValue> {
         self.properties
             .get(path)
             .and_then(|properties| properties.get(name))
             .cloned()
-            .expect("TDMS property exists")
+    }
+
+    fn property(&self, path: &str, name: &str) -> TdmsPropertyValue {
+        self.property_opt(path, name).expect("TDMS property exists")
     }
 
     fn samples(&self, path: &str) -> Vec<f64> {

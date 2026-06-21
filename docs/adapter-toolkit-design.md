@@ -307,11 +307,12 @@ the runtime layer that such a DSL would generate or call.
   `SegmentReducer`. The example writes two logical channels across three
   segments, exercises TDMS-style `same-as-previous` raw indexes, bool/string/
   integer/float tagged properties, an adapter-owned `.vtidx` sidecar, and
-  both path-backed and byte-backed adapter inputs.
+  both path-backed and byte-backed adapter inputs. It also reopens existing
+  TDMS-style files with `open_layout_writer` and appends another segment.
 - `crates/varve/examples/bmp_physical.rs` uses `BinaryWriter`, `BinaryCursor`,
   and row-level `ChunkIndexBuilder` entries for the BMP proof.
-- Python harnesses verify the TDMS-style adapter against `npTDMS` and BMP
-  against Pillow.
+- Python harnesses verify Varve-authored TDMS create+append with `npTDMS`,
+  npTDMS-authored TDMS files after Varve append, and BMP against Pillow.
 - `crates/varve/tests/perf_smoke.rs` includes an ignored adapter-toolkit smoke
   path using `BinaryWriter`, `BinaryCursor`, `ChunkIndexBuilder`, and
   `SegmentReducer`; run it with

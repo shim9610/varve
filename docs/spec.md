@@ -216,7 +216,8 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   `LayoutSegmentInfo`, and whose raw `f64` channel bytes are contiguous.
 - The TDMS-style physical writer example is an external adapter proof, not a
   Varve-provided TDMS feature. It produces a three-segment, two-channel file
-  using Varve's generated layout APIs plus adapter toolkit helpers. The optional
+  using Varve's generated layout APIs plus adapter toolkit helpers, then
+  reopens it with `open_layout_writer` to append another segment. The optional
   Python harness opens that file with `npTDMS` and verifies file properties,
   group/channel lookup, channel properties, `same-as-previous` raw-index reuse,
   bool/string/integer/float tagged properties, sidecar inspection, byte-backed
@@ -224,7 +225,8 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - The reverse TDMS-style harness generates a two-segment, two-channel TDMS file
   with Python `npTDMS`, then parses it through a Varve-based example adapter
   that uses the generated layout reader plus caller-owned TDMS metadata/raw
-  logic.
+  logic. It then appends one segment with Varve and verifies the result with
+  both npTDMS and Varve.
 - `docs/nptdms-adapter-boundary.md` records the boundary between Varve generic
   API obligations and external TDMS adapter obligations.
 - The BMP/Pillow harness verifies a non-TDMS custom physical layout in both
