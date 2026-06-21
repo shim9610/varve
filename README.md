@@ -1,15 +1,32 @@
 # Varve
 
 Varve is a Rust library for building append-friendly, segment-oriented custom
-binary formats from typed block definitions. The main workflow is
-format-first: declare a file contract with `varve_format!`, then use the
-generated typed reader and writer APIs.
+binary formats from typed block definitions. It is not one fixed file format.
+The main workflow is format-first: declare a file contract with
+`varve_format!`, then use the generated typed reader and writer APIs.
 
 The workspace contains:
 
 - `varve`: public facade crate
 - `varve-core`: runtime, codecs, file I/O, diagnostics
 - `varve-macros`: `varve_format!` and derive support
+
+## What Varve Provides
+
+- Compile-time format declarations with generated typed reader and writer APIs.
+- Fixed and variable blocks with canonical encoding instead of Rust memory
+  layout copying by default.
+- Append-friendly record framing, offset-chain metadata, commit policies,
+  checksum hooks, keyed collections, and lazy scan/index support.
+- Variable payload compression policies that can be declared globally, per
+  block, or left unspecified for caller-defined behavior.
+- Adapter primitives for physical formats that need custom lead-ins, table of
+  contents masks, raw data offsets, next-segment offsets, or externally defined
+  record framing.
+
+Varve should own the reusable binary-format mechanics. Application-specific
+meaning, domain transforms, and compatibility with an external specification
+remain caller code.
 
 ## Start Here
 
@@ -65,6 +82,25 @@ The user declares the format and block types. Varve generates the typed
 methods, block metadata, required field encoding, record headers, commit
 handling, offset-chain metadata, and diagnostics.
 
+## Examples
+
+| Example | Role |
+| --- | --- |
+| `crates/varve/examples/bmp_physical.rs` | Small physical-format adapter proof for BMP-style headers and raw pixel data, verified against Pillow. |
+| `crates/varve/examples/perf_bench.rs` | Local throughput check for append, open, scan, and block access paths. |
+| `crates/varve/examples/tdms_physical_reader.rs` | Thin reader entry point for the TDMS physical adapter example. |
+| `crates/varve/examples/tdms_physical_writer.rs` | Thin writer entry point for the TDMS physical adapter example. |
+| `crates/varve/examples/tdms_physical_adapter.rs` | CLI wrapper around the TDMS adapter for write, append, read, read-bytes, and inspect flows. |
+| `crates/varve/examples/tdms_physical/common/adapter.rs` | Large TDMS physical adapter proof using Varve's generic adapter APIs. |
+| `crates/varve/examples/tdms_physical/common/example_data.rs` | Multi-channel TDMS scenario fixtures. |
+| `crates/varve/examples/tdms_physical/common/verify.rs` | Regression checks for TDMS round trips and segment-layout behavior. |
+
+The TDMS example is intentionally larger than a quickstart. Its job is to prove
+that Varve can support a demanding external binary format without hard-coding
+TDMS-specific behavior into the library. It also acts as a regression harness so
+combined changes do not silently break segment appends, metadata reuse, scalar
+types, or cross-tool compatibility.
+
 ## Self-Check
 
 Generated formats expose diagnostics and end-to-end self-test helpers:
@@ -99,3 +135,20 @@ cargo test
 cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+Optional compatibility harnesses use Python reference libraries:
+
+```powershell
+.\.venv-tdms\Scripts\python.exe scripts\verify_tdms_with_nptdms.py
+.\.venv-tdms\Scripts\python.exe scripts\verify_nptdms_multichannel_with_varve.py
+.\.venv-tdms\Scripts\python.exe scripts\verify_bmp_with_pillow.py
+```
+
+## License
+
+Varve is licensed under either of:
+
+- [MIT License](LICENSE-MIT)
+- [Apache License, Version 2.0](LICENSE-APACHE)
+
+at your option. See [LICENSE](LICENSE) for the short dual-license notice.
