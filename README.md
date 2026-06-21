@@ -33,6 +33,7 @@ remain caller code.
 | Document | Use it for |
 | --- | --- |
 | [Quickstart](docs/quickstart.md) | shortest path from format declaration to write/read |
+| [Declaration And Internals](docs/declaration-and-internals.md) | how the DSL maps to generated Rust API, native bytes, records, fields, indexes, commits, and custom physical layouts |
 | [How Varve Works](docs/how-it-works.md) | mental model of generated code, append logs, matrix storage, durability |
 | [API Reference](docs/api-reference.md) | practical public API map |
 | [Format Author Guide](docs/format-author-guide.md) | policy choices, compression, commit modes, matrix blocks |
