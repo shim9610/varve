@@ -1928,6 +1928,10 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 #open_writer_body
             }
 
+            pub fn open_layout_writer<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::LayoutWriter> {
+                Self::spec().open_layout_writer(path)
+            }
+
             pub fn open_readonly<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::VarveFile> {
                 Self::spec().open_readonly(path)
             }

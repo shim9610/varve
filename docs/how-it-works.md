@@ -72,7 +72,11 @@ offsets such as `next_segment_offset` and `raw_data_offset`. The layout writer
 writes placeholders for finalized fields, writes metadata/raw/footer bytes, then
 backpatches the computed values. The layout reader validates the header,
 literals, finalized offsets, forward progress, and region bounds before exposing
-metadata and raw byte ranges.
+metadata and raw byte ranges. Reopening a layout writer first runs that same
+validation pass, then seeks to EOF so new segments are appended after the last
+validated segment. Validated lead-in/footer values remain available on
+`LayoutSegmentInfo`, so callers can inspect fields such as ToC masks without
+manual byte parsing.
 
 ## Append-Log Records
 

@@ -148,6 +148,11 @@ fn custom_layout_writes_file_header_and_segment_footer() -> varve::Result<()> {
         assert_eq!(info.footer_offset, 37);
         assert_eq!(info.footer_len, 12);
         assert_eq!(info.segment_end, 49);
+        assert_eq!(info.field("kind"), Some(&LayoutValue::U32(7)));
+        assert_eq!(
+            info.footer_field("segment_len"),
+            Some(&LayoutValue::U64(43))
+        );
         writer.flush()?;
     }
 
@@ -166,6 +171,14 @@ fn custom_layout_writes_file_header_and_segment_footer() -> varve::Result<()> {
     let reader = FramedPhysicalFormat::open_layout_reader(&path)?;
     assert_eq!(reader.file_header_len(), 6);
     assert_eq!(reader.segments().len(), 1);
+    assert_eq!(
+        reader.segments()[0].field("kind"),
+        Some(&LayoutValue::U32(7))
+    );
+    assert_eq!(
+        reader.segments()[0].footer_field("segment_len"),
+        Some(&LayoutValue::U64(43))
+    );
     assert_eq!(reader.read_metadata(0)?, b"abc");
     assert_eq!(reader.read_raw(0)?, raw);
 
@@ -225,6 +238,16 @@ fn tdms_style_layout_writes_physical_leadin_offsets_and_raw_region() -> varve::R
     let reader = TdmsPhysicalFormat::open_layout_reader(&path)?;
     assert_eq!(reader.segments().len(), 1);
     let segment = &reader.segments()[0];
+    assert_eq!(segment.field("toc_mask"), Some(&LayoutValue::U32(0x1110)));
+    assert_eq!(segment.field("version"), Some(&LayoutValue::U32(4713)));
+    assert_eq!(
+        segment.field("next_segment_offset"),
+        Some(&LayoutValue::I64((metadata.len() + raw.len()) as i64))
+    );
+    assert_eq!(
+        segment.field("raw_data_offset"),
+        Some(&LayoutValue::I64(metadata.len() as i64))
+    );
     assert_eq!(segment.metadata_len, metadata.len() as u64);
     assert_eq!(segment.raw_len, raw.len() as u64);
     assert_eq!(reader.read_metadata(0)?, metadata);
@@ -235,7 +258,7 @@ fn tdms_style_layout_writes_physical_leadin_offsets_and_raw_region() -> varve::R
 }
 
 #[test]
-fn tdms_style_layout_appends_multiple_segments() -> varve::Result<()> {
+fn tdms_style_layout_reopens_and_appends_multiple_segments() -> varve::Result<()> {
     let path = temp_path("tdms_physical_append");
     cleanup(&path);
     let fields = [
@@ -258,6 +281,11 @@ fn tdms_style_layout_appends_multiple_segments() -> varve::Result<()> {
             metadata: b"meta-a",
             raw: &f64_bytes(&[1.0, 2.0]),
         })?;
+        writer.flush()?;
+    }
+
+    {
+        let mut writer = TdmsPhysicalFormat::open_layout_writer(&path)?;
         writer.write_segment(SegmentWrite {
             name: "TdmsSegment",
             fields: &fields,
@@ -274,6 +302,10 @@ fn tdms_style_layout_appends_multiple_segments() -> varve::Result<()> {
     assert_eq!(f64_values(&reader.read_raw(0)?), vec![1.0, 2.0]);
     assert_eq!(reader.read_metadata(1)?, b"meta-bb");
     assert_eq!(f64_values(&reader.read_raw(1)?), vec![3.0]);
+    assert_eq!(
+        reader.segments()[1].field("toc_mask"),
+        Some(&LayoutValue::U32(0x1108))
+    );
     assert_eq!(
         reader.segments()[1].segment_start,
         reader.segments()[0].segment_end

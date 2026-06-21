@@ -285,7 +285,25 @@ fn physical_layout_segments(case: PerfCase) -> varve::Result<()> {
 
     let elapsed = timed(|| {
         let mut writer = PerfPhysicalLayoutFormat::create_layout_writer(&path)?;
-        for index in 0..case.records {
+        let split = (case.records / 2).max(1);
+        for index in 0..split {
+            let metadata = (index as u64).to_le_bytes();
+            let mut raw = [0u8; 16];
+            raw[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            raw[8..].copy_from_slice(&((index as u64).wrapping_mul(3)).to_le_bytes());
+            writer.write_segment(SegmentWrite {
+                name: "PhysicalSegment",
+                fields: &fields,
+                footer_fields: &[],
+                metadata: &metadata,
+                raw: &raw,
+            })?;
+        }
+        writer.flush()?;
+
+        drop(writer);
+        let mut writer = PerfPhysicalLayoutFormat::open_layout_writer(&path)?;
+        for index in split..case.records {
             let metadata = (index as u64).to_le_bytes();
             let mut raw = [0u8; 16];
             raw[..8].copy_from_slice(&(index as u64).to_le_bytes());
@@ -301,7 +319,7 @@ fn physical_layout_segments(case: PerfCase) -> varve::Result<()> {
         writer.flush()?;
         Ok(())
     })?;
-    report("layout append", case.records, &path, elapsed);
+    report("layout reopen+append", case.records, &path, elapsed);
 
     let elapsed = timed(|| {
         let reader = PerfPhysicalLayoutFormat::open_layout_reader(&path)?;

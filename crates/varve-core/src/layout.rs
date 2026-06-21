@@ -8,7 +8,7 @@ use crate::{
     SegmentDescriptor, SegmentRepeat,
 };
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayoutValue {
     Bytes(Vec<u8>),
     U8(u8),
@@ -18,7 +18,7 @@ pub enum LayoutValue {
     I64(i64),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayoutFieldValue {
     pub name: &'static str,
     pub value: LayoutValue,
@@ -36,6 +36,8 @@ pub struct SegmentWrite<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayoutSegmentInfo {
     pub name: &'static str,
+    pub fields: Vec<LayoutFieldValue>,
+    pub footer_fields: Vec<LayoutFieldValue>,
     pub segment_start: u64,
     pub lead_in_len: u64,
     pub metadata_offset: u64,
@@ -45,6 +47,22 @@ pub struct LayoutSegmentInfo {
     pub footer_offset: u64,
     pub footer_len: u64,
     pub segment_end: u64,
+}
+
+impl LayoutSegmentInfo {
+    pub fn field(&self, name: &str) -> Option<&LayoutValue> {
+        self.fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| &field.value)
+    }
+
+    pub fn footer_field(&self, name: &str) -> Option<&LayoutValue> {
+        self.footer_fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| &field.value)
+    }
 }
 
 #[derive(Debug)]
@@ -95,6 +113,11 @@ impl FormatSpec {
         LayoutWriter::create_with_header(self, path, fields)
     }
 
+    pub fn open_layout_writer<P: AsRef<Path>>(self, path: P) -> Result<LayoutWriter> {
+        self.validate()?;
+        LayoutWriter::open(self, path)
+    }
+
     pub fn open_layout_reader<P: AsRef<Path>>(self, path: P) -> Result<LayoutReader> {
         self.validate()?;
         LayoutReader::open(self, path)
@@ -125,6 +148,22 @@ impl LayoutWriter {
         } else if !fields.is_empty() {
             return Err(Error::LayoutFieldUnexpected(fields[0].name.to_string()));
         }
+        Ok(Self {
+            spec,
+            path,
+            file,
+            _lock: lock,
+        })
+    }
+
+    pub fn open<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        ensure_custom_layout_spec(spec)?;
+        let path = path.as_ref().to_path_buf();
+        let lock = crate::file::WriterLock::acquire(&path)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let file_header_len = read_file_header(spec, &mut file)?;
+        scan_layout_segments(spec, &mut file, file_header_len)?;
+        file.seek(SeekFrom::End(0))?;
         Ok(Self {
             spec,
             path,
@@ -207,6 +246,14 @@ impl LayoutWriter {
             footer_start: footer_offset,
             footer_end,
         };
+        let fields =
+            collect_written_layout_values(descriptor.lead_in.fields, segment.fields, anchors)?;
+        let footer_fields = descriptor
+            .footer
+            .map(|footer| {
+                collect_written_layout_values(footer.fields, segment.footer_fields, anchors)
+            })
+            .unwrap_or_else(|| Ok(Vec::new()))?;
 
         for patch in patches {
             let value = finalized_value(patch.field, anchors)?;
@@ -217,6 +264,8 @@ impl LayoutWriter {
 
         Ok(LayoutSegmentInfo {
             name: descriptor.name,
+            fields,
+            footer_fields,
             segment_start,
             lead_in_len,
             metadata_offset,
@@ -431,6 +480,35 @@ fn write_patchable_layout_fields(
     Ok(())
 }
 
+fn collect_written_layout_values(
+    descriptors: &[LayoutFieldDescriptor],
+    caller_fields: &[LayoutFieldValue],
+    anchors: Anchors,
+) -> Result<Vec<LayoutFieldValue>> {
+    descriptors
+        .iter()
+        .map(|field| {
+            let value = match field.source {
+                LayoutFieldSource::LiteralBytes(bytes) => LayoutValue::Bytes(bytes.to_vec()),
+                LayoutFieldSource::LiteralU64(value) => {
+                    normalize_layout_value(*field, &LayoutValue::U64(value))?
+                }
+                LayoutFieldSource::LiteralI64(value) => {
+                    normalize_layout_value(*field, &LayoutValue::I64(value))?
+                }
+                LayoutFieldSource::Caller => {
+                    normalize_layout_value(*field, caller_field_value(caller_fields, field.name)?)?
+                }
+                LayoutFieldSource::Finalize(_) => finalized_value(*field, anchors)?,
+            };
+            Ok(LayoutFieldValue {
+                name: field.name,
+                value,
+            })
+        })
+        .collect()
+}
+
 fn read_file_header(spec: FormatSpec, file: &mut File) -> Result<u64> {
     let Some(header) = spec.layout.file_header() else {
         return Ok(0);
@@ -549,9 +627,11 @@ fn read_layout_segment_at(
     file.seek(SeekFrom::Start(segment_start))?;
     let mut position = segment_start;
     let mut finalized = Vec::new();
+    let mut fields = Vec::new();
     for field in descriptor.lead_in.fields {
         let value_offset = position;
         let value = read_layout_value(file, *field, spec.endian)?;
+        let stored_value = value.clone();
         match field.source {
             LayoutFieldSource::LiteralBytes(expected) => match value {
                 LayoutValue::Bytes(actual) if actual == expected => {}
@@ -581,6 +661,10 @@ fn read_layout_segment_at(
             LayoutFieldSource::Caller => {}
             LayoutFieldSource::Finalize(finalize) => finalized.push((*field, finalize, value)),
         }
+        fields.push(LayoutFieldValue {
+            name: field.name,
+            value: stored_value,
+        });
         position =
             position
                 .checked_add(field.ty.byte_len())
@@ -664,11 +748,15 @@ fn read_layout_segment_at(
             });
         }
     }
-    if let Some(footer) = descriptor.footer {
-        read_footer_layout_fields(file, footer.fields, footer_offset, spec.endian, anchors)?;
-    }
+    let footer_fields = if let Some(footer) = descriptor.footer {
+        read_footer_layout_fields(file, footer.fields, footer_offset, spec.endian, anchors)?
+    } else {
+        Vec::new()
+    };
     Ok(LayoutSegmentInfo {
         name: descriptor.name,
+        fields,
+        footer_fields,
         segment_start,
         lead_in_len,
         metadata_offset,
@@ -687,11 +775,13 @@ fn read_footer_layout_fields(
     footer_offset: u64,
     endian: Endian,
     anchors: Anchors,
-) -> Result<()> {
+) -> Result<Vec<LayoutFieldValue>> {
     file.seek(SeekFrom::Start(footer_offset))?;
     let mut position = footer_offset;
+    let mut fields = Vec::new();
     for field in descriptors {
         let value = read_layout_value(file, *field, endian)?;
+        let stored_value = value.clone();
         match field.source {
             LayoutFieldSource::LiteralBytes(expected) => match value {
                 LayoutValue::Bytes(actual) if actual == expected => {}
@@ -729,6 +819,10 @@ fn read_footer_layout_fields(
                 }
             }
         }
+        fields.push(LayoutFieldValue {
+            name: field.name,
+            value: stored_value,
+        });
         position =
             position
                 .checked_add(field.ty.byte_len())
@@ -736,7 +830,7 @@ fn read_footer_layout_fields(
                     offset: footer_offset,
                 })?;
     }
-    Ok(())
+    Ok(fields)
 }
 
 fn finalized_value_for(
@@ -780,6 +874,46 @@ fn numeric_u64_matches(value: &LayoutValue, expected: u64) -> bool {
         LayoutValue::I64(actual) => u64::try_from(*actual) == Ok(expected),
         LayoutValue::Bytes(_) => false,
     }
+}
+
+fn normalize_layout_value(
+    field: LayoutFieldDescriptor,
+    value: &LayoutValue,
+) -> Result<LayoutValue> {
+    Ok(match (field.ty, value) {
+        (LayoutFieldType::Bytes { len }, LayoutValue::Bytes(bytes))
+            if len == bytes.len() as u64 =>
+        {
+            LayoutValue::Bytes(bytes.clone())
+        }
+        (LayoutFieldType::U8, LayoutValue::U8(value)) => LayoutValue::U8(*value),
+        (LayoutFieldType::U8, LayoutValue::U64(value)) => LayoutValue::U8(
+            u8::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field.name))?,
+        ),
+        (LayoutFieldType::U16, LayoutValue::U8(value)) => LayoutValue::U16(u16::from(*value)),
+        (LayoutFieldType::U16, LayoutValue::U16(value)) => LayoutValue::U16(*value),
+        (LayoutFieldType::U16, LayoutValue::U64(value)) => LayoutValue::U16(
+            u16::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field.name))?,
+        ),
+        (LayoutFieldType::U32, LayoutValue::U8(value)) => LayoutValue::U32(u32::from(*value)),
+        (LayoutFieldType::U32, LayoutValue::U16(value)) => LayoutValue::U32(u32::from(*value)),
+        (LayoutFieldType::U32, LayoutValue::U32(value)) => LayoutValue::U32(*value),
+        (LayoutFieldType::U32, LayoutValue::U64(value)) => LayoutValue::U32(
+            u32::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field.name))?,
+        ),
+        (LayoutFieldType::U64, LayoutValue::U8(value)) => LayoutValue::U64(u64::from(*value)),
+        (LayoutFieldType::U64, LayoutValue::U16(value)) => LayoutValue::U64(u64::from(*value)),
+        (LayoutFieldType::U64, LayoutValue::U32(value)) => LayoutValue::U64(u64::from(*value)),
+        (LayoutFieldType::U64, LayoutValue::U64(value)) => LayoutValue::U64(*value),
+        (LayoutFieldType::I64, LayoutValue::U8(value)) => LayoutValue::I64(i64::from(*value)),
+        (LayoutFieldType::I64, LayoutValue::U16(value)) => LayoutValue::I64(i64::from(*value)),
+        (LayoutFieldType::I64, LayoutValue::U32(value)) => LayoutValue::I64(i64::from(*value)),
+        (LayoutFieldType::I64, LayoutValue::U64(value)) => LayoutValue::I64(
+            i64::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field.name))?,
+        ),
+        (LayoutFieldType::I64, LayoutValue::I64(value)) => LayoutValue::I64(*value),
+        _ => return Err(Error::LayoutFieldTypeMismatch(field.name)),
+    })
 }
 
 fn layout_value_matches_offset(value: LayoutValue, expected: u64) -> bool {

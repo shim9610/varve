@@ -173,12 +173,15 @@ bytes, optional footer fields, and finalized/backpatched offsets.
 | `layout { file_header ... segment ... }` | declare file header, segment lead-in, metadata region, raw region, optional footer |
 | `Format::create_layout_writer(path)` | create a custom physical-layout writer |
 | `Format::create_layout_writer_with_header(path, fields)` | create a writer when the file header has caller-supplied fields |
+| `Format::open_layout_writer(path)` | validate an existing custom-layout file and append more segments |
 | `Format::open_layout_reader(path)` | open a custom physical-layout reader |
 | `LayoutWriter::write_segment(SegmentWrite)` | write lead-in, metadata, raw bytes, footer, then backpatch offsets |
 | `SegmentWrite::fields` | caller values for lead-in fields |
 | `SegmentWrite::footer_fields` | caller values for footer fields |
 | `LayoutReader::file_header_len()` | validated header length before the first segment |
 | `LayoutReader::segments()` | inspect validated physical segment ranges |
+| `LayoutSegmentInfo::field(name)` | read validated lead-in values such as ToC mask or version |
+| `LayoutSegmentInfo::footer_field(name)` | read validated footer values |
 | `LayoutReader::read_metadata(index)` | read opaque metadata bytes for a segment |
 | `LayoutReader::read_raw(index)` | read contiguous raw-region bytes for a segment |
 

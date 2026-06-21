@@ -77,12 +77,18 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Reader model is snapshot-on-open; live tailing is out of scope for v0.1.
 - `FormatSpec::create_layout_writer`,
   `FormatSpec::create_layout_writer_with_header`, and
-  `FormatSpec::open_layout_reader` are the custom physical-layout entry points.
-  They do not write or expect the Varve-native container header.
+  `FormatSpec::open_layout_writer`, and `FormatSpec::open_layout_reader` are
+  the custom physical-layout entry points. They do not write or expect the
+  Varve-native container header.
 - Custom layout files use `LayoutWriter::write_segment` with
   `SegmentWrite { fields, footer_fields, metadata, raw }`; incomplete
   backpatch windows are treated as corrupt physical data by strict open in the
   first slice.
+- `open_layout_writer` validates the existing file header, segment literals,
+  finalized offsets, and bounds before seeking to EOF for additional appends.
+- `LayoutSegmentInfo` exposes validated lead-in and footer field values so
+  callers can inspect ToC masks, versions, offset fields, and footer metadata
+  without re-parsing bytes manually.
 - Durability is explicit: writes are buffered until `flush`, and durable fsync is exposed as `sync`.
 - `RecoveryPolicy::Strict` rejects incomplete tails.
 - `RecoveryPolicy::TruncateTail` truncates incomplete record header/payload tails and returns a recovery report through `open_recover_with_report`.
@@ -167,7 +173,8 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   preset for the same native format declaration.
 - A TDMS-style custom layout can write files whose first bytes are `TDSm`, whose
   `next_segment_offset` and `raw_data_offset` fields are backpatched to actual
-  metadata/raw boundaries, and whose raw `f64` channel bytes are contiguous.
+  metadata/raw boundaries, whose ToC/version fields are visible through
+  `LayoutSegmentInfo`, and whose raw `f64` channel bytes are contiguous.
 - A custom physical layout with a declared file header and segment footer writes
   those bytes at the declared offsets, exposes `file_header_len`, and excludes
   footer bytes from the segment raw-region read.
