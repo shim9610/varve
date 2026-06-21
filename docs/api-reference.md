@@ -63,6 +63,7 @@ Generated typed methods depend on block names:
 | `with_matrix_aux(aux)` | manual matrix aux registry |
 | `validate()` | check static spec consistency |
 | `computed_schema_hash()` | deterministic schema fingerprint |
+| `effective_layout()` | physical layout plan using header/segment/lead-in/raw/footer vocabulary |
 | `schema_debug_dump()` | human-readable schema dump |
 | `diagnostics()` | structured static diagnostics |
 | `diagnose_file(path)` | structured file diagnostics |
@@ -70,6 +71,13 @@ Generated typed methods depend on block names:
 
 Use the generated `Format::spec()` path unless you need derive-first or manual
 registry construction.
+
+For omitted or explicit `preset: varve_native`, `effective_layout()` returns a
+synthetic plan containing the native `VarveFileHeader` and repeated
+`VarveRecord` segment. `VARVE3` formats expose the native `VarveRecordFooter`
+there too. This keeps the native preset visible through the same physical
+layout vocabulary used by custom layouts while preserving existing native file
+bytes.
 
 ## Reader And Writer Handles
 

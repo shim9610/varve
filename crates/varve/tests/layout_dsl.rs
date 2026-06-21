@@ -1,7 +1,10 @@
 use std::fs::{read, remove_file, write};
 use std::path::PathBuf;
 
-use varve::{Error, LayoutFieldValue, LayoutValue, SegmentWrite, VarveBlock, varve_format};
+use varve::{
+    Error, LayoutFieldValue, LayoutPlanFieldSource, LayoutPlanFieldType, LayoutPlanLen,
+    LayoutPlanPartKind, LayoutValue, SegmentRepeat, SegmentWrite, VarveBlock, varve_format,
+};
 
 #[derive(Clone, Debug, PartialEq, VarveBlock)]
 #[varve(id = 50, version = 1, kind = "fixed")]
@@ -27,6 +30,17 @@ varve_format! {
         endian: little;
         schema_hash: computed;
         preset: varve_native;
+        blocks: [NativePoint];
+    }
+}
+
+varve_format! {
+    pub struct NativeFooterFormat {
+        magic: b"NATV3";
+        version: 1;
+        endian: little;
+        schema_hash: computed;
+        commit: record_footer;
         blocks: [NativePoint];
     }
 }
@@ -119,6 +133,79 @@ fn explicit_varve_native_preset_preserves_native_bytes() -> varve::Result<()> {
     cleanup(&default_path);
     cleanup(&explicit_path);
     Ok(())
+}
+
+#[test]
+fn varve_native_preset_exposes_effective_layout_plan() {
+    let plan = NativeDefaultFormat::spec().effective_layout();
+    assert_eq!(plan.parts.len(), 2);
+
+    let LayoutPlanPartKind::FileHeader(header) = &plan.parts[0].kind else {
+        panic!("expected native file header");
+    };
+    assert_eq!(header.name, "VarveFileHeader");
+    assert_eq!(header.fields[0].name, "magic");
+    assert_eq!(
+        header.fields[0].ty,
+        LayoutPlanFieldType::Bytes {
+            len: LayoutPlanLen::Fixed(4)
+        }
+    );
+    assert_eq!(
+        header.fields[1].source,
+        LayoutPlanFieldSource::LiteralBytes(b"VARVE1".to_vec())
+    );
+
+    let LayoutPlanPartKind::Segment(segment) = &plan.parts[1].kind else {
+        panic!("expected native record segment");
+    };
+    assert_eq!(segment.name, "VarveRecord");
+    assert_eq!(segment.repeat, SegmentRepeat::UntilEof);
+    assert_eq!(segment.lead_in.name, "VarveRecordHeader");
+    assert!(segment.footer.is_none());
+    assert_eq!(segment.raw_region.name, "Payload");
+    assert!(
+        segment
+            .lead_in
+            .fields
+            .iter()
+            .any(|field| field.name == "payload_len"
+                && matches!(field.source, LayoutPlanFieldSource::Finalize(_)))
+    );
+}
+
+#[test]
+fn varve3_native_preset_exposes_footer_layout_plan() {
+    let plan = NativeFooterFormat::spec().effective_layout();
+    let LayoutPlanPartKind::FileHeader(header) = &plan.parts[0].kind else {
+        panic!("expected native file header");
+    };
+    assert_eq!(
+        header.fields[1].source,
+        LayoutPlanFieldSource::LiteralBytes(b"VARVE3".to_vec())
+    );
+    assert!(
+        header
+            .fields
+            .iter()
+            .any(|field| field.name == "extension_len")
+    );
+
+    let LayoutPlanPartKind::Segment(segment) = &plan.parts[1].kind else {
+        panic!("expected native record segment");
+    };
+    let footer = segment.footer.as_ref().expect("VARVE3 footer plan");
+    assert_eq!(footer.name, "VarveRecordFooter");
+    assert_eq!(
+        footer.fields[0].source,
+        LayoutPlanFieldSource::LiteralBytes(b"VRF1".to_vec())
+    );
+    assert!(
+        footer
+            .fields
+            .iter()
+            .any(|field| field.name == "prev_same_block_offset")
+    );
 }
 
 #[test]

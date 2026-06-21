@@ -18,6 +18,10 @@
   Varve-native container; custom layouts can own byte zero and declare
   file headers, append-oriented segment lead-ins, metadata regions, raw
   regions, footer descriptors, and finalized/backpatched offset fields.
+- `FormatSpec::effective_layout()` is the bridge between the native preset and
+  the custom layout DSL. Native formats expose a synthetic `VarveFileHeader` and
+  repeated `VarveRecord` segment plan; custom formats expose their declared
+  layout parts directly.
 - `#[derive(VarveBlock)]` remains available for derive-first block definitions when structs need to live outside the format declaration.
 - Block ids are explicit `u32` values below `0xFFFF_FF00`; higher ids are reserved for internal records.
 - Same-type blocks are read lazily through `BlockVec<T>`.

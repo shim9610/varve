@@ -432,6 +432,90 @@ pub struct LayoutSpec {
     pub parts: &'static [LayoutPartDescriptor],
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutPlan {
+    pub preset: LayoutPreset,
+    pub parts: Vec<LayoutPlanPartDescriptor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutPlanPartDescriptor {
+    pub name: String,
+    pub kind: LayoutPlanPartKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LayoutPlanPartKind {
+    FileHeader(LayoutPlanFieldGroup),
+    Segment(LayoutPlanSegment),
+    LeadIn(LayoutPlanFieldGroup),
+    Metadata(LayoutPlanRegion),
+    RawRegion(LayoutPlanRegion),
+    Footer(LayoutPlanFieldGroup),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutPlanSegment {
+    pub name: String,
+    pub repeat: SegmentRepeat,
+    pub lead_in: LayoutPlanFieldGroup,
+    pub metadata: LayoutPlanRegion,
+    pub raw_region: LayoutPlanRegion,
+    pub footer: Option<LayoutPlanFieldGroup>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutPlanFieldGroup {
+    pub name: String,
+    pub fields: Vec<LayoutPlanField>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutPlanRegion {
+    pub name: String,
+    pub source: LayoutPlanRegionSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LayoutPlanRegionSource {
+    Caller,
+    Native(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutPlanField {
+    pub name: String,
+    pub ty: LayoutPlanFieldType,
+    pub source: LayoutPlanFieldSource,
+    pub endian: Option<Endian>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutPlanFieldType {
+    Bytes { len: LayoutPlanLen },
+    U8,
+    U16,
+    U32,
+    U64,
+    I64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutPlanLen {
+    Fixed(u64),
+    Dynamic,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LayoutPlanFieldSource {
+    LiteralBytes(Vec<u8>),
+    LiteralU64(u64),
+    LiteralI64(i64),
+    Caller,
+    Finalize(LayoutFinalize),
+    Native(&'static str),
+}
+
 impl LayoutSpec {
     pub const fn varve_native() -> Self {
         Self {
@@ -746,6 +830,14 @@ impl FormatSpec {
         self.blocks.iter().copied().find(|block| block.id == id)
     }
 
+    pub fn effective_layout(&self) -> LayoutPlan {
+        if self.layout.is_varve_native_default() {
+            native_layout_plan(*self)
+        } else {
+            layout_spec_to_plan(self.layout)
+        }
+    }
+
     pub fn schema_debug_dump(&self) -> String {
         let mut output = String::new();
         output.push_str("varve schema\n");
@@ -769,6 +861,17 @@ impl FormatSpec {
         output.push_str(&format!("layout_preset: {:?}\n", self.layout.preset));
         for part in self.layout.parts {
             output.push_str(&format!("layout_part {} {:?}\n", part.name, part.kind));
+        }
+        let effective_layout = self.effective_layout();
+        output.push_str(&format!(
+            "effective_layout_preset: {:?}\n",
+            effective_layout.preset
+        ));
+        for part in &effective_layout.parts {
+            output.push_str(&format!(
+                "effective_layout_part {} {:?}\n",
+                part.name, part.kind
+            ));
         }
         for override_policy in self.block_compression {
             output.push_str(&format!(
@@ -1477,6 +1580,313 @@ fn hash_layout_spec(hash: &mut Fnv1a64, layout: LayoutSpec) {
                 hash_layout_fields(hash, footer.fields);
             }
         }
+    }
+}
+
+fn layout_spec_to_plan(layout: LayoutSpec) -> LayoutPlan {
+    LayoutPlan {
+        preset: layout.preset,
+        parts: layout
+            .parts
+            .iter()
+            .map(|part| LayoutPlanPartDescriptor {
+                name: part.name.to_string(),
+                kind: match part.kind {
+                    LayoutPartKind::FileHeader(header) => LayoutPlanPartKind::FileHeader(
+                        layout_field_group_to_plan(header.name, header.fields),
+                    ),
+                    LayoutPartKind::Segment(segment) => {
+                        LayoutPlanPartKind::Segment(layout_segment_to_plan(segment))
+                    }
+                    LayoutPartKind::LeadIn(lead_in) => LayoutPlanPartKind::LeadIn(
+                        layout_field_group_to_plan(lead_in.name, lead_in.fields),
+                    ),
+                    LayoutPartKind::Metadata(metadata) => LayoutPlanPartKind::Metadata(
+                        layout_region_to_plan(metadata.name, metadata.source),
+                    ),
+                    LayoutPartKind::RawRegion(raw) => {
+                        LayoutPlanPartKind::RawRegion(layout_region_to_plan(raw.name, raw.source))
+                    }
+                    LayoutPartKind::Footer(footer) => LayoutPlanPartKind::Footer(
+                        layout_field_group_to_plan(footer.name, footer.fields),
+                    ),
+                },
+            })
+            .collect(),
+    }
+}
+
+fn layout_segment_to_plan(segment: SegmentDescriptor) -> LayoutPlanSegment {
+    LayoutPlanSegment {
+        name: segment.name.to_string(),
+        repeat: segment.repeat,
+        lead_in: layout_field_group_to_plan(segment.lead_in.name, segment.lead_in.fields),
+        metadata: layout_region_to_plan(segment.metadata.name, segment.metadata.source),
+        raw_region: layout_region_to_plan(segment.raw_region.name, segment.raw_region.source),
+        footer: segment
+            .footer
+            .map(|footer| layout_field_group_to_plan(footer.name, footer.fields)),
+    }
+}
+
+fn layout_field_group_to_plan(
+    name: &'static str,
+    fields: &[LayoutFieldDescriptor],
+) -> LayoutPlanFieldGroup {
+    LayoutPlanFieldGroup {
+        name: name.to_string(),
+        fields: fields.iter().copied().map(layout_field_to_plan).collect(),
+    }
+}
+
+fn layout_region_to_plan(name: &'static str, source: LayoutBytesSource) -> LayoutPlanRegion {
+    LayoutPlanRegion {
+        name: name.to_string(),
+        source: match source {
+            LayoutBytesSource::Caller => LayoutPlanRegionSource::Caller,
+        },
+    }
+}
+
+fn layout_field_to_plan(field: LayoutFieldDescriptor) -> LayoutPlanField {
+    LayoutPlanField {
+        name: field.name.to_string(),
+        ty: layout_field_type_to_plan(field.ty),
+        source: match field.source {
+            LayoutFieldSource::LiteralBytes(bytes) => {
+                LayoutPlanFieldSource::LiteralBytes(bytes.to_vec())
+            }
+            LayoutFieldSource::LiteralU64(value) => LayoutPlanFieldSource::LiteralU64(value),
+            LayoutFieldSource::LiteralI64(value) => LayoutPlanFieldSource::LiteralI64(value),
+            LayoutFieldSource::Caller => LayoutPlanFieldSource::Caller,
+            LayoutFieldSource::Finalize(finalize) => LayoutPlanFieldSource::Finalize(finalize),
+        },
+        endian: field.endian,
+    }
+}
+
+fn layout_field_type_to_plan(ty: LayoutFieldType) -> LayoutPlanFieldType {
+    match ty {
+        LayoutFieldType::Bytes { len } => LayoutPlanFieldType::Bytes {
+            len: LayoutPlanLen::Fixed(len),
+        },
+        LayoutFieldType::U8 => LayoutPlanFieldType::U8,
+        LayoutFieldType::U16 => LayoutPlanFieldType::U16,
+        LayoutFieldType::U32 => LayoutPlanFieldType::U32,
+        LayoutFieldType::U64 => LayoutPlanFieldType::U64,
+        LayoutFieldType::I64 => LayoutPlanFieldType::I64,
+    }
+}
+
+fn native_layout_plan(spec: FormatSpec) -> LayoutPlan {
+    let mut header_fields = vec![
+        native_bytes_field(
+            "magic",
+            LayoutPlanLen::Fixed(spec.magic.len() as u64),
+            LayoutPlanFieldSource::LiteralBytes(spec.magic.to_vec()),
+        ),
+        native_bytes_field(
+            "container_marker",
+            LayoutPlanLen::Fixed(6),
+            LayoutPlanFieldSource::LiteralBytes(native_container_marker(spec).to_vec()),
+        ),
+        native_field(
+            "format_version",
+            LayoutPlanFieldType::U16,
+            LayoutPlanFieldSource::Native("format_version"),
+        ),
+        native_field(
+            "endian",
+            LayoutPlanFieldType::U8,
+            LayoutPlanFieldSource::Native("endian"),
+        ),
+        native_field(
+            "flags",
+            LayoutPlanFieldType::U8,
+            LayoutPlanFieldSource::LiteralU64(0),
+        ),
+        native_field(
+            "schema_hash",
+            LayoutPlanFieldType::U64,
+            LayoutPlanFieldSource::Native("schema_hash"),
+        ),
+    ];
+    if native_has_extension_len_field(spec) {
+        header_fields.push(native_field(
+            "extension_len",
+            LayoutPlanFieldType::U32,
+            LayoutPlanFieldSource::Native("extension_len"),
+        ));
+    }
+    if native_file_explicit_compression(spec).is_some() {
+        header_fields.push(native_bytes_field(
+            "extensions",
+            LayoutPlanLen::Fixed(28),
+            LayoutPlanFieldSource::Native("file_explicit_compression_header"),
+        ));
+    }
+
+    let footer = if spec.spec_needs_record_footer() {
+        Some(LayoutPlanFieldGroup {
+            name: "VarveRecordFooter".to_string(),
+            fields: vec![
+                native_bytes_field(
+                    "magic",
+                    LayoutPlanLen::Fixed(4),
+                    LayoutPlanFieldSource::LiteralBytes(b"VRF1".to_vec()),
+                ),
+                native_field(
+                    "footer_version",
+                    LayoutPlanFieldType::U16,
+                    LayoutPlanFieldSource::LiteralU64(1),
+                ),
+                native_field(
+                    "footer_flags",
+                    LayoutPlanFieldType::U16,
+                    LayoutPlanFieldSource::Native("footer_flags"),
+                ),
+                native_field(
+                    "prev_same_block_offset",
+                    LayoutPlanFieldType::U64,
+                    LayoutPlanFieldSource::Native("prev_same_block_offset"),
+                ),
+                native_field(
+                    "prev_same_key_offset",
+                    LayoutPlanFieldType::U64,
+                    LayoutPlanFieldSource::Native("prev_same_key_offset"),
+                ),
+                native_field(
+                    "footer_crc32",
+                    LayoutPlanFieldType::U32,
+                    LayoutPlanFieldSource::LiteralU64(0),
+                ),
+                native_field(
+                    "reserved",
+                    LayoutPlanFieldType::U32,
+                    LayoutPlanFieldSource::LiteralU64(0),
+                ),
+            ],
+        })
+    } else {
+        None
+    };
+
+    LayoutPlan {
+        preset: LayoutPreset::VarveNative,
+        parts: vec![
+            LayoutPlanPartDescriptor {
+                name: "VarveFileHeader".to_string(),
+                kind: LayoutPlanPartKind::FileHeader(LayoutPlanFieldGroup {
+                    name: "VarveFileHeader".to_string(),
+                    fields: header_fields,
+                }),
+            },
+            LayoutPlanPartDescriptor {
+                name: "VarveRecord".to_string(),
+                kind: LayoutPlanPartKind::Segment(LayoutPlanSegment {
+                    name: "VarveRecord".to_string(),
+                    repeat: SegmentRepeat::UntilEof,
+                    lead_in: LayoutPlanFieldGroup {
+                        name: "VarveRecordHeader".to_string(),
+                        fields: vec![
+                            native_field(
+                                "block_id",
+                                LayoutPlanFieldType::U32,
+                                LayoutPlanFieldSource::Caller,
+                            ),
+                            native_field(
+                                "block_version",
+                                LayoutPlanFieldType::U16,
+                                LayoutPlanFieldSource::Caller,
+                            ),
+                            native_field(
+                                "flags",
+                                LayoutPlanFieldType::U16,
+                                LayoutPlanFieldSource::Native("record_flags"),
+                            ),
+                            native_field(
+                                "sequence",
+                                LayoutPlanFieldType::U64,
+                                LayoutPlanFieldSource::Native("sequence"),
+                            ),
+                            native_field(
+                                "payload_len",
+                                LayoutPlanFieldType::U64,
+                                LayoutPlanFieldSource::Finalize(LayoutFinalize {
+                                    target: LayoutAnchor::FooterStart,
+                                    relative_to: LayoutAnchor::RawRegionStart,
+                                }),
+                            ),
+                            native_field(
+                                "checksum",
+                                LayoutPlanFieldType::U32,
+                                LayoutPlanFieldSource::Native("checksum"),
+                            ),
+                            native_field(
+                                "uncompressed_len_hint",
+                                LayoutPlanFieldType::U32,
+                                LayoutPlanFieldSource::Native("uncompressed_len_hint"),
+                            ),
+                        ],
+                    },
+                    metadata: LayoutPlanRegion {
+                        name: "NoMetadata".to_string(),
+                        source: LayoutPlanRegionSource::Native("none"),
+                    },
+                    raw_region: LayoutPlanRegion {
+                        name: "Payload".to_string(),
+                        source: LayoutPlanRegionSource::Native("record_payload"),
+                    },
+                    footer,
+                }),
+            },
+        ],
+    }
+}
+
+fn native_field(
+    name: &'static str,
+    ty: LayoutPlanFieldType,
+    source: LayoutPlanFieldSource,
+) -> LayoutPlanField {
+    LayoutPlanField {
+        name: name.to_string(),
+        ty,
+        source,
+        endian: Some(Endian::Little),
+    }
+}
+
+fn native_bytes_field(
+    name: &'static str,
+    len: LayoutPlanLen,
+    source: LayoutPlanFieldSource,
+) -> LayoutPlanField {
+    native_field(name, LayoutPlanFieldType::Bytes { len }, source)
+}
+
+fn native_container_marker(spec: FormatSpec) -> &'static [u8] {
+    if spec.spec_needs_record_footer() {
+        b"VARVE3"
+    } else if native_file_explicit_compression(spec).is_some() {
+        b"VARVE2"
+    } else {
+        b"VARVE1"
+    }
+}
+
+fn native_has_extension_len_field(spec: FormatSpec) -> bool {
+    spec.spec_needs_record_footer() || native_file_explicit_compression(spec).is_some()
+}
+
+fn native_file_explicit_compression(spec: FormatSpec) -> Option<VariableCompression> {
+    match spec.compression_policy {
+        CompressionPolicy::VariableBlocks(compression)
+            if compression.header_mode == CompressionHeaderMode::FileExplicit =>
+        {
+            Some(compression)
+        }
+        _ => None,
     }
 }
 

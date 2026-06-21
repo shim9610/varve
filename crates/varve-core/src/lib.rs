@@ -38,10 +38,12 @@ pub use format::{
     FieldPresence, FileHeaderDescriptor, FooterDescriptor, FormatSpec, FormatSpecBuilder,
     IndexPolicy, IntegrityPolicy, LayoutAnchor, LayoutBytesSource, LayoutFieldDescriptor,
     LayoutFieldSource, LayoutFieldType, LayoutFinalize, LayoutPartDescriptor, LayoutPartKind,
-    LayoutPreset, LayoutSpec, LeadInDescriptor, ManifestPolicy, MatrixAuxDescriptor,
-    MatrixBlockDescriptor, MatrixCommitDescriptor, MatrixCommitKind, MatrixDimensionDescriptor,
-    MetadataDescriptor, RawRegionDescriptor, RecoveryPolicy, SegmentDescriptor, SegmentRepeat,
-    TransactionMarkerMode, VariableCompression,
+    LayoutPlan, LayoutPlanField, LayoutPlanFieldGroup, LayoutPlanFieldSource, LayoutPlanFieldType,
+    LayoutPlanLen, LayoutPlanPartDescriptor, LayoutPlanPartKind, LayoutPlanRegion,
+    LayoutPlanRegionSource, LayoutPlanSegment, LayoutPreset, LayoutSpec, LeadInDescriptor,
+    ManifestPolicy, MatrixAuxDescriptor, MatrixBlockDescriptor, MatrixCommitDescriptor,
+    MatrixCommitKind, MatrixDimensionDescriptor, MetadataDescriptor, RawRegionDescriptor,
+    RecoveryPolicy, SegmentDescriptor, SegmentRepeat, TransactionMarkerMode, VariableCompression,
 };
 pub use layout::{
     LayoutFieldValue, LayoutReader, LayoutSegmentInfo, LayoutValue, LayoutWriter, SegmentWrite,
