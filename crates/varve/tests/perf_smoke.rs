@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use varve::{
-    BlockDescriptor, BlockKind, Endian, FormatSpec, IndexPolicy, MatrixAuxDescriptor,
+    BinaryCursor, BinaryWriter, BlockDescriptor, BlockKind, ChunkEntry, ChunkIndexBuilder,
+    ChunkLayout, Endian, FormatSpec, IndexPolicy, LayoutSegmentInfo, MatrixAuxDescriptor,
     MatrixBlockDescriptor, MatrixCommitDescriptor, MatrixCommitKind, MatrixDimensionDescriptor,
-    MatrixDimensions, MatrixKey, RecoveryPolicy, SegmentWrite, VarveBlock, VarveDecode,
-    VarveEncode, VarveMatrixBlock, VarveMerge, compact_keyed_file, compact_keyed_files,
-    merge_keyed_files, varve_format,
+    MatrixDimensions, MatrixKey, RecoveryPolicy, SegmentReducer, SegmentWrite, VarveBlock,
+    VarveDecode, VarveEncode, VarveMatrixBlock, VarveMerge, compact_keyed_file,
+    compact_keyed_files, merge_keyed_files, reduce_segments_by_ref, varve_format,
 };
 
 #[derive(Clone, Debug, PartialEq, VarveBlock)]
@@ -264,6 +265,7 @@ fn perf_smoke_core_paths() -> varve::Result<()> {
         varve3_footer_and_chain(case)?;
         materialized_keyed_state(case)?;
         physical_layout_segments(case)?;
+        adapter_toolkit_paths(case)?;
         matrix_direct_access(case)?;
         matrix_aux_region_access(case)?;
         #[cfg(feature = "integrity")]
@@ -272,6 +274,81 @@ fn perf_smoke_core_paths() -> varve::Result<()> {
 
     merge_and_compact(2_048)?;
     recovery_tail_truncation(2_048)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PerfAdapterMetadata {
+    value: u64,
+}
+
+#[derive(Default)]
+struct PerfAdapterState {
+    total: u64,
+}
+
+struct PerfAdapterReducer;
+
+impl SegmentReducer for PerfAdapterReducer {
+    type Metadata = PerfAdapterMetadata;
+    type State = PerfAdapterState;
+
+    fn initial() -> Self::State {
+        PerfAdapterState::default()
+    }
+
+    fn apply_segment(
+        state: &mut Self::State,
+        _segment: &LayoutSegmentInfo,
+        metadata: Self::Metadata,
+    ) -> varve::Result<()> {
+        state.total = state.total.wrapping_add(metadata.value);
+        Ok(())
+    }
+}
+
+fn adapter_toolkit_paths(case: PerfCase) -> varve::Result<()> {
+    let path = temp_path(&format!("{}_adapter_toolkit", case.name));
+    let mut segments = Vec::with_capacity(case.records);
+    let mut metadata = Vec::with_capacity(case.records);
+    let elapsed = timed(|| {
+        let mut chunks = ChunkIndexBuilder::new();
+        for index in 0..case.records {
+            let mut writer = BinaryWriter::new(Endian::Little);
+            writer.len_prefixed_string::<u16>("stream")?;
+            writer.u64(index as u64)?;
+            writer.f64(index as f64 * 0.5)?;
+            let bytes = writer.into_inner();
+
+            let mut cursor = BinaryCursor::new(&bytes, Endian::Little);
+            assert_eq!(cursor.len_prefixed_string::<u16>()?, "stream");
+            let value = cursor.u64()?;
+            let _ = cursor.f64()?;
+            cursor.finish()?;
+
+            let segment = perf_layout_segment_info(index as u64 * 16, 16);
+            chunks.push(
+                ChunkEntry {
+                    key: (index % 16) as u16,
+                    segment_index: index,
+                    byte_offset: 0,
+                    byte_len: 16,
+                    value_count: 2,
+                    layout: ChunkLayout::Contiguous,
+                },
+                &segment,
+            )?;
+            segments.push(segment);
+            metadata.push(PerfAdapterMetadata { value });
+        }
+        let chunk_index = chunks.finish()?;
+        assert_eq!(chunk_index.len(), case.records);
+        let reduced =
+            reduce_segments_by_ref::<PerfAdapterReducer, _>(segments.iter().zip(metadata.clone()))?;
+        assert_eq!(reduced.segments_applied, case.records);
+        Ok(())
+    })?;
+    report("adapter toolkit", case.records, &path, elapsed);
     Ok(())
 }
 
@@ -963,6 +1040,23 @@ fn append_partial_record_header(path: &Path) -> varve::Result<()> {
     let mut file = OpenOptions::new().append(true).open(path)?;
     file.write_all(&[0xAA, 0xBB, 0xCC, 0xDD])?;
     Ok(())
+}
+
+fn perf_layout_segment_info(raw_offset: u64, raw_len: u64) -> LayoutSegmentInfo {
+    LayoutSegmentInfo {
+        name: "PerfAdapterSegment",
+        segment_start: raw_offset,
+        lead_in_len: 0,
+        metadata_offset: raw_offset,
+        metadata_len: 0,
+        raw_offset,
+        raw_len,
+        footer_offset: raw_offset + raw_len,
+        footer_len: 0,
+        segment_end: raw_offset + raw_len,
+        fields: Vec::new(),
+        footer_fields: Vec::new(),
+    }
 }
 
 fn temp_path(name: &str) -> PathBuf {

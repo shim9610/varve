@@ -1,8 +1,8 @@
 # Adapter Toolkit Design
 
-This document defines a proposed Varve adapter toolkit for external binary
-formats. It is not a TDMS implementation plan. TDMS is one useful stress case,
-but the toolkit should stay generic enough for other segmented formats such as
+This document defines the Varve adapter toolkit for external binary formats. It
+is not a TDMS implementation plan. TDMS is one useful stress case, but the
+toolkit stays generic enough for other segmented formats such as
 instrument logs, media chunks, packet captures, image containers, and columnar
 binary files.
 
@@ -10,7 +10,7 @@ The design principle is declaration plus user definition:
 
 - Varve declares and verifies reusable binary mechanics.
 - The adapter author defines domain meaning where the format requires it.
-- A TDMS adapter should be one branch produced by these generic pieces, not a
+- A TDMS adapter is one branch produced by these generic pieces, not a
   hardcoded Varve feature.
 
 ## Layer Model
@@ -27,9 +27,9 @@ The existing physical layout layer owns file headers, segment lead-ins,
 metadata regions, raw regions, footers, finalized offsets, range reads,
 streamed segment writes, and tolerant scan reports.
 
-The adapter toolkit sits above that layer. It should help parse binary metadata,
+The adapter toolkit sits above that layer. It helps parse binary metadata,
 build logical indexes over raw regions, reduce segment metadata into state, and
-run adapter self-checks. It should not know TDMS object paths, NI scaling,
+run adapter self-checks. It does not know TDMS object paths, NI scaling,
 DAQmx, HDF export, or any other domain-specific meaning.
 
 ## Declaration And Definition Split
@@ -37,44 +37,27 @@ DAQmx, HDF export, or any other domain-specific meaning.
 An adapter author should be able to declare stable mechanics and provide Rust
 definitions for the parts that are not universal.
 
-Illustrative future syntax:
+The current implementation exposes runtime declarations through Rust structs
+and traits. A future macro DSL could wrap this surface, but the stable direction
+is already usable directly:
 
 ```rust
-varve_adapter! {
-    pub adapter ExampleAdapter for ExamplePhysicalFormat {
-        cursor {
-            endian: little;
-            strings: len_prefixed(u32, utf8);
-        }
-
-        tagged_value PropertyValue {
-            type_id: u32;
-            codec: ExamplePropertyCodec;
-        }
-
-        chunks ChannelChunks {
-            source: raw_region;
-            key: [group, channel];
-            builder: ExampleChunkBuilder;
-        }
-
-        reducer ObjectState {
-            metadata: ExampleMetadata;
-            state: ExampleState;
-            apply: ExampleReducer;
-        }
-
-        sidecar ExampleIndex {
-            extension: "idx";
-            mode: optional;
-        }
-    }
+struct ExamplePropertyCodec;
+impl TaggedValueCodec for ExamplePropertyCodec {
+    type Value = ExampleProperty;
+    type TypeId = u32;
+    // user-defined encode/decode
 }
+
+let mut chunks = ChunkIndexBuilder::new();
+chunks.push(entry, segment_info)?;
+
+let reduced = reduce_segments_by_ref::<ExampleReducer, _>(segments_and_metadata)?;
 ```
 
-This syntax is not implemented yet. It records the direction: the user declares
-which generic mechanisms are needed, and supplies codecs, chunk builders, and
-reducers as ordinary Rust types.
+The user declares which generic mechanisms are needed and supplies codecs,
+chunk builders, and reducers as ordinary Rust types. That leaves room for each
+adapter to define its own domain model.
 
 ## Generic Components
 
@@ -84,7 +67,7 @@ Most external binary formats repeat the same checked endian operations:
 primitive reads, primitive writes, bounded slices, arrays, length-prefixed
 strings, and length-prefixed blobs.
 
-Planned shape:
+Current shape:
 
 ```rust
 let mut cursor = BinaryCursor::new(bytes, Endian::Little);
@@ -97,7 +80,7 @@ writer.u32(count)?;
 writer.len_prefixed_bytes::<u32>(name.as_bytes())?;
 ```
 
-Varve should provide bounds checks, overflow checks, cursor position reporting,
+Varve provides bounds checks, overflow checks, cursor position reporting,
 and consistent error classification. The adapter author still decides what each
 field means.
 
@@ -111,9 +94,9 @@ Customization points:
 ### Length-Prefixed Values
 
 Length-prefixed bytes and strings are common enough to deserve first-class
-helpers. They should be independent from Varve-native variable fields.
+helpers. They are independent from Varve-native variable fields.
 
-Planned helpers:
+Current helpers:
 
 ```rust
 cursor.len_prefixed_bytes::<u32>()?;
@@ -132,10 +115,10 @@ Many binary metadata formats encode:
 name + type_id + payload
 ```
 
-Varve should provide the dispatch pattern, but the mapping from type id to
+Varve provides the dispatch pattern, but the mapping from type id to
 meaning must remain user-defined.
 
-Planned trait shape:
+Current trait shape:
 
 ```rust
 trait TaggedValueCodec {
@@ -164,24 +147,23 @@ describes several logical streams inside that region. TDMS channels are one
 example, but the pattern also applies to sensors, frames, columns, and packet
 streams.
 
-Planned shape:
+Current shape:
 
 ```rust
 let mut chunks = ChunkIndexBuilder::new();
 chunks.push(ChunkEntry {
     key: ChannelKey { group, channel },
     segment_index,
-    raw_offset,
     byte_offset,
     byte_len,
     value_count,
     layout: ChunkLayout::Contiguous,
-})?;
+}, segment_info)?;
 let index = chunks.finish()?;
 ```
 
-The builder should validate byte bounds against Varve's physical segment
-information. It should not infer domain metadata by itself.
+The builder validates byte bounds against Varve's physical segment
+information. It does not infer domain metadata by itself.
 
 Customization points:
 
@@ -197,7 +179,7 @@ Many segmented files carry incremental metadata. Later segments may extend,
 replace, or reuse earlier state. TDMS `same-as-previous` is one example, but the
 general mechanism is a stateful segment reducer.
 
-Planned trait shape:
+Current trait shape:
 
 ```rust
 trait SegmentReducer {
@@ -228,7 +210,7 @@ Customization points:
 Some formats pair a main file with an index or cache sidecar. TDMS `.tdms_index`
 is one example, but the pattern is generic.
 
-Planned shape:
+Current shape:
 
 ```rust
 SidecarPolicy {
@@ -239,7 +221,7 @@ SidecarPolicy {
 }
 ```
 
-Varve should provide path derivation, basic identity checks, and diagnostics.
+Varve provides path derivation, basic identity checks, and diagnostics.
 The adapter owns sidecar payload grammar and invalidation policy.
 
 Customization points:
@@ -251,11 +233,11 @@ Customization points:
 
 ### Tail Status And Adapter Diagnostics
 
-`inspect_layout_file_report` already separates a complete physical prefix from
-a terminal truncated or invalid tail. The adapter toolkit should build on that
-instead of hiding it.
+`inspect_layout_file_report` separates a complete physical prefix from a
+terminal truncated or invalid tail. The adapter toolkit builds on that instead
+of hiding it.
 
-Future diagnostics should combine:
+Adapter diagnostics combine:
 
 - static declaration diagnostics;
 - physical layout scan status;
@@ -296,31 +278,39 @@ This split keeps Varve reusable. A different format should be able to reuse the
 same cursor, tagged value, chunk index, reducer, sidecar, and diagnostic
 mechanisms with completely different domain types.
 
-## Implementation Phases
-
-P0:
+## Implemented Surface
 
 - `BinaryCursor` and `BinaryWriter`;
 - checked primitive and byte reads/writes;
-- length-prefixed bytes/string helpers;
-- adapter-oriented error categories;
-- tests against current TDMS-style and BMP examples.
+- length-prefixed bytes/string helpers for `u8`, `u16`, `u32`, and `u64`;
+- `TaggedValueCodec` and a small generic `TaggedValue` enum;
+- generic `ChunkIndex`, `ChunkIndexEntry`, `ChunkEntry`, and
+  `ChunkIndexBuilder`;
+- `SegmentReducer`, `reduce_segments`, and `reduce_segments_by_ref`;
+- `SidecarPolicy`, `SidecarMode`, `SidecarIdentity`, and `SidecarReport`;
+- `AdapterCheckReport`, `AdapterDiagnostic`, and `AdapterTailStatus`;
+- `AdapterInputFile` for path-owned or temporary byte-backed adapter inputs.
 
-P1:
+The macro DSL sketched in earlier drafts is not implemented. The current API is
+the runtime layer that such a DSL would generate or call.
 
-- `TaggedValueCodec`;
-- generic `ChunkIndex` and `ChunkIndexBuilder`;
-- `SegmentReducer` runner;
-- adapter self-check report;
-- documentation and examples showing TDMS as one possible adapter.
+## Verification
 
-P2:
-
-- declarative `varve_adapter!` or nested `adapter { ... }` DSL;
-- sidecar policy helpers;
-- richer tail status with expected end, available length, and adapter evidence;
-- file-like input bridge where path ownership is not natural;
-- performance smoke paths for chunk index and reducer construction.
+- `crates/varve/tests/adapter_toolkit.rs` covers cursor/writer roundtrips,
+  length prefixes, tagged values, chunk bounds, stateful reducers, sidecar
+  identity, and physical tail report composition.
+- `crates/varve/examples/tdms_physical/common.rs` contains one TDMS-style layout
+  declaration and shared reader/writer adapter implementation using
+  `BinaryCursor`, `BinaryWriter`, `TaggedValueCodec`, `ChunkIndexBuilder`, and
+  `SegmentReducer`.
+- `crates/varve/examples/bmp_physical.rs` uses `BinaryWriter`, `BinaryCursor`,
+  and `ChunkIndexBuilder` for the BMP proof.
+- Python harnesses verify the TDMS-style adapter against `npTDMS` and BMP
+  against Pillow.
+- `crates/varve/tests/perf_smoke.rs` includes an ignored adapter-toolkit smoke
+  path using `BinaryWriter`, `BinaryCursor`, `ChunkIndexBuilder`, and
+  `SegmentReducer`; run it with
+  `cargo test -p varve --test perf_smoke -- --ignored --nocapture`.
 
 ## Expected Code Reduction
 

@@ -741,6 +741,7 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::LayoutSegmentMissing(_)
         | Error::LayoutRepeatedOnceSegment { .. }
         | Error::LayoutSegmentIndexOutOfBounds { .. }
+        | Error::AdapterDiagnostic(_)
         | Error::ZeroCopyBlockKindMismatch { .. }
         | Error::ZeroCopyEndianMismatch { .. }
         | Error::ZeroCopyPayloadSizeMismatch { .. }
@@ -789,7 +790,10 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::LayoutNoMatchingSegment { .. }
         | Error::LayoutTruncatedLeadIn { .. }
         | Error::LayoutTruncatedHeader { .. }
-        | Error::LayoutInvalidSegmentBounds { .. } => DiagnosticDomain::FileData,
+        | Error::LayoutInvalidSegmentBounds { .. }
+        | Error::AdapterBounds { .. }
+        | Error::AdapterUnsupportedType { .. }
+        | Error::AdapterInvalidLength { .. } => DiagnosticDomain::FileData,
 
         Error::WriterLockBreakRefused(_) => DiagnosticDomain::CallerUsage,
         Error::MatrixLayoutMissing => DiagnosticDomain::LibraryInvariant,

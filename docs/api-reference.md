@@ -291,20 +291,48 @@ discriminator; immediately following literal numeric fields extend the dispatch
 key. Generated segment-specific `index` parameters are per segment kind, while
 the low-level range methods continue to use the global physical stream index.
 
-`crates/varve/examples/tdms_physical_writer.rs` demonstrates a TDMS-style
-external adapter proof built on public Varve APIs, and
-`scripts/verify_tdms_with_nptdms.py` verifies the produced file with the
-optional Python `npTDMS` harness. The reverse harness,
-`scripts/verify_nptdms_multichannel_with_varve.py`, writes a two-channel TDMS
-file with `npTDMS` and parses it with Varve-based example code in
-`crates/varve/examples/tdms_physical_reader.rs`. These examples are not a
-Varve-provided TDMS reader/writer feature.
+`crates/varve/examples/tdms_physical/common.rs` contains one TDMS-style layout
+declaration plus shared reader/writer adapter code. The combined
+`tdms_physical_adapter` example exposes `write` and `read` subcommands, while
+the older `tdms_physical_writer` and `tdms_physical_reader` examples are thin
+wrappers over the same shared declaration. `scripts/verify_tdms_with_nptdms.py`
+verifies adapter-authored files with the optional Python `npTDMS` harness, and
+`scripts/verify_nptdms_multichannel_with_varve.py` writes a two-channel TDMS
+file with `npTDMS` and parses it with the same Varve-based adapter code. These
+examples are not a Varve-provided TDMS reader/writer feature.
 
 `crates/varve/examples/bmp_physical.rs` is the non-TDMS external-format smoke
 example. `scripts/verify_bmp_with_pillow.py` writes a 24-bit BMP through
 Varve's generated layout writer and verifies it with Pillow, then writes a BMP
 with Pillow and verifies the physical header and pixel payload through Varve's
 layout reader.
+
+## Adapter Toolkit API
+
+Use this layer when a custom physical layout has format-specific metadata or raw
+region semantics. The toolkit is generic: TDMS, BMP, and future external
+formats provide their own domain codecs and models.
+
+| API | Meaning |
+| --- | --- |
+| `BinaryCursor::new(bytes, endian)` | checked endian-aware metadata/raw byte reader |
+| `BinaryWriter::new(endian)` | endian-aware byte builder for external metadata/raw payloads |
+| `LengthPrefix` | implemented for `u8`, `u16`, `u32`, and `u64` length-prefixed values |
+| `cursor.len_prefixed_bytes::<u32>()` | read a length-prefixed byte slice |
+| `writer.len_prefixed_string::<u32>(value)` | write a length-prefixed UTF-8 string |
+| `TaggedValueCodec` | user-owned mapping from external type ids to value enums |
+| `ChunkIndexBuilder` | validate logical raw chunks against `LayoutSegmentInfo::raw_len` |
+| `ChunkIndex::entries_for(key)` | inspect logical chunks for a stream/key |
+| `SegmentReducer` | user-owned stateful reducer for segmented metadata |
+| `reduce_segments_by_ref::<R, _>(...)` | run a reducer over segment metadata without copying segment info |
+| `SidecarPolicy` | derive/check companion sidecar paths and main-file identity |
+| `AdapterCheckReport` | compose physical tail status and adapter diagnostics |
+| `AdapterTailStatus` | summarize expected end, available tail length, and evidence for damaged tails |
+| `AdapterInputFile` | bridge path-backed and temporary byte-backed adapter inputs |
+
+The toolkit deliberately does not define TDMS object paths, scaling, DAQmx,
+DataFrame/HDF export, or other domain semantics. See
+`docs/adapter-toolkit-design.md`.
 
 ## Mmap And Zero-Copy
 

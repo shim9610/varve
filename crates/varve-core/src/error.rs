@@ -279,4 +279,22 @@ pub enum Error {
 
     #[error("layout segment {segment} index {index} is out of bounds")]
     LayoutSegmentIndexOutOfBounds { segment: String, index: usize },
+
+    #[error(
+        "adapter byte range is out of bounds: offset {offset}, len {len}, available {available}"
+    )]
+    AdapterBounds {
+        offset: u64,
+        len: u64,
+        available: u64,
+    },
+
+    #[error("adapter unsupported tagged value type {type_id}")]
+    AdapterUnsupportedType { type_id: u64 },
+
+    #[error("adapter invalid length {value}")]
+    AdapterInvalidLength { value: u64 },
+
+    #[error("adapter diagnostic: {0}")]
+    AdapterDiagnostic(&'static str),
 }

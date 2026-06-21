@@ -1,3 +1,4 @@
+mod adapter;
 mod chunks;
 mod codec;
 mod collections;
@@ -11,6 +12,13 @@ mod merge;
 mod native_layout;
 mod traits;
 
+pub use adapter::{
+    AdapterCheckReport, AdapterCheckStatus, AdapterDiagnostic, AdapterDiagnosticDomain,
+    AdapterInputFile, AdapterTailStatus, BinaryCursor, BinaryWriter, ChunkEntry, ChunkIndex,
+    ChunkIndexBuilder, ChunkIndexEntry, ChunkLayout, LengthPrefix, SegmentReducer,
+    SegmentReductionReport, SidecarIdentity, SidecarMode, SidecarPolicy, SidecarReport,
+    TaggedValue, TaggedValueCodec, reduce_segments, reduce_segments_by_ref,
+};
 pub use chunks::ChunkedBytes;
 pub use codec::{
     Decoder, Encoder, FieldHeader, VarveDecode, VarveEncode, WireType, decode_from_slice,

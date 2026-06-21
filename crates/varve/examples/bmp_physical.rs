@@ -2,7 +2,9 @@ use std::env;
 use std::fs::remove_file;
 use std::path::{Path, PathBuf};
 
-use varve::varve_format;
+use varve::{
+    BinaryCursor, BinaryWriter, ChunkEntry, ChunkIndexBuilder, ChunkLayout, Endian, varve_format,
+};
 
 const WIDTH: u32 = 3;
 const HEIGHT: u32 = 2;
@@ -69,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn write_bmp(path: &Path) -> varve::Result<()> {
     cleanup(path);
-    let pixels = encode_bmp_pixels(WIDTH, HEIGHT, &expected_pixels());
+    let pixels = encode_bmp_pixels(WIDTH, HEIGHT, &expected_pixels())?;
     let mut writer = BmpCompatFormat::create_layout_writer(path)?;
     writer.write_bitmap_image(BmpCompatFormatBitmapImageLayoutWrite {
         fields: BmpCompatFormatBitmapImageLayoutFields {
@@ -102,8 +104,21 @@ fn read_bmp(path: &Path) -> varve::Result<()> {
 
     let raw = reader.read_bitmap_image_raw(0)?;
     assert_eq!(raw.len() as u32, image.image_size()?);
+    let mut chunks = ChunkIndexBuilder::new();
+    chunks.push(
+        ChunkEntry {
+            key: "pixels",
+            segment_index: 0,
+            byte_offset: 0,
+            byte_len: u64::from(image.image_size()?),
+            value_count: u64::from(WIDTH * HEIGHT),
+            layout: ChunkLayout::Contiguous,
+        },
+        image.as_layout_segment_info(),
+    )?;
+    assert_eq!(chunks.finish()?.entries().len(), 1);
     assert_eq!(
-        decode_bmp_pixels(WIDTH, HEIGHT, &raw),
+        decode_bmp_pixels(WIDTH, HEIGHT, &raw)?,
         expected_pixels(),
         "BMP pixel payload mismatch"
     );
@@ -121,54 +136,48 @@ fn expected_pixels() -> Vec<(u8, u8, u8)> {
     ]
 }
 
-fn encode_bmp_pixels(width: u32, height: u32, rgb_top_down: &[(u8, u8, u8)]) -> Vec<u8> {
+fn encode_bmp_pixels(
+    width: u32,
+    height: u32,
+    rgb_top_down: &[(u8, u8, u8)],
+) -> varve::Result<Vec<u8>> {
     let stride = bmp_row_stride(width);
     let row_len = (width * 3) as usize;
-    let mut raw = vec![0; stride * height as usize];
-    for top_y in 0..height as usize {
-        let stored_y = height as usize - 1 - top_y;
-        let row_offset = stored_y * stride;
-        let row = raw
-            .get_mut(row_offset..(row_offset + stride))
-            .expect("BMP encoded row is in bounds");
+    let mut writer = BinaryWriter::with_capacity(Endian::Little, stride * height as usize);
+    for stored_y in 0..height as usize {
+        let top_y = height as usize - 1 - stored_y;
         for x in 0..width as usize {
             let (r, g, b) = rgb_top_down
                 .get(top_y * width as usize + x)
                 .copied()
                 .expect("BMP source pixel is in bounds");
-            let offset = row_offset + x * 3;
-            row.get_mut((offset - row_offset)..(offset - row_offset + 3))
-                .expect("BMP encoded pixel is in bounds")
-                .copy_from_slice(&[b, g, r]);
+            writer.bytes(&[b, g, r])?;
         }
-        row.get_mut(row_len..stride)
-            .expect("BMP encoded row padding is in bounds")
-            .fill(0);
+        writer.bytes(&vec![0; stride - row_len])?;
     }
-    raw
+    Ok(writer.into_inner())
 }
 
-fn decode_bmp_pixels(width: u32, height: u32, raw: &[u8]) -> Vec<(u8, u8, u8)> {
+fn decode_bmp_pixels(width: u32, height: u32, raw: &[u8]) -> varve::Result<Vec<(u8, u8, u8)>> {
     let stride = bmp_row_stride(width);
     assert_eq!(raw.len(), stride * height as usize);
-    let mut rgb = Vec::with_capacity((width * height) as usize);
-    for top_y in 0..height as usize {
-        let stored_y = height as usize - 1 - top_y;
-        let row_offset = stored_y * stride;
-        let row = raw
-            .get(row_offset..(row_offset + stride))
-            .expect("BMP decoded row is in bounds");
-        for x in 0..width as usize {
-            let offset = x * 3;
-            let [b, g, r]: [u8; 3] = row
-                .get(offset..(offset + 3))
-                .expect("BMP decoded pixel is in bounds")
+    let mut cursor = BinaryCursor::new(raw, Endian::Little);
+    let mut stored_rows = Vec::with_capacity(height as usize);
+    for _ in 0..height as usize {
+        let mut row_pixels = Vec::with_capacity(width as usize);
+        for _ in 0..width as usize {
+            let [b, g, r]: [u8; 3] = cursor
+                .bytes(3)?
                 .try_into()
                 .expect("BMP decoded pixel has exactly 3 bytes");
-            rgb.push((r, g, b));
+            row_pixels.push((r, g, b));
         }
+        cursor.bytes(stride - (width as usize * 3))?;
+        stored_rows.push(row_pixels);
     }
-    rgb
+    cursor.finish()?;
+    let rgb = stored_rows.into_iter().rev().flatten().collect();
+    Ok(rgb)
 }
 
 fn bmp_row_stride(width: u32) -> usize {

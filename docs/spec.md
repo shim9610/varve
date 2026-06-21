@@ -395,26 +395,28 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
 
 ### External Adapter Toolkit
 
-- The adapter toolkit is a planned generic layer above custom physical layouts.
+- The adapter toolkit is a generic layer above custom physical layouts.
   It must not hardcode TDMS. TDMS-style support should emerge from reusable
   declarations plus user-defined codecs, chunk builders, and reducers.
-- P0 provides `BinaryCursor` and `BinaryWriter` for checked endian-aware
+- `BinaryCursor` and `BinaryWriter` provide checked endian-aware
   primitive reads/writes, bounded byte windows, cursor position reporting, and
   length-prefixed bytes/string helpers.
-- P1 provides a `TaggedValueCodec` trait so adapters can map format-specific
+- `TaggedValueCodec` lets adapters map format-specific
   type ids to user value enums without Varve owning the meaning of those type
   ids.
-- P1 provides `ChunkIndex` and `ChunkIndexBuilder` for mapping physical segment
+- `ChunkIndex` and `ChunkIndexBuilder` map physical segment
   raw regions to logical stream chunks. The builder validates bounds against
   `LayoutSegmentInfo`, while the adapter supplies stream keys, value counts,
   stride/interleaving rules, and semantic metadata.
-- P1 provides a `SegmentReducer` runner for stateful segmented metadata. Varve
+- `SegmentReducer`, `reduce_segments`, and `reduce_segments_by_ref` run
+  stateful segmented metadata reductions. Varve
   owns iteration and diagnostics; the adapter owns inheritance, replacement,
   same-as-previous, deletion, and version semantics.
-- P2 provides sidecar policy helpers for companion index/cache files. Varve owns
+- Sidecar policy helpers support companion index/cache files. Varve owns
   path derivation and basic identity diagnostics; the adapter owns sidecar wire
   grammar and rebuild policy.
-- P2 may add a declarative `varve_adapter!` or nested `adapter { ... }` DSL. The
+- A future declarative `varve_adapter!` or nested `adapter { ... }` DSL may
+  generate calls to this runtime layer. The
   DSL should generate adapter scaffolding from declarations but keep custom
   semantics in ordinary user Rust implementations.
 - Adapter diagnostics should combine static declaration checks, physical layout

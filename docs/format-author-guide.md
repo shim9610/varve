@@ -372,16 +372,17 @@ an adapter needs to separate a valid complete prefix from a truncated or invalid
 tail before deciding whether the file should be rejected or reported as an
 incomplete external-format file.
 
-For concrete compatibility checks, `crates/varve/examples/tdms_physical_writer.rs`
-is a TDMS-style external adapter proof. It writes a minimal two-segment file
-with real `TDSm` lead-ins, TDMS object metadata, a channel raw-data index, and
-appended contiguous `f64` samples using only the generated physical-layout
-writer. The optional Python harness verifies that file with `npTDMS`. The
-reverse harness creates a two-segment, two-channel TDMS file with `npTDMS`,
-then parses it through `crates/varve/examples/tdms_physical_reader.rs`, a
-Varve-based example adapter that uses the generated layout reader plus
-caller-owned TDMS metadata logic. These examples are not a Varve-provided TDMS
-reader/writer feature:
+For concrete compatibility checks, `crates/varve/examples/tdms_physical/common.rs`
+contains one TDMS-style layout declaration and shared adapter implementation.
+It writes a minimal two-segment file with real `TDSm` lead-ins, TDMS object
+metadata, a channel raw-data index, and appended contiguous `f64` samples using
+the generated physical-layout writer plus adapter toolkit helpers. The combined
+`tdms_physical_adapter` example exposes both `write` and `read` subcommands,
+and the older writer/reader examples are thin wrappers over the same shared
+declaration. The optional Python harness verifies adapter-authored files with
+`npTDMS`; the reverse harness creates a two-segment, two-channel TDMS file with
+`npTDMS`, then parses it through the same Varve-based adapter code. These
+examples are not a Varve-provided TDMS reader/writer feature:
 
 ```powershell
 python -m venv .venv-tdms
@@ -421,7 +422,9 @@ examples when you want API intent to be obvious.
 
 Run the ignored smoke tests when a format change touches indexing, scanning,
 manifest output, integrity, compression, codecs, merge, compact, mmap, or
-zero-copy paths:
+zero-copy paths. The default ignored smoke test also exercises the external
+adapter toolkit path so cursor, chunk-index, and reducer changes show up in the
+same regression pass:
 
 ```powershell
 cargo test -p varve --test perf_smoke -- --ignored --nocapture

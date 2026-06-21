@@ -54,7 +54,7 @@
 - Custom physical layouts also expose streamed segment writes and tolerant scan
   reports, so external adapters can avoid prebuffering large raw regions and can
   distinguish a complete physical prefix from a truncated or invalid tail.
-- A planned adapter toolkit should sit above custom physical layouts with
+- The adapter toolkit sits above custom physical layouts with
   reusable binary cursors, length-prefixed helpers, tagged-value codecs,
   logical chunk indexes, segment reducers, sidecar policies, and adapter
   diagnostics. These are generic external-format primitives, not TDMS-specific
@@ -172,6 +172,6 @@
   for caller-managed blobs. VMAT-native chunk compression and bulk migration
   publication remain next-wave work.
 - Remaining polish areas include stricter manifest validation if needed, richer error ergonomics, and future live tailing if it becomes a requirement.
-- The next external-format design target is `docs/adapter-toolkit-design.md`,
-  which keeps TDMS as a proof case while extracting only reusable adapter
-  patterns into Varve.
+- `docs/adapter-toolkit-design.md` records the external-format adapter toolkit.
+  It keeps TDMS as a proof case while extracting only reusable adapter patterns
+  into Varve.
