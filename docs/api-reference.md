@@ -291,8 +291,10 @@ discriminator; immediately following literal numeric fields extend the dispatch
 key. Generated segment-specific `index` parameters are per segment kind, while
 the low-level range methods continue to use the global physical stream index.
 
-`crates/varve/examples/tdms_physical/common.rs` contains one TDMS-style layout
-declaration plus shared reader/writer adapter code. The combined
+`crates/varve/examples/tdms_physical/common.rs` is a thin façade over the TDMS
+example modules: `common/adapter.rs` contains the physical layout and
+reader/writer adapter, `common/example_data.rs` contains fixture/scenario data,
+and `common/verify.rs` contains self-verification. The combined
 `tdms_physical_adapter` example exposes `write`, `append`, `read`, `read-bytes`,
 and `inspect` subcommands, while the older `tdms_physical_writer` and
 `tdms_physical_reader` examples are thin wrappers over the same shared

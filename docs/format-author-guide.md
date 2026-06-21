@@ -373,8 +373,11 @@ tail before deciding whether the file should be rejected or reported as an
 incomplete external-format file.
 
 For concrete compatibility checks, `crates/varve/examples/tdms_physical/common.rs`
-contains one TDMS-style layout declaration and shared adapter implementation.
-It writes a three-segment file with real `TDSm` lead-ins, TDMS object metadata,
+is a façade over split TDMS example modules. The physical adapter implementation
+lives in `tdms_physical/common/adapter.rs`, fixture/scenario data lives in
+`tdms_physical/common/example_data.rs`, and self-verification lives in
+`tdms_physical/common/verify.rs`. The example writes a three-segment file with
+real `TDSm` lead-ins, TDMS object metadata,
 mixed raw channel objects, a changed raw-data-index segment,
 `same-as-previous` raw-index reuse, bool/string/integer/float tagged
 properties, an adapter-owned `.vtidx` sidecar, and appended raw samples using

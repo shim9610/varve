@@ -301,8 +301,11 @@ the runtime layer that such a DSL would generate or call.
 - `crates/varve/tests/adapter_toolkit.rs` covers cursor/writer roundtrips,
   length prefixes, tagged values, chunk bounds, stateful reducers, sidecar
   identity, and physical tail report composition.
-- `crates/varve/examples/tdms_physical/common.rs` contains one TDMS-style layout
-  declaration and shared reader/writer adapter implementation using
+- `crates/varve/examples/tdms_physical/common.rs` is a thin façade over the
+  split TDMS example modules. The physical adapter implementation lives in
+  `tdms_physical/common/adapter.rs`, example fixture data lives in
+  `tdms_physical/common/example_data.rs`, and self-verification lives in
+  `tdms_physical/common/verify.rs`. The adapter implementation uses
   `BinaryCursor`, `BinaryWriter`, `TaggedValueCodec`, `ChunkIndexBuilder`, and
   `SegmentReducer`. The example writes a TDMS scalar type matrix across three
   segments, exercises a changed raw-data-index segment,
