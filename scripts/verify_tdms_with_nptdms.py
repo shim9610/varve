@@ -58,13 +58,52 @@ def main() -> int:
     assert tdms.properties["title"] == "Varve TDMS adapter proof smoke"
 
     group = tdms["Measured Data"]
-    channel = group["Amplitude"]
-    assert channel.properties["unit_string"] == "V"
-    assert math.isclose(channel.properties["wf_increment"], 0.001)
-    assert channel.properties["sample_count"] == 6
+    amplitude = group["Amplitude"]
+    assert amplitude.properties["unit_string"] == "V"
+    assert math.isclose(amplitude.properties["wf_increment"], 0.001)
+    assert amplitude.properties["adapter_enabled"] is True
+    assert amplitude.properties["sample_count"] == 8
+    assert amplitude.properties["segment_note"] == "same raw index reused"
 
-    values = [float(value) for value in channel[:]]
-    assert values == [0.10, 0.20, 0.30, 0.40, 0.50, 0.60]
+    phase = group["Phase"]
+    assert phase.properties["unit_string"] == "rad"
+    assert math.isclose(phase.properties["wf_increment"], 0.001)
+    assert phase.properties["sample_count"] == 8
+
+    amplitude_values = [float(value) for value in amplitude[:]]
+    assert amplitude_values == [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80]
+
+    phase_values = [float(value) for value in phase[:]]
+    assert phase_values == [1.00, 1.10, 1.20, 1.30, 1.40, 1.50, 1.60, 1.70]
+
+    subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-p",
+            "varve",
+            "--example",
+            "tdms_physical_adapter",
+            "--",
+            "inspect",
+            str(output),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-p",
+            "varve",
+            "--example",
+            "tdms_physical_adapter",
+            "--",
+            "read-bytes",
+            str(output),
+        ],
+        check=True,
+    )
 
     print(f"npTDMS verified {output}")
     return 0

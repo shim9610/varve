@@ -1,12 +1,14 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::fs::remove_file;
+use std::fs::{read, remove_file, write};
 use std::path::{Path, PathBuf};
 
 use varve::{
-    BinaryCursor, BinaryWriter, ChunkEntry, ChunkIndexBuilder, ChunkLayout, Endian, SegmentReducer,
-    TaggedValueCodec, reduce_segments_by_ref, varve_format,
+    AdapterCheckReport, AdapterCheckStatus, AdapterDiagnosticDomain, AdapterInputFile,
+    AdapterTailStatus, BinaryCursor, BinaryWriter, ChunkEntry, ChunkIndexBuilder, ChunkLayout,
+    Endian, SegmentReducer, SidecarIdentity, SidecarMode, SidecarPolicy, TaggedValueCodec,
+    reduce_segments_by_ref, varve_format,
 };
 
 const TDMS_VERSION: u32 = 4713;
@@ -20,6 +22,8 @@ const TDMS_RAW_INDEX_LEN: u32 = 20;
 const TDMS_TYPE_I64: u32 = 4;
 const TDMS_TYPE_DOUBLE_FLOAT: u32 = 10;
 const TDMS_TYPE_STRING: u32 = 0x20;
+const TDMS_TYPE_BOOLEAN: u32 = 0x21;
+const TDMS_INDEX_SIDECAR_MAGIC: &[u8; 4] = b"VTIX";
 
 varve_format! {
     pub format TdmsCompatFormat {
@@ -79,25 +83,87 @@ pub fn write_example(path: &Path) -> varve::Result<()> {
                     name: "wf_increment",
                     value: TdmsPropertyValue::F64(0.001),
                 },
+                TdmsProperty {
+                    name: "adapter_enabled",
+                    value: TdmsPropertyValue::Bool(true),
+                },
+            ],
+        },
+        TdmsObject {
+            path: "/'Measured Data'/'Phase'",
+            raw_data_index: RawDataIndex::New {
+                data_type: TDMS_TYPE_DOUBLE_FLOAT,
+                dimensions: 1,
+                values: 4,
+            },
+            properties: vec![
+                TdmsProperty {
+                    name: "unit_string",
+                    value: TdmsPropertyValue::String("rad".to_string()),
+                },
+                TdmsProperty {
+                    name: "wf_increment",
+                    value: TdmsPropertyValue::F64(0.001),
+                },
             ],
         },
     ])?;
-    let second_metadata = tdms_metadata(&[TdmsObject {
-        path: "/'Measured Data'/'Amplitude'",
-        raw_data_index: RawDataIndex::New {
-            data_type: TDMS_TYPE_DOUBLE_FLOAT,
-            dimensions: 1,
-            values: 2,
+    let second_metadata = tdms_metadata(&[
+        TdmsObject {
+            path: "/'Measured Data'/'Amplitude'",
+            raw_data_index: RawDataIndex::New {
+                data_type: TDMS_TYPE_DOUBLE_FLOAT,
+                dimensions: 1,
+                values: 2,
+            },
+            properties: vec![TdmsProperty {
+                name: "sample_count",
+                value: TdmsPropertyValue::I64(6),
+            }],
         },
-        properties: vec![TdmsProperty {
-            name: "sample_count",
-            value: TdmsPropertyValue::I64(6),
-        }],
-    }])?;
-    let first_raw = f64_bytes(&[0.10, 0.20, 0.30, 0.40])?;
-    let second_raw = f64_bytes(&[0.50, 0.60])?;
+        TdmsObject {
+            path: "/'Measured Data'/'Phase'",
+            raw_data_index: RawDataIndex::New {
+                data_type: TDMS_TYPE_DOUBLE_FLOAT,
+                dimensions: 1,
+                values: 2,
+            },
+            properties: vec![TdmsProperty {
+                name: "sample_count",
+                value: TdmsPropertyValue::I64(6),
+            }],
+        },
+    ])?;
+    let third_metadata = tdms_metadata(&[
+        TdmsObject {
+            path: "/'Measured Data'/'Amplitude'",
+            raw_data_index: RawDataIndex::SameAsPrevious,
+            properties: vec![
+                TdmsProperty {
+                    name: "sample_count",
+                    value: TdmsPropertyValue::I64(8),
+                },
+                TdmsProperty {
+                    name: "segment_note",
+                    value: TdmsPropertyValue::String("same raw index reused".to_string()),
+                },
+            ],
+        },
+        TdmsObject {
+            path: "/'Measured Data'/'Phase'",
+            raw_data_index: RawDataIndex::SameAsPrevious,
+            properties: vec![TdmsProperty {
+                name: "sample_count",
+                value: TdmsPropertyValue::I64(8),
+            }],
+        },
+    ])?;
+    let first_raw = f64_bytes(&[0.10, 0.20, 0.30, 0.40, 1.00, 1.10, 1.20, 1.30])?;
+    let second_raw = f64_bytes(&[0.50, 0.60, 1.40, 1.50])?;
+    let third_raw = f64_bytes(&[0.70, 0.80, 1.60, 1.70])?;
 
     let mut writer = TdmsCompatFormat::create_layout_writer(path)?;
+    let mut segment_count = 0u32;
     writer.write_tdms_segment(TdmsCompatFormatTdmsSegmentLayoutWrite {
         fields: TdmsCompatFormatTdmsSegmentLayoutFields {
             toc_mask: TDMS_TOC_METADATA | TDMS_TOC_NEW_OBJECT_LIST | TDMS_TOC_RAW_DATA,
@@ -107,6 +173,7 @@ pub fn write_example(path: &Path) -> varve::Result<()> {
         metadata: &first_metadata,
         raw: &first_raw,
     })?;
+    segment_count += 1;
     writer.write_tdms_segment(TdmsCompatFormatTdmsSegmentLayoutWrite {
         fields: TdmsCompatFormatTdmsSegmentLayoutFields {
             toc_mask: TDMS_TOC_METADATA | TDMS_TOC_RAW_DATA,
@@ -116,12 +183,32 @@ pub fn write_example(path: &Path) -> varve::Result<()> {
         metadata: &second_metadata,
         raw: &second_raw,
     })?;
+    segment_count += 1;
+    writer.write_tdms_segment(TdmsCompatFormatTdmsSegmentLayoutWrite {
+        fields: TdmsCompatFormatTdmsSegmentLayoutFields {
+            toc_mask: TDMS_TOC_METADATA | TDMS_TOC_RAW_DATA,
+            version: TDMS_VERSION,
+        },
+        footer_fields: TdmsCompatFormatTdmsSegmentLayoutFooterFields,
+        metadata: &third_metadata,
+        raw: &third_raw,
+    })?;
+    segment_count += 1;
     writer.flush()?;
+    write_index_sidecar(path, segment_count, 6)?;
     Ok(())
 }
 
 pub fn read_and_verify(path: &Path) -> varve::Result<()> {
-    let reader = TdmsCompatFormat::open_layout_reader(path)?;
+    let adapter_report = inspect_example(path)?;
+    if adapter_report.status() == AdapterCheckStatus::Failed {
+        return Err(varve::Error::AdapterDiagnostic(
+            "TDMS example adapter inspection failed",
+        ));
+    }
+
+    let input = AdapterInputFile::from_path(path);
+    let reader = TdmsCompatFormat::open_layout_reader(input.path())?;
     let segments = reader.tdms_segments()?;
     let mut reducer_input = Vec::new();
 
@@ -166,7 +253,7 @@ pub fn read_and_verify(path: &Path) -> varve::Result<()> {
             );
         }
         TdmsPropertyValue::String(title) if title == "Varve TDMS adapter proof smoke" => {
-            assert_eq!(chunk_index.entries().len(), 2);
+            assert_eq!(chunk_index.entries().len(), 6);
             assert_eq!(
                 report
                     .state
@@ -176,17 +263,119 @@ pub fn read_and_verify(path: &Path) -> varve::Result<()> {
             assert_eq!(
                 report
                     .state
+                    .property("/'Measured Data'/'Amplitude'", "adapter_enabled"),
+                TdmsPropertyValue::Bool(true)
+            );
+            assert_eq!(
+                report
+                    .state
                     .property("/'Measured Data'/'Amplitude'", "sample_count"),
-                TdmsPropertyValue::I64(6)
+                TdmsPropertyValue::I64(8)
+            );
+            assert_eq!(
+                report
+                    .state
+                    .property("/'Measured Data'/'Amplitude'", "segment_note"),
+                TdmsPropertyValue::String("same raw index reused".to_string())
+            );
+            assert_eq!(
+                report
+                    .state
+                    .property("/'Measured Data'/'Phase'", "unit_string"),
+                TdmsPropertyValue::String("rad".to_string())
+            );
+            assert_eq!(
+                report
+                    .state
+                    .property("/'Measured Data'/'Phase'", "sample_count"),
+                TdmsPropertyValue::I64(8)
             );
             assert_eq!(
                 report.state.samples("/'Measured Data'/'Amplitude'"),
-                vec![0.10, 0.20, 0.30, 0.40, 0.50, 0.60]
+                vec![0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80]
+            );
+            assert_eq!(
+                report.state.samples("/'Measured Data'/'Phase'"),
+                vec![1.00, 1.10, 1.20, 1.30, 1.40, 1.50, 1.60, 1.70]
             );
         }
         other => panic!("unexpected TDMS example title {other:?}"),
     }
     Ok(())
+}
+
+pub fn read_and_verify_bytes(bytes: &[u8]) -> varve::Result<()> {
+    let input = AdapterInputFile::from_bytes("tdms", bytes)?;
+    read_and_verify(input.path())
+}
+
+pub fn inspect_example(path: &Path) -> varve::Result<AdapterCheckReport> {
+    let input = AdapterInputFile::from_path(path);
+    let layout_report = TdmsCompatFormat::inspect_layout_file_report(input.path())?;
+    let mut report = AdapterCheckReport::from_layout_report(&layout_report);
+
+    if let Some(tail) = report.physical_tail.clone() {
+        let tail = AdapterTailStatus::new(
+            tail,
+            None,
+            Some("custom TDMS-style physical scan did not reach EOF".to_string()),
+        );
+        report.push(
+            AdapterCheckStatus::Warning,
+            AdapterDiagnosticDomain::PhysicalLayout,
+            format!(
+                "adapter tail evidence: {} bytes remain after offset {}",
+                tail.available_len, tail.tail.offset
+            ),
+        );
+    }
+
+    let expected = SidecarIdentity::from_main_file(input.path())?;
+    let sidecar_policy = tdms_sidecar_policy();
+    let sidecar_report = sidecar_policy.inspect(input.path(), Some(&expected))?;
+    if sidecar_report.present {
+        match read_index_sidecar(input.path()) {
+            Ok(sidecar) if sidecar.matches(&expected, layout_report.segments.len() as u32) => {
+                report.push(
+                    AdapterCheckStatus::Passed,
+                    AdapterDiagnosticDomain::Sidecar,
+                    format!(
+                        "TDMS example sidecar {} covers {} segments and {} chunks",
+                        sidecar_report.path.display(),
+                        sidecar.segment_count,
+                        sidecar.chunk_count
+                    ),
+                );
+            }
+            Ok(_) => report.push(
+                AdapterCheckStatus::Failed,
+                AdapterDiagnosticDomain::Sidecar,
+                format!(
+                    "TDMS example sidecar {} is stale for the main file",
+                    sidecar_report.path.display()
+                ),
+            ),
+            Err(error) => report.push(
+                AdapterCheckStatus::Failed,
+                AdapterDiagnosticDomain::Sidecar,
+                format!(
+                    "TDMS example sidecar {} could not be parsed: {error}",
+                    sidecar_report.path.display()
+                ),
+            ),
+        }
+    } else {
+        report.push(
+            sidecar_report.status,
+            AdapterDiagnosticDomain::Sidecar,
+            format!(
+                "optional TDMS example sidecar {} is not present",
+                sidecar_report.path.display()
+            ),
+        );
+    }
+
+    Ok(report)
 }
 
 #[derive(Clone, Debug)]
@@ -215,6 +404,7 @@ struct TdmsProperty {
 
 #[derive(Clone, Debug, PartialEq)]
 enum TdmsPropertyValue {
+    Bool(bool),
     I64(i64),
     F64(f64),
     String(String),
@@ -233,6 +423,7 @@ impl TaggedValueCodec for TdmsPropertyCodec {
             TDMS_TYPE_STRING => Ok(TdmsPropertyValue::String(
                 cursor.len_prefixed_string::<u32>()?,
             )),
+            TDMS_TYPE_BOOLEAN => Ok(TdmsPropertyValue::Bool(cursor.u8()? != 0)),
             other => Err(varve::Error::AdapterUnsupportedType {
                 type_id: u64::from(other),
             }),
@@ -241,6 +432,10 @@ impl TaggedValueCodec for TdmsPropertyCodec {
 
     fn encode(value: &Self::Value, writer: &mut BinaryWriter) -> varve::Result<Self::TypeId> {
         match value {
+            TdmsPropertyValue::Bool(value) => {
+                writer.u8(u8::from(*value))?;
+                Ok(TDMS_TYPE_BOOLEAN)
+            }
             TdmsPropertyValue::I64(value) => {
                 writer.i64(*value)?;
                 Ok(TDMS_TYPE_I64)
@@ -346,6 +541,70 @@ fn f64_bytes(values: &[f64]) -> varve::Result<Vec<u8>> {
     let mut writer = BinaryWriter::with_capacity(Endian::Little, values.len() * 8);
     writer.array_f64(values)?;
     Ok(writer.into_inner())
+}
+
+fn tdms_sidecar_policy() -> SidecarPolicy {
+    SidecarPolicy {
+        extension: "vtidx",
+        mode: SidecarMode::Optional,
+        verify_main_len: true,
+        verify_main_fingerprint: true,
+    }
+}
+
+fn write_index_sidecar(path: &Path, segment_count: u32, chunk_count: u32) -> varve::Result<()> {
+    let identity = SidecarIdentity::from_main_file(path)?;
+    let mut writer = BinaryWriter::new(Endian::Little);
+    writer.bytes(TDMS_INDEX_SIDECAR_MAGIC)?;
+    writer.u16(1)?;
+    writer.u16(0)?;
+    writer.u64(identity.main_len)?;
+    writer.u64(identity.main_fingerprint)?;
+    writer.u32(segment_count)?;
+    writer.u32(chunk_count)?;
+    write(tdms_sidecar_policy().sidecar_path(path), writer.as_slice())?;
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct TdmsIndexSidecar {
+    main_len: u64,
+    main_fingerprint: u64,
+    segment_count: u32,
+    chunk_count: u32,
+}
+
+impl TdmsIndexSidecar {
+    fn matches(&self, identity: &SidecarIdentity, segment_count: u32) -> bool {
+        self.main_len == identity.main_len
+            && self.main_fingerprint == identity.main_fingerprint
+            && self.segment_count == segment_count
+    }
+}
+
+fn read_index_sidecar(path: &Path) -> varve::Result<TdmsIndexSidecar> {
+    let bytes = read(tdms_sidecar_policy().sidecar_path(path))?;
+    let mut cursor = BinaryCursor::new(&bytes, Endian::Little);
+    if cursor.bytes(4)? != &TDMS_INDEX_SIDECAR_MAGIC[..] {
+        return Err(varve::Error::AdapterDiagnostic(
+            "TDMS example sidecar magic mismatch",
+        ));
+    }
+    let version = cursor.u16()?;
+    let _flags = cursor.u16()?;
+    if version != 1 {
+        return Err(varve::Error::AdapterInvalidLength {
+            value: u64::from(version),
+        });
+    }
+    let sidecar = TdmsIndexSidecar {
+        main_len: cursor.u64()?,
+        main_fingerprint: cursor.u64()?,
+        segment_count: cursor.u32()?,
+        chunk_count: cursor.u32()?,
+    };
+    cursor.finish()?;
+    Ok(sidecar)
 }
 
 #[derive(Clone, Debug)]
@@ -487,6 +746,10 @@ fn read_f64_values(bytes: &[u8], count: usize) -> varve::Result<Vec<f64>> {
 
 pub fn cleanup(path: &Path) {
     let _ = remove_file(path);
+    let _ = remove_file(tdms_sidecar_policy().sidecar_path(path));
+    let mut tdms_index = path.as_os_str().to_os_string();
+    tdms_index.push("_index");
+    let _ = remove_file(PathBuf::from(tdms_index));
     let mut lock = path.as_os_str().to_os_string();
     lock.push(".lock");
     let _ = remove_file(PathBuf::from(lock));

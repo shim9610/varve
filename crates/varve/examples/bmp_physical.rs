@@ -104,19 +104,25 @@ fn read_bmp(path: &Path) -> varve::Result<()> {
 
     let raw = reader.read_bitmap_image_raw(0)?;
     assert_eq!(raw.len() as u32, image.image_size()?);
+    let stride = bmp_row_stride(WIDTH);
+    let row_len = u64::from(WIDTH * 3);
     let mut chunks = ChunkIndexBuilder::new();
-    chunks.push(
-        ChunkEntry {
-            key: "pixels",
-            segment_index: 0,
-            byte_offset: 0,
-            byte_len: u64::from(image.image_size()?),
-            value_count: u64::from(WIDTH * HEIGHT),
-            layout: ChunkLayout::Contiguous,
-        },
-        image.as_layout_segment_info(),
-    )?;
-    assert_eq!(chunks.finish()?.entries().len(), 1);
+    for stored_y in 0..HEIGHT {
+        chunks.push(
+            ChunkEntry {
+                key: stored_y,
+                segment_index: 0,
+                byte_offset: u64::from(stored_y) * stride as u64,
+                byte_len: row_len,
+                value_count: u64::from(WIDTH),
+                layout: ChunkLayout::Strided { byte_stride: 3 },
+            },
+            image.as_layout_segment_info(),
+        )?;
+    }
+    let chunk_index = chunks.finish()?;
+    assert_eq!(chunk_index.entries().len(), HEIGHT as usize);
+    assert_eq!(chunk_index.entries_for(&0).count(), 1);
     assert_eq!(
         decode_bmp_pixels(WIDTH, HEIGHT, &raw)?,
         expected_pixels(),

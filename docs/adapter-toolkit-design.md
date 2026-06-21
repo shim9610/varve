@@ -260,7 +260,9 @@ A TDMS adapter could use the toolkit like this:
 - chunk index: channel paths mapped to raw byte ranges;
 - reducer: object metadata and same-as-previous raw indexes applied to TDMS
   state;
-- sidecar: optional `.tdms_index` grammar owned by the TDMS adapter;
+- sidecar: optional index grammar owned by the TDMS adapter; a full TDMS
+  adapter may choose `.tdms_index`, while the Varve example uses `.vtidx` to
+  avoid claiming TDMS index compatibility;
 - diagnostics: incomplete final segment reported from physical tail status plus
   adapter-computed channel expected/read lengths.
 
@@ -302,9 +304,12 @@ the runtime layer that such a DSL would generate or call.
 - `crates/varve/examples/tdms_physical/common.rs` contains one TDMS-style layout
   declaration and shared reader/writer adapter implementation using
   `BinaryCursor`, `BinaryWriter`, `TaggedValueCodec`, `ChunkIndexBuilder`, and
-  `SegmentReducer`.
+  `SegmentReducer`. The example writes two logical channels across three
+  segments, exercises TDMS-style `same-as-previous` raw indexes, bool/string/
+  integer/float tagged properties, an adapter-owned `.vtidx` sidecar, and
+  both path-backed and byte-backed adapter inputs.
 - `crates/varve/examples/bmp_physical.rs` uses `BinaryWriter`, `BinaryCursor`,
-  and `ChunkIndexBuilder` for the BMP proof.
+  and row-level `ChunkIndexBuilder` entries for the BMP proof.
 - Python harnesses verify the TDMS-style adapter against `npTDMS` and BMP
   against Pillow.
 - `crates/varve/tests/perf_smoke.rs` includes an ignored adapter-toolkit smoke

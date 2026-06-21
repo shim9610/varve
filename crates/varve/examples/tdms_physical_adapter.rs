@@ -1,4 +1,5 @@
 use std::env;
+use std::fs::read;
 use std::path::PathBuf;
 
 #[path = "tdms_physical/common.rs"]
@@ -10,11 +11,11 @@ fn main() -> varve::Result<()> {
     let command = args
         .next()
         .and_then(|value| value.into_string().ok())
-        .expect("usage: tdms_physical_adapter <write|read> <file.tdms>");
+        .expect("usage: tdms_physical_adapter <write|read|read-bytes|inspect> <file.tdms>");
     let path = args
         .next()
         .map(PathBuf::from)
-        .expect("usage: tdms_physical_adapter <write|read> <file.tdms>");
+        .expect("usage: tdms_physical_adapter <write|read|read-bytes|inspect> <file.tdms>");
 
     match command.as_str() {
         "write" => {
@@ -28,7 +29,25 @@ fn main() -> varve::Result<()> {
                 path.display()
             );
         }
-        _ => panic!("usage: tdms_physical_adapter <write|read> <file.tdms>"),
+        "read-bytes" => {
+            let bytes = read(&path)?;
+            common::read_and_verify_bytes(&bytes)?;
+            println!(
+                "Varve-based byte-backed adapter example parsed TDMS file {}",
+                path.display()
+            );
+        }
+        "inspect" => {
+            let report = common::inspect_example(&path)?;
+            println!("adapter inspection status: {:?}", report.status());
+            for diagnostic in report.diagnostics {
+                println!(
+                    "{:?} {:?}: {}",
+                    diagnostic.status, diagnostic.domain, diagnostic.message
+                );
+            }
+        }
+        _ => panic!("usage: tdms_physical_adapter <write|read|read-bytes|inspect> <file.tdms>"),
     }
     Ok(())
 }

@@ -41,10 +41,11 @@
 - `VARVE3` record footers carry commit/offset metadata when `CommitPolicy` or offset-chain `IndexPolicy` requires it.
 - `LayoutWriter` and `LayoutReader` provide the first non-native physical path
   for optional file header + repeated segments. The initial verified targets are
-  a TDMS-style external adapter proof with `TDSm` lead-in + TDMS metadata bytes
-  + contiguous raw channel bytes verified by `npTDMS`, 24-bit BMP headers and
-  pixel payloads verified by Pillow, and a generic framed layout with declared
-  file header and segment footer.
+  a TDMS-style external adapter proof with `TDSm` lead-in + TDMS metadata bytes,
+  `same-as-previous` raw-index reuse, sidecar inspection, byte-backed reads,
+  and contiguous raw channel bytes verified by `npTDMS`; 24-bit BMP headers and
+  row-indexed pixel payloads verified by Pillow; and a generic framed layout
+  with declared file header and segment footer.
 - Custom physical readers can dispatch multiple declared segment descriptors by
   leading literal lead-in prefixes, including a byte tag plus literal numeric
   kind fields.
@@ -133,13 +134,16 @@
 - It also covers custom physical layout append and open/scan so layout DSL
   changes expose obvious framing or scan regressions.
 - TDMS-style adapter feasibility is checked by optional Python harnesses: one
-  opens a Varve-authored example file with `npTDMS`, and the other generates a
-  two-channel `npTDMS` file and parses it through Varve-based example code.
+  opens a Varve-authored, two-channel, three-segment example file with
+  `npTDMS`, and the other generates a two-channel `npTDMS` file and parses it
+  through Varve-based example code. The harnesses also exercise adapter inspect
+  and byte-backed read paths.
   Varve does not ship these examples as a TDMS reader/writer feature; see
   `docs/nptdms-adapter-boundary.md`.
 - Non-TDMS physical-format compatibility is checked by a BMP/Pillow harness:
   Varve writes a 24-bit BMP that Pillow opens, then Pillow writes a BMP that
-  Varve validates and decodes through the generated layout reader.
+  Varve validates and decodes through the generated layout reader plus
+  row-level chunk-index entries.
 - The purpose is regression detection, especially accidental O(n^2) scans, excessive allocation, or unexpected slow open/merge/compact paths.
 - Performance smoke output is not a product guarantee before stabilization, but a large unexplained slowdown blocks integration.
 

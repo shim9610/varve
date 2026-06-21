@@ -90,6 +90,20 @@ def main() -> int:
         ],
         check=True,
     )
+    subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-p",
+            "varve",
+            "--example",
+            "tdms_physical_adapter",
+            "--",
+            "read-bytes",
+            str(output),
+        ],
+        check=True,
+    )
 
     print(f"Varve example parsed npTDMS multichannel file {output}")
     return 0

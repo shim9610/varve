@@ -215,10 +215,12 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   metadata/raw boundaries, whose ToC/version fields are visible through
   `LayoutSegmentInfo`, and whose raw `f64` channel bytes are contiguous.
 - The TDMS-style physical writer example is an external adapter proof, not a
-  Varve-provided TDMS feature. It produces a minimal two-segment file using
-  only Varve's generated layout APIs. The optional Python harness opens that
-  file with `npTDMS` and verifies file properties, group/channel lookup,
-  channel properties, and appended raw `f64` samples.
+  Varve-provided TDMS feature. It produces a three-segment, two-channel file
+  using Varve's generated layout APIs plus adapter toolkit helpers. The optional
+  Python harness opens that file with `npTDMS` and verifies file properties,
+  group/channel lookup, channel properties, `same-as-previous` raw-index reuse,
+  bool/string/integer/float tagged properties, sidecar inspection, byte-backed
+  reading, and appended raw `f64` samples.
 - The reverse TDMS-style harness generates a two-segment, two-channel TDMS file
   with Python `npTDMS`, then parses it through a Varve-based example adapter
   that uses the generated layout reader plus caller-owned TDMS metadata/raw
@@ -227,7 +229,8 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   API obligations and external TDMS adapter obligations.
 - The BMP/Pillow harness verifies a non-TDMS custom physical layout in both
   directions: Varve writes a 24-bit BMP opened by Pillow, and Pillow writes a
-  BMP whose header fields and pixel payload are decoded by Varve.
+  BMP whose header fields, row-level chunk index, and pixel payload are decoded
+  by Varve.
 - A custom physical layout with a declared file header and segment footer writes
   those bytes at the declared offsets, exposes `file_header_len` and validated
   file-header values, and excludes footer bytes from the segment raw-region

@@ -374,15 +374,17 @@ incomplete external-format file.
 
 For concrete compatibility checks, `crates/varve/examples/tdms_physical/common.rs`
 contains one TDMS-style layout declaration and shared adapter implementation.
-It writes a minimal two-segment file with real `TDSm` lead-ins, TDMS object
-metadata, a channel raw-data index, and appended contiguous `f64` samples using
-the generated physical-layout writer plus adapter toolkit helpers. The combined
-`tdms_physical_adapter` example exposes both `write` and `read` subcommands,
-and the older writer/reader examples are thin wrappers over the same shared
-declaration. The optional Python harness verifies adapter-authored files with
-`npTDMS`; the reverse harness creates a two-segment, two-channel TDMS file with
-`npTDMS`, then parses it through the same Varve-based adapter code. These
-examples are not a Varve-provided TDMS reader/writer feature:
+It writes a three-segment file with real `TDSm` lead-ins, TDMS object metadata,
+two logical channels, `same-as-previous` raw-index reuse, bool/string/integer/
+float tagged properties, an adapter-owned `.vtidx` sidecar, and appended
+contiguous `f64` samples using the generated physical-layout writer plus
+adapter toolkit helpers. The combined `tdms_physical_adapter` example exposes
+`write`, `read`, `read-bytes`, and `inspect` subcommands, and the older
+writer/reader examples are thin wrappers over the same shared declaration. The
+optional Python harness verifies adapter-authored files with `npTDMS`; the
+reverse harness creates a two-segment, two-channel TDMS file with `npTDMS`,
+then parses it through the same Varve-based adapter code. These examples are
+not a Varve-provided TDMS reader/writer feature:
 
 ```powershell
 python -m venv .venv-tdms
