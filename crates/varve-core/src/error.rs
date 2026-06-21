@@ -243,4 +243,28 @@ pub enum Error {
 
     #[error("invalid matrix layout")]
     InvalidMatrixLayout,
+
+    #[error("layout field {0} is missing")]
+    LayoutFieldMissing(&'static str),
+
+    #[error("layout field {0} was not expected")]
+    LayoutFieldUnexpected(String),
+
+    #[error("layout field {0} has the wrong value type")]
+    LayoutFieldTypeMismatch(&'static str),
+
+    #[error("layout literal mismatch for field {field} at offset {offset}")]
+    LayoutLiteralMismatch { field: &'static str, offset: u64 },
+
+    #[error("layout lead-in is truncated at offset {offset}")]
+    LayoutTruncatedLeadIn { offset: u64 },
+
+    #[error("layout file header is truncated at offset {offset}")]
+    LayoutTruncatedHeader { offset: u64 },
+
+    #[error("layout segment bounds are invalid at offset {offset}")]
+    LayoutInvalidSegmentBounds { offset: u64 },
+
+    #[error("layout segment {0} is not declared")]
+    LayoutSegmentMissing(String),
 }

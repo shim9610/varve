@@ -419,6 +419,9 @@ struct FormatInput {
     matrix_aux: Vec<MatrixAux>,
     registry_blocks: Vec<Type>,
     inline_blocks: Vec<InlineBlock>,
+    layout_preset: Option<LayoutPresetChoice>,
+    layout_file_header: Option<LayoutFileHeader>,
+    layout_segments: Vec<LayoutSegment>,
     typed_api: bool,
 }
 
@@ -522,6 +525,82 @@ enum CompressionHeaderChoice {
     FormatContract,
 }
 
+#[derive(Clone, Copy)]
+enum LayoutPresetChoice {
+    VarveNative,
+    None,
+    Custom,
+}
+
+struct LayoutFileHeader {
+    name: Ident,
+    fields: Vec<LayoutField>,
+}
+
+struct LayoutSegment {
+    name: Ident,
+    repeat: SegmentRepeatChoice,
+    lead_in: LayoutLeadIn,
+    metadata: Ident,
+    raw_region: Ident,
+    footer: Option<LayoutFooter>,
+}
+
+#[derive(Clone, Copy)]
+enum SegmentRepeatChoice {
+    Once,
+    UntilEof,
+}
+
+struct LayoutLeadIn {
+    name: Ident,
+    fields: Vec<LayoutField>,
+}
+
+struct LayoutFooter {
+    name: Ident,
+    fields: Vec<LayoutField>,
+}
+
+struct LayoutField {
+    name: Ident,
+    ty: LayoutFieldTypeChoice,
+    source: LayoutFieldSourceChoice,
+}
+
+enum LayoutFieldTypeChoice {
+    Bytes(u64),
+    U8,
+    U16,
+    U32,
+    U64,
+    I64,
+}
+
+enum LayoutFieldSourceChoice {
+    LiteralBytes(LitByteStr),
+    LiteralU64(u64),
+    LiteralI64(i64),
+    Caller,
+    Finalize(LayoutFinalizeChoice),
+}
+
+struct LayoutFinalizeChoice {
+    target: LayoutAnchorChoice,
+    relative_to: LayoutAnchorChoice,
+}
+
+#[derive(Clone, Copy)]
+enum LayoutAnchorChoice {
+    SegmentStart,
+    AfterLeadIn,
+    MetadataStart,
+    RawRegionStart,
+    SegmentEnd,
+    FooterStart,
+    FooterEnd,
+}
+
 enum InlineBlockKind {
     Fixed,
     Variable,
@@ -602,6 +681,9 @@ impl Parse for FormatInput {
         let mut matrix_aux: Option<Vec<MatrixAux>> = None;
         let mut registry_blocks: Option<Vec<Type>> = None;
         let mut inline_blocks: Option<Vec<InlineBlock>> = None;
+        let mut layout_preset = None;
+        let mut layout_file_header = None;
+        let mut layout_segments: Option<Vec<LayoutSegment>> = None;
 
         while !content.is_empty() {
             let key: Ident = content.parse()?;
@@ -627,6 +709,17 @@ impl Parse for FormatInput {
                 let inner;
                 braced!(inner in content);
                 inline_blocks = Some(parse_inline_blocks(&inner)?);
+                if content.peek(Token![;]) {
+                    content.parse::<Token![;]>()?;
+                }
+                continue;
+            }
+            if key == "layout" && content.peek(syn::token::Brace) {
+                let inner;
+                braced!(inner in content);
+                let layout = parse_layout(&inner)?;
+                layout_file_header = layout.file_header;
+                layout_segments = Some(layout.segments);
                 if content.peek(Token![;]) {
                     content.parse::<Token![;]>()?;
                 }
@@ -697,6 +790,19 @@ impl Parse for FormatInput {
                 };
             } else if key == "compression" {
                 compression = parse_compression_choice(&content)?;
+            } else if key == "preset" {
+                let value: Ident = content.parse()?;
+                layout_preset = Some(match value.to_string().as_str() {
+                    "varve_native" => LayoutPresetChoice::VarveNative,
+                    "none" => LayoutPresetChoice::None,
+                    "custom" => LayoutPresetChoice::Custom,
+                    _ => {
+                        return Err(syn::Error::new_spanned(
+                            value,
+                            "expected varve_native, none, or custom",
+                        ));
+                    }
+                });
             } else if key == "blocks" {
                 let inner;
                 bracketed!(inner in content);
@@ -712,6 +818,11 @@ impl Parse for FormatInput {
                     key,
                     "expected aux { name: byte_len, ... }",
                 ));
+            } else if key == "layout" {
+                return Err(syn::Error::new_spanned(
+                    key,
+                    "expected layout { file_header ... segment ... }",
+                ));
             } else {
                 return Err(syn::Error::new_spanned(key, "unsupported varve_format key"));
             }
@@ -722,7 +833,8 @@ impl Parse for FormatInput {
         let matrix_aux = matrix_aux.unwrap_or_default();
         let registry_blocks = registry_blocks.unwrap_or_default();
         let inline_blocks = inline_blocks.unwrap_or_default();
-        if typed_api && inline_blocks.is_empty() {
+        let layout_segments = layout_segments.unwrap_or_default();
+        if typed_api && inline_blocks.is_empty() && layout_segments.is_empty() {
             return Err(content.error("format syntax requires inline blocks"));
         }
         if !typed_api && registry_blocks.is_empty() {
@@ -749,6 +861,9 @@ impl Parse for FormatInput {
             matrix_aux,
             registry_blocks,
             inline_blocks,
+            layout_preset,
+            layout_file_header,
+            layout_segments,
             typed_api,
         })
     }
@@ -840,6 +955,226 @@ fn parse_commit_choice(input: ParseStream<'_>) -> Result<ParsedCommitChoice> {
             "expected none, record_footer, transaction_marker(...), or cell_bitmap { ... }",
         )),
     }
+}
+
+struct LayoutDecl {
+    file_header: Option<LayoutFileHeader>,
+    segments: Vec<LayoutSegment>,
+}
+
+fn parse_layout(input: ParseStream<'_>) -> Result<LayoutDecl> {
+    let mut file_header = None;
+    let mut segments = Vec::new();
+    while !input.is_empty() {
+        let keyword: Ident = input.parse()?;
+        match keyword.to_string().as_str() {
+            "file_header" => {
+                if file_header.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        keyword,
+                        "layout can declare at most one file_header",
+                    ));
+                }
+                let name: Ident = input.parse()?;
+                let inner;
+                braced!(inner in input);
+                file_header = Some(LayoutFileHeader {
+                    name,
+                    fields: parse_layout_fields(&inner)?,
+                });
+            }
+            "segment" => {
+                let name: Ident = input.parse()?;
+                let mut repeat = SegmentRepeatChoice::Once;
+                if input.peek(Ident) {
+                    let repeat_keyword: Ident = input.parse()?;
+                    if repeat_keyword != "repeat" {
+                        return Err(syn::Error::new_spanned(repeat_keyword, "expected repeat"));
+                    }
+                    let repeat_value: Ident = input.parse()?;
+                    repeat = match repeat_value.to_string().as_str() {
+                        "once" => SegmentRepeatChoice::Once,
+                        "until_eof" => SegmentRepeatChoice::UntilEof,
+                        _ => {
+                            return Err(syn::Error::new_spanned(
+                                repeat_value,
+                                "expected once or until_eof",
+                            ));
+                        }
+                    };
+                }
+                let inner;
+                braced!(inner in input);
+                segments.push(parse_layout_segment_body(name, repeat, &inner)?);
+            }
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    keyword,
+                    "expected file_header or segment",
+                ));
+            }
+        }
+        if input.peek(Token![;]) {
+            input.parse::<Token![;]>()?;
+        }
+    }
+    Ok(LayoutDecl {
+        file_header,
+        segments,
+    })
+}
+
+fn parse_layout_segment_body(
+    name: Ident,
+    repeat: SegmentRepeatChoice,
+    input: ParseStream<'_>,
+) -> Result<LayoutSegment> {
+    let mut lead_in = None;
+    let mut metadata = None;
+    let mut raw_region = None;
+    let mut footer = None;
+    while !input.is_empty() {
+        let keyword: Ident = input.parse()?;
+        match keyword.to_string().as_str() {
+            "lead_in" => {
+                let lead_name: Ident = input.parse()?;
+                let inner;
+                braced!(inner in input);
+                lead_in = Some(LayoutLeadIn {
+                    name: lead_name,
+                    fields: parse_layout_fields(&inner)?,
+                });
+            }
+            "metadata" => {
+                metadata = Some(input.parse()?);
+                input.parse::<Token![;]>()?;
+            }
+            "raw_region" => {
+                raw_region = Some(input.parse()?);
+                input.parse::<Token![;]>()?;
+            }
+            "footer" => {
+                let footer_name: Ident = input.parse()?;
+                let inner;
+                braced!(inner in input);
+                footer = Some(LayoutFooter {
+                    name: footer_name,
+                    fields: parse_layout_fields(&inner)?,
+                });
+            }
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    keyword,
+                    "expected lead_in, metadata, raw_region, or footer",
+                ));
+            }
+        }
+    }
+    Ok(LayoutSegment {
+        name,
+        repeat,
+        lead_in: lead_in.ok_or_else(|| input.error("layout segment requires lead_in"))?,
+        metadata: metadata.ok_or_else(|| input.error("layout segment requires metadata"))?,
+        raw_region: raw_region.ok_or_else(|| input.error("layout segment requires raw_region"))?,
+        footer,
+    })
+}
+
+fn parse_layout_fields(input: ParseStream<'_>) -> Result<Vec<LayoutField>> {
+    let mut fields = Vec::new();
+    while !input.is_empty() {
+        let ty_ident: Ident = input.parse()?;
+        let name: Ident = input.parse()?;
+        let mut source = LayoutFieldSourceChoice::Caller;
+        let ty = match ty_ident.to_string().as_str() {
+            "bytes" => {
+                input.parse::<Token![=]>()?;
+                let bytes: LitByteStr = input.parse()?;
+                let len = bytes.value().len() as u64;
+                source = LayoutFieldSourceChoice::LiteralBytes(bytes);
+                LayoutFieldTypeChoice::Bytes(len)
+            }
+            "u8" => LayoutFieldTypeChoice::U8,
+            "u16" => LayoutFieldTypeChoice::U16,
+            "u32" => LayoutFieldTypeChoice::U32,
+            "u64" => LayoutFieldTypeChoice::U64,
+            "i64" => LayoutFieldTypeChoice::I64,
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    ty_ident,
+                    "expected bytes, u8, u16, u32, u64, or i64",
+                ));
+            }
+        };
+        if !matches!(ty, LayoutFieldTypeChoice::Bytes(_)) && input.peek(Token![=]) {
+            input.parse::<Token![=]>()?;
+            if input.peek(Ident) {
+                source = LayoutFieldSourceChoice::Finalize(parse_layout_finalize(input)?);
+            } else {
+                let value: LitInt = input.parse()?;
+                source = match ty {
+                    LayoutFieldTypeChoice::I64 => {
+                        LayoutFieldSourceChoice::LiteralI64(value.base10_parse::<i64>()?)
+                    }
+                    _ => LayoutFieldSourceChoice::LiteralU64(value.base10_parse::<u64>()?),
+                };
+            }
+        }
+        input.parse::<Token![;]>()?;
+        fields.push(LayoutField { name, ty, source });
+    }
+    Ok(fields)
+}
+
+fn parse_layout_finalize(input: ParseStream<'_>) -> Result<LayoutFinalizeChoice> {
+    let function: Ident = input.parse()?;
+    if function != "finalize" {
+        return Err(syn::Error::new_spanned(function, "expected finalize"));
+    }
+    let args;
+    parenthesized!(args in input);
+    let mut target = None;
+    let mut relative_to = None;
+    while !args.is_empty() {
+        let key: Ident = args.parse()?;
+        args.parse::<Token![=]>()?;
+        let value: Ident = args.parse()?;
+        match key.to_string().as_str() {
+            "target" => target = Some(parse_layout_anchor(value)?),
+            "relative_to" => relative_to = Some(parse_layout_anchor(value)?),
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    key,
+                    "expected target or relative_to",
+                ));
+            }
+        }
+        if args.peek(Token![,]) {
+            args.parse::<Token![,]>()?;
+        }
+    }
+    Ok(LayoutFinalizeChoice {
+        target: target.ok_or_else(|| args.error("finalize requires target"))?,
+        relative_to: relative_to.ok_or_else(|| args.error("finalize requires relative_to"))?,
+    })
+}
+
+fn parse_layout_anchor(value: Ident) -> Result<LayoutAnchorChoice> {
+    Ok(match value.to_string().as_str() {
+        "segment_start" => LayoutAnchorChoice::SegmentStart,
+        "after_lead_in" => LayoutAnchorChoice::AfterLeadIn,
+        "metadata_start" => LayoutAnchorChoice::MetadataStart,
+        "raw_region_start" => LayoutAnchorChoice::RawRegionStart,
+        "segment_end" => LayoutAnchorChoice::SegmentEnd,
+        "footer_start" => LayoutAnchorChoice::FooterStart,
+        "footer_end" => LayoutAnchorChoice::FooterEnd,
+        _ => {
+            return Err(syn::Error::new_spanned(
+                value,
+                "expected a known layout anchor",
+            ));
+        }
+    })
 }
 
 fn parse_matrix_dims(input: ParseStream<'_>) -> Result<Vec<MatrixDim>> {
@@ -1432,6 +1767,11 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     let dims = input.dims;
     let matrix_commit = input.matrix_commit;
     let matrix_aux = input.matrix_aux;
+    let layout = layout_tokens(
+        input.layout_preset,
+        input.layout_file_header.as_ref(),
+        &input.layout_segments,
+    );
     let registry_blocks = input.registry_blocks;
     let inline_blocks = input.inline_blocks;
     let inline_block_defs = inline_blocks
@@ -1555,6 +1895,7 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 .with_commit_policy(#commit)
                 .with_compression_policy(#compression)
                 #matrix_spec_step
+                .with_layout(#layout)
                 #schema_hash_step
             }
 
@@ -1564,6 +1905,17 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
 
             pub fn create_writer<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<#writer_return> {
                 #create_writer_body
+            }
+
+            pub fn create_layout_writer<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::LayoutWriter> {
+                Self::spec().create_layout_writer(path)
+            }
+
+            pub fn create_layout_writer_with_header<P: AsRef<::std::path::Path>>(
+                path: P,
+                fields: &[::varve::__core::LayoutFieldValue],
+            ) -> ::varve::__core::Result<::varve::__core::LayoutWriter> {
+                Self::spec().create_layout_writer_with_header(path, fields)
             }
 
             #create_writer_with_dims_method
@@ -1582,6 +1934,10 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
 
             pub fn open_reader<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<#reader_return> {
                 #open_reader_body
+            }
+
+            pub fn open_layout_reader<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::LayoutReader> {
+                Self::spec().open_layout_reader(path)
             }
 
             pub fn open_recover<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::VarveFile> {
@@ -1623,6 +1979,238 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
 
         #(#duplicate_asserts)*
         #typed_api
+    }
+}
+
+fn layout_tokens(
+    preset: Option<LayoutPresetChoice>,
+    file_header: Option<&LayoutFileHeader>,
+    segments: &[LayoutSegment],
+) -> TokenStream2 {
+    let has_parts = file_header.is_some() || !segments.is_empty();
+    let preset = preset.unwrap_or(if !has_parts {
+        LayoutPresetChoice::VarveNative
+    } else {
+        LayoutPresetChoice::Custom
+    });
+    let preset_tokens = layout_preset_tokens(preset);
+    if !has_parts {
+        return match preset {
+            LayoutPresetChoice::VarveNative => quote!(::varve::__core::LayoutSpec::varve_native()),
+            LayoutPresetChoice::None => quote!(::varve::__core::LayoutSpec::none()),
+            LayoutPresetChoice::Custom => {
+                quote!(::varve::__core::LayoutSpec::custom(&[]))
+            }
+        };
+    }
+
+    let header_fields_const = format_ident!("__VARVE_LAYOUT_FILE_HEADER_FIELDS");
+    let header_field_const = file_header
+        .map(|header| {
+            let fields = header.fields.iter().map(layout_field_tokens);
+            quote! {
+                const #header_fields_const: &[::varve::__core::LayoutFieldDescriptor] = &[
+                    #(#fields,)*
+                ];
+            }
+        })
+        .unwrap_or_else(|| quote!());
+    let header_part = file_header
+        .map(|header| {
+            let name = &header.name;
+            quote! {
+                ::varve::__core::LayoutPartDescriptor {
+                    name: stringify!(#name),
+                    kind: ::varve::__core::LayoutPartKind::FileHeader(
+                        ::varve::__core::FileHeaderDescriptor {
+                            name: stringify!(#name),
+                            fields: #header_fields_const,
+                        }
+                    ),
+                },
+            }
+        })
+        .unwrap_or_else(|| quote!());
+
+    let lead_field_const_names: Vec<_> = (0..segments.len())
+        .map(|index| format_ident!("__VARVE_LAYOUT_LEAD_IN_FIELDS_{index}"))
+        .collect();
+    let footer_field_const_names: Vec<_> = (0..segments.len())
+        .map(|index| format_ident!("__VARVE_LAYOUT_FOOTER_FIELDS_{index}"))
+        .collect();
+    let lead_field_consts =
+        segments
+            .iter()
+            .zip(lead_field_const_names.iter())
+            .map(|(segment, const_name)| {
+                let fields = segment.lead_in.fields.iter().map(layout_field_tokens);
+                quote! {
+                    const #const_name: &[::varve::__core::LayoutFieldDescriptor] = &[
+                        #(#fields,)*
+                    ];
+                }
+            });
+    let footer_field_consts = segments
+        .iter()
+        .zip(footer_field_const_names.iter())
+        .filter_map(|(segment, const_name)| {
+            segment.footer.as_ref().map(|footer| {
+                let fields = footer.fields.iter().map(layout_field_tokens);
+                quote! {
+                    const #const_name: &[::varve::__core::LayoutFieldDescriptor] = &[
+                        #(#fields,)*
+                    ];
+                }
+            })
+        });
+    let parts = segments
+        .iter()
+        .zip(lead_field_const_names.iter())
+        .zip(footer_field_const_names.iter())
+        .map(|((segment, fields), footer_fields)| {
+            let name = &segment.name;
+            let repeat = segment_repeat_tokens(segment.repeat);
+            let lead_in = &segment.lead_in.name;
+            let metadata = &segment.metadata;
+            let raw_region = &segment.raw_region;
+            let footer = segment
+                .footer
+                .as_ref()
+                .map(|footer| {
+                    let footer_name = &footer.name;
+                    quote! {
+                        Some(::varve::__core::FooterDescriptor {
+                            name: stringify!(#footer_name),
+                            fields: #footer_fields,
+                        })
+                    }
+                })
+                .unwrap_or_else(|| quote!(None));
+            quote! {
+                ::varve::__core::LayoutPartDescriptor {
+                    name: stringify!(#name),
+                    kind: ::varve::__core::LayoutPartKind::Segment(
+                        ::varve::__core::SegmentDescriptor {
+                            name: stringify!(#name),
+                            repeat: #repeat,
+                            lead_in: ::varve::__core::LeadInDescriptor {
+                                name: stringify!(#lead_in),
+                                fields: #fields,
+                            },
+                            metadata: ::varve::__core::MetadataDescriptor {
+                                name: stringify!(#metadata),
+                                source: ::varve::__core::LayoutBytesSource::Caller,
+                            },
+                            raw_region: ::varve::__core::RawRegionDescriptor {
+                                name: stringify!(#raw_region),
+                                source: ::varve::__core::LayoutBytesSource::Caller,
+                            },
+                            footer: #footer,
+                        }
+                    ),
+                }
+            }
+        });
+
+    quote! {
+        {
+            #header_field_const
+            #(#lead_field_consts)*
+            #(#footer_field_consts)*
+            const __VARVE_LAYOUT_PARTS: &[::varve::__core::LayoutPartDescriptor] = &[
+                #header_part
+                #(#parts,)*
+            ];
+            ::varve::__core::LayoutSpec {
+                preset: #preset_tokens,
+                parts: __VARVE_LAYOUT_PARTS,
+            }
+        }
+    }
+}
+
+fn layout_field_tokens(field: &LayoutField) -> TokenStream2 {
+    let name = &field.name;
+    let ty = layout_field_type_tokens(&field.ty);
+    let source = layout_field_source_tokens(&field.source);
+    quote! {
+        ::varve::__core::LayoutFieldDescriptor {
+            name: stringify!(#name),
+            ty: #ty,
+            source: #source,
+            endian: None,
+        }
+    }
+}
+
+fn layout_preset_tokens(preset: LayoutPresetChoice) -> TokenStream2 {
+    match preset {
+        LayoutPresetChoice::VarveNative => quote!(::varve::__core::LayoutPreset::VarveNative),
+        LayoutPresetChoice::None => quote!(::varve::__core::LayoutPreset::None),
+        LayoutPresetChoice::Custom => quote!(::varve::__core::LayoutPreset::Custom),
+    }
+}
+
+fn segment_repeat_tokens(repeat: SegmentRepeatChoice) -> TokenStream2 {
+    match repeat {
+        SegmentRepeatChoice::Once => quote!(::varve::__core::SegmentRepeat::Once),
+        SegmentRepeatChoice::UntilEof => quote!(::varve::__core::SegmentRepeat::UntilEof),
+    }
+}
+
+fn layout_field_type_tokens(ty: &LayoutFieldTypeChoice) -> TokenStream2 {
+    match ty {
+        LayoutFieldTypeChoice::Bytes(len) => {
+            quote!(::varve::__core::LayoutFieldType::Bytes { len: #len })
+        }
+        LayoutFieldTypeChoice::U8 => quote!(::varve::__core::LayoutFieldType::U8),
+        LayoutFieldTypeChoice::U16 => quote!(::varve::__core::LayoutFieldType::U16),
+        LayoutFieldTypeChoice::U32 => quote!(::varve::__core::LayoutFieldType::U32),
+        LayoutFieldTypeChoice::U64 => quote!(::varve::__core::LayoutFieldType::U64),
+        LayoutFieldTypeChoice::I64 => quote!(::varve::__core::LayoutFieldType::I64),
+    }
+}
+
+fn layout_field_source_tokens(source: &LayoutFieldSourceChoice) -> TokenStream2 {
+    match source {
+        LayoutFieldSourceChoice::LiteralBytes(bytes) => {
+            quote!(::varve::__core::LayoutFieldSource::LiteralBytes(#bytes))
+        }
+        LayoutFieldSourceChoice::LiteralU64(value) => {
+            quote!(::varve::__core::LayoutFieldSource::LiteralU64(#value))
+        }
+        LayoutFieldSourceChoice::LiteralI64(value) => {
+            quote!(::varve::__core::LayoutFieldSource::LiteralI64(#value))
+        }
+        LayoutFieldSourceChoice::Caller => {
+            quote!(::varve::__core::LayoutFieldSource::Caller)
+        }
+        LayoutFieldSourceChoice::Finalize(finalize) => {
+            let target = layout_anchor_tokens(finalize.target);
+            let relative_to = layout_anchor_tokens(finalize.relative_to);
+            quote! {
+                ::varve::__core::LayoutFieldSource::Finalize(
+                    ::varve::__core::LayoutFinalize {
+                        target: #target,
+                        relative_to: #relative_to,
+                    }
+                )
+            }
+        }
+    }
+}
+
+fn layout_anchor_tokens(anchor: LayoutAnchorChoice) -> TokenStream2 {
+    match anchor {
+        LayoutAnchorChoice::SegmentStart => quote!(::varve::__core::LayoutAnchor::SegmentStart),
+        LayoutAnchorChoice::AfterLeadIn => quote!(::varve::__core::LayoutAnchor::AfterLeadIn),
+        LayoutAnchorChoice::MetadataStart => quote!(::varve::__core::LayoutAnchor::MetadataStart),
+        LayoutAnchorChoice::RawRegionStart => {
+            quote!(::varve::__core::LayoutAnchor::RawRegionStart)
+        }
+        LayoutAnchorChoice::SegmentEnd => quote!(::varve::__core::LayoutAnchor::SegmentEnd),
+        LayoutAnchorChoice::FooterStart => quote!(::varve::__core::LayoutAnchor::FooterStart),
+        LayoutAnchorChoice::FooterEnd => quote!(::varve::__core::LayoutAnchor::FooterEnd),
     }
 }
 

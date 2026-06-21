@@ -735,6 +735,10 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::MatrixNumericOutOfBounds { .. }
         | Error::MatrixNotCommitted
         | Error::MatrixCellNotWritten
+        | Error::LayoutFieldMissing(_)
+        | Error::LayoutFieldUnexpected(_)
+        | Error::LayoutFieldTypeMismatch(_)
+        | Error::LayoutSegmentMissing(_)
         | Error::ZeroCopyBlockKindMismatch { .. }
         | Error::ZeroCopyEndianMismatch { .. }
         | Error::ZeroCopyPayloadSizeMismatch { .. }
@@ -777,7 +781,11 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::MatrixSidecarMismatch(_)
         | Error::MatrixSidecarChecksumMismatch { .. }
         | Error::MatrixChecksumMismatch { .. }
-        | Error::InvalidMatrixLayout => DiagnosticDomain::FileData,
+        | Error::InvalidMatrixLayout
+        | Error::LayoutLiteralMismatch { .. }
+        | Error::LayoutTruncatedLeadIn { .. }
+        | Error::LayoutTruncatedHeader { .. }
+        | Error::LayoutInvalidSegmentBounds { .. } => DiagnosticDomain::FileData,
 
         Error::WriterLockBreakRefused(_) => DiagnosticDomain::CallerUsage,
         Error::MatrixLayoutMissing => DiagnosticDomain::LibraryInvariant,

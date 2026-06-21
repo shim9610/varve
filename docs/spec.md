@@ -12,6 +12,20 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 
 ## Wire Contract
 
+- `LayoutSpec` is the physical layout layer. If no layout is declared,
+  `LayoutPreset::VarveNative` is used and the existing Varve header/record
+  bytes remain unchanged.
+- `LayoutPreset::None` lets a declared layout own byte zero. This is the first
+  custom physical-layout path and is intended for append segment formats whose
+  lead-in is not `VARVE1/2/3`, such as TDMS-style `TDSm` segments.
+- Non-native layout descriptors can declare a file header, segment lead-in
+  fields, metadata regions, raw regions, footer descriptors, field constants,
+  caller-supplied fields, and finalized/backpatched offset fields.
+- The first runtime slice supports one optional file header followed by repeated
+  segments with lead-in + caller metadata bytes + contiguous raw bytes +
+  optional footer. The writer backpatches finalized offsets after the segment is
+  written, and the reader validates literals, finalized offsets, forward
+  progress, footer bounds, and region bounds.
 - File header includes user magic, Varve container marker, format version, endian, flags byte, and schema hash.
 - Record header includes block id, block version, flags, sequence, payload length, checksum, and reserved bytes.
 - The final record header word is `uncompressed_len_hint` for compressed records and `0` otherwise. `payload length` is always the physical stored byte length.
@@ -61,6 +75,14 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 
 - Writer model is single-writer per file, enforced with a sidecar lock file.
 - Reader model is snapshot-on-open; live tailing is out of scope for v0.1.
+- `FormatSpec::create_layout_writer`,
+  `FormatSpec::create_layout_writer_with_header`, and
+  `FormatSpec::open_layout_reader` are the custom physical-layout entry points.
+  They do not write or expect the Varve-native container header.
+- Custom layout files use `LayoutWriter::write_segment` with
+  `SegmentWrite { fields, footer_fields, metadata, raw }`; incomplete
+  backpatch windows are treated as corrupt physical data by strict open in the
+  first slice.
 - Durability is explicit: writes are buffered until `flush`, and durable fsync is exposed as `sync`.
 - `RecoveryPolicy::Strict` rejects incomplete tails.
 - `RecoveryPolicy::TruncateTail` truncates incomplete record header/payload tails and returns a recovery report through `open_recover_with_report`.
@@ -103,6 +125,14 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - `varve_format!` supports the legacy registry form `pub struct Format { blocks: [A, B]; }` and the format-first form `pub format Format { blocks { fixed A(...) { ... } } }`.
 - In format-first form, block structs, `VarveBlock` implementations, typed reader/writer wrappers, and typed read/write traits are generated from the format declaration.
 - `varve_format!` supports `magic`, `version`, `endian`, optional `schema_hash`, optional `commit`, optional `integrity`, optional `index`, optional `recovery`, optional `manifest`, and `blocks`.
+- `varve_format!` supports `preset: varve_native|none|custom;`. Omitted preset
+  means `varve_native` unless a custom layout is declared.
+- `varve_format!` supports the first custom layout grammar:
+  `layout { file_header Header { bytes sig = b"..."; } segment Name repeat
+  until_eof { lead_in Name { bytes tag = b"..."; u32 caller_field; i64 offset =
+  finalize(target = segment_end, relative_to = after_lead_in); } metadata Name;
+  raw_region Name; footer Footer { bytes seal = b"..."; u64 len =
+  finalize(target = segment_end, relative_to = segment_start); } } }`.
 - `schema_hash: computed;` asks the macro to call `with_computed_schema_hash()` after policies are attached.
 - `index` accepts either a single legacy identifier or a list such as `[scan_on_open, checkpoint_on_flush, block_offset_chain, keyed_offset_chain]`.
 - `commit` accepts `none`, `record_footer`, or `transaction_marker(on_flush|explicit)`.
@@ -113,6 +143,9 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - `#[varve(default)]` is variable-block-only. Fixed blocks are positional canonical payloads and cannot omit fields.
 - `key = "..."` must contain one or more valid Rust identifiers separated by commas. Empty key strings, empty segments, duplicates, and missing fields are compile errors.
 - `FormatSpec::computed_schema_hash()` computes a deterministic schema fingerprint from format version, endian, policies, block descriptors, and field descriptors. It intentionally excludes the pinned header `schema_hash` value.
+- Custom layout descriptors participate in `computed_schema_hash()`. The
+  default `LayoutPreset::VarveNative` with no custom parts is intentionally not
+  hashed so existing native format hashes and bytes remain stable.
 - `FormatSpec::schema_debug_dump()` emits a human-readable registered schema view for diagnostics.
 - `FormatSpec::diagnostics()`, `FormatSpec::diagnose_file(path)`, and
   `FormatSpec::self_test(path)` provide user-facing sanity checks that classify
@@ -130,6 +163,17 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Strict recovery rejects corrupt tails; recover mode truncates incomplete tails.
 - CRC integrity detects tampering when feature-enabled.
 - Variable-block compression roundtrips under record-explicit, file-explicit, and format-contract metadata modes.
+- Explicit `preset: varve_native` produces byte-identical output to the omitted
+  preset for the same native format declaration.
+- A TDMS-style custom layout can write files whose first bytes are `TDSm`, whose
+  `next_segment_offset` and `raw_data_offset` fields are backpatched to actual
+  metadata/raw boundaries, and whose raw `f64` channel bytes are contiguous.
+- A custom physical layout with a declared file header and segment footer writes
+  those bytes at the declared offsets, exposes `file_header_len`, and excludes
+  footer bytes from the segment raw-region read.
+- Custom layout readers reject bad literal tags, truncated lead-ins, invalid
+  file headers, invalid offset ordering, footer mismatches, and segment bounds
+  beyond EOF.
 - Block-specific record-explicit compression can compress one registered variable block while leaving other blocks uncompressed when the global policy is `None`.
 - Compressed checkpoint entries and rewrite replacement preserve `uncompressed_len_hint`.
 - `compression-zstd` disabled builds report `CompressionFeatureDisabled` when actual compression is attempted.
@@ -143,8 +187,8 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Performance smoke tests are run during major implementation phases to catch accidental O(n^2) scans, excessive allocations, and slow open/merge paths.
 - Benchmarks and smoke checks track encode, decode, append, open/scan,
   checkpoint open, materialized keyed state, merge/compact, direct base+delta
-  compact, recovery, mmap payload windows, matrix mmap windows, and zero-copy
-  read paths.
+  compact, custom physical layout append/open-scan, recovery, mmap payload
+  windows, matrix mmap windows, and zero-copy read paths.
 - Compression checks track compressed append/read, physical scan behavior, checkpoint reuse, rewrite, file size, and backend-disabled failure paths.
 - Dependency license audit reports only commercially usable permissive choices.
 
@@ -156,6 +200,8 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - The baseline dataset should include at least small, medium, and large record counts so regressions are visible before real-world scale.
 - The first benchmark suite should measure wall time, records per second, file size, and approximate allocation-sensitive behavior where practical.
 - Any implementation that changes indexing, scanning, merge, codec, compression, recovery, mmap, or zero-copy behavior must document the expected complexity and include a regression-oriented performance check.
+- Any implementation that changes custom physical layout framing or scanning
+  must include the layout append/open-scan smoke path.
 - Direct base+delta compact is measured separately from merge-then-compact so unnecessary intermediate file costs are visible.
 - A performance result is not a hard product guarantee during pre-stable versions, but a large unexplained slowdown is a blocking implementation finding.
 

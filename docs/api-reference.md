@@ -159,6 +159,71 @@ Lower-level matrix calls use `MatrixKey { scan, ch }`. Generated format-first
 wrappers expose block-specific key structs such as `CellKey { scan, ch }` and
 convert them into the runtime key internally.
 
+## Physical Layout API
+
+Use this when the file bytes are not the Varve-native container. The first
+supported shape is an optional declared file header followed by an append stream
+of declared segments with lead-in fields, caller metadata bytes, contiguous raw
+bytes, optional footer fields, and finalized/backpatched offsets.
+
+| API | Meaning |
+| --- | --- |
+| `preset: varve_native` | explicit native container preset; also the default |
+| `preset: none` | custom layout owns byte zero |
+| `layout { file_header ... segment ... }` | declare file header, segment lead-in, metadata region, raw region, optional footer |
+| `Format::create_layout_writer(path)` | create a custom physical-layout writer |
+| `Format::create_layout_writer_with_header(path, fields)` | create a writer when the file header has caller-supplied fields |
+| `Format::open_layout_reader(path)` | open a custom physical-layout reader |
+| `LayoutWriter::write_segment(SegmentWrite)` | write lead-in, metadata, raw bytes, footer, then backpatch offsets |
+| `SegmentWrite::fields` | caller values for lead-in fields |
+| `SegmentWrite::footer_fields` | caller values for footer fields |
+| `LayoutReader::file_header_len()` | validated header length before the first segment |
+| `LayoutReader::segments()` | inspect validated physical segment ranges |
+| `LayoutReader::read_metadata(index)` | read opaque metadata bytes for a segment |
+| `LayoutReader::read_raw(index)` | read contiguous raw-region bytes for a segment |
+
+This path is separate from `create_writer/open_reader`; native append-log APIs
+still write the `VARVE1/2/3` container. TDMS-style files use `preset: none` so
+the first bytes can be `TDSm`.
+
+Example:
+
+```rust
+varve_format! {
+    pub format FramedFormat {
+        magic: b"FRAM";
+        version: 1;
+        schema_hash: computed;
+        preset: none;
+
+        layout {
+            file_header Header {
+                bytes signature = b"VRV!";
+                u16 header_version = 1;
+            }
+
+            segment DataSegment repeat until_eof {
+                lead_in LeadIn {
+                    bytes tag = b"SEGM";
+                    u32 toc_mask;
+                    i64 next_segment_offset =
+                        finalize(target = segment_end, relative_to = after_lead_in);
+                    i64 raw_data_offset =
+                        finalize(target = raw_region_start, relative_to = after_lead_in);
+                }
+                metadata Metadata;
+                raw_region Raw;
+                footer Footer {
+                    bytes seal = b"END!";
+                    u64 segment_len =
+                        finalize(target = segment_end, relative_to = segment_start);
+                }
+            }
+        }
+    }
+}
+```
+
 ## Mmap And Zero-Copy
 
 Feature-gated APIs:

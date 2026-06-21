@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use varve::{
     BlockDescriptor, BlockKind, Endian, FormatSpec, IndexPolicy, MatrixAuxDescriptor,
     MatrixBlockDescriptor, MatrixCommitDescriptor, MatrixCommitKind, MatrixDimensionDescriptor,
-    MatrixDimensions, MatrixKey, RecoveryPolicy, VarveBlock, VarveDecode, VarveEncode,
-    VarveMatrixBlock, VarveMerge, compact_keyed_file, compact_keyed_files, merge_keyed_files,
-    varve_format,
+    MatrixDimensions, MatrixKey, RecoveryPolicy, SegmentWrite, VarveBlock, VarveDecode,
+    VarveEncode, VarveMatrixBlock, VarveMerge, compact_keyed_file, compact_keyed_files,
+    merge_keyed_files, varve_format,
 };
 
 #[derive(Clone, Debug, PartialEq, VarveBlock)]
@@ -192,6 +192,40 @@ varve_format! {
     }
 }
 
+varve_format! {
+    pub format PerfPhysicalLayoutFormat {
+        magic: b"PERFPHY";
+        version: 1;
+        endian: little;
+        schema_hash: computed;
+        preset: none;
+
+        layout {
+            file_header PhysicalHeader {
+                bytes signature = b"PHY!";
+                u16 header_version = 1;
+            }
+
+            segment PhysicalSegment repeat until_eof {
+                lead_in PhysicalLeadIn {
+                    bytes tag = b"PSEG";
+                    u32 toc_mask;
+                    i64 next_segment_offset = finalize(target = segment_end, relative_to = after_lead_in);
+                    i64 raw_data_offset = finalize(target = raw_region_start, relative_to = after_lead_in);
+                }
+
+                metadata PhysicalMetadata;
+                raw_region PhysicalRaw;
+
+                footer PhysicalFooter {
+                    bytes seal = b"DONE";
+                    u64 segment_len = finalize(target = segment_end, relative_to = segment_start);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(feature = "compression-zstd")]
 varve_format! {
     pub struct PerfCompressedFormat {
@@ -229,6 +263,7 @@ fn perf_smoke_core_paths() -> varve::Result<()> {
         checkpoint_open(case)?;
         varve3_footer_and_chain(case)?;
         materialized_keyed_state(case)?;
+        physical_layout_segments(case)?;
         matrix_direct_access(case)?;
         matrix_aux_region_access(case)?;
         #[cfg(feature = "integrity")]
@@ -237,6 +272,51 @@ fn perf_smoke_core_paths() -> varve::Result<()> {
 
     merge_and_compact(2_048)?;
     recovery_tail_truncation(2_048)?;
+    Ok(())
+}
+
+fn physical_layout_segments(case: PerfCase) -> varve::Result<()> {
+    let path = temp_path(&format!("{}_physical_layout", case.name));
+    cleanup(&path);
+    let fields = [varve::LayoutFieldValue {
+        name: "toc_mask",
+        value: varve::LayoutValue::U32(0x1110),
+    }];
+
+    let elapsed = timed(|| {
+        let mut writer = PerfPhysicalLayoutFormat::create_layout_writer(&path)?;
+        for index in 0..case.records {
+            let metadata = (index as u64).to_le_bytes();
+            let mut raw = [0u8; 16];
+            raw[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            raw[8..].copy_from_slice(&((index as u64).wrapping_mul(3)).to_le_bytes());
+            writer.write_segment(SegmentWrite {
+                name: "PhysicalSegment",
+                fields: &fields,
+                footer_fields: &[],
+                metadata: &metadata,
+                raw: &raw,
+            })?;
+        }
+        writer.flush()?;
+        Ok(())
+    })?;
+    report("layout append", case.records, &path, elapsed);
+
+    let elapsed = timed(|| {
+        let reader = PerfPhysicalLayoutFormat::open_layout_reader(&path)?;
+        assert_eq!(reader.file_header_len(), 6);
+        assert_eq!(reader.segments().len(), case.records);
+        let raw = reader.read_raw(case.records - 1)?;
+        assert_eq!(
+            u64::from_le_bytes(raw[..8].try_into().expect("raw prefix")),
+            (case.records - 1) as u64
+        );
+        Ok(())
+    })?;
+    report("layout open/scan", case.records, &path, elapsed);
+
+    cleanup(&path);
     Ok(())
 }
 

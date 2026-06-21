@@ -4183,13 +4183,13 @@ fn crc32_record_bytes(_payload: &[u8], _footer: &[u8]) -> Result<u32> {
 }
 
 #[derive(Debug)]
-struct WriterLock {
+pub(crate) struct WriterLock {
     path: PathBuf,
     _file: File,
 }
 
 impl WriterLock {
-    fn acquire(path: &Path) -> Result<Self> {
+    pub(crate) fn acquire(path: &Path) -> Result<Self> {
         Self::acquire_with_policy(path, WriterLockBreakPolicy::Refuse)
     }
 

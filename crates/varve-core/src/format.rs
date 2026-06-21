@@ -296,6 +296,190 @@ pub struct BlockDescriptor {
     pub fields: &'static [FieldDescriptor],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutPreset {
+    VarveNative,
+    None,
+    Custom,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentRepeat {
+    Once,
+    UntilEof,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutPartKind {
+    FileHeader(FileHeaderDescriptor),
+    Segment(SegmentDescriptor),
+    LeadIn(LeadInDescriptor),
+    Metadata(MetadataDescriptor),
+    RawRegion(RawRegionDescriptor),
+    Footer(FooterDescriptor),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutPartDescriptor {
+    pub name: &'static str,
+    pub kind: LayoutPartKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileHeaderDescriptor {
+    pub name: &'static str,
+    pub fields: &'static [LayoutFieldDescriptor],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentDescriptor {
+    pub name: &'static str,
+    pub repeat: SegmentRepeat,
+    pub lead_in: LeadInDescriptor,
+    pub metadata: MetadataDescriptor,
+    pub raw_region: RawRegionDescriptor,
+    pub footer: Option<FooterDescriptor>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeadInDescriptor {
+    pub name: &'static str,
+    pub fields: &'static [LayoutFieldDescriptor],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataDescriptor {
+    pub name: &'static str,
+    pub source: LayoutBytesSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawRegionDescriptor {
+    pub name: &'static str,
+    pub source: LayoutBytesSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FooterDescriptor {
+    pub name: &'static str,
+    pub fields: &'static [LayoutFieldDescriptor],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutBytesSource {
+    Caller,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutFieldDescriptor {
+    pub name: &'static str,
+    pub ty: LayoutFieldType,
+    pub source: LayoutFieldSource,
+    pub endian: Option<Endian>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutFieldType {
+    Bytes { len: u64 },
+    U8,
+    U16,
+    U32,
+    U64,
+    I64,
+}
+
+impl LayoutFieldType {
+    pub const fn byte_len(self) -> u64 {
+        match self {
+            Self::Bytes { len } => len,
+            Self::U8 => 1,
+            Self::U16 => 2,
+            Self::U32 => 4,
+            Self::U64 | Self::I64 => 8,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutFieldSource {
+    LiteralBytes(&'static [u8]),
+    LiteralU64(u64),
+    LiteralI64(i64),
+    Caller,
+    Finalize(LayoutFinalize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutFinalize {
+    pub target: LayoutAnchor,
+    pub relative_to: LayoutAnchor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutAnchor {
+    SegmentStart,
+    AfterLeadIn,
+    MetadataStart,
+    RawRegionStart,
+    SegmentEnd,
+    FooterStart,
+    FooterEnd,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutSpec {
+    pub preset: LayoutPreset,
+    pub parts: &'static [LayoutPartDescriptor],
+}
+
+impl LayoutSpec {
+    pub const fn varve_native() -> Self {
+        Self {
+            preset: LayoutPreset::VarveNative,
+            parts: &[],
+        }
+    }
+
+    pub const fn none() -> Self {
+        Self {
+            preset: LayoutPreset::None,
+            parts: &[],
+        }
+    }
+
+    pub const fn custom(parts: &'static [LayoutPartDescriptor]) -> Self {
+        Self {
+            preset: LayoutPreset::Custom,
+            parts,
+        }
+    }
+
+    pub const fn none_with_parts(parts: &'static [LayoutPartDescriptor]) -> Self {
+        Self {
+            preset: LayoutPreset::None,
+            parts,
+        }
+    }
+
+    pub const fn is_varve_native_default(self) -> bool {
+        matches!(self.preset, LayoutPreset::VarveNative) && self.parts.is_empty()
+    }
+
+    pub fn first_segment(self) -> Option<SegmentDescriptor> {
+        self.parts.iter().find_map(|part| match part.kind {
+            LayoutPartKind::Segment(segment) => Some(segment),
+            _ => None,
+        })
+    }
+
+    pub fn file_header(self) -> Option<FileHeaderDescriptor> {
+        self.parts.iter().find_map(|part| match part.kind {
+            LayoutPartKind::FileHeader(header) => Some(header),
+            _ => None,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct FormatSpec {
     pub magic: &'static [u8],
@@ -315,6 +499,7 @@ pub struct FormatSpec {
     pub matrix_commits: &'static [MatrixCommitDescriptor],
     pub matrix_blocks: &'static [MatrixBlockDescriptor],
     pub matrix_aux: &'static [MatrixAuxDescriptor],
+    pub layout: LayoutSpec,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -336,6 +521,7 @@ pub struct FormatSpecBuilder {
     matrix_commits: &'static [MatrixCommitDescriptor],
     matrix_blocks: &'static [MatrixBlockDescriptor],
     matrix_aux: &'static [MatrixAuxDescriptor],
+    layout: LayoutSpec,
 }
 
 impl FormatSpec {
@@ -369,6 +555,7 @@ impl FormatSpec {
             matrix_commits: &[],
             matrix_blocks: &[],
             matrix_aux: &[],
+            layout: LayoutSpec::varve_native(),
         }
     }
 
@@ -434,6 +621,11 @@ impl FormatSpec {
 
     pub const fn with_matrix_aux(mut self, aux: &'static [MatrixAuxDescriptor]) -> Self {
         self.matrix_aux = aux;
+        self
+    }
+
+    pub const fn with_layout(mut self, layout: LayoutSpec) -> Self {
+        self.layout = layout;
         self
     }
 
@@ -574,6 +766,10 @@ impl FormatSpec {
             "compression_policy: {:?}\n",
             self.compression_policy
         ));
+        output.push_str(&format!("layout_preset: {:?}\n", self.layout.preset));
+        for part in self.layout.parts {
+            output.push_str(&format!("layout_part {} {:?}\n", part.name, part.kind));
+        }
         for override_policy in self.block_compression {
             output.push_str(&format!(
                 "block_compression {} {:?}\n",
@@ -669,6 +865,10 @@ impl FormatSpec {
             hash.write_str(aux.name);
             hash.write_bytes(&aux.byte_len.to_le_bytes());
         }
+        if !self.layout.is_varve_native_default() {
+            hash.write_bytes(b"layout-v1");
+            hash_layout_spec(&mut hash, self.layout);
+        }
         let mut blocks = self.blocks.to_vec();
         blocks.sort_by_key(|block| block.id);
         for block in blocks {
@@ -747,6 +947,7 @@ impl FormatSpec {
             }
         }
         self.validate_matrix_spec()?;
+        self.validate_layout_spec()?;
         if let CompressionPolicy::VariableBlocks(compression) = self.compression_policy {
             self.validate_variable_compression(compression)?;
         }
@@ -782,6 +983,202 @@ impl FormatSpec {
 
     pub const fn has_matrix_blocks(self) -> bool {
         !self.matrix_blocks.is_empty()
+    }
+
+    fn validate_layout_spec(self) -> Result<()> {
+        match self.layout.preset {
+            LayoutPreset::VarveNative => {
+                if !self.layout.parts.is_empty() {
+                    return Err(Error::InvalidFormatSpec(
+                        "varve_native layout must not declare custom parts",
+                    ));
+                }
+            }
+            LayoutPreset::None | LayoutPreset::Custom => {
+                if self.has_matrix_blocks() {
+                    return Err(Error::InvalidFormatSpec(
+                        "custom layout does not support matrix blocks in this release",
+                    ));
+                }
+                if self.commit_policy != CommitPolicy::None {
+                    return Err(Error::InvalidFormatSpec(
+                        "custom layout does not support native commit policy in this release",
+                    ));
+                }
+                if self.index_policy.checkpoint_on_flush
+                    || self.index_policy.block_offset_chain
+                    || self.index_policy.keyed_offset_chain
+                {
+                    return Err(Error::InvalidFormatSpec(
+                        "custom layout does not support native index records in this release",
+                    ));
+                }
+                if self.manifest_policy != ManifestPolicy::None {
+                    return Err(Error::InvalidFormatSpec(
+                        "custom layout does not support embedded native manifests in this release",
+                    ));
+                }
+                if self.compression_policy != CompressionPolicy::None
+                    || !self.block_compression.is_empty()
+                {
+                    return Err(Error::InvalidFormatSpec(
+                        "custom layout does not support native record compression in this release",
+                    ));
+                }
+                if self.layout.parts.is_empty() {
+                    return Err(Error::InvalidFormatSpec(
+                        "custom layout requires at least one layout part",
+                    ));
+                }
+            }
+        }
+
+        for (index, part) in self.layout.parts.iter().enumerate() {
+            if part.name.is_empty() {
+                return Err(Error::InvalidFormatSpec(
+                    "layout part name must not be empty",
+                ));
+            }
+            for other in &self.layout.parts[(index + 1)..] {
+                if part.name == other.name {
+                    return Err(Error::InvalidFormatSpec("duplicate layout part name"));
+                }
+            }
+            match part.kind {
+                LayoutPartKind::FileHeader(header) => {
+                    self.validate_layout_fields(header.fields)?;
+                    if header
+                        .fields
+                        .iter()
+                        .any(|field| matches!(field.source, LayoutFieldSource::Finalize(_)))
+                    {
+                        return Err(Error::InvalidFormatSpec(
+                            "layout file_header does not support finalized fields in this release",
+                        ));
+                    }
+                }
+                LayoutPartKind::Segment(segment) => self.validate_segment_layout(segment)?,
+                LayoutPartKind::LeadIn(lead_in) => self.validate_layout_fields(lead_in.fields)?,
+                LayoutPartKind::Metadata(metadata) => {
+                    if metadata.name.is_empty() {
+                        return Err(Error::InvalidFormatSpec(
+                            "layout metadata name must not be empty",
+                        ));
+                    }
+                }
+                LayoutPartKind::RawRegion(raw) => {
+                    if raw.name.is_empty() {
+                        return Err(Error::InvalidFormatSpec(
+                            "layout raw region name must not be empty",
+                        ));
+                    }
+                }
+                LayoutPartKind::Footer(footer) => self.validate_layout_fields(footer.fields)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_segment_layout(self, segment: SegmentDescriptor) -> Result<()> {
+        if segment.name.is_empty()
+            || segment.lead_in.name.is_empty()
+            || segment.metadata.name.is_empty()
+            || segment.raw_region.name.is_empty()
+        {
+            return Err(Error::InvalidFormatSpec(
+                "layout segment names must not be empty",
+            ));
+        }
+        self.validate_layout_fields(segment.lead_in.fields)?;
+        if let Some(footer) = segment.footer {
+            if footer.name.is_empty() {
+                return Err(Error::InvalidFormatSpec(
+                    "layout footer name must not be empty",
+                ));
+            }
+            self.validate_layout_fields(footer.fields)?;
+        }
+        let has_segment_end = segment.lead_in.fields.iter().any(|field| {
+            matches!(
+                field.source,
+                LayoutFieldSource::Finalize(LayoutFinalize {
+                    target: LayoutAnchor::SegmentEnd,
+                    relative_to: LayoutAnchor::AfterLeadIn
+                })
+            )
+        });
+        let has_raw_start = segment.lead_in.fields.iter().any(|field| {
+            matches!(
+                field.source,
+                LayoutFieldSource::Finalize(LayoutFinalize {
+                    target: LayoutAnchor::RawRegionStart,
+                    relative_to: LayoutAnchor::AfterLeadIn
+                })
+            )
+        });
+        if !has_segment_end || !has_raw_start {
+            return Err(Error::InvalidFormatSpec(
+                "layout segment requires finalized segment_end and raw_region_start fields relative to after_lead_in",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_layout_fields(self, fields: &[LayoutFieldDescriptor]) -> Result<()> {
+        if fields.is_empty() {
+            return Err(Error::InvalidFormatSpec("layout fields must not be empty"));
+        }
+        let mut total_len = 0u64;
+        for (index, field) in fields.iter().enumerate() {
+            if field.name.is_empty() {
+                return Err(Error::InvalidFormatSpec(
+                    "layout field name must not be empty",
+                ));
+            }
+            let len = field.ty.byte_len();
+            if len == 0 {
+                return Err(Error::InvalidFormatSpec(
+                    "layout field length must be non-zero",
+                ));
+            }
+            total_len = total_len
+                .checked_add(len)
+                .ok_or(Error::InvalidFormatSpec("layout fields overflow"))?;
+            if let LayoutFieldSource::LiteralBytes(bytes) = field.source
+                && !matches!(field.ty, LayoutFieldType::Bytes { len } if len == bytes.len() as u64)
+            {
+                return Err(Error::InvalidFormatSpec(
+                    "literal bytes length must match layout field length",
+                ));
+            }
+            if matches!(field.source, LayoutFieldSource::LiteralBytes(_))
+                && !matches!(field.ty, LayoutFieldType::Bytes { .. })
+            {
+                return Err(Error::InvalidFormatSpec(
+                    "literal bytes require a bytes layout field",
+                ));
+            }
+            if matches!(field.source, LayoutFieldSource::LiteralI64(_))
+                && !matches!(field.ty, LayoutFieldType::I64)
+            {
+                return Err(Error::InvalidFormatSpec(
+                    "literal i64 requires an i64 layout field",
+                ));
+            }
+            if matches!(field.source, LayoutFieldSource::Finalize(_))
+                && !matches!(field.ty, LayoutFieldType::U64 | LayoutFieldType::I64)
+            {
+                return Err(Error::InvalidFormatSpec(
+                    "finalized layout fields must be u64 or i64",
+                ));
+            }
+            for other in &fields[(index + 1)..] {
+                if field.name == other.name {
+                    return Err(Error::InvalidFormatSpec("duplicate layout field name"));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn validate_matrix_spec(self) -> Result<()> {
@@ -1044,6 +1441,148 @@ fn hash_variable_compression(hash: &mut Fnv1a64, compression: VariableCompressio
     hash.write_bytes(&compression.max_uncompressed_len.to_le_bytes());
 }
 
+fn hash_layout_spec(hash: &mut Fnv1a64, layout: LayoutSpec) {
+    hash.write_u8(layout_preset_hash_byte(layout.preset));
+    hash.write_bytes(&(layout.parts.len() as u64).to_le_bytes());
+    for part in layout.parts {
+        hash.write_str(part.name);
+        match part.kind {
+            LayoutPartKind::FileHeader(header) => {
+                hash.write_u8(1);
+                hash.write_str(header.name);
+                hash_layout_fields(hash, header.fields);
+            }
+            LayoutPartKind::Segment(segment) => {
+                hash.write_u8(2);
+                hash_segment_descriptor(hash, segment);
+            }
+            LayoutPartKind::LeadIn(lead_in) => {
+                hash.write_u8(3);
+                hash.write_str(lead_in.name);
+                hash_layout_fields(hash, lead_in.fields);
+            }
+            LayoutPartKind::Metadata(metadata) => {
+                hash.write_u8(4);
+                hash.write_str(metadata.name);
+                hash.write_u8(layout_bytes_source_hash_byte(metadata.source));
+            }
+            LayoutPartKind::RawRegion(raw) => {
+                hash.write_u8(5);
+                hash.write_str(raw.name);
+                hash.write_u8(layout_bytes_source_hash_byte(raw.source));
+            }
+            LayoutPartKind::Footer(footer) => {
+                hash.write_u8(6);
+                hash.write_str(footer.name);
+                hash_layout_fields(hash, footer.fields);
+            }
+        }
+    }
+}
+
+fn hash_segment_descriptor(hash: &mut Fnv1a64, segment: SegmentDescriptor) {
+    hash.write_str(segment.name);
+    hash.write_u8(segment_repeat_hash_byte(segment.repeat));
+    hash.write_str(segment.lead_in.name);
+    hash_layout_fields(hash, segment.lead_in.fields);
+    hash.write_str(segment.metadata.name);
+    hash.write_u8(layout_bytes_source_hash_byte(segment.metadata.source));
+    hash.write_str(segment.raw_region.name);
+    hash.write_u8(layout_bytes_source_hash_byte(segment.raw_region.source));
+    match segment.footer {
+        Some(footer) => {
+            hash.write_u8(1);
+            hash.write_str(footer.name);
+            hash_layout_fields(hash, footer.fields);
+        }
+        None => hash.write_u8(0),
+    }
+}
+
+fn hash_layout_fields(hash: &mut Fnv1a64, fields: &[LayoutFieldDescriptor]) {
+    hash.write_bytes(&(fields.len() as u64).to_le_bytes());
+    for field in fields {
+        hash.write_str(field.name);
+        hash.write_u8(layout_field_type_hash_byte(field.ty));
+        if let LayoutFieldType::Bytes { len } = field.ty {
+            hash.write_bytes(&len.to_le_bytes());
+        }
+        hash.write_u8(match field.endian {
+            Some(endian) => endian.to_byte(),
+            None => 0,
+        });
+        hash_layout_field_source(hash, field.source);
+    }
+}
+
+fn hash_layout_field_source(hash: &mut Fnv1a64, source: LayoutFieldSource) {
+    match source {
+        LayoutFieldSource::LiteralBytes(bytes) => {
+            hash.write_u8(1);
+            hash.write_bytes(&(bytes.len() as u64).to_le_bytes());
+            hash.write_bytes(bytes);
+        }
+        LayoutFieldSource::LiteralU64(value) => {
+            hash.write_u8(2);
+            hash.write_bytes(&value.to_le_bytes());
+        }
+        LayoutFieldSource::LiteralI64(value) => {
+            hash.write_u8(3);
+            hash.write_bytes(&value.to_le_bytes());
+        }
+        LayoutFieldSource::Caller => hash.write_u8(4),
+        LayoutFieldSource::Finalize(finalize) => {
+            hash.write_u8(5);
+            hash.write_u8(layout_anchor_hash_byte(finalize.target));
+            hash.write_u8(layout_anchor_hash_byte(finalize.relative_to));
+        }
+    }
+}
+
+const fn layout_preset_hash_byte(preset: LayoutPreset) -> u8 {
+    match preset {
+        LayoutPreset::VarveNative => 1,
+        LayoutPreset::None => 2,
+        LayoutPreset::Custom => 3,
+    }
+}
+
+const fn segment_repeat_hash_byte(repeat: SegmentRepeat) -> u8 {
+    match repeat {
+        SegmentRepeat::Once => 1,
+        SegmentRepeat::UntilEof => 2,
+    }
+}
+
+const fn layout_bytes_source_hash_byte(source: LayoutBytesSource) -> u8 {
+    match source {
+        LayoutBytesSource::Caller => 1,
+    }
+}
+
+const fn layout_field_type_hash_byte(ty: LayoutFieldType) -> u8 {
+    match ty {
+        LayoutFieldType::Bytes { .. } => 1,
+        LayoutFieldType::U8 => 2,
+        LayoutFieldType::U16 => 3,
+        LayoutFieldType::U32 => 4,
+        LayoutFieldType::U64 => 5,
+        LayoutFieldType::I64 => 6,
+    }
+}
+
+const fn layout_anchor_hash_byte(anchor: LayoutAnchor) -> u8 {
+    match anchor {
+        LayoutAnchor::SegmentStart => 1,
+        LayoutAnchor::AfterLeadIn => 2,
+        LayoutAnchor::MetadataStart => 3,
+        LayoutAnchor::RawRegionStart => 4,
+        LayoutAnchor::SegmentEnd => 5,
+        LayoutAnchor::FooterStart => 6,
+        LayoutAnchor::FooterEnd => 7,
+    }
+}
+
 const fn compression_algorithm_hash_byte(algorithm: CompressionAlgorithm) -> u8 {
     match algorithm {
         CompressionAlgorithm::Zstd => 1,
@@ -1087,6 +1626,7 @@ impl FormatSpecBuilder {
             matrix_commits: &[],
             matrix_blocks: &[],
             matrix_aux: &[],
+            layout: LayoutSpec::varve_native(),
         }
     }
 
@@ -1175,6 +1715,11 @@ impl FormatSpecBuilder {
         self
     }
 
+    pub const fn layout(mut self, layout: LayoutSpec) -> Self {
+        self.layout = layout;
+        self
+    }
+
     pub fn build(self) -> Result<FormatSpec> {
         let magic = self
             .magic
@@ -1199,7 +1744,8 @@ impl FormatSpecBuilder {
             self.matrix_commits,
             self.matrix_blocks,
         )
-        .with_matrix_aux(self.matrix_aux);
+        .with_matrix_aux(self.matrix_aux)
+        .with_layout(self.layout);
         spec.validate()?;
         Ok(spec)
     }

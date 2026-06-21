@@ -5,6 +5,7 @@ mod diagnostics;
 mod error;
 mod file;
 mod format;
+mod layout;
 mod matrix;
 mod merge;
 mod traits;
@@ -34,9 +35,16 @@ pub use file::{MmapMatrix, MmapPayloads};
 pub use format::{
     BlockCompressionDescriptor, BlockDescriptor, BlockKind, CommitPolicy, CompressionAlgorithm,
     CompressionHeaderMode, CompressionLevel, CompressionPolicy, Endian, FieldDescriptor,
-    FieldPresence, FormatSpec, FormatSpecBuilder, IndexPolicy, IntegrityPolicy, ManifestPolicy,
-    MatrixAuxDescriptor, MatrixBlockDescriptor, MatrixCommitDescriptor, MatrixCommitKind,
-    MatrixDimensionDescriptor, RecoveryPolicy, TransactionMarkerMode, VariableCompression,
+    FieldPresence, FileHeaderDescriptor, FooterDescriptor, FormatSpec, FormatSpecBuilder,
+    IndexPolicy, IntegrityPolicy, LayoutAnchor, LayoutBytesSource, LayoutFieldDescriptor,
+    LayoutFieldSource, LayoutFieldType, LayoutFinalize, LayoutPartDescriptor, LayoutPartKind,
+    LayoutPreset, LayoutSpec, LeadInDescriptor, ManifestPolicy, MatrixAuxDescriptor,
+    MatrixBlockDescriptor, MatrixCommitDescriptor, MatrixCommitKind, MatrixDimensionDescriptor,
+    MetadataDescriptor, RawRegionDescriptor, RecoveryPolicy, SegmentDescriptor, SegmentRepeat,
+    TransactionMarkerMode, VariableCompression,
+};
+pub use layout::{
+    LayoutFieldValue, LayoutReader, LayoutSegmentInfo, LayoutValue, LayoutWriter, SegmentWrite,
 };
 pub use matrix::{
     MatrixCellStatus, MatrixCommitEvent, MatrixCorruptionKind, MatrixCorruptionSeverity,

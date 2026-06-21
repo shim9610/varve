@@ -279,6 +279,61 @@ The writer automatically fills `prev_same_block_offset` for each block id and,
 for generated keyed writers, `prev_same_key_offset` for the key. User code never
 has to calculate or patch offsets.
 
+## Custom Physical Layout
+
+Most formats should use the Varve-native append log. Use custom physical layout
+when you need the file bytes themselves to follow another segmented format, for
+example a TDMS-style lead-in with ToC mask, next segment offset, raw data
+offset, metadata bytes, and contiguous raw channel data.
+
+`preset: none;` gives your layout ownership of byte zero. You can declare a
+literal or caller-filled file header, segment lead-in fields, opaque metadata
+bytes, raw-region bytes, and optional footer fields:
+
+```rust
+varve_format! {
+    pub format PhysicalFormat {
+        magic: b"PHYS";
+        version: 1;
+        schema_hash: computed;
+        preset: none;
+
+        layout {
+            file_header Header {
+                bytes signature = b"VRV!";
+                u16 header_version = 1;
+            }
+
+            segment DataSegment repeat until_eof {
+                lead_in LeadIn {
+                    bytes tag = b"SEGM";
+                    u32 toc_mask;
+                    i64 next_segment_offset =
+                        finalize(target = segment_end, relative_to = after_lead_in);
+                    i64 raw_data_offset =
+                        finalize(target = raw_region_start, relative_to = after_lead_in);
+                }
+
+                metadata Metadata;
+                raw_region Raw;
+
+                footer Footer {
+                    bytes seal = b"END!";
+                    u64 segment_len =
+                        finalize(target = segment_end, relative_to = segment_start);
+                }
+            }
+        }
+    }
+}
+```
+
+Write it with `create_layout_writer` and `write_segment`. `fields` supplies
+caller values for lead-in fields, `footer_fields` supplies caller values for
+footer fields, and finalized fields are backpatched after the segment bytes are
+known. `open_layout_reader` validates literal tags, offset fields, header/footer
+bounds, and exposes opaque `read_metadata` and `read_raw` ranges.
+
 ## Read And Write
 
 ```rust

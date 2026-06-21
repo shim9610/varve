@@ -51,6 +51,29 @@ Every file starts with:
 The user magic and version prevent opening the wrong file type. The schema hash
 can pin the exact declared shape when you choose `schema_hash: computed;`.
 
+## Custom Physical Layouts
+
+The Varve-native header is the default preset. A format can instead choose
+`preset: none;` and declare its own byte-level layout. In that mode Varve does
+not write `VARVE1/2/3`; the declared `file_header`, segment `lead_in`,
+`metadata`, `raw_region`, and optional `footer` own the physical bytes.
+
+```mermaid
+flowchart LR
+    A["file_header"] --> B["segment lead_in"]
+    B --> C["metadata bytes"]
+    C --> D["raw-region bytes"]
+    D --> E["optional footer"]
+    E --> F["next segment"]
+```
+
+Lead-in and footer fields can be literals, caller-supplied values, or finalized
+offsets such as `next_segment_offset` and `raw_data_offset`. The layout writer
+writes placeholders for finalized fields, writes metadata/raw/footer bytes, then
+backpatches the computed values. The layout reader validates the header,
+literals, finalized offsets, forward progress, and region bounds before exposing
+metadata and raw byte ranges.
+
 ## Append-Log Records
 
 Fixed and variable blocks are stored as append-log records.

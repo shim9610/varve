@@ -5,6 +5,7 @@ fn macro_compile_contracts() {
     tests.pass("tests/ui/pass_policies.rs");
     tests.pass("tests/ui/pass_format_dsl.rs");
     tests.pass("tests/ui/pass_matrix_aux.rs");
+    tests.pass("tests/ui/pass_layout.rs");
     tests.compile_fail("tests/ui/fail_duplicate_id.rs");
     tests.compile_fail("tests/ui/fail_duplicate_field_id.rs");
     tests.compile_fail("tests/ui/fail_zero_field_id.rs");

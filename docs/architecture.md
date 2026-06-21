@@ -14,6 +14,10 @@
 
 - A block is the logical segment unit.
 - `varve_format!` is format-first by default: it can generate block structs, typed reader/writer wrappers, and the static format registry from one declaration.
+- `LayoutSpec` is the physical layout layer. The default preset is the current
+  Varve-native container; custom layouts can own byte zero and declare
+  file headers, append-oriented segment lead-ins, metadata regions, raw
+  regions, footer descriptors, and finalized/backpatched offset fields.
 - `#[derive(VarveBlock)]` remains available for derive-first block definitions when structs need to live outside the format declaration.
 - Block ids are explicit `u32` values below `0xFFFF_FF00`; higher ids are reserved for internal records.
 - Same-type blocks are read lazily through `BlockVec<T>`.
@@ -23,6 +27,10 @@
 - Variable blocks use `field_id + wire_type + length + payload`, so unknown field ids with known wire types can be skipped.
 - Variable user blocks may opt into compression after canonical field encoding through a global policy or block-specific record-explicit descriptors. Fixed blocks and Varve internal records stay uncompressed.
 - `VARVE3` record footers carry commit/offset metadata when `CommitPolicy` or offset-chain `IndexPolicy` requires it.
+- `LayoutWriter` and `LayoutReader` provide the first non-native physical path
+  for optional file header + repeated segments. The initial verified targets are
+  TDMS-style `TDSm` lead-in + metadata bytes + contiguous raw channel bytes, and
+  a generic framed layout with declared file header and segment footer.
 - Matrix blocks use deterministic slot layout and commit bitmaps instead of
   append-log record footers or offset chains.
 - Endian priority is block override, then format setting, then the macro little-endian default.
@@ -93,6 +101,8 @@
 - Every major implementation slice must include a runnable performance check before integration.
 - `crates/varve/tests/perf_smoke.rs` is the current smoke suite and is intentionally ignored by default.
 - The suite covers small, medium, and large cases for append/open/scan, checkpoint open, materialized keyed state, merge, compact, direct base+delta compact, recovery, mmap payload windows, matrix direct access, matrix aux regions, and zero-copy raw fixed reads.
+- It also covers custom physical layout append and open/scan so layout DSL
+  changes expose obvious framing or scan regressions.
 - The purpose is regression detection, especially accidental O(n^2) scans, excessive allocation, or unexpected slow open/merge/compact paths.
 - Performance smoke output is not a product guarantee before stabilization, but a large unexplained slowdown blocks integration.
 
