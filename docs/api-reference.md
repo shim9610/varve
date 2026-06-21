@@ -64,6 +64,7 @@ Generated typed methods depend on block names:
 | `validate()` | check static spec consistency |
 | `computed_schema_hash()` | deterministic schema fingerprint |
 | `effective_layout()` | physical layout plan using header/segment/lead-in/raw/footer vocabulary |
+| `inspect_layout_file(path)` | validate a native or custom file and return physical layout ranges |
 | `schema_debug_dump()` | human-readable schema dump |
 | `diagnostics()` | structured static diagnostics |
 | `diagnose_file(path)` | structured file diagnostics |
@@ -183,6 +184,7 @@ bytes, optional footer fields, and finalized/backpatched offsets.
 | `Format::create_layout_writer_with_header(path, fields)` | create a writer when the file header has caller-supplied fields |
 | `Format::open_layout_writer(path)` | validate an existing custom-layout file and append more segments |
 | `Format::open_layout_reader(path)` | open a custom physical-layout reader |
+| `Format::inspect_layout_file(path)` | inspect native or custom physical file framing through one result type |
 | `LayoutWriter::write_segment(SegmentWrite)` | write lead-in, metadata, raw bytes, footer, then backpatch offsets |
 | `SegmentWrite::fields` | caller values for lead-in fields |
 | `SegmentWrite::footer_fields` | caller values for footer fields |

@@ -1944,6 +1944,10 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 Self::spec().open_layout_reader(path)
             }
 
+            pub fn inspect_layout_file<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::LayoutFileInfo> {
+                Self::spec().inspect_layout_file(path)
+            }
+
             pub fn open_recover<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::VarveFile> {
                 Self::spec().open_recover(path)
             }

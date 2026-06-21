@@ -78,6 +78,10 @@ validated segment. Validated lead-in/footer values remain available on
 `LayoutSegmentInfo`, so callers can inspect fields such as ToC masks without
 manual byte parsing.
 
+`inspect_layout_file` is the common inspection path. For custom physical files
+it delegates to the layout reader; for Varve-native files it performs the normal
+strict native scan and projects each record into the same segment range model.
+
 ## Append-Log Records
 
 Fixed and variable blocks are stored as append-log records.

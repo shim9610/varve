@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     Endian, Error, FileHeaderDescriptor, FormatSpec, LayoutAnchor, LayoutFieldDescriptor,
-    LayoutFieldSource, LayoutFieldType, LayoutFinalize, LayoutPartKind, LayoutPreset, Result,
-    SegmentDescriptor, SegmentRepeat,
+    LayoutFieldSource, LayoutFieldType, LayoutFinalize, LayoutPartKind, LayoutPlan, LayoutPreset,
+    Result, SegmentDescriptor, SegmentRepeat,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +47,13 @@ pub struct LayoutSegmentInfo {
     pub footer_offset: u64,
     pub footer_len: u64,
     pub segment_end: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutFileInfo {
+    pub plan: LayoutPlan,
+    pub file_header_len: u64,
+    pub segments: Vec<LayoutSegmentInfo>,
 }
 
 impl LayoutSegmentInfo {
@@ -121,6 +128,20 @@ impl FormatSpec {
     pub fn open_layout_reader<P: AsRef<Path>>(self, path: P) -> Result<LayoutReader> {
         self.validate()?;
         LayoutReader::open(self, path)
+    }
+
+    pub fn inspect_layout_file<P: AsRef<Path>>(self, path: P) -> Result<LayoutFileInfo> {
+        self.validate()?;
+        if self.layout.is_varve_native_default() {
+            inspect_native_layout_file(self, path)
+        } else {
+            let reader = LayoutReader::open(self, path)?;
+            Ok(LayoutFileInfo {
+                plan: self.effective_layout(),
+                file_header_len: reader.file_header_len,
+                segments: reader.segments,
+            })
+        }
     }
 }
 
@@ -349,6 +370,88 @@ fn ensure_custom_layout_spec(spec: FormatSpec) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn inspect_native_layout_file<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<LayoutFileInfo> {
+    let path = path.as_ref();
+    let mut header_file = File::open(path)?;
+    let file_header_len = crate::file::read_file_header(spec, &mut header_file)?;
+    let file = crate::file::VarveFile::open_readonly(spec, path)?;
+    let segments = file
+        .index_entries()
+        .iter()
+        .map(native_record_to_layout_segment)
+        .collect();
+    Ok(LayoutFileInfo {
+        plan: spec.effective_layout(),
+        file_header_len,
+        segments,
+    })
+}
+
+fn native_record_to_layout_segment(entry: &crate::file::RecordIndexEntry) -> LayoutSegmentInfo {
+    let footer_offset = entry
+        .footer_offset
+        .unwrap_or(entry.payload_offset + entry.payload_len);
+    let footer_len = if entry.footer_offset.is_some() {
+        crate::file::RECORD_FOOTER_LEN
+    } else {
+        0
+    };
+    let mut footer_fields = Vec::new();
+    if entry.footer_offset.is_some() {
+        footer_fields.push(LayoutFieldValue {
+            name: "prev_same_block_offset",
+            value: LayoutValue::U64(entry.prev_same_block_offset.unwrap_or(0)),
+        });
+        footer_fields.push(LayoutFieldValue {
+            name: "prev_same_key_offset",
+            value: LayoutValue::U64(entry.prev_same_key_offset.unwrap_or(0)),
+        });
+    }
+    LayoutSegmentInfo {
+        name: "VarveRecord",
+        fields: vec![
+            LayoutFieldValue {
+                name: "block_id",
+                value: LayoutValue::U32(entry.block_id),
+            },
+            LayoutFieldValue {
+                name: "block_version",
+                value: LayoutValue::U16(entry.block_version),
+            },
+            LayoutFieldValue {
+                name: "flags",
+                value: LayoutValue::U16(entry.flags),
+            },
+            LayoutFieldValue {
+                name: "sequence",
+                value: LayoutValue::U64(entry.sequence),
+            },
+            LayoutFieldValue {
+                name: "payload_len",
+                value: LayoutValue::U64(entry.payload_len),
+            },
+            LayoutFieldValue {
+                name: "checksum",
+                value: LayoutValue::U32(entry.checksum),
+            },
+            LayoutFieldValue {
+                name: "uncompressed_len_hint",
+                value: LayoutValue::U32(entry.uncompressed_len_hint),
+            },
+        ],
+        footer_fields,
+        segment_start: entry.record_offset,
+        lead_in_len: crate::file::RECORD_HEADER_LEN,
+        metadata_offset: entry.payload_offset,
+        metadata_len: 0,
+        raw_offset: entry.payload_offset,
+        raw_len: entry.payload_len,
+        footer_offset,
+        footer_len,
+        segment_end: entry.physical_end(),
+    }
 }
 
 fn segment_descriptor(spec: FormatSpec, name: &str) -> Result<SegmentDescriptor> {

@@ -171,6 +171,10 @@ For generated API and file sanity checks, use `AppFormat::self_test(path)` with
 representative sample values and `AppFormat::diagnose_file(path)` for existing
 files. See `docs/self-check-guide.md`.
 
+Use `AppFormat::inspect_layout_file(path)` when you need to inspect physical
+framing. It validates either the Varve-native preset or a custom physical layout
+and returns file-header length plus segment/raw/footer ranges.
+
 ## Variable Compression
 
 Compression is disabled by default. Enable it only for variable user blocks

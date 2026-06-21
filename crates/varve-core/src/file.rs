@@ -27,8 +27,8 @@ const CONTAINER_MARKER_V1: &[u8; 6] = b"VARVE1";
 const CONTAINER_MARKER_V2: &[u8; 6] = b"VARVE2";
 const CONTAINER_MARKER_V3: &[u8; 6] = b"VARVE3";
 const HEADER_FIXED_LEN: u64 = 6 + 2 + 1 + 1 + 8;
-const RECORD_HEADER_LEN: u64 = 32;
-const RECORD_FOOTER_LEN: u64 = 32;
+pub(crate) const RECORD_HEADER_LEN: u64 = 32;
+pub(crate) const RECORD_FOOTER_LEN: u64 = 32;
 const RECORD_FLAG_COMPRESSED: u16 = 0x0001;
 const RECORD_FLAG_INTERNAL: u16 = 0x8000;
 const RECORD_KNOWN_FLAGS: u16 = RECORD_FLAG_COMPRESSED | RECORD_FLAG_INTERNAL;
@@ -3243,7 +3243,7 @@ fn write_file_header(spec: FormatSpec, file: &mut File) -> Result<()> {
     Ok(())
 }
 
-fn read_file_header(spec: FormatSpec, file: &mut File) -> Result<u64> {
+pub(crate) fn read_file_header(spec: FormatSpec, file: &mut File) -> Result<u64> {
     file.seek(SeekFrom::Start(0))?;
     let mut magic = vec![0; spec.magic.len()];
     file.read_exact(&mut magic)?;

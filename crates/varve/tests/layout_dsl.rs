@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use varve::{
     Error, LayoutFieldValue, LayoutPlanFieldSource, LayoutPlanFieldType, LayoutPlanLen,
-    LayoutPlanPartKind, LayoutValue, SegmentRepeat, SegmentWrite, VarveBlock, varve_format,
+    LayoutPlanPartKind, LayoutPreset, LayoutValue, SegmentRepeat, SegmentWrite, VarveBlock,
+    varve_format,
 };
 
 #[derive(Clone, Debug, PartialEq, VarveBlock)]
@@ -129,6 +130,20 @@ fn explicit_varve_native_preset_preserves_native_bytes() -> varve::Result<()> {
         NativeExplicitFormat::spec().schema_hash
     );
     assert_eq!(read(&default_path)?, read(&explicit_path)?);
+
+    let inspected = NativeDefaultFormat::inspect_layout_file(&default_path)?;
+    assert_eq!(inspected.plan.preset, LayoutPreset::VarveNative);
+    assert_eq!(inspected.file_header_len, 22);
+    assert_eq!(inspected.segments.len(), 1);
+    assert_eq!(
+        inspected.segments[0].field("block_id"),
+        Some(&LayoutValue::U32(NativePoint::ID))
+    );
+    assert_eq!(
+        inspected.segments[0].field("payload_len"),
+        Some(&LayoutValue::U64(8))
+    );
+    assert_eq!(inspected.segments[0].raw_len, 8);
 
     cleanup(&default_path);
     cleanup(&explicit_path);
@@ -268,6 +283,11 @@ fn custom_layout_writes_file_header_and_segment_footer() -> varve::Result<()> {
     );
     assert_eq!(reader.read_metadata(0)?, b"abc");
     assert_eq!(reader.read_raw(0)?, raw);
+
+    let inspected = FramedPhysicalFormat::inspect_layout_file(&path)?;
+    assert_eq!(inspected.plan.preset, LayoutPreset::None);
+    assert_eq!(inspected.file_header_len, 6);
+    assert_eq!(inspected.segments.as_slice(), reader.segments());
 
     cleanup(&path);
     Ok(())

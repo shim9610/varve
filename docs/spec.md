@@ -20,6 +20,11 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   native and custom formats. For `LayoutPreset::VarveNative`, the plan is
   synthetic and mirrors the existing native writer/reader byte contract without
   changing native bytes or schema hashes.
+- `FormatSpec::inspect_layout_file(path)` validates an existing native or
+  custom file and returns `LayoutFileInfo` with the effective plan, file-header
+  length, and physical segment ranges. Native files are projected from strict
+  `RecordIndexEntry` scans into the same `LayoutSegmentInfo` shape used by
+  custom segment layouts.
 - `LayoutPreset::None` lets a declared layout own byte zero. This is the first
   custom physical-layout path and is intended for append segment formats whose
   lead-in is not `VARVE1/2/3`, such as TDMS-style `TDSm` segments.
@@ -179,6 +184,8 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Omitted or explicit `preset: varve_native` exposes an effective layout plan
   containing `VarveFileHeader`, repeated `VarveRecord`, and, when applicable,
   `VarveRecordFooter`.
+- `inspect_layout_file` works for both native preset files and `preset: none`
+  custom physical layouts.
 - A TDMS-style custom layout can write files whose first bytes are `TDSm`, whose
   `next_segment_offset` and `raw_data_offset` fields are backpatched to actual
   metadata/raw boundaries, whose ToC/version fields are visible through

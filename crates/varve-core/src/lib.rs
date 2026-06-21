@@ -46,7 +46,8 @@ pub use format::{
     RecoveryPolicy, SegmentDescriptor, SegmentRepeat, TransactionMarkerMode, VariableCompression,
 };
 pub use layout::{
-    LayoutFieldValue, LayoutReader, LayoutSegmentInfo, LayoutValue, LayoutWriter, SegmentWrite,
+    LayoutFieldValue, LayoutFileInfo, LayoutReader, LayoutSegmentInfo, LayoutValue, LayoutWriter,
+    SegmentWrite,
 };
 pub use matrix::{
     MatrixCellStatus, MatrixCommitEvent, MatrixCorruptionKind, MatrixCorruptionSeverity,
