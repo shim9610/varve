@@ -195,7 +195,9 @@ metadata and raw regions.
 | `FormatLayoutReader::data_segments()` | generated typed segment info collection |
 | `FormatLayoutReader::file_header()` | generated typed file-header info when a `file_header` is declared |
 | `FormatLayoutReader::read_data_segment_metadata(index)` | generated metadata reader for the declared segment |
+| `FormatLayoutReader::read_data_segment_metadata_range(index, offset, len)` | generated bounded metadata subrange reader |
 | `FormatLayoutReader::read_data_segment_raw(index)` | generated raw-region reader for the declared segment |
+| `FormatLayoutReader::read_data_segment_raw_range(index, offset, len)` | generated bounded raw-region subrange reader |
 | `LayoutWriter::write_segment(SegmentWrite)` | write lead-in, metadata, raw bytes, footer, then backpatch offsets |
 | `SegmentWrite::fields` | caller values for lead-in fields |
 | `SegmentWrite::footer_fields` | caller values for footer fields |
@@ -206,7 +208,9 @@ metadata and raw regions.
 | `LayoutSegmentInfo::field(name)` | read validated lead-in values such as ToC mask or version |
 | `LayoutSegmentInfo::footer_field(name)` | read validated footer values |
 | `LayoutReader::read_metadata(index)` | read opaque metadata bytes for a segment |
+| `LayoutReader::read_metadata_range(index, offset, len)` | read a checked metadata byte range without loading the whole region |
 | `LayoutReader::read_raw(index)` | read contiguous raw-region bytes for a segment |
+| `LayoutReader::read_raw_range(index, offset, len)` | read a checked raw byte range without loading the whole region |
 
 This path is separate from `create_writer/open_reader`; native append-log APIs
 still write the `VARVE1/2/3` container. TDMS-style files use `preset: none` so
@@ -268,17 +272,17 @@ let header = reader.file_header();
 assert_eq!(header.header_version()?, 1);
 let first = reader.data_segment(0)?.unwrap();
 assert_eq!(first.toc_mask()?, 0x1108);
-let raw = reader.read_data_segment_raw(0)?;
+let raw_slice = reader.read_data_segment_raw_range(0, 8, 8)?;
 ```
 
 The generated wrapper still exposes the low-level `write_segment`,
-`read_metadata`, `read_raw`, and `segments` methods for adapters that need to
-bridge dynamic metadata. Multiple segment descriptors are dispatched by their
-leading literal lead-in prefix. A byte tag such as `bytes tag = b"DATA"` is the
-common discriminator; immediately following literal numeric fields extend the
-dispatch key. Generated segment-specific `index` parameters are per segment
-kind, while the low-level `read_metadata(index)` and `read_raw(index)` methods
-continue to use the global physical stream index.
+`read_metadata`, `read_metadata_range`, `read_raw`, `read_raw_range`, and
+`segments` methods for adapters that need to bridge dynamic metadata. Multiple
+segment descriptors are dispatched by their leading literal lead-in prefix. A
+byte tag such as `bytes tag = b"DATA"` is the common discriminator; immediately
+following literal numeric fields extend the dispatch key. Generated
+segment-specific `index` parameters are per segment kind, while the low-level
+range methods continue to use the global physical stream index.
 
 `crates/varve/examples/tdms_physical_writer.rs` demonstrates a public-API TDMS
 writer, and `scripts/verify_tdms_with_nptdms.py` verifies the produced file
@@ -286,6 +290,12 @@ with the optional Python `npTDMS` harness. The reverse harness,
 `scripts/verify_nptdms_multichannel_with_varve.py`, writes a two-channel TDMS
 file with `npTDMS` and parses it with
 `crates/varve/examples/tdms_physical_reader.rs`.
+
+`crates/varve/examples/bmp_physical.rs` is the non-TDMS external-format smoke
+example. `scripts/verify_bmp_with_pillow.py` writes a 24-bit BMP through
+Varve's generated layout writer and verifies it with Pillow, then writes a BMP
+with Pillow and verifies the physical header and pixel payload through Varve's
+layout reader.
 
 ## Mmap And Zero-Copy
 

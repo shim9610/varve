@@ -495,6 +495,21 @@ impl LayoutReader {
         read_range(&self.path, segment.metadata_offset, segment.metadata_len)
     }
 
+    pub fn read_metadata_range(&self, index: usize, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let segment = self
+            .segments
+            .get(index)
+            .ok_or(Error::LayoutInvalidSegmentBounds { offset: 0 })?;
+        let absolute = checked_subrange(
+            segment.metadata_offset,
+            segment.metadata_len,
+            offset,
+            len,
+            segment.segment_start,
+        )?;
+        read_range(&self.path, absolute, len)
+    }
+
     pub fn read_raw(&self, index: usize) -> Result<Vec<u8>> {
         let segment = self
             .segments
@@ -502,6 +517,44 @@ impl LayoutReader {
             .ok_or(Error::LayoutInvalidSegmentBounds { offset: 0 })?;
         read_range(&self.path, segment.raw_offset, segment.raw_len)
     }
+
+    pub fn read_raw_range(&self, index: usize, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let segment = self
+            .segments
+            .get(index)
+            .ok_or(Error::LayoutInvalidSegmentBounds { offset: 0 })?;
+        let absolute = checked_subrange(
+            segment.raw_offset,
+            segment.raw_len,
+            offset,
+            len,
+            segment.segment_start,
+        )?;
+        read_range(&self.path, absolute, len)
+    }
+}
+
+fn checked_subrange(
+    base: u64,
+    total_len: u64,
+    offset: u64,
+    len: u64,
+    error_offset: u64,
+) -> Result<u64> {
+    let end = offset
+        .checked_add(len)
+        .ok_or(Error::LayoutInvalidSegmentBounds {
+            offset: error_offset,
+        })?;
+    if end > total_len {
+        return Err(Error::LayoutInvalidSegmentBounds {
+            offset: error_offset,
+        });
+    }
+    base.checked_add(offset)
+        .ok_or(Error::LayoutInvalidSegmentBounds {
+            offset: error_offset,
+        })
 }
 
 fn ensure_custom_layout_spec(spec: FormatSpec) -> Result<()> {
@@ -1212,42 +1265,21 @@ fn read_layout_segment_at(
                 })?;
     }
 
-    let raw_rel = finalized_value_for(
+    let metadata_offset = after_lead_in;
+    let raw_offset = finalized_target_absolute(
         &finalized,
         LayoutAnchor::RawRegionStart,
-        LayoutAnchor::AfterLeadIn,
         segment_start,
+        after_lead_in,
+        None,
     )?;
-    let end_rel = finalized_value_for(
+    let segment_end = finalized_target_absolute(
         &finalized,
         LayoutAnchor::SegmentEnd,
-        LayoutAnchor::AfterLeadIn,
         segment_start,
+        after_lead_in,
+        Some(raw_offset),
     )?;
-    if raw_rel < 0 || end_rel < 0 || raw_rel > end_rel {
-        return Err(Error::LayoutInvalidSegmentBounds {
-            offset: segment_start,
-        });
-    }
-    let raw_rel = u64::try_from(raw_rel).map_err(|_| Error::LayoutInvalidSegmentBounds {
-        offset: segment_start,
-    })?;
-    let end_rel = u64::try_from(end_rel).map_err(|_| Error::LayoutInvalidSegmentBounds {
-        offset: segment_start,
-    })?;
-    let metadata_offset = after_lead_in;
-    let raw_offset =
-        after_lead_in
-            .checked_add(raw_rel)
-            .ok_or(Error::LayoutInvalidSegmentBounds {
-                offset: segment_start,
-            })?;
-    let segment_end =
-        after_lead_in
-            .checked_add(end_rel)
-            .ok_or(Error::LayoutInvalidSegmentBounds {
-                offset: segment_start,
-            })?;
     let footer_offset =
         segment_end
             .checked_sub(footer_len)
@@ -1372,25 +1404,54 @@ fn read_footer_layout_fields(
     Ok(fields)
 }
 
-fn finalized_value_for(
+fn finalized_target_absolute(
     values: &[(LayoutFieldDescriptor, LayoutFinalize, LayoutValue)],
     target: LayoutAnchor,
-    relative_to: LayoutAnchor,
     segment_start: u64,
-) -> Result<i128> {
-    values
-        .iter()
-        .find_map(|(_, finalize, value)| {
-            if finalize.target == target && finalize.relative_to == relative_to {
-                Some(layout_value_to_i128(value))
-            } else {
-                None
-            }
-        })
-        .transpose()?
-        .ok_or(Error::LayoutInvalidSegmentBounds {
-            offset: segment_start,
-        })
+    after_lead_in: u64,
+    raw_region_start: Option<u64>,
+) -> Result<u64> {
+    for (_, finalize, value) in values {
+        if finalize.target != target {
+            continue;
+        }
+        let Some(relative) = known_scan_anchor_value(
+            finalize.relative_to,
+            segment_start,
+            after_lead_in,
+            raw_region_start,
+        ) else {
+            continue;
+        };
+        let absolute = i128::from(relative)
+            .checked_add(layout_value_to_i128(value)?)
+            .ok_or(Error::LayoutInvalidSegmentBounds {
+                offset: segment_start,
+            })?;
+        if absolute < 0 || absolute > i128::from(u64::MAX) {
+            return Err(Error::LayoutInvalidSegmentBounds {
+                offset: segment_start,
+            });
+        }
+        return Ok(absolute as u64);
+    }
+    Err(Error::LayoutInvalidSegmentBounds {
+        offset: segment_start,
+    })
+}
+
+fn known_scan_anchor_value(
+    anchor: LayoutAnchor,
+    segment_start: u64,
+    after_lead_in: u64,
+    raw_region_start: Option<u64>,
+) -> Option<u64> {
+    match anchor {
+        LayoutAnchor::SegmentStart => Some(segment_start),
+        LayoutAnchor::AfterLeadIn | LayoutAnchor::MetadataStart => Some(after_lead_in),
+        LayoutAnchor::RawRegionStart => raw_region_start,
+        LayoutAnchor::SegmentEnd | LayoutAnchor::FooterStart | LayoutAnchor::FooterEnd => None,
+    }
 }
 
 fn layout_value_to_i128(value: &LayoutValue) -> Result<i128> {
@@ -1490,6 +1551,21 @@ fn finalized_value(field: LayoutFieldDescriptor, anchors: Anchors) -> Result<Lay
             offset: anchors.segment_start,
         })?;
     match field.ty {
+        LayoutFieldType::U8 => Ok(LayoutValue::U8(u8::try_from(value).map_err(|_| {
+            Error::LayoutInvalidSegmentBounds {
+                offset: anchors.segment_start,
+            }
+        })?)),
+        LayoutFieldType::U16 => Ok(LayoutValue::U16(u16::try_from(value).map_err(|_| {
+            Error::LayoutInvalidSegmentBounds {
+                offset: anchors.segment_start,
+            }
+        })?)),
+        LayoutFieldType::U32 => Ok(LayoutValue::U32(u32::try_from(value).map_err(|_| {
+            Error::LayoutInvalidSegmentBounds {
+                offset: anchors.segment_start,
+            }
+        })?)),
         LayoutFieldType::U64 => Ok(LayoutValue::U64(value)),
         LayoutFieldType::I64 => Ok(LayoutValue::I64(i64::try_from(value).map_err(|_| {
             Error::LayoutInvalidSegmentBounds {

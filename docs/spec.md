@@ -154,11 +154,15 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   finalize(target = segment_end, relative_to = after_lead_in); } metadata Name;
   raw_region Name; footer Footer { bytes seal = b"..."; u64 len =
   finalize(target = segment_end, relative_to = segment_start); } } }`.
+- Custom physical layout scanning accepts numeric finalized fields with the
+  target format's required integer width. Segment `raw_region_start` may be
+  resolved relative to `segment_start`, `after_lead_in`, or `metadata_start`;
+  `segment_end` may additionally be resolved relative to `raw_region_start`.
 - Format-first custom layout declarations generate typed
   `FormatLayoutWriter` / `FormatLayoutReader` wrappers, typed header-field
   structs, typed header info getters, typed segment write structs, and typed
   segment info getters. The generated wrapper still exposes the low-level
-  `SegmentWrite` path.
+  `SegmentWrite` path and whole-region or range metadata/raw readers.
 - Physical layout declarations are not `VarveBlock` payload declarations:
   `VarveBlock` is the logical native append-log record unit, while
   `file_header`, `lead_in`, `footer`, `metadata`, and `raw_region` declare the
@@ -216,6 +220,9 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - The reverse TDMS harness generates a two-segment, two-channel TDMS file with
   Python `npTDMS`, then parses it through Varve's generated layout reader and a
   caller-owned TDMS metadata/raw parser.
+- The BMP/Pillow harness verifies a non-TDMS custom physical layout in both
+  directions: Varve writes a 24-bit BMP opened by Pillow, and Pillow writes a
+  BMP whose header fields and pixel payload are decoded by Varve.
 - A custom physical layout with a declared file header and segment footer writes
   those bytes at the declared offsets, exposes `file_header_len` and validated
   file-header values, and excludes footer bytes from the segment raw-region

@@ -67,6 +67,23 @@ let report = MatrixFormat::self_test("matrix-check.varve")
 
 Use a temporary path. Self-test creation truncates the target file.
 
+## External Compatibility Harnesses
+
+When custom physical layout behavior is in question, run the optional Python
+harnesses to compare Varve output with established readers and writers:
+
+```powershell
+python -m venv .venv-tdms
+.\.venv-tdms\Scripts\python.exe -m pip install -r scripts\requirements-tdms-harness.txt
+.\.venv-tdms\Scripts\python.exe scripts\verify_tdms_with_nptdms.py
+.\.venv-tdms\Scripts\python.exe scripts\verify_nptdms_multichannel_with_varve.py
+.\.venv-tdms\Scripts\python.exe scripts\verify_bmp_with_pillow.py
+```
+
+The TDMS harnesses check Varve-authored files against `npTDMS` and
+`npTDMS`-authored multichannel files against Varve. The BMP harness checks a
+non-TDMS layout in both directions with Pillow.
+
 ## Domain Meaning
 
 - `FormatDefinition`: the declared schema or policy is suspicious.

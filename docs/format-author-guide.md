@@ -341,10 +341,15 @@ For format-first declarations, the macro generates a typed physical-layout
 facade. `PhysicalFormat::create_layout_writer` returns
 `PhysicalFormatLayoutWriter`, and `segment DataSegment` generates
 `write_data_segment`, `data_segments`, `data_segment`,
-`read_data_segment_metadata`, and `read_data_segment_raw`. A declared
+`read_data_segment_metadata`, `read_data_segment_metadata_range`,
+`read_data_segment_raw`, and `read_data_segment_raw_range`. A declared
 `file_header` also generates `file_header()` on the layout reader. Caller fields
 become typed Rust struct fields; literal and finalized fields are supplied,
 validated, or backpatched by Varve, then exposed through typed info getters.
+Finalized numeric fields may use the numeric width required by the target
+format. For example, BMP-style headers can use `u32 file_size` relative to
+`segment_start`, while TDMS-style headers can use `u64 next_segment_offset`
+relative to `after_lead_in`.
 
 Formats can declare more than one segment descriptor. The reader chooses the
 descriptor at each file offset from the leading literal lead-in prefix, for
@@ -359,7 +364,8 @@ through the generated wrapper for dynamic adapters. Reopen the same file with
 `open_layout_writer` when you need to validate the existing segment stream and
 append more segments. `open_layout_reader` validates literal tags, offset
 fields, header/footer bounds, exposes typed getters on generated
-`...LayoutInfo`, and still returns opaque `read_metadata` and `read_raw` ranges.
+`...LayoutInfo`, and still returns opaque `read_metadata`, `read_metadata_range`,
+`read_raw`, and `read_raw_range` methods.
 
 For concrete compatibility checks, `crates/varve/examples/tdms_physical_writer.rs`
 writes a minimal two-segment TDMS file with real `TDSm` lead-ins, TDMS object
@@ -375,10 +381,11 @@ python -m venv .venv-tdms
 .\.venv-tdms\Scripts\python.exe -m pip install -r scripts\requirements-tdms-harness.txt
 .\.venv-tdms\Scripts\python.exe scripts\verify_tdms_with_nptdms.py
 .\.venv-tdms\Scripts\python.exe scripts\verify_nptdms_multichannel_with_varve.py
+.\.venv-tdms\Scripts\python.exe scripts\verify_bmp_with_pillow.py
 ```
 
-`npTDMS` is used only as an external verification harness dependency, not as a
-Rust crate dependency or runtime dependency of Varve.
+`npTDMS` and Pillow are used only as external verification harness dependencies,
+not as Rust crate dependencies or runtime dependencies of Varve.
 
 ## Read And Write
 

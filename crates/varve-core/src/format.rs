@@ -1211,7 +1211,10 @@ impl FormatSpec {
                 field.source,
                 LayoutFieldSource::Finalize(LayoutFinalize {
                     target: LayoutAnchor::SegmentEnd,
-                    relative_to: LayoutAnchor::AfterLeadIn
+                    relative_to: LayoutAnchor::SegmentStart
+                        | LayoutAnchor::AfterLeadIn
+                        | LayoutAnchor::MetadataStart
+                        | LayoutAnchor::RawRegionStart
                 })
             )
         });
@@ -1220,13 +1223,15 @@ impl FormatSpec {
                 field.source,
                 LayoutFieldSource::Finalize(LayoutFinalize {
                     target: LayoutAnchor::RawRegionStart,
-                    relative_to: LayoutAnchor::AfterLeadIn
+                    relative_to: LayoutAnchor::SegmentStart
+                        | LayoutAnchor::AfterLeadIn
+                        | LayoutAnchor::MetadataStart
                 })
             )
         });
         if !has_segment_end || !has_raw_start {
             return Err(Error::InvalidFormatSpec(
-                "layout segment requires finalized segment_end and raw_region_start fields relative to after_lead_in",
+                "layout segment requires scan-resolvable finalized segment_end and raw_region_start fields",
             ));
         }
         Ok(())
@@ -1274,10 +1279,10 @@ impl FormatSpec {
                 ));
             }
             if matches!(field.source, LayoutFieldSource::Finalize(_))
-                && !matches!(field.ty, LayoutFieldType::U64 | LayoutFieldType::I64)
+                && matches!(field.ty, LayoutFieldType::Bytes { .. })
             {
                 return Err(Error::InvalidFormatSpec(
-                    "finalized layout fields must be u64 or i64",
+                    "finalized layout fields must be numeric",
                 ));
             }
             for other in &fields[(index + 1)..] {

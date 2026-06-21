@@ -2633,8 +2633,26 @@ fn layout_typed_api_tokens(
                 self.inner.read_metadata(index)
             }
 
+            pub fn read_metadata_range(
+                &self,
+                index: usize,
+                offset: u64,
+                len: u64,
+            ) -> ::varve::__core::Result<Vec<u8>> {
+                self.inner.read_metadata_range(index, offset, len)
+            }
+
             pub fn read_raw(&self, index: usize) -> ::varve::__core::Result<Vec<u8>> {
                 self.inner.read_raw(index)
+            }
+
+            pub fn read_raw_range(
+                &self,
+                index: usize,
+                offset: u64,
+                len: u64,
+            ) -> ::varve::__core::Result<Vec<u8>> {
+                self.inner.read_raw_range(index, offset, len)
             }
 
             fn __varve_layout_segment_index(
@@ -2878,7 +2896,12 @@ fn layout_reader_segment_methods_tokens(
     let plural = plural_method_ident(&segment.name);
     let singular = format_ident!("{}", singular_method_name(&segment.name));
     let read_metadata = format_ident!("read_{}_metadata", singular_method_name(&segment.name));
+    let read_metadata_range = format_ident!(
+        "read_{}_metadata_range",
+        singular_method_name(&segment.name)
+    );
     let read_raw = format_ident!("read_{}_raw", singular_method_name(&segment.name));
+    let read_raw_range = format_ident!("read_{}_raw_range", singular_method_name(&segment.name));
     let info_type = format_ident!("{}{}LayoutInfo", format_name, segment.name);
     let segment_name = segment.name.to_string();
     quote! {
@@ -2906,9 +2929,29 @@ fn layout_reader_segment_methods_tokens(
             self.inner.read_metadata(index)
         }
 
+        pub fn #read_metadata_range(
+            &self,
+            index: usize,
+            offset: u64,
+            len: u64,
+        ) -> ::varve::__core::Result<Vec<u8>> {
+            let index = self.__varve_layout_segment_index(#segment_name, index)?;
+            self.inner.read_metadata_range(index, offset, len)
+        }
+
         pub fn #read_raw(&self, index: usize) -> ::varve::__core::Result<Vec<u8>> {
             let index = self.__varve_layout_segment_index(#segment_name, index)?;
             self.inner.read_raw(index)
+        }
+
+        pub fn #read_raw_range(
+            &self,
+            index: usize,
+            offset: u64,
+            len: u64,
+        ) -> ::varve::__core::Result<Vec<u8>> {
+            let index = self.__varve_layout_segment_index(#segment_name, index)?;
+            self.inner.read_raw_range(index, offset, len)
         }
     }
 }

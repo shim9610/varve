@@ -42,8 +42,9 @@
 - `LayoutWriter` and `LayoutReader` provide the first non-native physical path
   for optional file header + repeated segments. The initial verified targets are
   TDMS `TDSm` lead-in + TDMS metadata bytes + contiguous raw channel bytes
-  verified by `npTDMS`, and a generic framed layout with declared file header
-  and segment footer.
+  verified by `npTDMS`, 24-bit BMP headers and pixel payloads verified by
+  Pillow, and a generic framed layout with declared file header and segment
+  footer.
 - Custom physical readers can dispatch multiple declared segment descriptors by
   leading literal lead-in prefixes, including a byte tag plus literal numeric
   kind fields.
@@ -125,6 +126,9 @@
 - TDMS compatibility is checked by optional Python harnesses: one opens a
   Varve-authored TDMS file with `npTDMS`, and the other generates a
   two-channel `npTDMS` file and parses it through Varve's layout reader.
+- Non-TDMS physical-format compatibility is checked by a BMP/Pillow harness:
+  Varve writes a 24-bit BMP that Pillow opens, then Pillow writes a BMP that
+  Varve validates and decodes through the generated layout reader.
 - The purpose is regression detection, especially accidental O(n^2) scans, excessive allocation, or unexpected slow open/merge/compact paths.
 - Performance smoke output is not a product guarantee before stabilization, but a large unexplained slowdown blocks integration.
 
@@ -132,9 +136,10 @@
 
 - Direct dependencies are permissive OSS candidates: `syn`, `quote`, `proc-macro2`, `thiserror`, optional `crc32fast`, `memmap2`, `zerocopy`, and `zstd`.
 - Test dependencies include `trybuild` and `proptest`.
-- The optional TDMS compatibility harness uses Python `npTDMS` only outside the
-  Rust crate dependency graph. `pip show nptdms` reports LGPL; this is a
-  harness-only dependency and is not linked into or redistributed by the Rust
+- The optional compatibility harnesses use Python `npTDMS` and Pillow only
+  outside the Rust crate dependency graph. `pip show nptdms` reports LGPL, and
+  Pillow is distributed under the permissive HPND license family; both are
+  harness-only dependencies and are not linked into or redistributed by the Rust
   library.
 - The current direct and transitive dependency graph has been audited from `cargo metadata --all-features` and exposes commercially usable permissive license choices.
 

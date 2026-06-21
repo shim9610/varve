@@ -84,6 +84,42 @@ varve_format! {
 }
 
 varve_format! {
+    pub format BmpPhysicalFormat {
+        magic: b"BMPX";
+        version: 1;
+        endian: little;
+        schema_hash: computed;
+        extension: "bmp";
+        preset: none;
+
+        layout {
+            segment BitmapImage repeat once {
+                lead_in BitmapHeader {
+                    bytes signature = b"BM";
+                    u32 file_size = finalize(target = segment_end, relative_to = segment_start);
+                    u32 reserved = 0;
+                    u32 pixel_data_offset = finalize(target = raw_region_start, relative_to = segment_start);
+                    u32 dib_header_size = 40;
+                    u32 width;
+                    u32 height;
+                    u16 planes = 1;
+                    u16 bits_per_pixel = 24;
+                    u32 compression = 0;
+                    u32 image_size = finalize(target = segment_end, relative_to = raw_region_start);
+                    u32 x_pixels_per_meter = 2835;
+                    u32 y_pixels_per_meter = 2835;
+                    u32 colors_used = 0;
+                    u32 important_colors = 0;
+                }
+
+                metadata BitmapMetadata;
+                raw_region BitmapPixels;
+            }
+        }
+    }
+}
+
+varve_format! {
     pub format FramedPhysicalFormat {
         magic: b"FRAM";
         version: 1;
@@ -579,12 +615,72 @@ fn custom_layout_writes_file_header_and_segment_footer() -> varve::Result<()> {
         Some(&LayoutValue::U64(43))
     );
     assert_eq!(reader.read_metadata(0)?, b"abc");
+    assert_eq!(reader.read_metadata_range(0, 1, 2)?, b"bc");
+    assert!(matches!(
+        reader.read_metadata_range(0, 2, 2),
+        Err(Error::LayoutInvalidSegmentBounds { .. })
+    ));
     assert_eq!(reader.read_raw(0)?, raw);
+    assert_eq!(reader.read_raw_range(0, 1, 2)?, b"at");
 
     let inspected = FramedPhysicalFormat::inspect_layout_file(&path)?;
     assert_eq!(inspected.plan.preset, LayoutPreset::None);
     assert_eq!(inspected.file_header_len, 6);
     assert_eq!(inspected.segments.as_slice(), reader.segments());
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn bmp_style_layout_uses_u32_finalized_offsets() -> varve::Result<()> {
+    let path = temp_path("bmp_style_physical_layout");
+    cleanup(&path);
+
+    let pixels = vec![0, 0, 255, 255, 255, 255, 0, 0, 0, 255, 0, 255, 0, 0, 0, 0];
+
+    {
+        let mut writer = BmpPhysicalFormat::create_layout_writer(&path)?;
+        let info = writer.write_bitmap_image(BmpPhysicalFormatBitmapImageLayoutWrite {
+            fields: BmpPhysicalFormatBitmapImageLayoutFields {
+                width: 2,
+                height: 2,
+            },
+            footer_fields: BmpPhysicalFormatBitmapImageLayoutFooterFields,
+            metadata: b"",
+            raw: &pixels,
+        })?;
+        assert_eq!(info.file_size()?, 70);
+        assert_eq!(info.pixel_data_offset()?, 54);
+        assert_eq!(info.image_size()?, 16);
+        writer.flush()?;
+    }
+
+    let bytes = read(&path)?;
+    assert_eq!(&bytes[0..2], b"BM");
+    assert_eq!(u32_at(&bytes, 2), 70);
+    assert_eq!(u32_at(&bytes, 10), 54);
+    assert_eq!(u32_at(&bytes, 34), 16);
+    assert_eq!(&bytes[54..], pixels.as_slice());
+
+    let reader = BmpPhysicalFormat::open_layout_reader(&path)?;
+    let image = reader.bitmap_image(0)?.expect("bitmap image segment");
+    assert_eq!(image.signature()?, b"BM");
+    assert_eq!(image.file_size()?, 70);
+    assert_eq!(image.pixel_data_offset()?, 54);
+    assert_eq!(image.width()?, 2);
+    assert_eq!(image.height()?, 2);
+    assert_eq!(image.image_size()?, 16);
+    assert_eq!(reader.read_bitmap_image_metadata(0)?, b"");
+    assert_eq!(reader.read_bitmap_image_raw(0)?, pixels);
+    assert_eq!(
+        reader.read_bitmap_image_raw_range(0, 8, 3)?,
+        vec![0, 255, 0]
+    );
+    assert!(matches!(
+        reader.read_bitmap_image_raw_range(0, 15, 2),
+        Err(Error::LayoutInvalidSegmentBounds { .. })
+    ));
 
     cleanup(&path);
     Ok(())
@@ -632,7 +728,15 @@ fn typed_layout_api_writes_and_reads_tdms_style_segments() -> varve::Result<()> 
     assert_eq!(segments[0].raw_data_offset()?, metadata.len() as u64);
     assert_eq!(reader.tdms_segment(0)?.unwrap().version()?, 4713);
     assert_eq!(reader.read_tdms_segment_metadata(0)?, metadata);
+    assert_eq!(
+        reader.read_tdms_segment_metadata_range(0, 6, 7)?,
+        b"objects"
+    );
     assert_eq!(reader.read_tdms_segment_raw(0)?, raw);
+    assert_eq!(
+        f64_values(&reader.read_tdms_segment_raw_range(0, 8, 8)?),
+        vec![3.5]
+    );
 
     cleanup(&path);
     Ok(())
@@ -921,7 +1025,12 @@ fn tdms_style_layout_writes_physical_leadin_offsets_and_raw_region() -> varve::R
     assert_eq!(segment.metadata_len, metadata.len() as u64);
     assert_eq!(segment.raw_len, raw.len() as u64);
     assert_eq!(reader.read_metadata(0)?, metadata);
+    assert_eq!(reader.read_metadata_range(0, 0, 7)?, b"objects");
     assert_eq!(reader.read_raw(0)?, raw);
+    assert_eq!(
+        f64_values(&reader.read_tdms_segment_raw_range(0, 8, 8)?),
+        vec![0.50]
+    );
 
     cleanup(&path);
     Ok(())
