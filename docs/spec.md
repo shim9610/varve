@@ -213,6 +213,9 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   using only Varve's generated layout APIs. The optional Python harness opens
   that file with `npTDMS` and verifies file properties, group/channel lookup,
   channel properties, and appended raw `f64` samples.
+- The reverse TDMS harness generates a two-segment, two-channel TDMS file with
+  Python `npTDMS`, then parses it through Varve's generated layout reader and a
+  caller-owned TDMS metadata/raw parser.
 - A custom physical layout with a declared file header and segment footer writes
   those bytes at the declared offsets, exposes `file_header_len` and validated
   file-header values, and excludes footer bytes from the segment raw-region

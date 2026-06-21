@@ -122,8 +122,9 @@
 - The suite covers small, medium, and large cases for append/open/scan, checkpoint open, materialized keyed state, merge, compact, direct base+delta compact, recovery, mmap payload windows, matrix direct access, matrix aux regions, and zero-copy raw fixed reads.
 - It also covers custom physical layout append and open/scan so layout DSL
   changes expose obvious framing or scan regressions.
-- TDMS compatibility is checked by an optional Python harness that runs the
-  Varve TDMS writer example and opens the output with `npTDMS`.
+- TDMS compatibility is checked by optional Python harnesses: one opens a
+  Varve-authored TDMS file with `npTDMS`, and the other generates a
+  two-channel `npTDMS` file and parses it through Varve's layout reader.
 - The purpose is regression detection, especially accidental O(n^2) scans, excessive allocation, or unexpected slow open/merge/compact paths.
 - Performance smoke output is not a product guarantee before stabilization, but a large unexplained slowdown blocks integration.
 

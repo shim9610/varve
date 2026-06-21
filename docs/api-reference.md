@@ -282,7 +282,10 @@ continue to use the global physical stream index.
 
 `crates/varve/examples/tdms_physical_writer.rs` demonstrates a public-API TDMS
 writer, and `scripts/verify_tdms_with_nptdms.py` verifies the produced file
-with the optional Python `npTDMS` harness.
+with the optional Python `npTDMS` harness. The reverse harness,
+`scripts/verify_nptdms_multichannel_with_varve.py`, writes a two-channel TDMS
+file with `npTDMS` and parses it with
+`crates/varve/examples/tdms_physical_reader.rs`.
 
 ## Mmap And Zero-Copy
 

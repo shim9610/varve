@@ -361,16 +361,20 @@ append more segments. `open_layout_reader` validates literal tags, offset
 fields, header/footer bounds, exposes typed getters on generated
 `...LayoutInfo`, and still returns opaque `read_metadata` and `read_raw` ranges.
 
-For a concrete compatibility check, `crates/varve/examples/tdms_physical_writer.rs`
+For concrete compatibility checks, `crates/varve/examples/tdms_physical_writer.rs`
 writes a minimal two-segment TDMS file with real `TDSm` lead-ins, TDMS object
 metadata, a channel raw-data index, and appended contiguous `f64` samples using
 only the generated physical-layout writer. The optional Python harness verifies
-that file with `npTDMS`:
+that file with `npTDMS`. The reverse harness creates a two-segment, two-channel
+TDMS file with `npTDMS`, then parses it with
+`crates/varve/examples/tdms_physical_reader.rs` through Varve's generated
+layout reader:
 
 ```powershell
 python -m venv .venv-tdms
 .\.venv-tdms\Scripts\python.exe -m pip install -r scripts\requirements-tdms-harness.txt
 .\.venv-tdms\Scripts\python.exe scripts\verify_tdms_with_nptdms.py
+.\.venv-tdms\Scripts\python.exe scripts\verify_nptdms_multichannel_with_varve.py
 ```
 
 `npTDMS` is used only as an external verification harness dependency, not as a
