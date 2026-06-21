@@ -1,0 +1,128 @@
+# Varve Self-Check Guide
+
+This guide is for application developers who need to decide whether a failure is
+caused by a Varve library bug, a bad format declaration, a wrong API call, a
+feature flag mismatch, or damaged file bytes.
+
+## Static Format Diagnostics
+
+Run diagnostics before creating long-lived files:
+
+```rust
+let report = AppFormat::diagnostics();
+assert!(report.passed(), "{report:#?}");
+println!("computed schema hash: {:#018x}", report.computed_schema_hash);
+```
+
+`FormatSpec::diagnostics()` checks the static registry, schema hash state,
+matrix declarations, and required feature gates. Each diagnostic has:
+
+- `severity`: `Info`, `Warning`, or `Error`
+- `domain`: where to look first
+- `code`: stable machine-readable category
+- `message` and optional `hint`
+
+## File Diagnostics
+
+Use file diagnostics when a real file fails to open or read:
+
+```rust
+let report = AppFormat::diagnose_file("data.varve");
+for item in &report.items {
+    eprintln!("{:?} {:?} {}: {}", item.severity, item.domain, item.code, item.message);
+}
+```
+
+This opens the file read-only, validates record payloads logically, checks
+compression and CRC feature gates, compares embedded manifests when present, and
+reports matrix recovery findings.
+
+## End-To-End Self Test
+
+Self-tests create a disposable Varve file, write caller-provided sample values,
+reopen it read-only, and verify that the generated/runtime APIs roundtrip those
+values:
+
+```rust
+let report = AppFormat::self_test("self-check.varve")
+    .with_block(Point { x: 1, y: 2 })
+    .with_keyed_block(User { id: 7, name: "Ada".into(), flags: 0 })
+    .cleanup(true)
+    .run();
+
+assert!(report.passed(), "{report:#?}");
+```
+
+For matrix formats:
+
+```rust
+let report = MatrixFormat::self_test("matrix-check.varve")
+    .with_dims(MatrixDimensions::from_pairs([("scan", 2), ("ch", 2)]))
+    .with_matrix_cell(MatrixKey::new(0, 0), Cell { value: 9 })
+    .with_uncommitted_matrix_cell(MatrixKey::new(1, 1), Cell { value: 11 })
+    .with_matrix_aux("scratch", 0, [1, 2, 3, 4])
+    .cleanup(true)
+    .run();
+```
+
+Use a temporary path. Self-test creation truncates the target file.
+
+## External Compatibility Harnesses
+
+When custom physical layout behavior is in question, run the optional Python
+harnesses to compare Varve output with established readers and writers:
+
+```powershell
+python -m venv .venv-tdms
+.\.venv-tdms\Scripts\python.exe -m pip install -r scripts\requirements-tdms-harness.txt
+.\.venv-tdms\Scripts\python.exe scripts\verify_tdms_with_nptdms.py
+.\.venv-tdms\Scripts\python.exe scripts\verify_nptdms_multichannel_with_varve.py
+.\.venv-tdms\Scripts\python.exe scripts\verify_bmp_with_pillow.py
+```
+
+The TDMS harnesses check Varve-authored example files against `npTDMS` and
+`npTDMS`-authored scalar type matrix files against a Varve-based example
+adapter. The covered TDMS proof set includes signed/unsigned integer widths,
+single/double floats, booleans, strings, timestamps, complex single/double
+floats, changed raw-data-index segments, `same-as-previous` raw-index reuse,
+mixed objects in one segment, and Varve append into an npTDMS-authored file.
+The Varve-authored direction also covers npTDMS-readable
+`SingleFloatWithUnit`/`DoubleFloatWithUnit` channel type ids; the reverse
+npTDMS-authored direction omits those two because npTDMS 1.10.0 does not author
+them correctly through its normal `ChannelObject` writer path. The BMP harness
+checks a non-TDMS layout in both directions with Pillow.
+
+For TDMS-style work, remember that the repository contains adapter proofs, not
+a Varve-provided TDMS reader/writer. Use `docs/nptdms-adapter-boundary.md` to
+decide whether a failure belongs to Varve's generic API or to caller-owned TDMS
+semantics. A quick rule:
+
+- If strict layout open succeeds, `inspect_layout_file_report` is complete, and
+  the adapter can read the required metadata/raw byte ranges, failures in TDMS
+  object paths, property typing, scaling, timestamps, channel slicing, or export
+  are caller/adapter issues.
+- If a valid external physical layout cannot be declared, cannot stream or read
+  required byte ranges, or cannot report a truncated tail before TDMS semantics
+  run, treat it as a Varve API limitation.
+
+## Domain Meaning
+
+- `FormatDefinition`: the declared schema or policy is suspicious.
+- `CallerUsage`: API call, dimensions, key, block type, commit state, or sample
+  setup is wrong.
+- `FeatureGate`: enable the required Cargo feature, such as `integrity` or
+  `compression-zstd`.
+- `FileData`: the bytes on disk do not match the supplied static format or
+  failed integrity/decode checks.
+- `Environment`: filesystem permissions, writer lock, or concurrent process
+  issue.
+- `LibraryInvariant`: a self-test roundtrip mismatch after successful write and
+  read. First check custom codecs; if those are simple/correct, minimize and
+  report as a likely Varve bug.
+
+## Practical Rule
+
+If `diagnostics()` passes and a self-test using your actual generated format and
+sample values passes, but your application path still fails, start by checking
+caller-owned policy: dimensions, key construction, commit timing, sidecar
+generation, migration functions, and custom codec semantics.

@@ -1,0 +1,5 @@
+error: missing #[varve(id = ...)]
+ --> tests/ui/fail_missing_block_id.rs:5:8
+  |
+5 | struct MissingId {
+  |        ^^^^^^^^^

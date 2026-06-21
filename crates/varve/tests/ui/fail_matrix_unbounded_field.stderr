@@ -1,0 +1,5 @@
+error: P0 matrix fields must be fixed-width scalar or fixed-array types
+  --> tests/ui/fail_matrix_unbounded_field.rs:17:17
+   |
+17 |                 value: String,
+   |                 ^^^^^

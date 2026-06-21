@@ -1,0 +1,5 @@
+error: unsupported varve kind "stream"; use "fixed", "variable", or "matrix"
+ --> tests/ui/fail_unsupported_kind.rs:4:19
+  |
+4 | #[varve(id = 410, kind = "stream")]
+  |                   ^^^^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: varve block id is reserved; use an id below 0xFFFF_FF00
+ --> tests/ui/fail_reserved_block_id.rs:5:8
+  |
+5 | struct Reserved {
+  |        ^^^^^^^^

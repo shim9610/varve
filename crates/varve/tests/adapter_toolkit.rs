@@ -1,0 +1,354 @@
+use std::fs::{remove_file, write};
+use std::path::PathBuf;
+
+use varve::{
+    AdapterCheckReport, AdapterCheckStatus, AdapterInputFile, AdapterTailStatus, BinaryCursor,
+    BinaryWriter, ChunkEntry, ChunkIndexBuilder, ChunkLayout, Endian, Error, LayoutSegmentInfo,
+    LayoutTailInfo, LayoutTailKind, SegmentReducer, SidecarIdentity, SidecarMode, SidecarPolicy,
+    TaggedValueCodec, reduce_segments_by_ref, varve_format,
+};
+
+varve_format! {
+    pub format AdapterTailFormat {
+        magic: b"ATK";
+        version: 1;
+        endian: little;
+        schema_hash: computed;
+        preset: none;
+
+        layout {
+            segment Data repeat until_eof {
+                lead_in Lead {
+                    bytes tag = b"ATK!";
+                    u32 kind;
+                    u64 next = finalize(target = segment_end, relative_to = after_lead_in);
+                    u64 raw = finalize(target = raw_region_start, relative_to = after_lead_in);
+                }
+
+                metadata Metadata;
+                raw_region Raw;
+            }
+        }
+    }
+}
+
+#[test]
+fn binary_writer_and_cursor_roundtrip_endian_values() -> varve::Result<()> {
+    let mut writer = BinaryWriter::new(Endian::Big);
+    writer.u8(7)?;
+    writer.u16(0x1020)?;
+    writer.u32(0x3040_5060)?;
+    writer.i64(-77)?;
+    writer.f64(3.5)?;
+    writer.array_f64(&[1.25, 2.5])?;
+    writer.len_prefixed_string::<u16>("hello")?;
+
+    let bytes = writer.into_inner();
+    let mut cursor = BinaryCursor::new(&bytes, Endian::Big);
+    assert_eq!(cursor.u8()?, 7);
+    assert_eq!(cursor.u16()?, 0x1020);
+    assert_eq!(cursor.u32()?, 0x3040_5060);
+    assert_eq!(cursor.i64()?, -77);
+    assert_eq!(cursor.f64()?, 3.5);
+    assert_eq!(cursor.array_f64(2)?, vec![1.25, 2.5]);
+    assert_eq!(cursor.len_prefixed_string::<u16>()?, "hello");
+    cursor.finish()?;
+    Ok(())
+}
+
+#[test]
+fn cursor_reports_eof_and_invalid_utf8() -> varve::Result<()> {
+    let mut cursor = BinaryCursor::new(&[1, 2, 3], Endian::Little);
+    assert!(matches!(cursor.u32(), Err(Error::UnexpectedEof)));
+
+    let mut writer = BinaryWriter::new(Endian::Little);
+    writer.len_prefixed_bytes::<u16>(&[0xff])?;
+    let bytes = writer.into_inner();
+    let mut cursor = BinaryCursor::new(&bytes, Endian::Little);
+    assert!(matches!(
+        cursor.len_prefixed_string::<u16>(),
+        Err(Error::InvalidUtf8)
+    ));
+    Ok(())
+}
+
+#[test]
+fn length_prefix_widths_roundtrip() -> varve::Result<()> {
+    let mut writer = BinaryWriter::new(Endian::Little);
+    writer.len_prefixed_bytes::<u8>(b"a")?;
+    writer.len_prefixed_bytes::<u32>(b"bc")?;
+    writer.len_prefixed_bytes::<u64>(b"def")?;
+    let bytes = writer.into_inner();
+
+    let mut cursor = BinaryCursor::new(&bytes, Endian::Little);
+    assert_eq!(cursor.len_prefixed_bytes::<u8>()?, b"a");
+    assert_eq!(cursor.len_prefixed_bytes::<u32>()?, b"bc");
+    assert_eq!(cursor.len_prefixed_bytes::<u64>()?, b"def");
+    cursor.finish()?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum TestValue {
+    I64(i64),
+    F64(f64),
+    String(String),
+}
+
+struct TestValueCodec;
+
+impl TaggedValueCodec for TestValueCodec {
+    type Value = TestValue;
+    type TypeId = u32;
+
+    fn decode(type_id: Self::TypeId, cursor: &mut BinaryCursor<'_>) -> varve::Result<Self::Value> {
+        match type_id {
+            1 => Ok(TestValue::I64(cursor.i64()?)),
+            2 => Ok(TestValue::F64(cursor.f64()?)),
+            3 => Ok(TestValue::String(cursor.len_prefixed_string::<u32>()?)),
+            other => Err(Error::AdapterUnsupportedType {
+                type_id: u64::from(other),
+            }),
+        }
+    }
+
+    fn encode(value: &Self::Value, writer: &mut BinaryWriter) -> varve::Result<Self::TypeId> {
+        match value {
+            TestValue::I64(value) => {
+                writer.i64(*value)?;
+                Ok(1)
+            }
+            TestValue::F64(value) => {
+                writer.f64(*value)?;
+                Ok(2)
+            }
+            TestValue::String(value) => {
+                writer.len_prefixed_string::<u32>(value)?;
+                Ok(3)
+            }
+        }
+    }
+}
+
+#[test]
+fn tagged_value_codec_keeps_type_id_policy_user_owned() -> varve::Result<()> {
+    let mut writer = BinaryWriter::new(Endian::Little);
+    let type_id = TestValueCodec::encode(&TestValue::String("ada".to_string()), &mut writer)?;
+    writer.u32(type_id)?;
+    let bytes = writer.into_inner();
+
+    let mut cursor = BinaryCursor::new(&bytes, Endian::Little);
+    let value = TestValueCodec::decode(3, &mut cursor)?;
+    assert_eq!(value, TestValue::String("ada".to_string()));
+    assert_eq!(cursor.u32()?, 3);
+    assert!(matches!(
+        TestValueCodec::decode(99, &mut cursor),
+        Err(Error::AdapterUnsupportedType { type_id: 99 })
+    ));
+    Ok(())
+}
+
+#[test]
+fn chunk_index_validates_raw_bounds_and_keeps_duplicate_keys() -> varve::Result<()> {
+    let segment = segment_info(10, 32);
+    let mut builder = ChunkIndexBuilder::new();
+    builder
+        .push(chunk("voltage", 0, 0, 16, 2), &segment)?
+        .push(chunk("voltage", 0, 16, 16, 2), &segment)?;
+    let index = builder.finish()?;
+    assert_eq!(index.len(), 2);
+    let entries: Vec<_> = index.entries_for(&"voltage").collect();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].absolute_offset()?, 10);
+    assert_eq!(entries[1].absolute_offset()?, 26);
+
+    let mut builder = ChunkIndexBuilder::new();
+    let result = builder.push(chunk("voltage", 0, 24, 16, 2), &segment);
+    assert!(matches!(result, Err(Error::AdapterBounds { .. })));
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReducerMetadata {
+    value: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReducerState {
+    values: Vec<u32>,
+    previous: u32,
+}
+
+struct TestReducer;
+
+impl SegmentReducer for TestReducer {
+    type Metadata = ReducerMetadata;
+    type State = ReducerState;
+
+    fn initial() -> Self::State {
+        ReducerState::default()
+    }
+
+    fn apply_segment(
+        state: &mut Self::State,
+        _segment: &LayoutSegmentInfo,
+        metadata: Self::Metadata,
+    ) -> varve::Result<()> {
+        let value = metadata.value.unwrap_or(state.previous);
+        state.previous = value;
+        state.values.push(value);
+        Ok(())
+    }
+}
+
+#[test]
+fn reducer_applies_stateful_segment_metadata() -> varve::Result<()> {
+    let first = segment_info(0, 4);
+    let second = segment_info(4, 4);
+    let report = reduce_segments_by_ref::<TestReducer, _>([
+        (&first, ReducerMetadata { value: Some(7) }),
+        (&second, ReducerMetadata { value: None }),
+    ])?;
+    assert_eq!(report.segments_applied, 2);
+    assert_eq!(report.state.values, vec![7, 7]);
+    Ok(())
+}
+
+#[test]
+fn sidecar_policy_checks_presence_and_identity() -> varve::Result<()> {
+    let main = temp_path("adapter_toolkit_sidecar", "bin");
+    let sidecar = temp_path("adapter_toolkit_sidecar", "idx");
+    cleanup(&main);
+    cleanup(&sidecar);
+    write(&main, b"main")?;
+
+    let policy = SidecarPolicy {
+        extension: "idx",
+        mode: SidecarMode::Optional,
+        verify_main_len: true,
+        verify_main_fingerprint: true,
+    };
+    assert_eq!(policy.sidecar_path(&main), sidecar);
+    assert_eq!(policy.check_presence(&main)?, AdapterCheckStatus::Warning);
+
+    write(policy.sidecar_path(&main), b"index")?;
+    let identity = SidecarIdentity::from_main_file(&main)?;
+    let report = policy.inspect(&main, Some(&identity))?;
+    assert_eq!(report.status, AdapterCheckStatus::Passed);
+
+    cleanup(&main);
+    cleanup(&policy.sidecar_path(&main));
+    Ok(())
+}
+
+#[test]
+fn adapter_report_preserves_layout_tail_status() -> varve::Result<()> {
+    let path = temp_path("adapter_toolkit_tail", "atk");
+    cleanup(&path);
+
+    {
+        let mut writer = AdapterTailFormat::create_layout_writer(&path)?;
+        writer.write_data(AdapterTailFormatDataLayoutWrite {
+            fields: AdapterTailFormatDataLayoutFields { kind: 1 },
+            footer_fields: AdapterTailFormatDataLayoutFooterFields,
+            metadata: b"meta",
+            raw: b"raw",
+        })?;
+        writer.write_data(AdapterTailFormatDataLayoutWrite {
+            fields: AdapterTailFormatDataLayoutFields { kind: 2 },
+            footer_fields: AdapterTailFormatDataLayoutFooterFields,
+            metadata: b"broken",
+            raw: b"tail",
+        })?;
+        writer.flush()?;
+    }
+    let len = std::fs::metadata(&path)?.len();
+    let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+    file.set_len(len - 2)?;
+
+    let layout_report = AdapterTailFormat::inspect_layout_file_report(&path)?;
+    let adapter_report = AdapterCheckReport::from_layout_report(&layout_report);
+    assert_eq!(layout_report.segments.len(), 1);
+    assert_eq!(
+        adapter_report.physical_tail.as_ref().unwrap().kind,
+        LayoutTailKind::InvalidSegmentBounds
+    );
+    assert_eq!(adapter_report.status(), AdapterCheckStatus::Warning);
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn adapter_input_file_materializes_bytes_and_cleans_up_temp_path() -> varve::Result<()> {
+    let input = AdapterInputFile::from_bytes("bin", b"abc")?;
+    let path = input.path().to_path_buf();
+
+    assert!(input.is_temporary());
+    assert_eq!(std::fs::read(&path)?, b"abc");
+
+    drop(input);
+    assert!(!path.exists());
+    Ok(())
+}
+
+#[test]
+fn adapter_tail_status_summarizes_remaining_physical_tail() {
+    let tail = LayoutTailInfo {
+        offset: 40,
+        file_len: 64,
+        kind: LayoutTailKind::InvalidSegmentBounds,
+    };
+    let status = AdapterTailStatus::new(tail, Some(56), Some("footer mismatch".to_string()));
+
+    assert_eq!(status.available_len, 24);
+    assert_eq!(status.expected_end, Some(56));
+    assert_eq!(status.evidence.as_deref(), Some("footer mismatch"));
+}
+
+fn chunk(
+    key: &'static str,
+    segment_index: usize,
+    byte_offset: u64,
+    byte_len: u64,
+    value_count: u64,
+) -> ChunkEntry<&'static str> {
+    ChunkEntry {
+        key,
+        segment_index,
+        byte_offset,
+        byte_len,
+        value_count,
+        layout: ChunkLayout::Contiguous,
+    }
+}
+
+fn segment_info(raw_offset: u64, raw_len: u64) -> LayoutSegmentInfo {
+    LayoutSegmentInfo {
+        name: "Data",
+        segment_start: raw_offset,
+        lead_in_len: 0,
+        metadata_offset: raw_offset,
+        metadata_len: 0,
+        raw_offset,
+        raw_len,
+        footer_offset: raw_offset + raw_len,
+        footer_len: 0,
+        segment_end: raw_offset + raw_len,
+        fields: Vec::new(),
+        footer_fields: Vec::new(),
+    }
+}
+
+fn temp_path(name: &str, extension: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!("varve_{name}_{}.{}", std::process::id(), extension));
+    path
+}
+
+fn cleanup(path: &PathBuf) {
+    let _ = remove_file(path);
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".lock");
+    let _ = remove_file(PathBuf::from(lock));
+}

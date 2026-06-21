@@ -1,0 +1,5 @@
+error: #[varve(default)] is only supported on variable blocks
+ --> tests/ui/fail_fixed_default.rs:7:5
+  |
+7 |     value: u32,
+  |     ^^^^^

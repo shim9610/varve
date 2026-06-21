@@ -1,0 +1,5 @@
+error: varve key must name at least one field
+ --> tests/ui/fail_empty_key.rs:4:44
+  |
+4 | #[varve(id = 414, kind = "variable", key = "")]
+  |                                            ^^
