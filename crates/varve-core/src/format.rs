@@ -1096,6 +1096,7 @@ impl FormatSpec {
                         "varve_native layout must not declare custom parts",
                     ));
                 }
+                crate::native_layout::ensure_native_record_layout_contract()?;
             }
             LayoutPreset::None | LayoutPreset::Custom => {
                 if self.has_matrix_blocks() {
@@ -1729,43 +1730,7 @@ fn native_layout_plan(spec: FormatSpec) -> LayoutPlan {
     let footer = if spec.spec_needs_record_footer() {
         Some(LayoutPlanFieldGroup {
             name: "VarveRecordFooter".to_string(),
-            fields: vec![
-                native_bytes_field(
-                    "magic",
-                    LayoutPlanLen::Fixed(4),
-                    LayoutPlanFieldSource::LiteralBytes(b"VRF1".to_vec()),
-                ),
-                native_field(
-                    "footer_version",
-                    LayoutPlanFieldType::U16,
-                    LayoutPlanFieldSource::LiteralU64(1),
-                ),
-                native_field(
-                    "footer_flags",
-                    LayoutPlanFieldType::U16,
-                    LayoutPlanFieldSource::Native("footer_flags"),
-                ),
-                native_field(
-                    "prev_same_block_offset",
-                    LayoutPlanFieldType::U64,
-                    LayoutPlanFieldSource::Native("prev_same_block_offset"),
-                ),
-                native_field(
-                    "prev_same_key_offset",
-                    LayoutPlanFieldType::U64,
-                    LayoutPlanFieldSource::Native("prev_same_key_offset"),
-                ),
-                native_field(
-                    "footer_crc32",
-                    LayoutPlanFieldType::U32,
-                    LayoutPlanFieldSource::LiteralU64(0),
-                ),
-                native_field(
-                    "reserved",
-                    LayoutPlanFieldType::U32,
-                    LayoutPlanFieldSource::LiteralU64(0),
-                ),
-            ],
+            fields: crate::native_layout::native_record_footer_plan_fields(),
         })
     } else {
         None
@@ -1788,46 +1753,7 @@ fn native_layout_plan(spec: FormatSpec) -> LayoutPlan {
                     repeat: SegmentRepeat::UntilEof,
                     lead_in: LayoutPlanFieldGroup {
                         name: "VarveRecordHeader".to_string(),
-                        fields: vec![
-                            native_field(
-                                "block_id",
-                                LayoutPlanFieldType::U32,
-                                LayoutPlanFieldSource::Caller,
-                            ),
-                            native_field(
-                                "block_version",
-                                LayoutPlanFieldType::U16,
-                                LayoutPlanFieldSource::Caller,
-                            ),
-                            native_field(
-                                "flags",
-                                LayoutPlanFieldType::U16,
-                                LayoutPlanFieldSource::Native("record_flags"),
-                            ),
-                            native_field(
-                                "sequence",
-                                LayoutPlanFieldType::U64,
-                                LayoutPlanFieldSource::Native("sequence"),
-                            ),
-                            native_field(
-                                "payload_len",
-                                LayoutPlanFieldType::U64,
-                                LayoutPlanFieldSource::Finalize(LayoutFinalize {
-                                    target: LayoutAnchor::FooterStart,
-                                    relative_to: LayoutAnchor::RawRegionStart,
-                                }),
-                            ),
-                            native_field(
-                                "checksum",
-                                LayoutPlanFieldType::U32,
-                                LayoutPlanFieldSource::Native("checksum"),
-                            ),
-                            native_field(
-                                "uncompressed_len_hint",
-                                LayoutPlanFieldType::U32,
-                                LayoutPlanFieldSource::Native("uncompressed_len_hint"),
-                            ),
-                        ],
+                        fields: crate::native_layout::native_record_header_plan_fields(),
                     },
                     metadata: LayoutPlanRegion {
                         name: "NoMetadata".to_string(),

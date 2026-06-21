@@ -47,6 +47,17 @@ varve_format! {
 }
 
 varve_format! {
+    pub struct NativeChainFormat {
+        magic: b"NATVC";
+        version: 1;
+        endian: little;
+        schema_hash: computed;
+        index: [scan_on_open, block_offset_chain];
+        blocks: [NativePoint];
+    }
+}
+
+varve_format! {
     pub format TdmsPhysicalFormat {
         magic: b"TDMS";
         version: 1;
@@ -221,6 +232,124 @@ fn varve3_native_preset_exposes_footer_layout_plan() {
             .iter()
             .any(|field| field.name == "prev_same_block_offset")
     );
+}
+
+#[test]
+fn native_record_layout_codec_preserves_header_and_footer_bytes() -> varve::Result<()> {
+    let path = temp_path("native_layout_codec_v3");
+    cleanup(&path);
+
+    {
+        let mut file = NativeFooterFormat::create(&path)?;
+        file.push(&NativePoint { x: 9, y: 10 })?;
+        file.flush()?;
+    }
+
+    let bytes = read(&path)?;
+    let inspected = NativeFooterFormat::inspect_layout_file(&path)?;
+    assert_eq!(inspected.segments.len(), 1);
+    let segment = &inspected.segments[0];
+    let offset = segment.segment_start as usize;
+
+    assert_eq!(u32_at(&bytes, offset), NativePoint::ID);
+    assert_eq!(u16_at(&bytes, offset + 4), 1);
+    assert_eq!(u16_at(&bytes, offset + 6), 0);
+    assert_eq!(u64_at(&bytes, offset + 8), 0);
+    assert_eq!(u64_at(&bytes, offset + 16), 8);
+    assert_eq!(u32_at(&bytes, offset + 24), 0);
+    assert_eq!(u32_at(&bytes, offset + 28), 0);
+    assert_eq!(segment.raw_offset, segment.segment_start + 32);
+    assert_eq!(segment.raw_len, 8);
+
+    let footer = segment.footer_offset as usize;
+    assert_eq!(&bytes[footer..footer + 4], b"VRF1");
+    assert_eq!(u16_at(&bytes, footer + 4), 1);
+    assert_eq!(u16_at(&bytes, footer + 6), 0);
+    assert_eq!(u64_at(&bytes, footer + 8), 0);
+    assert_eq!(u64_at(&bytes, footer + 16), 0);
+    assert_eq!(u32_at(&bytes, footer + 24), 0);
+    assert_eq!(u32_at(&bytes, footer + 28), 0);
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn native_record_layout_codec_preserves_block_offset_chain_footer() -> varve::Result<()> {
+    let path = temp_path("native_layout_codec_chain");
+    cleanup(&path);
+
+    {
+        let mut file = NativeChainFormat::create(&path)?;
+        file.push(&NativePoint { x: 1, y: 2 })?;
+        file.push(&NativePoint { x: 3, y: 4 })?;
+        file.flush()?;
+    }
+
+    let bytes = read(&path)?;
+    let inspected = NativeChainFormat::inspect_layout_file(&path)?;
+    assert_eq!(inspected.segments.len(), 2);
+    let first = &inspected.segments[0];
+    let second = &inspected.segments[1];
+    assert_eq!(
+        first.footer_field("prev_same_block_offset"),
+        Some(&LayoutValue::U64(0))
+    );
+    assert_eq!(
+        second.footer_field("prev_same_block_offset"),
+        Some(&LayoutValue::U64(first.segment_start))
+    );
+
+    let first_footer = first.footer_offset as usize;
+    let second_footer = second.footer_offset as usize;
+    assert_eq!(u16_at(&bytes, first_footer + 6), 0);
+    assert_eq!(u64_at(&bytes, first_footer + 8), 0);
+    assert_eq!(u16_at(&bytes, second_footer + 6), 1);
+    assert_eq!(u64_at(&bytes, second_footer + 8), first.segment_start);
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn native_record_layout_codec_rejects_invalid_footer_fields() -> varve::Result<()> {
+    let path = temp_path("native_layout_codec_footer_invalid_base");
+    let bad_flags = temp_path("native_layout_codec_footer_bad_flags");
+    let bad_reserved = temp_path("native_layout_codec_footer_bad_reserved");
+    cleanup(&path);
+    cleanup(&bad_flags);
+    cleanup(&bad_reserved);
+
+    {
+        let mut file = NativeFooterFormat::create(&path)?;
+        file.push(&NativePoint { x: 9, y: 10 })?;
+        file.flush()?;
+    }
+
+    let bytes = read(&path)?;
+    let inspected = NativeFooterFormat::inspect_layout_file(&path)?;
+    let footer = inspected.segments[0].footer_offset as usize;
+
+    let mut corrupted = bytes.clone();
+    corrupted[footer + 6..footer + 8].copy_from_slice(&0x8000u16.to_le_bytes());
+    write(&bad_flags, &corrupted)?;
+    assert!(matches!(
+        NativeFooterFormat::open_readonly(&bad_flags),
+        Err(Error::InvalidRecordFooter { .. })
+    ));
+
+    let mut corrupted = bytes;
+    corrupted[footer + 28..footer + 32].copy_from_slice(&1u32.to_le_bytes());
+    write(&bad_reserved, &corrupted)?;
+    assert!(matches!(
+        NativeFooterFormat::open_readonly(&bad_reserved),
+        Err(Error::InvalidRecordFooter { .. })
+    ));
+
+    cleanup(&path);
+    cleanup(&bad_flags);
+    cleanup(&bad_reserved);
+    Ok(())
 }
 
 #[test]

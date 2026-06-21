@@ -22,6 +22,9 @@
   the custom layout DSL. Native formats expose a synthetic `VarveFileHeader` and
   repeated `VarveRecord` segment plan; custom formats expose their declared
   layout parts directly.
+- The native record lead-in and optional `VARVE3` footer share an internal
+  native layout codec with that synthetic `VarveRecord` plan, so the default
+  preset is no longer only a documentation projection for record framing.
 - `#[derive(VarveBlock)]` remains available for derive-first block definitions when structs need to live outside the format declaration.
 - Block ids are explicit `u32` values below `0xFFFF_FF00`; higher ids are reserved for internal records.
 - Same-type blocks are read lazily through `BlockVec<T>`.

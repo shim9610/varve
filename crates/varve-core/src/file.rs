@@ -14,6 +14,10 @@ use crate::{
     MatrixCommitEvent, MatrixDimensions, MatrixKey, MatrixRecoveryAction, MatrixRecoveryReport,
     MatrixResumeSignal, RecoveryPolicy, Result, VariableCompression, VarveBlock, VarveKeyedBlock,
     VarveMatrixBlock, VarveMerge, VarveMigration, WireType, decode_from_slice, encode_to_vec,
+    native_layout::{
+        decode_native_record_footer, encode_native_record_footer, native_record_footer_len,
+        native_record_header_len, read_native_record_header, write_native_record_header,
+    },
 };
 
 pub const TOMBSTONE_BLOCK_ID: u32 = 0xFFFF_FFFE;
@@ -32,11 +36,11 @@ pub(crate) const RECORD_FOOTER_LEN: u64 = 32;
 const RECORD_FLAG_COMPRESSED: u16 = 0x0001;
 const RECORD_FLAG_INTERNAL: u16 = 0x8000;
 const RECORD_KNOWN_FLAGS: u16 = RECORD_FLAG_COMPRESSED | RECORD_FLAG_INTERNAL;
-const RECORD_FOOTER_MAGIC: &[u8; 4] = b"VRF1";
-const RECORD_FOOTER_VERSION: u16 = 1;
-const RECORD_FOOTER_FLAG_PREV_SAME_BLOCK: u16 = 0x0001;
-const RECORD_FOOTER_FLAG_PREV_SAME_KEY: u16 = 0x0002;
-const RECORD_FOOTER_KNOWN_FLAGS: u16 =
+pub(crate) const RECORD_FOOTER_MAGIC: &[u8; 4] = b"VRF1";
+pub(crate) const RECORD_FOOTER_VERSION: u16 = 1;
+pub(crate) const RECORD_FOOTER_FLAG_PREV_SAME_BLOCK: u16 = 0x0001;
+pub(crate) const RECORD_FOOTER_FLAG_PREV_SAME_KEY: u16 = 0x0002;
+pub(crate) const RECORD_FOOTER_KNOWN_FLAGS: u16 =
     RECORD_FOOTER_FLAG_PREV_SAME_BLOCK | RECORD_FOOTER_FLAG_PREV_SAME_KEY;
 const COMMIT_PAYLOAD_MAGIC: &[u8; 4] = b"VCMT";
 const INDEX_CHECKPOINT_MAGIC: &[u8; 4] = b"VIDX";
@@ -308,21 +312,21 @@ struct StoredPayload {
     bytes: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RecordHeaderFields {
-    block_id: u32,
-    block_version: u16,
-    flags: u16,
-    sequence: u64,
-    payload_len: u64,
-    checksum: u32,
-    uncompressed_len_hint: u32,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecordHeaderFields {
+    pub(crate) block_id: u32,
+    pub(crate) block_version: u16,
+    pub(crate) flags: u16,
+    pub(crate) sequence: u64,
+    pub(crate) payload_len: u64,
+    pub(crate) checksum: u32,
+    pub(crate) uncompressed_len_hint: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RecordFooterFields {
-    prev_same_block_offset: Option<u64>,
-    prev_same_key_offset: Option<u64>,
+pub(crate) struct RecordFooterFields {
+    pub(crate) prev_same_block_offset: Option<u64>,
+    pub(crate) prev_same_key_offset: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1456,6 +1460,8 @@ impl VarveFile {
         self.file.seek(SeekFrom::Start(entry.record_offset))?;
         write_record_header(
             &mut self.file,
+            self.spec,
+            entry.record_offset,
             RecordHeaderFields {
                 block_id: entry.block_id,
                 block_version: entry.block_version,
@@ -1521,6 +1527,8 @@ impl VarveFile {
             let offset = temp_file.stream_position()?;
             write_record_header(
                 &mut temp_file,
+                self.spec,
+                offset,
                 RecordHeaderFields {
                     block_id: entry.block_id,
                     block_version: entry.block_version,
@@ -1533,7 +1541,7 @@ impl VarveFile {
             )?;
             temp_file.write_all(&payload)?;
             entry.record_offset = offset;
-            entry.payload_offset = offset + RECORD_HEADER_LEN;
+            entry.payload_offset = offset + native_record_header_len();
             entry.payload_len = payload.len() as u64;
             new_index.push(entry);
         }
@@ -2111,13 +2119,15 @@ impl VarveFile {
             Some(encode_record_footer(RecordFooterFields {
                 prev_same_block_offset,
                 prev_same_key_offset,
-            }))
+            })?)
         } else {
             None
         };
         let checksum = checksum_record_bytes(self.spec, payload, footer.as_deref().unwrap_or(&[]))?;
         write_record_header(
             &mut self.file,
+            self.spec,
+            record_offset,
             RecordHeaderFields {
                 block_id,
                 block_version,
@@ -3355,7 +3365,7 @@ where
 
 fn record_footer_len(spec: FormatSpec) -> u64 {
     if spec.spec_needs_record_footer() {
-        RECORD_FOOTER_LEN
+        native_record_footer_len()
     } else {
         0
     }
@@ -3392,7 +3402,7 @@ fn read_record_entry_at(
         return handle_structural_tail(file, offset, allow_tail, recovery_policy);
     }
     file.seek(SeekFrom::Start(offset))?;
-    let mut entry = read_record_header(file, offset)?;
+    let mut entry = read_record_header(file, spec, offset)?;
     validate_record_entry(spec, &entry)?;
     let payload_end = entry
         .payload_offset
@@ -3778,37 +3788,20 @@ impl RecordIndexEntry {
     }
 }
 
-fn read_record_header(file: &mut File, offset: u64) -> Result<RecordIndexEntry> {
-    let mut header = [0; RECORD_HEADER_LEN as usize];
-    file.read_exact(&mut header)?;
-    let mut u32_buf = [0; 4];
-    let mut u16_buf = [0; 2];
-    let mut u64_buf = [0; 8];
-
-    u32_buf.copy_from_slice(&header[0..4]);
-    let block_id = u32::from_le_bytes(u32_buf);
-    u16_buf.copy_from_slice(&header[4..6]);
-    let block_version = u16::from_le_bytes(u16_buf);
-    u16_buf.copy_from_slice(&header[6..8]);
-    let flags = u16::from_le_bytes(u16_buf);
-    u64_buf.copy_from_slice(&header[8..16]);
-    let sequence = u64::from_le_bytes(u64_buf);
-    u64_buf.copy_from_slice(&header[16..24]);
-    let payload_len = u64::from_le_bytes(u64_buf);
-    u32_buf.copy_from_slice(&header[24..28]);
-    let checksum = u32::from_le_bytes(u32_buf);
-    u32_buf.copy_from_slice(&header[28..32]);
-    let uncompressed_len_hint = u32::from_le_bytes(u32_buf);
+fn read_record_header(file: &mut File, _spec: FormatSpec, offset: u64) -> Result<RecordIndexEntry> {
+    let decoded = read_native_record_header(file, offset)?;
+    debug_assert_eq!(decoded.lead_in_len, RECORD_HEADER_LEN);
+    let header = decoded.fields;
     Ok(RecordIndexEntry {
-        block_id,
-        block_version,
-        flags,
-        sequence,
+        block_id: header.block_id,
+        block_version: header.block_version,
+        flags: header.flags,
+        sequence: header.sequence,
         record_offset: offset,
-        payload_offset: offset + RECORD_HEADER_LEN,
-        payload_len,
-        checksum,
-        uncompressed_len_hint,
+        payload_offset: offset + decoded.lead_in_len,
+        payload_len: header.payload_len,
+        checksum: header.checksum,
+        uncompressed_len_hint: header.uncompressed_len_hint,
         footer_offset: None,
         prev_same_block_offset: None,
         prev_same_key_offset: None,
@@ -3816,34 +3809,21 @@ fn read_record_header(file: &mut File, offset: u64) -> Result<RecordIndexEntry> 
     })
 }
 
-fn write_record_header(file: &mut File, header: RecordHeaderFields) -> Result<()> {
-    file.write_all(&header.block_id.to_le_bytes())?;
-    file.write_all(&header.block_version.to_le_bytes())?;
-    file.write_all(&header.flags.to_le_bytes())?;
-    file.write_all(&header.sequence.to_le_bytes())?;
-    file.write_all(&header.payload_len.to_le_bytes())?;
-    file.write_all(&header.checksum.to_le_bytes())?;
-    file.write_all(&header.uncompressed_len_hint.to_le_bytes())?;
-    Ok(())
+fn write_record_header(
+    file: &mut File,
+    spec: FormatSpec,
+    record_offset: u64,
+    header: RecordHeaderFields,
+) -> Result<()> {
+    let footer_len = record_footer_len(spec);
+    debug_assert_eq!(native_record_header_len(), RECORD_HEADER_LEN);
+    write_native_record_header(file, header, record_offset, footer_len)
 }
 
-fn encode_record_footer(footer: RecordFooterFields) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(RECORD_FOOTER_LEN as usize);
-    let mut flags = 0u16;
-    if footer.prev_same_block_offset.is_some() {
-        flags |= RECORD_FOOTER_FLAG_PREV_SAME_BLOCK;
-    }
-    if footer.prev_same_key_offset.is_some() {
-        flags |= RECORD_FOOTER_FLAG_PREV_SAME_KEY;
-    }
-    bytes.extend_from_slice(RECORD_FOOTER_MAGIC);
-    bytes.extend_from_slice(&RECORD_FOOTER_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&flags.to_le_bytes());
-    bytes.extend_from_slice(&footer.prev_same_block_offset.unwrap_or(0).to_le_bytes());
-    bytes.extend_from_slice(&footer.prev_same_key_offset.unwrap_or(0).to_le_bytes());
-    bytes.extend_from_slice(&0u32.to_le_bytes());
-    bytes.extend_from_slice(&0u32.to_le_bytes());
-    bytes
+fn encode_record_footer(footer: RecordFooterFields) -> Result<Vec<u8>> {
+    let bytes = encode_native_record_footer(footer)?;
+    debug_assert_eq!(bytes.len() as u64, RECORD_FOOTER_LEN);
+    Ok(bytes)
 }
 
 fn read_record_footer_bytes(file: &mut File, offset: u64) -> Result<Vec<u8>> {
@@ -3858,67 +3838,7 @@ fn decode_record_footer(
     footer_offset: u64,
     record_offset: u64,
 ) -> Result<RecordFooterFields> {
-    if bytes.len() != RECORD_FOOTER_LEN as usize || &bytes[..4] != RECORD_FOOTER_MAGIC {
-        return Err(Error::InvalidRecordFooter {
-            offset: footer_offset,
-        });
-    }
-    let mut u16_buf = [0; 2];
-    let mut u64_buf = [0; 8];
-    let mut u32_buf = [0; 4];
-    u16_buf.copy_from_slice(&bytes[4..6]);
-    let version = u16::from_le_bytes(u16_buf);
-    if version != RECORD_FOOTER_VERSION {
-        return Err(Error::InvalidRecordFooter {
-            offset: footer_offset,
-        });
-    }
-    u16_buf.copy_from_slice(&bytes[6..8]);
-    let flags = u16::from_le_bytes(u16_buf);
-    if flags & !RECORD_FOOTER_KNOWN_FLAGS != 0 {
-        return Err(Error::InvalidRecordFooter {
-            offset: footer_offset,
-        });
-    }
-    u64_buf.copy_from_slice(&bytes[8..16]);
-    let prev_same_block_offset = u64::from_le_bytes(u64_buf);
-    u64_buf.copy_from_slice(&bytes[16..24]);
-    let prev_same_key_offset = u64::from_le_bytes(u64_buf);
-    u32_buf.copy_from_slice(&bytes[24..28]);
-    let footer_crc32 = u32::from_le_bytes(u32_buf);
-    u32_buf.copy_from_slice(&bytes[28..32]);
-    let reserved = u32::from_le_bytes(u32_buf);
-    if footer_crc32 != 0 || reserved != 0 {
-        return Err(Error::InvalidRecordFooter {
-            offset: footer_offset,
-        });
-    }
-    let prev_same_block_offset = match flags & RECORD_FOOTER_FLAG_PREV_SAME_BLOCK {
-        0 if prev_same_block_offset == 0 => None,
-        RECORD_FOOTER_FLAG_PREV_SAME_BLOCK if prev_same_block_offset < record_offset => {
-            Some(prev_same_block_offset)
-        }
-        _ => {
-            return Err(Error::InvalidRecordFooter {
-                offset: footer_offset,
-            });
-        }
-    };
-    let prev_same_key_offset = match flags & RECORD_FOOTER_FLAG_PREV_SAME_KEY {
-        0 if prev_same_key_offset == 0 => None,
-        RECORD_FOOTER_FLAG_PREV_SAME_KEY if prev_same_key_offset < record_offset => {
-            Some(prev_same_key_offset)
-        }
-        _ => {
-            return Err(Error::InvalidRecordFooter {
-                offset: footer_offset,
-            });
-        }
-    };
-    Ok(RecordFooterFields {
-        prev_same_block_offset,
-        prev_same_key_offset,
-    })
+    decode_native_record_footer(bytes, footer_offset, record_offset)
 }
 
 fn checksum(spec: FormatSpec, payload: &[u8]) -> Result<u32> {

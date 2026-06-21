@@ -8,6 +8,7 @@ mod format;
 mod layout;
 mod matrix;
 mod merge;
+mod native_layout;
 mod traits;
 
 pub use chunks::ChunkedBytes;
