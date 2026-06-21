@@ -58,27 +58,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     assert_eq!(
-        state.properties["/"]["title"],
+        state.property("/", "title"),
         PropertyValue::String("npTDMS multichannel smoke".to_string())
     );
     assert_eq!(
-        state.properties["/'Bench'"]["operator"],
+        state.property("/'Bench'", "operator"),
         PropertyValue::String("Ada".to_string())
     );
     assert_eq!(
-        state.properties["/'Bench'/'Voltage'"]["unit_string"],
+        state.property("/'Bench'/'Voltage'", "unit_string"),
         PropertyValue::String("V".to_string())
     );
     assert_eq!(
-        state.properties["/'Bench'/'Current'"]["unit_string"],
+        state.property("/'Bench'/'Current'", "unit_string"),
         PropertyValue::String("A".to_string())
     );
     assert_eq!(
-        state.samples["/'Bench'/'Voltage'"],
+        state.samples("/'Bench'/'Voltage'"),
         vec![1.0, 2.0, 3.0, 4.0]
     );
     assert_eq!(
-        state.samples["/'Bench'/'Current'"],
+        state.samples("/'Bench'/'Current'"),
         vec![0.10, 0.20, 0.30, 0.40]
     );
 
@@ -97,6 +97,18 @@ struct TdmsState {
 }
 
 impl TdmsState {
+    fn property(&self, path: &str, name: &str) -> PropertyValue {
+        self.properties
+            .get(path)
+            .and_then(|properties| properties.get(name))
+            .cloned()
+            .expect("TDMS property exists")
+    }
+
+    fn samples(&self, path: &str) -> Vec<f64> {
+        self.samples.get(path).cloned().expect("TDMS samples exist")
+    }
+
     fn apply_segment(&mut self, metadata: TdmsMetadata, raw: &[u8]) {
         let mut raw_order = Vec::new();
         for object in metadata.objects {
@@ -125,11 +137,11 @@ impl TdmsState {
             };
             let byte_len = (values as usize) * 8;
             let end = offset + byte_len;
-            assert!(end <= raw.len(), "TDMS raw segment is truncated");
+            let raw_values = raw.get(offset..end).expect("TDMS raw segment is truncated");
             self.samples
                 .entry(path.clone())
                 .or_default()
-                .extend(read_f64_values(&raw[offset..end]));
+                .extend(read_f64_values(raw_values));
             offset = end;
         }
         assert_eq!(offset, raw.len(), "TDMS raw segment has trailing bytes");
@@ -196,8 +208,10 @@ impl<'a> TdmsCursor<'a> {
 
     fn bytes(&mut self, len: usize) -> &'a [u8] {
         let end = self.position + len;
-        assert!(end <= self.bytes.len(), "TDMS metadata is truncated");
-        let value = &self.bytes[self.position..end];
+        let value = self
+            .bytes
+            .get(self.position..end)
+            .expect("TDMS metadata is truncated");
         self.position = end;
         value
     }

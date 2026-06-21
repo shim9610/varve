@@ -128,14 +128,22 @@ fn encode_bmp_pixels(width: u32, height: u32, rgb_top_down: &[(u8, u8, u8)]) -> 
     for top_y in 0..height as usize {
         let stored_y = height as usize - 1 - top_y;
         let row_offset = stored_y * stride;
+        let row = raw
+            .get_mut(row_offset..(row_offset + stride))
+            .expect("BMP encoded row is in bounds");
         for x in 0..width as usize {
-            let (r, g, b) = rgb_top_down[top_y * width as usize + x];
+            let (r, g, b) = rgb_top_down
+                .get(top_y * width as usize + x)
+                .copied()
+                .expect("BMP source pixel is in bounds");
             let offset = row_offset + x * 3;
-            raw[offset] = b;
-            raw[offset + 1] = g;
-            raw[offset + 2] = r;
+            row.get_mut((offset - row_offset)..(offset - row_offset + 3))
+                .expect("BMP encoded pixel is in bounds")
+                .copy_from_slice(&[b, g, r]);
         }
-        raw[(row_offset + row_len)..(row_offset + stride)].fill(0);
+        row.get_mut(row_len..stride)
+            .expect("BMP encoded row padding is in bounds")
+            .fill(0);
     }
     raw
 }
@@ -147,9 +155,17 @@ fn decode_bmp_pixels(width: u32, height: u32, raw: &[u8]) -> Vec<(u8, u8, u8)> {
     for top_y in 0..height as usize {
         let stored_y = height as usize - 1 - top_y;
         let row_offset = stored_y * stride;
+        let row = raw
+            .get(row_offset..(row_offset + stride))
+            .expect("BMP decoded row is in bounds");
         for x in 0..width as usize {
-            let offset = row_offset + x * 3;
-            rgb.push((raw[offset + 2], raw[offset + 1], raw[offset]));
+            let offset = x * 3;
+            let [b, g, r]: [u8; 3] = row
+                .get(offset..(offset + 3))
+                .expect("BMP decoded pixel is in bounds")
+                .try_into()
+                .expect("BMP decoded pixel has exactly 3 bytes");
+            rgb.push((r, g, b));
         }
     }
     rgb
