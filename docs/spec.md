@@ -158,8 +158,11 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   `FormatLayoutWriter` / `FormatLayoutReader` wrappers, typed header-field
   structs, typed segment write structs, and typed segment info getters. The
   generated wrapper still exposes the low-level `SegmentWrite` path.
-- The first generated typed layout API supports one repeated physical segment
-  descriptor. Multi-segment physical dispatch remains a follow-up extension.
+- Custom layouts may declare multiple physical segment descriptors. The scanner
+  dispatches each segment by its leading literal lead-in prefix; immediately
+  following literal numeric fields extend the dispatch key. Segment-specific
+  generated reader indexes are per segment kind, while low-level layout reader
+  indexes remain physical stream indexes.
 - `schema_hash: computed;` asks the macro to call `with_computed_schema_hash()` after policies are attached.
 - `index` accepts either a single legacy identifier or a list such as `[scan_on_open, checkpoint_on_flush, block_offset_chain, keyed_offset_chain]`.
 - `commit` accepts `none`, `record_footer`, or `transaction_marker(on_flush|explicit)`.

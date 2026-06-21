@@ -163,6 +163,7 @@ pub struct LayoutWriter {
     spec: FormatSpec,
     path: PathBuf,
     file: File,
+    segment_counts: Vec<SegmentCount>,
     _lock: crate::file::WriterLock,
 }
 
@@ -189,6 +190,19 @@ struct Anchors {
     segment_end: u64,
     footer_start: u64,
     footer_end: u64,
+}
+
+#[derive(Clone, Debug)]
+struct SegmentDispatch {
+    descriptor: SegmentDescriptor,
+    key: Option<Vec<u8>>,
+    lead_in_len: u64,
+}
+
+#[derive(Clone, Debug)]
+struct SegmentCount {
+    name: &'static str,
+    count: u64,
 }
 
 impl FormatSpec {
@@ -259,6 +273,7 @@ impl LayoutWriter {
             spec,
             path,
             file,
+            segment_counts: initial_segment_counts(spec)?,
             _lock: lock,
         })
     }
@@ -269,12 +284,14 @@ impl LayoutWriter {
         let lock = crate::file::WriterLock::acquire(&path)?;
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
         let file_header_len = read_file_header(spec, &mut file)?;
-        scan_layout_segments(spec, &mut file, file_header_len)?;
+        let segments = scan_layout_segments(spec, &mut file, file_header_len)?;
+        let segment_counts = segment_counts_from_infos(spec, &segments)?;
         file.seek(SeekFrom::End(0))?;
         Ok(Self {
             spec,
             path,
             file,
+            segment_counts,
             _lock: lock,
         })
     }
@@ -289,6 +306,7 @@ impl LayoutWriter {
 
     pub fn write_segment(&mut self, segment: SegmentWrite<'_>) -> Result<LayoutSegmentInfo> {
         let descriptor = segment_descriptor(self.spec, segment.name)?;
+        self.ensure_segment_can_write(descriptor)?;
         ensure_no_unexpected_fields_for(descriptor.lead_in.fields, segment.fields)?;
         let footer_fields = descriptor.footer.map(|footer| footer.fields).unwrap_or(&[]);
         ensure_no_unexpected_fields_for(footer_fields, segment.footer_fields)?;
@@ -369,7 +387,7 @@ impl LayoutWriter {
         }
         self.file.seek(SeekFrom::Start(segment_end))?;
 
-        Ok(LayoutSegmentInfo {
+        let info = LayoutSegmentInfo {
             name: descriptor.name,
             fields,
             footer_fields,
@@ -382,7 +400,9 @@ impl LayoutWriter {
             footer_offset,
             footer_len,
             segment_end,
-        })
+        };
+        self.increment_segment_count(descriptor.name);
+        Ok(info)
     }
 
     pub fn flush(&mut self) -> Result<()> {
@@ -393,6 +413,31 @@ impl LayoutWriter {
     pub fn sync(&mut self) -> Result<()> {
         self.file.sync_all()?;
         Ok(())
+    }
+
+    fn ensure_segment_can_write(&self, descriptor: SegmentDescriptor) -> Result<()> {
+        if descriptor.repeat == SegmentRepeat::Once
+            && self
+                .segment_counts
+                .iter()
+                .any(|count| count.name == descriptor.name && count.count > 0)
+        {
+            return Err(Error::LayoutRepeatedOnceSegment {
+                segment: descriptor.name.to_string(),
+                offset: self.file.metadata()?.len(),
+            });
+        }
+        Ok(())
+    }
+
+    fn increment_segment_count(&mut self, name: &'static str) {
+        if let Some(count) = self
+            .segment_counts
+            .iter_mut()
+            .find(|count| count.name == name)
+        {
+            count.count += 1;
+        }
     }
 }
 
@@ -551,10 +596,43 @@ fn segment_descriptor(spec: FormatSpec, name: &str) -> Result<SegmentDescriptor>
         .ok_or_else(|| Error::LayoutSegmentMissing(name.to_string()))
 }
 
-fn first_segment_descriptor(spec: FormatSpec) -> Result<SegmentDescriptor> {
-    spec.layout
-        .first_segment()
-        .ok_or(Error::InvalidFormatSpec("missing layout segment"))
+fn segment_descriptors(spec: FormatSpec) -> Result<Vec<SegmentDescriptor>> {
+    let segments: Vec<_> = spec
+        .layout
+        .parts
+        .iter()
+        .filter_map(|part| match part.kind {
+            LayoutPartKind::Segment(segment) => Some(segment),
+            _ => None,
+        })
+        .collect();
+    if segments.is_empty() {
+        return Err(Error::InvalidFormatSpec("missing layout segment"));
+    }
+    Ok(segments)
+}
+
+fn initial_segment_counts(spec: FormatSpec) -> Result<Vec<SegmentCount>> {
+    Ok(segment_descriptors(spec)?
+        .into_iter()
+        .map(|segment| SegmentCount {
+            name: segment.name,
+            count: 0,
+        })
+        .collect())
+}
+
+fn segment_counts_from_infos(
+    spec: FormatSpec,
+    segments: &[LayoutSegmentInfo],
+) -> Result<Vec<SegmentCount>> {
+    let mut counts = initial_segment_counts(spec)?;
+    for segment in segments {
+        if let Some(count) = counts.iter_mut().find(|count| count.name == segment.name) {
+            count.count += 1;
+        }
+    }
+    Ok(counts)
 }
 
 fn descriptor_lead_in_len(segment: SegmentDescriptor) -> Result<u64> {
@@ -773,29 +851,173 @@ fn scan_layout_segments(
     file: &mut File,
     start_offset: u64,
 ) -> Result<Vec<LayoutSegmentInfo>> {
-    let descriptor = first_segment_descriptor(spec)?;
-    let lead_in_len = descriptor_lead_in_len(descriptor)?;
+    let dispatch = segment_dispatch_table(spec)?;
     let file_len = file.metadata()?.len();
     let mut offset = start_offset;
     let mut segments = Vec::new();
+    let mut segment_counts = initial_segment_counts(spec)?;
     while offset < file_len {
-        if file_len - offset < lead_in_len {
-            return Err(Error::LayoutTruncatedLeadIn { offset });
+        let dispatch_index = select_segment_descriptor(&dispatch, file, offset, file_len)?;
+        let descriptor = dispatch[dispatch_index].descriptor;
+        if descriptor.repeat == SegmentRepeat::Once
+            && segment_counts
+                .iter()
+                .any(|count| count.name == descriptor.name && count.count > 0)
+        {
+            return Err(Error::LayoutRepeatedOnceSegment {
+                segment: descriptor.name.to_string(),
+                offset,
+            });
         }
         let info = read_layout_segment_at(spec, file, descriptor, offset, file_len)?;
         if info.segment_end <= offset {
             return Err(Error::LayoutInvalidSegmentBounds { offset });
         }
         offset = info.segment_end;
-        segments.push(info);
-        if descriptor.repeat == SegmentRepeat::Once {
-            break;
+        if let Some(count) = segment_counts
+            .iter_mut()
+            .find(|count| count.name == descriptor.name)
+        {
+            count.count += 1;
         }
+        segments.push(info);
     }
     if offset != file_len {
         return Err(Error::LayoutInvalidSegmentBounds { offset });
     }
     Ok(segments)
+}
+
+fn segment_dispatch_table(spec: FormatSpec) -> Result<Vec<SegmentDispatch>> {
+    segment_descriptors(spec)?
+        .into_iter()
+        .map(|descriptor| {
+            Ok(SegmentDispatch {
+                descriptor,
+                key: segment_dispatch_key(descriptor, spec.endian)?,
+                lead_in_len: descriptor_lead_in_len(descriptor)?,
+            })
+        })
+        .collect()
+}
+
+fn select_segment_descriptor(
+    dispatch: &[SegmentDispatch],
+    file: &mut File,
+    offset: u64,
+    file_len: u64,
+) -> Result<usize> {
+    if dispatch.len() == 1 {
+        let lead_in_len = dispatch[0].lead_in_len;
+        if file_len - offset < lead_in_len {
+            return Err(Error::LayoutTruncatedLeadIn { offset });
+        }
+        return Ok(0);
+    }
+
+    let mut matches = Vec::new();
+    let mut fallback = None;
+    let mut saw_truncated = false;
+    for (index, candidate) in dispatch.iter().enumerate() {
+        if let Some(key) = &candidate.key {
+            if file_len - offset < key.len() as u64 {
+                saw_truncated = true;
+                continue;
+            }
+            if bytes_at(file, offset, key.len())? == *key {
+                if file_len - offset < candidate.lead_in_len {
+                    return Err(Error::LayoutTruncatedLeadIn { offset });
+                }
+                matches.push(index);
+            }
+        } else {
+            if fallback.is_some() {
+                return Err(Error::InvalidFormatSpec(
+                    "layout has multiple fallback segment descriptors",
+                ));
+            }
+            fallback = Some(index);
+        }
+    }
+
+    match matches.len() {
+        1 => Ok(matches[0]),
+        n if n > 1 => Err(Error::LayoutAmbiguousSegment { offset }),
+        _ => {
+            if let Some(index) = fallback {
+                if file_len - offset < dispatch[index].lead_in_len {
+                    return Err(Error::LayoutTruncatedLeadIn { offset });
+                }
+                Ok(index)
+            } else if saw_truncated {
+                Err(Error::LayoutTruncatedLeadIn { offset })
+            } else {
+                Err(Error::LayoutNoMatchingSegment { offset })
+            }
+        }
+    }
+}
+
+fn bytes_at(file: &mut File, offset: u64, len: usize) -> Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = vec![0; len];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn segment_dispatch_key(
+    descriptor: SegmentDescriptor,
+    format_endian: Endian,
+) -> Result<Option<Vec<u8>>> {
+    let mut key = Vec::new();
+    for field in descriptor.lead_in.fields {
+        let value = match field.source {
+            LayoutFieldSource::LiteralBytes(bytes) => LayoutValue::Bytes(bytes.to_vec()),
+            LayoutFieldSource::LiteralU64(value) => {
+                normalize_layout_value(*field, &LayoutValue::U64(value))?
+            }
+            LayoutFieldSource::LiteralI64(value) => {
+                normalize_layout_value(*field, &LayoutValue::I64(value))?
+            }
+            LayoutFieldSource::Caller | LayoutFieldSource::Finalize(_) => break,
+        };
+        write_layout_value(&mut key, *field, &value, format_endian)?;
+    }
+    Ok((!key.is_empty()).then_some(key))
+}
+
+pub(crate) fn validate_layout_segment_dispatch(spec: FormatSpec) -> Result<()> {
+    let dispatch = segment_dispatch_table(spec)?;
+    let mut fallback_count = 0usize;
+    for (index, candidate) in dispatch.iter().enumerate() {
+        if candidate.key.is_none() {
+            fallback_count += 1;
+        }
+        for other in &dispatch[(index + 1)..] {
+            if candidate.descriptor.name == other.descriptor.name {
+                return Err(Error::InvalidFormatSpec("duplicate layout segment name"));
+            }
+            if dispatch_keys_overlap(candidate.key.as_deref(), other.key.as_deref()) {
+                return Err(Error::InvalidFormatSpec(
+                    "layout segment dispatch keys are ambiguous",
+                ));
+            }
+        }
+    }
+    if fallback_count > 1 {
+        return Err(Error::InvalidFormatSpec(
+            "layout has multiple fallback segment descriptors",
+        ));
+    }
+    Ok(())
+}
+
+fn dispatch_keys_overlap(left: Option<&[u8]>, right: Option<&[u8]>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.starts_with(right) || right.starts_with(left),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn read_layout_segment_at(
@@ -1162,8 +1384,8 @@ fn anchor_value(anchor: LayoutAnchor, anchors: Anchors) -> Result<u64> {
     })
 }
 
-fn write_layout_value(
-    file: &mut File,
+fn write_layout_value<W: Write>(
+    writer: &mut W,
     field: LayoutFieldDescriptor,
     value: &LayoutValue,
     format_endian: Endian,
@@ -1172,19 +1394,19 @@ fn write_layout_value(
         (LayoutFieldType::Bytes { len }, LayoutValue::Bytes(bytes))
             if *len == bytes.len() as u64 =>
         {
-            file.write_all(bytes)?;
+            writer.write_all(bytes)?;
             Ok(())
         }
         (LayoutFieldType::U8, LayoutValue::U8(value)) => {
-            file.write_all(&[*value])?;
+            writer.write_all(&[*value])?;
             Ok(())
         }
-        _ => write_numeric(file, field, value, format_endian),
+        _ => write_numeric(writer, field, value, format_endian),
     }
 }
 
-fn write_numeric(
-    file: &mut File,
+fn write_numeric<W: Write>(
+    writer: &mut W,
     field: LayoutFieldDescriptor,
     value: &LayoutValue,
     format_endian: Endian,
@@ -1194,54 +1416,54 @@ fn write_numeric(
         (LayoutFieldType::U8, LayoutValue::U64(value)) => {
             let value =
                 u8::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field.name))?;
-            file.write_all(&[value])?;
+            writer.write_all(&[value])?;
             Ok(())
         }
-        (LayoutFieldType::U16, LayoutValue::U16(value)) => write_u16(file, *value, endian),
+        (LayoutFieldType::U16, LayoutValue::U16(value)) => write_u16(writer, *value, endian),
         (LayoutFieldType::U16, LayoutValue::U64(value)) => {
             let value =
                 u16::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field.name))?;
-            write_u16(file, value, endian)
+            write_u16(writer, value, endian)
         }
-        (LayoutFieldType::U32, LayoutValue::U32(value)) => write_u32(file, *value, endian),
+        (LayoutFieldType::U32, LayoutValue::U32(value)) => write_u32(writer, *value, endian),
         (LayoutFieldType::U32, LayoutValue::U64(value)) => {
             let value =
                 u32::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field.name))?;
-            write_u32(file, value, endian)
+            write_u32(writer, value, endian)
         }
-        (LayoutFieldType::U64, LayoutValue::U64(value)) => write_u64(file, *value, endian),
-        (LayoutFieldType::I64, LayoutValue::I64(value)) => write_i64(file, *value, endian),
+        (LayoutFieldType::U64, LayoutValue::U64(value)) => write_u64(writer, *value, endian),
+        (LayoutFieldType::I64, LayoutValue::I64(value)) => write_i64(writer, *value, endian),
         (LayoutFieldType::U16, LayoutValue::U8(value)) => {
-            write_u16(file, u16::from(*value), endian)
+            write_u16(writer, u16::from(*value), endian)
         }
         (LayoutFieldType::U32, LayoutValue::U8(value)) => {
-            write_u32(file, u32::from(*value), endian)
+            write_u32(writer, u32::from(*value), endian)
         }
         (LayoutFieldType::U32, LayoutValue::U16(value)) => {
-            write_u32(file, u32::from(*value), endian)
+            write_u32(writer, u32::from(*value), endian)
         }
         (LayoutFieldType::U64, LayoutValue::U8(value)) => {
-            write_u64(file, u64::from(*value), endian)
+            write_u64(writer, u64::from(*value), endian)
         }
         (LayoutFieldType::U64, LayoutValue::U16(value)) => {
-            write_u64(file, u64::from(*value), endian)
+            write_u64(writer, u64::from(*value), endian)
         }
         (LayoutFieldType::U64, LayoutValue::U32(value)) => {
-            write_u64(file, u64::from(*value), endian)
+            write_u64(writer, u64::from(*value), endian)
         }
         (LayoutFieldType::I64, LayoutValue::U8(value)) => {
-            write_i64(file, i64::from(*value), endian)
+            write_i64(writer, i64::from(*value), endian)
         }
         (LayoutFieldType::I64, LayoutValue::U16(value)) => {
-            write_i64(file, i64::from(*value), endian)
+            write_i64(writer, i64::from(*value), endian)
         }
         (LayoutFieldType::I64, LayoutValue::U32(value)) => {
-            write_i64(file, i64::from(*value), endian)
+            write_i64(writer, i64::from(*value), endian)
         }
         (LayoutFieldType::I64, LayoutValue::U64(value)) => {
             let value =
                 i64::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field.name))?;
-            write_i64(file, value, endian)
+            write_i64(writer, value, endian)
         }
         _ => Err(Error::LayoutFieldTypeMismatch(field.name)),
     }
@@ -1278,39 +1500,39 @@ fn write_zeroes(file: &mut File, len: u64) -> Result<()> {
     Ok(())
 }
 
-fn write_u16(file: &mut File, value: u16, endian: Endian) -> Result<()> {
+fn write_u16<W: Write>(writer: &mut W, value: u16, endian: Endian) -> Result<()> {
     let bytes = match endian {
         Endian::Little => value.to_le_bytes(),
         Endian::Big => value.to_be_bytes(),
     };
-    file.write_all(&bytes)?;
+    writer.write_all(&bytes)?;
     Ok(())
 }
 
-fn write_u32(file: &mut File, value: u32, endian: Endian) -> Result<()> {
+fn write_u32<W: Write>(writer: &mut W, value: u32, endian: Endian) -> Result<()> {
     let bytes = match endian {
         Endian::Little => value.to_le_bytes(),
         Endian::Big => value.to_be_bytes(),
     };
-    file.write_all(&bytes)?;
+    writer.write_all(&bytes)?;
     Ok(())
 }
 
-fn write_u64(file: &mut File, value: u64, endian: Endian) -> Result<()> {
+fn write_u64<W: Write>(writer: &mut W, value: u64, endian: Endian) -> Result<()> {
     let bytes = match endian {
         Endian::Little => value.to_le_bytes(),
         Endian::Big => value.to_be_bytes(),
     };
-    file.write_all(&bytes)?;
+    writer.write_all(&bytes)?;
     Ok(())
 }
 
-fn write_i64(file: &mut File, value: i64, endian: Endian) -> Result<()> {
+fn write_i64<W: Write>(writer: &mut W, value: i64, endian: Endian) -> Result<()> {
     let bytes = match endian {
         Endian::Little => value.to_le_bytes(),
         Endian::Big => value.to_be_bytes(),
     };
-    file.write_all(&bytes)?;
+    writer.write_all(&bytes)?;
     Ok(())
 }
 

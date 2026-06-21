@@ -171,6 +171,82 @@ varve_format! {
     }
 }
 
+varve_format! {
+    pub format MultiPhysicalFormat {
+        magic: b"MULT";
+        version: 1;
+        endian: little;
+        schema_hash: computed;
+
+        layout {
+            segment ControlSegment repeat once {
+                lead_in ControlLeadIn {
+                    bytes tag = b"CTRL";
+                    u16 version = 1;
+                    u32 code;
+                    i64 next_segment_offset = finalize(target = segment_end, relative_to = after_lead_in);
+                    i64 raw_data_offset = finalize(target = raw_region_start, relative_to = after_lead_in);
+                }
+
+                metadata ControlMetadata;
+                raw_region ControlRaw;
+            }
+
+            segment DataSegment repeat until_eof {
+                lead_in DataLeadIn {
+                    bytes tag = b"DATA";
+                    u32 channel;
+                    i64 next_segment_offset = finalize(target = segment_end, relative_to = after_lead_in);
+                    i64 raw_data_offset = finalize(target = raw_region_start, relative_to = after_lead_in);
+                }
+
+                metadata DataMetadata;
+                raw_region DataRaw;
+
+                footer DataFooter {
+                    bytes seal = b"DONE";
+                    u64 segment_len = finalize(target = segment_end, relative_to = segment_start);
+                }
+            }
+        }
+    }
+}
+
+varve_format! {
+    pub format SameTagPhysicalFormat {
+        magic: b"STAG";
+        version: 1;
+        endian: little;
+        schema_hash: computed;
+
+        layout {
+            segment MetaSegment repeat until_eof {
+                lead_in MetaLeadIn {
+                    bytes tag = b"STAG";
+                    u16 kind = 1;
+                    i64 next_segment_offset = finalize(target = segment_end, relative_to = after_lead_in);
+                    i64 raw_data_offset = finalize(target = raw_region_start, relative_to = after_lead_in);
+                }
+
+                metadata MetaMetadata;
+                raw_region MetaRaw;
+            }
+
+            segment RawSegment repeat until_eof {
+                lead_in RawLeadIn {
+                    bytes tag = b"STAG";
+                    u16 kind = 2;
+                    i64 next_segment_offset = finalize(target = segment_end, relative_to = after_lead_in);
+                    i64 raw_data_offset = finalize(target = raw_region_start, relative_to = after_lead_in);
+                }
+
+                metadata RawMetadata;
+                raw_region RawRaw;
+            }
+        }
+    }
+}
+
 #[test]
 fn explicit_varve_native_preset_preserves_native_bytes() -> varve::Result<()> {
     let default_path = temp_path("layout_native_default");
@@ -637,6 +713,130 @@ fn custom_layout_declaration_defaults_to_byte_zero_physical_layout() -> varve::R
 }
 
 #[test]
+fn multi_segment_layout_dispatches_by_leading_literal_tag() -> varve::Result<()> {
+    let path = temp_path("multi_physical_layout");
+    cleanup(&path);
+
+    {
+        let mut writer = MultiPhysicalFormat::create_layout_writer(&path)?;
+        let control =
+            writer.write_control_segment(MultiPhysicalFormatControlSegmentLayoutWrite {
+                fields: MultiPhysicalFormatControlSegmentLayoutFields { code: 99 },
+                footer_fields: MultiPhysicalFormatControlSegmentLayoutFooterFields,
+                metadata: b"control-meta",
+                raw: b"",
+            })?;
+        assert_eq!(control.tag()?, b"CTRL");
+        assert_eq!(control.version()?, 1);
+        assert_eq!(control.code()?, 99);
+
+        writer.write_data_segment(MultiPhysicalFormatDataSegmentLayoutWrite {
+            fields: MultiPhysicalFormatDataSegmentLayoutFields { channel: 7 },
+            footer_fields: MultiPhysicalFormatDataSegmentLayoutFooterFields,
+            metadata: b"data-a",
+            raw: b"aaaa",
+        })?;
+        writer.write_data_segment(MultiPhysicalFormatDataSegmentLayoutWrite {
+            fields: MultiPhysicalFormatDataSegmentLayoutFields { channel: 8 },
+            footer_fields: MultiPhysicalFormatDataSegmentLayoutFooterFields,
+            metadata: b"data-bb",
+            raw: b"bbbbbb",
+        })?;
+
+        assert!(matches!(
+            writer.write_control_segment(MultiPhysicalFormatControlSegmentLayoutWrite {
+                fields: MultiPhysicalFormatControlSegmentLayoutFields { code: 100 },
+                footer_fields: MultiPhysicalFormatControlSegmentLayoutFooterFields,
+                metadata: b"second",
+                raw: b"",
+            }),
+            Err(Error::LayoutRepeatedOnceSegment { .. })
+        ));
+        writer.flush()?;
+    }
+
+    let reader = MultiPhysicalFormat::open_layout_reader(&path)?;
+    assert_eq!(reader.segments().len(), 3);
+    assert_eq!(reader.segments()[0].name, "ControlSegment");
+    assert_eq!(reader.segments()[1].name, "DataSegment");
+    assert_eq!(reader.segments()[2].name, "DataSegment");
+    assert_eq!(reader.read_metadata(1)?, b"data-a");
+    assert_eq!(reader.read_data_segment_metadata(0)?, b"data-a");
+    assert_eq!(reader.read_data_segment_metadata(1)?, b"data-bb");
+    assert_eq!(reader.read_data_segment_raw(0)?, b"aaaa");
+    assert_eq!(reader.read_data_segment_raw(1)?, b"bbbbbb");
+
+    let controls = reader.control_segments()?;
+    let data = reader.data_segments()?;
+    assert_eq!(controls.len(), 1);
+    assert_eq!(data.len(), 2);
+    assert_eq!(reader.control_segment(0)?.unwrap().code()?, 99);
+    assert_eq!(reader.data_segment(0)?.unwrap().channel()?, 7);
+    assert_eq!(reader.data_segment(1)?.unwrap().channel()?, 8);
+    assert!(reader.data_segment(2)?.is_none());
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn multi_segment_layout_dispatches_by_extended_literal_prefix() -> varve::Result<()> {
+    let path = temp_path("same_tag_physical_layout");
+    cleanup(&path);
+
+    {
+        let mut writer = SameTagPhysicalFormat::create_layout_writer(&path)?;
+        writer.write_raw_segment(SameTagPhysicalFormatRawSegmentLayoutWrite {
+            fields: SameTagPhysicalFormatRawSegmentLayoutFields,
+            footer_fields: SameTagPhysicalFormatRawSegmentLayoutFooterFields,
+            metadata: b"raw-meta",
+            raw: b"raw",
+        })?;
+        writer.write_meta_segment(SameTagPhysicalFormatMetaSegmentLayoutWrite {
+            fields: SameTagPhysicalFormatMetaSegmentLayoutFields,
+            footer_fields: SameTagPhysicalFormatMetaSegmentLayoutFooterFields,
+            metadata: b"meta-meta",
+            raw: b"meta",
+        })?;
+        writer.flush()?;
+    }
+
+    let bytes = read(&path)?;
+    assert_eq!(&bytes[0..4], b"STAG");
+    assert_eq!(u16_at(&bytes, 4), 2);
+
+    let reader = SameTagPhysicalFormat::open_layout_reader(&path)?;
+    assert_eq!(reader.segments().len(), 2);
+    assert_eq!(reader.segments()[0].name, "RawSegment");
+    assert_eq!(reader.segments()[1].name, "MetaSegment");
+    assert_eq!(reader.read_raw_segment_raw(0)?, b"raw");
+    assert_eq!(reader.read_meta_segment_raw(0)?, b"meta");
+    assert_eq!(reader.raw_segment(0)?.unwrap().kind()?, 2);
+    assert_eq!(reader.meta_segment(0)?.unwrap().kind()?, 1);
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn multi_segment_layout_rejects_repeated_once_segment_on_scan() -> varve::Result<()> {
+    let path = temp_path("multi_physical_repeated_once_scan");
+    cleanup(&path);
+
+    let mut bytes = control_segment_bytes(1, b"first");
+    bytes.extend_from_slice(&control_segment_bytes(2, b"second"));
+    write(&path, &bytes)?;
+
+    assert!(matches!(
+        MultiPhysicalFormat::open_layout_reader(&path),
+        Err(Error::LayoutRepeatedOnceSegment { .. })
+    ));
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
 fn tdms_style_layout_writes_physical_leadin_offsets_and_raw_region() -> varve::Result<()> {
     let path = temp_path("tdms_physical_layout");
     cleanup(&path);
@@ -827,6 +1027,17 @@ fn f64_values(bytes: &[u8]) -> Vec<f64> {
             f64::from_le_bytes(value)
         })
         .collect()
+}
+
+fn control_segment_bytes(code: u32, metadata: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"CTRL");
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&code.to_le_bytes());
+    bytes.extend_from_slice(&(metadata.len() as i64).to_le_bytes());
+    bytes.extend_from_slice(&(metadata.len() as i64).to_le_bytes());
+    bytes.extend_from_slice(metadata);
+    bytes
 }
 
 fn u16_at(bytes: &[u8], offset: usize) -> u16 {

@@ -1181,6 +1181,9 @@ impl FormatSpec {
                 LayoutPartKind::Footer(footer) => self.validate_layout_fields(footer.fields)?,
             }
         }
+        if !matches!(self.layout.preset, LayoutPreset::VarveNative) {
+            crate::layout::validate_layout_segment_dispatch(self)?;
+        }
         Ok(())
     }
 

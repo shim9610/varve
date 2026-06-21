@@ -739,6 +739,8 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::LayoutFieldUnexpected(_)
         | Error::LayoutFieldTypeMismatch(_)
         | Error::LayoutSegmentMissing(_)
+        | Error::LayoutRepeatedOnceSegment { .. }
+        | Error::LayoutSegmentIndexOutOfBounds { .. }
         | Error::ZeroCopyBlockKindMismatch { .. }
         | Error::ZeroCopyEndianMismatch { .. }
         | Error::ZeroCopyPayloadSizeMismatch { .. }
@@ -783,6 +785,8 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::MatrixChecksumMismatch { .. }
         | Error::InvalidMatrixLayout
         | Error::LayoutLiteralMismatch { .. }
+        | Error::LayoutAmbiguousSegment { .. }
+        | Error::LayoutNoMatchingSegment { .. }
         | Error::LayoutTruncatedLeadIn { .. }
         | Error::LayoutTruncatedHeader { .. }
         | Error::LayoutInvalidSegmentBounds { .. } => DiagnosticDomain::FileData,

@@ -267,4 +267,16 @@ pub enum Error {
 
     #[error("layout segment {0} is not declared")]
     LayoutSegmentMissing(String),
+
+    #[error("layout segment dispatch is ambiguous at offset {offset}")]
+    LayoutAmbiguousSegment { offset: u64 },
+
+    #[error("no layout segment descriptor matched at offset {offset}")]
+    LayoutNoMatchingSegment { offset: u64 },
+
+    #[error("layout segment {segment} is repeat once but appears again at offset {offset}")]
+    LayoutRepeatedOnceSegment { segment: String, offset: u64 },
+
+    #[error("layout segment {segment} index {index} is out of bounds")]
+    LayoutSegmentIndexOutOfBounds { segment: String, index: usize },
 }

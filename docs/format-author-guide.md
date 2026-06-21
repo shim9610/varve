@@ -340,6 +340,14 @@ facade. `PhysicalFormat::create_layout_writer` returns
 typed Rust struct fields; literal and finalized fields are supplied or
 backpatched by Varve.
 
+Formats can declare more than one segment descriptor. The reader chooses the
+descriptor at each file offset from the leading literal lead-in prefix, for
+example `bytes tag = b"CTRL"` versus `bytes tag = b"DATA"`. Literal numeric
+fields immediately after the tag can extend that prefix, which lets a format use
+one byte tag plus a literal kind field. Generated typed reader indexes are per
+segment kind: `read_data_segment_raw(0)` reads the first `DataSegment` even if a
+different segment appears before it in the physical stream.
+
 The low-level `LayoutWriter::write_segment(SegmentWrite)` path remains exposed
 through the generated wrapper for dynamic adapters. Reopen the same file with
 `open_layout_writer` when you need to validate the existing segment stream and

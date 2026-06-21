@@ -263,9 +263,12 @@ let raw = reader.read_data_segment_raw(0)?;
 
 The generated wrapper still exposes the low-level `write_segment`,
 `read_metadata`, `read_raw`, and `segments` methods for adapters that need to
-bridge dynamic metadata. The first typed facade supports one repeated physical
-segment descriptor, so generated `index` parameters refer to the physical
-segment stream.
+bridge dynamic metadata. Multiple segment descriptors are dispatched by their
+leading literal lead-in prefix. A byte tag such as `bytes tag = b"DATA"` is the
+common discriminator; immediately following literal numeric fields extend the
+dispatch key. Generated segment-specific `index` parameters are per segment
+kind, while the low-level `read_metadata(index)` and `read_raw(index)` methods
+continue to use the global physical stream index.
 
 ## Mmap And Zero-Copy
 

@@ -78,6 +78,13 @@ validated segment. Validated lead-in/footer values remain available on
 `LayoutSegmentInfo`, so callers can inspect fields such as ToC masks without
 manual byte parsing.
 
+When multiple segment descriptors are declared, the reader dispatches each
+physical segment from the leading literal lead-in prefix. A leading byte tag is
+the common case; literal numeric fields immediately after that tag can further
+separate segment kinds. Once a descriptor is selected, failed footer, offset, or
+bounds validation is treated as corrupt file data rather than a reason to try a
+different descriptor.
+
 When the layout is declared in `varve_format!`, the macro generates a typed
 physical-layout facade over that same engine. Segment caller fields become a
 typed `FormatSegmentLayoutFields` struct, `write_segment_name` lowers them into

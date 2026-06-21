@@ -837,12 +837,6 @@ impl Parse for FormatInput {
         if typed_api && inline_blocks.is_empty() && layout_segments.is_empty() {
             return Err(content.error("format syntax requires inline blocks"));
         }
-        if typed_api && layout_segments.len() > 1 {
-            return Err(syn::Error::new_spanned(
-                &layout_segments[1].name,
-                "typed layout API currently supports one segment descriptor",
-            ));
-        }
         if !typed_api && registry_blocks.is_empty() {
             return Err(content.error("missing blocks"));
         }
@@ -2640,6 +2634,24 @@ fn layout_typed_api_tokens(
                 self.inner.read_raw(index)
             }
 
+            fn __varve_layout_segment_index(
+                &self,
+                name: &'static str,
+                ordinal: usize,
+            ) -> ::varve::__core::Result<usize> {
+                self.inner
+                    .segments()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, segment)| segment.name == name)
+                    .nth(ordinal)
+                    .map(|(index, _)| index)
+                    .ok_or_else(|| ::varve::__core::Error::LayoutSegmentIndexOutOfBounds {
+                        segment: name.to_string(),
+                        index: ordinal,
+                    })
+            }
+
             #(#reader_segment_methods)*
         }
 
@@ -2826,20 +2838,20 @@ fn layout_reader_segment_methods_tokens(
         }
 
         pub fn #singular(&self, index: usize) -> ::varve::__core::Result<Option<#info_type>> {
-            let Some(segment) = self.inner.segments().get(index) else {
+            let Ok(index) = self.__varve_layout_segment_index(#segment_name, index) else {
                 return Ok(None);
             };
-            if segment.name != #segment_name {
-                return Ok(None);
-            }
+            let segment = &self.inner.segments()[index];
             Ok(Some(#info_type::from_inner(segment.clone())))
         }
 
         pub fn #read_metadata(&self, index: usize) -> ::varve::__core::Result<Vec<u8>> {
+            let index = self.__varve_layout_segment_index(#segment_name, index)?;
             self.inner.read_metadata(index)
         }
 
         pub fn #read_raw(&self, index: usize) -> ::varve::__core::Result<Vec<u8>> {
+            let index = self.__varve_layout_segment_index(#segment_name, index)?;
             self.inner.read_raw(index)
         }
     }

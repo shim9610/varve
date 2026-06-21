@@ -38,6 +38,9 @@
   for optional file header + repeated segments. The initial verified targets are
   TDMS-style `TDSm` lead-in + metadata bytes + contiguous raw channel bytes, and
   a generic framed layout with declared file header and segment footer.
+- Custom physical readers can dispatch multiple declared segment descriptors by
+  leading literal lead-in prefixes, including a byte tag plus literal numeric
+  kind fields.
 - Format-first custom layouts generate typed `FormatLayoutWriter` and
   `FormatLayoutReader` wrappers over that physical path while preserving the
   low-level dynamic `SegmentWrite` escape hatch.
