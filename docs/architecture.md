@@ -41,16 +41,19 @@
 - `VARVE3` record footers carry commit/offset metadata when `CommitPolicy` or offset-chain `IndexPolicy` requires it.
 - `LayoutWriter` and `LayoutReader` provide the first non-native physical path
   for optional file header + repeated segments. The initial verified targets are
-  TDMS `TDSm` lead-in + TDMS metadata bytes + contiguous raw channel bytes
-  verified by `npTDMS`, 24-bit BMP headers and pixel payloads verified by
-  Pillow, and a generic framed layout with declared file header and segment
-  footer.
+  a TDMS-style external adapter proof with `TDSm` lead-in + TDMS metadata bytes
+  + contiguous raw channel bytes verified by `npTDMS`, 24-bit BMP headers and
+  pixel payloads verified by Pillow, and a generic framed layout with declared
+  file header and segment footer.
 - Custom physical readers can dispatch multiple declared segment descriptors by
   leading literal lead-in prefixes, including a byte tag plus literal numeric
   kind fields.
 - Format-first custom layouts generate typed `FormatLayoutWriter` and
   `FormatLayoutReader` wrappers over that physical path while preserving the
   low-level dynamic `SegmentWrite` escape hatch.
+- Custom physical layouts also expose streamed segment writes and tolerant scan
+  reports, so external adapters can avoid prebuffering large raw regions and can
+  distinguish a complete physical prefix from a truncated or invalid tail.
 - Matrix blocks use deterministic slot layout and commit bitmaps instead of
   append-log record footers or offset chains.
 - Endian priority is block override, then format setting, then the macro little-endian default.
@@ -123,9 +126,11 @@
 - The suite covers small, medium, and large cases for append/open/scan, checkpoint open, materialized keyed state, merge, compact, direct base+delta compact, recovery, mmap payload windows, matrix direct access, matrix aux regions, and zero-copy raw fixed reads.
 - It also covers custom physical layout append and open/scan so layout DSL
   changes expose obvious framing or scan regressions.
-- TDMS compatibility is checked by optional Python harnesses: one opens a
-  Varve-authored TDMS file with `npTDMS`, and the other generates a
-  two-channel `npTDMS` file and parses it through Varve's layout reader.
+- TDMS-style adapter feasibility is checked by optional Python harnesses: one
+  opens a Varve-authored example file with `npTDMS`, and the other generates a
+  two-channel `npTDMS` file and parses it through Varve-based example code.
+  Varve does not ship these examples as a TDMS reader/writer feature; see
+  `docs/nptdms-adapter-boundary.md`.
 - Non-TDMS physical-format compatibility is checked by a BMP/Pillow harness:
   Varve writes a 24-bit BMP that Pillow opens, then Pillow writes a BMP that
   Varve validates and decodes through the generated layout reader.

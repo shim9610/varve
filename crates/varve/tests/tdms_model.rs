@@ -136,7 +136,7 @@ fn tdms_data_model_reader_writer_can_be_built_on_public_api() -> varve::Result<(
     assert_eq!(properties.len(), 6);
     assert_eq!(
         properties.get(&(s("/"), s("title")))?.unwrap().string_value,
-        "Varve TDMS model smoke"
+        "Varve TDMS-style adapter model smoke"
     );
     assert_eq!(
         properties
@@ -228,7 +228,11 @@ fn write_first_tdms_segment(writer: &mut TdmsModelFormatWriter) -> varve::Result
         group: s("Measured Data"),
         channel: s("Amplitude"),
     })?;
-    writer.push_tdms_property(&string_property("/", "title", "Varve TDMS model smoke"))?;
+    writer.push_tdms_property(&string_property(
+        "/",
+        "title",
+        "Varve TDMS-style adapter model smoke",
+    ))?;
     writer.push_tdms_property(&bool_property("/'Measured Data'", "calibrated", true))?;
     writer.push_tdms_property(&float_property(
         "/'Measured Data'",

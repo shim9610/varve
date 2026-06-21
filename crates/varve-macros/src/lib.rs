@@ -1993,6 +1993,10 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 Self::spec().inspect_layout_file(path)
             }
 
+            pub fn inspect_layout_file_report<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::LayoutScanReport> {
+                Self::spec().inspect_layout_file_report(path)
+            }
+
             pub fn open_recover<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::VarveFile> {
                 Self::spec().open_recover(path)
             }
@@ -2706,6 +2710,17 @@ fn layout_typed_api_tokens(
                 self.inner.write_segment(segment)
             }
 
+            pub fn write_segment_streamed<M, R>(
+                &mut self,
+                segment: ::varve::__core::SegmentWriteStream<'_, M, R>,
+            ) -> ::varve::__core::Result<::varve::__core::LayoutSegmentInfo>
+            where
+                M: FnOnce(&mut dyn ::std::io::Write) -> ::varve::__core::Result<()>,
+                R: FnOnce(&mut dyn ::std::io::Write) -> ::varve::__core::Result<()>,
+            {
+                self.inner.write_segment_streamed(segment)
+            }
+
             pub fn flush(&mut self) -> ::varve::__core::Result<()> {
                 self.inner.flush()
             }
@@ -2867,7 +2882,10 @@ fn layout_writer_segment_method_tokens(
     segment: &LayoutSegment,
 ) -> TokenStream2 {
     let method = format_ident!("write_{}", singular_method_name(&segment.name));
+    let streamed_method = format_ident!("write_{}_streamed", singular_method_name(&segment.name));
     let write_type = format_ident!("{}{}LayoutWrite", format_name, segment.name);
+    let field_type = format_ident!("{}{}LayoutFields", format_name, segment.name);
+    let footer_field_type = format_ident!("{}{}LayoutFooterFields", format_name, segment.name);
     let info_type = format_ident!("{}{}LayoutInfo", format_name, segment.name);
     let segment_name = segment.name.to_string();
     quote! {
@@ -2883,6 +2901,29 @@ fn layout_writer_segment_method_tokens(
                 footer_fields: &footer_fields,
                 metadata: segment.metadata,
                 raw: segment.raw,
+            })?;
+            Ok(#info_type::from_inner(info))
+        }
+
+        pub fn #streamed_method<M, R>(
+            &mut self,
+            fields: #field_type,
+            footer_fields: #footer_field_type,
+            write_metadata: M,
+            write_raw: R,
+        ) -> ::varve::__core::Result<#info_type>
+        where
+            M: FnOnce(&mut dyn ::std::io::Write) -> ::varve::__core::Result<()>,
+            R: FnOnce(&mut dyn ::std::io::Write) -> ::varve::__core::Result<()>,
+        {
+            let fields = fields.__varve_layout_values();
+            let footer_fields = footer_fields.__varve_layout_values();
+            let info = self.inner.write_segment_streamed(::varve::__core::SegmentWriteStream {
+                name: #segment_name,
+                fields: &fields,
+                footer_fields: &footer_fields,
+                write_metadata,
+                write_raw,
             })?;
             Ok(#info_type::from_inner(info))
         }

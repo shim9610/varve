@@ -162,7 +162,8 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   `FormatLayoutWriter` / `FormatLayoutReader` wrappers, typed header-field
   structs, typed header info getters, typed segment write structs, and typed
   segment info getters. The generated wrapper still exposes the low-level
-  `SegmentWrite` path and whole-region or range metadata/raw readers.
+  `SegmentWrite` path, streamed segment writes, tolerant scan reports, and
+  whole-region or range metadata/raw readers.
 - Physical layout declarations are not `VarveBlock` payload declarations:
   `VarveBlock` is the logical native append-log record unit, while
   `file_header`, `lead_in`, `footer`, `metadata`, and `raw_region` declare the
@@ -213,13 +214,17 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   `next_segment_offset` and `raw_data_offset` fields are backpatched to actual
   metadata/raw boundaries, whose ToC/version fields are visible through
   `LayoutSegmentInfo`, and whose raw `f64` channel bytes are contiguous.
-- The TDMS physical writer example produces a minimal two-segment TDMS file
-  using only Varve's generated layout APIs. The optional Python harness opens
-  that file with `npTDMS` and verifies file properties, group/channel lookup,
+- The TDMS-style physical writer example is an external adapter proof, not a
+  Varve-provided TDMS feature. It produces a minimal two-segment file using
+  only Varve's generated layout APIs. The optional Python harness opens that
+  file with `npTDMS` and verifies file properties, group/channel lookup,
   channel properties, and appended raw `f64` samples.
-- The reverse TDMS harness generates a two-segment, two-channel TDMS file with
-  Python `npTDMS`, then parses it through Varve's generated layout reader and a
-  caller-owned TDMS metadata/raw parser.
+- The reverse TDMS-style harness generates a two-segment, two-channel TDMS file
+  with Python `npTDMS`, then parses it through a Varve-based example adapter
+  that uses the generated layout reader plus caller-owned TDMS metadata/raw
+  logic.
+- `docs/nptdms-adapter-boundary.md` records the boundary between Varve generic
+  API obligations and external TDMS adapter obligations.
 - The BMP/Pillow harness verifies a non-TDMS custom physical layout in both
   directions: Varve writes a 24-bit BMP opened by Pillow, and Pillow writes a
   BMP whose header fields and pixel payload are decoded by Varve.

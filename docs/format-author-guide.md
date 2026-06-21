@@ -340,12 +340,13 @@ varve_format! {
 For format-first declarations, the macro generates a typed physical-layout
 facade. `PhysicalFormat::create_layout_writer` returns
 `PhysicalFormatLayoutWriter`, and `segment DataSegment` generates
-`write_data_segment`, `data_segments`, `data_segment`,
-`read_data_segment_metadata`, `read_data_segment_metadata_range`,
-`read_data_segment_raw`, and `read_data_segment_raw_range`. A declared
-`file_header` also generates `file_header()` on the layout reader. Caller fields
-become typed Rust struct fields; literal and finalized fields are supplied,
-validated, or backpatched by Varve, then exposed through typed info getters.
+`write_data_segment`, `write_data_segment_streamed`, `data_segments`,
+`data_segment`, `read_data_segment_metadata`,
+`read_data_segment_metadata_range`, `read_data_segment_raw`, and
+`read_data_segment_raw_range`. A declared `file_header` also generates
+`file_header()` on the layout reader. Caller fields become typed Rust struct
+fields; literal and finalized fields are supplied, validated, or backpatched by
+Varve, then exposed through typed info getters.
 Finalized numeric fields may use the numeric width required by the target
 format. For example, BMP-style headers can use `u32 file_size` relative to
 `segment_start`, while TDMS-style headers can use `u64 next_segment_offset`
@@ -359,22 +360,28 @@ one byte tag plus a literal kind field. Generated typed reader indexes are per
 segment kind: `read_data_segment_raw(0)` reads the first `DataSegment` even if a
 different segment appears before it in the physical stream.
 
-The low-level `LayoutWriter::write_segment(SegmentWrite)` path remains exposed
-through the generated wrapper for dynamic adapters. Reopen the same file with
+The low-level `LayoutWriter::write_segment(SegmentWrite)` and
+`write_segment_streamed(SegmentWriteStream)` paths remain exposed through the
+generated wrapper for dynamic adapters. Reopen the same file with
 `open_layout_writer` when you need to validate the existing segment stream and
 append more segments. `open_layout_reader` validates literal tags, offset
 fields, header/footer bounds, exposes typed getters on generated
 `...LayoutInfo`, and still returns opaque `read_metadata`, `read_metadata_range`,
-`read_raw`, and `read_raw_range` methods.
+`read_raw`, and `read_raw_range` methods. Use `inspect_layout_file_report` when
+an adapter needs to separate a valid complete prefix from a truncated or invalid
+tail before deciding whether the file should be rejected or reported as an
+incomplete external-format file.
 
 For concrete compatibility checks, `crates/varve/examples/tdms_physical_writer.rs`
-writes a minimal two-segment TDMS file with real `TDSm` lead-ins, TDMS object
-metadata, a channel raw-data index, and appended contiguous `f64` samples using
-only the generated physical-layout writer. The optional Python harness verifies
-that file with `npTDMS`. The reverse harness creates a two-segment, two-channel
-TDMS file with `npTDMS`, then parses it with
-`crates/varve/examples/tdms_physical_reader.rs` through Varve's generated
-layout reader:
+is a TDMS-style external adapter proof. It writes a minimal two-segment file
+with real `TDSm` lead-ins, TDMS object metadata, a channel raw-data index, and
+appended contiguous `f64` samples using only the generated physical-layout
+writer. The optional Python harness verifies that file with `npTDMS`. The
+reverse harness creates a two-segment, two-channel TDMS file with `npTDMS`,
+then parses it through `crates/varve/examples/tdms_physical_reader.rs`, a
+Varve-based example adapter that uses the generated layout reader plus
+caller-owned TDMS metadata logic. These examples are not a Varve-provided TDMS
+reader/writer feature:
 
 ```powershell
 python -m venv .venv-tdms

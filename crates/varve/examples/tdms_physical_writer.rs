@@ -53,7 +53,7 @@ fn main() -> varve::Result<()> {
             raw_data_index: RawDataIndex::None,
             properties: vec![TdmsProperty::String {
                 name: "title",
-                value: "Varve TDMS compatibility smoke",
+                value: "Varve TDMS adapter proof smoke",
             }],
         },
         TdmsObject {

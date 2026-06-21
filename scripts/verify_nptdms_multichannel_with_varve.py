@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a multi-channel TDMS file with npTDMS and parse it with Varve."""
+"""Parse an npTDMS-authored file with a Varve-based example adapter."""
 
 from __future__ import annotations
 
@@ -90,7 +90,7 @@ def main() -> int:
         check=True,
     )
 
-    print(f"Varve verified npTDMS multichannel file {output}")
+    print(f"Varve example parsed npTDMS multichannel file {output}")
     return 0
 
 

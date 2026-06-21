@@ -92,17 +92,22 @@ typed `FormatSegmentLayoutFields` struct, `write_segment_name` lowers them into
 `LayoutFieldValue`s, and generated segment info getters read validated values
 back from `LayoutSegmentInfo`. A declared file header similarly gains a typed
 `file_header()` info object on the generated reader. Raw and metadata regions
-intentionally remain byte slices so TDMS-style adapters can own their metadata
-and channel encoding.
+intentionally remain byte slices so external adapters can own their metadata
+and channel encoding. For large metadata or raw regions, generated
+`write_*_streamed` methods and low-level `write_segment_streamed` let the
+adapter stream bytes while Varve still counts lengths and backpatches offsets.
 
-`inspect_layout_file` is the common inspection path. For custom physical files
+`inspect_layout_file` is the strict inspection path. For custom physical files
 it delegates to the layout reader; for Varve-native files it performs the normal
 strict native scan and projects each record into the same segment range model.
-The Varve-native file header, record lead-in, and optional footer are also
-emitted and parsed through an internal native layout codec that feeds the same
-effective `VarveFileHeader` and `VarveRecord` plan, while the higher-level
-append-log, recovery, compression, and index semantics stay in the native
-reader/writer.
+Use `inspect_layout_file_report` when an adapter needs a diagnostic view of the
+complete prefix plus the terminal tail status before its own metadata semantics
+run. That split is what lets an external adapter decide whether a failure is a
+Varve physical-layout limitation or caller-owned parsing/model logic. The
+Varve-native file header, record lead-in, and optional footer are also emitted
+and parsed through an internal native layout codec that feeds the same effective
+`VarveFileHeader` and `VarveRecord` plan, while the higher-level append-log,
+recovery, compression, and index semantics stay in the native reader/writer.
 
 ## Append-Log Records
 

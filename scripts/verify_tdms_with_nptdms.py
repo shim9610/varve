@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a Varve-authored TDMS file and verify it with npTDMS."""
+"""Verify a Varve-based TDMS example file against npTDMS."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def main() -> int:
         )
 
     tdms = TdmsFile.read(output)
-    assert tdms.properties["title"] == "Varve TDMS compatibility smoke"
+    assert tdms.properties["title"] == "Varve TDMS adapter proof smoke"
 
     group = tdms["Measured Data"]
     channel = group["Amplitude"]

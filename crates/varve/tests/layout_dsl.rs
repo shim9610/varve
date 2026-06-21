@@ -1,10 +1,10 @@
-use std::fs::{read, remove_file, write};
+use std::fs::{OpenOptions, read, remove_file, write};
 use std::path::PathBuf;
 
 use varve::{
     Error, LayoutFieldValue, LayoutPlanFieldSource, LayoutPlanFieldType, LayoutPlanLen,
-    LayoutPlanPartKind, LayoutPreset, LayoutValue, SegmentRepeat, SegmentWrite, VarveBlock,
-    varve_format,
+    LayoutPlanPartKind, LayoutPreset, LayoutTailKind, LayoutValue, SegmentRepeat, SegmentWrite,
+    VarveBlock, varve_format,
 };
 
 #[derive(Clone, Debug, PartialEq, VarveBlock)]
@@ -627,6 +627,104 @@ fn custom_layout_writes_file_header_and_segment_footer() -> varve::Result<()> {
     assert_eq!(inspected.plan.preset, LayoutPreset::None);
     assert_eq!(inspected.file_header_len, 6);
     assert_eq!(inspected.segments.as_slice(), reader.segments());
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn custom_layout_streams_metadata_and_raw_without_prebuffering() -> varve::Result<()> {
+    let path = temp_path("framed_physical_streamed_layout");
+    cleanup(&path);
+
+    {
+        let mut writer = FramedPhysicalFormat::create_layout_writer(&path)?;
+        let info = writer.write_data_segment_streamed(
+            FramedPhysicalFormatDataSegmentLayoutFields { kind: 11 },
+            FramedPhysicalFormatDataSegmentLayoutFooterFields,
+            |out| {
+                out.write_all(b"meta-")?;
+                out.write_all(b"stream")?;
+                Ok(())
+            },
+            |out| {
+                for chunk in [b"raw-" as &[u8], b"stream"] {
+                    out.write_all(chunk)?;
+                }
+                Ok(())
+            },
+        )?;
+        assert_eq!(info.kind()?, 11);
+        assert_eq!(info.next_segment_offset()?, 33);
+        assert_eq!(info.raw_data_offset()?, 11);
+        assert_eq!(info.footer_segment_len()?, 57);
+        writer.flush()?;
+    }
+
+    let reader = FramedPhysicalFormat::open_layout_reader(&path)?;
+    assert_eq!(reader.read_data_segment_metadata(0)?, b"meta-stream");
+    assert_eq!(reader.read_data_segment_raw(0)?, b"raw-stream");
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn custom_layout_report_preserves_complete_prefix_before_truncated_tail() -> varve::Result<()> {
+    let path = temp_path("tdms_physical_report_truncated_tail");
+    cleanup(&path);
+    let fields = [
+        LayoutFieldValue {
+            name: "toc_mask",
+            value: LayoutValue::U32(0x1108),
+        },
+        LayoutFieldValue {
+            name: "version",
+            value: LayoutValue::U32(4713),
+        },
+    ];
+
+    {
+        let mut writer = TdmsPhysicalFormat::create_layout_writer(&path)?;
+        writer.write_segment(SegmentWrite {
+            name: "TdmsSegment",
+            fields: &fields,
+            footer_fields: &[],
+            metadata: b"complete",
+            raw: &f64_bytes(&[1.0]),
+        })?;
+        writer.write_segment(SegmentWrite {
+            name: "TdmsSegment",
+            fields: &fields,
+            footer_fields: &[],
+            metadata: b"tail",
+            raw: &f64_bytes(&[2.0, 3.0]),
+        })?;
+        writer.flush()?;
+    }
+
+    let original_len = read(&path)?.len() as u64;
+    OpenOptions::new()
+        .write(true)
+        .open(&path)?
+        .set_len(original_len - 4)?;
+
+    assert!(matches!(
+        TdmsPhysicalFormat::open_layout_reader(&path),
+        Err(Error::LayoutInvalidSegmentBounds { .. })
+    ));
+
+    let report = TdmsPhysicalFormat::inspect_layout_file_report(&path)?;
+    assert!(!report.is_complete());
+    assert_eq!(report.segments.len(), 1);
+    assert_eq!(
+        report.segments[0].field("version"),
+        Some(&LayoutValue::U32(4713))
+    );
+    let tail = report.tail.expect("truncated tail report");
+    assert_eq!(tail.offset, report.segments[0].segment_end);
+    assert_eq!(tail.file_len, original_len - 4);
+    assert_eq!(tail.kind, LayoutTailKind::InvalidSegmentBounds);
 
     cleanup(&path);
     Ok(())

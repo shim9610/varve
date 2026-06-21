@@ -82,7 +82,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec![0.10, 0.20, 0.30, 0.40]
     );
 
-    println!("Varve parsed npTDMS multichannel file {}", path.display());
+    println!(
+        "Varve-based example parsed npTDMS multichannel file {}",
+        path.display()
+    );
     Ok(())
 }
 

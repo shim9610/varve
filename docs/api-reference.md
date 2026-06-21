@@ -191,7 +191,9 @@ metadata and raw regions.
 | `Format::open_layout_writer(path)` | validate an existing custom-layout file and append more segments through `FormatLayoutWriter` |
 | `Format::open_layout_reader(path)` | open a generated `FormatLayoutReader` |
 | `Format::inspect_layout_file(path)` | inspect native or custom physical file framing through one result type |
+| `Format::inspect_layout_file_report(path)` | inspect complete physical prefix plus terminal tail status without claiming strict open success |
 | `FormatLayoutWriter::write_data_segment(...)` | generated segment writer from the declared segment name |
+| `FormatLayoutWriter::write_data_segment_streamed(...)` | generated segment writer that streams metadata/raw bytes into the file |
 | `FormatLayoutReader::data_segments()` | generated typed segment info collection |
 | `FormatLayoutReader::file_header()` | generated typed file-header info when a `file_header` is declared |
 | `FormatLayoutReader::read_data_segment_metadata(index)` | generated metadata reader for the declared segment |
@@ -199,8 +201,11 @@ metadata and raw regions.
 | `FormatLayoutReader::read_data_segment_raw(index)` | generated raw-region reader for the declared segment |
 | `FormatLayoutReader::read_data_segment_raw_range(index, offset, len)` | generated bounded raw-region subrange reader |
 | `LayoutWriter::write_segment(SegmentWrite)` | write lead-in, metadata, raw bytes, footer, then backpatch offsets |
+| `LayoutWriter::write_segment_streamed(SegmentWriteStream)` | stream metadata and raw bytes while still counting/backpatching offsets |
 | `SegmentWrite::fields` | caller values for lead-in fields |
 | `SegmentWrite::footer_fields` | caller values for footer fields |
+| `SegmentWriteStream::write_metadata` | closure that writes metadata bytes directly to the file |
+| `SegmentWriteStream::write_raw` | closure that writes raw-region bytes directly to the file |
 | `LayoutReader::file_header_len()` | validated header length before the first segment |
 | `LayoutReader::file_header_fields()` | validated declared file-header values |
 | `LayoutReader::file_header_field(name)` | read one validated file-header value |
@@ -211,6 +216,8 @@ metadata and raw regions.
 | `LayoutReader::read_metadata_range(index, offset, len)` | read a checked metadata byte range without loading the whole region |
 | `LayoutReader::read_raw(index)` | read contiguous raw-region bytes for a segment |
 | `LayoutReader::read_raw_range(index, offset, len)` | read a checked raw byte range without loading the whole region |
+| `LayoutScanReport` | tolerant scan result with complete segments and optional `LayoutTailInfo` |
+| `LayoutTailInfo` | terminal custom-layout scan status for truncated, invalid, or unmatched tails |
 
 This path is separate from `create_writer/open_reader`; native append-log APIs
 still write the `VARVE1/2/3` container. TDMS-style files use `preset: none` so
@@ -276,20 +283,22 @@ let raw_slice = reader.read_data_segment_raw_range(0, 8, 8)?;
 ```
 
 The generated wrapper still exposes the low-level `write_segment`,
-`read_metadata`, `read_metadata_range`, `read_raw`, `read_raw_range`, and
-`segments` methods for adapters that need to bridge dynamic metadata. Multiple
-segment descriptors are dispatched by their leading literal lead-in prefix. A
-byte tag such as `bytes tag = b"DATA"` is the common discriminator; immediately
-following literal numeric fields extend the dispatch key. Generated
-segment-specific `index` parameters are per segment kind, while the low-level
-range methods continue to use the global physical stream index.
+`write_segment_streamed`, `read_metadata`, `read_metadata_range`, `read_raw`,
+`read_raw_range`, and `segments` methods for adapters that need to bridge
+dynamic metadata. Multiple segment descriptors are dispatched by their leading
+literal lead-in prefix. A byte tag such as `bytes tag = b"DATA"` is the common
+discriminator; immediately following literal numeric fields extend the dispatch
+key. Generated segment-specific `index` parameters are per segment kind, while
+the low-level range methods continue to use the global physical stream index.
 
-`crates/varve/examples/tdms_physical_writer.rs` demonstrates a public-API TDMS
-writer, and `scripts/verify_tdms_with_nptdms.py` verifies the produced file
-with the optional Python `npTDMS` harness. The reverse harness,
+`crates/varve/examples/tdms_physical_writer.rs` demonstrates a TDMS-style
+external adapter proof built on public Varve APIs, and
+`scripts/verify_tdms_with_nptdms.py` verifies the produced file with the
+optional Python `npTDMS` harness. The reverse harness,
 `scripts/verify_nptdms_multichannel_with_varve.py`, writes a two-channel TDMS
-file with `npTDMS` and parses it with
-`crates/varve/examples/tdms_physical_reader.rs`.
+file with `npTDMS` and parses it with Varve-based example code in
+`crates/varve/examples/tdms_physical_reader.rs`. These examples are not a
+Varve-provided TDMS reader/writer feature.
 
 `crates/varve/examples/bmp_physical.rs` is the non-TDMS external-format smoke
 example. `scripts/verify_bmp_with_pillow.py` writes a 24-bit BMP through

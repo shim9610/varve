@@ -80,9 +80,22 @@ python -m venv .venv-tdms
 .\.venv-tdms\Scripts\python.exe scripts\verify_bmp_with_pillow.py
 ```
 
-The TDMS harnesses check Varve-authored files against `npTDMS` and
-`npTDMS`-authored multichannel files against Varve. The BMP harness checks a
-non-TDMS layout in both directions with Pillow.
+The TDMS harnesses check Varve-authored example files against `npTDMS` and
+`npTDMS`-authored multichannel files against a Varve-based example adapter. The
+BMP harness checks a non-TDMS layout in both directions with Pillow.
+
+For TDMS-style work, remember that the repository contains adapter proofs, not
+a Varve-provided TDMS reader/writer. Use `docs/nptdms-adapter-boundary.md` to
+decide whether a failure belongs to Varve's generic API or to caller-owned TDMS
+semantics. A quick rule:
+
+- If strict layout open succeeds, `inspect_layout_file_report` is complete, and
+  the adapter can read the required metadata/raw byte ranges, failures in TDMS
+  object paths, property typing, scaling, timestamps, channel slicing, or export
+  are caller/adapter issues.
+- If a valid external physical layout cannot be declared, cannot stream or read
+  required byte ranges, or cannot report a truncated tail before TDMS semantics
+  run, treat it as a Varve API limitation.
 
 ## Domain Meaning
 

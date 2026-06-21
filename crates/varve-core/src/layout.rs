@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::{
@@ -119,6 +119,15 @@ pub struct SegmentWrite<'a> {
     pub raw: &'a [u8],
 }
 
+#[derive(Clone, Copy)]
+pub struct SegmentWriteStream<'a, M, R> {
+    pub name: &'static str,
+    pub fields: &'a [LayoutFieldValue],
+    pub footer_fields: &'a [LayoutFieldValue],
+    pub write_metadata: M,
+    pub write_raw: R,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayoutSegmentInfo {
     pub name: &'static str,
@@ -141,6 +150,39 @@ pub struct LayoutFileInfo {
     pub file_header_len: u64,
     pub file_header_fields: Vec<LayoutFieldValue>,
     pub segments: Vec<LayoutSegmentInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutScanReport {
+    pub plan: LayoutPlan,
+    pub file_header_len: u64,
+    pub file_header_fields: Vec<LayoutFieldValue>,
+    pub segments: Vec<LayoutSegmentInfo>,
+    pub tail: Option<LayoutTailInfo>,
+}
+
+impl LayoutScanReport {
+    pub fn is_complete(&self) -> bool {
+        self.tail.is_none()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutTailInfo {
+    pub offset: u64,
+    pub file_len: u64,
+    pub kind: LayoutTailKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutTailKind {
+    TruncatedHeader,
+    TruncatedLeadIn,
+    InvalidSegmentBounds,
+    LiteralMismatch,
+    AmbiguousSegment,
+    NoMatchingSegment,
+    RepeatedOnceSegment,
 }
 
 impl LayoutSegmentInfo {
@@ -207,6 +249,39 @@ struct SegmentCount {
     count: u64,
 }
 
+struct CountingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    bytes_written: u64,
+}
+
+impl<'a, W: Write> CountingWriter<'a, W> {
+    fn new(inner: &'a mut W) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+        }
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+}
+
+impl<W: Write> Write for CountingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::other("layout stream write length overflow"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 impl FormatSpec {
     pub fn create_layout_writer<P: AsRef<Path>>(self, path: P) -> Result<LayoutWriter> {
         self.validate()?;
@@ -245,6 +320,54 @@ impl FormatSpec {
                 segments: reader.segments,
             })
         }
+    }
+
+    pub fn inspect_layout_file_report<P: AsRef<Path>>(self, path: P) -> Result<LayoutScanReport> {
+        self.validate()?;
+        if self.layout.is_varve_native_default() {
+            let info = inspect_native_layout_file(self, path)?;
+            return Ok(LayoutScanReport {
+                plan: info.plan,
+                file_header_len: info.file_header_len,
+                file_header_fields: info.file_header_fields,
+                segments: info.segments,
+                tail: None,
+            });
+        }
+
+        ensure_custom_layout_spec(self)?;
+        let path = path.as_ref();
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        let (file_header_len, file_header_fields) = match read_file_header(self, &mut file) {
+            Ok(header) => header,
+            Err(error) => {
+                if let Some(tail) = layout_tail_info(&error, 0, file_len) {
+                    let file_header_len = self
+                        .layout
+                        .file_header()
+                        .map(file_header_len)
+                        .transpose()?
+                        .unwrap_or(0);
+                    return Ok(LayoutScanReport {
+                        plan: self.effective_layout(),
+                        file_header_len,
+                        file_header_fields: Vec::new(),
+                        segments: Vec::new(),
+                        tail: Some(tail),
+                    });
+                }
+                return Err(error);
+            }
+        };
+        let (segments, tail) = scan_layout_segments_report(self, &mut file, file_header_len)?;
+        Ok(LayoutScanReport {
+            plan: self.effective_layout(),
+            file_header_len,
+            file_header_fields,
+            segments,
+            tail,
+        })
     }
 }
 
@@ -308,6 +431,29 @@ impl LayoutWriter {
     }
 
     pub fn write_segment(&mut self, segment: SegmentWrite<'_>) -> Result<LayoutSegmentInfo> {
+        self.write_segment_streamed(SegmentWriteStream {
+            name: segment.name,
+            fields: segment.fields,
+            footer_fields: segment.footer_fields,
+            write_metadata: |writer: &mut dyn Write| {
+                writer.write_all(segment.metadata)?;
+                Ok(())
+            },
+            write_raw: |writer: &mut dyn Write| {
+                writer.write_all(segment.raw)?;
+                Ok(())
+            },
+        })
+    }
+
+    pub fn write_segment_streamed<M, R>(
+        &mut self,
+        segment: SegmentWriteStream<'_, M, R>,
+    ) -> Result<LayoutSegmentInfo>
+    where
+        M: FnOnce(&mut dyn Write) -> Result<()>,
+        R: FnOnce(&mut dyn Write) -> Result<()>,
+    {
         let descriptor = segment_descriptor(self.spec, segment.name)?;
         self.ensure_segment_can_write(descriptor)?;
         ensure_no_unexpected_fields_for(descriptor.lead_in.fields, segment.fields)?;
@@ -332,16 +478,18 @@ impl LayoutWriter {
                     offset: segment_start,
                 })?;
         let metadata_offset = after_lead_in;
-        self.file.write_all(segment.metadata)?;
-        let metadata_len = segment.metadata.len() as u64;
+        let mut metadata_writer = CountingWriter::new(&mut self.file);
+        (segment.write_metadata)(&mut metadata_writer)?;
+        let metadata_len = metadata_writer.bytes_written();
         let raw_offset =
             metadata_offset
                 .checked_add(metadata_len)
                 .ok_or(Error::LayoutInvalidSegmentBounds {
                     offset: segment_start,
                 })?;
-        self.file.write_all(segment.raw)?;
-        let raw_len = segment.raw.len() as u64;
+        let mut raw_writer = CountingWriter::new(&mut self.file);
+        (segment.write_raw)(&mut raw_writer)?;
+        let raw_len = raw_writer.bytes_written();
         let footer_offset =
             raw_offset
                 .checked_add(raw_len)
@@ -1067,6 +1215,94 @@ fn scan_layout_segments(
         return Err(Error::LayoutInvalidSegmentBounds { offset });
     }
     Ok(segments)
+}
+
+fn scan_layout_segments_report(
+    spec: FormatSpec,
+    file: &mut File,
+    start_offset: u64,
+) -> Result<(Vec<LayoutSegmentInfo>, Option<LayoutTailInfo>)> {
+    let dispatch = segment_dispatch_table(spec)?;
+    let file_len = file.metadata()?.len();
+    let mut offset = start_offset;
+    let mut segments = Vec::new();
+    let mut segment_counts = initial_segment_counts(spec)?;
+    while offset < file_len {
+        let dispatch_index = match select_segment_descriptor(&dispatch, file, offset, file_len) {
+            Ok(index) => index,
+            Err(error) => {
+                if let Some(tail) = layout_tail_info(&error, offset, file_len) {
+                    return Ok((segments, Some(tail)));
+                }
+                return Err(error);
+            }
+        };
+        let descriptor = dispatch[dispatch_index].descriptor;
+        if descriptor.repeat == SegmentRepeat::Once
+            && segment_counts
+                .iter()
+                .any(|count| count.name == descriptor.name && count.count > 0)
+        {
+            return Ok((
+                segments,
+                Some(LayoutTailInfo {
+                    offset,
+                    file_len,
+                    kind: LayoutTailKind::RepeatedOnceSegment,
+                }),
+            ));
+        }
+        let info = match read_layout_segment_at(spec, file, descriptor, offset, file_len) {
+            Ok(info) => info,
+            Err(error) => {
+                if let Some(tail) = layout_tail_info(&error, offset, file_len) {
+                    return Ok((segments, Some(tail)));
+                }
+                return Err(error);
+            }
+        };
+        if info.segment_end <= offset {
+            return Ok((
+                segments,
+                Some(LayoutTailInfo {
+                    offset,
+                    file_len,
+                    kind: LayoutTailKind::InvalidSegmentBounds,
+                }),
+            ));
+        }
+        offset = info.segment_end;
+        if let Some(count) = segment_counts
+            .iter_mut()
+            .find(|count| count.name == descriptor.name)
+        {
+            count.count += 1;
+        }
+        segments.push(info);
+    }
+    Ok((segments, None))
+}
+
+fn layout_tail_info(error: &Error, default_offset: u64, file_len: u64) -> Option<LayoutTailInfo> {
+    let (offset, kind) = match error {
+        Error::LayoutTruncatedHeader { offset } => (*offset, LayoutTailKind::TruncatedHeader),
+        Error::LayoutTruncatedLeadIn { offset } => (*offset, LayoutTailKind::TruncatedLeadIn),
+        Error::LayoutInvalidSegmentBounds { offset } => {
+            (*offset, LayoutTailKind::InvalidSegmentBounds)
+        }
+        Error::LayoutLiteralMismatch { offset, .. } => (*offset, LayoutTailKind::LiteralMismatch),
+        Error::LayoutAmbiguousSegment { offset } => (*offset, LayoutTailKind::AmbiguousSegment),
+        Error::LayoutNoMatchingSegment { offset } => (*offset, LayoutTailKind::NoMatchingSegment),
+        Error::LayoutRepeatedOnceSegment { offset, .. } => {
+            (*offset, LayoutTailKind::RepeatedOnceSegment)
+        }
+        _ => return None,
+    };
+    Some(LayoutTailInfo {
+        offset: if offset == 0 { default_offset } else { offset },
+        file_len,
+        kind,
+    })
 }
 
 fn segment_dispatch_table(spec: FormatSpec) -> Result<Vec<SegmentDispatch>> {
