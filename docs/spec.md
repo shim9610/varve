@@ -392,3 +392,34 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
   per-cell CRC verification when enabled.
 - Variable blocks are not zero-copy eligible in the first scaffold.
 - No API may silently reinterpret canonical fixed encoding as Rust memory layout.
+
+### External Adapter Toolkit
+
+- The adapter toolkit is a planned generic layer above custom physical layouts.
+  It must not hardcode TDMS. TDMS-style support should emerge from reusable
+  declarations plus user-defined codecs, chunk builders, and reducers.
+- P0 provides `BinaryCursor` and `BinaryWriter` for checked endian-aware
+  primitive reads/writes, bounded byte windows, cursor position reporting, and
+  length-prefixed bytes/string helpers.
+- P1 provides a `TaggedValueCodec` trait so adapters can map format-specific
+  type ids to user value enums without Varve owning the meaning of those type
+  ids.
+- P1 provides `ChunkIndex` and `ChunkIndexBuilder` for mapping physical segment
+  raw regions to logical stream chunks. The builder validates bounds against
+  `LayoutSegmentInfo`, while the adapter supplies stream keys, value counts,
+  stride/interleaving rules, and semantic metadata.
+- P1 provides a `SegmentReducer` runner for stateful segmented metadata. Varve
+  owns iteration and diagnostics; the adapter owns inheritance, replacement,
+  same-as-previous, deletion, and version semantics.
+- P2 provides sidecar policy helpers for companion index/cache files. Varve owns
+  path derivation and basic identity diagnostics; the adapter owns sidecar wire
+  grammar and rebuild policy.
+- P2 may add a declarative `varve_adapter!` or nested `adapter { ... }` DSL. The
+  DSL should generate adapter scaffolding from declarations but keep custom
+  semantics in ordinary user Rust implementations.
+- Adapter diagnostics should combine static declaration checks, physical layout
+  reports, cursor parse errors, chunk-bound checks, reducer status, and sidecar
+  status so users can decide whether a failure belongs to Varve mechanics,
+  adapter declarations, user domain code, or damaged file bytes.
+- See `docs/adapter-toolkit-design.md` for the detailed design and the example
+  of TDMS as one possible instantiation.

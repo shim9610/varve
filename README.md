@@ -22,6 +22,7 @@ The workspace contains:
 | [Self-Check Guide](docs/self-check-guide.md) | deciding whether a failure is format, caller, data, feature, environment, or library |
 | [Architecture](docs/architecture.md) | current architectural outline and implementation status |
 | [Requirements Boundary](docs/requirements-boundary.md) | what Varve owns versus what callers should implement |
+| [Adapter Toolkit Design](docs/adapter-toolkit-design.md) | planned generic adapter primitives for external binary formats |
 | [npTDMS Adapter Boundary](docs/nptdms-adapter-boundary.md) | how npTDMS-documented behavior maps to Varve generic APIs versus external adapter code |
 
 ## Minimal Shape
