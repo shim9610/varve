@@ -1,7 +1,7 @@
 # Varve Requirements Boundary
 
-This document maps `varve-requirements.md` into the boundary between Varve
-runtime responsibilities and caller responsibilities. It is intentionally
+This document maps internal storage requirements into the boundary between
+Varve runtime responsibilities and caller responsibilities. It is intentionally
 storage-layer focused: domain analysis, scheduling, and business semantics stay
 outside Varve.
 
