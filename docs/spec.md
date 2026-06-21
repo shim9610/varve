@@ -213,16 +213,20 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - A TDMS-style custom layout can write files whose first bytes are `TDSm`, whose
   `next_segment_offset` and `raw_data_offset` fields are backpatched to actual
   metadata/raw boundaries, whose ToC/version fields are visible through
-  `LayoutSegmentInfo`, and whose raw `f64` channel bytes are contiguous.
+  `LayoutSegmentInfo`, and whose mixed raw channel bytes are sliced by
+  adapter-owned chunk metadata.
 - The TDMS-style physical writer example is an external adapter proof, not a
-  Varve-provided TDMS feature. It produces a three-segment, two-channel file
+  Varve-provided TDMS feature. It produces a three-segment scalar type matrix
   using Varve's generated layout APIs plus adapter toolkit helpers, then
   reopens it with `open_layout_writer` to append another segment. The optional
   Python harness opens that file with `npTDMS` and verifies file properties,
-  group/channel lookup, channel properties, `same-as-previous` raw-index reuse,
-  bool/string/integer/float tagged properties, sidecar inspection, byte-backed
-  reading, and appended raw `f64` samples.
-- The reverse TDMS-style harness generates a two-segment, two-channel TDMS file
+  group/channel lookup, channel properties, changed raw-data-index segments,
+  `same-as-previous` raw-index reuse, bool/string/integer/float tagged
+  properties, sidecar inspection, byte-backed reading, and exact raw values for
+  signed/unsigned integer widths, single/double floats, single/double floats
+  with unit type ids, booleans, strings, timestamps, and complex single/double
+  floats.
+- The reverse TDMS-style harness generates a two-segment scalar type matrix
   with Python `npTDMS`, then parses it through a Varve-based example adapter
   that uses the generated layout reader plus caller-owned TDMS metadata/raw
   logic. It then appends one segment with Varve and verifies the result with

@@ -65,9 +65,18 @@ report a documented physical status, that is a Varve generic API issue.
 ## Current Proofs
 
 - `scripts/verify_tdms_with_nptdms.py` checks a Varve-authored TDMS-style
-  example file with npTDMS.
+  example file with npTDMS. The example writes real `TDSm` segments, TDMS object
+  metadata, mixed raw channel objects, `.vtidx` sidecar evidence, a changed raw
+  index segment, `same-as-previous` raw-index reuse, and a Varve append segment.
+  npTDMS verifies exact values for signed and unsigned integer widths, single
+  and double floats, single/double floats with unit type ids, booleans, strings,
+  timestamps as `(second_fractions, seconds)`, and complex single/double floats.
 - `scripts/verify_nptdms_multichannel_with_varve.py` checks an npTDMS-authored
-  two-channel, two-segment file with a Varve-based example parser.
+  two-segment file with a Varve-based example parser, then appends a segment
+  with Varve and verifies the resulting file with npTDMS. This reverse harness
+  covers the standard scalar/channel types that npTDMS can author correctly:
+  signed and unsigned integer widths, single/double floats, booleans, strings,
+  timestamps, and complex single/double floats.
 - `scripts/verify_bmp_with_pillow.py` checks a non-TDMS custom physical layout
   against Pillow in both directions.
 - `crates/varve/tests/layout_dsl.rs` covers strict custom-layout parsing,
@@ -76,3 +85,8 @@ report a documented physical status, that is a Varve generic API issue.
 
 These tests are proof points for generic API sufficiency, not a promise that
 Varve ships a production TDMS adapter.
+
+Current TDMS example non-goals remain explicit: DAQmx raw scaler data,
+interleaved data, scaling formulas, waveform `time_track`, `.tdms_index`
+compatibility, DataFrame/HDF export, TDM/XML headers, and extended precision
+float types that npTDMS 1.10.0 itself marks as unsized/unsupported.

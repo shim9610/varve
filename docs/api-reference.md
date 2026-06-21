@@ -293,18 +293,20 @@ the low-level range methods continue to use the global physical stream index.
 
 `crates/varve/examples/tdms_physical/common.rs` contains one TDMS-style layout
 declaration plus shared reader/writer adapter code. The combined
-`tdms_physical_adapter` example exposes `write`, `append`, `read`, `read-bytes`, and
-`inspect` subcommands, while the older `tdms_physical_writer` and
+`tdms_physical_adapter` example exposes `write`, `append`, `read`, `read-bytes`,
+and `inspect` subcommands, while the older `tdms_physical_writer` and
 `tdms_physical_reader` examples are thin wrappers over the same shared
-declaration. The adapter-authored file includes two logical channels across
-three segments, TDMS-style `same-as-previous` raw index reuse, bool/string/
-integer/float tagged properties, and an adapter-owned `.vtidx` sidecar.
-`scripts/verify_tdms_with_nptdms.py` verifies Varve create+append output with
-the optional Python `npTDMS` harness, and
-`scripts/verify_nptdms_multichannel_with_varve.py` writes a two-channel TDMS
-file with `npTDMS`, parses it, appends a segment with Varve, then verifies the
-result with both npTDMS and the same Varve-based adapter code. These examples
-are not a Varve-provided TDMS reader/writer feature.
+declaration. The adapter-authored file includes mixed TDMS raw channel objects
+across three segments, a changed raw-data-index segment, TDMS-style
+`same-as-previous` raw index reuse, bool/string/integer/float tagged
+properties, and an adapter-owned `.vtidx` sidecar. The npTDMS harness verifies
+exact channel values for signed/unsigned integer widths, single/double floats,
+single/double floats with unit type ids, booleans, strings, timestamps, and
+complex single/double floats. The reverse harness writes the scalar/channel
+types that npTDMS can author correctly, parses them with the Varve-based
+adapter, appends a segment with Varve, then verifies the result with both
+npTDMS and the same adapter code. These examples are not a Varve-provided TDMS
+reader/writer feature.
 
 `crates/varve/examples/bmp_physical.rs` is the non-TDMS external-format smoke
 example. `scripts/verify_bmp_with_pillow.py` writes a 24-bit BMP through

@@ -19,10 +19,23 @@ const TDMS_TOC_INTERLEAVED_DATA: u32 = 1 << 5;
 const TDMS_RAW_INDEX_NONE: u32 = 0xFFFF_FFFF;
 const TDMS_RAW_INDEX_SAME_AS_PREVIOUS: u32 = 0;
 const TDMS_RAW_INDEX_LEN: u32 = 20;
+const TDMS_TYPE_I8: u32 = 1;
+const TDMS_TYPE_I16: u32 = 2;
+const TDMS_TYPE_I32: u32 = 3;
 const TDMS_TYPE_I64: u32 = 4;
+const TDMS_TYPE_U8: u32 = 5;
+const TDMS_TYPE_U16: u32 = 6;
+const TDMS_TYPE_U32: u32 = 7;
+const TDMS_TYPE_U64: u32 = 8;
+const TDMS_TYPE_SINGLE_FLOAT: u32 = 9;
 const TDMS_TYPE_DOUBLE_FLOAT: u32 = 10;
+const TDMS_TYPE_SINGLE_FLOAT_WITH_UNIT: u32 = 0x19;
+const TDMS_TYPE_DOUBLE_FLOAT_WITH_UNIT: u32 = 0x1A;
 const TDMS_TYPE_STRING: u32 = 0x20;
 const TDMS_TYPE_BOOLEAN: u32 = 0x21;
+const TDMS_TYPE_TIMESTAMP: u32 = 0x44;
+const TDMS_TYPE_COMPLEX_SINGLE_FLOAT: u32 = 0x08000c;
+const TDMS_TYPE_COMPLEX_DOUBLE_FLOAT: u32 = 0x10000d;
 const TDMS_INDEX_SIDECAR_MAGIC: &[u8; 4] = b"VTIX";
 
 varve_format! {
@@ -51,116 +64,30 @@ varve_format! {
     }
 }
 
+const GROUP_NAME: &str = "Measured Data";
+const GROUP_PATH: &str = "/'Measured Data'";
+
 pub fn write_example(path: &Path) -> varve::Result<()> {
     cleanup(path);
-    let first_metadata = tdms_metadata(&[
-        TdmsObject {
-            path: "/",
-            raw_data_index: RawDataIndex::None,
-            properties: vec![TdmsProperty {
-                name: "title",
-                value: TdmsPropertyValue::String("Varve TDMS adapter proof smoke".to_string()),
-            }],
-        },
-        TdmsObject {
-            path: "/'Measured Data'",
-            raw_data_index: RawDataIndex::None,
-            properties: Vec::new(),
-        },
-        TdmsObject {
-            path: "/'Measured Data'/'Amplitude'",
-            raw_data_index: RawDataIndex::New {
-                data_type: TDMS_TYPE_DOUBLE_FLOAT,
-                dimensions: 1,
-                values: 4,
-            },
-            properties: vec![
-                TdmsProperty {
-                    name: "unit_string",
-                    value: TdmsPropertyValue::String("V".to_string()),
-                },
-                TdmsProperty {
-                    name: "wf_increment",
-                    value: TdmsPropertyValue::F64(0.001),
-                },
-                TdmsProperty {
-                    name: "adapter_enabled",
-                    value: TdmsPropertyValue::Bool(true),
-                },
-            ],
-        },
-        TdmsObject {
-            path: "/'Measured Data'/'Phase'",
-            raw_data_index: RawDataIndex::New {
-                data_type: TDMS_TYPE_DOUBLE_FLOAT,
-                dimensions: 1,
-                values: 4,
-            },
-            properties: vec![
-                TdmsProperty {
-                    name: "unit_string",
-                    value: TdmsPropertyValue::String("rad".to_string()),
-                },
-                TdmsProperty {
-                    name: "wf_increment",
-                    value: TdmsPropertyValue::F64(0.001),
-                },
-            ],
-        },
-    ])?;
-    let second_metadata = tdms_metadata(&[
-        TdmsObject {
-            path: "/'Measured Data'/'Amplitude'",
-            raw_data_index: RawDataIndex::New {
-                data_type: TDMS_TYPE_DOUBLE_FLOAT,
-                dimensions: 1,
-                values: 2,
-            },
-            properties: vec![TdmsProperty {
-                name: "sample_count",
-                value: TdmsPropertyValue::I64(6),
-            }],
-        },
-        TdmsObject {
-            path: "/'Measured Data'/'Phase'",
-            raw_data_index: RawDataIndex::New {
-                data_type: TDMS_TYPE_DOUBLE_FLOAT,
-                dimensions: 1,
-                values: 2,
-            },
-            properties: vec![TdmsProperty {
-                name: "sample_count",
-                value: TdmsPropertyValue::I64(6),
-            }],
-        },
-    ])?;
-    let third_metadata = tdms_metadata(&[
-        TdmsObject {
-            path: "/'Measured Data'/'Amplitude'",
-            raw_data_index: RawDataIndex::SameAsPrevious,
-            properties: vec![
-                TdmsProperty {
-                    name: "sample_count",
-                    value: TdmsPropertyValue::I64(8),
-                },
-                TdmsProperty {
-                    name: "segment_note",
-                    value: TdmsPropertyValue::String("same raw index reused".to_string()),
-                },
-            ],
-        },
-        TdmsObject {
-            path: "/'Measured Data'/'Phase'",
-            raw_data_index: RawDataIndex::SameAsPrevious,
-            properties: vec![TdmsProperty {
-                name: "sample_count",
-                value: TdmsPropertyValue::I64(8),
-            }],
-        },
-    ])?;
-    let first_raw = f64_bytes(&[0.10, 0.20, 0.30, 0.40, 1.00, 1.10, 1.20, 1.30])?;
-    let second_raw = f64_bytes(&[0.50, 0.60, 1.40, 1.50])?;
-    let third_raw = f64_bytes(&[0.70, 0.80, 1.60, 1.70])?;
+    let first_channels = first_tdms_channel_values(true);
+    let second_channels = changed_tdms_channel_values(true);
+    let third_channels = same_tdms_channel_values(true);
+    let first_metadata = tdms_metadata(&initial_tdms_objects(&first_channels)?)?;
+    let second_metadata = tdms_metadata(&channel_tdms_objects(
+        &second_channels,
+        RawIndexMode::New,
+        3,
+        None,
+    )?)?;
+    let third_metadata = tdms_metadata(&channel_tdms_objects(
+        &third_channels,
+        RawIndexMode::SameAsPrevious,
+        4,
+        Some("same raw index reused"),
+    )?)?;
+    let first_raw = encode_channel_values(&first_channels)?;
+    let second_raw = encode_channel_values(&second_channels)?;
+    let third_raw = encode_channel_values(&third_channels)?;
 
     let mut writer = TdmsCompatFormat::create_layout_writer(path)?;
     let mut segment_count = 0u32;
@@ -195,7 +122,11 @@ pub fn write_example(path: &Path) -> varve::Result<()> {
     })?;
     segment_count += 1;
     writer.flush()?;
-    write_index_sidecar(path, segment_count, 6)?;
+    write_index_sidecar(
+        path,
+        segment_count,
+        expected_chunk_count(false, false) as u32,
+    )?;
     Ok(())
 }
 
@@ -210,96 +141,75 @@ pub fn read_and_verify(path: &Path) -> varve::Result<()> {
     let input = AdapterInputFile::from_path(path);
     let report = load_tdms_state(input.path())?;
     match report.state.property("/", "title") {
-        TdmsPropertyValue::String(title) if title == "npTDMS multichannel smoke" => {
+        TdmsPropertyValue::String(title) if title == "npTDMS scalar type matrix smoke" => {
             let appended = report
                 .state
-                .property_opt("/'Bench'/'Voltage'", "append_source")
+                .property_opt(channel_path("Float64"), "append_source")
                 .is_some();
-            assert_eq!(report.chunk_count, if appended { 6 } else { 4 });
+            assert_eq!(report.chunk_count, expected_chunk_count(true, appended));
             assert_eq!(
-                report.state.property("/'Bench'", "operator"),
+                report.state.property(GROUP_PATH, "operator"),
                 TdmsPropertyValue::String("Ada".to_string())
             );
             assert_eq!(
-                report.state.property("/'Bench'/'Voltage'", "unit_string"),
-                TdmsPropertyValue::String("V".to_string())
-            );
-            assert_eq!(
-                report.state.property("/'Bench'/'Current'", "unit_string"),
-                TdmsPropertyValue::String("A".to_string())
-            );
-            let mut voltage = vec![1.0, 2.0, 3.0, 4.0];
-            let mut current = vec![0.10, 0.20, 0.30, 0.40];
-            if appended {
-                voltage.push(5.0);
-                current.push(0.50);
-                assert_eq!(
-                    report.state.property("/'Bench'/'Voltage'", "append_source"),
-                    TdmsPropertyValue::String("varve-open-layout-writer".to_string())
-                );
-            }
-            assert_eq!(report.state.samples("/'Bench'/'Voltage'"), voltage);
-            assert_eq!(report.state.samples("/'Bench'/'Current'"), current);
-        }
-        TdmsPropertyValue::String(title) if title == "Varve TDMS adapter proof smoke" => {
-            let appended = report
-                .state
-                .property_opt("/'Measured Data'/'Amplitude'", "append_source")
-                .is_some();
-            assert_eq!(report.chunk_count, if appended { 8 } else { 6 });
-            assert_eq!(
-                report
-                    .state
-                    .property("/'Measured Data'/'Amplitude'", "unit_string"),
-                TdmsPropertyValue::String("V".to_string())
-            );
-            assert_eq!(
-                report
-                    .state
-                    .property("/'Measured Data'/'Amplitude'", "adapter_enabled"),
+                report.state.property(GROUP_PATH, "verified"),
                 TdmsPropertyValue::Bool(true)
             );
             assert_eq!(
                 report
                     .state
-                    .property("/'Measured Data'/'Amplitude'", "sample_count"),
-                TdmsPropertyValue::I64(if appended { 9 } else { 8 })
+                    .property(channel_path("Boolean"), "unit_string"),
+                TdmsPropertyValue::String("Boolean".to_string())
             );
-            assert_eq!(
-                report
-                    .state
-                    .property("/'Measured Data'/'Amplitude'", "segment_note"),
-                TdmsPropertyValue::String("same raw index reused".to_string())
-            );
-            assert_eq!(
-                report
-                    .state
-                    .property("/'Measured Data'/'Phase'", "unit_string"),
-                TdmsPropertyValue::String("rad".to_string())
-            );
-            assert_eq!(
-                report
-                    .state
-                    .property("/'Measured Data'/'Phase'", "sample_count"),
-                TdmsPropertyValue::I64(if appended { 9 } else { 8 })
-            );
-            let mut amplitude = vec![0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80];
-            let mut phase = vec![1.00, 1.10, 1.20, 1.30, 1.40, 1.50, 1.60, 1.70];
             if appended {
-                amplitude.push(0.90);
-                phase.push(1.80);
                 assert_eq!(
                     report
                         .state
-                        .property("/'Measured Data'/'Amplitude'", "append_source"),
+                        .property(channel_path("Float64"), "append_source"),
                     TdmsPropertyValue::String("varve-open-layout-writer".to_string())
                 );
             }
+            assert_tdms_matrix(&report.state, false, false, appended);
+        }
+        TdmsPropertyValue::String(title) if title == "Varve TDMS adapter proof smoke" => {
+            let appended = report
+                .state
+                .property_opt(channel_path("Float64"), "append_source")
+                .is_some();
+            assert_eq!(report.chunk_count, expected_chunk_count(false, appended));
             assert_eq!(
-                report.state.samples("/'Measured Data'/'Amplitude'"),
-                amplitude
+                report
+                    .state
+                    .property(channel_path("Float64"), "unit_string"),
+                TdmsPropertyValue::String("Float64".to_string())
             );
-            assert_eq!(report.state.samples("/'Measured Data'/'Phase'"), phase);
+            assert_eq!(
+                report
+                    .state
+                    .property(channel_path("Boolean"), "adapter_enabled"),
+                TdmsPropertyValue::Bool(true)
+            );
+            assert_eq!(
+                report
+                    .state
+                    .property(channel_path("String"), "sample_count"),
+                TdmsPropertyValue::I64(if appended { 5 } else { 4 })
+            );
+            assert_eq!(
+                report
+                    .state
+                    .property(channel_path("String"), "segment_note"),
+                TdmsPropertyValue::String("same raw index reused".to_string())
+            );
+            if appended {
+                assert_eq!(
+                    report
+                        .state
+                        .property(channel_path("Float64"), "append_source"),
+                    TdmsPropertyValue::String("varve-open-layout-writer".to_string())
+                );
+            }
+            assert_tdms_matrix(&report.state, true, true, appended);
         }
         other => panic!("unexpected TDMS example title {other:?}"),
     }
@@ -309,68 +219,23 @@ pub fn read_and_verify(path: &Path) -> varve::Result<()> {
 pub fn append_example(path: &Path) -> varve::Result<()> {
     let report = load_tdms_state(path)?;
     let (metadata, raw, added_chunks) = match report.state.property("/", "title") {
-        TdmsPropertyValue::String(title) if title == "Varve TDMS adapter proof smoke" => {
-            let metadata = tdms_metadata(&[
-                TdmsObject {
-                    path: "/'Measured Data'/'Amplitude'",
-                    raw_data_index: RawDataIndex::New {
-                        data_type: TDMS_TYPE_DOUBLE_FLOAT,
-                        dimensions: 1,
-                        values: 1,
-                    },
-                    properties: vec![
-                        TdmsProperty {
-                            name: "sample_count",
-                            value: TdmsPropertyValue::I64(9),
-                        },
-                        TdmsProperty {
-                            name: "append_source",
-                            value: TdmsPropertyValue::String(
-                                "varve-open-layout-writer".to_string(),
-                            ),
-                        },
-                    ],
-                },
-                TdmsObject {
-                    path: "/'Measured Data'/'Phase'",
-                    raw_data_index: RawDataIndex::New {
-                        data_type: TDMS_TYPE_DOUBLE_FLOAT,
-                        dimensions: 1,
-                        values: 1,
-                    },
-                    properties: vec![TdmsProperty {
-                        name: "sample_count",
-                        value: TdmsPropertyValue::I64(9),
-                    }],
-                },
-            ])?;
-            (metadata, f64_bytes(&[0.90, 1.80])?, 2u32)
-        }
-        TdmsPropertyValue::String(title) if title == "npTDMS multichannel smoke" => {
-            let metadata = tdms_metadata(&[
-                TdmsObject {
-                    path: "/'Bench'/'Voltage'",
-                    raw_data_index: RawDataIndex::New {
-                        data_type: TDMS_TYPE_DOUBLE_FLOAT,
-                        dimensions: 1,
-                        values: 1,
-                    },
-                    properties: vec![TdmsProperty {
-                        name: "append_source",
-                        value: TdmsPropertyValue::String("varve-open-layout-writer".to_string()),
-                    }],
-                },
-                TdmsObject {
-                    path: "/'Bench'/'Current'",
-                    raw_data_index: RawDataIndex::New {
-                        data_type: TDMS_TYPE_DOUBLE_FLOAT,
-                        dimensions: 1,
-                        values: 1,
-                    },
-                    properties: Vec::new(),
-                },
-            ])?;
-            (metadata, f64_bytes(&[5.0, 0.50])?, 2u32)
+        TdmsPropertyValue::String(title)
+            if title == "Varve TDMS adapter proof smoke"
+                || title == "npTDMS scalar type matrix smoke" =>
+        {
+            let include_unit_channels = title == "Varve TDMS adapter proof smoke";
+            let append_channels = append_tdms_channel_values(include_unit_channels);
+            let metadata = tdms_metadata(&channel_tdms_objects(
+                &append_channels,
+                RawIndexMode::SameAsPrevious,
+                5,
+                None,
+            )?)?;
+            (
+                metadata,
+                encode_channel_values(&append_channels)?,
+                append_channels.len() as u32,
+            )
         }
         other => panic!("unexpected TDMS example title for append {other:?}"),
     };
@@ -523,6 +388,7 @@ enum RawDataIndex {
         data_type: u32,
         dimensions: u32,
         values: u64,
+        byte_len: Option<u64>,
     },
 }
 
@@ -608,11 +474,18 @@ fn write_raw_data_index(writer: &mut BinaryWriter, index: RawDataIndex) -> varve
             data_type,
             dimensions,
             values,
+            byte_len,
         } => {
             writer.u32(TDMS_RAW_INDEX_LEN)?;
             writer.u32(data_type)?;
             writer.u32(dimensions)?;
-            writer.u64(values)
+            writer.u64(values)?;
+            if data_type == TDMS_TYPE_STRING {
+                writer.u64(byte_len.ok_or(varve::Error::AdapterDiagnostic(
+                    "TDMS string raw index requires an explicit byte length",
+                ))?)?;
+            }
+            Ok(())
         }
     }
 }
@@ -650,15 +523,21 @@ fn read_raw_data_index(cursor: &mut BinaryCursor<'_>) -> varve::Result<RawDataIn
             let data_type = cursor.u32()?;
             let dimensions = cursor.u32()?;
             let values = cursor.u64()?;
-            if data_type != TDMS_TYPE_DOUBLE_FLOAT || dimensions != 1 {
+            if !is_supported_tdms_channel_type(data_type) || dimensions != 1 {
                 return Err(varve::Error::AdapterDiagnostic(
-                    "example reader supports only one-dimensional f64 raw data",
+                    "example reader supports only one-dimensional non-DAQmx TDMS raw channel data",
                 ));
             }
+            let byte_len = if data_type == TDMS_TYPE_STRING {
+                Some(cursor.u64()?)
+            } else {
+                None
+            };
             Ok(RawDataIndex::New {
                 data_type,
                 dimensions,
                 values,
+                byte_len,
             })
         }
         other => Err(varve::Error::AdapterInvalidLength {
@@ -667,10 +546,769 @@ fn read_raw_data_index(cursor: &mut BinaryCursor<'_>) -> varve::Result<RawDataIn
     }
 }
 
-fn f64_bytes(values: &[f64]) -> varve::Result<Vec<u8>> {
-    let mut writer = BinaryWriter::with_capacity(Endian::Little, values.len() * 8);
-    writer.array_f64(values)?;
-    Ok(writer.into_inner())
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TdmsTimestampValue {
+    second_fractions: u64,
+    seconds: i64,
+}
+
+#[derive(Clone, Debug)]
+struct TdmsChannelValues {
+    name: &'static str,
+    values: TdmsRawValues,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawIndexMode {
+    New,
+    SameAsPrevious,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum TdmsRawValues {
+    I8(Vec<i8>),
+    I16(Vec<i16>),
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+    F32WithUnit(Vec<f32>),
+    F64WithUnit(Vec<f64>),
+    Bool(Vec<bool>),
+    String(Vec<String>),
+    Timestamp(Vec<TdmsTimestampValue>),
+    ComplexF32(Vec<(f32, f32)>),
+    ComplexF64(Vec<(f64, f64)>),
+}
+
+impl TdmsRawValues {
+    fn data_type(&self) -> u32 {
+        match self {
+            Self::I8(_) => TDMS_TYPE_I8,
+            Self::I16(_) => TDMS_TYPE_I16,
+            Self::I32(_) => TDMS_TYPE_I32,
+            Self::I64(_) => TDMS_TYPE_I64,
+            Self::U8(_) => TDMS_TYPE_U8,
+            Self::U16(_) => TDMS_TYPE_U16,
+            Self::U32(_) => TDMS_TYPE_U32,
+            Self::U64(_) => TDMS_TYPE_U64,
+            Self::F32(_) => TDMS_TYPE_SINGLE_FLOAT,
+            Self::F64(_) => TDMS_TYPE_DOUBLE_FLOAT,
+            Self::F32WithUnit(_) => TDMS_TYPE_SINGLE_FLOAT_WITH_UNIT,
+            Self::F64WithUnit(_) => TDMS_TYPE_DOUBLE_FLOAT_WITH_UNIT,
+            Self::Bool(_) => TDMS_TYPE_BOOLEAN,
+            Self::String(_) => TDMS_TYPE_STRING,
+            Self::Timestamp(_) => TDMS_TYPE_TIMESTAMP,
+            Self::ComplexF32(_) => TDMS_TYPE_COMPLEX_SINGLE_FLOAT,
+            Self::ComplexF64(_) => TDMS_TYPE_COMPLEX_DOUBLE_FLOAT,
+        }
+    }
+
+    fn value_count(&self) -> u64 {
+        (match self {
+            Self::I8(values) => values.len(),
+            Self::I16(values) => values.len(),
+            Self::I32(values) => values.len(),
+            Self::I64(values) => values.len(),
+            Self::U8(values) => values.len(),
+            Self::U16(values) => values.len(),
+            Self::U32(values) => values.len(),
+            Self::U64(values) => values.len(),
+            Self::F32(values) => values.len(),
+            Self::F64(values) => values.len(),
+            Self::F32WithUnit(values) => values.len(),
+            Self::F64WithUnit(values) => values.len(),
+            Self::Bool(values) => values.len(),
+            Self::String(values) => values.len(),
+            Self::Timestamp(values) => values.len(),
+            Self::ComplexF32(values) => values.len(),
+            Self::ComplexF64(values) => values.len(),
+        }) as u64
+    }
+
+    fn raw_index(&self) -> varve::Result<RawDataIndex> {
+        let data_type = self.data_type();
+        let byte_len = if data_type == TDMS_TYPE_STRING {
+            Some(self.encode()?.len() as u64)
+        } else {
+            None
+        };
+        Ok(RawDataIndex::New {
+            data_type,
+            dimensions: 1,
+            values: self.value_count(),
+            byte_len,
+        })
+    }
+
+    fn encode(&self) -> varve::Result<Vec<u8>> {
+        let mut writer = BinaryWriter::new(Endian::Little);
+        match self {
+            Self::I8(values) => {
+                for value in values {
+                    writer.i8(*value)?;
+                }
+            }
+            Self::I16(values) => {
+                for value in values {
+                    writer.i16(*value)?;
+                }
+            }
+            Self::I32(values) => {
+                for value in values {
+                    writer.i32(*value)?;
+                }
+            }
+            Self::I64(values) => {
+                for value in values {
+                    writer.i64(*value)?;
+                }
+            }
+            Self::U8(values) => {
+                for value in values {
+                    writer.u8(*value)?;
+                }
+            }
+            Self::U16(values) => {
+                for value in values {
+                    writer.u16(*value)?;
+                }
+            }
+            Self::U32(values) => {
+                for value in values {
+                    writer.u32(*value)?;
+                }
+            }
+            Self::U64(values) => {
+                for value in values {
+                    writer.u64(*value)?;
+                }
+            }
+            Self::F32(values) => {
+                for value in values {
+                    writer.f32(*value)?;
+                }
+            }
+            Self::F64(values) => writer.array_f64(values)?,
+            Self::F32WithUnit(values) => {
+                for value in values {
+                    writer.f32(*value)?;
+                }
+            }
+            Self::F64WithUnit(values) => writer.array_f64(values)?,
+            Self::Bool(values) => {
+                for value in values {
+                    writer.u8(u8::from(*value))?;
+                }
+            }
+            Self::String(values) => {
+                let encoded: Vec<_> = values.iter().map(|value| value.as_bytes()).collect();
+                let mut offset = 0u32;
+                for value in &encoded {
+                    offset = offset
+                        .checked_add(value.len() as u32)
+                        .ok_or(varve::Error::LengthOverflow { value: u64::MAX })?;
+                    writer.u32(offset)?;
+                }
+                for value in encoded {
+                    writer.bytes(value)?;
+                }
+            }
+            Self::Timestamp(values) => {
+                for value in values {
+                    writer.u64(value.second_fractions)?;
+                    writer.i64(value.seconds)?;
+                }
+            }
+            Self::ComplexF32(values) => {
+                for (real, imaginary) in values {
+                    writer.f32(*real)?;
+                    writer.f32(*imaginary)?;
+                }
+            }
+            Self::ComplexF64(values) => {
+                for (real, imaginary) in values {
+                    writer.f64(*real)?;
+                    writer.f64(*imaginary)?;
+                }
+            }
+        }
+        Ok(writer.into_inner())
+    }
+
+    fn decode(data_type: u32, bytes: &[u8], count: usize) -> varve::Result<Self> {
+        let mut cursor = BinaryCursor::new(bytes, Endian::Little);
+        let values = match data_type {
+            TDMS_TYPE_I8 => Self::I8(
+                (0..count)
+                    .map(|_| cursor.i8())
+                    .collect::<varve::Result<_>>()?,
+            ),
+            TDMS_TYPE_I16 => Self::I16(
+                (0..count)
+                    .map(|_| cursor.i16())
+                    .collect::<varve::Result<_>>()?,
+            ),
+            TDMS_TYPE_I32 => Self::I32(
+                (0..count)
+                    .map(|_| cursor.i32())
+                    .collect::<varve::Result<_>>()?,
+            ),
+            TDMS_TYPE_I64 => Self::I64(
+                (0..count)
+                    .map(|_| cursor.i64())
+                    .collect::<varve::Result<_>>()?,
+            ),
+            TDMS_TYPE_U8 => Self::U8(
+                (0..count)
+                    .map(|_| cursor.u8())
+                    .collect::<varve::Result<_>>()?,
+            ),
+            TDMS_TYPE_U16 => Self::U16(
+                (0..count)
+                    .map(|_| cursor.u16())
+                    .collect::<varve::Result<_>>()?,
+            ),
+            TDMS_TYPE_U32 => Self::U32(
+                (0..count)
+                    .map(|_| cursor.u32())
+                    .collect::<varve::Result<_>>()?,
+            ),
+            TDMS_TYPE_U64 => Self::U64(
+                (0..count)
+                    .map(|_| cursor.u64())
+                    .collect::<varve::Result<_>>()?,
+            ),
+            TDMS_TYPE_SINGLE_FLOAT => Self::F32(
+                (0..count)
+                    .map(|_| cursor.f32())
+                    .collect::<varve::Result<_>>()?,
+            ),
+            TDMS_TYPE_DOUBLE_FLOAT => Self::F64(cursor.array_f64(count)?),
+            TDMS_TYPE_SINGLE_FLOAT_WITH_UNIT => Self::F32WithUnit(
+                (0..count)
+                    .map(|_| cursor.f32())
+                    .collect::<varve::Result<_>>()?,
+            ),
+            TDMS_TYPE_DOUBLE_FLOAT_WITH_UNIT => Self::F64WithUnit(cursor.array_f64(count)?),
+            TDMS_TYPE_BOOLEAN => Self::Bool(
+                (0..count)
+                    .map(|_| Ok(cursor.u8()? != 0))
+                    .collect::<varve::Result<_>>()?,
+            ),
+            TDMS_TYPE_STRING => {
+                let mut offsets = Vec::with_capacity(count);
+                for _ in 0..count {
+                    offsets.push(cursor.u32()? as usize);
+                }
+                let data = cursor.bytes(cursor.remaining())?;
+                let mut start = 0usize;
+                let mut strings = Vec::with_capacity(count);
+                for end in offsets {
+                    let bytes = data.get(start..end).ok_or(varve::Error::AdapterBounds {
+                        offset: start as u64,
+                        len: end.saturating_sub(start) as u64,
+                        available: data.len() as u64,
+                    })?;
+                    strings.push(
+                        String::from_utf8(bytes.to_vec()).map_err(|_| varve::Error::InvalidUtf8)?,
+                    );
+                    start = end;
+                }
+                if start != data.len() {
+                    return Err(varve::Error::TrailingBytes {
+                        remaining: data.len() - start,
+                    });
+                }
+                Self::String(strings)
+            }
+            TDMS_TYPE_TIMESTAMP => {
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count {
+                    values.push(TdmsTimestampValue {
+                        second_fractions: cursor.u64()?,
+                        seconds: cursor.i64()?,
+                    });
+                }
+                Self::Timestamp(values)
+            }
+            TDMS_TYPE_COMPLEX_SINGLE_FLOAT => {
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count {
+                    values.push((cursor.f32()?, cursor.f32()?));
+                }
+                Self::ComplexF32(values)
+            }
+            TDMS_TYPE_COMPLEX_DOUBLE_FLOAT => {
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count {
+                    values.push((cursor.f64()?, cursor.f64()?));
+                }
+                Self::ComplexF64(values)
+            }
+            other => {
+                return Err(varve::Error::AdapterUnsupportedType {
+                    type_id: u64::from(other),
+                });
+            }
+        };
+        cursor.finish()?;
+        Ok(values)
+    }
+
+    fn extend_with(&mut self, values: Self) -> varve::Result<()> {
+        match (self, values) {
+            (Self::I8(current), Self::I8(next)) => current.extend(next),
+            (Self::I16(current), Self::I16(next)) => current.extend(next),
+            (Self::I32(current), Self::I32(next)) => current.extend(next),
+            (Self::I64(current), Self::I64(next)) => current.extend(next),
+            (Self::U8(current), Self::U8(next)) => current.extend(next),
+            (Self::U16(current), Self::U16(next)) => current.extend(next),
+            (Self::U32(current), Self::U32(next)) => current.extend(next),
+            (Self::U64(current), Self::U64(next)) => current.extend(next),
+            (Self::F32(current), Self::F32(next)) => current.extend(next),
+            (Self::F64(current), Self::F64(next)) => current.extend(next),
+            (Self::F32WithUnit(current), Self::F32WithUnit(next)) => current.extend(next),
+            (Self::F64WithUnit(current), Self::F64WithUnit(next)) => current.extend(next),
+            (Self::Bool(current), Self::Bool(next)) => current.extend(next),
+            (Self::String(current), Self::String(next)) => current.extend(next),
+            (Self::Timestamp(current), Self::Timestamp(next)) => current.extend(next),
+            (Self::ComplexF32(current), Self::ComplexF32(next)) => current.extend(next),
+            (Self::ComplexF64(current), Self::ComplexF64(next)) => current.extend(next),
+            _ => {
+                return Err(varve::Error::AdapterDiagnostic(
+                    "TDMS channel changed raw type across chunks",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_supported_tdms_channel_type(data_type: u32) -> bool {
+    matches!(
+        data_type,
+        TDMS_TYPE_I8
+            | TDMS_TYPE_I16
+            | TDMS_TYPE_I32
+            | TDMS_TYPE_I64
+            | TDMS_TYPE_U8
+            | TDMS_TYPE_U16
+            | TDMS_TYPE_U32
+            | TDMS_TYPE_U64
+            | TDMS_TYPE_SINGLE_FLOAT
+            | TDMS_TYPE_DOUBLE_FLOAT
+            | TDMS_TYPE_SINGLE_FLOAT_WITH_UNIT
+            | TDMS_TYPE_DOUBLE_FLOAT_WITH_UNIT
+            | TDMS_TYPE_STRING
+            | TDMS_TYPE_BOOLEAN
+            | TDMS_TYPE_TIMESTAMP
+            | TDMS_TYPE_COMPLEX_SINGLE_FLOAT
+            | TDMS_TYPE_COMPLEX_DOUBLE_FLOAT
+    )
+}
+
+fn tdms_type_byte_len(data_type: u32, values: u64, byte_len: Option<u64>) -> varve::Result<u64> {
+    if data_type == TDMS_TYPE_STRING {
+        return byte_len.ok_or(varve::Error::AdapterDiagnostic(
+            "TDMS string raw index is missing its total byte length",
+        ));
+    }
+
+    let size = match data_type {
+        TDMS_TYPE_I8 | TDMS_TYPE_U8 | TDMS_TYPE_BOOLEAN => 1,
+        TDMS_TYPE_I16 | TDMS_TYPE_U16 => 2,
+        TDMS_TYPE_I32
+        | TDMS_TYPE_U32
+        | TDMS_TYPE_SINGLE_FLOAT
+        | TDMS_TYPE_SINGLE_FLOAT_WITH_UNIT => 4,
+        TDMS_TYPE_I64
+        | TDMS_TYPE_U64
+        | TDMS_TYPE_DOUBLE_FLOAT
+        | TDMS_TYPE_DOUBLE_FLOAT_WITH_UNIT
+        | TDMS_TYPE_COMPLEX_SINGLE_FLOAT => 8,
+        TDMS_TYPE_TIMESTAMP | TDMS_TYPE_COMPLEX_DOUBLE_FLOAT => 16,
+        other => {
+            return Err(varve::Error::AdapterUnsupportedType {
+                type_id: u64::from(other),
+            });
+        }
+    };
+    values
+        .checked_mul(size)
+        .ok_or(varve::Error::AdapterInvalidLength { value: values })
+}
+
+fn channel_path(name: &str) -> &'static str {
+    match name {
+        "Int8" => "/'Measured Data'/'Int8'",
+        "Int16" => "/'Measured Data'/'Int16'",
+        "Int32" => "/'Measured Data'/'Int32'",
+        "Int64" => "/'Measured Data'/'Int64'",
+        "Uint8" => "/'Measured Data'/'Uint8'",
+        "Uint16" => "/'Measured Data'/'Uint16'",
+        "Uint32" => "/'Measured Data'/'Uint32'",
+        "Uint64" => "/'Measured Data'/'Uint64'",
+        "Float32" => "/'Measured Data'/'Float32'",
+        "Float64" => "/'Measured Data'/'Float64'",
+        "Float32Unit" => "/'Measured Data'/'Float32Unit'",
+        "Float64Unit" => "/'Measured Data'/'Float64Unit'",
+        "Boolean" => "/'Measured Data'/'Boolean'",
+        "String" => "/'Measured Data'/'String'",
+        "Timestamp" => "/'Measured Data'/'Timestamp'",
+        "Complex64" => "/'Measured Data'/'Complex64'",
+        "Complex128" => "/'Measured Data'/'Complex128'",
+        _ => panic!("unknown TDMS example channel {name}"),
+    }
+}
+
+fn first_tdms_channel_values(include_unit_channels: bool) -> Vec<TdmsChannelValues> {
+    let mut channels = vec![
+        channel("Int8", TdmsRawValues::I8(vec![-1, 2])),
+        channel("Int16", TdmsRawValues::I16(vec![-300, 400])),
+        channel("Int32", TdmsRawValues::I32(vec![-70_000, 80_000])),
+        channel(
+            "Int64",
+            TdmsRawValues::I64(vec![-9_000_000_000, 10_000_000_000]),
+        ),
+        channel("Uint8", TdmsRawValues::U8(vec![1, 250])),
+        channel("Uint16", TdmsRawValues::U16(vec![500, 60_000])),
+        channel("Uint32", TdmsRawValues::U32(vec![70_000, 4_000_000_000])),
+        channel(
+            "Uint64",
+            TdmsRawValues::U64(vec![9_000_000_000, 18_000_000_000_000_000_000]),
+        ),
+        channel("Float32", TdmsRawValues::F32(vec![1.25, -2.5])),
+        channel("Float64", TdmsRawValues::F64(vec![3.5, -4.75])),
+    ];
+    if include_unit_channels {
+        channels.extend([
+            channel(
+                "Float32Unit",
+                TdmsRawValues::F32WithUnit(vec![10.25, -20.5]),
+            ),
+            channel(
+                "Float64Unit",
+                TdmsRawValues::F64WithUnit(vec![30.5, -40.75]),
+            ),
+        ]);
+    }
+    channels.extend([
+        channel("Boolean", TdmsRawValues::Bool(vec![true, false])),
+        channel(
+            "String",
+            TdmsRawValues::String(vec!["red".to_string(), "blue".to_string()]),
+        ),
+        channel(
+            "Timestamp",
+            TdmsRawValues::Timestamp(vec![
+                TdmsTimestampValue {
+                    second_fractions: 0,
+                    seconds: 3_660_681_600,
+                },
+                TdmsTimestampValue {
+                    second_fractions: 9_223_372_036_854_775_808,
+                    seconds: 3_660_681_600,
+                },
+            ]),
+        ),
+        channel(
+            "Complex64",
+            TdmsRawValues::ComplexF32(vec![(1.0, 2.0), (-3.0, 4.0)]),
+        ),
+        channel(
+            "Complex128",
+            TdmsRawValues::ComplexF64(vec![(5.0, 6.0), (-7.0, 8.0)]),
+        ),
+    ]);
+    channels
+}
+
+fn changed_tdms_channel_values(include_unit_channels: bool) -> Vec<TdmsChannelValues> {
+    let mut channels = vec![
+        channel("Int8", TdmsRawValues::I8(vec![3])),
+        channel("Int16", TdmsRawValues::I16(vec![-500])),
+        channel("Int32", TdmsRawValues::I32(vec![90_000])),
+        channel("Int64", TdmsRawValues::I64(vec![11_000_000_000])),
+        channel("Uint8", TdmsRawValues::U8(vec![42])),
+        channel("Uint16", TdmsRawValues::U16(vec![1234])),
+        channel("Uint32", TdmsRawValues::U32(vec![5_000_000])),
+        channel(
+            "Uint64",
+            TdmsRawValues::U64(vec![17_000_000_000_000_000_000]),
+        ),
+        channel("Float32", TdmsRawValues::F32(vec![3.75])),
+        channel("Float64", TdmsRawValues::F64(vec![6.25])),
+    ];
+    if include_unit_channels {
+        channels.extend([
+            channel("Float32Unit", TdmsRawValues::F32WithUnit(vec![50.25])),
+            channel("Float64Unit", TdmsRawValues::F64WithUnit(vec![60.125])),
+        ]);
+    }
+    channels.extend([
+        channel("Boolean", TdmsRawValues::Bool(vec![true])),
+        channel("String", TdmsRawValues::String(vec!["cyan".to_string()])),
+        channel(
+            "Timestamp",
+            TdmsRawValues::Timestamp(vec![TdmsTimestampValue {
+                second_fractions: 0,
+                seconds: 3_660_681_601,
+            }]),
+        ),
+        channel("Complex64", TdmsRawValues::ComplexF32(vec![(5.0, -6.0)])),
+        channel("Complex128", TdmsRawValues::ComplexF64(vec![(9.0, -10.0)])),
+    ]);
+    channels
+}
+
+fn same_tdms_channel_values(include_unit_channels: bool) -> Vec<TdmsChannelValues> {
+    let mut channels = vec![
+        channel("Int8", TdmsRawValues::I8(vec![-4])),
+        channel("Int16", TdmsRawValues::I16(vec![600])),
+        channel("Int32", TdmsRawValues::I32(vec![-100_000])),
+        channel("Int64", TdmsRawValues::I64(vec![-12_000_000_000])),
+        channel("Uint8", TdmsRawValues::U8(vec![7])),
+        channel("Uint16", TdmsRawValues::U16(vec![4321])),
+        channel("Uint32", TdmsRawValues::U32(vec![6_000_000])),
+        channel(
+            "Uint64",
+            TdmsRawValues::U64(vec![16_000_000_000_000_000_000]),
+        ),
+        channel("Float32", TdmsRawValues::F32(vec![-4.5])),
+        channel("Float64", TdmsRawValues::F64(vec![-7.5])),
+    ];
+    if include_unit_channels {
+        channels.extend([
+            channel("Float32Unit", TdmsRawValues::F32WithUnit(vec![-70.5])),
+            channel("Float64Unit", TdmsRawValues::F64WithUnit(vec![-80.875])),
+        ]);
+    }
+    channels.extend([
+        channel("Boolean", TdmsRawValues::Bool(vec![false])),
+        channel("String", TdmsRawValues::String(vec!["gold".to_string()])),
+        channel(
+            "Timestamp",
+            TdmsRawValues::Timestamp(vec![TdmsTimestampValue {
+                second_fractions: 4_611_686_018_427_387_904,
+                seconds: 3_660_681_601,
+            }]),
+        ),
+        channel("Complex64", TdmsRawValues::ComplexF32(vec![(-7.0, -8.0)])),
+        channel(
+            "Complex128",
+            TdmsRawValues::ComplexF64(vec![(-11.0, -12.0)]),
+        ),
+    ]);
+    channels
+}
+
+fn append_tdms_channel_values(include_unit_channels: bool) -> Vec<TdmsChannelValues> {
+    let mut channels = vec![
+        channel("Int8", TdmsRawValues::I8(vec![5])),
+        channel("Int16", TdmsRawValues::I16(vec![-700])),
+        channel("Int32", TdmsRawValues::I32(vec![110_000])),
+        channel("Int64", TdmsRawValues::I64(vec![13_000_000_000])),
+        channel("Uint8", TdmsRawValues::U8(vec![8])),
+        channel("Uint16", TdmsRawValues::U16(vec![5432])),
+        channel("Uint32", TdmsRawValues::U32(vec![7_000_000])),
+        channel(
+            "Uint64",
+            TdmsRawValues::U64(vec![15_000_000_000_000_000_000]),
+        ),
+        channel("Float32", TdmsRawValues::F32(vec![5.5])),
+        channel("Float64", TdmsRawValues::F64(vec![8.5])),
+    ];
+    if include_unit_channels {
+        channels.extend([
+            channel("Float32Unit", TdmsRawValues::F32WithUnit(vec![90.5])),
+            channel("Float64Unit", TdmsRawValues::F64WithUnit(vec![100.625])),
+        ]);
+    }
+    channels.extend([
+        channel("Boolean", TdmsRawValues::Bool(vec![true])),
+        channel("String", TdmsRawValues::String(vec!["navy".to_string()])),
+        channel(
+            "Timestamp",
+            TdmsRawValues::Timestamp(vec![TdmsTimestampValue {
+                second_fractions: 0,
+                seconds: 3_660_681_602,
+            }]),
+        ),
+        channel("Complex64", TdmsRawValues::ComplexF32(vec![(9.0, 10.0)])),
+        channel("Complex128", TdmsRawValues::ComplexF64(vec![(13.0, 14.0)])),
+    ]);
+    channels
+}
+
+fn channel(name: &'static str, values: TdmsRawValues) -> TdmsChannelValues {
+    TdmsChannelValues { name, values }
+}
+
+fn initial_tdms_objects(channels: &[TdmsChannelValues]) -> varve::Result<Vec<TdmsObject<'static>>> {
+    let mut objects = vec![
+        TdmsObject {
+            path: "/",
+            raw_data_index: RawDataIndex::None,
+            properties: vec![TdmsProperty {
+                name: "title",
+                value: TdmsPropertyValue::String("Varve TDMS adapter proof smoke".to_string()),
+            }],
+        },
+        TdmsObject {
+            path: GROUP_PATH,
+            raw_data_index: RawDataIndex::None,
+            properties: vec![
+                TdmsProperty {
+                    name: "operator",
+                    value: TdmsPropertyValue::String("Varve".to_string()),
+                },
+                TdmsProperty {
+                    name: "verified",
+                    value: TdmsPropertyValue::Bool(true),
+                },
+            ],
+        },
+    ];
+    for channel in channels {
+        let mut properties = vec![
+            TdmsProperty {
+                name: "unit_string",
+                value: TdmsPropertyValue::String(channel.name.to_string()),
+            },
+            TdmsProperty {
+                name: "type_name",
+                value: TdmsPropertyValue::String(channel.name.to_string()),
+            },
+        ];
+        if channel.name == "Boolean" {
+            properties.push(TdmsProperty {
+                name: "adapter_enabled",
+                value: TdmsPropertyValue::Bool(true),
+            });
+        }
+        if channel.name == "Float64" {
+            properties.push(TdmsProperty {
+                name: "wf_increment",
+                value: TdmsPropertyValue::F64(0.001),
+            });
+        }
+        objects.push(TdmsObject {
+            path: channel_path(channel.name),
+            raw_data_index: channel.values.raw_index()?,
+            properties,
+        });
+    }
+    Ok(objects)
+}
+
+fn channel_tdms_objects(
+    channels: &[TdmsChannelValues],
+    index_mode: RawIndexMode,
+    sample_count: i64,
+    segment_note: Option<&str>,
+) -> varve::Result<Vec<TdmsObject<'static>>> {
+    let mut objects = Vec::with_capacity(channels.len());
+    for channel in channels {
+        let mut properties = vec![TdmsProperty {
+            name: "sample_count",
+            value: TdmsPropertyValue::I64(sample_count),
+        }];
+        if sample_count == 5 && channel.name == "Float64" {
+            properties.push(TdmsProperty {
+                name: "append_source",
+                value: TdmsPropertyValue::String("varve-open-layout-writer".to_string()),
+            });
+        }
+        if channel.name == "String"
+            && let Some(note) = segment_note
+        {
+            properties.push(TdmsProperty {
+                name: "segment_note",
+                value: TdmsPropertyValue::String(note.to_string()),
+            });
+        }
+        objects.push(TdmsObject {
+            path: channel_path(channel.name),
+            raw_data_index: match index_mode {
+                RawIndexMode::New => channel.values.raw_index()?,
+                RawIndexMode::SameAsPrevious => RawDataIndex::SameAsPrevious,
+            },
+            properties,
+        });
+    }
+    Ok(objects)
+}
+
+fn encode_channel_values(channels: &[TdmsChannelValues]) -> varve::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for channel in channels {
+        bytes.extend(channel.values.encode()?);
+    }
+    Ok(bytes)
+}
+
+fn expected_tdms_channels(
+    include_unit_channels: bool,
+    include_same_index_segment: bool,
+    appended: bool,
+) -> varve::Result<Vec<TdmsChannelValues>> {
+    let mut expected = first_tdms_channel_values(include_unit_channels);
+    extend_channel_values(
+        &mut expected,
+        changed_tdms_channel_values(include_unit_channels),
+    )?;
+    if include_same_index_segment {
+        extend_channel_values(
+            &mut expected,
+            same_tdms_channel_values(include_unit_channels),
+        )?;
+    }
+    if appended {
+        extend_channel_values(
+            &mut expected,
+            append_tdms_channel_values(include_unit_channels),
+        )?;
+    }
+    Ok(expected)
+}
+
+fn extend_channel_values(
+    current: &mut [TdmsChannelValues],
+    next: Vec<TdmsChannelValues>,
+) -> varve::Result<()> {
+    assert_eq!(current.len(), next.len());
+    for (current, next) in current.iter_mut().zip(next) {
+        assert_eq!(current.name, next.name);
+        current.values.extend_with(next.values)?;
+    }
+    Ok(())
+}
+
+fn assert_tdms_matrix(
+    state: &TdmsState,
+    include_unit_channels: bool,
+    include_same_index_segment: bool,
+    appended: bool,
+) {
+    let expected =
+        expected_tdms_channels(include_unit_channels, include_same_index_segment, appended)
+            .expect("expected TDMS channel matrix");
+    for channel in expected {
+        assert_eq!(state.raw_values(channel_path(channel.name)), channel.values);
+    }
+}
+
+fn expected_chunk_count(nptdms_authored: bool, appended: bool) -> usize {
+    let include_unit_channels = !nptdms_authored;
+    let channel_count = first_tdms_channel_values(include_unit_channels).len();
+    let base_segments = if nptdms_authored { 2 } else { 3 };
+    let appended_segments = usize::from(appended);
+    (base_segments + appended_segments) * channel_count
 }
 
 fn tdms_sidecar_policy() -> SidecarPolicy {
@@ -759,7 +1397,7 @@ struct TdmsSegmentPayload {
 struct TdmsState {
     properties: HashMap<String, HashMap<String, TdmsPropertyValue>>,
     raw_indexes: HashMap<String, RawDataIndex>,
-    samples: HashMap<String, Vec<f64>>,
+    raw_values: HashMap<String, TdmsRawValues>,
     chunks: ChunkIndexBuilder<String>,
     segments_seen: usize,
 }
@@ -776,8 +1414,11 @@ impl TdmsState {
         self.property_opt(path, name).expect("TDMS property exists")
     }
 
-    fn samples(&self, path: &str) -> Vec<f64> {
-        self.samples.get(path).cloned().expect("TDMS samples exist")
+    fn raw_values(&self, path: &str) -> TdmsRawValues {
+        self.raw_values
+            .get(path)
+            .cloned()
+            .expect("TDMS raw values exist")
     }
 }
 
@@ -821,12 +1462,16 @@ impl SegmentReducer for TdmsReducer {
 
         let mut byte_offset = 0u64;
         for (path, index) in raw_order {
-            let RawDataIndex::New { values, .. } = index else {
+            let RawDataIndex::New {
+                data_type,
+                values,
+                byte_len,
+                ..
+            } = index
+            else {
                 continue;
             };
-            let byte_len = values
-                .checked_mul(8)
-                .ok_or(varve::Error::AdapterInvalidLength { value: values })?;
+            let byte_len = tdms_type_byte_len(data_type, values, byte_len)?;
             let end = byte_offset
                 .checked_add(byte_len)
                 .ok_or(varve::Error::AdapterBounds {
@@ -852,11 +1497,12 @@ impl SegmentReducer for TdmsReducer {
                 },
                 segment,
             )?;
-            state
-                .samples
-                .entry(path)
-                .or_default()
-                .extend(read_f64_values(raw_values, values as usize)?);
+            let decoded = TdmsRawValues::decode(data_type, raw_values, values as usize)?;
+            if let Some(current) = state.raw_values.get_mut(&path) {
+                current.extend_with(decoded)?;
+            } else {
+                state.raw_values.insert(path, decoded);
+            }
             byte_offset = end;
         }
         if byte_offset != payload.raw.len() as u64 {
@@ -868,13 +1514,6 @@ impl SegmentReducer for TdmsReducer {
         }
         Ok(())
     }
-}
-
-fn read_f64_values(bytes: &[u8], count: usize) -> varve::Result<Vec<f64>> {
-    let mut cursor = BinaryCursor::new(bytes, Endian::Little);
-    let values = cursor.array_f64(count)?;
-    cursor.finish()?;
-    Ok(values)
 }
 
 pub fn cleanup(path: &Path) {

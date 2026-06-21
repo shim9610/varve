@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parse an npTDMS-authored file with a Varve-based example adapter."""
+"""Parse and append an npTDMS-authored scalar type matrix with Varve."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+from verify_tdms_with_nptdms import assert_channel_matrix, changed_values, first_values
 
 
 def main() -> int:
@@ -31,51 +33,27 @@ def main() -> int:
         )
         return 2
 
-    output = args.output or Path(tempfile.gettempdir()) / "nptdms-varve-multichannel.tdms"
+    output = args.output or Path(tempfile.gettempdir()) / "nptdms-varve-type-matrix.tdms"
     output = output.resolve()
     for stale in [output, output.with_suffix(".vtidx"), Path(str(output) + "_index")]:
         if stale.exists():
             stale.unlink()
 
-    with TdmsWriter(str(output)) as writer:
+    with TdmsWriter(str(output), version=4713) as writer:
         writer.write_segment(
             [
-                RootObject(properties={"title": "npTDMS multichannel smoke"}),
-                GroupObject("Bench", properties={"operator": "Ada"}),
-                ChannelObject(
-                    "Bench",
-                    "Voltage",
-                    np.array([1.0, 2.0, 3.0], dtype=np.float64),
-                    properties={"unit_string": "V"},
-                ),
-                ChannelObject(
-                    "Bench",
-                    "Current",
-                    np.array([0.10, 0.20, 0.30], dtype=np.float64),
-                    properties={"unit_string": "A"},
-                ),
+                RootObject(properties={"title": "npTDMS scalar type matrix smoke"}),
+                GroupObject("Measured Data", properties={"operator": "Ada", "verified": True}),
+                *channel_objects(np, first_values(include_unit=False)),
             ]
         )
-        writer.write_segment(
-            [
-                ChannelObject(
-                    "Bench",
-                    "Voltage",
-                    np.array([4.0], dtype=np.float64),
-                ),
-                ChannelObject(
-                    "Bench",
-                    "Current",
-                    np.array([0.40], dtype=np.float64),
-                ),
-            ]
-        )
+        writer.write_segment(channel_objects(np, changed_values(include_unit=False)))
 
-    tdms = TdmsFile.read(output)
-    assert tdms.properties["title"] == "npTDMS multichannel smoke"
-    assert tdms["Bench"].properties["operator"] == "Ada"
-    assert [float(value) for value in tdms["Bench"]["Voltage"][:]] == [1.0, 2.0, 3.0, 4.0]
-    assert [float(value) for value in tdms["Bench"]["Current"][:]] == [0.10, 0.20, 0.30, 0.40]
+    tdms = TdmsFile.read(output, raw_timestamps=True)
+    assert tdms.properties["title"] == "npTDMS scalar type matrix smoke"
+    assert tdms["Measured Data"].properties["operator"] == "Ada"
+    assert tdms["Measured Data"].properties["verified"] is True
+    assert_channel_matrix(tdms["Measured Data"], include_unit=False, include_same=False, appended=False)
 
     subprocess.run(
         [
@@ -107,22 +85,16 @@ def main() -> int:
         check=True,
     )
 
-    appended = TdmsFile.read(output)
-    assert [float(value) for value in appended["Bench"]["Voltage"][:]] == [
-        1.0,
-        2.0,
-        3.0,
-        4.0,
-        5.0,
-    ]
-    assert [float(value) for value in appended["Bench"]["Current"][:]] == [
-        0.10,
-        0.20,
-        0.30,
-        0.40,
-        0.50,
-    ]
-    assert appended["Bench"]["Voltage"].properties["append_source"] == "varve-open-layout-writer"
+    appended = TdmsFile.read(output, raw_timestamps=True)
+    assert appended["Measured Data"]["Float64"].properties["append_source"] == (
+        "varve-open-layout-writer"
+    )
+    assert_channel_matrix(
+        appended["Measured Data"],
+        include_unit=False,
+        include_same=False,
+        appended=True,
+    )
 
     subprocess.run(
         [
@@ -167,8 +139,70 @@ def main() -> int:
         check=True,
     )
 
-    print(f"Varve example parsed and appended npTDMS multichannel file {output}")
+    print(f"Varve example parsed and appended npTDMS scalar type matrix {output}")
     return 0
+
+
+def channel_objects(np, values_by_name: dict[str, list]):
+    return [
+        channel_object(np, name, values)
+        for name, values in values_by_name.items()
+    ]
+
+
+def channel_object(np, name: str, values: list):
+    from nptdms import ChannelObject
+
+    return ChannelObject(
+        "Measured Data",
+        name,
+        channel_data(np, name, values),
+        properties={"unit_string": name},
+    )
+
+
+def channel_data(np, name: str, values: list):
+    if name == "Int8":
+        return np.array(values, dtype=np.int8)
+    if name == "Int16":
+        return np.array(values, dtype=np.int16)
+    if name == "Int32":
+        return np.array(values, dtype=np.int32)
+    if name == "Int64":
+        return np.array(values, dtype=np.int64)
+    if name == "Uint8":
+        return np.array(values, dtype=np.uint8)
+    if name == "Uint16":
+        return np.array(values, dtype=np.uint16)
+    if name == "Uint32":
+        return np.array(values, dtype=np.uint32)
+    if name == "Uint64":
+        return np.array(values, dtype=np.uint64)
+    if name == "Float32":
+        return np.array(values, dtype=np.float32)
+    if name == "Float64":
+        return np.array(values, dtype=np.float64)
+    if name == "Boolean":
+        return np.array(values, dtype=np.bool_)
+    if name == "String":
+        return np.array(values)
+    if name == "Timestamp":
+        return np.array([tdms_timestamp_to_datetime64(np, value) for value in values])
+    if name == "Complex64":
+        return np.array([complex(real, imaginary) for real, imaginary in values], dtype=np.complex64)
+    if name == "Complex128":
+        return np.array([complex(real, imaginary) for real, imaginary in values], dtype=np.complex128)
+    raise AssertionError(f"npTDMS writer does not author {name} in this harness")
+
+
+def tdms_timestamp_to_datetime64(np, value: tuple[int, int]):
+    fractions, seconds = value
+    micros = int(round((fractions / 2**64) * 1_000_000))
+    return (
+        np.datetime64("1904-01-01T00:00:00.000000", "us")
+        + np.timedelta64(seconds, "s")
+        + np.timedelta64(micros, "us")
+    )
 
 
 if __name__ == "__main__":

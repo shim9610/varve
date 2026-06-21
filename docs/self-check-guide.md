@@ -81,8 +81,16 @@ python -m venv .venv-tdms
 ```
 
 The TDMS harnesses check Varve-authored example files against `npTDMS` and
-`npTDMS`-authored multichannel files against a Varve-based example adapter. The
-BMP harness checks a non-TDMS layout in both directions with Pillow.
+`npTDMS`-authored scalar type matrix files against a Varve-based example
+adapter. The covered TDMS proof set includes signed/unsigned integer widths,
+single/double floats, booleans, strings, timestamps, complex single/double
+floats, changed raw-data-index segments, `same-as-previous` raw-index reuse,
+mixed objects in one segment, and Varve append into an npTDMS-authored file.
+The Varve-authored direction also covers npTDMS-readable
+`SingleFloatWithUnit`/`DoubleFloatWithUnit` channel type ids; the reverse
+npTDMS-authored direction omits those two because npTDMS 1.10.0 does not author
+them correctly through its normal `ChannelObject` writer path. The BMP harness
+checks a non-TDMS layout in both directions with Pillow.
 
 For TDMS-style work, remember that the repository contains adapter proofs, not
 a Varve-provided TDMS reader/writer. Use `docs/nptdms-adapter-boundary.md` to

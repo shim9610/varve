@@ -134,11 +134,15 @@
 - It also covers custom physical layout append and open/scan so layout DSL
   changes expose obvious framing or scan regressions.
 - TDMS-style adapter feasibility is checked by optional Python harnesses: one
-  opens a Varve-authored, two-channel, three-segment example file with
-  `npTDMS` after Varve appends an additional segment, and the other generates a
-  two-channel `npTDMS` file, parses it through Varve-based example code,
-  appends a segment with Varve, and rechecks the result with npTDMS. The
-  harnesses also exercise adapter inspect and byte-backed read paths.
+  opens a Varve-authored scalar type matrix with `npTDMS` after Varve appends
+  an additional segment, and the other generates an npTDMS-authored scalar type
+  matrix, parses it through Varve-based example code, appends a segment with
+  Varve, and rechecks the result with npTDMS. The proof covers signed/unsigned
+  integer widths, single/double floats, booleans, strings, timestamps, complex
+  single/double floats, changed raw-data-index segments, mixed objects, and
+  `same-as-previous` raw-index reuse; the Varve-authored direction also covers
+  npTDMS-readable single/double float-with-unit type ids. The harnesses also
+  exercise adapter inspect and byte-backed read paths.
   Varve does not ship these examples as a TDMS reader/writer feature; see
   `docs/nptdms-adapter-boundary.md`.
 - Non-TDMS physical-format compatibility is checked by a BMP/Pillow harness:

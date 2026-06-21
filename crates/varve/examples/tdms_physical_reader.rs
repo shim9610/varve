@@ -11,7 +11,7 @@ fn main() -> varve::Result<()> {
         .expect("usage: tdms_physical_reader <file.tdms>");
     common::read_and_verify(&path)?;
     println!(
-        "Varve-based example parsed npTDMS multichannel file {}",
+        "Varve-based example parsed TDMS scalar type matrix file {}",
         path.display()
     );
     Ok(())
