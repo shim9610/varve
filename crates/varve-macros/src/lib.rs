@@ -2961,7 +2961,9 @@ fn layout_reader_segment_methods_tokens(
             let Ok(index) = self.__varve_layout_segment_index(#segment_name, index) else {
                 return Ok(None);
             };
-            let segment = &self.inner.segments()[index];
+            let Some(segment) = self.inner.segments().get(index) else {
+                return Ok(None);
+            };
             Ok(Some(#info_type::from_inner(segment.clone())))
         }
 
