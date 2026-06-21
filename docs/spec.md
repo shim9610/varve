@@ -20,8 +20,8 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   native and custom formats. For `LayoutPreset::VarveNative`, the plan is
   synthetic and mirrors the existing native writer/reader byte contract without
   changing native bytes or schema hashes.
-- The Varve-native record lead-in and optional record footer are generated from
-  the same internal native layout field contract used by
+- The Varve-native file header, record lead-in, and optional record footer are
+  generated from the same internal native layout field contract used by
   `effective_layout()`. The native append-log semantics remain in the native
   reader/writer; this is a parity extraction, not a semantic rewrite.
 - `FormatSpec::inspect_layout_file(path)` validates an existing native or

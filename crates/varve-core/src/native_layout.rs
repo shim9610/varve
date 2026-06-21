@@ -1,11 +1,18 @@
 use std::io::{Read, Write};
 
 use crate::{
-    Endian, Error, LayoutAnchor, LayoutFinalize, LayoutPlanField, LayoutPlanFieldSource,
-    LayoutPlanFieldType, LayoutPlanLen, Result,
+    CompressionHeaderMode, CompressionPolicy, Endian, Error, FormatSpec, LayoutAnchor,
+    LayoutFinalize, LayoutPlanField, LayoutPlanFieldSource, LayoutPlanFieldType, LayoutPlanLen,
+    Result,
     file::{RecordFooterFields, RecordHeaderFields},
     layout::LayoutValue,
 };
+
+const CONTAINER_MARKER_V1: &[u8; 6] = b"VARVE1";
+const CONTAINER_MARKER_V2: &[u8; 6] = b"VARVE2";
+const CONTAINER_MARKER_V3: &[u8; 6] = b"VARVE3";
+const FILE_HEADER_FIXED_LEN: u64 = 6 + 2 + 1 + 1 + 8;
+const FILE_EXPLICIT_COMPRESSION_HEADER_LEN: u64 = 28;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeFieldSource {
@@ -26,6 +33,7 @@ struct NativeField {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeFieldType {
     Bytes { len: u64 },
+    U8,
     U16,
     U32,
     U64,
@@ -35,6 +43,7 @@ impl NativeFieldType {
     const fn byte_len(self) -> u64 {
         match self {
             Self::Bytes { len } => len,
+            Self::U8 => 1,
             Self::U16 => 2,
             Self::U32 => 4,
             Self::U64 => 8,
@@ -46,6 +55,26 @@ impl NativeFieldType {
 pub(crate) struct DecodedRecordHeader {
     pub(crate) fields: RecordHeaderFields,
     pub(crate) lead_in_len: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DecodedFileHeader {
+    pub(crate) schema_hash: u64,
+    pub(crate) extensions: Vec<u8>,
+    pub(crate) has_extension_len: bool,
+    pub(crate) header_len: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeFileHeaderField {
+    Magic,
+    ContainerMarker,
+    FormatVersion,
+    Endian,
+    Flags,
+    SchemaHash,
+    ExtensionLen,
+    Extensions,
 }
 
 const RECORD_HEADER_FIELDS: &[NativeField] = &[
@@ -127,6 +156,134 @@ const RECORD_FOOTER_FIELDS: &[NativeField] = &[
     },
 ];
 
+pub(crate) fn native_file_header_plan_fields(spec: FormatSpec) -> Vec<LayoutPlanField> {
+    let extension_len = native_file_header_plan_extension_len(spec);
+    let mut fields = Vec::new();
+    visit_native_file_header_fields(spec, extension_len, |field| {
+        fields.push(native_file_header_field_to_plan(spec, field, extension_len));
+        Ok(())
+    })
+    .expect("native file-header field visitor cannot fail while collecting plan fields");
+    fields
+}
+
+pub(crate) fn native_file_header_len(spec: FormatSpec, extension_len: u64) -> u64 {
+    let ext_len_field = if extension_len == 0 && !spec.spec_needs_record_footer() {
+        0
+    } else {
+        4
+    };
+    spec.magic.len() as u64 + FILE_HEADER_FIXED_LEN + ext_len_field + extension_len
+}
+
+pub(crate) fn write_native_file_header<W: Write>(
+    writer: &mut W,
+    spec: FormatSpec,
+    extensions: &[u8],
+) -> Result<u64> {
+    let extension_len =
+        u64::try_from(extensions.len()).map_err(|_| Error::InvalidCompressionHeader)?;
+    let marker = native_container_marker_for_extensions(spec, extension_len);
+    visit_native_file_header_fields(spec, extension_len, |field| {
+        let value = native_file_header_write_value(spec, field, marker, extensions)?;
+        write_native_value(
+            writer,
+            native_file_header_field(spec, field, extension_len),
+            &value,
+        )
+    })?;
+    Ok(native_file_header_len(spec, extension_len))
+}
+
+pub(crate) fn read_native_file_header<R: Read>(
+    reader: &mut R,
+    spec: FormatSpec,
+) -> Result<DecodedFileHeader> {
+    let magic = read_native_value(
+        reader,
+        native_file_header_field(spec, NativeFileHeaderField::Magic, 0),
+    )?;
+    match magic {
+        LayoutValue::Bytes(actual) if actual == spec.magic => {}
+        _ => return Err(Error::InvalidMagic),
+    }
+
+    let marker_value = read_native_value(
+        reader,
+        native_file_header_field(spec, NativeFileHeaderField::ContainerMarker, 0),
+    )?;
+    let marker = match marker_value {
+        LayoutValue::Bytes(actual) => native_marker_from_bytes(&actual)?,
+        _ => return Err(Error::UnsupportedContainer),
+    };
+    if spec.spec_needs_record_footer() != (marker == *CONTAINER_MARKER_V3) {
+        return Err(Error::UnsupportedContainer);
+    }
+
+    let version = read_native_value(
+        reader,
+        native_file_header_field(spec, NativeFileHeaderField::FormatVersion, 0),
+    )?;
+    let version = value_as_u16("format_version", &version)?;
+    if version != spec.version {
+        return Err(Error::FormatVersionMismatch {
+            expected: spec.version,
+            actual: version,
+        });
+    }
+
+    let endian = read_native_value(
+        reader,
+        native_file_header_field(spec, NativeFileHeaderField::Endian, 0),
+    )?;
+    let endian = value_as_u8("endian", &endian)?;
+    let endian = Endian::from_byte(endian).ok_or(Error::UnsupportedEndian(endian))?;
+    if endian != spec.endian {
+        return Err(Error::EndianMismatch {
+            expected: spec.endian,
+            actual: endian,
+        });
+    }
+
+    let _flags = read_native_value(
+        reader,
+        native_file_header_field(spec, NativeFileHeaderField::Flags, 0),
+    )?;
+
+    let hash = read_native_value(
+        reader,
+        native_file_header_field(spec, NativeFileHeaderField::SchemaHash, 0),
+    )?;
+    let schema_hash = value_as_u64("schema_hash", &hash)?;
+
+    let has_extension_len = marker == *CONTAINER_MARKER_V2 || marker == *CONTAINER_MARKER_V3;
+    let extensions = if has_extension_len {
+        let extension_len = read_native_value(
+            reader,
+            native_file_header_field(spec, NativeFileHeaderField::ExtensionLen, 0),
+        )?;
+        let extension_len = value_as_u32("extension_len", &extension_len)?;
+        let extension_len = u64::from(extension_len);
+        match read_native_value(
+            reader,
+            native_file_header_field(spec, NativeFileHeaderField::Extensions, extension_len),
+        )? {
+            LayoutValue::Bytes(bytes) => bytes,
+            _ => return Err(Error::InvalidCompressionHeader),
+        }
+    } else {
+        Vec::new()
+    };
+    let extension_len =
+        u64::try_from(extensions.len()).map_err(|_| Error::InvalidCompressionHeader)?;
+    Ok(DecodedFileHeader {
+        schema_hash,
+        extensions,
+        has_extension_len,
+        header_len: native_file_header_len(spec, extension_len),
+    })
+}
+
 pub(crate) fn native_record_header_plan_fields() -> Vec<LayoutPlanField> {
     native_fields_to_plan(RECORD_HEADER_FIELDS)
 }
@@ -152,6 +309,29 @@ pub(crate) fn ensure_native_record_layout_contract() -> Result<()> {
     if native_record_footer_len() != crate::file::RECORD_FOOTER_LEN {
         return Err(Error::InvalidFormatSpec(
             "native record footer layout length mismatch",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_native_file_header_layout_contract(spec: FormatSpec) -> Result<()> {
+    let plan_extension_len = native_file_header_plan_extension_len(spec);
+    let mut visited_len = 0u64;
+    visit_native_file_header_fields(spec, plan_extension_len, |field| {
+        visited_len = visited_len
+            .checked_add(
+                native_file_header_field(spec, field, plan_extension_len)
+                    .ty
+                    .byte_len(),
+            )
+            .ok_or(Error::InvalidFormatSpec(
+                "native file header layout length overflow",
+            ))?;
+        Ok(())
+    })?;
+    if visited_len != native_file_header_len(spec, plan_extension_len) {
+        return Err(Error::InvalidFormatSpec(
+            "native file header layout length mismatch",
         ));
     }
     Ok(())
@@ -443,6 +623,179 @@ fn validate_footer_offset(
     }
 }
 
+fn visit_native_file_header_fields<F>(
+    spec: FormatSpec,
+    extension_len: u64,
+    mut visit: F,
+) -> Result<()>
+where
+    F: FnMut(NativeFileHeaderField) -> Result<()>,
+{
+    visit(NativeFileHeaderField::Magic)?;
+    visit(NativeFileHeaderField::ContainerMarker)?;
+    visit(NativeFileHeaderField::FormatVersion)?;
+    visit(NativeFileHeaderField::Endian)?;
+    visit(NativeFileHeaderField::Flags)?;
+    visit(NativeFileHeaderField::SchemaHash)?;
+    if native_file_header_has_extension_len(spec, extension_len) {
+        visit(NativeFileHeaderField::ExtensionLen)?;
+    }
+    if extension_len > 0 {
+        visit(NativeFileHeaderField::Extensions)?;
+    }
+    Ok(())
+}
+
+fn native_file_header_field(
+    spec: FormatSpec,
+    field: NativeFileHeaderField,
+    extension_len: u64,
+) -> NativeField {
+    match field {
+        NativeFileHeaderField::Magic => NativeField {
+            name: "magic",
+            ty: NativeFieldType::Bytes {
+                len: spec.magic.len() as u64,
+            },
+            source: NativeFieldSource::Native("magic"),
+        },
+        NativeFileHeaderField::ContainerMarker => NativeField {
+            name: "container_marker",
+            ty: NativeFieldType::Bytes { len: 6 },
+            source: NativeFieldSource::Native("container_marker"),
+        },
+        NativeFileHeaderField::FormatVersion => NativeField {
+            name: "format_version",
+            ty: NativeFieldType::U16,
+            source: NativeFieldSource::Native("format_version"),
+        },
+        NativeFileHeaderField::Endian => NativeField {
+            name: "endian",
+            ty: NativeFieldType::U8,
+            source: NativeFieldSource::Native("endian"),
+        },
+        NativeFileHeaderField::Flags => NativeField {
+            name: "flags",
+            ty: NativeFieldType::U8,
+            source: NativeFieldSource::LiteralU64(0),
+        },
+        NativeFileHeaderField::SchemaHash => NativeField {
+            name: "schema_hash",
+            ty: NativeFieldType::U64,
+            source: NativeFieldSource::Native("schema_hash"),
+        },
+        NativeFileHeaderField::ExtensionLen => NativeField {
+            name: "extension_len",
+            ty: NativeFieldType::U32,
+            source: NativeFieldSource::Native("extension_len"),
+        },
+        NativeFileHeaderField::Extensions => NativeField {
+            name: "extensions",
+            ty: NativeFieldType::Bytes { len: extension_len },
+            source: NativeFieldSource::Native("file_explicit_compression_header"),
+        },
+    }
+}
+
+fn native_file_header_field_to_plan(
+    spec: FormatSpec,
+    field: NativeFileHeaderField,
+    extension_len: u64,
+) -> LayoutPlanField {
+    let native_field = native_file_header_field(spec, field, extension_len);
+    LayoutPlanField {
+        name: native_field.name.to_string(),
+        ty: match field {
+            NativeFileHeaderField::Magic => LayoutPlanFieldType::Bytes {
+                len: LayoutPlanLen::Fixed(spec.magic.len() as u64),
+            },
+            _ => native_field_type_to_plan(native_field.ty),
+        },
+        source: match field {
+            NativeFileHeaderField::Magic => {
+                LayoutPlanFieldSource::LiteralBytes(spec.magic.to_vec())
+            }
+            NativeFileHeaderField::ContainerMarker => {
+                LayoutPlanFieldSource::LiteralBytes(native_container_marker_for_plan(spec).to_vec())
+            }
+            NativeFileHeaderField::Flags => LayoutPlanFieldSource::LiteralU64(0),
+            _ => native_field_source_to_plan(native_field.source),
+        },
+        endian: Some(Endian::Little),
+    }
+}
+
+fn native_file_header_write_value(
+    spec: FormatSpec,
+    field: NativeFileHeaderField,
+    marker: &[u8; 6],
+    extensions: &[u8],
+) -> Result<LayoutValue> {
+    Ok(match field {
+        NativeFileHeaderField::Magic => LayoutValue::Bytes(spec.magic.to_vec()),
+        NativeFileHeaderField::ContainerMarker => LayoutValue::Bytes(marker.to_vec()),
+        NativeFileHeaderField::FormatVersion => LayoutValue::U16(spec.version),
+        NativeFileHeaderField::Endian => LayoutValue::U8(spec.endian.to_byte()),
+        NativeFileHeaderField::Flags => LayoutValue::U8(0),
+        NativeFileHeaderField::SchemaHash => LayoutValue::U64(spec.schema_hash),
+        NativeFileHeaderField::ExtensionLen => {
+            let len =
+                u32::try_from(extensions.len()).map_err(|_| Error::InvalidCompressionHeader)?;
+            LayoutValue::U32(len)
+        }
+        NativeFileHeaderField::Extensions => LayoutValue::Bytes(extensions.to_vec()),
+    })
+}
+
+fn native_marker_from_bytes(bytes: &[u8]) -> Result<[u8; 6]> {
+    if bytes == CONTAINER_MARKER_V1 {
+        Ok(*CONTAINER_MARKER_V1)
+    } else if bytes == CONTAINER_MARKER_V2 {
+        Ok(*CONTAINER_MARKER_V2)
+    } else if bytes == CONTAINER_MARKER_V3 {
+        Ok(*CONTAINER_MARKER_V3)
+    } else {
+        Err(Error::UnsupportedContainer)
+    }
+}
+
+fn native_container_marker_for_extensions(
+    spec: FormatSpec,
+    extension_len: u64,
+) -> &'static [u8; 6] {
+    if spec.spec_needs_record_footer() {
+        CONTAINER_MARKER_V3
+    } else if extension_len == 0 {
+        CONTAINER_MARKER_V1
+    } else {
+        CONTAINER_MARKER_V2
+    }
+}
+
+fn native_container_marker_for_plan(spec: FormatSpec) -> &'static [u8; 6] {
+    native_container_marker_for_extensions(spec, native_file_header_plan_extension_len(spec))
+}
+
+fn native_file_header_plan_extension_len(spec: FormatSpec) -> u64 {
+    if native_uses_file_explicit_compression(spec) {
+        FILE_EXPLICIT_COMPRESSION_HEADER_LEN
+    } else {
+        0
+    }
+}
+
+fn native_file_header_has_extension_len(spec: FormatSpec, extension_len: u64) -> bool {
+    spec.spec_needs_record_footer() || extension_len > 0
+}
+
+fn native_uses_file_explicit_compression(spec: FormatSpec) -> bool {
+    matches!(
+        spec.compression_policy,
+        CompressionPolicy::VariableBlocks(compression)
+            if compression.header_mode == CompressionHeaderMode::FileExplicit
+    )
+}
+
 fn native_fields_to_plan(fields: &[NativeField]) -> Vec<LayoutPlanField> {
     fields
         .iter()
@@ -460,6 +813,7 @@ fn native_field_type_to_plan(ty: NativeFieldType) -> LayoutPlanFieldType {
         NativeFieldType::Bytes { len } => LayoutPlanFieldType::Bytes {
             len: LayoutPlanLen::Fixed(len),
         },
+        NativeFieldType::U8 => LayoutPlanFieldType::U8,
         NativeFieldType::U16 => LayoutPlanFieldType::U16,
         NativeFieldType::U32 => LayoutPlanFieldType::U32,
         NativeFieldType::U64 => LayoutPlanFieldType::U64,
@@ -492,6 +846,16 @@ fn write_native_value<W: Write>(
             if len == bytes.len() as u64 =>
         {
             writer.write_all(bytes)?;
+            Ok(())
+        }
+        (NativeFieldType::U8, LayoutValue::U8(value)) => {
+            writer.write_all(&[*value])?;
+            Ok(())
+        }
+        (NativeFieldType::U8, LayoutValue::U64(value)) => {
+            let value =
+                u8::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field.name))?;
+            writer.write_all(&[value])?;
             Ok(())
         }
         (NativeFieldType::U16, LayoutValue::U16(value)) => {
@@ -530,6 +894,11 @@ fn read_native_value<R: Read>(reader: &mut R, field: NativeField) -> Result<Layo
             reader.read_exact(&mut bytes)?;
             LayoutValue::Bytes(bytes)
         }
+        NativeFieldType::U8 => {
+            let mut bytes = [0; 1];
+            reader.read_exact(&mut bytes)?;
+            LayoutValue::U8(bytes[0])
+        }
         NativeFieldType::U16 => {
             let mut bytes = [0; 2];
             reader.read_exact(&mut bytes)?;
@@ -548,8 +917,19 @@ fn read_native_value<R: Read>(reader: &mut R, field: NativeField) -> Result<Layo
     })
 }
 
+fn value_as_u8(field: &'static str, value: &LayoutValue) -> Result<u8> {
+    match value {
+        LayoutValue::U8(value) => Ok(*value),
+        LayoutValue::U64(value) => {
+            u8::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field))
+        }
+        _ => Err(Error::LayoutFieldTypeMismatch(field)),
+    }
+}
+
 fn value_as_u16(field: &'static str, value: &LayoutValue) -> Result<u16> {
     match value {
+        LayoutValue::U8(value) => Ok(u16::from(*value)),
         LayoutValue::U16(value) => Ok(*value),
         LayoutValue::U64(value) => {
             u16::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field))
@@ -560,6 +940,8 @@ fn value_as_u16(field: &'static str, value: &LayoutValue) -> Result<u16> {
 
 fn value_as_u32(field: &'static str, value: &LayoutValue) -> Result<u32> {
     match value {
+        LayoutValue::U8(value) => Ok(u32::from(*value)),
+        LayoutValue::U16(value) => Ok(u32::from(*value)),
         LayoutValue::U32(value) => Ok(*value),
         LayoutValue::U64(value) => {
             u32::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field))
@@ -570,6 +952,7 @@ fn value_as_u32(field: &'static str, value: &LayoutValue) -> Result<u32> {
 
 fn value_as_u64(field: &'static str, value: &LayoutValue) -> Result<u64> {
     match value {
+        LayoutValue::U8(value) => Ok(u64::from(*value)),
         LayoutValue::U16(value) => Ok(u64::from(*value)),
         LayoutValue::U32(value) => Ok(u64::from(*value)),
         LayoutValue::U64(value) => Ok(*value),

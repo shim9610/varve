@@ -15,8 +15,9 @@ use crate::{
     MatrixResumeSignal, RecoveryPolicy, Result, VariableCompression, VarveBlock, VarveKeyedBlock,
     VarveMatrixBlock, VarveMerge, VarveMigration, WireType, decode_from_slice, encode_to_vec,
     native_layout::{
-        decode_native_record_footer, encode_native_record_footer, native_record_footer_len,
-        native_record_header_len, read_native_record_header, write_native_record_header,
+        decode_native_record_footer, encode_native_record_footer, native_file_header_len,
+        native_record_footer_len, native_record_header_len, read_native_file_header,
+        read_native_record_header, write_native_file_header, write_native_record_header,
     },
 };
 
@@ -27,10 +28,6 @@ pub const INDEX_BLOCK_ID: u32 = 0xFFFF_FFFB;
 pub const MANIFEST_BLOCK_ID: u32 = 0xFFFF_FFFA;
 pub const COMMIT_BLOCK_ID: u32 = 0xFFFF_FFF9;
 const RESERVED_BLOCK_ID_START: u32 = 0xFFFF_FF00;
-const CONTAINER_MARKER_V1: &[u8; 6] = b"VARVE1";
-const CONTAINER_MARKER_V2: &[u8; 6] = b"VARVE2";
-const CONTAINER_MARKER_V3: &[u8; 6] = b"VARVE3";
-const HEADER_FIXED_LEN: u64 = 6 + 2 + 1 + 1 + 8;
 pub(crate) const RECORD_HEADER_LEN: u64 = 32;
 pub(crate) const RECORD_FOOTER_LEN: u64 = 32;
 const RECORD_FLAG_COMPRESSED: u16 = 0x0001;
@@ -3231,69 +3228,15 @@ where
 }
 
 fn write_file_header(spec: FormatSpec, file: &mut File) -> Result<()> {
-    file.write_all(spec.magic)?;
     let extensions = file_header_extensions(spec)?;
-    if spec.spec_needs_record_footer() {
-        file.write_all(CONTAINER_MARKER_V3)?;
-    } else if extensions.is_empty() {
-        file.write_all(CONTAINER_MARKER_V1)?;
-    } else {
-        file.write_all(CONTAINER_MARKER_V2)?;
-    }
-    file.write_all(&spec.version.to_le_bytes())?;
-    file.write_all(&[spec.endian.to_byte()])?;
-    file.write_all(&[0])?;
-    file.write_all(&spec.schema_hash.to_le_bytes())?;
-    if spec.spec_needs_record_footer() || !extensions.is_empty() {
-        let ext_len =
-            u32::try_from(extensions.len()).map_err(|_| Error::InvalidCompressionHeader)?;
-        file.write_all(&ext_len.to_le_bytes())?;
-        file.write_all(&extensions)?;
-    }
+    write_native_file_header(file, spec, &extensions)?;
     Ok(())
 }
 
 pub(crate) fn read_file_header(spec: FormatSpec, file: &mut File) -> Result<u64> {
     file.seek(SeekFrom::Start(0))?;
-    let mut magic = vec![0; spec.magic.len()];
-    file.read_exact(&mut magic)?;
-    if magic != spec.magic {
-        return Err(Error::InvalidMagic);
-    }
-    let mut marker = [0; 6];
-    file.read_exact(&mut marker)?;
-    if &marker != CONTAINER_MARKER_V1
-        && &marker != CONTAINER_MARKER_V2
-        && &marker != CONTAINER_MARKER_V3
-    {
-        return Err(Error::UnsupportedContainer);
-    }
-    if spec.spec_needs_record_footer() != (&marker == CONTAINER_MARKER_V3) {
-        return Err(Error::UnsupportedContainer);
-    }
-    let mut version = [0; 2];
-    file.read_exact(&mut version)?;
-    let version = u16::from_le_bytes(version);
-    if version != spec.version {
-        return Err(Error::FormatVersionMismatch {
-            expected: spec.version,
-            actual: version,
-        });
-    }
-    let mut endian = [0; 1];
-    file.read_exact(&mut endian)?;
-    let endian = Endian::from_byte(endian[0]).ok_or(Error::UnsupportedEndian(endian[0]))?;
-    if endian != spec.endian {
-        return Err(Error::EndianMismatch {
-            expected: spec.endian,
-            actual: endian,
-        });
-    }
-    let mut flags = [0; 1];
-    file.read_exact(&mut flags)?;
-    let mut hash = [0; 8];
-    file.read_exact(&mut hash)?;
-    let hash = u64::from_le_bytes(hash);
+    let header = read_native_file_header(file, spec)?;
+    let hash = header.schema_hash;
     if spec.schema_hash != 0 && hash != spec.schema_hash {
         return Err(Error::SchemaHashMismatch {
             expected: spec.schema_hash,
@@ -3309,29 +3252,15 @@ pub(crate) fn read_file_header(spec: FormatSpec, file: &mut File) -> Result<u64>
             });
         }
     }
-    if &marker == CONTAINER_MARKER_V2 || &marker == CONTAINER_MARKER_V3 {
-        let mut ext_len = [0; 4];
-        file.read_exact(&mut ext_len)?;
-        let ext_len = u32::from_le_bytes(ext_len);
-        let mut extensions = vec![0; ext_len as usize];
-        file.read_exact(&mut extensions)?;
-        validate_file_header_extensions(spec, &extensions)?;
-        Ok(file_header_len(spec, u64::from(ext_len)))
+    if header.has_extension_len {
+        validate_file_header_extensions(spec, &header.extensions)?;
+        Ok(header.header_len)
     } else {
         if uses_file_explicit_compression(spec) {
             return Err(Error::InvalidCompressionHeader);
         }
-        Ok(file_header_len(spec, 0))
+        Ok(native_file_header_len(spec, 0))
     }
-}
-
-fn file_header_len(spec: FormatSpec, extension_len: u64) -> u64 {
-    let ext_len_field = if extension_len == 0 && !spec.spec_needs_record_footer() {
-        0
-    } else {
-        4
-    };
-    spec.magic.len() as u64 + HEADER_FIXED_LEN + ext_len_field + extension_len
 }
 
 fn read_matrix_layout_if_needed(

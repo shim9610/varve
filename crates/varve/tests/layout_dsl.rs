@@ -142,6 +142,17 @@ fn explicit_varve_native_preset_preserves_native_bytes() -> varve::Result<()> {
     );
     assert_eq!(read(&default_path)?, read(&explicit_path)?);
 
+    let default_bytes = read(&default_path)?;
+    assert_eq!(&default_bytes[0..4], b"NATV");
+    assert_eq!(&default_bytes[4..10], b"VARVE1");
+    assert_eq!(u16_at(&default_bytes, 10), 1);
+    assert_eq!(default_bytes[12], 1);
+    assert_eq!(default_bytes[13], 0);
+    assert_eq!(
+        u64_at(&default_bytes, 14),
+        NativeDefaultFormat::spec().schema_hash
+    );
+
     let inspected = NativeDefaultFormat::inspect_layout_file(&default_path)?;
     assert_eq!(inspected.plan.preset, LayoutPreset::VarveNative);
     assert_eq!(inspected.file_header_len, 22);
@@ -232,6 +243,34 @@ fn varve3_native_preset_exposes_footer_layout_plan() {
             .iter()
             .any(|field| field.name == "prev_same_block_offset")
     );
+}
+
+#[test]
+fn native_file_header_layout_codec_preserves_varve3_extension_len_zero() -> varve::Result<()> {
+    let path = temp_path("native_file_header_codec_v3");
+    cleanup(&path);
+
+    {
+        let mut file = NativeFooterFormat::create(&path)?;
+        file.push(&NativePoint { x: 5, y: 6 })?;
+        file.flush()?;
+    }
+
+    let bytes = read(&path)?;
+    assert_eq!(&bytes[0..5], b"NATV3");
+    assert_eq!(&bytes[5..11], b"VARVE3");
+    assert_eq!(u16_at(&bytes, 11), 1);
+    assert_eq!(bytes[13], 1);
+    assert_eq!(bytes[14], 0);
+    assert_eq!(u64_at(&bytes, 15), NativeFooterFormat::spec().schema_hash);
+    assert_eq!(u32_at(&bytes, 23), 0);
+
+    let inspected = NativeFooterFormat::inspect_layout_file(&path)?;
+    assert_eq!(inspected.file_header_len, 27);
+    assert_eq!(inspected.segments[0].segment_start, 27);
+
+    cleanup(&path);
+    Ok(())
 }
 
 #[test]

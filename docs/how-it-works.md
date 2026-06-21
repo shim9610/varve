@@ -81,10 +81,11 @@ manual byte parsing.
 `inspect_layout_file` is the common inspection path. For custom physical files
 it delegates to the layout reader; for Varve-native files it performs the normal
 strict native scan and projects each record into the same segment range model.
-The Varve-native record lead-in and optional footer are also emitted and parsed
-through an internal native layout codec that feeds the same effective
-`VarveRecord` plan, while the higher-level append-log, recovery, compression,
-and index semantics stay in the native reader/writer.
+The Varve-native file header, record lead-in, and optional footer are also
+emitted and parsed through an internal native layout codec that feeds the same
+effective `VarveFileHeader` and `VarveRecord` plan, while the higher-level
+append-log, recovery, compression, and index semantics stay in the native
+reader/writer.
 
 ## Append-Log Records
 

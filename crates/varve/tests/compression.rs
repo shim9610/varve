@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use varve::{
     BlockCompressionDescriptor, BlockDescriptor, BlockKind, CommitPolicy, CompressionAlgorithm,
     CompressionHeaderMode, CompressionLevel, CompressionPolicy, Endian, FormatSpec, IndexPolicy,
-    IntegrityPolicy, ManifestPolicy, RecoveryPolicy, VariableCompression, encode_to_vec,
+    IntegrityPolicy, LayoutPlanFieldSource, LayoutPlanFieldType, LayoutPlanLen, LayoutPlanPartKind,
+    ManifestPolicy, RecoveryPolicy, VariableCompression, encode_to_vec,
 };
 #[cfg(all(feature = "compression-zstd", feature = "integrity"))]
 use varve::{ChunkedBytes, decode_from_slice};
@@ -78,6 +79,24 @@ varve_format! {
         magic: b"COMPF";
         version: 1;
         endian: little;
+        compression: variable_blocks(
+            zstd,
+            level = fast,
+            header = file_explicit,
+            min_len = 32,
+            only_if_smaller = true,
+            max_len = 1048576,
+        );
+        blocks: [CompressibleBlock, FixedBlock];
+    }
+}
+
+varve_format! {
+    pub struct FileExplicitFooterCompressionFormat {
+        magic: b"COMPF3";
+        version: 1;
+        endian: little;
+        commit: record_footer;
         compression: variable_blocks(
             zstd,
             level = fast,
@@ -233,7 +252,72 @@ fn file_explicit_uses_varve2_header_and_raw_compressed_payload() -> varve::Resul
 
     let bytes = std::fs::read(&path)?;
     assert_eq!(&bytes[5..11], b"VARVE2");
+    assert_eq!(u16_at(&bytes, 11), 1);
+    assert_eq!(bytes[13], 1);
+    assert_eq!(bytes[14], 0);
+    assert_eq!(u32_at(&bytes, 23), 28);
+    assert_eq!(&bytes[27..31], b"VCHD");
+
+    let plan = FileExplicitCompressionFormat::spec().effective_layout();
+    let LayoutPlanPartKind::FileHeader(header) = &plan.parts[0].kind else {
+        panic!("expected native file header");
+    };
+    assert_eq!(
+        header.fields[1].source,
+        LayoutPlanFieldSource::LiteralBytes(b"VARVE2".to_vec())
+    );
+    assert!(
+        header
+            .fields
+            .iter()
+            .any(|field| field.name == "extension_len"
+                && field.ty == LayoutPlanFieldType::U32
+                && matches!(field.source, LayoutPlanFieldSource::Native("extension_len")))
+    );
+    assert!(header.fields.iter().any(|field| field.name == "extensions"
+        && field.ty
+            == LayoutPlanFieldType::Bytes {
+                len: LayoutPlanLen::Fixed(28)
+            }
+        && matches!(
+            field.source,
+            LayoutPlanFieldSource::Native("file_explicit_compression_header")
+        )));
+
     let file = FileExplicitCompressionFormat::open_readonly(&path)?;
+    assert_eq!(file.blocks::<CompressibleBlock>()?.get(0)?, Some(value));
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[cfg(feature = "compression-zstd")]
+#[test]
+fn file_explicit_with_record_footer_uses_varve3_header_and_extensions() -> varve::Result<()> {
+    let path = temp_path("file_explicit_footer");
+    cleanup(&path);
+    let value = compressible(88, 16 * 1024);
+
+    {
+        let mut file = FileExplicitFooterCompressionFormat::create(&path)?;
+        file.push(&value)?;
+        file.flush()?;
+    }
+
+    let bytes = std::fs::read(&path)?;
+    assert_eq!(&bytes[0..6], b"COMPF3");
+    assert_eq!(&bytes[6..12], b"VARVE3");
+    assert_eq!(u16_at(&bytes, 12), 1);
+    assert_eq!(bytes[14], 1);
+    assert_eq!(bytes[15], 0);
+    assert_eq!(u32_at(&bytes, 24), 28);
+    assert_eq!(&bytes[28..32], b"VCHD");
+
+    let inspected = FileExplicitFooterCompressionFormat::inspect_layout_file(&path)?;
+    assert_eq!(inspected.file_header_len, 56);
+    assert_eq!(inspected.segments[0].segment_start, 56);
+
+    let file = FileExplicitFooterCompressionFormat::open_readonly(&path)?;
     assert_eq!(file.blocks::<CompressibleBlock>()?.get(0)?, Some(value));
 
     cleanup(&path);
@@ -518,4 +602,18 @@ fn cleanup(path: &Path) {
     let mut lock = path.as_os_str().to_os_string();
     lock.push(".lock");
     let _ = remove_file(PathBuf::from(lock));
+}
+
+#[cfg(feature = "compression-zstd")]
+fn u16_at(bytes: &[u8], offset: usize) -> u16 {
+    let mut value = [0; 2];
+    value.copy_from_slice(&bytes[offset..offset + 2]);
+    u16::from_le_bytes(value)
+}
+
+#[cfg(feature = "compression-zstd")]
+fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+    let mut value = [0; 4];
+    value.copy_from_slice(&bytes[offset..offset + 4]);
+    u32::from_le_bytes(value)
 }

@@ -1096,6 +1096,7 @@ impl FormatSpec {
                         "varve_native layout must not declare custom parts",
                     ));
                 }
+                crate::native_layout::ensure_native_file_header_layout_contract(self)?;
                 crate::native_layout::ensure_native_record_layout_contract()?;
             }
             LayoutPreset::None | LayoutPreset::Custom => {
@@ -1680,53 +1681,6 @@ fn layout_field_type_to_plan(ty: LayoutFieldType) -> LayoutPlanFieldType {
 }
 
 fn native_layout_plan(spec: FormatSpec) -> LayoutPlan {
-    let mut header_fields = vec![
-        native_bytes_field(
-            "magic",
-            LayoutPlanLen::Fixed(spec.magic.len() as u64),
-            LayoutPlanFieldSource::LiteralBytes(spec.magic.to_vec()),
-        ),
-        native_bytes_field(
-            "container_marker",
-            LayoutPlanLen::Fixed(6),
-            LayoutPlanFieldSource::LiteralBytes(native_container_marker(spec).to_vec()),
-        ),
-        native_field(
-            "format_version",
-            LayoutPlanFieldType::U16,
-            LayoutPlanFieldSource::Native("format_version"),
-        ),
-        native_field(
-            "endian",
-            LayoutPlanFieldType::U8,
-            LayoutPlanFieldSource::Native("endian"),
-        ),
-        native_field(
-            "flags",
-            LayoutPlanFieldType::U8,
-            LayoutPlanFieldSource::LiteralU64(0),
-        ),
-        native_field(
-            "schema_hash",
-            LayoutPlanFieldType::U64,
-            LayoutPlanFieldSource::Native("schema_hash"),
-        ),
-    ];
-    if native_has_extension_len_field(spec) {
-        header_fields.push(native_field(
-            "extension_len",
-            LayoutPlanFieldType::U32,
-            LayoutPlanFieldSource::Native("extension_len"),
-        ));
-    }
-    if native_file_explicit_compression(spec).is_some() {
-        header_fields.push(native_bytes_field(
-            "extensions",
-            LayoutPlanLen::Fixed(28),
-            LayoutPlanFieldSource::Native("file_explicit_compression_header"),
-        ));
-    }
-
     let footer = if spec.spec_needs_record_footer() {
         Some(LayoutPlanFieldGroup {
             name: "VarveRecordFooter".to_string(),
@@ -1743,7 +1697,7 @@ fn native_layout_plan(spec: FormatSpec) -> LayoutPlan {
                 name: "VarveFileHeader".to_string(),
                 kind: LayoutPlanPartKind::FileHeader(LayoutPlanFieldGroup {
                     name: "VarveFileHeader".to_string(),
-                    fields: header_fields,
+                    fields: crate::native_layout::native_file_header_plan_fields(spec),
                 }),
             },
             LayoutPlanPartDescriptor {
@@ -1767,52 +1721,6 @@ fn native_layout_plan(spec: FormatSpec) -> LayoutPlan {
                 }),
             },
         ],
-    }
-}
-
-fn native_field(
-    name: &'static str,
-    ty: LayoutPlanFieldType,
-    source: LayoutPlanFieldSource,
-) -> LayoutPlanField {
-    LayoutPlanField {
-        name: name.to_string(),
-        ty,
-        source,
-        endian: Some(Endian::Little),
-    }
-}
-
-fn native_bytes_field(
-    name: &'static str,
-    len: LayoutPlanLen,
-    source: LayoutPlanFieldSource,
-) -> LayoutPlanField {
-    native_field(name, LayoutPlanFieldType::Bytes { len }, source)
-}
-
-fn native_container_marker(spec: FormatSpec) -> &'static [u8] {
-    if spec.spec_needs_record_footer() {
-        b"VARVE3"
-    } else if native_file_explicit_compression(spec).is_some() {
-        b"VARVE2"
-    } else {
-        b"VARVE1"
-    }
-}
-
-fn native_has_extension_len_field(spec: FormatSpec) -> bool {
-    spec.spec_needs_record_footer() || native_file_explicit_compression(spec).is_some()
-}
-
-fn native_file_explicit_compression(spec: FormatSpec) -> Option<VariableCompression> {
-    match spec.compression_policy {
-        CompressionPolicy::VariableBlocks(compression)
-            if compression.header_mode == CompressionHeaderMode::FileExplicit =>
-        {
-            Some(compression)
-        }
-        _ => None,
     }
 }
 
