@@ -59,4 +59,17 @@ fn main() {
         LayoutFieldSource::LiteralBytes(bytes) => assert_eq!(bytes, b"TDSm"),
         _ => panic!("expected literal tag"),
     }
+
+    let _header = LayoutOnlyFormatTdmsFileHeaderLayoutFields;
+    let _write = LayoutOnlyFormatTdmsSegmentLayoutWrite {
+        fields: LayoutOnlyFormatTdmsSegmentLayoutFields {
+            toc_mask: 1,
+            version: 4713,
+        },
+        footer_fields: LayoutOnlyFormatTdmsSegmentLayoutFooterFields,
+        metadata: b"metadata",
+        raw: b"raw",
+    };
+    fn _accept_writer(_: LayoutOnlyFormatLayoutWriter) {}
+    fn _accept_reader(_: LayoutOnlyFormatLayoutReader) {}
 }

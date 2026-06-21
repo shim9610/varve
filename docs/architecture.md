@@ -38,6 +38,9 @@
   for optional file header + repeated segments. The initial verified targets are
   TDMS-style `TDSm` lead-in + metadata bytes + contiguous raw channel bytes, and
   a generic framed layout with declared file header and segment footer.
+- Format-first custom layouts generate typed `FormatLayoutWriter` and
+  `FormatLayoutReader` wrappers over that physical path while preserving the
+  low-level dynamic `SegmentWrite` escape hatch.
 - Matrix blocks use deterministic slot layout and commit bitmaps instead of
   append-log record footers or offset chains.
 - Endian priority is block override, then format setting, then the macro little-endian default.

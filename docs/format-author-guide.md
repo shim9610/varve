@@ -332,14 +332,20 @@ varve_format! {
 }
 ```
 
-Write it with `create_layout_writer` and `write_segment`. Reopen the same file
-with `open_layout_writer` when you need to validate the existing segment stream
-and append more segments. `fields` supplies caller values for lead-in fields,
-`footer_fields` supplies caller values for footer fields, and finalized fields
-are backpatched after the segment bytes are known. `open_layout_reader`
-validates literal tags, offset fields, header/footer bounds, exposes
-`LayoutSegmentInfo::field` / `footer_field`, and returns opaque `read_metadata`
-and `read_raw` ranges.
+For format-first declarations, the macro generates a typed physical-layout
+facade. `PhysicalFormat::create_layout_writer` returns
+`PhysicalFormatLayoutWriter`, and `segment DataSegment` generates
+`write_data_segment`, `data_segments`, `data_segment`,
+`read_data_segment_metadata`, and `read_data_segment_raw`. Caller fields become
+typed Rust struct fields; literal and finalized fields are supplied or
+backpatched by Varve.
+
+The low-level `LayoutWriter::write_segment(SegmentWrite)` path remains exposed
+through the generated wrapper for dynamic adapters. Reopen the same file with
+`open_layout_writer` when you need to validate the existing segment stream and
+append more segments. `open_layout_reader` validates literal tags, offset
+fields, header/footer bounds, exposes typed getters on generated
+`...LayoutInfo`, and still returns opaque `read_metadata` and `read_raw` ranges.
 
 ## Read And Write
 

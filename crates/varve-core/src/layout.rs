@@ -18,6 +18,92 @@ pub enum LayoutValue {
     I64(i64),
 }
 
+impl LayoutValue {
+    pub fn to_bytes(&self, field: &'static str) -> Result<Vec<u8>> {
+        match self {
+            Self::Bytes(bytes) => Ok(bytes.clone()),
+            _ => Err(Error::LayoutFieldTypeMismatch(field)),
+        }
+    }
+
+    pub fn to_u8(&self, field: &'static str) -> Result<u8> {
+        match self {
+            Self::U8(value) => Ok(*value),
+            Self::U16(value) => {
+                u8::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field))
+            }
+            Self::U32(value) => {
+                u8::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field))
+            }
+            Self::U64(value) => {
+                u8::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field))
+            }
+            Self::I64(value) => {
+                u8::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field))
+            }
+            Self::Bytes(_) => Err(Error::LayoutFieldTypeMismatch(field)),
+        }
+    }
+
+    pub fn to_u16(&self, field: &'static str) -> Result<u16> {
+        match self {
+            Self::U8(value) => Ok(u16::from(*value)),
+            Self::U16(value) => Ok(*value),
+            Self::U32(value) => {
+                u16::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field))
+            }
+            Self::U64(value) => {
+                u16::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field))
+            }
+            Self::I64(value) => {
+                u16::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field))
+            }
+            Self::Bytes(_) => Err(Error::LayoutFieldTypeMismatch(field)),
+        }
+    }
+
+    pub fn to_u32(&self, field: &'static str) -> Result<u32> {
+        match self {
+            Self::U8(value) => Ok(u32::from(*value)),
+            Self::U16(value) => Ok(u32::from(*value)),
+            Self::U32(value) => Ok(*value),
+            Self::U64(value) => {
+                u32::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field))
+            }
+            Self::I64(value) => {
+                u32::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field))
+            }
+            Self::Bytes(_) => Err(Error::LayoutFieldTypeMismatch(field)),
+        }
+    }
+
+    pub fn to_u64(&self, field: &'static str) -> Result<u64> {
+        match self {
+            Self::U8(value) => Ok(u64::from(*value)),
+            Self::U16(value) => Ok(u64::from(*value)),
+            Self::U32(value) => Ok(u64::from(*value)),
+            Self::U64(value) => Ok(*value),
+            Self::I64(value) => {
+                u64::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field))
+            }
+            Self::Bytes(_) => Err(Error::LayoutFieldTypeMismatch(field)),
+        }
+    }
+
+    pub fn to_i64(&self, field: &'static str) -> Result<i64> {
+        match self {
+            Self::U8(value) => Ok(i64::from(*value)),
+            Self::U16(value) => Ok(i64::from(*value)),
+            Self::U32(value) => Ok(i64::from(*value)),
+            Self::U64(value) => {
+                i64::try_from(*value).map_err(|_| Error::LayoutFieldTypeMismatch(field))
+            }
+            Self::I64(value) => Ok(*value),
+            Self::Bytes(_) => Err(Error::LayoutFieldTypeMismatch(field)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayoutFieldValue {
     pub name: &'static str,

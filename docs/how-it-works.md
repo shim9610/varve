@@ -78,6 +78,13 @@ validated segment. Validated lead-in/footer values remain available on
 `LayoutSegmentInfo`, so callers can inspect fields such as ToC masks without
 manual byte parsing.
 
+When the layout is declared in `varve_format!`, the macro generates a typed
+physical-layout facade over that same engine. Segment caller fields become a
+typed `FormatSegmentLayoutFields` struct, `write_segment_name` lowers them into
+`LayoutFieldValue`s, and generated segment info getters read validated values
+back from `LayoutSegmentInfo`. Raw and metadata regions intentionally remain
+byte slices so TDMS-style adapters can own their metadata and channel encoding.
+
 `inspect_layout_file` is the common inspection path. For custom physical files
 it delegates to the layout reader; for Varve-native files it performs the normal
 strict native scan and projects each record into the same segment range model.

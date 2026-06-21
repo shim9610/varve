@@ -837,6 +837,12 @@ impl Parse for FormatInput {
         if typed_api && inline_blocks.is_empty() && layout_segments.is_empty() {
             return Err(content.error("format syntax requires inline blocks"));
         }
+        if typed_api && layout_segments.len() > 1 {
+            return Err(syn::Error::new_spanned(
+                &layout_segments[1].name,
+                "typed layout API currently supports one segment descriptor",
+            ));
+        }
         if !typed_api && registry_blocks.is_empty() {
             return Err(content.error("missing blocks"));
         }
@@ -1767,10 +1773,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     let dims = input.dims;
     let matrix_commit = input.matrix_commit;
     let matrix_aux = input.matrix_aux;
+    let layout_file_header = input.layout_file_header;
+    let layout_segments = input.layout_segments;
+    let typed_api_enabled = input.typed_api;
     let layout = layout_tokens(
         input.layout_preset,
-        input.layout_file_header.as_ref(),
-        &input.layout_segments,
+        layout_file_header.as_ref(),
+        &layout_segments,
     );
     let registry_blocks = input.registry_blocks;
     let inline_blocks = input.inline_blocks;
@@ -1807,42 +1816,84 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
             );
         }
     });
-    let typed_api = if input.typed_api {
+    let typed_api = if typed_api_enabled {
         typed_api_tokens(&name, &inline_blocks, matrix_commit.as_ref(), &matrix_aux)
     } else {
         quote!()
     };
-    let writer_return = if input.typed_api {
+    let layout_typed_api = if typed_api_enabled && !layout_segments.is_empty() {
+        layout_typed_api_tokens(&name, layout_file_header.as_ref(), &layout_segments)
+    } else {
+        quote!()
+    };
+    let writer_return = if typed_api_enabled {
         let writer_name = format_ident!("{}Writer", name);
         quote!(#writer_name)
     } else {
         quote!(::varve::__core::VarveWriter)
     };
-    let reader_return = if input.typed_api {
+    let reader_return = if typed_api_enabled {
         let reader_name = format_ident!("{}Reader", name);
         quote!(#reader_name)
     } else {
         quote!(::varve::__core::VarveReader)
     };
-    let create_writer_body = if input.typed_api {
+    let has_typed_layout_api = typed_api_enabled && !layout_segments.is_empty();
+    let layout_writer_return = if has_typed_layout_api {
+        let writer_name = format_ident!("{}LayoutWriter", name);
+        quote!(#writer_name)
+    } else {
+        quote!(::varve::__core::LayoutWriter)
+    };
+    let layout_reader_return = if has_typed_layout_api {
+        let reader_name = format_ident!("{}LayoutReader", name);
+        quote!(#reader_name)
+    } else {
+        quote!(::varve::__core::LayoutReader)
+    };
+    let create_layout_writer_body = if has_typed_layout_api {
+        let writer_name = format_ident!("{}LayoutWriter", name);
+        quote!(Ok(#writer_name::from_inner(Self::spec().create_layout_writer(path)?)))
+    } else {
+        quote!(Self::spec().create_layout_writer(path))
+    };
+    let create_layout_writer_with_header_body = if has_typed_layout_api {
+        let writer_name = format_ident!("{}LayoutWriter", name);
+        quote!(Ok(#writer_name::from_inner(Self::spec().create_layout_writer_with_header(path, fields)?)))
+    } else {
+        quote!(Self::spec().create_layout_writer_with_header(path, fields))
+    };
+    let open_layout_writer_body = if has_typed_layout_api {
+        let writer_name = format_ident!("{}LayoutWriter", name);
+        quote!(Ok(#writer_name::from_inner(Self::spec().open_layout_writer(path)?)))
+    } else {
+        quote!(Self::spec().open_layout_writer(path))
+    };
+    let open_layout_reader_body = if has_typed_layout_api {
+        let reader_name = format_ident!("{}LayoutReader", name);
+        quote!(Ok(#reader_name::from_inner(Self::spec().open_layout_reader(path)?)))
+    } else {
+        quote!(Self::spec().open_layout_reader(path))
+    };
+    let create_writer_body = if typed_api_enabled {
         let writer_name = format_ident!("{}Writer", name);
         quote!(#writer_name::from_inner(Self::spec().create_writer(path)?))
     } else {
         quote!(Self::spec().create_writer(path))
     };
-    let open_writer_body = if input.typed_api {
+    let open_writer_body = if typed_api_enabled {
         let writer_name = format_ident!("{}Writer", name);
         quote!(#writer_name::from_inner(Self::spec().open_writer(path)?))
     } else {
         quote!(Self::spec().open_writer(path))
     };
-    let open_recover_writer_body = if input.typed_api {
+    let open_recover_writer_body = if typed_api_enabled {
         let writer_name = format_ident!("{}Writer", name);
         quote!(#writer_name::from_inner(Self::spec().open_recover_writer(path)?))
     } else {
         quote!(Self::spec().open_recover_writer(path))
     };
-    let open_recover_writer_report_body = if input.typed_api {
+    let open_recover_writer_report_body = if typed_api_enabled {
         let writer_name = format_ident!("{}Writer", name);
         quote! {
             {
@@ -1853,7 +1904,7 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     } else {
         quote!(Self::spec().open_recover_writer_with_report(path))
     };
-    let open_reader_body = if input.typed_api {
+    let open_reader_body = if typed_api_enabled {
         let reader_name = format_ident!("{}Reader", name);
         quote!(Ok(#reader_name::from_inner(Self::spec().open_reader(path)?)))
     } else {
@@ -1865,7 +1916,7 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
         &name,
         &dims,
         matrix_commit.as_ref(),
-        input.typed_api,
+        typed_api_enabled,
         &writer_return,
     );
 
@@ -1907,15 +1958,15 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 #create_writer_body
             }
 
-            pub fn create_layout_writer<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::LayoutWriter> {
-                Self::spec().create_layout_writer(path)
+            pub fn create_layout_writer<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<#layout_writer_return> {
+                #create_layout_writer_body
             }
 
             pub fn create_layout_writer_with_header<P: AsRef<::std::path::Path>>(
                 path: P,
                 fields: &[::varve::__core::LayoutFieldValue],
-            ) -> ::varve::__core::Result<::varve::__core::LayoutWriter> {
-                Self::spec().create_layout_writer_with_header(path, fields)
+            ) -> ::varve::__core::Result<#layout_writer_return> {
+                #create_layout_writer_with_header_body
             }
 
             #create_writer_with_dims_method
@@ -1928,8 +1979,8 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 #open_writer_body
             }
 
-            pub fn open_layout_writer<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::LayoutWriter> {
-                Self::spec().open_layout_writer(path)
+            pub fn open_layout_writer<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<#layout_writer_return> {
+                #open_layout_writer_body
             }
 
             pub fn open_readonly<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::VarveFile> {
@@ -1940,8 +1991,8 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 #open_reader_body
             }
 
-            pub fn open_layout_reader<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::LayoutReader> {
-                Self::spec().open_layout_reader(path)
+            pub fn open_layout_reader<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<#layout_reader_return> {
+                #open_layout_reader_body
             }
 
             pub fn inspect_layout_file<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::LayoutFileInfo> {
@@ -1987,6 +2038,7 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
 
         #(#duplicate_asserts)*
         #typed_api
+        #layout_typed_api
     }
 }
 
@@ -1999,7 +2051,7 @@ fn layout_tokens(
     let preset = preset.unwrap_or(if !has_parts {
         LayoutPresetChoice::VarveNative
     } else {
-        LayoutPresetChoice::Custom
+        LayoutPresetChoice::None
     });
     let preset_tokens = layout_preset_tokens(preset);
     if !has_parts {
@@ -2523,6 +2575,395 @@ fn inline_block_tokens(vis: &Visibility, block: &InlineBlock, dims: &[MatrixDim]
         }
 
         #matrix_impl
+    }
+}
+
+fn layout_typed_api_tokens(
+    format_name: &Ident,
+    file_header: Option<&LayoutFileHeader>,
+    segments: &[LayoutSegment],
+) -> TokenStream2 {
+    let reader_name = format_ident!("{}LayoutReader", format_name);
+    let writer_name = format_ident!("{}LayoutWriter", format_name);
+    let header_tokens = file_header
+        .map(|header| layout_header_typed_tokens(format_name, &writer_name, header))
+        .unwrap_or_else(|| quote!());
+    let segment_types = segments
+        .iter()
+        .map(|segment| layout_segment_typed_tokens(format_name, segment));
+    let writer_segment_methods = segments
+        .iter()
+        .map(|segment| layout_writer_segment_method_tokens(format_name, segment));
+    let reader_segment_methods = segments
+        .iter()
+        .map(|segment| layout_reader_segment_methods_tokens(format_name, segment));
+
+    quote! {
+        #header_tokens
+        #(#segment_types)*
+
+        #[derive(Debug)]
+        pub struct #reader_name {
+            inner: ::varve::__core::LayoutReader,
+        }
+
+        impl #reader_name {
+            pub fn from_inner(inner: ::varve::__core::LayoutReader) -> Self {
+                Self { inner }
+            }
+
+            pub fn into_inner(self) -> ::varve::__core::LayoutReader {
+                self.inner
+            }
+
+            pub fn spec(&self) -> ::varve::__core::FormatSpec {
+                self.inner.spec()
+            }
+
+            pub fn path(&self) -> &::std::path::Path {
+                self.inner.path()
+            }
+
+            pub fn file_header_len(&self) -> u64 {
+                self.inner.file_header_len()
+            }
+
+            pub fn segments(&self) -> &[::varve::__core::LayoutSegmentInfo] {
+                self.inner.segments()
+            }
+
+            pub fn read_metadata(&self, index: usize) -> ::varve::__core::Result<Vec<u8>> {
+                self.inner.read_metadata(index)
+            }
+
+            pub fn read_raw(&self, index: usize) -> ::varve::__core::Result<Vec<u8>> {
+                self.inner.read_raw(index)
+            }
+
+            #(#reader_segment_methods)*
+        }
+
+        #[derive(Debug)]
+        pub struct #writer_name {
+            inner: ::varve::__core::LayoutWriter,
+        }
+
+        impl #writer_name {
+            pub fn from_inner(inner: ::varve::__core::LayoutWriter) -> Self {
+                Self { inner }
+            }
+
+            pub fn into_inner(self) -> ::varve::__core::LayoutWriter {
+                self.inner
+            }
+
+            pub fn spec(&self) -> ::varve::__core::FormatSpec {
+                self.inner.spec()
+            }
+
+            pub fn path(&self) -> &::std::path::Path {
+                self.inner.path()
+            }
+
+            pub fn write_segment(
+                &mut self,
+                segment: ::varve::__core::SegmentWrite<'_>,
+            ) -> ::varve::__core::Result<::varve::__core::LayoutSegmentInfo> {
+                self.inner.write_segment(segment)
+            }
+
+            pub fn flush(&mut self) -> ::varve::__core::Result<()> {
+                self.inner.flush()
+            }
+
+            pub fn sync(&mut self) -> ::varve::__core::Result<()> {
+                self.inner.sync()
+            }
+
+            #(#writer_segment_methods)*
+        }
+    }
+}
+
+fn layout_header_typed_tokens(
+    format_name: &Ident,
+    writer_name: &Ident,
+    header: &LayoutFileHeader,
+) -> TokenStream2 {
+    let fields_name = format_ident!("{}{}LayoutFields", format_name, header.name);
+    let field_struct = layout_field_struct_tokens(&fields_name, &header.fields);
+    quote! {
+        #field_struct
+
+        impl #format_name {
+            pub fn create_layout_writer_with_typed_header<P: AsRef<::std::path::Path>>(
+                path: P,
+                header: #fields_name,
+            ) -> ::varve::__core::Result<#writer_name> {
+                let fields = header.__varve_layout_values();
+                Ok(#writer_name::from_inner(
+                    Self::spec().create_layout_writer_with_header(path, &fields)?
+                ))
+            }
+        }
+    }
+}
+
+fn layout_segment_typed_tokens(format_name: &Ident, segment: &LayoutSegment) -> TokenStream2 {
+    let field_type = format_ident!("{}{}LayoutFields", format_name, segment.name);
+    let footer_field_type = format_ident!("{}{}LayoutFooterFields", format_name, segment.name);
+    let write_type = format_ident!("{}{}LayoutWrite", format_name, segment.name);
+    let info_type = format_ident!("{}{}LayoutInfo", format_name, segment.name);
+    let field_struct = layout_field_struct_tokens(&field_type, &segment.lead_in.fields);
+    let footer_fields = segment
+        .footer
+        .as_ref()
+        .map(|footer| footer.fields.as_slice())
+        .unwrap_or(&[]);
+    let footer_field_struct = layout_field_struct_tokens(&footer_field_type, footer_fields);
+    let lead_in_getters = segment.lead_in.fields.iter().map(layout_info_field_getter);
+    let footer_getters = footer_fields.iter().map(layout_info_footer_field_getter);
+
+    quote! {
+        #field_struct
+        #footer_field_struct
+
+        #[derive(Clone, Debug)]
+        pub struct #write_type<'a> {
+            pub fields: #field_type,
+            pub footer_fields: #footer_field_type,
+            pub metadata: &'a [u8],
+            pub raw: &'a [u8],
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct #info_type {
+            inner: ::varve::__core::LayoutSegmentInfo,
+        }
+
+        impl #info_type {
+            pub fn from_inner(inner: ::varve::__core::LayoutSegmentInfo) -> Self {
+                Self { inner }
+            }
+
+            pub fn as_layout_segment_info(&self) -> &::varve::__core::LayoutSegmentInfo {
+                &self.inner
+            }
+
+            pub fn into_layout_segment_info(self) -> ::varve::__core::LayoutSegmentInfo {
+                self.inner
+            }
+
+            pub fn segment_start(&self) -> u64 {
+                self.inner.segment_start
+            }
+
+            pub fn metadata_len(&self) -> u64 {
+                self.inner.metadata_len
+            }
+
+            pub fn raw_len(&self) -> u64 {
+                self.inner.raw_len
+            }
+
+            pub fn segment_end(&self) -> u64 {
+                self.inner.segment_end
+            }
+
+            #(#lead_in_getters)*
+            #(#footer_getters)*
+        }
+    }
+}
+
+fn layout_writer_segment_method_tokens(
+    format_name: &Ident,
+    segment: &LayoutSegment,
+) -> TokenStream2 {
+    let method = format_ident!("write_{}", singular_method_name(&segment.name));
+    let write_type = format_ident!("{}{}LayoutWrite", format_name, segment.name);
+    let info_type = format_ident!("{}{}LayoutInfo", format_name, segment.name);
+    let segment_name = segment.name.to_string();
+    quote! {
+        pub fn #method(
+            &mut self,
+            segment: #write_type<'_>,
+        ) -> ::varve::__core::Result<#info_type> {
+            let fields = segment.fields.__varve_layout_values();
+            let footer_fields = segment.footer_fields.__varve_layout_values();
+            let info = self.inner.write_segment(::varve::__core::SegmentWrite {
+                name: #segment_name,
+                fields: &fields,
+                footer_fields: &footer_fields,
+                metadata: segment.metadata,
+                raw: segment.raw,
+            })?;
+            Ok(#info_type::from_inner(info))
+        }
+    }
+}
+
+fn layout_reader_segment_methods_tokens(
+    format_name: &Ident,
+    segment: &LayoutSegment,
+) -> TokenStream2 {
+    let plural = plural_method_ident(&segment.name);
+    let singular = format_ident!("{}", singular_method_name(&segment.name));
+    let read_metadata = format_ident!("read_{}_metadata", singular_method_name(&segment.name));
+    let read_raw = format_ident!("read_{}_raw", singular_method_name(&segment.name));
+    let info_type = format_ident!("{}{}LayoutInfo", format_name, segment.name);
+    let segment_name = segment.name.to_string();
+    quote! {
+        pub fn #plural(&self) -> ::varve::__core::Result<Vec<#info_type>> {
+            self.inner
+                .segments()
+                .iter()
+                .filter(|segment| segment.name == #segment_name)
+                .cloned()
+                .map(#info_type::from_inner)
+                .map(Ok)
+                .collect()
+        }
+
+        pub fn #singular(&self, index: usize) -> ::varve::__core::Result<Option<#info_type>> {
+            let Some(segment) = self.inner.segments().get(index) else {
+                return Ok(None);
+            };
+            if segment.name != #segment_name {
+                return Ok(None);
+            }
+            Ok(Some(#info_type::from_inner(segment.clone())))
+        }
+
+        pub fn #read_metadata(&self, index: usize) -> ::varve::__core::Result<Vec<u8>> {
+            self.inner.read_metadata(index)
+        }
+
+        pub fn #read_raw(&self, index: usize) -> ::varve::__core::Result<Vec<u8>> {
+            self.inner.read_raw(index)
+        }
+    }
+}
+
+fn layout_field_struct_tokens(name: &Ident, fields: &[LayoutField]) -> TokenStream2 {
+    let caller_fields: Vec<_> = fields
+        .iter()
+        .filter(|field| matches!(&field.source, LayoutFieldSourceChoice::Caller))
+        .collect();
+    if caller_fields.is_empty() {
+        return quote! {
+            #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+            pub struct #name;
+
+            impl #name {
+                fn __varve_layout_values(&self) -> Vec<::varve::__core::LayoutFieldValue> {
+                    Vec::new()
+                }
+            }
+        };
+    }
+
+    let struct_fields = caller_fields.iter().map(|field| {
+        let field_name = &field.name;
+        let ty = layout_field_rust_type_tokens(&field.ty);
+        quote!(pub #field_name: #ty,)
+    });
+    let value_entries = caller_fields.iter().map(|field| {
+        let field_name = &field.name;
+        let field_name_string = field.name.to_string();
+        let value = layout_field_to_value_tokens(field, quote!(self.#field_name));
+        quote! {
+            ::varve::__core::LayoutFieldValue {
+                name: #field_name_string,
+                value: #value,
+            }
+        }
+    });
+
+    quote! {
+        #[derive(Clone, Debug, Default, PartialEq, Eq)]
+        pub struct #name {
+            #(#struct_fields)*
+        }
+
+        impl #name {
+            fn __varve_layout_values(&self) -> Vec<::varve::__core::LayoutFieldValue> {
+                vec![
+                    #(#value_entries,)*
+                ]
+            }
+        }
+    }
+}
+
+fn layout_info_field_getter(field: &LayoutField) -> TokenStream2 {
+    let method = &field.name;
+    let field_name = field.name.to_string();
+    let ty = layout_field_rust_type_tokens(&field.ty);
+    let conversion = layout_value_conversion_tokens(&field.ty, quote!(value), &field_name);
+    quote! {
+        pub fn #method(&self) -> ::varve::__core::Result<#ty> {
+            let value = self
+                .inner
+                .field(#field_name)
+                .ok_or(::varve::__core::Error::LayoutFieldMissing(#field_name))?;
+            #conversion
+        }
+    }
+}
+
+fn layout_info_footer_field_getter(field: &LayoutField) -> TokenStream2 {
+    let method = format_ident!("footer_{}", field.name);
+    let field_name = field.name.to_string();
+    let ty = layout_field_rust_type_tokens(&field.ty);
+    let conversion = layout_value_conversion_tokens(&field.ty, quote!(value), &field_name);
+    quote! {
+        pub fn #method(&self) -> ::varve::__core::Result<#ty> {
+            let value = self
+                .inner
+                .footer_field(#field_name)
+                .ok_or(::varve::__core::Error::LayoutFieldMissing(#field_name))?;
+            #conversion
+        }
+    }
+}
+
+fn layout_field_rust_type_tokens(ty: &LayoutFieldTypeChoice) -> TokenStream2 {
+    match ty {
+        LayoutFieldTypeChoice::Bytes(_) => quote!(Vec<u8>),
+        LayoutFieldTypeChoice::U8 => quote!(u8),
+        LayoutFieldTypeChoice::U16 => quote!(u16),
+        LayoutFieldTypeChoice::U32 => quote!(u32),
+        LayoutFieldTypeChoice::U64 => quote!(u64),
+        LayoutFieldTypeChoice::I64 => quote!(i64),
+    }
+}
+
+fn layout_field_to_value_tokens(field: &LayoutField, access: TokenStream2) -> TokenStream2 {
+    match field.ty {
+        LayoutFieldTypeChoice::Bytes(_) => {
+            quote!(::varve::__core::LayoutValue::Bytes(#access.clone()))
+        }
+        LayoutFieldTypeChoice::U8 => quote!(::varve::__core::LayoutValue::U8(#access)),
+        LayoutFieldTypeChoice::U16 => quote!(::varve::__core::LayoutValue::U16(#access)),
+        LayoutFieldTypeChoice::U32 => quote!(::varve::__core::LayoutValue::U32(#access)),
+        LayoutFieldTypeChoice::U64 => quote!(::varve::__core::LayoutValue::U64(#access)),
+        LayoutFieldTypeChoice::I64 => quote!(::varve::__core::LayoutValue::I64(#access)),
+    }
+}
+
+fn layout_value_conversion_tokens(
+    ty: &LayoutFieldTypeChoice,
+    value: TokenStream2,
+    field_name: &str,
+) -> TokenStream2 {
+    match ty {
+        LayoutFieldTypeChoice::Bytes(_) => quote!(#value.to_bytes(#field_name)),
+        LayoutFieldTypeChoice::U8 => quote!(#value.to_u8(#field_name)),
+        LayoutFieldTypeChoice::U16 => quote!(#value.to_u16(#field_name)),
+        LayoutFieldTypeChoice::U32 => quote!(#value.to_u32(#field_name)),
+        LayoutFieldTypeChoice::U64 => quote!(#value.to_u64(#field_name)),
+        LayoutFieldTypeChoice::I64 => quote!(#value.to_i64(#field_name)),
     }
 }
 

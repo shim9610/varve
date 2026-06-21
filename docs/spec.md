@@ -146,13 +146,20 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - In format-first form, block structs, `VarveBlock` implementations, typed reader/writer wrappers, and typed read/write traits are generated from the format declaration.
 - `varve_format!` supports `magic`, `version`, `endian`, optional `schema_hash`, optional `commit`, optional `integrity`, optional `index`, optional `recovery`, optional `manifest`, and `blocks`.
 - `varve_format!` supports `preset: varve_native|none|custom;`. Omitted preset
-  means `varve_native` unless a custom layout is declared.
+  means `varve_native` unless a custom layout is declared; with declared layout
+  parts, omission means `none` so the declaration owns byte zero.
 - `varve_format!` supports the first custom layout grammar:
   `layout { file_header Header { bytes sig = b"..."; } segment Name repeat
   until_eof { lead_in Name { bytes tag = b"..."; u32 caller_field; i64 offset =
   finalize(target = segment_end, relative_to = after_lead_in); } metadata Name;
   raw_region Name; footer Footer { bytes seal = b"..."; u64 len =
   finalize(target = segment_end, relative_to = segment_start); } } }`.
+- Format-first custom layout declarations generate typed
+  `FormatLayoutWriter` / `FormatLayoutReader` wrappers, typed header-field
+  structs, typed segment write structs, and typed segment info getters. The
+  generated wrapper still exposes the low-level `SegmentWrite` path.
+- The first generated typed layout API supports one repeated physical segment
+  descriptor. Multi-segment physical dispatch remains a follow-up extension.
 - `schema_hash: computed;` asks the macro to call `with_computed_schema_hash()` after policies are attached.
 - `index` accepts either a single legacy identifier or a list such as `[scan_on_open, checkpoint_on_flush, block_offset_chain, keyed_offset_chain]`.
 - `commit` accepts `none`, `record_footer`, or `transaction_marker(on_flush|explicit)`.

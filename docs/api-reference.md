@@ -180,11 +180,16 @@ bytes, optional footer fields, and finalized/backpatched offsets.
 | `preset: varve_native` | explicit native container preset; also the default |
 | `preset: none` | custom layout owns byte zero |
 | `layout { file_header ... segment ... }` | declare file header, segment lead-in, metadata region, raw region, optional footer |
-| `Format::create_layout_writer(path)` | create a custom physical-layout writer |
-| `Format::create_layout_writer_with_header(path, fields)` | create a writer when the file header has caller-supplied fields |
-| `Format::open_layout_writer(path)` | validate an existing custom-layout file and append more segments |
-| `Format::open_layout_reader(path)` | open a custom physical-layout reader |
+| `Format::create_layout_writer(path)` | create a generated `FormatLayoutWriter` for format-first layout declarations |
+| `Format::create_layout_writer_with_header(path, fields)` | low-level header-field creation path |
+| `Format::create_layout_writer_with_typed_header(path, header)` | generated typed header-field creation path when a `file_header` is declared |
+| `Format::open_layout_writer(path)` | validate an existing custom-layout file and append more segments through `FormatLayoutWriter` |
+| `Format::open_layout_reader(path)` | open a generated `FormatLayoutReader` |
 | `Format::inspect_layout_file(path)` | inspect native or custom physical file framing through one result type |
+| `FormatLayoutWriter::write_data_segment(...)` | generated segment writer from the declared segment name |
+| `FormatLayoutReader::data_segments()` | generated typed segment info collection |
+| `FormatLayoutReader::read_data_segment_metadata(index)` | generated metadata reader for the declared segment |
+| `FormatLayoutReader::read_data_segment_raw(index)` | generated raw-region reader for the declared segment |
 | `LayoutWriter::write_segment(SegmentWrite)` | write lead-in, metadata, raw bytes, footer, then backpatch offsets |
 | `SegmentWrite::fields` | caller values for lead-in fields |
 | `SegmentWrite::footer_fields` | caller values for footer fields |
@@ -236,6 +241,31 @@ varve_format! {
     }
 }
 ```
+
+The macro also generates a typed physical-layout facade. For the example above,
+the generated method names are derived from `DataSegment`:
+
+```rust
+let mut writer = FramedFormat::create_layout_writer("data.frame")?;
+writer.write_data_segment(FramedFormatDataSegmentLayoutWrite {
+    fields: FramedFormatDataSegmentLayoutFields { toc_mask: 0x1108 },
+    footer_fields: FramedFormatDataSegmentLayoutFooterFields,
+    metadata: b"objects",
+    raw: b"raw channel bytes",
+})?;
+writer.flush()?;
+
+let reader = FramedFormat::open_layout_reader("data.frame")?;
+let first = reader.data_segment(0)?.unwrap();
+assert_eq!(first.toc_mask()?, 0x1108);
+let raw = reader.read_data_segment_raw(0)?;
+```
+
+The generated wrapper still exposes the low-level `write_segment`,
+`read_metadata`, `read_raw`, and `segments` methods for adapters that need to
+bridge dynamic metadata. The first typed facade supports one repeated physical
+segment descriptor, so generated `index` parameters refer to the physical
+segment stream.
 
 ## Mmap And Zero-Copy
 

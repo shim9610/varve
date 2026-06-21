@@ -118,6 +118,59 @@ varve_format! {
     }
 }
 
+varve_format! {
+    pub format HeaderCallerPhysicalFormat {
+        magic: b"HEAD";
+        version: 1;
+        endian: little;
+        schema_hash: computed;
+        extension: "head";
+        preset: none;
+
+        layout {
+            file_header CallerHeader {
+                bytes signature = b"HDCT";
+                u16 kind;
+            }
+
+            segment HeaderDataSegment repeat until_eof {
+                lead_in HeaderDataLeadIn {
+                    bytes tag = b"DATA";
+                    u32 kind;
+                    i64 next_segment_offset = finalize(target = segment_end, relative_to = after_lead_in);
+                    i64 raw_data_offset = finalize(target = raw_region_start, relative_to = after_lead_in);
+                }
+
+                metadata HeaderDataMetadata;
+                raw_region HeaderDataRaw;
+            }
+        }
+    }
+}
+
+varve_format! {
+    pub format ImplicitPhysicalFormat {
+        magic: b"IMPL";
+        version: 1;
+        endian: little;
+        schema_hash: computed;
+
+        layout {
+            segment ImplicitSegment repeat until_eof {
+                lead_in ImplicitLeadIn {
+                    bytes tag = b"IMPL";
+                    u32 kind;
+                    i64 next_segment_offset = finalize(target = segment_end, relative_to = after_lead_in);
+                    i64 raw_data_offset = finalize(target = raw_region_start, relative_to = after_lead_in);
+                }
+
+                metadata ImplicitMetadata;
+                raw_region ImplicitRaw;
+            }
+        }
+    }
+}
+
 #[test]
 fn explicit_varve_native_preset_preserves_native_bytes() -> varve::Result<()> {
     let default_path = temp_path("layout_native_default");
@@ -456,6 +509,128 @@ fn custom_layout_writes_file_header_and_segment_footer() -> varve::Result<()> {
     assert_eq!(inspected.plan.preset, LayoutPreset::None);
     assert_eq!(inspected.file_header_len, 6);
     assert_eq!(inspected.segments.as_slice(), reader.segments());
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn typed_layout_api_writes_and_reads_tdms_style_segments() -> varve::Result<()> {
+    let path = temp_path("tdms_typed_physical_layout");
+    cleanup(&path);
+
+    let metadata = b"typed-objects";
+    let raw = f64_bytes(&[2.5, 3.5]);
+
+    {
+        let mut writer = TdmsPhysicalFormat::create_layout_writer(&path)?;
+        let info = writer.write_tdms_segment(TdmsPhysicalFormatTdmsSegmentLayoutWrite {
+            fields: TdmsPhysicalFormatTdmsSegmentLayoutFields {
+                toc_mask: 0x1120,
+                version: 4713,
+            },
+            footer_fields: TdmsPhysicalFormatTdmsSegmentLayoutFooterFields,
+            metadata,
+            raw: &raw,
+        })?;
+        assert_eq!(info.tag()?, b"TDSm");
+        assert_eq!(info.toc_mask()?, 0x1120);
+        assert_eq!(info.version()?, 4713);
+        assert_eq!(
+            info.next_segment_offset()?,
+            (metadata.len() + raw.len()) as i64
+        );
+        assert_eq!(info.raw_data_offset()?, metadata.len() as i64);
+        writer.flush()?;
+    }
+
+    let bytes = read(&path)?;
+    assert_eq!(&bytes[0..4], b"TDSm");
+    assert_eq!(u32_at(&bytes, 4), 0x1120);
+    assert_eq!(i64_at(&bytes, 12), (metadata.len() + raw.len()) as i64);
+
+    let reader = TdmsPhysicalFormat::open_layout_reader(&path)?;
+    let segments = reader.tdms_segments()?;
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].toc_mask()?, 0x1120);
+    assert_eq!(segments[0].raw_data_offset()?, metadata.len() as i64);
+    assert_eq!(reader.tdms_segment(0)?.unwrap().version()?, 4713);
+    assert_eq!(reader.read_tdms_segment_metadata(0)?, metadata);
+    assert_eq!(reader.read_tdms_segment_raw(0)?, raw);
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn typed_layout_api_handles_caller_file_header_fields() -> varve::Result<()> {
+    let path = temp_path("typed_header_physical_layout");
+    cleanup(&path);
+
+    {
+        let mut writer = HeaderCallerPhysicalFormat::create_layout_writer_with_typed_header(
+            &path,
+            HeaderCallerPhysicalFormatCallerHeaderLayoutFields { kind: 42 },
+        )?;
+        let info = writer.write_header_data_segment(
+            HeaderCallerPhysicalFormatHeaderDataSegmentLayoutWrite {
+                fields: HeaderCallerPhysicalFormatHeaderDataSegmentLayoutFields { kind: 7 },
+                footer_fields: HeaderCallerPhysicalFormatHeaderDataSegmentLayoutFooterFields,
+                metadata: b"m",
+                raw: b"raw",
+            },
+        )?;
+        assert_eq!(info.kind()?, 7);
+        writer.flush()?;
+    }
+
+    let bytes = read(&path)?;
+    assert_eq!(&bytes[0..4], b"HDCT");
+    assert_eq!(u16_at(&bytes, 4), 42);
+    assert_eq!(&bytes[6..10], b"DATA");
+    assert_eq!(u32_at(&bytes, 10), 7);
+
+    let reader = HeaderCallerPhysicalFormat::open_layout_reader(&path)?;
+    assert_eq!(reader.file_header_len(), 6);
+    let segment = reader.header_data_segment(0)?.unwrap();
+    assert_eq!(segment.kind()?, 7);
+    assert_eq!(reader.read_header_data_segment_metadata(0)?, b"m");
+    assert_eq!(reader.read_header_data_segment_raw(0)?, b"raw");
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn custom_layout_declaration_defaults_to_byte_zero_physical_layout() -> varve::Result<()> {
+    let path = temp_path("implicit_physical_layout");
+    cleanup(&path);
+
+    assert_eq!(
+        ImplicitPhysicalFormat::spec().layout.preset,
+        LayoutPreset::None
+    );
+    {
+        let mut writer = ImplicitPhysicalFormat::create_layout_writer(&path)?;
+        writer.write_implicit_segment(ImplicitPhysicalFormatImplicitSegmentLayoutWrite {
+            fields: ImplicitPhysicalFormatImplicitSegmentLayoutFields { kind: 9 },
+            footer_fields: ImplicitPhysicalFormatImplicitSegmentLayoutFooterFields,
+            metadata: b"",
+            raw: b"abc",
+        })?;
+        writer.flush()?;
+    }
+
+    let bytes = read(&path)?;
+    assert_eq!(&bytes[0..4], b"IMPL");
+    assert_eq!(u32_at(&bytes, 4), 9);
+    assert_eq!(&bytes[24..27], b"abc");
+    assert_eq!(
+        ImplicitPhysicalFormat::open_layout_reader(&path)?
+            .segments()
+            .len(),
+        1
+    );
 
     cleanup(&path);
     Ok(())
