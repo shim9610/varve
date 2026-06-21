@@ -2582,6 +2582,9 @@ fn layout_typed_api_tokens(
     let header_tokens = file_header
         .map(|header| layout_header_typed_tokens(format_name, &writer_name, header))
         .unwrap_or_else(|| quote!());
+    let reader_header_methods = file_header
+        .map(|header| layout_reader_header_method_tokens(format_name, header))
+        .unwrap_or_else(|| quote!());
     let segment_types = segments
         .iter()
         .map(|segment| layout_segment_typed_tokens(format_name, segment));
@@ -2652,6 +2655,7 @@ fn layout_typed_api_tokens(
                     })
             }
 
+            #reader_header_methods
             #(#reader_segment_methods)*
         }
 
@@ -2703,9 +2707,38 @@ fn layout_header_typed_tokens(
     header: &LayoutFileHeader,
 ) -> TokenStream2 {
     let fields_name = format_ident!("{}{}LayoutFields", format_name, header.name);
+    let info_name = format_ident!("{}{}LayoutInfo", format_name, header.name);
     let field_struct = layout_field_struct_tokens(&fields_name, &header.fields);
+    let getters = header
+        .fields
+        .iter()
+        .map(layout_file_header_info_field_getter);
     quote! {
         #field_struct
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct #info_name {
+            fields: Vec<::varve::__core::LayoutFieldValue>,
+        }
+
+        impl #info_name {
+            pub fn from_fields(fields: Vec<::varve::__core::LayoutFieldValue>) -> Self {
+                Self { fields }
+            }
+
+            pub fn fields(&self) -> &[::varve::__core::LayoutFieldValue] {
+                &self.fields
+            }
+
+            pub fn field(&self, name: &str) -> ::core::option::Option<&::varve::__core::LayoutValue> {
+                self.fields
+                    .iter()
+                    .find(|field| field.name == name)
+                    .map(|field| &field.value)
+            }
+
+            #(#getters)*
+        }
 
         impl #format_name {
             pub fn create_layout_writer_with_typed_header<P: AsRef<::std::path::Path>>(
@@ -2717,6 +2750,29 @@ fn layout_header_typed_tokens(
                     Self::spec().create_layout_writer_with_header(path, &fields)?
                 ))
             }
+        }
+    }
+}
+
+fn layout_reader_header_method_tokens(
+    format_name: &Ident,
+    header: &LayoutFileHeader,
+) -> TokenStream2 {
+    let info_name = format_ident!("{}{}LayoutInfo", format_name, header.name);
+    quote! {
+        pub fn file_header(&self) -> #info_name {
+            #info_name::from_fields(self.inner.file_header_fields().to_vec())
+        }
+
+        pub fn file_header_fields(&self) -> &[::varve::__core::LayoutFieldValue] {
+            self.inner.file_header_fields()
+        }
+
+        pub fn file_header_field(
+            &self,
+            name: &str,
+        ) -> ::core::option::Option<&::varve::__core::LayoutValue> {
+            self.inner.file_header_field(name)
         }
     }
 }
@@ -2917,6 +2973,21 @@ fn layout_info_field_getter(field: &LayoutField) -> TokenStream2 {
         pub fn #method(&self) -> ::varve::__core::Result<#ty> {
             let value = self
                 .inner
+                .field(#field_name)
+                .ok_or(::varve::__core::Error::LayoutFieldMissing(#field_name))?;
+            #conversion
+        }
+    }
+}
+
+fn layout_file_header_info_field_getter(field: &LayoutField) -> TokenStream2 {
+    let method = &field.name;
+    let field_name = field.name.to_string();
+    let ty = layout_field_rust_type_tokens(&field.ty);
+    let conversion = layout_value_conversion_tokens(&field.ty, quote!(value), &field_name);
+    quote! {
+        pub fn #method(&self) -> ::varve::__core::Result<#ty> {
+            let value = self
                 .field(#field_name)
                 .ok_or(::varve::__core::Error::LayoutFieldMissing(#field_name))?;
             #conversion

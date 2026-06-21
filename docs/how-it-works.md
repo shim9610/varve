@@ -72,11 +72,12 @@ offsets such as `next_segment_offset` and `raw_data_offset`. The layout writer
 writes placeholders for finalized fields, writes metadata/raw/footer bytes, then
 backpatches the computed values. The layout reader validates the header,
 literals, finalized offsets, forward progress, and region bounds before exposing
-metadata and raw byte ranges. Reopening a layout writer first runs that same
+metadata and raw byte ranges. Declared file-header fields are also retained as
+validated `LayoutFieldValue`s. Reopening a layout writer first runs that same
 validation pass, then seeks to EOF so new segments are appended after the last
-validated segment. Validated lead-in/footer values remain available on
-`LayoutSegmentInfo`, so callers can inspect fields such as ToC masks without
-manual byte parsing.
+validated segment. Validated header/lead-in/footer values remain available on
+`LayoutReader` and `LayoutSegmentInfo`, so callers can inspect fields such as
+ToC masks without manual byte parsing.
 
 When multiple segment descriptors are declared, the reader dispatches each
 physical segment from the leading literal lead-in prefix. A leading byte tag is
@@ -89,8 +90,10 @@ When the layout is declared in `varve_format!`, the macro generates a typed
 physical-layout facade over that same engine. Segment caller fields become a
 typed `FormatSegmentLayoutFields` struct, `write_segment_name` lowers them into
 `LayoutFieldValue`s, and generated segment info getters read validated values
-back from `LayoutSegmentInfo`. Raw and metadata regions intentionally remain
-byte slices so TDMS-style adapters can own their metadata and channel encoding.
+back from `LayoutSegmentInfo`. A declared file header similarly gains a typed
+`file_header()` info object on the generated reader. Raw and metadata regions
+intentionally remain byte slices so TDMS-style adapters can own their metadata
+and channel encoding.
 
 `inspect_layout_file` is the common inspection path. For custom physical files
 it delegates to the layout reader; for Varve-native files it performs the normal

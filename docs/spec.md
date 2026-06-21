@@ -156,8 +156,13 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   finalize(target = segment_end, relative_to = segment_start); } } }`.
 - Format-first custom layout declarations generate typed
   `FormatLayoutWriter` / `FormatLayoutReader` wrappers, typed header-field
-  structs, typed segment write structs, and typed segment info getters. The
-  generated wrapper still exposes the low-level `SegmentWrite` path.
+  structs, typed header info getters, typed segment write structs, and typed
+  segment info getters. The generated wrapper still exposes the low-level
+  `SegmentWrite` path.
+- Physical layout declarations are not `VarveBlock` payload declarations:
+  `VarveBlock` is the logical native append-log record unit, while
+  `file_header`, `lead_in`, `footer`, `metadata`, and `raw_region` declare the
+  surrounding byte-level framing for custom external formats.
 - Custom layouts may declare multiple physical segment descriptors. The scanner
   dispatches each segment by its leading literal lead-in prefix; immediately
   following literal numeric fields extend the dispatch key. Segment-specific
@@ -199,14 +204,19 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   containing `VarveFileHeader`, repeated `VarveRecord`, and, when applicable,
   `VarveRecordFooter`.
 - `inspect_layout_file` works for both native preset files and `preset: none`
-  custom physical layouts.
+  custom physical layouts, including validated file-header fields.
 - A TDMS-style custom layout can write files whose first bytes are `TDSm`, whose
   `next_segment_offset` and `raw_data_offset` fields are backpatched to actual
   metadata/raw boundaries, whose ToC/version fields are visible through
   `LayoutSegmentInfo`, and whose raw `f64` channel bytes are contiguous.
+- The TDMS physical writer example produces a minimal two-segment TDMS file
+  using only Varve's generated layout APIs. The optional Python harness opens
+  that file with `npTDMS` and verifies file properties, group/channel lookup,
+  channel properties, and appended raw `f64` samples.
 - A custom physical layout with a declared file header and segment footer writes
-  those bytes at the declared offsets, exposes `file_header_len`, and excludes
-  footer bytes from the segment raw-region read.
+  those bytes at the declared offsets, exposes `file_header_len` and validated
+  file-header values, and excludes footer bytes from the segment raw-region
+  read.
 - Custom layout readers reject bad literal tags, truncated lead-ins, invalid
   file headers, invalid offset ordering, footer mismatches, and segment bounds
   beyond EOF.

@@ -12,7 +12,12 @@
 
 ## Core Model
 
-- A block is the logical segment unit.
+- A `VarveBlock` is the logical append-log record unit used by the native
+  preset. Physical headers are declared separately as layout field groups:
+  `file_header`, segment `lead_in`, optional segment `footer`, `metadata`, and
+  `raw_region`. Both layers are declaration-first, but they do not share the
+  same Rust trait because TDMS-style framing and Varve-native payload records
+  have different responsibilities.
 - `varve_format!` is format-first by default: it can generate block structs, typed reader/writer wrappers, and the static format registry from one declaration.
 - `LayoutSpec` is the physical layout layer. The default preset is the current
   Varve-native container; custom layouts can own byte zero and declare
@@ -36,8 +41,9 @@
 - `VARVE3` record footers carry commit/offset metadata when `CommitPolicy` or offset-chain `IndexPolicy` requires it.
 - `LayoutWriter` and `LayoutReader` provide the first non-native physical path
   for optional file header + repeated segments. The initial verified targets are
-  TDMS-style `TDSm` lead-in + metadata bytes + contiguous raw channel bytes, and
-  a generic framed layout with declared file header and segment footer.
+  TDMS `TDSm` lead-in + TDMS metadata bytes + contiguous raw channel bytes
+  verified by `npTDMS`, and a generic framed layout with declared file header
+  and segment footer.
 - Custom physical readers can dispatch multiple declared segment descriptors by
   leading literal lead-in prefixes, including a byte tag plus literal numeric
   kind fields.
@@ -116,6 +122,8 @@
 - The suite covers small, medium, and large cases for append/open/scan, checkpoint open, materialized keyed state, merge, compact, direct base+delta compact, recovery, mmap payload windows, matrix direct access, matrix aux regions, and zero-copy raw fixed reads.
 - It also covers custom physical layout append and open/scan so layout DSL
   changes expose obvious framing or scan regressions.
+- TDMS compatibility is checked by an optional Python harness that runs the
+  Varve TDMS writer example and opens the output with `npTDMS`.
 - The purpose is regression detection, especially accidental O(n^2) scans, excessive allocation, or unexpected slow open/merge/compact paths.
 - Performance smoke output is not a product guarantee before stabilization, but a large unexplained slowdown blocks integration.
 
@@ -123,6 +131,10 @@
 
 - Direct dependencies are permissive OSS candidates: `syn`, `quote`, `proc-macro2`, `thiserror`, optional `crc32fast`, `memmap2`, `zerocopy`, and `zstd`.
 - Test dependencies include `trybuild` and `proptest`.
+- The optional TDMS compatibility harness uses Python `npTDMS` only outside the
+  Rust crate dependency graph. `pip show nptdms` reports LGPL; this is a
+  harness-only dependency and is not linked into or redistributed by the Rust
+  library.
 - The current direct and transitive dependency graph has been audited from `cargo metadata --all-features` and exposes commercially usable permissive license choices.
 
 ## Current Status

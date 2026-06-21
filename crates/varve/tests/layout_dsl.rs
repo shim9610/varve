@@ -72,8 +72,8 @@ varve_format! {
                     bytes tag = b"TDSm";
                     u32 toc_mask;
                     u32 version;
-                    i64 next_segment_offset = finalize(target = segment_end, relative_to = after_lead_in);
-                    i64 raw_data_offset = finalize(target = raw_region_start, relative_to = after_lead_in);
+                    u64 next_segment_offset = finalize(target = segment_end, relative_to = after_lead_in);
+                    u64 raw_data_offset = finalize(target = raw_region_start, relative_to = after_lead_in);
                 }
 
                 metadata TdmsMetadata;
@@ -614,22 +614,22 @@ fn typed_layout_api_writes_and_reads_tdms_style_segments() -> varve::Result<()> 
         assert_eq!(info.version()?, 4713);
         assert_eq!(
             info.next_segment_offset()?,
-            (metadata.len() + raw.len()) as i64
+            (metadata.len() + raw.len()) as u64
         );
-        assert_eq!(info.raw_data_offset()?, metadata.len() as i64);
+        assert_eq!(info.raw_data_offset()?, metadata.len() as u64);
         writer.flush()?;
     }
 
     let bytes = read(&path)?;
     assert_eq!(&bytes[0..4], b"TDSm");
     assert_eq!(u32_at(&bytes, 4), 0x1120);
-    assert_eq!(i64_at(&bytes, 12), (metadata.len() + raw.len()) as i64);
+    assert_eq!(u64_at(&bytes, 12), (metadata.len() + raw.len()) as u64);
 
     let reader = TdmsPhysicalFormat::open_layout_reader(&path)?;
     let segments = reader.tdms_segments()?;
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].toc_mask()?, 0x1120);
-    assert_eq!(segments[0].raw_data_offset()?, metadata.len() as i64);
+    assert_eq!(segments[0].raw_data_offset()?, metadata.len() as u64);
     assert_eq!(reader.tdms_segment(0)?.unwrap().version()?, 4713);
     assert_eq!(reader.read_tdms_segment_metadata(0)?, metadata);
     assert_eq!(reader.read_tdms_segment_raw(0)?, raw);
@@ -668,10 +668,30 @@ fn typed_layout_api_handles_caller_file_header_fields() -> varve::Result<()> {
 
     let reader = HeaderCallerPhysicalFormat::open_layout_reader(&path)?;
     assert_eq!(reader.file_header_len(), 6);
+    assert_eq!(reader.file_header_fields().len(), 2);
+    assert_eq!(
+        reader.file_header_field("kind"),
+        Some(&LayoutValue::U16(42))
+    );
+    let header = reader.file_header();
+    assert_eq!(header.signature()?, b"HDCT".to_vec());
+    assert_eq!(header.kind()?, 42);
+    assert_eq!(header.fields().len(), 2);
     let segment = reader.header_data_segment(0)?.unwrap();
     assert_eq!(segment.kind()?, 7);
     assert_eq!(reader.read_header_data_segment_metadata(0)?, b"m");
     assert_eq!(reader.read_header_data_segment_raw(0)?, b"raw");
+
+    let inspected = HeaderCallerPhysicalFormat::inspect_layout_file(&path)?;
+    assert_eq!(inspected.file_header_len, 6);
+    assert_eq!(inspected.file_header_fields.len(), 2);
+    assert_eq!(
+        inspected.file_header_fields[1],
+        LayoutFieldValue {
+            name: "kind",
+            value: LayoutValue::U16(42),
+        }
+    );
 
     cleanup(&path);
     Ok(())
@@ -878,8 +898,8 @@ fn tdms_style_layout_writes_physical_leadin_offsets_and_raw_region() -> varve::R
     assert_eq!(&bytes[0..4], b"TDSm");
     assert_eq!(u32_at(&bytes, 4), 0x1110);
     assert_eq!(u32_at(&bytes, 8), 4713);
-    assert_eq!(i64_at(&bytes, 12), (metadata.len() + raw.len()) as i64);
-    assert_eq!(i64_at(&bytes, 20), metadata.len() as i64);
+    assert_eq!(u64_at(&bytes, 12), (metadata.len() + raw.len()) as u64);
+    assert_eq!(u64_at(&bytes, 20), metadata.len() as u64);
     let raw_start = 28 + metadata.len();
     assert_eq!(&bytes[28..raw_start], metadata);
     assert_eq!(&bytes[raw_start..], raw);
@@ -892,11 +912,11 @@ fn tdms_style_layout_writes_physical_leadin_offsets_and_raw_region() -> varve::R
     assert_eq!(segment.field("version"), Some(&LayoutValue::U32(4713)));
     assert_eq!(
         segment.field("next_segment_offset"),
-        Some(&LayoutValue::I64((metadata.len() + raw.len()) as i64))
+        Some(&LayoutValue::U64((metadata.len() + raw.len()) as u64))
     );
     assert_eq!(
         segment.field("raw_data_offset"),
-        Some(&LayoutValue::I64(metadata.len() as i64))
+        Some(&LayoutValue::U64(metadata.len() as u64))
     );
     assert_eq!(segment.metadata_len, metadata.len() as u64);
     assert_eq!(segment.raw_len, raw.len() as u64);
@@ -966,6 +986,131 @@ fn tdms_style_layout_reopens_and_appends_multiple_segments() -> varve::Result<()
 }
 
 #[test]
+fn tdms_physical_adapter_can_encode_metadata_and_raw_with_public_api() -> varve::Result<()> {
+    let path = temp_path("tdms_physical_adapter");
+    cleanup(&path);
+
+    let first_metadata = TdmsCompatMetadata {
+        objects: vec![
+            TdmsCompatObject {
+                path: s("/"),
+                raw_data_index: TdmsRawDataIndex::None,
+                properties: vec![TdmsCompatProperty::String {
+                    name: s("title"),
+                    value: s("Varve physical adapter smoke"),
+                }],
+            },
+            TdmsCompatObject {
+                path: s("/'Measured Data'"),
+                raw_data_index: TdmsRawDataIndex::None,
+                properties: Vec::new(),
+            },
+            TdmsCompatObject {
+                path: s("/'Measured Data'/'Amplitude'"),
+                raw_data_index: TdmsRawDataIndex::New {
+                    data_type: TDMS_TYPE_DOUBLE_FLOAT,
+                    dimensions: 1,
+                    values: 4,
+                },
+                properties: vec![
+                    TdmsCompatProperty::String {
+                        name: s("unit"),
+                        value: s("V"),
+                    },
+                    TdmsCompatProperty::F64 {
+                        name: s("wf_increment"),
+                        value: 0.001,
+                    },
+                ],
+            },
+        ],
+    };
+    let second_metadata = TdmsCompatMetadata {
+        objects: vec![TdmsCompatObject {
+            path: s("/'Measured Data'/'Amplitude'"),
+            raw_data_index: TdmsRawDataIndex::New {
+                data_type: TDMS_TYPE_DOUBLE_FLOAT,
+                dimensions: 1,
+                values: 2,
+            },
+            properties: vec![TdmsCompatProperty::I64 {
+                name: s("sample_count"),
+                value: 6,
+            }],
+        }],
+    };
+    let first_metadata_bytes = encode_tdms_compat_metadata(&first_metadata);
+    let second_metadata_bytes = encode_tdms_compat_metadata(&second_metadata);
+    let first_raw = f64_bytes(&[0.10, 0.20, 0.30, 0.40]);
+    let second_raw = f64_bytes(&[0.50, 0.60]);
+
+    {
+        let mut writer = TdmsPhysicalFormat::create_layout_writer(&path)?;
+        writer.write_tdms_segment(TdmsPhysicalFormatTdmsSegmentLayoutWrite {
+            fields: TdmsPhysicalFormatTdmsSegmentLayoutFields {
+                toc_mask: TDMS_TOC_METADATA | TDMS_TOC_NEW_OBJECT_LIST | TDMS_TOC_RAW_DATA,
+                version: TDMS_VERSION,
+            },
+            footer_fields: TdmsPhysicalFormatTdmsSegmentLayoutFooterFields,
+            metadata: &first_metadata_bytes,
+            raw: &first_raw,
+        })?;
+        writer.write_tdms_segment(TdmsPhysicalFormatTdmsSegmentLayoutWrite {
+            fields: TdmsPhysicalFormatTdmsSegmentLayoutFields {
+                toc_mask: TDMS_TOC_METADATA | TDMS_TOC_RAW_DATA,
+                version: TDMS_VERSION,
+            },
+            footer_fields: TdmsPhysicalFormatTdmsSegmentLayoutFooterFields,
+            metadata: &second_metadata_bytes,
+            raw: &second_raw,
+        })?;
+        writer.flush()?;
+    }
+
+    let bytes = read(&path)?;
+    assert_eq!(&bytes[0..4], b"TDSm");
+
+    let reader = TdmsPhysicalFormat::open_layout_reader(&path)?;
+    let segments = reader.tdms_segments()?;
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[0].tag()?, b"TDSm");
+    assert_eq!(segments[0].version()?, TDMS_VERSION);
+    assert_eq!(
+        segments[0].next_segment_offset()?,
+        (first_metadata_bytes.len() + first_raw.len()) as u64
+    );
+    assert_eq!(
+        segments[0].raw_data_offset()?,
+        first_metadata_bytes.len() as u64
+    );
+    assert_eq!(
+        segments[1].next_segment_offset()?,
+        (second_metadata_bytes.len() + second_raw.len()) as u64
+    );
+    assert_eq!(
+        segments[1].raw_data_offset()?,
+        second_metadata_bytes.len() as u64
+    );
+
+    let decoded_first = decode_tdms_compat_metadata(&reader.read_tdms_segment_metadata(0)?);
+    let decoded_second = decode_tdms_compat_metadata(&reader.read_tdms_segment_metadata(1)?);
+    assert_eq!(decoded_first, first_metadata);
+    assert_eq!(decoded_second, second_metadata);
+    assert_eq!(
+        f64_values(&reader.read_tdms_segment_raw(0)?),
+        vec![0.10, 0.20, 0.30, 0.40]
+    );
+    assert_eq!(
+        f64_values(&reader.read_tdms_segment_raw(1)?),
+        vec![0.50, 0.60]
+    );
+    assert_eq!(segments[1].segment_start(), segments[0].segment_end());
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
 fn tdms_style_layout_rejects_corrupt_physical_segments() -> varve::Result<()> {
     let bad_tag = temp_path("tdms_bad_tag");
     let truncated = temp_path("tdms_truncated");
@@ -978,8 +1123,8 @@ fn tdms_style_layout_rejects_corrupt_physical_segments() -> varve::Result<()> {
     bytes.extend_from_slice(b"BAD!");
     bytes.extend_from_slice(&0x1110u32.to_le_bytes());
     bytes.extend_from_slice(&4713u32.to_le_bytes());
-    bytes.extend_from_slice(&0i64.to_le_bytes());
-    bytes.extend_from_slice(&0i64.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
     write(&bad_tag, &bytes)?;
     assert!(matches!(
         TdmsPhysicalFormat::open_layout_reader(&bad_tag),
@@ -996,8 +1141,8 @@ fn tdms_style_layout_rejects_corrupt_physical_segments() -> varve::Result<()> {
     bytes.extend_from_slice(b"TDSm");
     bytes.extend_from_slice(&0x1110u32.to_le_bytes());
     bytes.extend_from_slice(&4713u32.to_le_bytes());
-    bytes.extend_from_slice(&4i64.to_le_bytes());
-    bytes.extend_from_slice(&8i64.to_le_bytes());
+    bytes.extend_from_slice(&4u64.to_le_bytes());
+    bytes.extend_from_slice(&8u64.to_le_bytes());
     bytes.extend_from_slice(&[0; 8]);
     write(&bad_bounds, &bytes)?;
     assert!(matches!(
@@ -1009,6 +1154,250 @@ fn tdms_style_layout_rejects_corrupt_physical_segments() -> varve::Result<()> {
     cleanup(&truncated);
     cleanup(&bad_bounds);
     Ok(())
+}
+
+#[test]
+fn custom_layout_rejects_corrupt_declared_file_header_and_footer() -> varve::Result<()> {
+    let bad_header = temp_path("custom_bad_file_header");
+    let good_footer = temp_path("custom_good_footer");
+    let bad_footer = temp_path("custom_bad_footer");
+    cleanup(&bad_header);
+    cleanup(&good_footer);
+    cleanup(&bad_footer);
+
+    let mut header_bytes = Vec::new();
+    header_bytes.extend_from_slice(b"BADC");
+    header_bytes.extend_from_slice(&42u16.to_le_bytes());
+    write(&bad_header, &header_bytes)?;
+    assert!(matches!(
+        HeaderCallerPhysicalFormat::open_layout_reader(&bad_header),
+        Err(Error::LayoutLiteralMismatch { .. })
+    ));
+
+    {
+        let mut writer = FramedPhysicalFormat::create_layout_writer(&good_footer)?;
+        writer.write_data_segment(FramedPhysicalFormatDataSegmentLayoutWrite {
+            fields: FramedPhysicalFormatDataSegmentLayoutFields { kind: 7 },
+            footer_fields: FramedPhysicalFormatDataSegmentLayoutFooterFields,
+            metadata: b"abc",
+            raw: b"data",
+        })?;
+        writer.flush()?;
+    }
+
+    let mut bytes = read(&good_footer)?;
+    let footer_offset = FramedPhysicalFormat::open_layout_reader(&good_footer)?.segments()[0]
+        .footer_offset as usize;
+    bytes[footer_offset..footer_offset + 4].copy_from_slice(b"BAD!");
+    write(&bad_footer, &bytes)?;
+    assert!(matches!(
+        FramedPhysicalFormat::open_layout_reader(&bad_footer),
+        Err(Error::LayoutLiteralMismatch { .. })
+    ));
+
+    cleanup(&bad_header);
+    cleanup(&good_footer);
+    cleanup(&bad_footer);
+    Ok(())
+}
+
+const TDMS_VERSION: u32 = 4713;
+const TDMS_TOC_METADATA: u32 = 1 << 1;
+const TDMS_TOC_NEW_OBJECT_LIST: u32 = 1 << 2;
+const TDMS_TOC_RAW_DATA: u32 = 1 << 3;
+const TDMS_RAW_INDEX_NONE: u32 = 0xFFFF_FFFF;
+const TDMS_RAW_INDEX_LEN: u32 = 20;
+const TDMS_TYPE_I64: u32 = 4;
+const TDMS_TYPE_DOUBLE_FLOAT: u32 = 10;
+const TDMS_TYPE_STRING: u32 = 0x20;
+
+#[derive(Clone, Debug, PartialEq)]
+struct TdmsCompatMetadata {
+    objects: Vec<TdmsCompatObject>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TdmsCompatObject {
+    path: String,
+    raw_data_index: TdmsRawDataIndex,
+    properties: Vec<TdmsCompatProperty>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum TdmsRawDataIndex {
+    None,
+    New {
+        data_type: u32,
+        dimensions: u32,
+        values: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum TdmsCompatProperty {
+    String { name: String, value: String },
+    I64 { name: String, value: i64 },
+    F64 { name: String, value: f64 },
+}
+
+fn encode_tdms_compat_metadata(metadata: &TdmsCompatMetadata) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    push_u32(&mut bytes, metadata.objects.len() as u32);
+    for object in &metadata.objects {
+        push_tdms_string(&mut bytes, &object.path);
+        push_tdms_raw_index(&mut bytes, &object.raw_data_index);
+        push_u32(&mut bytes, object.properties.len() as u32);
+        for property in &object.properties {
+            match property {
+                TdmsCompatProperty::String { name, value } => {
+                    push_tdms_string(&mut bytes, name);
+                    push_u32(&mut bytes, TDMS_TYPE_STRING);
+                    push_tdms_string(&mut bytes, value);
+                }
+                TdmsCompatProperty::I64 { name, value } => {
+                    push_tdms_string(&mut bytes, name);
+                    push_u32(&mut bytes, TDMS_TYPE_I64);
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                TdmsCompatProperty::F64 { name, value } => {
+                    push_tdms_string(&mut bytes, name);
+                    push_u32(&mut bytes, TDMS_TYPE_DOUBLE_FLOAT);
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+    }
+    bytes
+}
+
+fn push_tdms_raw_index(bytes: &mut Vec<u8>, index: &TdmsRawDataIndex) {
+    match index {
+        TdmsRawDataIndex::None => push_u32(bytes, TDMS_RAW_INDEX_NONE),
+        TdmsRawDataIndex::New {
+            data_type,
+            dimensions,
+            values,
+        } => {
+            push_u32(bytes, TDMS_RAW_INDEX_LEN);
+            push_u32(bytes, *data_type);
+            push_u32(bytes, *dimensions);
+            push_u64(bytes, *values);
+        }
+    }
+}
+
+fn decode_tdms_compat_metadata(bytes: &[u8]) -> TdmsCompatMetadata {
+    let mut cursor = TdmsCompatCursor { bytes, position: 0 };
+    let objects = (0..cursor.u32())
+        .map(|_| {
+            let path = cursor.string();
+            let raw_data_index = cursor.raw_data_index();
+            let properties = (0..cursor.u32())
+                .map(|_| {
+                    let name = cursor.string();
+                    match cursor.u32() {
+                        TDMS_TYPE_STRING => TdmsCompatProperty::String {
+                            name,
+                            value: cursor.string(),
+                        },
+                        TDMS_TYPE_I64 => TdmsCompatProperty::I64 {
+                            name,
+                            value: cursor.i64(),
+                        },
+                        TDMS_TYPE_DOUBLE_FLOAT => TdmsCompatProperty::F64 {
+                            name,
+                            value: cursor.f64(),
+                        },
+                        other => panic!("unknown TDMS property type {other}"),
+                    }
+                })
+                .collect();
+            TdmsCompatObject {
+                path,
+                raw_data_index,
+                properties,
+            }
+        })
+        .collect();
+    assert_eq!(cursor.remaining(), 0);
+    TdmsCompatMetadata { objects }
+}
+
+struct TdmsCompatCursor<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> TdmsCompatCursor<'a> {
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.position
+    }
+
+    fn bytes(&mut self, len: usize) -> &'a [u8] {
+        let end = self.position + len;
+        assert!(end <= self.bytes.len(), "TDMS metadata is truncated");
+        let value = &self.bytes[self.position..end];
+        self.position = end;
+        value
+    }
+
+    fn u32(&mut self) -> u32 {
+        let mut value = [0; 4];
+        value.copy_from_slice(self.bytes(4));
+        u32::from_le_bytes(value)
+    }
+
+    fn u64(&mut self) -> u64 {
+        let mut value = [0; 8];
+        value.copy_from_slice(self.bytes(8));
+        u64::from_le_bytes(value)
+    }
+
+    fn i64(&mut self) -> i64 {
+        let mut value = [0; 8];
+        value.copy_from_slice(self.bytes(8));
+        i64::from_le_bytes(value)
+    }
+
+    fn f64(&mut self) -> f64 {
+        let mut value = [0; 8];
+        value.copy_from_slice(self.bytes(8));
+        f64::from_le_bytes(value)
+    }
+
+    fn string(&mut self) -> String {
+        let len = self.u32() as usize;
+        String::from_utf8(self.bytes(len).to_vec()).expect("TDMS metadata string is UTF-8")
+    }
+
+    fn raw_data_index(&mut self) -> TdmsRawDataIndex {
+        match self.u32() {
+            TDMS_RAW_INDEX_NONE => TdmsRawDataIndex::None,
+            TDMS_RAW_INDEX_LEN => TdmsRawDataIndex::New {
+                data_type: self.u32(),
+                dimensions: self.u32(),
+                values: self.u64(),
+            },
+            other => panic!("unsupported TDMS raw data index length {other}"),
+        }
+    }
+}
+
+fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_tdms_string(bytes: &mut Vec<u8>, value: &str) {
+    let value = value.as_bytes();
+    push_u32(
+        bytes,
+        u32::try_from(value.len()).expect("TDMS string fits u32"),
+    );
+    bytes.extend_from_slice(value);
 }
 
 fn f64_bytes(values: &[f64]) -> Vec<u8> {
@@ -1027,6 +1416,10 @@ fn f64_values(bytes: &[u8]) -> Vec<f64> {
             f64::from_le_bytes(value)
         })
         .collect()
+}
+
+fn s(value: &str) -> String {
+    value.to_string()
 }
 
 fn control_segment_bytes(code: u32, metadata: &[u8]) -> Vec<u8> {

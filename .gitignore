@@ -1,6 +1,7 @@
 /target/
 /.idea/
 /.vscode/
+/.venv-tdms/
 *.pdb
 *.tmp
 *.bak

@@ -175,6 +175,11 @@ supported shape is an optional declared file header followed by an append stream
 of declared segments with lead-in fields, caller metadata bytes, contiguous raw
 bytes, optional footer fields, and finalized/backpatched offsets.
 
+Physical layout declarations are field groups, not logical `VarveBlock`
+payload structs. `VarveBlock` remains the native append-log payload unit;
+`file_header`, segment `lead_in`, and `footer` describe bytes that sit around
+metadata and raw regions.
+
 | API | Meaning |
 | --- | --- |
 | `preset: varve_native` | explicit native container preset; also the default |
@@ -188,12 +193,15 @@ bytes, optional footer fields, and finalized/backpatched offsets.
 | `Format::inspect_layout_file(path)` | inspect native or custom physical file framing through one result type |
 | `FormatLayoutWriter::write_data_segment(...)` | generated segment writer from the declared segment name |
 | `FormatLayoutReader::data_segments()` | generated typed segment info collection |
+| `FormatLayoutReader::file_header()` | generated typed file-header info when a `file_header` is declared |
 | `FormatLayoutReader::read_data_segment_metadata(index)` | generated metadata reader for the declared segment |
 | `FormatLayoutReader::read_data_segment_raw(index)` | generated raw-region reader for the declared segment |
 | `LayoutWriter::write_segment(SegmentWrite)` | write lead-in, metadata, raw bytes, footer, then backpatch offsets |
 | `SegmentWrite::fields` | caller values for lead-in fields |
 | `SegmentWrite::footer_fields` | caller values for footer fields |
 | `LayoutReader::file_header_len()` | validated header length before the first segment |
+| `LayoutReader::file_header_fields()` | validated declared file-header values |
+| `LayoutReader::file_header_field(name)` | read one validated file-header value |
 | `LayoutReader::segments()` | inspect validated physical segment ranges |
 | `LayoutSegmentInfo::field(name)` | read validated lead-in values such as ToC mask or version |
 | `LayoutSegmentInfo::footer_field(name)` | read validated footer values |
@@ -256,6 +264,8 @@ writer.write_data_segment(FramedFormatDataSegmentLayoutWrite {
 writer.flush()?;
 
 let reader = FramedFormat::open_layout_reader("data.frame")?;
+let header = reader.file_header();
+assert_eq!(header.header_version()?, 1);
 let first = reader.data_segment(0)?.unwrap();
 assert_eq!(first.toc_mask()?, 0x1108);
 let raw = reader.read_data_segment_raw(0)?;
@@ -269,6 +279,10 @@ common discriminator; immediately following literal numeric fields extend the
 dispatch key. Generated segment-specific `index` parameters are per segment
 kind, while the low-level `read_metadata(index)` and `read_raw(index)` methods
 continue to use the global physical stream index.
+
+`crates/varve/examples/tdms_physical_writer.rs` demonstrates a public-API TDMS
+writer, and `scripts/verify_tdms_with_nptdms.py` verifies the produced file
+with the optional Python `npTDMS` harness.
 
 ## Mmap And Zero-Copy
 

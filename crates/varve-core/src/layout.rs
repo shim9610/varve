@@ -139,6 +139,7 @@ pub struct LayoutSegmentInfo {
 pub struct LayoutFileInfo {
     pub plan: LayoutPlan,
     pub file_header_len: u64,
+    pub file_header_fields: Vec<LayoutFieldValue>,
     pub segments: Vec<LayoutSegmentInfo>,
 }
 
@@ -172,6 +173,7 @@ pub struct LayoutReader {
     spec: FormatSpec,
     path: PathBuf,
     file_header_len: u64,
+    file_header_fields: Vec<LayoutFieldValue>,
     segments: Vec<LayoutSegmentInfo>,
 }
 
@@ -239,6 +241,7 @@ impl FormatSpec {
             Ok(LayoutFileInfo {
                 plan: self.effective_layout(),
                 file_header_len: reader.file_header_len,
+                file_header_fields: reader.file_header_fields,
                 segments: reader.segments,
             })
         }
@@ -283,7 +286,7 @@ impl LayoutWriter {
         let path = path.as_ref().to_path_buf();
         let lock = crate::file::WriterLock::acquire(&path)?;
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-        let file_header_len = read_file_header(spec, &mut file)?;
+        let (file_header_len, _) = read_file_header(spec, &mut file)?;
         let segments = scan_layout_segments(spec, &mut file, file_header_len)?;
         let segment_counts = segment_counts_from_infos(spec, &segments)?;
         file.seek(SeekFrom::End(0))?;
@@ -446,12 +449,13 @@ impl LayoutReader {
         ensure_custom_layout_spec(spec)?;
         let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new().read(true).open(&path)?;
-        let file_header_len = read_file_header(spec, &mut file)?;
+        let (file_header_len, file_header_fields) = read_file_header(spec, &mut file)?;
         let segments = scan_layout_segments(spec, &mut file, file_header_len)?;
         Ok(Self {
             spec,
             path,
             file_header_len,
+            file_header_fields,
             segments,
         })
     }
@@ -466,6 +470,17 @@ impl LayoutReader {
 
     pub fn file_header_len(&self) -> u64 {
         self.file_header_len
+    }
+
+    pub fn file_header_fields(&self) -> &[LayoutFieldValue] {
+        &self.file_header_fields
+    }
+
+    pub fn file_header_field(&self, name: &str) -> Option<&LayoutValue> {
+        self.file_header_fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| &field.value)
     }
 
     pub fn segments(&self) -> &[LayoutSegmentInfo] {
@@ -507,6 +522,7 @@ fn inspect_native_layout_file<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Resu
     let path = path.as_ref();
     let mut header_file = File::open(path)?;
     let file_header_len = crate::file::read_file_header(spec, &mut header_file)?;
+    let file_header_fields = read_native_file_header_fields(path, spec, file_header_len)?;
     let file = crate::file::VarveFile::open_readonly(spec, path)?;
     let segments = file
         .index_entries()
@@ -516,8 +532,114 @@ fn inspect_native_layout_file<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Resu
     Ok(LayoutFileInfo {
         plan: spec.effective_layout(),
         file_header_len,
+        file_header_fields,
         segments,
     })
+}
+
+fn read_native_file_header_fields(
+    path: &Path,
+    spec: FormatSpec,
+    file_header_len: u64,
+) -> Result<Vec<LayoutFieldValue>> {
+    let mut file = File::open(path)?;
+    let header_len = usize::try_from(file_header_len).map_err(|_| Error::LengthOverflow {
+        value: file_header_len,
+    })?;
+    let mut bytes = vec![0; header_len];
+    file.read_exact(&mut bytes)?;
+    let mut position = 0usize;
+    let mut fields = Vec::new();
+
+    let magic_len = spec.magic.len();
+    fields.push(LayoutFieldValue {
+        name: "magic",
+        value: LayoutValue::Bytes(take_bytes(&bytes, &mut position, magic_len)?.to_vec()),
+    });
+    fields.push(LayoutFieldValue {
+        name: "container_marker",
+        value: LayoutValue::Bytes(take_bytes(&bytes, &mut position, 6)?.to_vec()),
+    });
+    fields.push(LayoutFieldValue {
+        name: "format_version",
+        value: LayoutValue::U16(read_u16_from_header(&bytes, &mut position)?),
+    });
+    fields.push(LayoutFieldValue {
+        name: "endian",
+        value: LayoutValue::U8(*take_bytes(&bytes, &mut position, 1)?.first().ok_or(
+            Error::LayoutTruncatedHeader {
+                offset: position as u64,
+            },
+        )?),
+    });
+    fields.push(LayoutFieldValue {
+        name: "flags",
+        value: LayoutValue::U8(*take_bytes(&bytes, &mut position, 1)?.first().ok_or(
+            Error::LayoutTruncatedHeader {
+                offset: position as u64,
+            },
+        )?),
+    });
+    fields.push(LayoutFieldValue {
+        name: "schema_hash",
+        value: LayoutValue::U64(read_u64_from_header(&bytes, &mut position)?),
+    });
+
+    if position < bytes.len() {
+        let extension_len = read_u32_from_header(&bytes, &mut position)?;
+        fields.push(LayoutFieldValue {
+            name: "extension_len",
+            value: LayoutValue::U32(extension_len),
+        });
+        if extension_len > 0 {
+            let extension_len =
+                usize::try_from(extension_len).map_err(|_| Error::LengthOverflow {
+                    value: u64::from(extension_len),
+                })?;
+            fields.push(LayoutFieldValue {
+                name: "extensions",
+                value: LayoutValue::Bytes(
+                    take_bytes(&bytes, &mut position, extension_len)?.to_vec(),
+                ),
+            });
+        }
+    }
+
+    Ok(fields)
+}
+
+fn take_bytes<'a>(bytes: &'a [u8], position: &mut usize, len: usize) -> Result<&'a [u8]> {
+    let end = position
+        .checked_add(len)
+        .ok_or(Error::LayoutTruncatedHeader {
+            offset: *position as u64,
+        })?;
+    if end > bytes.len() {
+        return Err(Error::LayoutTruncatedHeader {
+            offset: *position as u64,
+        });
+    }
+    let value = &bytes[*position..end];
+    *position = end;
+    Ok(value)
+}
+
+fn read_u16_from_header(bytes: &[u8], position: &mut usize) -> Result<u16> {
+    let mut value = [0; 2];
+    value.copy_from_slice(take_bytes(bytes, position, 2)?);
+    Ok(u16::from_le_bytes(value))
+}
+
+fn read_u32_from_header(bytes: &[u8], position: &mut usize) -> Result<u32> {
+    let mut value = [0; 4];
+    value.copy_from_slice(take_bytes(bytes, position, 4)?);
+    Ok(u32::from_le_bytes(value))
+}
+
+fn read_u64_from_header(bytes: &[u8], position: &mut usize) -> Result<u64> {
+    let mut value = [0; 8];
+    value.copy_from_slice(take_bytes(bytes, position, 8)?);
+    Ok(u64::from_le_bytes(value))
 }
 
 fn native_record_to_layout_segment(entry: &crate::file::RecordIndexEntry) -> LayoutSegmentInfo {
@@ -776,17 +898,17 @@ fn collect_written_layout_values(
         .collect()
 }
 
-fn read_file_header(spec: FormatSpec, file: &mut File) -> Result<u64> {
+fn read_file_header(spec: FormatSpec, file: &mut File) -> Result<(u64, Vec<LayoutFieldValue>)> {
     let Some(header) = spec.layout.file_header() else {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     };
     let header_len = file_header_len(header)?;
     let file_len = file.metadata()?.len();
     if file_len < header_len {
         return Err(Error::LayoutTruncatedHeader { offset: 0 });
     }
-    read_static_layout_fields(file, header.fields, 0, spec.endian)?;
-    Ok(header_len)
+    let fields = read_static_layout_fields(file, header.fields, 0, spec.endian)?;
+    Ok((header_len, fields))
 }
 
 fn file_header_len(header: FileHeaderDescriptor) -> Result<u64> {
@@ -798,11 +920,13 @@ fn read_static_layout_fields(
     descriptors: &[LayoutFieldDescriptor],
     start_offset: u64,
     endian: Endian,
-) -> Result<()> {
+) -> Result<Vec<LayoutFieldValue>> {
     file.seek(SeekFrom::Start(start_offset))?;
     let mut position = start_offset;
+    let mut fields = Vec::new();
     for field in descriptors {
         let value = read_layout_value(file, *field, endian)?;
+        let stored_value = value.clone();
         match field.source {
             LayoutFieldSource::LiteralBytes(expected) => match value {
                 LayoutValue::Bytes(actual) if actual == expected => {}
@@ -836,6 +960,10 @@ fn read_static_layout_fields(
                 ));
             }
         }
+        fields.push(LayoutFieldValue {
+            name: field.name,
+            value: stored_value,
+        });
         position =
             position
                 .checked_add(field.ty.byte_len())
@@ -843,7 +971,7 @@ fn read_static_layout_fields(
                     offset: start_offset,
                 })?;
     }
-    Ok(())
+    Ok(fields)
 }
 
 fn scan_layout_segments(

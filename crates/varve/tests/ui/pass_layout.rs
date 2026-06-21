@@ -22,8 +22,8 @@ varve_format! {
                     bytes tag = b"TDSm";
                     u32 toc_mask;
                     u32 version;
-                    i64 next_segment_offset = finalize(target = segment_end, relative_to = after_lead_in);
-                    i64 raw_data_offset = finalize(target = raw_region_start, relative_to = after_lead_in);
+                    u64 next_segment_offset = finalize(target = segment_end, relative_to = after_lead_in);
+                    u64 raw_data_offset = finalize(target = raw_region_start, relative_to = after_lead_in);
                 }
 
                 metadata TdmsMetadata;
