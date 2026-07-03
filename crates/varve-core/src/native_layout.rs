@@ -264,6 +264,9 @@ pub(crate) fn read_native_file_header<R: Read>(
         )?;
         let extension_len = value_as_u32("extension_len", &extension_len)?;
         let extension_len = u64::from(extension_len);
+        if extension_len != native_file_header_plan_extension_len(spec) {
+            return Err(Error::InvalidCompressionHeader);
+        }
         match read_native_value(
             reader,
             native_file_header_field(spec, NativeFileHeaderField::Extensions, extension_len),
@@ -343,6 +346,16 @@ pub(crate) fn write_native_record_header<W: Write>(
     record_offset: u64,
     footer_len: u64,
 ) -> Result<()> {
+    let bytes = encode_native_record_header(header, record_offset, footer_len)?;
+    writer.write_all(&bytes)?;
+    Ok(())
+}
+
+pub(crate) fn encode_native_record_header(
+    header: RecordHeaderFields,
+    record_offset: u64,
+    footer_len: u64,
+) -> Result<[u8; crate::file::RECORD_HEADER_LEN as usize]> {
     ensure_native_record_layout_contract()?;
     let anchors = NativeRecordAnchors::new(record_offset, header.payload_len, footer_len)?;
     let mut bytes = [0; crate::file::RECORD_HEADER_LEN as usize];
@@ -351,8 +364,7 @@ pub(crate) fn write_native_record_header<W: Write>(
         let value = native_header_value(*field, header, anchors)?;
         write_native_value(&mut cursor, *field, &value)?;
     }
-    writer.write_all(&bytes)?;
-    Ok(())
+    Ok(bytes)
 }
 
 pub(crate) fn read_native_record_header<R: Read>(

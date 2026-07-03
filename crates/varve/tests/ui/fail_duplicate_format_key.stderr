@@ -1,0 +1,5 @@
+error: duplicate varve_format key "magic"
+ --> tests/ui/fail_duplicate_format_key.rs:6:9
+  |
+6 |         magic: b"DUP2";
+  |         ^^^^^

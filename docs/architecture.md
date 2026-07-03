@@ -33,7 +33,9 @@
 - `#[derive(VarveBlock)]` remains available for derive-first block definitions when structs need to live outside the format declaration.
 - Block ids are explicit `u32` values below `0xFFFF_FF00`; higher ids are reserved for internal records.
 - Same-type blocks are read lazily through `BlockVec<T>`.
-- Keyed blocks are exposed through `KeyedBlockVec<K, T>` for put-only lookup and `materialized_keyed_blocks::<T>()` for put/op/tombstone state.
+- Keyed blocks are exposed through `KeyedBlockVec<K, T>` for latest put lookup
+  after tombstones. `materialized_keyed_blocks::<T>()` applies puts, ops, and
+  tombstones.
 - `VarveReader` and `VarveWriter` provide clearer read-only and write-capable handle workflows while preserving the lower-level `VarveFile` API.
 - Fixed blocks use canonical field encoding by default, not Rust memory layout copying.
 - Variable blocks use `field_id + wire_type + length + payload`, so unknown field ids with known wire types can be skipped.
@@ -105,7 +107,9 @@
 
 - `VarveBlock::FIELDS` records field id, field name, wire type, and required/defaulted presence.
 - Embedded schema manifests are optional and diagnostic. Static `FormatSpec` remains authoritative for typed access.
-- Manifest payload v4 includes extension, compression policy, commit/index/integrity/recovery/manifest policies, block descriptors, and field descriptors. v1-v3 manifests decode with missing newer fields defaulted.
+- Manifest payload v5 includes extension, compression policy, commit/index/
+  integrity/recovery/manifest policies, block descriptors, and field
+  descriptors. v1-v4 manifests decode with missing newer fields defaulted.
 - `FormatSpec::computed_schema_hash()` computes a deterministic schema fingerprint excluding the pinned header `schema_hash`.
 - `FormatSpec::schema_debug_dump()` emits a human-readable view for inspection and support.
 - Migration is explicit with `VarveMigration<From, To>` and `blocks_migrated::<From, To, M>()`.
@@ -117,6 +121,9 @@
 - Supported core shapes include scalars, option, fixed arrays, selected vectors, tuples, `BTreeMap`, and `HashMap`.
 - `HashMap` encoding sorts cloned keys before writing, so equivalent maps produce stable bytes regardless of insertion or hash iteration order.
 - Raw zero-copy representation is never the default codec.
+- Allocation limits are format-author policy. Built-in decoders avoid avoidable
+  allocation-before-validation, while custom codecs/adapters should enforce
+  domain-specific maximum lengths.
 
 ## Optional Mmap And Zero-Copy
 
@@ -124,7 +131,10 @@
 - `MmapPayloads` owns a cloned snapshot index and rejects forged public index entries.
 - `zero-copy` implies `mmap`.
 - `VarveRawFixedBlock` is an unsafe opt-in trait for raw fixed blocks whose implementor promises layout, endian, and alignment compatibility.
-- `MmapPayloads::raw_fixed::<T>()` validates registration, fixed kind, version, endian, payload size, and alignment before returning a raw reference.
+- `MmapPayloads::raw_fixed::<T>()` and `MmapMatrix::raw_cell::<T>()` are unsafe
+  raw-reference calls. They validate registration, kind, version, endian,
+  payload size, and alignment, while callers guarantee mapped bytes are not
+  mutated during the returned reference lifetime.
 
 ## Performance Guardrails
 

@@ -18,6 +18,20 @@ durability model:
 Even under the default policy, readers trust only commit maps. A clear commit
 bit means `NotCommitted` regardless of slot bytes.
 
+Append-log transaction markers follow the same explicit durability principle.
+`commit()` writes a logical visibility marker for
+`transaction_marker(explicit)` formats, but it is not a hidden fsync barrier.
+Use `commit_durable()` when the marker itself must only be published after
+commit-covered records, embedded manifest data, and index checkpoints have been
+flushed and synced.
+
+The durable append-log order is:
+
+1. write commit-covered records, manifest, and index checkpoint as needed
+2. flush and `sync_data` those bytes
+3. write the commit marker
+4. flush and `sync_all` the marker
+
 For P0, `commit_*` is logical visibility, not a hidden fsync. It writes the
 commit bit after slot bytes have been written through the file handle. Callers
 that need crash-durable completion must call `flush`/`sync` explicitly or use

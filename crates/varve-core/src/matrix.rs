@@ -1100,8 +1100,18 @@ fn set_commit_bit(
         return Err(Error::InvalidMatrixLayout);
     }
     set_bit(&mut commit.bits, ordinal, value)?;
-    file.seek(SeekFrom::Start(commit.map_offset))?;
-    file.write_all(&commit.bits)?;
+    let byte_index = usize::try_from(ordinal / 8).map_err(|_| Error::InvalidMatrixLayout)?;
+    let byte_value = *commit
+        .bits
+        .get(byte_index)
+        .ok_or(Error::InvalidMatrixLayout)?;
+    file.seek(SeekFrom::Start(
+        commit
+            .map_offset
+            .checked_add(byte_index as u64)
+            .ok_or(Error::InvalidMatrixLayout)?,
+    ))?;
+    file.write_all(&[byte_value])?;
     update_commit_crc(file, commit)?;
     Ok(())
 }
@@ -1512,7 +1522,7 @@ impl MatrixCrcLayout {
 fn matrix_crc_enabled(spec: FormatSpec) -> Result<bool> {
     match spec.integrity_policy {
         IntegrityPolicy::None => Ok(false),
-        IntegrityPolicy::Crc32 => {
+        IntegrityPolicy::Crc32 | IntegrityPolicy::Crc32WithHeader => {
             #[cfg(feature = "integrity")]
             {
                 Ok(true)
@@ -1844,7 +1854,7 @@ fn encode_dimension_table(dimensions: &[MatrixDimensionValue]) -> Result<Vec<u8>
 
 fn decode_dimension_table(bytes: &[u8], count: u32) -> Result<Vec<MatrixDimensionValue>> {
     let mut cursor = Cursor::new(bytes);
-    let mut dimensions = Vec::with_capacity(count as usize);
+    let mut dimensions = Vec::new();
     for _ in 0..count {
         let name = cursor.read_name()?;
         let value = cursor.read_u64()?;
@@ -1902,7 +1912,11 @@ fn decode_block_table(
     count: u32,
 ) -> Result<HashMap<u32, (u64, u64, u64)>> {
     const ENTRY_LEN: usize = 44;
-    if bytes.len() != count as usize * ENTRY_LEN || count as usize != spec.matrix_blocks.len() {
+    let count_usize = usize::try_from(count).map_err(|_| Error::InvalidMatrixLayout)?;
+    let expected_len = count_usize
+        .checked_mul(ENTRY_LEN)
+        .ok_or(Error::InvalidMatrixLayout)?;
+    if bytes.len() != expected_len || count_usize != spec.matrix_blocks.len() {
         return Err(Error::InvalidMatrixLayout);
     }
     let mut offsets = HashMap::new();
@@ -1978,7 +1992,7 @@ fn encode_category_table(
 
 fn decode_category_table(bytes: &[u8], count: u32) -> Result<Vec<StoredCommitPlan>> {
     let mut cursor = Cursor::new(bytes);
-    let mut commits = Vec::with_capacity(count as usize);
+    let mut commits = Vec::new();
     for _ in 0..count {
         let name = cursor.read_name()?;
         let kind = commit_kind_from_byte(cursor.read_u8()?)?;

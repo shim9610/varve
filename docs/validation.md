@@ -5,7 +5,7 @@
 - Merge order was unstable when delta shard local sequence numbers were lower than base records.
   - Resolution: merge ordering now compares shard ordinal first, then local sequence, then record ordinal.
 - `keyed_blocks::<T>()` did not apply tombstones or ops.
-  - Resolution: keep `keyed_blocks::<T>()` as put-only access and add `materialized_keyed_blocks::<T>()` for state materialization.
+  - Resolution: `keyed_blocks::<T>()` now applies tombstones to latest-put lookup; `materialized_keyed_blocks::<T>()` applies puts, ops, and tombstones for full state materialization.
 - Endian mismatch was accepted.
   - Resolution: file open now rejects header endian mismatch.
 - Macro field id validation was incomplete.
@@ -35,7 +35,7 @@
 - Clean zero-copy/mmap validation found underspecified writer lock metadata, independent `zero-copy`/`mmap` feature behavior, and forgeable mmap payload entries.
   - Resolution: lock metadata is now text version `varve-lock-v1`; `inspect_writer_lock` reports malformed locks instead of breaking them; `zero-copy` implies `mmap`; `MmapPayloads::payload_window` accepts only entries present in its cloned snapshot index.
 - Mmap and zero-copy scaffolds were deferred.
-  - Resolution: `VarveFile::mmap_payloads`, `MmapPayloads` payload windows, unsafe `VarveRawFixedBlock`, and `MmapPayloads::raw_fixed` are implemented behind opt-in features.
+  - Resolution: `VarveFile::mmap_payloads`, `MmapPayloads` payload windows, unsafe marker traits, and unsafe raw-reference calls are implemented behind opt-in features.
 - Explicit stale-lock handling was deferred.
   - Resolution: `WriterLockInfo`, `WriterLockBreakPolicy`, `FormatSpec::inspect_writer_lock`, and `FormatSpec::open_with_lock_policy` are implemented; existing open/create/recover paths still refuse locks by default.
 - Performance smoke caught an accidental O(n^2)-style mmap typed ordinal lookup path.

@@ -81,6 +81,21 @@ varve_format! {
     }
 }
 
+#[cfg(feature = "integrity")]
+varve_format! {
+    pub format CrcHeaderFormat {
+        magic: b"CRCH";
+        version: 1;
+        endian: little;
+        integrity: crc32_with_header;
+        blocks {
+            fixed CrcHeaderPoint(id = 41) {
+                value: u32,
+            }
+        }
+    }
+}
+
 #[test]
 fn format_first_dsl_generates_typed_api_and_offset_chains() -> varve::Result<()> {
     let path = temp_path("dsl_generated_api");
@@ -202,6 +217,26 @@ fn explicit_transaction_marker_controls_reader_visibility() -> varve::Result<()>
 }
 
 #[test]
+fn durable_commit_marks_visible_records() -> varve::Result<()> {
+    let path = temp_path("dsl_durable_commit");
+    cleanup(&path);
+
+    let mut writer = ExplicitCommitFormat::create_writer(&path)?;
+    writer.push_explicit_point(&ExplicitPoint { value: 42 })?;
+    let info = writer.commit_durable()?;
+    assert!(info.committed);
+    drop(writer);
+
+    let reader = ExplicitCommitFormat::open_reader(&path)?;
+    let points = reader.explicit_points()?;
+    assert_eq!(points.len(), 1);
+    assert_eq!(points.get(0)?.unwrap(), ExplicitPoint { value: 42 });
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
 fn transaction_writer_open_truncates_uncommitted_tail() -> varve::Result<()> {
     let path = temp_path("dsl_writer_open_truncate");
     cleanup(&path);
@@ -289,6 +324,27 @@ fn transaction_marker_crc_corruption_before_marker_is_fatal() -> varve::Result<(
     tamper_byte(&path, committed.payload_offset)?;
     assert!(matches!(
         CrcTxnFormat::open_reader(&path),
+        Err(Error::ChecksumMismatch { .. })
+    ));
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[cfg(feature = "integrity")]
+#[test]
+fn crc32_with_header_detects_header_tampering() -> varve::Result<()> {
+    let path = temp_path("crc_header");
+    cleanup(&path);
+
+    let mut writer = CrcHeaderFormat::create_writer(&path)?;
+    let info = writer.push_crc_header_point(&CrcHeaderPoint { value: 5 })?;
+    writer.flush()?;
+    drop(writer);
+
+    tamper_byte(&path, info.record_offset)?;
+    assert!(matches!(
+        CrcHeaderFormat::open_reader(&path),
         Err(Error::ChecksumMismatch { .. })
     ));
 

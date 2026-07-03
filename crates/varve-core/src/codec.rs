@@ -542,7 +542,7 @@ where
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         let len = decoder.read_len()?;
-        let mut values = HashMap::with_capacity(len);
+        let mut values = HashMap::new();
         for _ in 0..len {
             let key = K::decode_varve(decoder)?;
             let value = V::decode_varve(decoder)?;
@@ -572,7 +572,7 @@ macro_rules! vec_seq_codec {
 
                 fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
                     let len = decoder.read_len()?;
-                    let mut values = Vec::with_capacity(len);
+                    let mut values = Vec::new();
                     for _ in 0..len {
                         values.push(<$ty>::decode_varve(decoder)?);
                     }

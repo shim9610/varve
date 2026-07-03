@@ -80,8 +80,18 @@ impl ChunkedBytes {
     }
 
     pub fn decode_to_vec(&self) -> Result<Vec<u8>> {
+        self.decode_to_vec_limited(u64::MAX)
+    }
+
+    pub fn decode_to_vec_limited(&self, max_uncompressed_len: u64) -> Result<Vec<u8>> {
         let header = parse_header(&self.encoded)?;
-        let mut entries = Vec::with_capacity(header.chunk_count as usize);
+        if header.uncompressed_len > max_uncompressed_len {
+            return Err(Error::DecompressedLengthLimitExceeded {
+                actual: header.uncompressed_len,
+                limit: max_uncompressed_len,
+            });
+        }
+        let mut entries = Vec::new();
         let mut entry_offset = CHUNKED_HEADER_LEN;
         for _ in 0..header.chunk_count {
             entries.push(parse_entry(&self.encoded, entry_offset)?);

@@ -509,13 +509,13 @@ fn zero_copy_raw_fixed_reads(case: PerfCase) -> varve::Result<()> {
         let file = PerfFormat::open_readonly(&path)?;
         let mmap = file.mmap_payloads()?;
         for index in 0..case.records {
-            let Some(point) = mmap.raw_fixed::<PerfRawPoint>(index)? else {
+            let Some(point) = unsafe { mmap.raw_fixed::<PerfRawPoint>(index) }? else {
                 panic!("missing raw fixed block at index {index}");
             };
             assert_eq!(point.bytes[0], index as u8);
             assert_eq!(point.bytes[8], index.wrapping_mul(3) as u8);
         }
-        assert!(mmap.raw_fixed::<PerfRawPoint>(case.records)?.is_none());
+        assert!(unsafe { mmap.raw_fixed::<PerfRawPoint>(case.records) }?.is_none());
         Ok(())
     })?;
     report("zero-copy raw fixed", case.records, &path, elapsed);

@@ -462,7 +462,7 @@ fn embedded_manifest_is_optional_and_retrievable() -> varve::Result<()> {
     }
     let file = ManifestFormat::open_readonly(&present_path)?;
     let manifest = file.schema_manifest()?.expect("embedded manifest");
-    assert_eq!(manifest.payload_version, 4);
+    assert_eq!(manifest.payload_version, 5);
     assert_eq!(manifest.format_version, 1);
     assert_eq!(manifest.endian, Endian::Little);
     assert_eq!(manifest.schema_hash, 77);

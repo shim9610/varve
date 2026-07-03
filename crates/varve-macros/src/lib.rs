@@ -25,12 +25,18 @@ pub fn varve_format(input: TokenStream) -> TokenStream {
 }
 
 fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
-    let ident = input.ident;
+    let ident = input.ident.clone();
+    if !input.generics.params.is_empty() || input.generics.where_clause.is_some() {
+        return Err(syn::Error::new_spanned(
+            input.generics,
+            "VarveBlock derive does not support generic parameters yet; declare a concrete block type or implement VarveBlock manually",
+        ));
+    }
     let mut block_id = None;
     let mut version = quote!(1u16);
     let mut kind = quote!(::varve::__core::BlockKind::Fixed);
     let mut variable_block = false;
-    let mut endian = quote!(None);
+    let mut endian = quote!(::core::option::Option::None);
     let mut key_fields: Vec<Ident> = Vec::new();
 
     for attr in &input.attrs {
@@ -72,8 +78,8 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
             } else if meta.path.is_ident("endian") {
                 let value: LitStr = meta.value()?.parse()?;
                 endian = match value.value().as_str() {
-                    "little" => quote!(Some(::varve::__core::Endian::Little)),
-                    "big" => quote!(Some(::varve::__core::Endian::Big)),
+                    "little" => quote!(::core::option::Option::Some(::varve::__core::Endian::Little)),
+                    "big" => quote!(::core::option::Option::Some(::varve::__core::Endian::Big)),
                     other => {
                         return Err(meta.error(format!(
                             "unsupported endian {other:?}; use \"little\" or \"big\""
@@ -271,13 +277,13 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
             }
             ::varve::__core::BlockKind::Internal => {}
         }
-        Ok(())
+        ::core::result::Result::Ok(())
     };
 
     let decode_body = quote! {
         match Self::KIND {
             ::varve::__core::BlockKind::Fixed | ::varve::__core::BlockKind::Matrix => {
-                Ok(Self { #(#fixed_decode,)* })
+                ::core::result::Result::Ok(Self { #(#fixed_decode,)* })
             }
             ::varve::__core::BlockKind::Variable => {
                 #(#option_vars)*
@@ -289,7 +295,7 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
                         _ => {}
                     }
                 }
-                Ok(Self { #(#build_fields,)* })
+                ::core::result::Result::Ok(Self { #(#build_fields,)* })
             }
             ::varve::__core::BlockKind::Internal => unreachable!("user blocks cannot be internal"),
         }
@@ -482,6 +488,7 @@ enum ParsedCommitChoice {
 enum IntegrityChoice {
     None,
     Crc32,
+    Crc32WithHeader,
 }
 
 enum RecoveryChoice {
@@ -684,10 +691,12 @@ impl Parse for FormatInput {
         let mut layout_preset = None;
         let mut layout_file_header = None;
         let mut layout_segments: Option<Vec<LayoutSegment>> = None;
+        let mut seen_keys = Vec::new();
 
         while !content.is_empty() {
             let key: Ident = content.parse()?;
             if key == "dims" && content.peek(syn::token::Brace) {
+                note_format_key(&mut seen_keys, &key)?;
                 let inner;
                 braced!(inner in content);
                 dims = Some(parse_matrix_dims(&inner)?);
@@ -697,6 +706,7 @@ impl Parse for FormatInput {
                 continue;
             }
             if key == "aux" && content.peek(syn::token::Brace) {
+                note_format_key(&mut seen_keys, &key)?;
                 let inner;
                 braced!(inner in content);
                 matrix_aux = Some(parse_matrix_aux(&inner)?);
@@ -706,6 +716,7 @@ impl Parse for FormatInput {
                 continue;
             }
             if key == "blocks" && content.peek(syn::token::Brace) {
+                note_format_key(&mut seen_keys, &key)?;
                 let inner;
                 braced!(inner in content);
                 inline_blocks = Some(parse_inline_blocks(&inner)?);
@@ -715,6 +726,7 @@ impl Parse for FormatInput {
                 continue;
             }
             if key == "layout" && content.peek(syn::token::Brace) {
+                note_format_key(&mut seen_keys, &key)?;
                 let inner;
                 braced!(inner in content);
                 let layout = parse_layout(&inner)?;
@@ -726,6 +738,7 @@ impl Parse for FormatInput {
                 continue;
             }
             content.parse::<Token![:]>()?;
+            note_format_key(&mut seen_keys, &key)?;
             if key == "magic" {
                 magic = Some(content.parse()?);
             } else if key == "version" {
@@ -767,7 +780,13 @@ impl Parse for FormatInput {
                 integrity = match value.to_string().as_str() {
                     "none" => IntegrityChoice::None,
                     "crc32" => IntegrityChoice::Crc32,
-                    _ => return Err(syn::Error::new_spanned(value, "expected none or crc32")),
+                    "crc32_with_header" => IntegrityChoice::Crc32WithHeader,
+                    _ => {
+                        return Err(syn::Error::new_spanned(
+                            value,
+                            "expected none, crc32, or crc32_with_header",
+                        ));
+                    }
                 };
             } else if key == "recovery" {
                 let value: Ident = content.parse()?;
@@ -867,6 +886,18 @@ impl Parse for FormatInput {
             typed_api,
         })
     }
+}
+
+fn note_format_key(seen: &mut Vec<String>, key: &Ident) -> Result<()> {
+    let key_text = key.to_string();
+    if seen.iter().any(|seen| seen == &key_text) {
+        return Err(syn::Error::new_spanned(
+            key,
+            format!("duplicate varve_format key {key_text:?}"),
+        ));
+    }
+    seen.push(key_text);
+    Ok(())
 }
 
 fn parse_index_choice(input: ParseStream<'_>) -> Result<IndexChoice> {
@@ -1743,8 +1774,8 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     };
     let extension = input
         .extension
-        .map(|extension| quote!(Some(#extension)))
-        .unwrap_or_else(|| quote!(None));
+        .map(|extension| quote!(::core::option::Option::Some(#extension)))
+        .unwrap_or_else(|| quote!(::core::option::Option::None));
     let endian = match input.endian {
         EndianChoice::Little => quote!(::varve::__core::Endian::Little),
         EndianChoice::Big => quote!(::varve::__core::Endian::Big),
@@ -1754,6 +1785,9 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     let integrity = match input.integrity {
         IntegrityChoice::None => quote!(::varve::__core::IntegrityPolicy::None),
         IntegrityChoice::Crc32 => quote!(::varve::__core::IntegrityPolicy::Crc32),
+        IntegrityChoice::Crc32WithHeader => {
+            quote!(::varve::__core::IntegrityPolicy::Crc32WithHeader)
+        }
     };
     let recovery = match input.recovery {
         RecoveryChoice::Strict => quote!(::varve::__core::RecoveryPolicy::Strict),
@@ -1847,25 +1881,25 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     };
     let create_layout_writer_body = if has_typed_layout_api {
         let writer_name = format_ident!("{}LayoutWriter", name);
-        quote!(Ok(#writer_name::from_inner(Self::spec().create_layout_writer(path)?)))
+        quote!(::core::result::Result::Ok(#writer_name::from_inner(Self::spec().create_layout_writer(path)?)))
     } else {
         quote!(Self::spec().create_layout_writer(path))
     };
     let create_layout_writer_with_header_body = if has_typed_layout_api {
         let writer_name = format_ident!("{}LayoutWriter", name);
-        quote!(Ok(#writer_name::from_inner(Self::spec().create_layout_writer_with_header(path, fields)?)))
+        quote!(::core::result::Result::Ok(#writer_name::from_inner(Self::spec().create_layout_writer_with_header(path, fields)?)))
     } else {
         quote!(Self::spec().create_layout_writer_with_header(path, fields))
     };
     let open_layout_writer_body = if has_typed_layout_api {
         let writer_name = format_ident!("{}LayoutWriter", name);
-        quote!(Ok(#writer_name::from_inner(Self::spec().open_layout_writer(path)?)))
+        quote!(::core::result::Result::Ok(#writer_name::from_inner(Self::spec().open_layout_writer(path)?)))
     } else {
         quote!(Self::spec().open_layout_writer(path))
     };
     let open_layout_reader_body = if has_typed_layout_api {
         let reader_name = format_ident!("{}LayoutReader", name);
-        quote!(Ok(#reader_name::from_inner(Self::spec().open_layout_reader(path)?)))
+        quote!(::core::result::Result::Ok(#reader_name::from_inner(Self::spec().open_layout_reader(path)?)))
     } else {
         quote!(Self::spec().open_layout_reader(path))
     };
@@ -1892,7 +1926,7 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
         quote! {
             {
                 let (writer, report) = Self::spec().open_recover_writer_with_report(path)?;
-                Ok((#writer_name::from_inner(writer)?, report))
+                ::core::result::Result::Ok((#writer_name::from_inner(writer)?, report))
             }
         }
     } else {
@@ -1900,7 +1934,7 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     };
     let open_reader_body = if typed_api_enabled {
         let reader_name = format_ident!("{}Reader", name);
-        quote!(Ok(#reader_name::from_inner(Self::spec().open_reader(path)?)))
+        quote!(::core::result::Result::Ok(#reader_name::from_inner(Self::spec().open_reader(path)?)))
     } else {
         quote!(Self::spec().open_reader(path))
     };
@@ -2137,13 +2171,13 @@ fn layout_tokens(
                 .map(|footer| {
                     let footer_name = &footer.name;
                     quote! {
-                        Some(::varve::__core::FooterDescriptor {
+                        ::core::option::Option::Some(::varve::__core::FooterDescriptor {
                             name: stringify!(#footer_name),
                             fields: #footer_fields,
                         })
                     }
                 })
-                .unwrap_or_else(|| quote!(None));
+                .unwrap_or_else(|| quote!(::core::option::Option::None));
             quote! {
                 ::varve::__core::LayoutPartDescriptor {
                     name: stringify!(#name),
@@ -2633,7 +2667,7 @@ fn layout_typed_api_tokens(
                 self.inner.segments()
             }
 
-            pub fn read_metadata(&self, index: usize) -> ::varve::__core::Result<Vec<u8>> {
+            pub fn read_metadata(&self, index: usize) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
                 self.inner.read_metadata(index)
             }
 
@@ -2642,11 +2676,11 @@ fn layout_typed_api_tokens(
                 index: usize,
                 offset: u64,
                 len: u64,
-            ) -> ::varve::__core::Result<Vec<u8>> {
+            ) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
                 self.inner.read_metadata_range(index, offset, len)
             }
 
-            pub fn read_raw(&self, index: usize) -> ::varve::__core::Result<Vec<u8>> {
+            pub fn read_raw(&self, index: usize) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
                 self.inner.read_raw(index)
             }
 
@@ -2655,7 +2689,7 @@ fn layout_typed_api_tokens(
                 index: usize,
                 offset: u64,
                 len: u64,
-            ) -> ::varve::__core::Result<Vec<u8>> {
+            ) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
                 self.inner.read_raw_range(index, offset, len)
             }
 
@@ -2751,11 +2785,11 @@ fn layout_header_typed_tokens(
 
         #[derive(Clone, Debug, PartialEq, Eq)]
         pub struct #info_name {
-            fields: Vec<::varve::__core::LayoutFieldValue>,
+            fields: ::std::vec::Vec<::varve::__core::LayoutFieldValue>,
         }
 
         impl #info_name {
-            pub fn from_fields(fields: Vec<::varve::__core::LayoutFieldValue>) -> Self {
+            pub fn from_fields(fields: ::std::vec::Vec<::varve::__core::LayoutFieldValue>) -> Self {
                 Self { fields }
             }
 
@@ -2779,7 +2813,7 @@ fn layout_header_typed_tokens(
                 header: #fields_name,
             ) -> ::varve::__core::Result<#writer_name> {
                 let fields = header.__varve_layout_values();
-                Ok(#writer_name::from_inner(
+                ::core::result::Result::Ok(#writer_name::from_inner(
                     Self::spec().create_layout_writer_with_header(path, &fields)?
                 ))
             }
@@ -2902,7 +2936,7 @@ fn layout_writer_segment_method_tokens(
                 metadata: segment.metadata,
                 raw: segment.raw,
             })?;
-            Ok(#info_type::from_inner(info))
+            ::core::result::Result::Ok(#info_type::from_inner(info))
         }
 
         pub fn #streamed_method<M, R>(
@@ -2925,7 +2959,7 @@ fn layout_writer_segment_method_tokens(
                 write_metadata,
                 write_raw,
             })?;
-            Ok(#info_type::from_inner(info))
+            ::core::result::Result::Ok(#info_type::from_inner(info))
         }
     }
 }
@@ -2946,28 +2980,28 @@ fn layout_reader_segment_methods_tokens(
     let info_type = format_ident!("{}{}LayoutInfo", format_name, segment.name);
     let segment_name = segment.name.to_string();
     quote! {
-        pub fn #plural(&self) -> ::varve::__core::Result<Vec<#info_type>> {
+        pub fn #plural(&self) -> ::varve::__core::Result<::std::vec::Vec<#info_type>> {
             self.inner
                 .segments()
                 .iter()
                 .filter(|segment| segment.name == #segment_name)
                 .cloned()
                 .map(#info_type::from_inner)
-                .map(Ok)
+                .map(::core::result::Result::Ok)
                 .collect()
         }
 
-        pub fn #singular(&self, index: usize) -> ::varve::__core::Result<Option<#info_type>> {
-            let Ok(index) = self.__varve_layout_segment_index(#segment_name, index) else {
-                return Ok(None);
+        pub fn #singular(&self, index: usize) -> ::varve::__core::Result<::core::option::Option<#info_type>> {
+            let ::core::result::Result::Ok(index) = self.__varve_layout_segment_index(#segment_name, index) else {
+                return ::core::result::Result::Ok(::core::option::Option::None);
             };
-            let Some(segment) = self.inner.segments().get(index) else {
-                return Ok(None);
+            let ::core::option::Option::Some(segment) = self.inner.segments().get(index) else {
+                return ::core::result::Result::Ok(::core::option::Option::None);
             };
-            Ok(Some(#info_type::from_inner(segment.clone())))
+            ::core::result::Result::Ok(::core::option::Option::Some(#info_type::from_inner(segment.clone())))
         }
 
-        pub fn #read_metadata(&self, index: usize) -> ::varve::__core::Result<Vec<u8>> {
+        pub fn #read_metadata(&self, index: usize) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
             let index = self.__varve_layout_segment_index(#segment_name, index)?;
             self.inner.read_metadata(index)
         }
@@ -2977,12 +3011,12 @@ fn layout_reader_segment_methods_tokens(
             index: usize,
             offset: u64,
             len: u64,
-        ) -> ::varve::__core::Result<Vec<u8>> {
+        ) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
             let index = self.__varve_layout_segment_index(#segment_name, index)?;
             self.inner.read_metadata_range(index, offset, len)
         }
 
-        pub fn #read_raw(&self, index: usize) -> ::varve::__core::Result<Vec<u8>> {
+        pub fn #read_raw(&self, index: usize) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
             let index = self.__varve_layout_segment_index(#segment_name, index)?;
             self.inner.read_raw(index)
         }
@@ -2992,7 +3026,7 @@ fn layout_reader_segment_methods_tokens(
             index: usize,
             offset: u64,
             len: u64,
-        ) -> ::varve::__core::Result<Vec<u8>> {
+        ) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
             let index = self.__varve_layout_segment_index(#segment_name, index)?;
             self.inner.read_raw_range(index, offset, len)
         }
@@ -3010,8 +3044,8 @@ fn layout_field_struct_tokens(name: &Ident, fields: &[LayoutField]) -> TokenStre
             pub struct #name;
 
             impl #name {
-                fn __varve_layout_values(&self) -> Vec<::varve::__core::LayoutFieldValue> {
-                    Vec::new()
+                fn __varve_layout_values(&self) -> ::std::vec::Vec<::varve::__core::LayoutFieldValue> {
+                    ::std::vec::Vec::new()
                 }
             }
         };
@@ -3041,7 +3075,7 @@ fn layout_field_struct_tokens(name: &Ident, fields: &[LayoutField]) -> TokenStre
         }
 
         impl #name {
-            fn __varve_layout_values(&self) -> Vec<::varve::__core::LayoutFieldValue> {
+            fn __varve_layout_values(&self) -> ::std::vec::Vec<::varve::__core::LayoutFieldValue> {
                 vec![
                     #(#value_entries,)*
                 ]
@@ -3099,7 +3133,7 @@ fn layout_info_footer_field_getter(field: &LayoutField) -> TokenStream2 {
 
 fn layout_field_rust_type_tokens(ty: &LayoutFieldTypeChoice) -> TokenStream2 {
     match ty {
-        LayoutFieldTypeChoice::Bytes(_) => quote!(Vec<u8>),
+        LayoutFieldTypeChoice::Bytes(_) => quote!(::std::vec::Vec<u8>),
         LayoutFieldTypeChoice::U8 => quote!(u8),
         LayoutFieldTypeChoice::U16 => quote!(u16),
         LayoutFieldTypeChoice::U32 => quote!(u32),
@@ -3234,6 +3268,7 @@ fn typed_api_tokens(
             #matrix_writer_aux_trait_methods
 
             fn commit(&mut self) -> ::varve::__core::Result<::varve::__core::AppendInfo>;
+            fn commit_durable(&mut self) -> ::varve::__core::Result<::varve::__core::AppendInfo>;
             fn flush(&mut self) -> ::varve::__core::Result<()>;
             fn sync(&mut self) -> ::varve::__core::Result<()>;
         }
@@ -3280,7 +3315,7 @@ fn typed_api_tokens(
         impl #writer_name {
             pub fn from_inner(inner: ::varve::__core::VarveWriter) -> ::varve::__core::Result<Self> {
                 #(#writer_tail_inits)*
-                Ok(Self {
+                ::core::result::Result::Ok(Self {
                     inner,
                     #(#writer_tail_values)*
                 })
@@ -3300,6 +3335,10 @@ fn typed_api_tokens(
 
             pub fn commit(&mut self) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
                 self.inner.commit()
+            }
+
+            pub fn commit_durable(&mut self) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
+                self.inner.commit_durable()
             }
 
             pub fn flush(&mut self) -> ::varve::__core::Result<()> {
@@ -3322,6 +3361,10 @@ fn typed_api_tokens(
 
             fn commit(&mut self) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
                 self.commit()
+            }
+
+            fn commit_durable(&mut self) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
+                self.commit_durable()
             }
 
             fn flush(&mut self) -> ::varve::__core::Result<()> {
@@ -3357,7 +3400,7 @@ fn matrix_reader_aux_methods(aux: &[MatrixAux], target: MatrixMethodTarget) -> T
                     &mut self,
                     offset: u64,
                     len: u64,
-                ) -> ::varve::__core::Result<Vec<u8>> {
+                ) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
                     self.inner.read_matrix_aux(#name, offset, len)
                 }
             },
@@ -3368,7 +3411,7 @@ fn matrix_reader_aux_methods(aux: &[MatrixAux], target: MatrixMethodTarget) -> T
                     &mut self,
                     offset: u64,
                     len: u64,
-                ) -> ::varve::__core::Result<Vec<u8>>;
+                ) -> ::varve::__core::Result<::std::vec::Vec<u8>>;
             },
             MatrixMethodTarget::TraitImpl => quote! {
                 fn #len_method(&self) -> ::varve::__core::Result<u64> {
@@ -3379,7 +3422,7 @@ fn matrix_reader_aux_methods(aux: &[MatrixAux], target: MatrixMethodTarget) -> T
                     &mut self,
                     offset: u64,
                     len: u64,
-                ) -> ::varve::__core::Result<Vec<u8>> {
+                ) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
                     self.inner.read_matrix_aux(#name, offset, len)
                 }
             },
@@ -3406,7 +3449,7 @@ fn matrix_writer_aux_methods(aux: &[MatrixAux], target: MatrixMethodTarget) -> T
                     &mut self,
                     offset: u64,
                     len: u64,
-                ) -> ::varve::__core::Result<Vec<u8>> {
+                ) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
                     self.inner.read_matrix_aux(#name, offset, len)
                 }
 
@@ -3425,7 +3468,7 @@ fn matrix_writer_aux_methods(aux: &[MatrixAux], target: MatrixMethodTarget) -> T
                     &mut self,
                     offset: u64,
                     len: u64,
-                ) -> ::varve::__core::Result<Vec<u8>>;
+                ) -> ::varve::__core::Result<::std::vec::Vec<u8>>;
 
                 fn #write_method(
                     &mut self,
@@ -3442,7 +3485,7 @@ fn matrix_writer_aux_methods(aux: &[MatrixAux], target: MatrixMethodTarget) -> T
                     &mut self,
                     offset: u64,
                     len: u64,
-                ) -> ::varve::__core::Result<Vec<u8>> {
+                ) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
                     self.inner.read_matrix_aux(#name, offset, len)
                 }
 
@@ -3863,7 +3906,7 @@ fn writer_methods(block: &InlineBlock) -> Vec<TokenStream2> {
                     let prev = self.#tails.get(&key).copied();
                     let info = self.inner.push_with_prev_key_info(value, prev)?;
                     self.#tails.insert(key, info.record_offset);
-                    Ok(info)
+                    ::core::result::Result::Ok(info)
                 }
             },
             quote! {
@@ -3874,7 +3917,7 @@ fn writer_methods(block: &InlineBlock) -> Vec<TokenStream2> {
                     let prev = self.#tails.get(key).copied();
                     let info = self.inner.delete_with_prev_key_info::<#ty>(key, prev)?;
                     self.#tails.insert(key.clone(), info.record_offset);
-                    Ok(info)
+                    ::core::result::Result::Ok(info)
                 }
             },
         ]
@@ -3935,7 +3978,7 @@ fn writer_trait_impl_methods(block: &InlineBlock) -> Vec<TokenStream2> {
                     let prev = self.#tails.get(&key).copied();
                     let info = self.inner.push_with_prev_key_info(value, prev)?;
                     self.#tails.insert(key, info.record_offset);
-                    Ok(info)
+                    ::core::result::Result::Ok(info)
                 }
             },
             quote! {
@@ -3946,7 +3989,7 @@ fn writer_trait_impl_methods(block: &InlineBlock) -> Vec<TokenStream2> {
                     let prev = self.#tails.get(key).copied();
                     let info = self.inner.delete_with_prev_key_info::<#ty>(key, prev)?;
                     self.#tails.insert(key.clone(), info.record_offset);
-                    Ok(info)
+                    ::core::result::Result::Ok(info)
                 }
             },
         ]

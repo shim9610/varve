@@ -159,7 +159,7 @@ fn record_explicit_variable_blocks_roundtrip_with_physical_scan() -> varve::Resu
         file.push(&value)?;
         file.push(&fixed)?;
         let manifest = file.schema_manifest()?.expect("embedded manifest");
-        assert_eq!(manifest.payload_version, 4);
+        assert_eq!(manifest.payload_version, 5);
         assert_eq!(manifest.commit_policy, CommitPolicy::None);
         assert_eq!(manifest.extension, Some("vcz".to_string()));
         assert!(matches!(

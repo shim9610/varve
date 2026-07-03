@@ -105,27 +105,8 @@ where
     K: Eq + Hash + Clone,
     T: VarveKeyedBlock<Key = K>,
 {
-    pub(crate) fn build(inner: BlockVec<T>) -> Result<Self> {
-        let mut by_key = HashMap::new();
-        for entry in &inner.entries {
-            if entry.block_version != T::VERSION {
-                return Err(crate::Error::BlockVersionMismatch {
-                    block_id: T::ID,
-                    expected: T::VERSION,
-                    actual: entry.block_version,
-                });
-            }
-            let payload = entry.read_logical_payload(inner.spec, &inner.path)?;
-            let block: T = decode_from_slice(&payload, T::ENDIAN.unwrap_or(inner.spec.endian))?;
-            let key = block.key();
-            let should_replace = by_key
-                .get(&key)
-                .is_none_or(|old: &RecordIndexEntry| entry.sequence > old.sequence);
-            if should_replace {
-                by_key.insert(key, entry.clone());
-            }
-        }
-        Ok(Self { inner, by_key })
+    pub(crate) fn from_parts(inner: BlockVec<T>, by_key: HashMap<K, RecordIndexEntry>) -> Self {
+        Self { inner, by_key }
     }
 
     pub fn len(&self) -> usize {

@@ -521,7 +521,11 @@ pub fn diagnose_spec(spec: FormatSpec) -> FormatDiagnostics {
         );
     }
 
-    if spec.integrity_policy == crate::IntegrityPolicy::Crc32 && !cfg!(feature = "integrity") {
+    if matches!(
+        spec.integrity_policy,
+        crate::IntegrityPolicy::Crc32 | crate::IntegrityPolicy::Crc32WithHeader
+    ) && !cfg!(feature = "integrity")
+    {
         report.push(
             Diagnostic::error(
                 DiagnosticDomain::FeatureGate,

@@ -98,7 +98,8 @@ Common `VarveWriter` APIs:
 | `write_metadata(key, bytes)` | append internal metadata record |
 | `replace_fixed(index, &block)` | same-size in-place fixed replacement |
 | `replace_rewrite(index, &block)` | rewrite whole file through temp file |
-| `commit()` | write explicit transaction marker |
+| `commit()` | write explicit transaction marker without an implied fsync |
+| `commit_durable()` | write an explicit transaction marker with ordered flush/sync barriers |
 | `flush()` | write buffered records/checkpoints/manifests/marker |
 | `sync()` | request durable persistence |
 
@@ -107,7 +108,7 @@ Common `VarveReader` APIs:
 | API | Meaning |
 | --- | --- |
 | `blocks::<T>()` | lazy typed records by block type |
-| `keyed_blocks::<T>()` | latest put by key |
+| `keyed_blocks::<T>()` | latest put by key after tombstones are applied |
 | `materialized_keyed_blocks::<T>()` | applies puts, ops, tombstones |
 | `metadata(key)` | latest metadata value |
 | `schema_manifest()` | latest embedded manifest if present |
@@ -121,7 +122,7 @@ Common `VarveReader` APIs:
 | `BlockVec::len()` | number of visible records |
 | `BlockVec::get(index)` | decode one item on demand |
 | `BlockVec::iter()` | lazy iterator of decoded items |
-| `KeyedBlockVec<K, T>` | latest put per key |
+| `KeyedBlockVec<K, T>` | latest visible put per key after tombstones |
 | `KeyedBlockVec::get(&key)` | decode latest value for key |
 | `KeyedBlockVec::keys()` | iterate known keys |
 
@@ -353,11 +354,13 @@ Feature-gated APIs:
 | `mmap` | `mmap_payloads()` | mmap append-log payload windows |
 | `mmap` | `mmap_matrix()` | mmap matrix slot windows |
 | `mmap` | `MmapMatrix::cell_numeric::<T, N>(key)` | endian-aware numeric scalar read |
-| `zero-copy` | `MmapPayloads::raw_fixed::<T>()` | raw fixed block view |
-| `zero-copy` | `MmapMatrix::raw_cell::<T>(key)` | raw matrix cell view |
+| `zero-copy` | `unsafe MmapPayloads::raw_fixed::<T>()` | raw fixed block view |
+| `zero-copy` | `unsafe MmapMatrix::raw_cell::<T>(key)` | raw matrix cell view |
 
-Zero-copy is opt-in and requires unsafe marker traits. Normal fixed/matrix reads
-use owned canonical decoding.
+Zero-copy is opt-in and requires unsafe marker traits plus unsafe raw-read
+calls. Callers must guarantee the mapped file bytes are not mutated for the
+returned reference lifetime. Normal fixed/matrix reads use owned canonical
+decoding.
 
 ## Compression API
 
