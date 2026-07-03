@@ -1,0 +1,5 @@
+error: VarveBlock derive does not support generic parameters yet; declare a concrete block type or implement VarveBlock manually
+ --> tests/ui/fail_generic_derive.rs:5:20
+  |
+5 | struct GenericBlock<T> {
+  |                    ^^^

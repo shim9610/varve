@@ -108,7 +108,7 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - `RecoveryPolicy::TruncateTail` truncates incomplete record header/payload tails and returns a recovery report through `open_recover_with_report`.
 - Read-only open never truncates. Recovery truncation is explicit through `open_recover` or `open_recover_with_report`.
 - Read-write open for `CommitPolicy::TransactionMarker` truncates uncommitted tail after the latest valid marker so appends cannot accidentally commit stale tail data.
-- `IntegrityPolicy::Crc32` is feature-gated behind `integrity` and rejects corrupted payloads.
+- `IntegrityPolicy::Crc32` and `IntegrityPolicy::Crc32WithHeader` are feature-gated behind `integrity` and reject corrupted covered bytes.
 - `IndexPolicy` is a bitset-style policy with `scan_on_open`, `checkpoint_on_flush`, `block_offset_chain`, and `keyed_offset_chain`. Offset-chain policies are written automatically in `VARVE3` footers.
 - `CommitPolicy::RecordFooter` treats valid record footers as the commit flag for each record.
 - `CommitPolicy::TransactionMarker(on_flush|explicit)` appends internal `COMMIT_BLOCK_ID` marker records. Readers expose the latest marker-covered snapshot; writer open truncates uncommitted tail after the latest marker.
@@ -123,7 +123,7 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Keyed deletes use a common internal tombstone record.
 - Keyed ops use user-defined `VarveMerge::Op`.
 - Merge conflict ordering is shard order, then local sequence, then record ordinal; later delta shards win over base.
-- `keyed_blocks::<T>()` is put-only indexed access.
+- `keyed_blocks::<T>()` is latest-put indexed access after tombstones.
 - `materialized_keyed_blocks::<T>()` applies same-file puts, ops, and tombstones into current state.
 - `VarveReader` and `VarveWriter` are additive handle wrappers for clearer read-only and write-capable workflows. Existing `VarveFile` APIs remain available.
 
@@ -135,6 +135,13 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Decoding `HashMap<K, V>` preserves values but not insertion order.
 - Custom field codecs are supported by implementing `VarveEncode` and `VarveDecode` for the field type. The derive macro uses the type's `WIRE_TYPE` in field descriptors and manifests.
 - Enum-like values should use explicit custom codecs in v0.1; automatic enum representation inference is out of scope.
+- Length and count limits are format-author policy. Varve's built-in decoders
+  avoid large allocation-before-validation patterns where the remaining bytes
+  can be checked generically, but domain-specific maximum string, sequence,
+  map, chunk, or decompressed sizes should be enforced by the format's custom
+  codecs, compression policy, adapter, or caller validation.
+- `ChunkedBytes::decode_to_vec_limited(limit)` is provided for callers that
+  need an explicit decompressed-size ceiling.
 
 ## Macro Contract
 
@@ -145,6 +152,10 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - `varve_format!` supports the legacy registry form `pub struct Format { blocks: [A, B]; }` and the format-first form `pub format Format { blocks { fixed A(...) { ... } } }`.
 - In format-first form, block structs, `VarveBlock` implementations, typed reader/writer wrappers, and typed read/write traits are generated from the format declaration.
 - `varve_format!` supports `magic`, `version`, `endian`, optional `schema_hash`, optional `commit`, optional `integrity`, optional `index`, optional `recovery`, optional `manifest`, and `blocks`.
+- `integrity` accepts `none`, `crc32`, or `crc32_with_header`. `crc32`
+  covers payload plus native record footer when present. `crc32_with_header`
+  additionally covers the native 32-byte record header with the checksum field
+  normalized to zero.
 - `varve_format!` supports `preset: varve_native|none|custom;`. Omitted preset
   means `varve_native` unless a custom layout is declared; with declared layout
   parts, omission means `none` so the declaration owns byte zero.
@@ -176,9 +187,16 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - `schema_hash: computed;` asks the macro to call `with_computed_schema_hash()` after policies are attached.
 - `index` accepts either a single legacy identifier or a list such as `[scan_on_open, checkpoint_on_flush, block_offset_chain, keyed_offset_chain]`.
 - `commit` accepts `none`, `record_footer`, or `transaction_marker(on_flush|explicit)`.
+- Generated typed writers expose both `commit()` and `commit_durable()`.
+  `commit()` is a logical visibility marker and does not imply fsync.
+  `commit_durable()` writes commit-covered metadata/checkpoints, flushes and
+  syncs data, writes the marker, then syncs the marker.
 - `varve_format!` also supports optional `extension` and global `compression`. Compression syntax is `compression: none;` or `compression: variable_blocks(zstd, level = default|fast|best|N, header = record_explicit|file_explicit|format_contract, min_len = N, only_if_smaller = true|false, max_len = N);`.
 - Per-block compression overrides are a runtime `FormatSpec::with_block_compression` API in v0.1, not a macro DSL clause.
-- Legacy registry formats expose raw `VarveReader`/`VarveWriter` handles. Format-first declarations expose typed `FormatReader`/`FormatWriter` wrappers where methods such as `push_user`, `delete_user`, `users`, `commit`, `flush`, and `sync` are generated from block declarations.
+- Legacy registry formats expose raw `VarveReader`/`VarveWriter` handles. Format-first declarations expose typed `FormatReader`/`FormatWriter` wrappers where methods such as `push_user`, `delete_user`, `users`, `commit`, `commit_durable`, `flush`, and `sync` are generated from block declarations.
+- Duplicate top-level `varve_format!` keys are compile errors. The derive
+  macro rejects generic block structs in v0.1 with a direct diagnostic; use a
+  concrete block type or manual trait implementations.
 - The derive macro emits `VarveBlock::FIELDS`, including field id, field name, wire type, and required/defaulted presence.
 - `#[varve(default)]` is variable-block-only. Fixed blocks are positional canonical payloads and cannot omit fields.
 - `key = "..."` must contain one or more valid Rust identifiers separated by commas. Empty key strings, empty segments, duplicates, and missing fields are compile errors.
@@ -197,11 +215,15 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Roundtrip fixed, variable, nested, option, array, scalar vec, string vec, and bytes payloads.
 - Roundtrip and byte-stability checks for deterministic map codecs.
 - Lazy typed collections and keyed collections read back typed values.
+- `keyed_blocks::<T>()` applies tombstones to latest-put lookup. It does not
+  apply user-defined ops; use `materialized_keyed_blocks::<T>()` for put/op/
+  tombstone materialization.
 - Unknown variable fields are skipped.
 - Header/version/endian/schema mismatch is rejected.
 - Block version mismatch is rejected on typed read.
 - Strict recovery rejects corrupt tails; recover mode truncates incomplete tails.
-- CRC integrity detects tampering when feature-enabled.
+- CRC integrity detects payload/footer tampering when feature-enabled.
+- `crc32_with_header` detects native record header tampering as well.
 - Variable-block compression roundtrips under record-explicit, file-explicit, and format-contract metadata modes.
 - Explicit `preset: varve_native` produces byte-identical output to the omitted
   preset for the same native format declaration.
@@ -324,9 +346,10 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
 | Policy | Payload coverage | Header coverage | Checkpoint behavior | Recovery interaction |
 | --- | --- | --- | --- | --- |
 | `IntegrityPolicy::None` | No checksum validation. | Record headers are structurally parsed only. | Structurally invalid checkpoints can be ignored and full scan fallback is allowed. | Recovery can truncate incomplete tails only. Complete-but-wrong payload bytes may decode as data or fail codec validation. |
-| `IntegrityPolicy::Crc32` | Per-record payload CRC32 when the `integrity` feature is enabled. For `VARVE3`, the checksum covers `payload + footer`. | Header fields are not included in CRC32 in v0.1. | Checkpoint payload CRC mismatch is fatal and must not be hidden by fallback. | Recovery can truncate incomplete tails, and transaction-marker readers may ignore corrupt tail after the latest valid marker. Complete CRC mismatches in marker-covered or record-footer-visible records remain errors. |
+| `IntegrityPolicy::Crc32` | Per-record payload CRC32 when the `integrity` feature is enabled. For `VARVE3`, the checksum covers `payload + footer`. | Header fields are structurally parsed but not included in this CRC mode. | Checkpoint payload CRC mismatch is fatal and must not be hidden by fallback. | Recovery can truncate incomplete tails, and transaction-marker readers may ignore corrupt tail after the latest valid marker. Complete CRC mismatches in marker-covered or record-footer-visible records remain errors. |
+| `IntegrityPolicy::Crc32WithHeader` | Same payload/footer coverage as `Crc32`. | Also covers the native record header with the checksum field normalized to zero. | Same as `Crc32`. | Same as `Crc32`. |
 
-`integrity: crc32` is a corruption-detection aid, not an authenticity or tamper-proofing mechanism.
+CRC integrity is a corruption-detection aid, not an authenticity or tamper-proofing mechanism.
 
 ### Manifest
 
@@ -334,7 +357,7 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
 - Macro syntax: `manifest: none;` or `manifest: embedded;`.
 - Runtime policy enum: `ManifestPolicy::{None, Embedded}`.
 - Embedded manifests use internal block id `MANIFEST_BLOCK_ID`.
-- Manifest payload version is `u16 = 4`.
+- Manifest payload version is `u16 = 5`.
 - Manifest content includes format version, endian, schema hash, extension, index policy, commit policy, integrity policy, recovery policy, manifest policy, compression policy, registered block descriptors, and registered field descriptors.
 - v2 field descriptors include field id, wire type, required/defaulted presence, and field name. v1 manifests can still be decoded with empty field lists for compatibility.
 - `VarveFile::schema_manifest()` returns the latest embedded manifest if present.
@@ -392,13 +415,16 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
 - `MmapMatrix::cell_payload_window::<T>(key)` returns a committed matrix slot
   payload window and verifies the per-cell CRC when matrix integrity is enabled.
 - Initial zero-copy scope is limited to explicit raw fixed blocks whose implementor promises endian, alignment, and layout compatibility.
-- Raw fixed access is exposed only as `MmapPayloads::raw_fixed::<T>(index)` where `T: VarveRawFixedBlock`.
+- Raw fixed access is exposed only as `unsafe MmapPayloads::raw_fixed::<T>(index)` where `T: VarveRawFixedBlock`.
 - `VarveRawFixedBlock` is an unsafe opt-in trait over `VarveBlock + zerocopy::FromBytes + zerocopy::Immutable + zerocopy::KnownLayout`.
 - `raw_fixed` requires fixed block kind, registered id/version/kind, record version match, matching raw endian, exact `size_of::<T>()` payload length, and valid `align_of::<T>()` alignment.
-- Raw matrix access is exposed as `MmapMatrix::raw_cell::<T>(key)` where
+- Raw matrix access is exposed as `unsafe MmapMatrix::raw_cell::<T>(key)` where
   `T: VarveRawMatrixBlock`; it requires matrix block kind, committed status,
   matching raw endian, exact `size_of::<T>()` slot length, valid alignment, and
   per-cell CRC verification when enabled.
+- Raw zero-copy calls require the caller to guarantee the mapped bytes are not
+  mutated by any handle, thread, or process for the lifetime of returned
+  references.
 - Variable blocks are not zero-copy eligible in the first scaffold.
 - No API may silently reinterpret canonical fixed encoding as Rust memory layout.
 

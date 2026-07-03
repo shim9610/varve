@@ -15,9 +15,10 @@ use crate::{
     MatrixResumeSignal, RecoveryPolicy, Result, VariableCompression, VarveBlock, VarveKeyedBlock,
     VarveMatrixBlock, VarveMerge, VarveMigration, WireType, decode_from_slice, encode_to_vec,
     native_layout::{
-        decode_native_record_footer, encode_native_record_footer, native_file_header_len,
-        native_record_footer_len, native_record_header_len, read_native_file_header,
-        read_native_record_header, write_native_file_header, write_native_record_header,
+        decode_native_record_footer, encode_native_record_footer, encode_native_record_header,
+        native_file_header_len, native_record_footer_len, native_record_header_len,
+        read_native_file_header, read_native_record_header, write_native_file_header,
+        write_native_record_header,
     },
 };
 
@@ -42,7 +43,7 @@ pub(crate) const RECORD_FOOTER_KNOWN_FLAGS: u16 =
 const COMMIT_PAYLOAD_MAGIC: &[u8; 4] = b"VCMT";
 const INDEX_CHECKPOINT_MAGIC: &[u8; 4] = b"VIDX";
 const INDEX_CHECKPOINT_VERSION: u16 = 3;
-const MANIFEST_PAYLOAD_VERSION: u16 = 4;
+const MANIFEST_PAYLOAD_VERSION: u16 = 5;
 const WRITER_LOCK_MAGIC: &str = "varve-lock-v1";
 const COMPRESSION_ENVELOPE_MAGIC: &[u8; 4] = b"VCMP";
 const COMPRESSION_ENVELOPE_VERSION: u8 = 1;
@@ -208,7 +209,10 @@ impl RecordIndexEntry {
     pub fn read_payload(&self, path: &Path) -> Result<Vec<u8>> {
         let mut file = File::open(path)?;
         file.seek(SeekFrom::Start(self.payload_offset))?;
-        let mut payload = vec![0; self.payload_len as usize];
+        let payload_len = usize::try_from(self.payload_len).map_err(|_| Error::LengthOverflow {
+            value: self.payload_len,
+        })?;
+        let mut payload = vec![0; payload_len];
         file.read_exact(&mut payload)?;
         Ok(payload)
     }
@@ -385,7 +389,15 @@ impl MmapPayloads {
     }
 
     #[cfg(feature = "zero-copy")]
-    pub fn raw_fixed<T: crate::VarveRawFixedBlock>(
+    /// Returns a raw fixed block reference directly backed by the mmap snapshot.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the mapped file bytes are not mutated for the
+    /// lifetime of the returned reference, including by other handles,
+    /// threads, or processes. The block's `VarveRawFixedBlock` implementation
+    /// must also match the actual payload layout.
+    pub unsafe fn raw_fixed<T: crate::VarveRawFixedBlock>(
         &self,
         block_index: usize,
     ) -> Result<Option<&T>> {
@@ -511,7 +523,15 @@ impl MmapMatrix {
     }
 
     #[cfg(feature = "zero-copy")]
-    pub fn raw_cell<T: crate::VarveRawMatrixBlock>(&self, key: MatrixKey) -> Result<&T> {
+    /// Returns a raw matrix cell reference directly backed by the mmap snapshot.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the mapped file bytes are not mutated for the
+    /// lifetime of the returned reference, including by other handles,
+    /// threads, or processes. The block's `VarveRawMatrixBlock` implementation
+    /// must also match the actual slot layout.
+    pub unsafe fn raw_cell<T: crate::VarveRawMatrixBlock>(&self, key: MatrixKey) -> Result<&T> {
         if T::KIND != BlockKind::Matrix {
             return Err(Error::ZeroCopyBlockKindMismatch { actual: T::KIND });
         }
@@ -908,6 +928,10 @@ impl VarveWriter {
 
     pub fn commit(&mut self) -> Result<AppendInfo> {
         self.file.commit()
+    }
+
+    pub fn commit_durable(&mut self) -> Result<AppendInfo> {
+        self.file.commit_durable()
     }
 
     pub fn sync(&mut self) -> Result<()> {
@@ -1450,8 +1474,18 @@ impl VarveFile {
         }
 
         let sequence = self.next_sequence();
-        let checksum = checksum(self.spec, &payload)?;
         let entry = &mut self.index[target_position];
+        let header = RecordHeaderFields {
+            block_id: entry.block_id,
+            block_version: entry.block_version,
+            flags: entry.flags,
+            sequence,
+            payload_len: entry.payload_len,
+            checksum: 0,
+            uncompressed_len_hint: entry.uncompressed_len_hint,
+        };
+        let checksum =
+            checksum_record_fields(self.spec, entry.record_offset, header, &payload, &[])?;
         entry.sequence = sequence;
         entry.checksum = checksum;
         self.file.seek(SeekFrom::Start(entry.record_offset))?;
@@ -1459,15 +1493,7 @@ impl VarveFile {
             &mut self.file,
             self.spec,
             entry.record_offset,
-            RecordHeaderFields {
-                block_id: entry.block_id,
-                block_version: entry.block_version,
-                flags: entry.flags,
-                sequence,
-                payload_len: entry.payload_len,
-                checksum,
-                uncompressed_len_hint: entry.uncompressed_len_hint,
-            },
+            RecordHeaderFields { checksum, ..header },
         )?;
         self.file.seek(SeekFrom::Start(entry.payload_offset))?;
         self.file.write_all(&payload)?;
@@ -1508,7 +1534,6 @@ impl VarveFile {
                 updated.sequence = sequence;
                 updated.flags = replacement.flags;
                 updated.payload_len = payload.len() as u64;
-                updated.checksum = checksum(self.spec, &payload)?;
                 updated.uncompressed_len_hint = replacement.uncompressed_len_hint;
             }
             records.push((updated, payload));
@@ -1522,18 +1547,23 @@ impl VarveFile {
         let mut new_index = Vec::with_capacity(records.len());
         for (mut entry, payload) in records {
             let offset = temp_file.stream_position()?;
+            let header = RecordHeaderFields {
+                block_id: entry.block_id,
+                block_version: entry.block_version,
+                flags: entry.flags,
+                sequence: entry.sequence,
+                payload_len: payload.len() as u64,
+                checksum: 0,
+                uncompressed_len_hint: entry.uncompressed_len_hint,
+            };
+            entry.checksum = checksum_record_fields(self.spec, offset, header, &payload, &[])?;
             write_record_header(
                 &mut temp_file,
                 self.spec,
                 offset,
                 RecordHeaderFields {
-                    block_id: entry.block_id,
-                    block_version: entry.block_version,
-                    flags: entry.flags,
-                    sequence: entry.sequence,
-                    payload_len: payload.len() as u64,
                     checksum: entry.checksum,
-                    uncompressed_len_hint: entry.uncompressed_len_hint,
+                    ..header
                 },
             )?;
             temp_file.write_all(&payload)?;
@@ -1610,6 +1640,36 @@ impl VarveFile {
         self.write_commit_marker()
     }
 
+    pub fn commit_durable(&mut self) -> Result<AppendInfo> {
+        self.ensure_write()?;
+        if !self.spec.commit_policy.is_transaction_marker() {
+            return Err(Error::InvalidFormatSpec(
+                "commit markers require transaction_marker commit policy",
+            ));
+        }
+        self.write_embedded_manifest_if_needed()?;
+        if self.spec.index_policy.checkpoint_on_flush && self.needs_index_checkpoint() {
+            self.write_index_checkpoint()?;
+        }
+        if !self.has_uncommitted_since_last_commit()
+            && let Some(entry) = self
+                .index
+                .iter()
+                .rev()
+                .find(|entry| entry.block_id == COMMIT_BLOCK_ID)
+        {
+            self.file.flush()?;
+            self.file.sync_all()?;
+            return Ok(AppendInfo::from(entry));
+        }
+        self.file.flush()?;
+        self.file.sync_data()?;
+        let info = self.write_commit_marker()?;
+        self.file.flush()?;
+        self.file.sync_all()?;
+        Ok(info)
+    }
+
     pub fn sync(&mut self) -> Result<()> {
         self.file.sync_all()?;
         Ok(())
@@ -1654,9 +1714,50 @@ impl VarveFile {
     pub fn keyed_blocks<T>(&self) -> Result<KeyedBlockVec<T::Key, T>>
     where
         T: VarveKeyedBlock,
+        T::Key: Eq + Hash + Clone,
     {
-        let blocks = self.blocks::<T>()?;
-        KeyedBlockVec::build(blocks)
+        crate::collections::ensure_registered_block::<T>(self.spec)?;
+        let mut entries = Vec::new();
+        let mut by_key: HashMap<T::Key, RecordIndexEntry> = HashMap::new();
+        for entry in &self.index {
+            match entry.block_id {
+                id if id == T::ID => {
+                    if entry.block_version != T::VERSION {
+                        return Err(Error::BlockVersionMismatch {
+                            block_id: T::ID,
+                            expected: T::VERSION,
+                            actual: entry.block_version,
+                        });
+                    }
+                    let payload = entry.read_logical_payload(self.spec, &self.path)?;
+                    let block: T =
+                        decode_from_slice(&payload, T::ENDIAN.unwrap_or(self.spec.endian))?;
+                    let key = block.key();
+                    let should_replace = by_key
+                        .get(&key)
+                        .is_none_or(|old| entry.sequence > old.sequence);
+                    if should_replace {
+                        by_key.insert(key, entry.clone());
+                    }
+                    entries.push(entry.clone());
+                }
+                TOMBSTONE_BLOCK_ID => {
+                    let payload = entry.read_payload(&self.path)?;
+                    if let Some(key) = decode_internal_key_payload::<T>(self.spec.endian, &payload)?
+                    {
+                        let should_remove = by_key
+                            .get(&key)
+                            .is_none_or(|old| entry.sequence > old.sequence);
+                        if should_remove {
+                            by_key.remove(&key);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let blocks = BlockVec::new(self.spec, self.path.clone(), entries);
+        Ok(KeyedBlockVec::from_parts(blocks, by_key))
     }
 
     pub fn materialized_keyed_blocks<T>(&self) -> Result<HashMap<T::Key, T>>
@@ -2120,20 +2221,23 @@ impl VarveFile {
         } else {
             None
         };
-        let checksum = checksum_record_bytes(self.spec, payload, footer.as_deref().unwrap_or(&[]))?;
+        let header = RecordHeaderFields {
+            block_id,
+            block_version,
+            flags,
+            sequence,
+            payload_len: payload.len() as u64,
+            checksum: 0,
+            uncompressed_len_hint,
+        };
+        let footer_bytes = footer.as_deref().unwrap_or(&[]);
+        let checksum =
+            checksum_record_fields(self.spec, record_offset, header, payload, footer_bytes)?;
         write_record_header(
             &mut self.file,
             self.spec,
             record_offset,
-            RecordHeaderFields {
-                block_id,
-                block_version,
-                flags,
-                sequence,
-                payload_len: payload.len() as u64,
-                checksum,
-                uncompressed_len_hint,
-            },
+            RecordHeaderFields { checksum, ..header },
         )?;
         self.file.write_all(payload)?;
         let footer_offset = if let Some(footer) = footer {
@@ -2327,7 +2431,7 @@ fn decode_schema_manifest(payload: &[u8]) -> Result<SchemaManifest> {
         (None, CompressionPolicy::None)
     };
     let block_count = cursor.read_u32()? as usize;
-    let mut blocks = Vec::with_capacity(block_count);
+    let mut blocks = Vec::new();
     for _ in 0..block_count {
         let id = cursor.read_u32()?;
         let version = cursor.read_u16()?;
@@ -2336,7 +2440,7 @@ fn decode_schema_manifest(payload: &[u8]) -> Result<SchemaManifest> {
         let name = cursor.read_string(name_len)?;
         let fields = if payload_version >= 2 {
             let field_count = cursor.read_u32()? as usize;
-            let mut fields = Vec::with_capacity(field_count);
+            let mut fields = Vec::new();
             for _ in 0..field_count {
                 let id = cursor.read_u32()?;
                 let wire_type = wire_type_from_byte(cursor.read_u8()?)?;
@@ -2531,6 +2635,7 @@ fn integrity_policy_byte(policy: IntegrityPolicy) -> u8 {
     match policy {
         IntegrityPolicy::None => 1,
         IntegrityPolicy::Crc32 => 2,
+        IntegrityPolicy::Crc32WithHeader => 3,
     }
 }
 
@@ -2538,6 +2643,7 @@ fn integrity_policy_from_byte(value: u8) -> Result<IntegrityPolicy> {
     match value {
         1 => Ok(IntegrityPolicy::None),
         2 => Ok(IntegrityPolicy::Crc32),
+        3 => Ok(IntegrityPolicy::Crc32WithHeader),
         _ => Err(Error::InvalidSchemaManifest),
     }
 }
@@ -3166,7 +3272,9 @@ where
     }
     let mut len = [0; 8];
     len.copy_from_slice(&payload[4..12]);
-    let key_len = u64::from_le_bytes(len) as usize;
+    let key_len = usize::try_from(u64::from_le_bytes(len)).map_err(|_| Error::LengthOverflow {
+        value: u64::from_le_bytes(len),
+    })?;
     let key_start: usize = 12;
     let key_end = key_start.checked_add(key_len).ok_or(Error::UnexpectedEof)?;
     if key_end > payload.len() {
@@ -3207,7 +3315,10 @@ where
     }
     let mut key_len = [0; 8];
     key_len.copy_from_slice(&payload[4..12]);
-    let key_len = u64::from_le_bytes(key_len) as usize;
+    let key_len_value = u64::from_le_bytes(key_len);
+    let key_len = usize::try_from(key_len_value).map_err(|_| Error::LengthOverflow {
+        value: key_len_value,
+    })?;
     let key_start: usize = 12;
     let key_end = key_start.checked_add(key_len).ok_or(Error::UnexpectedEof)?;
     let op_len_end = key_end.checked_add(8).ok_or(Error::UnexpectedEof)?;
@@ -3217,7 +3328,10 @@ where
     let key = decode_from_slice(&payload[key_start..key_end], endian)?;
     let mut op_len = [0; 8];
     op_len.copy_from_slice(&payload[key_end..op_len_end]);
-    let op_len = u64::from_le_bytes(op_len) as usize;
+    let op_len_value = u64::from_le_bytes(op_len);
+    let op_len = usize::try_from(op_len_value).map_err(|_| Error::LengthOverflow {
+        value: op_len_value,
+    })?;
     let op_start = op_len_end;
     let op_end = op_start.checked_add(op_len).ok_or(Error::UnexpectedEof)?;
     if op_end > payload.len() {
@@ -3356,9 +3470,27 @@ fn read_record_entry_at(
         None
     };
 
-    if spec.integrity_policy == IntegrityPolicy::Crc32 {
+    if matches!(
+        spec.integrity_policy,
+        IntegrityPolicy::Crc32 | IntegrityPolicy::Crc32WithHeader
+    ) {
         let payload = entry.read_payload_file(file)?;
-        let expected = checksum_record_bytes(spec, &payload, footer.as_deref().unwrap_or(&[]))?;
+        let header = RecordHeaderFields {
+            block_id: entry.block_id,
+            block_version: entry.block_version,
+            flags: entry.flags,
+            sequence: entry.sequence,
+            payload_len: entry.payload_len,
+            checksum: 0,
+            uncompressed_len_hint: entry.uncompressed_len_hint,
+        };
+        let expected = checksum_record_fields(
+            spec,
+            entry.record_offset,
+            header,
+            &payload,
+            footer.as_deref().unwrap_or(&[]),
+        )?;
         if expected != entry.checksum {
             if spec.commit_policy.is_transaction_marker() && allow_tail {
                 if recovery_policy == RecoveryPolicy::TruncateTail {
@@ -3711,7 +3843,10 @@ fn scan_records_from(
 impl RecordIndexEntry {
     fn read_payload_file(&self, file: &mut File) -> Result<Vec<u8>> {
         file.seek(SeekFrom::Start(self.payload_offset))?;
-        let mut payload = vec![0; self.payload_len as usize];
+        let payload_len = usize::try_from(self.payload_len).map_err(|_| Error::LengthOverflow {
+            value: self.payload_len,
+        })?;
+        let mut payload = vec![0; payload_len];
         file.read_exact(&mut payload)?;
         Ok(payload)
     }
@@ -3770,14 +3905,41 @@ fn decode_record_footer(
     decode_native_record_footer(bytes, footer_offset, record_offset)
 }
 
-fn checksum(spec: FormatSpec, payload: &[u8]) -> Result<u32> {
-    checksum_record_bytes(spec, payload, &[])
+fn checksum_record_fields(
+    spec: FormatSpec,
+    record_offset: u64,
+    mut header: RecordHeaderFields,
+    payload: &[u8],
+    footer: &[u8],
+) -> Result<u32> {
+    header.checksum = 0;
+    let header_bytes = if spec.integrity_policy == IntegrityPolicy::Crc32WithHeader {
+        Some(encode_native_record_header(
+            header,
+            record_offset,
+            record_footer_len(spec),
+        )?)
+    } else {
+        None
+    };
+    checksum_record_bytes(
+        spec,
+        header_bytes.as_ref().map(|bytes| &bytes[..]).unwrap_or(&[]),
+        payload,
+        footer,
+    )
 }
 
-fn checksum_record_bytes(spec: FormatSpec, payload: &[u8], footer: &[u8]) -> Result<u32> {
+fn checksum_record_bytes(
+    spec: FormatSpec,
+    header: &[u8],
+    payload: &[u8],
+    footer: &[u8],
+) -> Result<u32> {
     match spec.integrity_policy {
         IntegrityPolicy::None => Ok(0),
-        IntegrityPolicy::Crc32 => crc32_record_bytes(payload, footer),
+        IntegrityPolicy::Crc32 => crc32_record_bytes(&[], payload, footer),
+        IntegrityPolicy::Crc32WithHeader => crc32_record_bytes(header, payload, footer),
     }
 }
 
@@ -4019,15 +4181,16 @@ fn crc32_bytes(_payload: &[u8]) -> Result<u32> {
 }
 
 #[cfg(feature = "integrity")]
-fn crc32_record_bytes(payload: &[u8], footer: &[u8]) -> Result<u32> {
+fn crc32_record_bytes(header: &[u8], payload: &[u8], footer: &[u8]) -> Result<u32> {
     let mut hasher = crc32fast::Hasher::new();
+    hasher.update(header);
     hasher.update(payload);
     hasher.update(footer);
     Ok(hasher.finalize())
 }
 
 #[cfg(not(feature = "integrity"))]
-fn crc32_record_bytes(_payload: &[u8], _footer: &[u8]) -> Result<u32> {
+fn crc32_record_bytes(_header: &[u8], _payload: &[u8], _footer: &[u8]) -> Result<u32> {
     Err(Error::IntegrityFeatureDisabled)
 }
 

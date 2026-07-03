@@ -203,7 +203,7 @@ Varve supports three append-log commit modes:
 | `commit: none` | records are visible after their complete header/payload is readable |
 | `record_footer` | each visible record must have a valid footer |
 | `transaction_marker(on_flush)` | `flush()` appends a marker; readers see marker-covered records |
-| `transaction_marker(explicit)` | only `commit()` appends a marker |
+| `transaction_marker(explicit)` | only `commit()` or `commit_durable()` appends a marker |
 
 Offset chains use `VARVE3` footers to link previous records with the same block
 id and, for keyed generated writers, previous records with the same key.
@@ -216,6 +216,9 @@ id and, for keyed generated writers, previous records with the same key.
 - `flush()` pushes buffered Varve records and writes configured checkpoint,
   manifest, or transaction marker records.
 - `sync()` asks the operating system to durably persist the file.
+- `commit()` writes a logical explicit marker but does not imply fsync.
+- `commit_durable()` flushes/syncs covered data before writing and syncing the
+  explicit marker.
 - matrix durable helpers provide stronger ordered sync semantics only when you
   call them explicitly.
 
@@ -284,8 +287,10 @@ same as VMAT-native chunked matrix storage.
 ## Integrity And Recovery
 
 With `integrity: crc32`, Varve validates record payload CRCs. In `VARVE3`, the
-CRC covers payload plus footer. Matrix CRC additionally covers metadata tables,
-commit maps, and committed slots.
+CRC covers payload plus footer. With `integrity: crc32_with_header`, the native
+record header is included too, with the checksum field normalized to zero.
+Matrix CRC additionally covers metadata tables, commit maps, and committed
+slots.
 
 CRC is corruption detection, not authentication. It does not protect against a
 malicious writer that can recompute checksums.

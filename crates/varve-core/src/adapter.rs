@@ -1,5 +1,5 @@
 use std::fs;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -743,7 +743,7 @@ fn fingerprint_file(path: &Path) -> Result<u64> {
         if read == 0 {
             break;
         }
-        buffer[..read].hash(&mut hasher);
+        hasher.write(&buffer[..read]);
     }
     Ok(hasher.finish())
 }

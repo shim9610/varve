@@ -50,7 +50,7 @@ file.flush()?;
 
 Read modes:
 
-- `keyed_blocks::<T>()` gives put-only keyed lookup.
+- `keyed_blocks::<T>()` gives latest-put keyed lookup after tombstones.
 - `materialized_keyed_blocks::<T>()` applies same-file puts, ops, and
   tombstones into final keyed state.
 

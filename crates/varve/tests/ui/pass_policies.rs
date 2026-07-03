@@ -36,6 +36,16 @@ varve_format! {
     }
 }
 
+varve_format! {
+    pub struct HeaderCrcPolicyFormat {
+        magic: b"HCRC";
+        version: 1;
+        endian: little;
+        integrity: crc32_with_header;
+        blocks: [PolicyBlock];
+    }
+}
+
 fn main() {
     let spec = PolicyFormat::spec();
     assert_eq!(spec.version, 2);
@@ -43,6 +53,10 @@ fn main() {
     assert_eq!(spec.schema_hash, 42);
     assert_eq!(spec.extension, Some("vrv"));
     assert_eq!(spec.integrity_policy, IntegrityPolicy::Crc32);
+    assert_eq!(
+        HeaderCrcPolicyFormat::spec().integrity_policy,
+        IntegrityPolicy::Crc32WithHeader
+    );
     assert_eq!(spec.index_policy, IndexPolicy::CheckpointOnFlush);
     assert_eq!(spec.recovery_policy, RecoveryPolicy::TruncateTail);
     assert_eq!(spec.manifest_policy, ManifestPolicy::Embedded);

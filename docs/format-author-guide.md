@@ -251,19 +251,36 @@ payload windows expose stored compressed bytes. Typed reads through
 `blocks::<T>()`, migration reads, and merge/materialization return decompressed
 logical values.
 
+## Length Limits And Caller Policy
+
+Varve defines the wire contract and generated reader/writer shape; it does not
+know every domain's safe maximum string, vector, map, chunk, or decompressed
+payload size. Built-in codecs avoid avoidable allocation-before-validation, but
+format authors should still enforce domain limits in custom codecs, adapters,
+compression `max_len`, or caller validation.
+
+For caller-managed compressed blobs, prefer
+`ChunkedBytes::decode_to_vec_limited(limit)` over unbounded decoding when the
+limit is part of the format contract.
+
 ## Integrity Policy
 
 `integrity: none` performs structural parsing only. It does not detect payload
 bit flips unless decoding happens to fail.
 
 `integrity: crc32` validates each record payload when the `integrity` feature is
-enabled. Header fields are not part of the CRC in v0.1. In `VARVE3` files, the
-record CRC covers the stored payload plus the record footer, so commit/offset
-metadata is validated with the payload. Checkpoint payload CRC mismatches are
-fatal; recovery truncates incomplete tails but does not hide complete CRC
-mismatches in visible records. Transaction-marker readers may ignore corrupt
-tail after the latest valid marker because that tail is not part of the reader
-snapshot.
+enabled. In `VARVE3` files, the record CRC covers the stored payload plus the
+record footer, so commit/offset metadata is validated with the payload.
+
+`integrity: crc32_with_header` additionally covers the native 32-byte record
+header with the checksum field normalized to zero. Use it when block id,
+version, flags, sequence, payload length, or length hints must be protected by
+the record checksum too.
+
+Checkpoint payload CRC mismatches are fatal; recovery truncates incomplete
+tails but does not hide complete CRC mismatches in visible records.
+Transaction-marker readers may ignore corrupt tail after the latest valid
+marker because that tail is not part of the reader snapshot.
 
 ## Commit And Offset Chains
 
@@ -272,6 +289,10 @@ stores a footer after each record and treats a valid footer as that record's
 commit flag. `commit: transaction_marker(on_flush);` writes an internal marker
 on `flush`, while `transaction_marker(explicit)` writes one only when
 `commit()` is called.
+
+`commit()` is a logical visibility marker, not a hidden fsync. Use
+`commit_durable()` when records covered by an explicit marker must be flushed
+and synced before the marker is published and synced.
 
 Offset chains are enabled through `index`:
 

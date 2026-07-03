@@ -298,13 +298,13 @@ fn zero_copy_raw_fixed_successfully_views_canonical_little_endian_payload() -> v
     let file = MmapFormat::open_readonly(&path)?;
     let mmap = file.mmap_payloads()?;
     assert_eq!(
-        mmap.raw_fixed::<RawPoint>(0)?,
+        unsafe { mmap.raw_fixed::<RawPoint>(0) }?,
         Some(&RawPoint {
             x: 0x1122_3344,
             y: 0x5566_7788
         })
     );
-    assert!(mmap.raw_fixed::<RawPoint>(1)?.is_none());
+    assert!(unsafe { mmap.raw_fixed::<RawPoint>(1) }?.is_none());
 
     cleanup(&path);
     Ok(())
@@ -326,7 +326,7 @@ fn zero_copy_rejects_variable_raw_block() -> varve::Result<()> {
     let mmap = file.mmap_payloads()?;
 
     assert!(matches!(
-        mmap.raw_fixed::<RawVariable>(0),
+        unsafe { mmap.raw_fixed::<RawVariable>(0) },
         Err(Error::ZeroCopyBlockKindMismatch {
             actual: BlockKind::Variable
         })
@@ -352,7 +352,7 @@ fn zero_copy_rejects_raw_endian_mismatch() -> varve::Result<()> {
     let mmap = file.mmap_payloads()?;
 
     assert!(matches!(
-        mmap.raw_fixed::<BigEndianRawPoint>(0),
+        unsafe { mmap.raw_fixed::<BigEndianRawPoint>(0) },
         Err(Error::ZeroCopyEndianMismatch {
             expected: Endian::Little,
             actual: Endian::Big
@@ -379,7 +379,7 @@ fn zero_copy_rejects_raw_payload_size_mismatch() -> varve::Result<()> {
     let mmap = file.mmap_payloads()?;
 
     assert!(matches!(
-        mmap.raw_fixed::<SizeMismatchRawPoint>(0),
+        unsafe { mmap.raw_fixed::<SizeMismatchRawPoint>(0) },
         Err(Error::ZeroCopyPayloadSizeMismatch {
             expected: 4,
             actual: 8

@@ -388,6 +388,32 @@ fn materialized_keyed_blocks_apply_same_file_ops_and_tombstones() -> varve::Resu
 }
 
 #[test]
+fn keyed_blocks_hide_same_file_tombstoned_keys() -> varve::Result<()> {
+    let path = temp_path("keyed_blocks_tombstone");
+    cleanup(&path);
+
+    {
+        let mut file = TestFormat::create(&path)?;
+        file.push(&User {
+            user_id: 12,
+            region: 82,
+            name: "remove".to_string(),
+        })?;
+        file.delete::<User>(&(12, 82))?;
+        file.flush()?;
+    }
+
+    let file = TestFormat::open_readonly(&path)?;
+    let users = file.keyed_blocks::<User>()?;
+    assert_eq!(users.len(), 0);
+    assert_eq!(users.get(&(12, 82))?, None);
+    assert_eq!(users.as_blocks().len(), 1);
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
 fn compact_keyed_file_writes_only_final_keyed_state() -> varve::Result<()> {
     let input = temp_path("compact_input");
     let output = temp_path("compact_output");

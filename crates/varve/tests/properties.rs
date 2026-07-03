@@ -207,6 +207,7 @@ proptest! {
                     }
                     KeyedStep::Delete { key } => {
                         file.delete::<PropUser>(&key).unwrap();
+                        last_put.remove(&key);
                         materialized.remove(&key);
                     }
                 }

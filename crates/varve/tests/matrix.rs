@@ -1052,7 +1052,7 @@ fn matrix_zero_copy_raw_cell_views_committed_slot() -> varve::Result<()> {
     {
         let reader = spec.open_reader(&path)?;
         let mmap = reader.mmap_matrix()?;
-        let raw = mmap.raw_cell::<RawMatrixCell>(key)?;
+        let raw = unsafe { mmap.raw_cell::<RawMatrixCell>(key) }?;
         assert_eq!(u32::from_le_bytes(raw.bytes), 1234);
     }
 

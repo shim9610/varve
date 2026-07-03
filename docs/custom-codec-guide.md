@@ -106,8 +106,16 @@ unsafe impl varve::VarveRawFixedBlock for RawPoint {
 }
 ```
 
-Default typed reads do not use this path. Callers opt in through
-`file.mmap_payloads()?.raw_fixed::<RawPoint>(index)`.
+Default typed reads do not use this path. Callers opt in through unsafe raw
+access:
+
+```rust
+let mmap = file.mmap_payloads()?;
+let point = unsafe { mmap.raw_fixed::<RawPoint>(index) }?;
+```
+
+The unsafe call requires the mapped file bytes to remain immutable for the
+returned reference lifetime.
 
 ## Performance Check
 

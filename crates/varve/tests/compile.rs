@@ -6,6 +6,7 @@ fn macro_compile_contracts() {
     tests.pass("tests/ui/pass_format_dsl.rs");
     tests.pass("tests/ui/pass_matrix_aux.rs");
     tests.pass("tests/ui/pass_layout.rs");
+    tests.pass("tests/ui/pass_macro_hygiene.rs");
     tests.compile_fail("tests/ui/fail_duplicate_id.rs");
     tests.compile_fail("tests/ui/fail_duplicate_field_id.rs");
     tests.compile_fail("tests/ui/fail_zero_field_id.rs");
@@ -23,4 +24,6 @@ fn macro_compile_contracts() {
     tests.compile_fail("tests/ui/fail_fixed_default.rs");
     tests.compile_fail("tests/ui/fail_inline_empty_key.rs");
     tests.compile_fail("tests/ui/fail_matrix_unbounded_field.rs");
+    tests.compile_fail("tests/ui/fail_duplicate_format_key.rs");
+    tests.compile_fail("tests/ui/fail_generic_derive.rs");
 }

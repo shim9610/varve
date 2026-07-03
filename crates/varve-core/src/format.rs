@@ -74,6 +74,7 @@ pub struct MatrixAuxDescriptor {
 pub enum IntegrityPolicy {
     None,
     Crc32,
+    Crc32WithHeader,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1508,6 +1509,7 @@ const fn integrity_policy_hash_byte(policy: IntegrityPolicy) -> u8 {
     match policy {
         IntegrityPolicy::None => 1,
         IntegrityPolicy::Crc32 => 2,
+        IntegrityPolicy::Crc32WithHeader => 3,
     }
 }
 

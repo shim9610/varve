@@ -63,7 +63,7 @@ scan, and decode files.
 | `preset` | `varve_native` or `none`. | Omitted means native unless a custom layout is declared. `none` lets the declared layout own byte zero. |
 | `index` | `scan_on_open`, `checkpoint_on_flush`, or a list. | Offset-chain indexes are written automatically in `VARVE3` footers. |
 | `commit` | `none`, `record_footer`, `transaction_marker(on_flush)`, `transaction_marker(explicit)`, or matrix `cell_bitmap`. | Controls reader visibility and writer tail behavior. |
-| `integrity` | `none` or `crc32`. | `crc32` requires the `integrity` Cargo feature for actual validation. It detects corruption, not malicious tampering. |
+| `integrity` | `none`, `crc32`, or `crc32_with_header`. | CRC modes require the `integrity` Cargo feature for actual validation. They detect corruption, not malicious tampering. |
 | `recovery` | `strict` or `truncate_tail`. | Recovery truncation is explicit through recovery open APIs. Read-only open never truncates. |
 | `manifest` | `none` or `embedded`. | Embedded manifests are diagnostics/debug metadata. The static spec remains authoritative. |
 | `compression` | `none` or `variable_blocks(...)`. | Applies after variable-block canonical encoding. Requires `compression-zstd` when using zstd. |
@@ -383,7 +383,8 @@ zstd-compressed records.
 
 `integrity: crc32` enables payload corruption detection when the `integrity`
 feature is enabled. In `VARVE3`, the CRC covers stored payload plus footer.
-Header fields are structurally parsed but not included in the v0.1 CRC.
+`integrity: crc32_with_header` also covers the native record header with the
+checksum field normalized to zero.
 
 CRC32 is not authentication. It detects accidental corruption; it does not stop
 a malicious writer from recomputing checksums.
