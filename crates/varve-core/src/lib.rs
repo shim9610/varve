@@ -1,3 +1,5 @@
+#![forbid(unsafe_op_in_unsafe_fn)]
+
 mod adapter;
 mod chunks;
 mod codec;

@@ -1,3 +1,5 @@
+#![forbid(unsafe_op_in_unsafe_fn)]
+
 pub use varve_core::*;
 pub use varve_macros::{VarveBlock, varve_format};
 

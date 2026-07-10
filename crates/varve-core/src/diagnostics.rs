@@ -746,6 +746,8 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::LayoutRepeatedOnceSegment { .. }
         | Error::LayoutSegmentIndexOutOfBounds { .. }
         | Error::AdapterDiagnostic(_)
+        | Error::InvalidAdapterExtension(_)
+        | Error::SequenceExhausted
         | Error::ZeroCopyBlockKindMismatch { .. }
         | Error::ZeroCopyEndianMismatch { .. }
         | Error::ZeroCopyPayloadSizeMismatch { .. }
@@ -755,9 +757,11 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
             DiagnosticDomain::FeatureGate
         }
 
-        Error::Io(_) | Error::WriterLockHeld(_) | Error::WriterLockMalformed(_) => {
-            DiagnosticDomain::Environment
-        }
+        Error::Io(_)
+        | Error::WriterLockHeld(_)
+        | Error::WriterLockMalformed(_)
+        | Error::WriterPoisoned(_)
+        | Error::WriteRollbackFailed { .. } => DiagnosticDomain::Environment,
 
         Error::InvalidMagic
         | Error::UnsupportedContainer
@@ -766,6 +770,8 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::LengthOverflow { .. }
         | Error::InvalidUtf8
         | Error::TrailingBytes { .. }
+        | Error::InvalidCanonicalEncoding(_)
+        | Error::LimitExceeded { .. }
         | Error::MissingField { .. }
         | Error::WireTypeMismatch { .. }
         | Error::UnknownWireType(_)

@@ -15,12 +15,13 @@ version = "0.1.0"
 
 [workspace.dependencies]
 crc32fast = "1.5.0"
-memmap2 = "0.9.10"
+memmap2 = "0.9.11"
 proc-macro2 = "1.0.106"
 proptest = "1.11.0"
-quote = "1.0.45"
-syn = { version = "2.0.117", features = ["full", "extra-traits"] }
+quote = "1.0.46"
+syn = { version = "2.0.118", features = ["full", "extra-traits"] }
+tempfile = "3.27.0"
 thiserror = "2.0.18"
-trybuild = "1.0.116"
-zerocopy = "=0.8.48"
+trybuild = "1.0.117"
+zerocopy = "0.8.54"
 zstd = "0.13.3"

@@ -5,6 +5,7 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("io error: {0}")]
     Io(#[from] io::Error),
@@ -35,6 +36,16 @@ pub enum Error {
 
     #[error("decoder left {remaining} trailing bytes")]
     TrailingBytes { remaining: usize },
+
+    #[error("invalid canonical encoding: {0}")]
+    InvalidCanonicalEncoding(&'static str),
+
+    #[error("{resource} length {actual} exceeds limit {limit}")]
+    LimitExceeded {
+        resource: &'static str,
+        actual: u64,
+        limit: u64,
+    },
 
     #[error("missing required field {field} ({field_id})")]
     MissingField { field: &'static str, field_id: u32 },
@@ -136,6 +147,19 @@ pub enum Error {
 
     #[error("writer lock break was refused for {0}")]
     WriterLockBreakRefused(String),
+
+    #[error("append record sequence is exhausted")]
+    SequenceExhausted,
+
+    #[error("{0} writer is poisoned after an uncertain write failure")]
+    WriterPoisoned(&'static str),
+
+    #[error("failed to roll back {operation}: {source}")]
+    WriteRollbackFailed {
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
 
     #[error("merge op referenced a missing target")]
     MissingMergeTarget,
@@ -294,6 +318,9 @@ pub enum Error {
 
     #[error("adapter invalid length {value}")]
     AdapterInvalidLength { value: u64 },
+
+    #[error("invalid adapter file extension {0:?}")]
+    InvalidAdapterExtension(String),
 
     #[error("adapter diagnostic: {0}")]
     AdapterDiagnostic(&'static str),
