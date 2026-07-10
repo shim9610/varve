@@ -14,11 +14,16 @@ wave.
   `offset = slot_region_start + ordinal * slot_stride`.
 - Slot payloads are fixed-stride, bounded, canonical encoded values.
 - Commit bitmaps are the only normal read-time validity source.
-- Readers snapshot layout metadata and commit maps on open.
+- Readers snapshot layout metadata and commit maps on open. Slot bytes remain
+  live in-place storage, so VMAT v1 does not promise immutable concurrent reads
+  across an overwrite of the same slot.
 - Same-size overwrite writes the existing slot range and must not change file
   length.
-- A same-size cell overwrite clears that cell's commit bit; callers must commit
-  the replacement payload before normal reads expose it again.
+- A same-size cell overwrite clears that cell's commit bit and CRC-valid evidence
+  before writing the replacement slot; callers must commit the replacement
+  payload before a newly opened reader exposes it again.
+- Partial matrix I/O leaves the cell uncommitted and poisons the writer. Bitmap
+  state is published in memory only after the corresponding disk write succeeds.
 - Append-log blocks may coexist after matrix regions; scanning starts at
   `VMAT.append_log_start`.
 - Generated API exposes format dims, cell key types, `create_writer_with_dims`,
@@ -102,8 +107,9 @@ Current implementation status:
 - `PackedBitmap` provides the LSB-first packed bitmap primitive.
 - `matrix_cell_payload` exposes checked positional slot payload reads for view
   builders.
-- With the `mmap` feature, `mmap_matrix()` exposes committed matrix slot
-  payload windows from a read-only snapshot.
+- With the `mmap` feature, unsafe `mmap_matrix()` exposes committed matrix slot
+  payload windows from a read-only snapshot. The caller keeps the backing file
+  immutable and valid through every handle and process for the mapping lifetime.
 - `MmapMatrix::cell_numeric` and `cell_numeric_at` provide safe endian-aware
   numeric scalar reads from checked committed payload windows.
 - With the `zero-copy` feature, `VarveRawMatrixBlock` allows explicit raw matrix

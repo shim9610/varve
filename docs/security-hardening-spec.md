@@ -79,8 +79,9 @@ coordinated additions are:
 - `LimitExceeded { resource, actual, limit }`;
 - `SequenceExhausted`;
 - `WriterPoisoned(&'static str)`;
-- `WriteRollbackFailed { operation, source }`; and
-- `InvalidAdapterExtension(String)`.
+- `WriteRollbackFailed { operation, source }`;
+- `InvalidAdapterExtension(String)`;
+- `MatrixCommitQuarantined(String)`.
 
 This one-time transition and the mmap `unsafe` qualifiers are the only
 allowlisted source breaks against `f7a9369`.
@@ -195,4 +196,3 @@ rejection applies only to bytes that canonical writers could not produce.
   tests
 - release performance comparison with the frozen method in
   `security-hardening-validation.md`
-

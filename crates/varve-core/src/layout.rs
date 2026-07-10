@@ -207,6 +207,7 @@ pub struct LayoutWriter {
     path: PathBuf,
     file: File,
     segment_counts: Vec<SegmentCount>,
+    poisoned: bool,
     _lock: crate::file::WriterLock,
 }
 
@@ -400,6 +401,7 @@ impl LayoutWriter {
             path,
             file,
             segment_counts: initial_segment_counts(spec)?,
+            poisoned: false,
             _lock: lock,
         })
     }
@@ -418,6 +420,7 @@ impl LayoutWriter {
             path,
             file,
             segment_counts,
+            poisoned: false,
             _lock: lock,
         })
     }
@@ -454,116 +457,167 @@ impl LayoutWriter {
         M: FnOnce(&mut dyn Write) -> Result<()>,
         R: FnOnce(&mut dyn Write) -> Result<()>,
     {
+        self.ensure_not_poisoned()?;
         let descriptor = segment_descriptor(self.spec, segment.name)?;
         self.ensure_segment_can_write(descriptor)?;
-        ensure_no_unexpected_fields_for(descriptor.lead_in.fields, segment.fields)?;
         let footer_fields = descriptor.footer.map(|footer| footer.fields).unwrap_or(&[]);
-        ensure_no_unexpected_fields_for(footer_fields, segment.footer_fields)?;
-
-        let segment_start = self.file.seek(SeekFrom::End(0))?;
-        let mut patches = Vec::new();
-        write_patchable_layout_fields(
-            &mut self.file,
+        prevalidate_patchable_layout_fields(
             descriptor.lead_in.fields,
             segment.fields,
             self.spec.endian,
-            &mut patches,
         )?;
-
+        prevalidate_patchable_layout_fields(
+            footer_fields,
+            segment.footer_fields,
+            self.spec.endian,
+        )?;
         let lead_in_len = descriptor_lead_in_len(descriptor)?;
+        let footer_len = descriptor_footer_len(descriptor)?;
+        let original_eof = self.file.metadata()?.len();
+        let original_cursor = self.file.stream_position()?;
         let after_lead_in =
-            segment_start
+            original_eof
                 .checked_add(lead_in_len)
                 .ok_or(Error::LayoutInvalidSegmentBounds {
-                    offset: segment_start,
+                    offset: original_eof,
                 })?;
-        let metadata_offset = after_lead_in;
-        let mut metadata_writer = CountingWriter::new(&mut self.file);
-        (segment.write_metadata)(&mut metadata_writer)?;
-        let metadata_len = metadata_writer.bytes_written();
-        let raw_offset =
-            metadata_offset
-                .checked_add(metadata_len)
-                .ok_or(Error::LayoutInvalidSegmentBounds {
-                    offset: segment_start,
-                })?;
-        let mut raw_writer = CountingWriter::new(&mut self.file);
-        (segment.write_raw)(&mut raw_writer)?;
-        let raw_len = raw_writer.bytes_written();
-        let footer_offset =
-            raw_offset
-                .checked_add(raw_len)
-                .ok_or(Error::LayoutInvalidSegmentBounds {
-                    offset: segment_start,
-                })?;
-        if let Some(footer) = descriptor.footer {
+        after_lead_in
+            .checked_add(footer_len)
+            .ok_or(Error::LayoutInvalidSegmentBounds {
+                offset: original_eof,
+            })?;
+        let (segment_count_index, original_segment_count, next_segment_count) =
+            self.segment_count_checkpoint(descriptor.name)?;
+
+        self.poisoned = true;
+        let result = (|| {
+            self.file.seek(SeekFrom::Start(original_eof))?;
+            let segment_start = original_eof;
+            let mut patches = Vec::new();
             write_patchable_layout_fields(
                 &mut self.file,
-                footer.fields,
-                segment.footer_fields,
+                descriptor.lead_in.fields,
+                segment.fields,
                 self.spec.endian,
                 &mut patches,
             )?;
-        }
-        let footer_len = descriptor_footer_len(descriptor)?;
-        let footer_end =
-            footer_offset
-                .checked_add(footer_len)
-                .ok_or(Error::LayoutInvalidSegmentBounds {
+            let metadata_offset = after_lead_in;
+            let mut metadata_writer = CountingWriter::new(&mut self.file);
+            (segment.write_metadata)(&mut metadata_writer)?;
+            let metadata_len = metadata_writer.bytes_written();
+            let raw_offset = metadata_offset.checked_add(metadata_len).ok_or(
+                Error::LayoutInvalidSegmentBounds {
                     offset: segment_start,
-                })?;
-        let segment_end = footer_end;
-        let anchors = Anchors {
-            segment_start,
-            after_lead_in,
-            metadata_start: metadata_offset,
-            raw_region_start: raw_offset,
-            segment_end,
-            footer_start: footer_offset,
-            footer_end,
-        };
-        let fields =
-            collect_written_layout_values(descriptor.lead_in.fields, segment.fields, anchors)?;
-        let footer_fields = descriptor
-            .footer
-            .map(|footer| {
-                collect_written_layout_values(footer.fields, segment.footer_fields, anchors)
+                },
+            )?;
+            let mut raw_writer = CountingWriter::new(&mut self.file);
+            (segment.write_raw)(&mut raw_writer)?;
+            let raw_len = raw_writer.bytes_written();
+            let footer_offset =
+                raw_offset
+                    .checked_add(raw_len)
+                    .ok_or(Error::LayoutInvalidSegmentBounds {
+                        offset: segment_start,
+                    })?;
+            if let Some(footer) = descriptor.footer {
+                write_patchable_layout_fields(
+                    &mut self.file,
+                    footer.fields,
+                    segment.footer_fields,
+                    self.spec.endian,
+                    &mut patches,
+                )?;
+            }
+            let footer_end =
+                footer_offset
+                    .checked_add(footer_len)
+                    .ok_or(Error::LayoutInvalidSegmentBounds {
+                        offset: segment_start,
+                    })?;
+            let segment_end = footer_end;
+            let anchors = Anchors {
+                segment_start,
+                after_lead_in,
+                metadata_start: metadata_offset,
+                raw_region_start: raw_offset,
+                segment_end,
+                footer_start: footer_offset,
+                footer_end,
+            };
+            let fields =
+                collect_written_layout_values(descriptor.lead_in.fields, segment.fields, anchors)?;
+            let footer_fields = descriptor
+                .footer
+                .map(|footer| {
+                    collect_written_layout_values(footer.fields, segment.footer_fields, anchors)
+                })
+                .unwrap_or_else(|| Ok(Vec::new()))?;
+
+            for patch in patches {
+                let value = finalized_value(patch.field, anchors)?;
+                self.file.seek(SeekFrom::Start(patch.offset))?;
+                write_layout_value(&mut self.file, patch.field, &value, self.spec.endian)?;
+            }
+            self.file.seek(SeekFrom::Start(segment_end))?;
+
+            Ok(LayoutSegmentInfo {
+                name: descriptor.name,
+                fields,
+                footer_fields,
+                segment_start,
+                lead_in_len,
+                metadata_offset,
+                metadata_len,
+                raw_offset,
+                raw_len,
+                footer_offset,
+                footer_len,
+                segment_end,
             })
-            .unwrap_or_else(|| Ok(Vec::new()))?;
+        })();
 
-        for patch in patches {
-            let value = finalized_value(patch.field, anchors)?;
-            self.file.seek(SeekFrom::Start(patch.offset))?;
-            write_layout_value(&mut self.file, patch.field, &value, self.spec.endian)?;
+        match result {
+            Ok(info) => {
+                self.segment_counts[segment_count_index].count = next_segment_count;
+                self.poisoned = false;
+                Ok(info)
+            }
+            Err(error) => {
+                if let Err(source) = self.rollback_segment_write(
+                    original_eof,
+                    original_cursor,
+                    segment_count_index,
+                    original_segment_count,
+                ) {
+                    return Err(Error::WriteRollbackFailed {
+                        operation: "layout segment write",
+                        source,
+                    });
+                }
+                self.poisoned = false;
+                Err(error)
+            }
         }
-        self.file.seek(SeekFrom::Start(segment_end))?;
-
-        let info = LayoutSegmentInfo {
-            name: descriptor.name,
-            fields,
-            footer_fields,
-            segment_start,
-            lead_in_len,
-            metadata_offset,
-            metadata_len,
-            raw_offset,
-            raw_len,
-            footer_offset,
-            footer_len,
-            segment_end,
-        };
-        self.increment_segment_count(descriptor.name);
-        Ok(info)
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        self.ensure_not_poisoned()?;
         self.file.flush()?;
         Ok(())
     }
 
     pub fn sync(&mut self) -> Result<()> {
+        self.ensure_not_poisoned()?;
         self.file.sync_all()?;
         Ok(())
+    }
+
+    fn ensure_not_poisoned(&self) -> Result<()> {
+        if self.poisoned {
+            Err(Error::WriterPoisoned("layout"))
+        } else {
+            Ok(())
+        }
     }
 
     fn ensure_segment_can_write(&self, descriptor: SegmentDescriptor) -> Result<()> {
@@ -581,13 +635,37 @@ impl LayoutWriter {
         Ok(())
     }
 
-    fn increment_segment_count(&mut self, name: &'static str) {
-        if let Some(count) = self
+    fn segment_count_checkpoint(&self, name: &'static str) -> Result<(usize, u64, u64)> {
+        let (index, count) = self
             .segment_counts
-            .iter_mut()
-            .find(|count| count.name == name)
-        {
-            count.count += 1;
+            .iter()
+            .enumerate()
+            .find(|(_, count)| count.name == name)
+            .map(|(index, count)| (index, count.count))
+            .ok_or(Error::InvalidFormatSpec("layout segment count is missing"))?;
+        let next = count
+            .checked_add(1)
+            .ok_or(Error::InvalidFormatSpec("layout segment count overflow"))?;
+        Ok((index, count, next))
+    }
+
+    fn rollback_segment_write(
+        &mut self,
+        original_eof: u64,
+        original_cursor: u64,
+        segment_count_index: usize,
+        original_segment_count: u64,
+    ) -> io::Result<()> {
+        self.segment_counts[segment_count_index].count = original_segment_count;
+        let truncate_error = self.file.set_len(original_eof).err();
+        let seek_error = self
+            .file
+            .seek(SeekFrom::Start(original_cursor))
+            .map(|_| ())
+            .err();
+        match truncate_error.or(seek_error) {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 }
@@ -729,7 +807,7 @@ fn inspect_native_layout_file<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Resu
         .index_entries()
         .iter()
         .map(native_record_to_layout_segment)
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(LayoutFileInfo {
         plan: spec.effective_layout(),
         file_header_len,
@@ -843,10 +921,11 @@ fn read_u64_from_header(bytes: &[u8], position: &mut usize) -> Result<u64> {
     Ok(u64::from_le_bytes(value))
 }
 
-fn native_record_to_layout_segment(entry: &crate::file::RecordIndexEntry) -> LayoutSegmentInfo {
-    let footer_offset = entry
-        .footer_offset
-        .unwrap_or(entry.payload_offset + entry.payload_len);
+fn native_record_to_layout_segment(
+    entry: &crate::file::RecordIndexEntry,
+) -> Result<LayoutSegmentInfo> {
+    let segment_end = entry.checked_physical_end()?;
+    let footer_offset = entry.footer_offset.unwrap_or(segment_end);
     let footer_len = if entry.footer_offset.is_some() {
         crate::file::RECORD_FOOTER_LEN
     } else {
@@ -863,7 +942,7 @@ fn native_record_to_layout_segment(entry: &crate::file::RecordIndexEntry) -> Lay
             value: LayoutValue::U64(entry.prev_same_key_offset.unwrap_or(0)),
         });
     }
-    LayoutSegmentInfo {
+    Ok(LayoutSegmentInfo {
         name: "VarveRecord",
         fields: vec![
             LayoutFieldValue {
@@ -904,8 +983,8 @@ fn native_record_to_layout_segment(entry: &crate::file::RecordIndexEntry) -> Lay
         raw_len: entry.payload_len,
         footer_offset,
         footer_len,
-        segment_end: entry.physical_end(),
-    }
+        segment_end,
+    })
 }
 
 fn segment_descriptor(spec: FormatSpec, name: &str) -> Result<SegmentDescriptor> {
@@ -991,6 +1070,42 @@ fn ensure_no_unexpected_fields_for(
         });
         if !expected {
             return Err(Error::LayoutFieldUnexpected(field.name.to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn prevalidate_patchable_layout_fields(
+    descriptors: &[LayoutFieldDescriptor],
+    fields: &[LayoutFieldValue],
+    endian: Endian,
+) -> Result<()> {
+    ensure_no_unexpected_fields_for(descriptors, fields)?;
+    descriptor_fields_len(descriptors)?;
+    let mut sink = io::sink();
+    for field in descriptors {
+        match field.source {
+            LayoutFieldSource::LiteralBytes(bytes) => {
+                if !matches!(field.ty, LayoutFieldType::Bytes { len } if len == bytes.len() as u64)
+                {
+                    return Err(Error::LayoutFieldTypeMismatch(field.name));
+                }
+            }
+            LayoutFieldSource::LiteralU64(value) => {
+                write_layout_value(&mut sink, *field, &LayoutValue::U64(value), endian)?;
+            }
+            LayoutFieldSource::LiteralI64(value) => {
+                write_layout_value(&mut sink, *field, &LayoutValue::I64(value), endian)?;
+            }
+            LayoutFieldSource::Caller => {
+                let value = caller_field_value(fields, field.name)?;
+                write_layout_value(&mut sink, *field, value, endian)?;
+            }
+            LayoutFieldSource::Finalize(_) => {
+                if matches!(field.ty, LayoutFieldType::Bytes { .. }) {
+                    return Err(Error::LayoutFieldTypeMismatch(field.name));
+                }
+            }
         }
     }
     Ok(())

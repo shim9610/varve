@@ -213,6 +213,9 @@ pub enum Error {
     #[error("matrix commit category {0} is missing from the layout")]
     MatrixCommitMissing(String),
 
+    #[error("matrix commit category {0} is quarantined after integrity failure")]
+    MatrixCommitQuarantined(String),
+
     #[error("matrix key is out of bounds: scan {scan}, ch {ch}")]
     MatrixKeyOutOfBounds { scan: u64, ch: u64 },
 

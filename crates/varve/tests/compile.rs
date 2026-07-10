@@ -27,3 +27,11 @@ fn macro_compile_contracts() {
     tests.compile_fail("tests/ui/fail_duplicate_format_key.rs");
     tests.compile_fail("tests/ui/fail_generic_derive.rs");
 }
+
+#[cfg(feature = "mmap")]
+#[test]
+fn mmap_safety_contracts() {
+    let tests = trybuild::TestCases::new();
+    tests.pass("tests/ui/pass_mmap_unsafe.rs");
+    tests.compile_fail("tests/ui/fail_mmap_requires_unsafe.rs");
+}

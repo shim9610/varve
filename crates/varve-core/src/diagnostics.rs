@@ -794,6 +794,7 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::MatrixSidecarMismatch(_)
         | Error::MatrixSidecarChecksumMismatch { .. }
         | Error::MatrixChecksumMismatch { .. }
+        | Error::MatrixCommitQuarantined(_)
         | Error::InvalidMatrixLayout
         | Error::LayoutLiteralMismatch { .. }
         | Error::LayoutAmbiguousSegment { .. }

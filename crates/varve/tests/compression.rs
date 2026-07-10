@@ -217,13 +217,16 @@ fn mmap_windows_expose_physical_compressed_payloads() -> varve::Result<()> {
     }
 
     let file = RecordCompressionFormat::open_readonly(&path)?;
-    let mmap = file.mmap_payloads()?;
+    // SAFETY: The fixture is not modified while the mapping is alive.
+    let mmap = unsafe { file.mmap_payloads()? };
     let window = mmap
         .block_payload_window::<CompressibleBlock>(0)?
         .expect("compressed payload window");
     assert_eq!(&window[..4], b"VCMP");
     assert_eq!(file.blocks::<CompressibleBlock>()?.get(0)?, Some(value));
 
+    drop(mmap);
+    drop(file);
     cleanup(&path);
     Ok(())
 }

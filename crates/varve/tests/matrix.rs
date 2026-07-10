@@ -1005,7 +1005,8 @@ fn matrix_mmap_payload_window_is_checked_and_snapshot_based() -> varve::Result<(
 
     {
         let reader = spec.open_reader(&path)?;
-        let mmap = reader.mmap_matrix()?;
+        // SAFETY: The fixture is not modified while the mapping is alive.
+        let mmap = unsafe { reader.mmap_matrix()? };
         assert_eq!(
             mmap.cell_numeric::<MatrixCell, u32>(MatrixKey::new(0, 0))?,
             77
@@ -1051,7 +1052,8 @@ fn matrix_zero_copy_raw_cell_views_committed_slot() -> varve::Result<()> {
 
     {
         let reader = spec.open_reader(&path)?;
-        let mmap = reader.mmap_matrix()?;
+        // SAFETY: The fixture is not modified while the mapping is alive.
+        let mmap = unsafe { reader.mmap_matrix()? };
         let raw = unsafe { mmap.raw_cell::<RawMatrixCell>(key) }?;
         assert_eq!(u32::from_le_bytes(raw.bytes), 1234);
     }
@@ -1187,7 +1189,8 @@ fn matrix_slot_crc_corruption_rejects_committed_cell_read() -> varve::Result<()>
     #[cfg(feature = "mmap")]
     {
         let reader = spec.open_reader(&path)?;
-        let mmap = reader.mmap_matrix()?;
+        // SAFETY: The fixture is not modified while the mapping is alive.
+        let mmap = unsafe { reader.mmap_matrix()? };
         assert!(matches!(
             mmap.cell_payload_window::<MatrixCell>(MatrixKey::new(1, 1)),
             Err(Error::MatrixChecksumMismatch { .. })

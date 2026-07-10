@@ -114,6 +114,24 @@ Common `VarveReader` APIs:
 | `schema_manifest()` | latest embedded manifest if present |
 | `scan()` | physical record event iterator |
 
+`scan()` yields entries whose physical payload can be read through
+`RecordIndexEntry`. Use `read_payload_limited(path, physical_limit)` for a
+stored-byte ceiling and
+`read_logical_payload_limited(spec, path, physical_limit, logical_limit)` to
+bound both the stored allocation and decoded logical allocation.
+`checked_physical_end()` is the overflow-reporting extent API; `physical_end()`
+remains a saturating compatibility helper.
+
+Append sequence numbers start at `0`, including after reopening an empty file.
+After `u64::MAX` is published once, further append operations return
+`SequenceExhausted` before mutating the file. A returned append or streamed
+layout write error is rolled back to the prior EOF when possible. If rollback
+fails, the handle returns `WriteRollbackFailed`, becomes poisoned, and rejects
+later mutation, `flush`, and `sync` with `WriterPoisoned`.
+
+`varve::Error` is `#[non_exhaustive]`. Downstream exhaustive matches must keep a
+wildcard arm so new diagnostics can be added without another enum-shape break.
+
 ## Collections
 
 | Type | Meaning |
@@ -143,6 +161,11 @@ Most users get these implementations from `varve_format!` or
 `#[derive(VarveBlock)]`. Implement codecs manually only for domain-specific
 value types.
 
+Canonical booleans are encoded only as `0` or `1`; other bytes are rejected.
+Decoded `BTreeMap` and `HashMap` values reject duplicate keys instead of silently
+keeping one value. `HashMap` encoding requires `Ord` for deterministic key order
+but no longer requires `Clone`.
+
 ## Matrix API
 
 Matrix API exists on `VarveFile`, `VarveReader`, `VarveWriter`, and generated
@@ -168,6 +191,21 @@ typed wrappers.
 Lower-level matrix calls use `MatrixKey { scan, ch }`. Generated format-first
 wrappers expose block-specific key structs such as `CellKey { scan, ch }` and
 convert them into the runtime key internally.
+
+When integrity verification finds a damaged commit map, open preserves the raw
+bytes as recovery evidence but quarantines them from visibility. Cell categories
+can be rebuilt from per-slot CRC evidence; single/per-channel categories must be
+explicitly cleared. Status and value reads return
+`MatrixCommitQuarantined(category)` instead of conflating unavailable evidence
+with `NotCommitted`; writes reject the category until recovery.
+
+An overwrite withdraws the old commit and CRC-valid evidence before touching
+slot bytes. A partial I/O failure therefore leaves the slot uncommitted and
+poisons the writer; successful replacement becomes readable only after a new
+commit. Matrix layout and commit maps are snapshotted on open, but slot bytes are
+in-place storage. Do not overlap a reader with writes to slots it may read.
+Immutable concurrent matrix snapshots require a future generation/version or
+read-lease design and are not promised by VMAT v1.
 
 ## Physical Layout API
 
@@ -218,6 +256,10 @@ metadata and raw regions.
 | `LayoutReader::read_raw(index)` | read contiguous raw-region bytes for a segment |
 | `LayoutReader::read_raw_range(index, offset, len)` | read a checked raw byte range without loading the whole region |
 | `LayoutScanReport` | tolerant scan result with complete segments and optional `LayoutTailInfo` |
+
+Stream callbacks are prevalidated before the first file mutation. A returned
+callback error rolls back the partial segment when possible. A callback panic is
+not caught: unwinding leaves the writer poisoned so it cannot be reused.
 | `LayoutTailInfo` | terminal custom-layout scan status for truncated, invalid, or unmatched tails |
 
 This path is separate from `create_writer/open_reader`; native append-log APIs
@@ -340,6 +382,7 @@ formats provide their own domain codecs and models.
 | `AdapterCheckReport` | compose physical tail status and adapter diagnostics |
 | `AdapterTailStatus` | summarize expected end, available tail length, and evidence for damaged tails |
 | `AdapterInputFile` | bridge path-backed and temporary byte-backed adapter inputs |
+| `AdapterInputFile::from_bytes(ext, bytes)` | create an exclusive temporary input; clones keep it alive until the last drop |
 
 The toolkit deliberately does not define TDMS object paths, scaling, DAQmx,
 DataFrame/HDF export, or other domain semantics. See
@@ -351,16 +394,40 @@ Feature-gated APIs:
 
 | Feature | API | Meaning |
 | --- | --- | --- |
-| `mmap` | `mmap_payloads()` | mmap append-log payload windows |
-| `mmap` | `mmap_matrix()` | mmap matrix slot windows |
+| `mmap` | `unsafe mmap_payloads()` | mmap append-log payload windows |
+| `mmap` | `unsafe mmap_matrix()` | mmap matrix slot windows |
 | `mmap` | `MmapMatrix::cell_numeric::<T, N>(key)` | endian-aware numeric scalar read |
 | `zero-copy` | `unsafe MmapPayloads::raw_fixed::<T>()` | raw fixed block view |
 | `zero-copy` | `unsafe MmapMatrix::raw_cell::<T>(key)` | raw matrix cell view |
 
-Zero-copy is opt-in and requires unsafe marker traits plus unsafe raw-read
-calls. Callers must guarantee the mapped file bytes are not mutated for the
-returned reference lifetime. Normal fixed/matrix reads use owned canonical
+Creating any file-backed mapping is unsafe. For the mapping's entire lifetime,
+the caller must prevent mutation, truncation, replacement, and backing-object
+invalidation through every handle, thread, and process. The implementation
+clones the already-open file handle and validates snapshot extents, but those
+checks cannot enforce external immutability. Zero-copy adds unsafe marker-trait
+and raw-reference contracts. Normal fixed/matrix reads use owned canonical
 decoding.
+
+Once the caller establishes that external immutability boundary, the returned
+safe window APIs stay memory-safe through these enforced invariants:
+
+1. The mapping is read-only and is created from a clone of the already-open file
+   handle, so a path rename or substitution cannot redirect the mapping.
+2. Record, footer, matrix, and slot extents use checked arithmetic and are
+   validated against the actual mapped length before exposure.
+3. `MmapPayloads` owns a copied snapshot index and rejects any
+   `RecordIndexEntry` that is not exactly in that snapshot.
+4. Safe accessors perform checked slicing; configured matrix CRCs are verified
+   before committed slot bytes are returned.
+5. The mmap owner holds the mapping for its full RAII lifetime, and returned
+   slices borrow that owner, so Rust prevents them from outliving the mapping.
+6. Raw zero-copy access additionally validates registration, block kind,
+   version, endian, exact size, and alignment before creating a typed reference.
+
+This is a conditional safety proof, not a claim that Varve can police arbitrary
+external processes. If a caller cannot control every writer, it must use owned
+reads such as `blocks::<T>()`, `read_payload`, or matrix typed reads instead of
+mmap.
 
 ## Compression API
 

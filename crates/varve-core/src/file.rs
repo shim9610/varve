@@ -52,6 +52,9 @@ const FILE_COMPRESSION_VERSION: u8 = 1;
 const MATRIX_SIDECAR_MAGIC: &[u8; 4] = b"VSID";
 const MATRIX_SIDECAR_VERSION: u16 = 1;
 const MATRIX_SIDECAR_FIXED_LEN: usize = 48;
+const PHYSICAL_PAYLOAD_RESOURCE: &str = "payload";
+const LOGICAL_PAYLOAD_RESOURCE: &str = "logical payload";
+const WRITER_POISON_CONTEXT: &str = "file";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SchemaManifest {
@@ -208,13 +211,15 @@ pub struct RecordIndexEntry {
 impl RecordIndexEntry {
     pub fn read_payload(&self, path: &Path) -> Result<Vec<u8>> {
         let mut file = File::open(path)?;
-        file.seek(SeekFrom::Start(self.payload_offset))?;
-        let payload_len = usize::try_from(self.payload_len).map_err(|_| Error::LengthOverflow {
-            value: self.payload_len,
-        })?;
-        let mut payload = vec![0; payload_len];
-        file.read_exact(&mut payload)?;
-        Ok(payload)
+        self.read_payload_file(&mut file)
+    }
+
+    pub fn read_payload_limited(&self, path: &Path, limit: u64) -> Result<Vec<u8>> {
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        self.validate_payload_extent(file_len)?;
+        ensure_payload_limit(PHYSICAL_PAYLOAD_RESOURCE, self.payload_len, limit)?;
+        self.read_payload_file_validated(&mut file)
     }
 
     pub fn is_compressed(&self) -> bool {
@@ -224,6 +229,34 @@ impl RecordIndexEntry {
     pub fn read_logical_payload(&self, spec: FormatSpec, path: &Path) -> Result<Vec<u8>> {
         let payload = self.read_payload(path)?;
         decode_record_payload(spec, self, &payload)
+    }
+
+    pub fn read_logical_payload_limited(
+        &self,
+        spec: FormatSpec,
+        path: &Path,
+        physical_limit: u64,
+        logical_limit: u64,
+    ) -> Result<Vec<u8>> {
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        self.validate_payload_extent(file_len)?;
+        ensure_payload_limit(PHYSICAL_PAYLOAD_RESOURCE, self.payload_len, physical_limit)?;
+        let logical_len = self.logical_payload_len_before_allocation(spec, &mut file)?;
+        ensure_payload_limit(LOGICAL_PAYLOAD_RESOURCE, logical_len, logical_limit)?;
+        let payload = self.read_payload_file_validated(&mut file)?;
+        decode_record_payload(spec, self, &payload)
+    }
+
+    pub fn checked_physical_end(&self) -> Result<u64> {
+        self.payload_offset
+            .checked_add(self.payload_len)
+            .and_then(|end| {
+                end.checked_add(u64::from(self.footer_offset.is_some()) * RECORD_FOOTER_LEN)
+            })
+            .ok_or(Error::LengthOverflow {
+                value: self.payload_len,
+            })
     }
 
     pub fn physical_end(&self) -> u64 {
@@ -314,6 +347,93 @@ struct StoredPayload {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SequenceState {
+    Available(u64),
+    Exhausted,
+}
+
+impl SequenceState {
+    fn from_index(index: &[RecordIndexEntry]) -> Self {
+        match index.iter().map(|entry| entry.sequence).max() {
+            None => Self::Available(0),
+            Some(u64::MAX) => Self::Exhausted,
+            Some(sequence) => Self::Available(sequence + 1),
+        }
+    }
+
+    fn available(self) -> Result<u64> {
+        match self {
+            Self::Available(sequence) => Ok(sequence),
+            Self::Exhausted => Err(Error::SequenceExhausted),
+        }
+    }
+
+    fn after_publishing(sequence: u64) -> Self {
+        match sequence.checked_add(1) {
+            Some(next) => Self::Available(next),
+            None => Self::Exhausted,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AppendSnapshot {
+    eof: u64,
+    cursor: u64,
+    sequence_state: SequenceState,
+    index_len: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WriteFault {
+    #[default]
+    None,
+    AppendAfterHeader,
+    AppendAfterHeaderWithRollbackFailure,
+    RollbackFailure,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static WRITE_FAULT: std::cell::Cell<WriteFault> = const {
+        std::cell::Cell::new(WriteFault::None)
+    };
+}
+
+#[cfg(test)]
+fn inject_write_fault(fault: WriteFault) {
+    WRITE_FAULT.set(fault);
+}
+
+#[cfg(test)]
+fn fail_append_after_header_if_requested() -> std::io::Result<()> {
+    WRITE_FAULT.with(|fault| match fault.get() {
+        WriteFault::AppendAfterHeader => {
+            fault.set(WriteFault::None);
+            Err(std::io::Error::other("injected append write failure"))
+        }
+        WriteFault::AppendAfterHeaderWithRollbackFailure => {
+            fault.set(WriteFault::RollbackFailure);
+            Err(std::io::Error::other("injected append write failure"))
+        }
+        _ => Ok(()),
+    })
+}
+
+#[cfg(test)]
+fn fail_rollback_if_requested() -> std::io::Result<()> {
+    WRITE_FAULT.with(|fault| {
+        if fault.get() == WriteFault::RollbackFailure {
+            fault.set(WriteFault::None);
+            Err(std::io::Error::other("injected rollback failure"))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RecordHeaderFields {
     pub(crate) block_id: u32,
     pub(crate) block_version: u16,
@@ -337,6 +457,18 @@ pub enum ReplaceStrategy {
 }
 
 #[cfg(feature = "mmap")]
+/// A read-only mapping paired with an immutable snapshot of the validated
+/// append-log index.
+///
+/// Varve constructs this type only after mapping the already-open backing
+/// object, validating every record extent against the mapped length, and
+/// copying the index into the owner. Safe window methods accept only entries in
+/// that copied snapshot and use checked slice bounds. The mapping owns its OS
+/// mapping, so returned slices cannot outlive it.
+///
+/// These guarantees rely on the caller having upheld the unsafe constructor's
+/// requirement that the backing object remains immutable and valid for this
+/// value's full lifetime.
 #[derive(Debug)]
 pub struct MmapPayloads {
     spec: FormatSpec,
@@ -463,6 +595,17 @@ impl MmapPayloads {
 }
 
 #[cfg(feature = "mmap")]
+/// A read-only mapping paired with an immutable snapshot of a validated matrix
+/// layout.
+///
+/// Varve validates the complete matrix extent against the mapped length before
+/// constructing this type. Safe accessors use checked slot offsets and verify
+/// configured CRC evidence. The mapping owns its OS mapping, so returned slices
+/// cannot outlive it.
+///
+/// These guarantees rely on the caller having upheld the unsafe constructor's
+/// requirement that the backing object remains immutable and valid for this
+/// value's full lifetime.
 #[derive(Debug)]
 pub struct MmapMatrix {
     spec: FormatSpec,
@@ -582,6 +725,63 @@ impl MmapMatrix {
     }
 }
 
+#[cfg(feature = "mmap")]
+fn validate_mmap_range(offset: u64, len: u64, mapped_len: u64) -> Result<()> {
+    let end = offset
+        .checked_add(len)
+        .ok_or(Error::MmapPayloadOutOfBounds { offset, len })?;
+    if end > mapped_len {
+        return Err(Error::MmapPayloadOutOfBounds { offset, len });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "mmap")]
+fn validate_mmap_index_entry(entry: &RecordIndexEntry, mapped_len: u64) -> Result<()> {
+    let expected_payload_offset = entry.record_offset.checked_add(RECORD_HEADER_LEN).ok_or(
+        Error::MmapPayloadOutOfBounds {
+            offset: entry.record_offset,
+            len: RECORD_HEADER_LEN,
+        },
+    )?;
+    if entry.payload_offset != expected_payload_offset {
+        return Err(Error::MmapPayloadOutOfBounds {
+            offset: entry.record_offset,
+            len: RECORD_HEADER_LEN,
+        });
+    }
+    validate_mmap_range(entry.payload_offset, entry.payload_len, mapped_len)?;
+    let payload_end = entry.payload_offset.checked_add(entry.payload_len).ok_or(
+        Error::MmapPayloadOutOfBounds {
+            offset: entry.payload_offset,
+            len: entry.payload_len,
+        },
+    )?;
+    if let Some(footer_offset) = entry.footer_offset {
+        if footer_offset != payload_end {
+            return Err(Error::MmapPayloadOutOfBounds {
+                offset: footer_offset,
+                len: RECORD_FOOTER_LEN,
+            });
+        }
+        validate_mmap_range(footer_offset, RECORD_FOOTER_LEN, mapped_len)?;
+    }
+    let physical_end = entry
+        .checked_physical_end()
+        .map_err(|_| Error::MmapPayloadOutOfBounds {
+            offset: entry.record_offset,
+            len: u64::MAX,
+        })?;
+    let record_len =
+        physical_end
+            .checked_sub(entry.record_offset)
+            .ok_or(Error::MmapPayloadOutOfBounds {
+                offset: entry.record_offset,
+                len: u64::MAX,
+            })?;
+    validate_mmap_range(entry.record_offset, record_len, mapped_len)
+}
+
 #[derive(Debug)]
 pub struct VarveFile {
     spec: FormatSpec,
@@ -590,7 +790,8 @@ pub struct VarveFile {
     mode: OpenMode,
     index: Vec<RecordIndexEntry>,
     matrix: Option<crate::matrix::MatrixLayout>,
-    next_sequence: u64,
+    sequence_state: SequenceState,
+    poisoned: bool,
     _lock: Option<WriterLock>,
 }
 
@@ -768,13 +969,41 @@ impl VarveReader {
     }
 
     #[cfg(feature = "mmap")]
-    pub fn mmap_payloads(&self) -> Result<MmapPayloads> {
-        self.file.mmap_payloads()
+    /// Maps the file's indexed record payloads as a read-only snapshot.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prevent mutation, truncation, replacement, backing-file
+    /// invalidation, and any other modification through every handle, thread,
+    /// and process for the full lifetime of the returned mapping.
+    ///
+    /// Once that condition holds, Varve keeps safe accessors sound by cloning
+    /// the existing backing handle, creating a read-only mapping, validating
+    /// every indexed extent with checked arithmetic, rejecting entries outside
+    /// the copied snapshot, and tying every returned slice to the mapping owner.
+    /// Use owned reads instead when external immutability cannot be guaranteed.
+    pub unsafe fn mmap_payloads(&self) -> Result<MmapPayloads> {
+        // SAFETY: The caller accepts the complete file-backed mapping contract.
+        unsafe { self.file.mmap_payloads() }
     }
 
     #[cfg(feature = "mmap")]
-    pub fn mmap_matrix(&self) -> Result<MmapMatrix> {
-        self.file.mmap_matrix()
+    /// Maps the file's matrix regions as a read-only snapshot.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prevent mutation, truncation, replacement, backing-file
+    /// invalidation, and any other modification through every handle, thread,
+    /// and process for the full lifetime of the returned mapping.
+    ///
+    /// Once that condition holds, Varve keeps safe accessors sound by cloning
+    /// the existing backing handle, creating a read-only mapping, validating
+    /// the complete matrix extent, checking every requested slot, and tying
+    /// every returned slice to the mapping owner. Use owned reads instead when
+    /// external immutability cannot be guaranteed.
+    pub unsafe fn mmap_matrix(&self) -> Result<MmapMatrix> {
+        // SAFETY: The caller accepts the complete file-backed mapping contract.
+        unsafe { self.file.mmap_matrix() }
     }
 }
 
@@ -1154,7 +1383,8 @@ impl VarveFile {
             mode: OpenMode::ReadWrite,
             index: Vec::new(),
             matrix: None,
-            next_sequence: 0,
+            sequence_state: SequenceState::Available(0),
+            poisoned: false,
             _lock: Some(lock),
         };
         file.write_embedded_manifest_if_needed()?;
@@ -1188,7 +1418,8 @@ impl VarveFile {
             mode: OpenMode::ReadWrite,
             index: Vec::new(),
             matrix: Some(matrix),
-            next_sequence: 0,
+            sequence_state: SequenceState::Available(0),
+            poisoned: false,
             _lock: Some(lock),
         };
         file.write_embedded_manifest_if_needed()?;
@@ -1205,7 +1436,7 @@ impl VarveFile {
         let append_start = append_log_start(header_len, matrix.as_ref());
         let index = load_index(spec, &mut file, append_start, RecoveryPolicy::Strict)?;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
-        let next_sequence = index.iter().map(|entry| entry.sequence).max().unwrap_or(0) + 1;
+        let sequence_state = SequenceState::from_index(&index);
         Ok(Self {
             spec,
             path,
@@ -1213,7 +1444,8 @@ impl VarveFile {
             mode: OpenMode::ReadWrite,
             index,
             matrix,
-            next_sequence,
+            sequence_state,
+            poisoned: false,
             _lock: Some(lock),
         })
     }
@@ -1232,7 +1464,7 @@ impl VarveFile {
         let append_start = append_log_start(header_len, matrix.as_ref());
         let index = load_index(spec, &mut file, append_start, RecoveryPolicy::Strict)?;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
-        let next_sequence = index.iter().map(|entry| entry.sequence).max().unwrap_or(0) + 1;
+        let sequence_state = SequenceState::from_index(&index);
         Ok(Self {
             spec,
             path,
@@ -1240,7 +1472,8 @@ impl VarveFile {
             mode: OpenMode::ReadWrite,
             index,
             matrix,
-            next_sequence,
+            sequence_state,
+            poisoned: false,
             _lock: Some(lock),
         })
     }
@@ -1253,7 +1486,7 @@ impl VarveFile {
         let matrix = read_matrix_layout_if_needed(spec, &mut file, header_len)?;
         let append_start = append_log_start(header_len, matrix.as_ref());
         let index = load_index(spec, &mut file, append_start, RecoveryPolicy::Strict)?;
-        let next_sequence = index.iter().map(|entry| entry.sequence).max().unwrap_or(0) + 1;
+        let sequence_state = SequenceState::from_index(&index);
         Ok(Self {
             spec,
             path,
@@ -1261,7 +1494,8 @@ impl VarveFile {
             mode: OpenMode::ReadOnly,
             index,
             matrix,
-            next_sequence,
+            sequence_state,
+            poisoned: false,
             _lock: None,
         })
     }
@@ -1285,7 +1519,7 @@ impl VarveFile {
         let index = load_index(spec, &mut file, append_start, spec.recovery_policy)?;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
         let recovered_len = file.metadata()?.len();
-        let next_sequence = index.iter().map(|entry| entry.sequence).max().unwrap_or(0) + 1;
+        let sequence_state = SequenceState::from_index(&index);
         let records_preserved = index.len();
         Ok((
             Self {
@@ -1295,7 +1529,8 @@ impl VarveFile {
                 mode: OpenMode::ReadWrite,
                 index,
                 matrix,
-                next_sequence,
+                sequence_state,
+                poisoned: false,
                 _lock: Some(lock),
             },
             RecoveryReport {
@@ -1473,8 +1708,8 @@ impl VarveFile {
             });
         }
 
-        let sequence = self.next_sequence();
-        let entry = &mut self.index[target_position];
+        let sequence = self.sequence_state.available()?;
+        let entry = &self.index[target_position];
         let header = RecordHeaderFields {
             block_id: entry.block_id,
             block_version: entry.block_version,
@@ -1486,17 +1721,28 @@ impl VarveFile {
         };
         let checksum =
             checksum_record_fields(self.spec, entry.record_offset, header, &payload, &[])?;
+        let header_bytes = encode_native_record_header(
+            RecordHeaderFields { checksum, ..header },
+            entry.record_offset,
+            record_footer_len(self.spec),
+        )?;
+        let record_offset = entry.record_offset;
+        let payload_offset = entry.payload_offset;
+        self.file.seek(SeekFrom::Start(record_offset))?;
+        let write_result = (|| -> std::io::Result<()> {
+            self.file.write_all(&header_bytes)?;
+            self.file.seek(SeekFrom::Start(payload_offset))?;
+            self.file.write_all(&payload)
+        })();
+        if let Err(error) = write_result {
+            self.poisoned = true;
+            return Err(Error::Io(error));
+        }
+
+        let entry = &mut self.index[target_position];
         entry.sequence = sequence;
         entry.checksum = checksum;
-        self.file.seek(SeekFrom::Start(entry.record_offset))?;
-        write_record_header(
-            &mut self.file,
-            self.spec,
-            entry.record_offset,
-            RecordHeaderFields { checksum, ..header },
-        )?;
-        self.file.seek(SeekFrom::Start(entry.payload_offset))?;
-        self.file.write_all(&payload)?;
+        self.publish_sequence(sequence);
         Ok(sequence)
     }
 
@@ -1517,7 +1763,7 @@ impl VarveFile {
             .nth(index)
             .map(|(position, _)| position)
             .ok_or(Error::UnexpectedEof)?;
-        let sequence = self.next_sequence;
+        let sequence = self.sequence_state.available()?;
         let endian = T::ENDIAN.unwrap_or(self.spec.endian);
         let replacement = encode_to_vec(block, endian)?;
         let replacement = prepare_user_record_payload(self.spec, T::ID, T::KIND, &replacement)?;
@@ -1568,7 +1814,12 @@ impl VarveFile {
             )?;
             temp_file.write_all(&payload)?;
             entry.record_offset = offset;
-            entry.payload_offset = offset + native_record_header_len();
+            entry.payload_offset =
+                offset
+                    .checked_add(native_record_header_len())
+                    .ok_or(Error::LengthOverflow {
+                        value: payload.len() as u64,
+                    })?;
             entry.payload_len = payload.len() as u64;
             new_index.push(entry);
         }
@@ -1581,9 +1832,16 @@ impl VarveFile {
             return Err(error);
         }
 
-        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        let reopened = match OpenOptions::new().read(true).write(true).open(&self.path) {
+            Ok(file) => file,
+            Err(error) => {
+                self.poisoned = true;
+                return Err(Error::Io(error));
+            }
+        };
+        self.file = reopened;
         self.index = new_index;
-        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.publish_sequence(sequence);
         Ok(sequence)
     }
 
@@ -1600,6 +1858,7 @@ impl VarveFile {
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        self.ensure_not_poisoned()?;
         self.write_embedded_manifest_if_needed()?;
         if self.mode == OpenMode::ReadWrite
             && self.spec.index_policy.checkpoint_on_flush
@@ -1671,6 +1930,7 @@ impl VarveFile {
     }
 
     pub fn sync(&mut self) -> Result<()> {
+        self.ensure_not_poisoned()?;
         self.file.sync_all()?;
         Ok(())
     }
@@ -1822,8 +2082,11 @@ impl VarveFile {
         value: &T,
     ) -> Result<()> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::write_cell(self.spec, matrix, &mut self.file, key, value)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::write_cell(self.spec, matrix, &mut self.file, key, value)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn write_matrix_cell_payload<T: VarveMatrixBlock>(
@@ -1832,8 +2095,11 @@ impl VarveFile {
         payload: &[u8],
     ) -> Result<()> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::write_cell_payload::<T>(self.spec, matrix, &mut self.file, key, payload)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::write_cell_payload::<T>(self.spec, matrix, &mut self.file, key, payload)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn copy_matrix_cell_bytes_from<From, To>(
@@ -1878,9 +2144,11 @@ impl VarveFile {
         F: FnOnce(MatrixCommitEvent) -> Result<()>,
     {
         self.write_matrix_cell(key, value)?;
-        barrier.sync_matrix_data(&mut self.file)?;
+        let sync_data = barrier.sync_matrix_data(&mut self.file);
+        self.poison_after_started_matrix_error(sync_data)?;
         self.commit_matrix_cell::<T>(key)?;
-        barrier.sync_matrix_commit(&mut self.file)?;
+        let sync_commit = barrier.sync_matrix_commit(&mut self.file);
+        self.poison_after_started_matrix_error(sync_commit)?;
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
         let event = crate::matrix::commit_event::<T>(self.spec, matrix, key)?;
         hook(event)
@@ -1908,8 +2176,11 @@ impl VarveFile {
 
     pub fn write_matrix_aux(&mut self, name: &str, offset: u64, payload: &[u8]) -> Result<()> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::write_aux(matrix, &mut self.file, name, offset, payload)
+        let result = {
+            let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::write_aux(matrix, &mut self.file, name, offset, payload)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn matrix_cell_status<T: VarveMatrixBlock>(
@@ -1922,26 +2193,38 @@ impl VarveFile {
 
     pub fn commit_matrix_cell<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<()> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::commit_cell::<T>(self.spec, matrix, &mut self.file, key)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::commit_cell::<T>(self.spec, matrix, &mut self.file, key)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn clear_matrix_cell<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<()> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::clear_cell::<T>(self.spec, matrix, &mut self.file, key)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::clear_cell::<T>(self.spec, matrix, &mut self.file, key)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn clear_matrix_cell_by_category(&mut self, category: &str, key: MatrixKey) -> Result<()> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::clear_cell_by_category(self.spec, matrix, &mut self.file, category, key)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::clear_cell_by_category(self.spec, matrix, &mut self.file, category, key)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn clear_matrix_category(&mut self, category: &str) -> Result<u64> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::clear_category(self.spec, matrix, &mut self.file, category)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::clear_category(self.spec, matrix, &mut self.file, category)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn apply_matrix_recovery_action(&mut self, action: &MatrixRecoveryAction) -> Result<()> {
@@ -1963,8 +2246,11 @@ impl VarveFile {
 
     pub fn rebuild_matrix_commit_from_crc<T: VarveMatrixBlock>(&mut self) -> Result<u64> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::rebuild_commit_map_from_crc::<T>(self.spec, matrix, &mut self.file)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::rebuild_commit_map_from_crc::<T>(self.spec, matrix, &mut self.file)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn is_matrix_single_committed(&self, name: &str) -> Result<bool> {
@@ -1974,8 +2260,11 @@ impl VarveFile {
 
     pub fn set_matrix_single_committed(&mut self, name: &str, value: bool) -> Result<()> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::set_single_committed(matrix, &mut self.file, name, value)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::set_single_committed(matrix, &mut self.file, name, value)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn is_matrix_channel_committed(&self, name: &str, channel: u64) -> Result<bool> {
@@ -1990,8 +2279,11 @@ impl VarveFile {
         value: bool,
     ) -> Result<()> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::set_channel_committed(matrix, &mut self.file, name, channel, value)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::set_channel_committed(matrix, &mut self.file, name, channel, value)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn matrix_resume_signal(&self, category: &str) -> Result<MatrixResumeSignal> {
@@ -2095,12 +2387,31 @@ impl VarveFile {
     }
 
     #[cfg(feature = "mmap")]
-    pub fn mmap_payloads(&self) -> Result<MmapPayloads> {
-        let file = File::open(&self.path)?;
-        // Mmap access is opt-in and read-only. Varve keeps owned canonical
-        // decoding as the default path and treats this mapping as a snapshot
-        // of the file/index at the time this method is called.
+    /// Maps the file's indexed record payloads as a read-only snapshot.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prevent mutation, truncation, replacement, backing-file
+    /// invalidation, and any other modification through every handle, thread,
+    /// and process for the full lifetime of the returned mapping. The mapping
+    /// remains tied to this already-open backing object even if its path is
+    /// renamed or replaced.
+    ///
+    /// Once that condition holds, Varve keeps safe accessors sound by creating
+    /// a read-only mapping from a clone of the existing handle, validating every
+    /// indexed extent with checked arithmetic, rejecting entries outside the
+    /// copied snapshot, and tying every returned slice to the mapping owner.
+    /// Use owned reads instead when external immutability cannot be guaranteed.
+    pub unsafe fn mmap_payloads(&self) -> Result<MmapPayloads> {
+        let file = self.file.try_clone()?;
+        // SAFETY: The caller guarantees that the cloned backing object remains
+        // immutable and valid for the mapping's entire lifetime.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let mapped_len =
+            u64::try_from(mmap.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+        for entry in &self.index {
+            validate_mmap_index_entry(entry, mapped_len)?;
+        }
         let entry_set = self.index.iter().cloned().collect();
         let mut by_block: HashMap<u32, Vec<usize>> = HashMap::new();
         for (position, entry) in self.index.iter().enumerate() {
@@ -2116,16 +2427,34 @@ impl VarveFile {
     }
 
     #[cfg(feature = "mmap")]
-    pub fn mmap_matrix(&self) -> Result<MmapMatrix> {
+    /// Maps the file's matrix regions as a read-only snapshot.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prevent mutation, truncation, replacement, backing-file
+    /// invalidation, and any other modification through every handle, thread,
+    /// and process for the full lifetime of the returned mapping. The mapping
+    /// remains tied to this already-open backing object even if its path is
+    /// renamed or replaced.
+    ///
+    /// Once that condition holds, Varve keeps safe accessors sound by creating
+    /// a read-only mapping from a clone of the existing handle, validating the
+    /// complete matrix extent, checking every requested slot, and tying every
+    /// returned slice to the mapping owner. Use owned reads instead when
+    /// external immutability cannot be guaranteed.
+    pub unsafe fn mmap_matrix(&self) -> Result<MmapMatrix> {
         let layout = self
             .matrix
             .as_ref()
             .ok_or(Error::MatrixLayoutMissing)?
             .clone();
-        let file = File::open(&self.path)?;
-        // Matrix mmap is a read-only snapshot of the current file contents and
-        // VMAT layout, separate from append-log payload mmap windows.
+        let file = self.file.try_clone()?;
+        // SAFETY: The caller guarantees that the cloned backing object remains
+        // immutable and valid for the mapping's entire lifetime.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let mapped_len =
+            u64::try_from(mmap.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+        validate_mmap_range(0, layout.append_log_start(), mapped_len)?;
         Ok(MmapMatrix {
             spec: self.spec,
             layout,
@@ -2134,6 +2463,7 @@ impl VarveFile {
     }
 
     fn ensure_write(&self) -> Result<()> {
+        self.ensure_not_poisoned()?;
         match self.mode {
             OpenMode::ReadWrite => Ok(()),
             OpenMode::ReadOnly => Err(Error::Io(std::io::Error::new(
@@ -2143,6 +2473,28 @@ impl VarveFile {
         }
     }
 
+    fn ensure_not_poisoned(&self) -> Result<()> {
+        if self.poisoned {
+            Err(Error::WriterPoisoned(WRITER_POISON_CONTEXT))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn finish_matrix_mutation<T>(&mut self, result: Result<T>) -> Result<T> {
+        if matches!(&result, Err(Error::Io(_))) {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn poison_after_started_matrix_error<T>(&mut self, result: Result<T>) -> Result<T> {
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
     fn ensure_user_block<T: VarveBlock>(&self) -> Result<()> {
         if T::ID >= RESERVED_BLOCK_ID_START {
             return Err(Error::ReservedBlockId(T::ID));
@@ -2150,10 +2502,9 @@ impl VarveFile {
         Ok(())
     }
 
-    fn next_sequence(&mut self) -> u64 {
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        sequence
+    fn publish_sequence(&mut self, sequence: u64) {
+        debug_assert_eq!(self.sequence_state, SequenceState::Available(sequence));
+        self.sequence_state = SequenceState::after_publishing(sequence);
     }
 
     fn write_record(
@@ -2196,9 +2547,22 @@ impl VarveFile {
         payload: &[u8],
         prev_same_key_offset: Option<u64>,
     ) -> Result<AppendInfo> {
-        let sequence = self.next_sequence();
-        self.file.seek(SeekFrom::End(0))?;
-        let record_offset = self.file.stream_position()?;
+        self.ensure_write()?;
+        let sequence = self.sequence_state.available()?;
+        let snapshot = AppendSnapshot {
+            eof: self.file.metadata()?.len(),
+            cursor: self.file.stream_position()?,
+            sequence_state: self.sequence_state,
+            index_len: self.index.len(),
+        };
+        let record_offset = snapshot.eof;
+        let payload_len = payload.len() as u64;
+        let payload_offset = record_offset
+            .checked_add(RECORD_HEADER_LEN)
+            .ok_or(Error::LengthOverflow { value: payload_len })?;
+        let payload_end = payload_offset
+            .checked_add(payload_len)
+            .ok_or(Error::LengthOverflow { value: payload_len })?;
         let prev_same_block_offset = if self.spec.index_policy.block_offset_chain {
             self.index
                 .iter()
@@ -2226,27 +2590,41 @@ impl VarveFile {
             block_version,
             flags,
             sequence,
-            payload_len: payload.len() as u64,
+            payload_len,
             checksum: 0,
             uncompressed_len_hint,
         };
         let footer_bytes = footer.as_deref().unwrap_or(&[]);
         let checksum =
             checksum_record_fields(self.spec, record_offset, header, payload, footer_bytes)?;
-        write_record_header(
-            &mut self.file,
-            self.spec,
-            record_offset,
+        let header_bytes = encode_native_record_header(
             RecordHeaderFields { checksum, ..header },
+            record_offset,
+            record_footer_len(self.spec),
         )?;
-        self.file.write_all(payload)?;
-        let footer_offset = if let Some(footer) = footer {
-            let footer_offset = record_offset + RECORD_HEADER_LEN + payload.len() as u64;
-            self.file.write_all(&footer)?;
-            Some(footer_offset)
+        let footer_offset = if footer.is_some() {
+            payload_end
+                .checked_add(RECORD_FOOTER_LEN)
+                .ok_or(Error::LengthOverflow { value: payload_len })?;
+            Some(payload_end)
         } else {
             None
         };
+        let write_result = (|| -> Result<()> {
+            self.file.seek(SeekFrom::Start(record_offset))?;
+            self.file.write_all(&header_bytes)?;
+            #[cfg(test)]
+            fail_append_after_header_if_requested()?;
+            self.file.write_all(payload)?;
+            if let Some(footer) = &footer {
+                self.file.write_all(footer)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            return Err(self.rollback_append(snapshot, error));
+        }
+
         let committed =
             !self.spec.commit_policy.is_transaction_marker() || block_id == COMMIT_BLOCK_ID;
         let entry = RecordIndexEntry {
@@ -2255,8 +2633,8 @@ impl VarveFile {
             flags,
             sequence,
             record_offset,
-            payload_offset: record_offset + RECORD_HEADER_LEN,
-            payload_len: payload.len() as u64,
+            payload_offset,
+            payload_len,
             checksum,
             uncompressed_len_hint,
             footer_offset,
@@ -2266,12 +2644,33 @@ impl VarveFile {
         };
         let info = AppendInfo::from(&entry);
         self.index.push(entry);
+        self.publish_sequence(sequence);
         Ok(info)
     }
 
+    fn rollback_append(&mut self, snapshot: AppendSnapshot, operation_error: Error) -> Error {
+        self.index.truncate(snapshot.index_len);
+        self.sequence_state = snapshot.sequence_state;
+
+        #[cfg(test)]
+        let truncate_result =
+            fail_rollback_if_requested().and_then(|()| self.file.set_len(snapshot.eof));
+        #[cfg(not(test))]
+        let truncate_result = self.file.set_len(snapshot.eof);
+        let cursor_result = self.file.seek(SeekFrom::Start(snapshot.cursor)).map(|_| ());
+        if let Some(source) = truncate_result.err().or_else(|| cursor_result.err()) {
+            self.poisoned = true;
+            Error::WriteRollbackFailed {
+                operation: "append record",
+                source,
+            }
+        } else {
+            operation_error
+        }
+    }
+
     fn write_index_checkpoint(&mut self) -> Result<u64> {
-        self.file.seek(SeekFrom::End(0))?;
-        let covered_offset = self.file.stream_position()?;
+        let covered_offset = self.file.metadata()?.len();
         let mut payload = Vec::new();
         let entries: Vec<_> = self.index.iter().collect();
         payload.extend_from_slice(INDEX_CHECKPOINT_MAGIC);
@@ -3441,7 +3840,10 @@ fn read_record_entry_at(
     allow_tail: bool,
     recovery_policy: RecoveryPolicy,
 ) -> Result<Option<RecordIndexEntry>> {
-    if file_len - offset < RECORD_HEADER_LEN {
+    if file_len
+        .checked_sub(offset)
+        .is_none_or(|remaining| remaining < RECORD_HEADER_LEN)
+    {
         return handle_structural_tail(file, offset, allow_tail, recovery_policy);
     }
     file.seek(SeekFrom::Start(offset))?;
@@ -3474,7 +3876,7 @@ fn read_record_entry_at(
         spec.integrity_policy,
         IntegrityPolicy::Crc32 | IntegrityPolicy::Crc32WithHeader
     ) {
-        let payload = entry.read_payload_file(file)?;
+        let payload = entry.read_payload_file_with_len(file, file_len)?;
         let header = RecordHeaderFields {
             block_id: entry.block_id,
             block_version: entry.block_version,
@@ -3503,7 +3905,7 @@ fn read_record_entry_at(
     }
 
     if entry.block_id == COMMIT_BLOCK_ID {
-        let payload = entry.read_payload_file(file)?;
+        let payload = entry.read_payload_file_with_len(file, file_len)?;
         if payload != COMMIT_PAYLOAD_MAGIC {
             return Err(Error::InvalidCommitMarker { offset });
         }
@@ -3542,11 +3944,14 @@ fn truncate_uncommitted_tail_if_needed(
     if !spec.commit_policy.is_transaction_marker() {
         return Ok(());
     }
-    let committed_end = entries
+    let committed_end = match entries
         .iter()
         .rev()
         .find(|entry| entry.block_id == COMMIT_BLOCK_ID)
-        .map_or(header_len, RecordIndexEntry::physical_end);
+    {
+        Some(entry) => entry.checked_physical_end()?,
+        None => header_len,
+    };
     if file.metadata()?.len() > committed_end {
         file.set_len(committed_end)?;
     }
@@ -3579,7 +3984,7 @@ fn find_latest_valid_checkpoint(
         if entry.block_id == INDEX_BLOCK_ID
             && (1..=INDEX_CHECKPOINT_VERSION).contains(&entry.block_version)
         {
-            let payload = entry.read_payload_file(file)?;
+            let payload = entry.read_payload_file_with_len(file, file_len)?;
             if let Ok(checkpoint) = decode_index_checkpoint(&payload)
                 && validate_index_checkpoint(
                     spec,
@@ -3595,7 +4000,11 @@ fn find_latest_valid_checkpoint(
                 latest = Some(checkpoint);
             }
         }
-        offset = entry.physical_end();
+        offset = entry
+            .checked_physical_end()
+            .map_err(|_| Error::CorruptTail {
+                offset: entry.record_offset,
+            })?;
         prefix_entries.push(entry);
     }
     Ok(latest)
@@ -3744,14 +4153,20 @@ fn validate_index_checkpoint(
 
     let mut previous_offset = header_len;
     for entry in &checkpoint.entries {
+        let expected_payload_offset = entry
+            .record_offset
+            .checked_add(RECORD_HEADER_LEN)
+            .ok_or(Error::InvalidIndexCheckpoint)?;
         if entry.record_offset < header_len
             || entry.record_offset < previous_offset
-            || entry.payload_offset != entry.record_offset + RECORD_HEADER_LEN
+            || entry.payload_offset != expected_payload_offset
             || entry.record_offset == checkpoint_record.record_offset
         {
             return Err(Error::InvalidIndexCheckpoint);
         }
-        let physical_end = entry.physical_end();
+        let physical_end = entry
+            .checked_physical_end()
+            .map_err(|_| Error::InvalidIndexCheckpoint)?;
         if physical_end > checkpoint.covered_offset || physical_end > file_len {
             return Err(Error::InvalidIndexCheckpoint);
         }
@@ -3819,7 +4234,11 @@ fn scan_records_from(
                 }
                 Err(error) => return Err(error),
             };
-        offset = entry.physical_end();
+        offset = entry
+            .checked_physical_end()
+            .map_err(|_| Error::CorruptTail {
+                offset: entry.record_offset,
+            })?;
         if entry.block_id == COMMIT_BLOCK_ID {
             latest_commit_position = Some(entries.len());
         }
@@ -3842,6 +4261,16 @@ fn scan_records_from(
 
 impl RecordIndexEntry {
     fn read_payload_file(&self, file: &mut File) -> Result<Vec<u8>> {
+        let file_len = file.metadata()?.len();
+        self.read_payload_file_with_len(file, file_len)
+    }
+
+    fn read_payload_file_with_len(&self, file: &mut File, file_len: u64) -> Result<Vec<u8>> {
+        self.validate_payload_extent(file_len)?;
+        self.read_payload_file_validated(file)
+    }
+
+    fn read_payload_file_validated(&self, file: &mut File) -> Result<Vec<u8>> {
         file.seek(SeekFrom::Start(self.payload_offset))?;
         let payload_len = usize::try_from(self.payload_len).map_err(|_| Error::LengthOverflow {
             value: self.payload_len,
@@ -3849,6 +4278,79 @@ impl RecordIndexEntry {
         let mut payload = vec![0; payload_len];
         file.read_exact(&mut payload)?;
         Ok(payload)
+    }
+
+    fn validate_payload_extent(&self, file_len: u64) -> Result<()> {
+        let payload_end =
+            self.payload_offset
+                .checked_add(self.payload_len)
+                .ok_or(Error::LengthOverflow {
+                    value: self.payload_len,
+                })?;
+        if payload_end > file_len {
+            return Err(Error::UnexpectedEof);
+        }
+        if let Some(footer_offset) = self.footer_offset {
+            if footer_offset != payload_end {
+                return Err(Error::CorruptTail {
+                    offset: self.record_offset,
+                });
+            }
+            if self.checked_physical_end()? > file_len {
+                return Err(Error::UnexpectedEof);
+            }
+        }
+        Ok(())
+    }
+
+    fn logical_payload_len_before_allocation(
+        &self,
+        spec: FormatSpec,
+        file: &mut File,
+    ) -> Result<u64> {
+        if !self.is_compressed() {
+            return Ok(self.payload_len);
+        }
+        validate_record_entry(spec, self)?;
+        let compression = variable_compression_for_block(spec, self.block_id)
+            .ok_or(Error::InvalidCompressionHeader)?;
+        let expected_len = match compression.header_mode {
+            CompressionHeaderMode::RecordExplicit => {
+                if self.payload_len < 20 {
+                    return Err(Error::InvalidCompressionHeader);
+                }
+                let mut prefix = [0; 20];
+                file.seek(SeekFrom::Start(self.payload_offset))?;
+                file.read_exact(&mut prefix)?;
+                let (_, expected_len, _) = decode_compression_envelope(&prefix)?;
+                expected_len
+            }
+            CompressionHeaderMode::FileExplicit | CompressionHeaderMode::FormatContract => {
+                if self.uncompressed_len_hint == 0 {
+                    return Err(Error::InvalidCompressionHeader);
+                }
+                u64::from(self.uncompressed_len_hint)
+            }
+        };
+        if expected_len > compression.max_uncompressed_len {
+            return Err(Error::DecompressedLengthLimitExceeded {
+                actual: expected_len,
+                limit: compression.max_uncompressed_len,
+            });
+        }
+        Ok(expected_len)
+    }
+}
+
+fn ensure_payload_limit(resource: &'static str, actual: u64, limit: u64) -> Result<()> {
+    if actual > limit {
+        Err(Error::LimitExceeded {
+            resource,
+            actual,
+            limit,
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -3862,7 +4364,9 @@ fn read_record_header(file: &mut File, _spec: FormatSpec, offset: u64) -> Result
         flags: header.flags,
         sequence: header.sequence,
         record_offset: offset,
-        payload_offset: offset + decoded.lead_in_len,
+        payload_offset: offset
+            .checked_add(decoded.lead_in_len)
+            .ok_or(Error::CorruptTail { offset })?,
         payload_len: header.payload_len,
         checksum: header.checksum,
         uncompressed_len_hint: header.uncompressed_len_hint,
@@ -4399,3 +4903,255 @@ fn _descriptor_for<T: VarveBlock>() -> BlockDescriptor {
 
 #[allow(dead_code)]
 struct TypedMarker<T>(PhantomData<T>);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{VarveDecode, VarveEncode};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct MatrixTestCell {
+        value: u32,
+    }
+
+    impl VarveEncode for MatrixTestCell {
+        const WIRE_TYPE: crate::WireType = crate::WireType::U32;
+
+        fn encode_varve(&self, encoder: &mut crate::Encoder) -> Result<()> {
+            self.value.encode_varve(encoder)
+        }
+    }
+
+    impl VarveDecode for MatrixTestCell {
+        const WIRE_TYPE: crate::WireType = crate::WireType::U32;
+
+        fn decode_varve(decoder: &mut crate::Decoder<'_>) -> Result<Self> {
+            Ok(Self {
+                value: u32::decode_varve(decoder)?,
+            })
+        }
+    }
+
+    impl VarveBlock for MatrixTestCell {
+        const ID: u32 = 41;
+        const VERSION: u16 = 1;
+        const KIND: BlockKind = BlockKind::Matrix;
+        const ENDIAN: Option<Endian> = None;
+    }
+
+    impl VarveMatrixBlock for MatrixTestCell {
+        const DIMENSIONS: [&'static str; 2] = ["scan", "ch"];
+        const CATEGORY: &'static str = "cells";
+        const SLOT_STRIDE: u64 = 4;
+    }
+
+    fn test_spec() -> FormatSpec {
+        FormatSpec::new(
+            b"VSTEST",
+            1,
+            Endian::Little,
+            0,
+            IndexPolicy::ScanOnOpen,
+            IntegrityPolicy::None,
+            RecoveryPolicy::Strict,
+            ManifestPolicy::None,
+            &[],
+        )
+    }
+
+    fn matrix_test_spec() -> FormatSpec {
+        static BLOCKS: &[BlockDescriptor] = &[BlockDescriptor {
+            id: MatrixTestCell::ID,
+            name: "MatrixTestCell",
+            version: MatrixTestCell::VERSION,
+            kind: BlockKind::Matrix,
+            fields: MatrixTestCell::FIELDS,
+        }];
+        static DIMENSIONS: &[crate::MatrixDimensionDescriptor] = &[
+            crate::MatrixDimensionDescriptor { name: "scan" },
+            crate::MatrixDimensionDescriptor { name: "ch" },
+        ];
+        static COMMITS: &[crate::MatrixCommitDescriptor] = &[crate::MatrixCommitDescriptor {
+            name: "cells",
+            kind: crate::MatrixCommitKind::Cell,
+        }];
+        static MATRIX_BLOCKS: &[crate::MatrixBlockDescriptor] = &[crate::MatrixBlockDescriptor {
+            block_id: MatrixTestCell::ID,
+            dimensions: MatrixTestCell::DIMENSIONS,
+            category: MatrixTestCell::CATEGORY,
+            slot_stride: MatrixTestCell::SLOT_STRIDE,
+        }];
+
+        FormatSpec::new(
+            b"VSMTX",
+            1,
+            Endian::Little,
+            0,
+            IndexPolicy::ScanOnOpen,
+            IntegrityPolicy::None,
+            RecoveryPolicy::Strict,
+            ManifestPolicy::None,
+            BLOCKS,
+        )
+        .with_matrix_spec(DIMENSIONS, COMMITS, MATRIX_BLOCKS)
+    }
+
+    #[test]
+    fn max_sequence_publishes_once_then_reopens_exhausted() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("max.varve");
+        let mut file = VarveFile::create(test_spec(), &path)?;
+        file.sequence_state = SequenceState::Available(u64::MAX);
+
+        assert_eq!(
+            file.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, b"max")?,
+            u64::MAX
+        );
+        assert_eq!(file.sequence_state, SequenceState::Exhausted);
+        let original_len = file.file.metadata()?.len();
+        let original_cursor = file.file.stream_position()?;
+        let original_index_len = file.index.len();
+        assert!(matches!(
+            file.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, b"again"),
+            Err(Error::SequenceExhausted)
+        ));
+        assert_eq!(file.file.metadata()?.len(), original_len);
+        assert_eq!(file.file.stream_position()?, original_cursor);
+        assert_eq!(file.index.len(), original_index_len);
+        drop(file);
+
+        let mut reopened = VarveFile::open(test_spec(), &path)?;
+        assert_eq!(reopened.sequence_state, SequenceState::Exhausted);
+        assert!(matches!(
+            reopened.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, b"again"),
+            Err(Error::SequenceExhausted)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn append_failure_rolls_back_and_preserves_sequence() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("rollback.varve");
+        let mut file = VarveFile::create(test_spec(), &path)?;
+        file.file.seek(SeekFrom::Start(0))?;
+        let original_len = file.file.metadata()?.len();
+        inject_write_fault(WriteFault::AppendAfterHeader);
+
+        assert!(matches!(
+            file.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, b"failed"),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(file.file.metadata()?.len(), original_len);
+        assert_eq!(file.file.stream_position()?, 0);
+        assert!(file.index.is_empty());
+        assert_eq!(file.sequence_state, SequenceState::Available(0));
+        assert!(!file.poisoned);
+        assert_eq!(
+            file.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, b"ok")?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_failure_poisons_mutation_flush_and_sync() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("poison.varve");
+        let mut file = VarveFile::create(test_spec(), &path)?;
+        inject_write_fault(WriteFault::AppendAfterHeaderWithRollbackFailure);
+
+        assert!(matches!(
+            file.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, b"failed"),
+            Err(Error::WriteRollbackFailed {
+                operation: "append record",
+                ..
+            })
+        ));
+        assert!(matches!(
+            file.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, b"again"),
+            Err(Error::WriterPoisoned("file"))
+        ));
+        assert!(matches!(file.flush(), Err(Error::WriterPoisoned("file"))));
+        assert!(matches!(file.sync(), Err(Error::WriterPoisoned("file"))));
+        Ok(())
+    }
+
+    #[test]
+    fn partial_matrix_overwrite_is_withdrawn_and_poisons_writer() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("matrix-partial.varve");
+        let spec = matrix_test_spec();
+        let key = MatrixKey::new(0, 0);
+        let mut file = VarveFile::create_with_dims(
+            spec,
+            &path,
+            MatrixDimensions::from_pairs([("scan", 1), ("ch", 1)]),
+        )?;
+        file.write_matrix_cell(key, &MatrixTestCell { value: 11 })?;
+        file.commit_matrix_cell::<MatrixTestCell>(key)?;
+        let original_len = file.file.metadata()?.len();
+
+        crate::matrix::inject_partial_slot_write_failure();
+        assert!(matches!(
+            file.write_matrix_cell(key, &MatrixTestCell { value: 22 }),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(file.file.metadata()?.len(), original_len);
+        assert_eq!(
+            file.matrix_cell_status::<MatrixTestCell>(key)?,
+            MatrixCellStatus::NotCommitted
+        );
+        assert!(matches!(
+            file.write_matrix_cell(key, &MatrixTestCell { value: 33 }),
+            Err(Error::WriterPoisoned("file"))
+        ));
+        assert!(matches!(file.flush(), Err(Error::WriterPoisoned("file"))));
+        assert!(matches!(file.sync(), Err(Error::WriterPoisoned("file"))));
+        drop(file);
+
+        let mut reopened = VarveFile::open_readonly(spec, &path)?;
+        assert_eq!(
+            reopened.matrix_cell_status::<MatrixTestCell>(key)?,
+            MatrixCellStatus::NotCommitted
+        );
+        assert!(matches!(
+            reopened.read_matrix_cell::<MatrixTestCell>(key),
+            Err(Error::MatrixNotCommitted)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_matrix_commit_publish_keeps_memory_uncommitted_and_poisons_writer() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("matrix-commit-failure.varve");
+        let spec = matrix_test_spec();
+        let key = MatrixKey::new(0, 0);
+        let mut file = VarveFile::create_with_dims(
+            spec,
+            &path,
+            MatrixDimensions::from_pairs([("scan", 1), ("ch", 1)]),
+        )?;
+        file.write_matrix_cell(key, &MatrixTestCell { value: 44 })?;
+
+        crate::matrix::inject_bitmap_write_failure();
+        assert!(matches!(
+            file.commit_matrix_cell::<MatrixTestCell>(key),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(
+            file.matrix_cell_status::<MatrixTestCell>(key)?,
+            MatrixCellStatus::NotCommitted
+        );
+        assert!(matches!(file.sync(), Err(Error::WriterPoisoned("file"))));
+        drop(file);
+
+        let reopened = VarveFile::open_readonly(spec, &path)?;
+        assert_eq!(
+            reopened.matrix_cell_status::<MatrixTestCell>(key)?,
+            MatrixCellStatus::NotCommitted
+        );
+        Ok(())
+    }
+}

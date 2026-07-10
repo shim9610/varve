@@ -181,7 +181,8 @@ fn mmap_payload_windows_match_indexed_payload_reads() -> varve::Result<()> {
     }
 
     let file = MmapFormat::open_readonly(&path)?;
-    let mmap = file.mmap_payloads()?;
+    // SAFETY: The fixture is not modified while the mapping is alive.
+    let mmap = unsafe { file.mmap_payloads()? };
 
     for entry in file.index_entries() {
         assert_eq!(mmap.payload_window(entry)?, entry.read_payload(&path)?);
@@ -216,6 +217,8 @@ fn mmap_payload_windows_match_indexed_payload_reads() -> varve::Result<()> {
     );
     assert!(mmap.block_payload_window::<MmapMessage>(1)?.is_none());
 
+    drop(mmap);
+    drop(file);
     cleanup(&path);
     Ok(())
 }
@@ -232,7 +235,8 @@ fn mmap_rejects_entries_outside_snapshot() -> varve::Result<()> {
     }
 
     let file = MmapFormat::open_readonly(&path)?;
-    let mmap = file.mmap_payloads()?;
+    // SAFETY: The fixture is not modified while the mapping is alive.
+    let mmap = unsafe { file.mmap_payloads()? };
     let mut forged: RecordIndexEntry = mmap.index_entries()[0].clone();
     forged.sequence = forged.sequence.saturating_add(1);
 
@@ -241,12 +245,14 @@ fn mmap_rejects_entries_outside_snapshot() -> varve::Result<()> {
         Err(Error::MmapEntryNotInSnapshot)
     ));
 
+    drop(mmap);
+    drop(file);
     cleanup(&path);
     Ok(())
 }
 
 #[test]
-fn mmap_snapshot_does_not_expose_later_appends() -> varve::Result<()> {
+fn mmap_snapshot_refreshes_after_append() -> varve::Result<()> {
     let path = temp_path("snapshot_append");
     cleanup(&path);
 
@@ -257,16 +263,16 @@ fn mmap_snapshot_does_not_expose_later_appends() -> varve::Result<()> {
     }
 
     let mut file = MmapFormat::open(&path)?;
-    let snapshot = file.mmap_payloads()?;
+    // SAFETY: Appends occur only after the snapshot mapping is dropped.
+    let snapshot = unsafe { file.mmap_payloads()? };
     assert_eq!(snapshot.len(), 1);
+    drop(snapshot);
 
     file.push(&MmapPoint { x: 3, y: 4 })?;
     file.flush()?;
 
-    assert_eq!(snapshot.len(), 1);
-    assert!(snapshot.block_payload_window::<MmapPoint>(1)?.is_none());
-
-    let fresh = file.mmap_payloads()?;
+    // SAFETY: No mutation occurs while the fresh mapping is alive.
+    let fresh = unsafe { file.mmap_payloads()? };
     assert_eq!(fresh.len(), 2);
     let appended = fresh
         .block_payload_window::<MmapPoint>(1)?
@@ -276,6 +282,8 @@ fn mmap_snapshot_does_not_expose_later_appends() -> varve::Result<()> {
         MmapPoint { x: 3, y: 4 }
     );
 
+    drop(fresh);
+    drop(file);
     cleanup(&path);
     Ok(())
 }
@@ -296,7 +304,8 @@ fn zero_copy_raw_fixed_successfully_views_canonical_little_endian_payload() -> v
     }
 
     let file = MmapFormat::open_readonly(&path)?;
-    let mmap = file.mmap_payloads()?;
+    // SAFETY: The fixture is not modified while the mapping is alive.
+    let mmap = unsafe { file.mmap_payloads()? };
     assert_eq!(
         unsafe { mmap.raw_fixed::<RawPoint>(0) }?,
         Some(&RawPoint {
@@ -306,6 +315,8 @@ fn zero_copy_raw_fixed_successfully_views_canonical_little_endian_payload() -> v
     );
     assert!(unsafe { mmap.raw_fixed::<RawPoint>(1) }?.is_none());
 
+    drop(mmap);
+    drop(file);
     cleanup(&path);
     Ok(())
 }
@@ -323,7 +334,8 @@ fn zero_copy_rejects_variable_raw_block() -> varve::Result<()> {
     }
 
     let file = MmapFormat::open_readonly(&path)?;
-    let mmap = file.mmap_payloads()?;
+    // SAFETY: The fixture is not modified while the mapping is alive.
+    let mmap = unsafe { file.mmap_payloads()? };
 
     assert!(matches!(
         unsafe { mmap.raw_fixed::<RawVariable>(0) },
@@ -332,6 +344,8 @@ fn zero_copy_rejects_variable_raw_block() -> varve::Result<()> {
         })
     ));
 
+    drop(mmap);
+    drop(file);
     cleanup(&path);
     Ok(())
 }
@@ -349,7 +363,8 @@ fn zero_copy_rejects_raw_endian_mismatch() -> varve::Result<()> {
     }
 
     let file = MmapFormat::open_readonly(&path)?;
-    let mmap = file.mmap_payloads()?;
+    // SAFETY: The fixture is not modified while the mapping is alive.
+    let mmap = unsafe { file.mmap_payloads()? };
 
     assert!(matches!(
         unsafe { mmap.raw_fixed::<BigEndianRawPoint>(0) },
@@ -359,6 +374,8 @@ fn zero_copy_rejects_raw_endian_mismatch() -> varve::Result<()> {
         })
     ));
 
+    drop(mmap);
+    drop(file);
     cleanup(&path);
     Ok(())
 }
@@ -376,7 +393,8 @@ fn zero_copy_rejects_raw_payload_size_mismatch() -> varve::Result<()> {
     }
 
     let file = MmapFormat::open_readonly(&path)?;
-    let mmap = file.mmap_payloads()?;
+    // SAFETY: The fixture is not modified while the mapping is alive.
+    let mmap = unsafe { file.mmap_payloads()? };
 
     assert!(matches!(
         unsafe { mmap.raw_fixed::<SizeMismatchRawPoint>(0) },
@@ -386,6 +404,8 @@ fn zero_copy_rejects_raw_payload_size_mismatch() -> varve::Result<()> {
         })
     ));
 
+    drop(mmap);
+    drop(file);
     cleanup(&path);
     Ok(())
 }

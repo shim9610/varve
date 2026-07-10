@@ -96,6 +96,14 @@ The first implementation focuses on dense `(scan, ch)` addressing, bounded slot
 payloads, `NotCommitted` reads, and same-size in-place overwrites. Append-log
 blocks may coexist after the preallocated matrix regions.
 
+Same-size overwrite is fail-safe within one writer: Varve clears the old commit
+and CRC-valid evidence before writing slot bytes, and a later explicit commit is
+the final visibility step. Partial matrix I/O poisons the writer and leaves the
+cell uncommitted. Matrix readers snapshot layout and commit maps, not immutable
+copies of every slot. Applications must not overlap a reader with in-place
+writes to slots it may read; use external read leases or a higher-level
+generation/version scheme when concurrent immutable snapshots are required.
+
 Rules to keep stable:
 
 - Block ids must be explicit `u32` values below `0xFFFF_FF00`.
@@ -263,6 +271,14 @@ For caller-managed compressed blobs, prefer
 `ChunkedBytes::decode_to_vec_limited(limit)` over unbounded decoding when the
 limit is part of the format contract.
 
+For physical records, use
+`RecordIndexEntry::read_payload_limited(path, physical_limit)` to cap stored
+bytes, or
+`read_logical_payload_limited(spec, path, physical_limit, logical_limit)` to cap
+both the stored compressed allocation and post-decompression logical allocation
+before either allocation. These are caller policy controls; Varve does not guess
+a global domain ceiling.
+
 ## Integrity Policy
 
 `integrity: none` performs structural parsing only. It does not detect payload
@@ -392,6 +408,12 @@ fields, header/footer bounds, exposes typed getters on generated
 an adapter needs to separate a valid complete prefix from a truncated or invalid
 tail before deciding whether the file should be rejected or reported as an
 incomplete external-format file.
+
+Returned callback errors trigger truncation back to the original EOF and leave
+the writer reusable only when rollback succeeds. A failed rollback poisons the
+writer. Panics are not caught; unwinding through a streaming callback also
+leaves that handle poisoned. Do not retain or reuse it after catching such a
+panic outside Varve.
 
 For concrete compatibility checks, `crates/varve/examples/tdms_physical/common.rs`
 is a façade over split TDMS example modules. The physical adapter implementation

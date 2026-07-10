@@ -100,8 +100,10 @@ let users = reader.users()?;
 let ada = users.get(&7)?;
 ```
 
-Readers are snapshot-on-open. They do not live-tail a writer. Open a new reader
-when you want a later committed snapshot.
+Append-log readers are snapshot-on-open. They do not live-tail a writer. Open a
+new reader when you want a later committed append snapshot. Matrix commit maps
+are also captured on open, but matrix slot bytes are in-place storage; do not
+overlap a matrix reader with writes to slots it may read.
 
 ## 5. Diagnose Existing Files
 

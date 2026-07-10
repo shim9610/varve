@@ -64,6 +64,14 @@ decoded keys using their Rust map identity, rather than separately encoding all
 keys to detect a non-injective custom codec. The latter would add allocation
 and work to every valid map and cannot repair an invalid user codec generally.
 
+The clean implementation verifier initially withheld PASS for an unbounded
+stored compressed-payload allocation behind the logical limit API. The API now
+requires separate physical and logical ceilings before either allocation.
+Follow-up clean passes found and verified complete footer extent validation and
+category-preserving matrix quarantine errors. The final focused clean-context
+recheck returned PASS for cell, single, and per-channel quarantine reads/writes
+while preserving whole-category clear and typed rebuild recovery paths.
+
 ## Final Verification Matrix
 
 | Domain | Required check |
@@ -78,3 +86,67 @@ and work to every valid map and cannot repair an invalid user codec generally.
 | Performance | frozen release median method |
 | Documentation | API, format-author, architecture, durability and migration guidance |
 
+## Final Candidate Results
+
+Supply-chain verification on the updated `Cargo.lock`:
+
+- `cargo update --dry-run` reports zero compatible updates for Rust 1.95;
+- `cargo audit --deny warnings` reports no vulnerabilities across 75 locked
+  dependencies;
+- `cargo deny check` passes advisories, bans, licenses, and sources;
+- direct versions match the frozen table, including `memmap2 0.9.11`,
+  `tempfile 3.27.0`, and stable `zerocopy 0.8.54`;
+- `anyhow 1.0.102` is absent from the final graph;
+- the remaining duplicate `getrandom` lines are split between test-only
+  `proptest` and runtime/build users of `tempfile`/`zstd`, not unresolved
+  advisories.
+
+Mechanical verification:
+
+- default-feature workspace tests pass;
+- all-target/all-feature workspace tests pass;
+- all-target/all-feature Clippy passes with `-D warnings`;
+- all-feature rustdoc passes with `RUSTDOCFLAGS=-D warnings`;
+- trybuild verifies all four file-backed mmap constructors fail outside an
+  unsafe block and pass with an explicit unsafe contract;
+- hostile codec, payload/footer extent, matrix descriptor, quarantine, append
+  rollback, layout callback, tempfile lifetime, and suffix tests pass;
+- matrix fault injection verifies partial slot overwrite and failed commit-map
+  publication remain uncommitted and poison later mutation, flush, and sync;
+- existing native, layout, compression, manifest, checkpoint, matrix, CRC,
+  zero-copy, TDMS-model, property, and durability-order assertions pass.
+
+`cargo-semver-checks` against `f7a9369` reports only the two allowlisted source
+break families in `varve-core`: `Error` becoming non-exhaustive and the four
+file-backed mmap constructors becoming unsafe. These changes require the next
+pre-1.0 breaking API release boundary if `f7a9369` has already been published.
+No wire layout, version, or schema-hash rule changes. The only canonical output
+correction is that appending after reopening an empty file now uses sequence `0`
+instead of the prior erroneous `1`.
+
+Final isolated release performance medians:
+
+| Large case | Baseline | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| append fixed | 112.527 ms | 119.081 ms | +5.8% |
+| open VARVE3 chain | 588.356 ms | 557.463 ms | -5.3% |
+| materialized keyed | 1036.685 ms | 802.685 ms | -22.6% |
+| layout reopen+append | 775.256 ms | 682.990 ms | -11.9% |
+| layout open/scan | 141.715 ms | 106.676 ms | -24.7% |
+| matrix CRC write+commit | 464.673 ms | 390.151 ms | -16.0% |
+| merge keyed files | 323.733 ms | 275.997 ms | -14.7% |
+
+The first candidate sample set was discarded because clean-context verification
+was concurrently using the same workspace and produced unrelated disk/CPU
+regressions. The table uses a later isolated warm-up plus five runs. No median
+crosses the 10% regression gate, no file size changed, and no implicit sync was
+added. The performance harness logic and datasets remained unchanged; only
+required unsafe-call syntax changed with the mmap API.
+
+## Explicit Residual Boundary
+
+Append-log readers remain snapshot-on-open. VMAT v1 snapshots layout metadata
+and commit maps but stores slot bytes in place. Applications must not overlap a
+matrix reader with writes to slots it may read. True immutable concurrent matrix
+snapshots require versioned slots/generations or read leases and are future
+storage-architecture work, not a guarantee of this candidate.

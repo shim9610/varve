@@ -131,7 +131,9 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 
 - Scalar, option, fixed array, selected vector, tuple, `BTreeMap`, and `HashMap` codecs are canonical and endian-aware.
 - `BTreeMap<K, V>` encodes in native sorted key order.
-- `HashMap<K, V>` encodes keys in sorted order, requiring `K: Ord + Clone`, so equivalent maps produce stable bytes independent of insertion or hash iteration order.
+- `HashMap<K, V>` encodes borrowed entries in sorted key order, requiring
+  `K: Ord` but not `Clone`, so equivalent maps produce stable bytes independent
+  of insertion or hash iteration order.
 - Decoding `HashMap<K, V>` preserves values but not insertion order.
 - Custom field codecs are supported by implementing `VarveEncode` and `VarveDecode` for the field type. The derive macro uses the type's `WIRE_TYPE` in field descriptors and manifests.
 - Enum-like values should use explicit custom codecs in v0.1; automatic enum representation inference is out of scope.
@@ -142,6 +144,13 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   codecs, compression policy, adapter, or caller validation.
 - `ChunkedBytes::decode_to_vec_limited(limit)` is provided for callers that
   need an explicit decompressed-size ceiling.
+- `RecordIndexEntry::read_payload_limited(path, limit)` validates the stored
+  extent and caller byte ceiling before allocation.
+- `RecordIndexEntry::read_logical_payload_limited(spec, path, physical_limit,
+  logical_limit)` applies both caller ceilings before allocating the complete
+  stored payload or decompressed logical payload.
+- Boolean decoders accept only canonical bytes `0` and `1`. Map decoders reject
+  duplicate destination keys before decoding a duplicate value.
 
 ## Macro Contract
 
@@ -406,12 +415,21 @@ CRC integrity is a corruption-detection aid, not an authenticity or tamper-proof
 
 - Mmap and zero-copy are opt-in features only. The `zero-copy` crate feature implies the `mmap` feature because the first raw-read API is mmap-backed.
 - Default typed decode remains owned canonical decoding.
-- Initial mmap scope exposes read-only payload windows from `VarveFile::mmap_payloads() -> MmapPayloads`.
+- Initial mmap scope exposes read-only payload windows from unsafe
+  `VarveFile::mmap_payloads() -> MmapPayloads`.
 - `MmapPayloads` owns a read-only mmap plus a cloned snapshot index and `FormatSpec`.
 - `MmapPayloads::payload_window(entry)` accepts only entries that exactly match the cloned snapshot index, preventing forged public offsets from exposing arbitrary file bytes.
 - `MmapPayloads::block_payload_window::<T>(index)` returns the typed block ordinal payload bytes or `None` when out of range.
-- `VarveFile::mmap_matrix()` and `VarveReader::mmap_matrix()` expose
+- Unsafe `VarveFile::mmap_matrix()` and `VarveReader::mmap_matrix()` expose
   `MmapMatrix`, a read-only mmap plus a cloned VMAT layout snapshot.
+- Every file-backed mmap constructor requires the caller to prevent mutation,
+  truncation, replacement, or backing-object invalidation through every handle,
+  thread, and process for the mapping's complete lifetime.
+- Under that precondition, safe mmap accessors rely on a cloned existing handle,
+  a read-only mapping, checked extents against mapped length, copied snapshot
+  metadata, exact record membership, checked slices, and owner-bounded Rust
+  lifetimes. Raw views additionally validate kind, version, endian, exact size,
+  and alignment.
 - `MmapMatrix::cell_payload_window::<T>(key)` returns a committed matrix slot
   payload window and verifies the per-cell CRC when matrix integrity is enabled.
 - Initial zero-copy scope is limited to explicit raw fixed blocks whose implementor promises endian, alignment, and layout compatibility.

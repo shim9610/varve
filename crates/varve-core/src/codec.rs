@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, btree_map, hash_map};
 use std::hash::Hash;
 
 use crate::{Endian, Error, Result};
@@ -335,7 +335,13 @@ impl VarveDecode for bool {
     const WIRE_TYPE: WireType = WireType::Bool;
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
-        Ok(decoder.read_u8()? != 0)
+        match decoder.read_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(Error::InvalidCanonicalEncoding(
+                "boolean value must be 0 or 1",
+            )),
+        }
     }
 }
 
@@ -505,8 +511,15 @@ where
         let mut values = BTreeMap::new();
         for _ in 0..len {
             let key = K::decode_varve(decoder)?;
-            let value = V::decode_varve(decoder)?;
-            values.insert(key, value);
+            match values.entry(key) {
+                btree_map::Entry::Vacant(entry) => {
+                    let value = V::decode_varve(decoder)?;
+                    entry.insert(value);
+                }
+                btree_map::Entry::Occupied(_) => {
+                    return Err(Error::InvalidCanonicalEncoding("duplicate BTreeMap key"));
+                }
+            }
         }
         Ok(values)
     }
@@ -514,20 +527,18 @@ where
 
 impl<K, V> VarveEncode for HashMap<K, V>
 where
-    K: VarveEncode + Ord + Clone + Eq + Hash,
+    K: VarveEncode + Ord + Eq + Hash,
     V: VarveEncode,
 {
     const WIRE_TYPE: WireType = WireType::Nested;
 
     fn encode_varve(&self, encoder: &mut Encoder) -> Result<()> {
-        let mut keys: Vec<K> = self.keys().cloned().collect();
-        keys.sort();
-        encoder.write_u64(keys.len() as u64);
-        for key in keys {
+        let mut entries: Vec<(&K, &V)> = self.iter().collect();
+        entries.sort_by_key(|(key, _)| *key);
+        encoder.write_u64(entries.len() as u64);
+        for (key, value) in entries {
             key.encode_varve(encoder)?;
-            self.get(&key)
-                .expect("sorted key came from map")
-                .encode_varve(encoder)?;
+            value.encode_varve(encoder)?;
         }
         Ok(())
     }
@@ -545,8 +556,15 @@ where
         let mut values = HashMap::new();
         for _ in 0..len {
             let key = K::decode_varve(decoder)?;
-            let value = V::decode_varve(decoder)?;
-            values.insert(key, value);
+            match values.entry(key) {
+                hash_map::Entry::Vacant(entry) => {
+                    let value = V::decode_varve(decoder)?;
+                    entry.insert(value);
+                }
+                hash_map::Entry::Occupied(_) => {
+                    return Err(Error::InvalidCanonicalEncoding("duplicate HashMap key"));
+                }
+            }
         }
         Ok(values)
     }

@@ -1,8 +1,8 @@
 use std::fs;
 use std::hash::Hasher;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
 use crate::{Endian, Error, LayoutScanReport, LayoutSegmentInfo, LayoutTailInfo, Result};
 
@@ -131,7 +131,24 @@ impl<'a> BinaryCursor<'a> {
     }
 
     pub fn array_f64(&mut self, count: usize) -> Result<Vec<f64>> {
-        (0..count).map(|_| self.f64()).collect()
+        let byte_len = count
+            .checked_mul(8)
+            .ok_or(Error::LengthOverflow { value: u64::MAX })?;
+        if byte_len > self.remaining() {
+            return Err(Error::UnexpectedEof);
+        }
+
+        let mut values = Vec::with_capacity(count);
+        let bytes = self.bytes(byte_len)?;
+        for bytes in bytes.chunks_exact(8) {
+            let mut value = [0; 8];
+            value.copy_from_slice(bytes);
+            values.push(f64::from_bits(match self.endian {
+                Endian::Little => u64::from_le_bytes(value),
+                Endian::Big => u64::from_be_bytes(value),
+            }));
+        }
+        Ok(values)
     }
 
     pub fn len_prefixed_bytes<P: LengthPrefix>(&mut self) -> Result<&'a [u8]> {
@@ -688,32 +705,29 @@ impl AdapterTailStatus {
 #[derive(Clone, Debug)]
 pub struct AdapterInputFile {
     path: PathBuf,
-    temporary: bool,
+    temporary: Option<Arc<tempfile::NamedTempFile>>,
 }
 
 impl AdapterInputFile {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
-            temporary: false,
+            temporary: None,
         }
     }
 
     pub fn from_bytes(extension: &str, bytes: &[u8]) -> Result<Self> {
-        let mut path = std::env::temp_dir();
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let extension = extension.trim_start_matches('.');
-        path.push(format!(
-            "varve-adapter-input-{}-{timestamp}.{extension}",
-            std::process::id()
-        ));
-        fs::write(&path, bytes)?;
+        let extension = normalize_adapter_extension(extension)?;
+        let suffix = format!(".{extension}");
+        let mut temporary = tempfile::Builder::new()
+            .prefix("varve-adapter-input-")
+            .suffix(&suffix)
+            .tempfile()?;
+        temporary.as_file_mut().write_all(bytes)?;
+        let path = temporary.path().to_path_buf();
         Ok(Self {
             path,
-            temporary: true,
+            temporary: Some(Arc::new(temporary)),
         })
     }
 
@@ -722,15 +736,26 @@ impl AdapterInputFile {
     }
 
     pub fn is_temporary(&self) -> bool {
-        self.temporary
+        self.temporary.is_some()
     }
 }
 
-impl Drop for AdapterInputFile {
-    fn drop(&mut self) {
-        if self.temporary {
-            let _ = fs::remove_file(&self.path);
-        }
+fn normalize_adapter_extension(extension: &str) -> Result<&str> {
+    let normalized = extension.strip_prefix('.').unwrap_or(extension);
+    let bytes = normalized.as_bytes();
+    let valid = !bytes.is_empty()
+        && bytes.len() <= 32
+        && normalized.is_ascii()
+        && matches!(bytes.first(), Some(byte) if byte.is_ascii_alphanumeric())
+        && matches!(bytes.last(), Some(byte) if byte.is_ascii_alphanumeric())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'-' | b'_'))
+        && !bytes.windows(2).any(|pair| pair == b"..");
+    if valid {
+        Ok(normalized)
+    } else {
+        Err(Error::InvalidAdapterExtension(extension.to_string()))
     }
 }
 

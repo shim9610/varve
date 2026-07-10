@@ -467,7 +467,8 @@ fn mmap_payload_window_scan(case: PerfCase) -> varve::Result<()> {
 
     let elapsed = timed(|| {
         let file = PerfFormat::open_readonly(&path)?;
-        let mmap = file.mmap_payloads()?;
+        // SAFETY: The benchmark does not mutate the fixture while mapped.
+        let mmap = unsafe { file.mmap_payloads()? };
         assert_eq!(mmap.len(), case.records);
 
         let mut total_len = 0usize;
@@ -507,7 +508,8 @@ fn zero_copy_raw_fixed_reads(case: PerfCase) -> varve::Result<()> {
 
     let elapsed = timed(|| {
         let file = PerfFormat::open_readonly(&path)?;
-        let mmap = file.mmap_payloads()?;
+        // SAFETY: The benchmark does not mutate the fixture while mapped.
+        let mmap = unsafe { file.mmap_payloads()? };
         for index in 0..case.records {
             let Some(point) = unsafe { mmap.raw_fixed::<PerfRawPoint>(index) }? else {
                 panic!("missing raw fixed block at index {index}");
@@ -897,7 +899,8 @@ fn matrix_direct_access_with_spec(
     {
         let elapsed = timed(|| {
             let reader = spec.open_reader(&path)?;
-            let mmap = reader.mmap_matrix()?;
+            // SAFETY: The benchmark does not mutate the fixture while mapped.
+            let mmap = unsafe { reader.mmap_matrix()? };
             for index in 0..case.records {
                 let key = MatrixKey::new((index / channels) as u64, (index % channels) as u64);
                 let payload = mmap.cell_payload_window::<PerfMatrixCell>(key)?;
@@ -917,7 +920,8 @@ fn matrix_direct_access_with_spec(
 
         let elapsed = timed(|| {
             let reader = spec.open_reader(&path)?;
-            let mmap = reader.mmap_matrix()?;
+            // SAFETY: The benchmark does not mutate the fixture while mapped.
+            let mmap = unsafe { reader.mmap_matrix()? };
             for index in 0..case.records {
                 let key = MatrixKey::new((index / channels) as u64, (index % channels) as u64);
                 let value = mmap.cell_numeric::<PerfMatrixCell, u32>(key)?;

@@ -110,11 +110,14 @@ Default typed reads do not use this path. Callers opt in through unsafe raw
 access:
 
 ```rust
-let mmap = file.mmap_payloads()?;
+// SAFETY: every handle and process keeps the backing file immutable and valid
+// until `mmap` is dropped.
+let mmap = unsafe { file.mmap_payloads()? };
 let point = unsafe { mmap.raw_fixed::<RawPoint>(index) }?;
 ```
 
-The unsafe call requires the mapped file bytes to remain immutable for the
+The mapping constructor requires backing-file immutability for the mapping's
+entire lifetime. The raw view has an additional representation contract for the
 returned reference lifetime.
 
 ## Performance Check
