@@ -9,7 +9,7 @@ use proptest::prelude::*;
 use varve::{
     BlockDescriptor, BlockKind, Endian, Error, FormatSpec, IndexPolicy, MatrixBlockDescriptor,
     MatrixCellStatus, MatrixCommitDescriptor, MatrixCommitKind, MatrixDimensionDescriptor,
-    MatrixDimensions, MatrixKey, MatrixResumeSignal, VarveBlock, VarveMatrixBlock,
+    MatrixDimensions, MatrixKey, MatrixResumeSignal, ReadLimits, VarveBlock, VarveMatrixBlock,
 };
 #[cfg(feature = "integrity")]
 use varve::{MatrixCorruptionKind, MatrixCorruptionSeverity, MatrixRecoveryAction};
@@ -104,6 +104,7 @@ fn matrix_spec(integrity: varve::IntegrityPolicy) -> FormatSpec {
         BLOCKS,
     )
     .with_matrix_spec(DIMENSIONS, COMMITS, MATRIX_BLOCKS)
+    .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }
 
 fn two_block_spec() -> FormatSpec {
@@ -164,6 +165,7 @@ fn two_block_spec() -> FormatSpec {
         BLOCKS,
     )
     .with_matrix_spec(DIMENSIONS, COMMITS, MATRIX_BLOCKS)
+    .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }
 
 #[derive(Clone, Copy, Debug)]

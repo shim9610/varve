@@ -268,7 +268,7 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
     });
 
     let encode_body = quote! {
-        match Self::KIND {
+        match <Self as ::varve::__core::VarveBlock>::KIND {
             ::varve::__core::BlockKind::Fixed | ::varve::__core::BlockKind::Matrix => {
                 #(#fixed_encode)*
             }
@@ -281,7 +281,7 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
     };
 
     let decode_body = quote! {
-        match Self::KIND {
+        match <Self as ::varve::__core::VarveBlock>::KIND {
             ::varve::__core::BlockKind::Fixed | ::varve::__core::BlockKind::Matrix => {
                 ::core::result::Result::Ok(Self { #(#fixed_decode,)* })
             }
@@ -420,6 +420,7 @@ struct FormatInput {
     recovery: RecoveryChoice,
     manifest: ManifestChoice,
     compression: CompressionChoice,
+    limits: LimitsChoice,
     dims: Vec<MatrixDim>,
     matrix_commit: Option<MatrixCommit>,
     matrix_aux: Vec<MatrixAux>,
@@ -504,6 +505,16 @@ enum ManifestChoice {
 enum CompressionChoice {
     None,
     VariableBlocks(VariableCompressionChoice),
+}
+
+enum LimitsChoice {
+    Finite(Vec<LimitEntry>),
+    TrustedUnbounded,
+}
+
+struct LimitEntry {
+    key: Ident,
+    value: u64,
 }
 
 struct VariableCompressionChoice {
@@ -683,6 +694,7 @@ impl Parse for FormatInput {
         let mut recovery = RecoveryChoice::Strict;
         let mut manifest = ManifestChoice::None;
         let mut compression = CompressionChoice::None;
+        let mut limits = None;
         let mut dims: Option<Vec<MatrixDim>> = None;
         let mut matrix_commit = None;
         let mut matrix_aux: Option<Vec<MatrixAux>> = None;
@@ -695,6 +707,16 @@ impl Parse for FormatInput {
 
         while !content.is_empty() {
             let key: Ident = content.parse()?;
+            if key == "limits" && content.peek(syn::token::Brace) {
+                note_format_key(&mut seen_keys, &key)?;
+                let inner;
+                braced!(inner in content);
+                limits = Some(LimitsChoice::Finite(parse_read_limits(&inner)?));
+                if content.peek(Token![;]) {
+                    content.parse::<Token![;]>()?;
+                }
+                continue;
+            }
             if key == "dims" && content.peek(syn::token::Brace) {
                 note_format_key(&mut seen_keys, &key)?;
                 let inner;
@@ -809,6 +831,15 @@ impl Parse for FormatInput {
                 };
             } else if key == "compression" {
                 compression = parse_compression_choice(&content)?;
+            } else if key == "limits" {
+                let value: Ident = content.parse()?;
+                if value != "trusted_unbounded" {
+                    return Err(syn::Error::new_spanned(
+                        value,
+                        "expected trusted_unbounded or limits { ... }",
+                    ));
+                }
+                limits = Some(LimitsChoice::TrustedUnbounded);
             } else if key == "preset" {
                 let value: Ident = content.parse()?;
                 layout_preset = Some(match value.to_string().as_str() {
@@ -853,11 +884,79 @@ impl Parse for FormatInput {
         let registry_blocks = registry_blocks.unwrap_or_default();
         let inline_blocks = inline_blocks.unwrap_or_default();
         let layout_segments = layout_segments.unwrap_or_default();
+        let limits = limits.ok_or_else(|| {
+            content.error(
+                "missing limits policy; declare limits { ... } or limits: trusted_unbounded;",
+            )
+        })?;
         if typed_api && inline_blocks.is_empty() && layout_segments.is_empty() {
             return Err(content.error("format syntax requires inline blocks"));
         }
         if !typed_api && registry_blocks.is_empty() {
             return Err(content.error("missing blocks"));
+        }
+        if let LimitsChoice::Finite(entries) = &limits {
+            let has_custom_layout = !layout_segments.is_empty()
+                || matches!(
+                    layout_preset,
+                    Some(LayoutPresetChoice::Custom | LayoutPresetChoice::None)
+                );
+            let has_matrix = !dims.is_empty()
+                || inline_blocks
+                    .iter()
+                    .any(|block| matches!(block.kind, InlineBlockKind::Matrix(_)));
+            let has_native_blocks = !registry_blocks.is_empty()
+                || inline_blocks
+                    .iter()
+                    .any(|block| !matches!(block.kind, InlineBlockKind::Matrix(_)));
+            let has_native = has_native_blocks || (!has_custom_layout && !has_matrix);
+
+            if has_native {
+                require_read_limit_keys(
+                    entries,
+                    &[
+                        "file_len",
+                        "records",
+                        "index_bytes",
+                        "scan_bytes",
+                        "record_payload",
+                        "logical_payload",
+                        "materialized_bytes",
+                    ],
+                    &content,
+                )?;
+            }
+            if has_custom_layout {
+                require_read_limit_keys(
+                    entries,
+                    &[
+                        "file_len",
+                        "scan_bytes",
+                        "segments",
+                        "index_bytes",
+                        "record_payload",
+                    ],
+                    &content,
+                )?;
+            }
+            if has_matrix {
+                require_read_limit_keys(
+                    entries,
+                    &[
+                        "file_len",
+                        "record_payload",
+                        "materialized_bytes",
+                        "matrix_dimension",
+                        "matrix_cells",
+                        "matrix_bitmap",
+                        "matrix_crc",
+                        "matrix_metadata",
+                        "matrix_slot_region",
+                        "sidecar",
+                    ],
+                    &content,
+                )?;
+            }
         }
         validate_matrix_format(&dims, matrix_commit.as_ref(), &matrix_aux, &inline_blocks)?;
 
@@ -875,6 +974,7 @@ impl Parse for FormatInput {
             recovery,
             manifest,
             compression,
+            limits,
             dims,
             matrix_commit,
             matrix_aux,
@@ -886,6 +986,64 @@ impl Parse for FormatInput {
             typed_api,
         })
     }
+}
+
+const READ_LIMIT_KEYS: &[&str] = &[
+    "file_len",
+    "records",
+    "index_bytes",
+    "scan_bytes",
+    "record_payload",
+    "logical_payload",
+    "materialized_bytes",
+    "segments",
+    "matrix_dimension",
+    "matrix_cells",
+    "matrix_bitmap",
+    "matrix_crc",
+    "matrix_metadata",
+    "matrix_slot_region",
+    "sidecar",
+    "mmap",
+];
+
+fn parse_read_limits(input: ParseStream<'_>) -> Result<Vec<LimitEntry>> {
+    let mut entries = Vec::new();
+    while !input.is_empty() {
+        let key: Ident = input.parse()?;
+        let key_text = key.to_string();
+        if !READ_LIMIT_KEYS.contains(&key_text.as_str()) {
+            return Err(syn::Error::new_spanned(key, "unknown Varve read limit key"));
+        }
+        if entries.iter().any(|entry: &LimitEntry| entry.key == key) {
+            return Err(syn::Error::new_spanned(
+                key,
+                format!("duplicate Varve read limit key {key_text:?}"),
+            ));
+        }
+        input.parse::<Token![:]>()?;
+        let value: LitInt = input.parse()?;
+        entries.push(LimitEntry {
+            key,
+            value: value.base10_parse::<u64>()?,
+        });
+        input.parse::<Token![;]>()?;
+    }
+
+    Ok(entries)
+}
+
+fn require_read_limit_keys(
+    entries: &[LimitEntry],
+    required: &[&str],
+    input: ParseStream<'_>,
+) -> Result<()> {
+    for required in required {
+        if !entries.iter().any(|entry| entry.key == *required) {
+            return Err(input.error(format!("missing Varve read limit key {required:?}")));
+        }
+    }
+    Ok(())
 }
 
 fn note_format_key(seen: &mut Vec<String>, key: &Ident) -> Result<()> {
@@ -1798,6 +1956,7 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
         ManifestChoice::Embedded => quote!(::varve::__core::ManifestPolicy::Embedded),
     };
     let compression = compression_tokens(input.compression);
+    let read_limits = read_limits_tokens(input.limits);
     let dims = input.dims;
     let matrix_commit = input.matrix_commit;
     let matrix_aux = input.matrix_aux;
@@ -1885,11 +2044,35 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     } else {
         quote!(Self::spec().create_layout_writer(path))
     };
+    let create_layout_writer_with_limits_body = if has_typed_layout_api {
+        let writer_name = format_ident!("{}LayoutWriter", name);
+        quote!(::core::result::Result::Ok(#writer_name::from_inner(Self::spec().create_layout_writer_with_limits(path, limits)?)))
+    } else {
+        quote!(Self::spec().create_layout_writer_with_limits(path, limits))
+    };
+    let create_layout_writer_trusted_body = if has_typed_layout_api {
+        let writer_name = format_ident!("{}LayoutWriter", name);
+        quote!(::core::result::Result::Ok(#writer_name::from_inner(Self::spec().create_layout_writer_trusted_unbounded(path)?)))
+    } else {
+        quote!(Self::spec().create_layout_writer_trusted_unbounded(path))
+    };
     let create_layout_writer_with_header_body = if has_typed_layout_api {
         let writer_name = format_ident!("{}LayoutWriter", name);
         quote!(::core::result::Result::Ok(#writer_name::from_inner(Self::spec().create_layout_writer_with_header(path, fields)?)))
     } else {
         quote!(Self::spec().create_layout_writer_with_header(path, fields))
+    };
+    let create_layout_writer_with_header_and_limits_body = if has_typed_layout_api {
+        let writer_name = format_ident!("{}LayoutWriter", name);
+        quote!(::core::result::Result::Ok(#writer_name::from_inner(Self::spec().create_layout_writer_with_header_and_limits(path, fields, limits)?)))
+    } else {
+        quote!(Self::spec().create_layout_writer_with_header_and_limits(path, fields, limits))
+    };
+    let create_layout_writer_with_header_trusted_body = if has_typed_layout_api {
+        let writer_name = format_ident!("{}LayoutWriter", name);
+        quote!(::core::result::Result::Ok(#writer_name::from_inner(Self::spec().create_layout_writer_with_header_trusted_unbounded(path, fields)?)))
+    } else {
+        quote!(Self::spec().create_layout_writer_with_header_trusted_unbounded(path, fields))
     };
     let open_layout_writer_body = if has_typed_layout_api {
         let writer_name = format_ident!("{}LayoutWriter", name);
@@ -1897,11 +2080,35 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     } else {
         quote!(Self::spec().open_layout_writer(path))
     };
+    let open_layout_writer_with_limits_body = if has_typed_layout_api {
+        let writer_name = format_ident!("{}LayoutWriter", name);
+        quote!(::core::result::Result::Ok(#writer_name::from_inner(Self::spec().open_layout_writer_with_limits(path, limits)?)))
+    } else {
+        quote!(Self::spec().open_layout_writer_with_limits(path, limits))
+    };
+    let open_layout_writer_trusted_body = if has_typed_layout_api {
+        let writer_name = format_ident!("{}LayoutWriter", name);
+        quote!(::core::result::Result::Ok(#writer_name::from_inner(Self::spec().open_layout_writer_trusted_unbounded(path)?)))
+    } else {
+        quote!(Self::spec().open_layout_writer_trusted_unbounded(path))
+    };
     let open_layout_reader_body = if has_typed_layout_api {
         let reader_name = format_ident!("{}LayoutReader", name);
         quote!(::core::result::Result::Ok(#reader_name::from_inner(Self::spec().open_layout_reader(path)?)))
     } else {
         quote!(Self::spec().open_layout_reader(path))
+    };
+    let open_layout_reader_with_limits_body = if has_typed_layout_api {
+        let reader_name = format_ident!("{}LayoutReader", name);
+        quote!(::core::result::Result::Ok(#reader_name::from_inner(Self::spec().open_layout_reader_with_limits(path, limits)?)))
+    } else {
+        quote!(Self::spec().open_layout_reader_with_limits(path, limits))
+    };
+    let open_layout_reader_trusted_body = if has_typed_layout_api {
+        let reader_name = format_ident!("{}LayoutReader", name);
+        quote!(::core::result::Result::Ok(#reader_name::from_inner(Self::spec().open_layout_reader_trusted_unbounded(path)?)))
+    } else {
+        quote!(Self::spec().open_layout_reader_trusted_unbounded(path))
     };
     let create_writer_body = if typed_api_enabled {
         let writer_name = format_ident!("{}Writer", name);
@@ -1909,17 +2116,53 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     } else {
         quote!(Self::spec().create_writer(path))
     };
+    let create_writer_with_limits_body = if typed_api_enabled {
+        let writer_name = format_ident!("{}Writer", name);
+        quote!(#writer_name::from_inner(Self::spec().create_writer_with_limits(path, limits)?))
+    } else {
+        quote!(Self::spec().create_writer_with_limits(path, limits))
+    };
+    let create_writer_trusted_body = if typed_api_enabled {
+        let writer_name = format_ident!("{}Writer", name);
+        quote!(#writer_name::from_inner(Self::spec().create_writer_trusted_unbounded(path)?))
+    } else {
+        quote!(Self::spec().create_writer_trusted_unbounded(path))
+    };
     let open_writer_body = if typed_api_enabled {
         let writer_name = format_ident!("{}Writer", name);
         quote!(#writer_name::from_inner(Self::spec().open_writer(path)?))
     } else {
         quote!(Self::spec().open_writer(path))
     };
+    let open_writer_with_limits_body = if typed_api_enabled {
+        let writer_name = format_ident!("{}Writer", name);
+        quote!(#writer_name::from_inner(Self::spec().open_writer_with_limits(path, limits)?))
+    } else {
+        quote!(Self::spec().open_writer_with_limits(path, limits))
+    };
+    let open_writer_trusted_body = if typed_api_enabled {
+        let writer_name = format_ident!("{}Writer", name);
+        quote!(#writer_name::from_inner(Self::spec().open_writer_trusted_unbounded(path)?))
+    } else {
+        quote!(Self::spec().open_writer_trusted_unbounded(path))
+    };
     let open_recover_writer_body = if typed_api_enabled {
         let writer_name = format_ident!("{}Writer", name);
         quote!(#writer_name::from_inner(Self::spec().open_recover_writer(path)?))
     } else {
         quote!(Self::spec().open_recover_writer(path))
+    };
+    let open_recover_writer_with_limits_body = if typed_api_enabled {
+        let writer_name = format_ident!("{}Writer", name);
+        quote!(#writer_name::from_inner(Self::spec().open_recover_writer_with_limits(path, limits)?))
+    } else {
+        quote!(Self::spec().open_recover_writer_with_limits(path, limits))
+    };
+    let open_recover_writer_trusted_body = if typed_api_enabled {
+        let writer_name = format_ident!("{}Writer", name);
+        quote!(#writer_name::from_inner(Self::spec().open_recover_writer_trusted_unbounded(path)?))
+    } else {
+        quote!(Self::spec().open_recover_writer_trusted_unbounded(path))
     };
     let open_recover_writer_report_body = if typed_api_enabled {
         let writer_name = format_ident!("{}Writer", name);
@@ -1932,11 +2175,47 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     } else {
         quote!(Self::spec().open_recover_writer_with_report(path))
     };
+    let open_recover_writer_report_with_limits_body = if typed_api_enabled {
+        let writer_name = format_ident!("{}Writer", name);
+        quote! {
+            {
+                let (writer, report) = Self::spec()
+                    .open_recover_writer_with_report_and_limits(path, limits)?;
+                ::core::result::Result::Ok((#writer_name::from_inner(writer)?, report))
+            }
+        }
+    } else {
+        quote!(Self::spec().open_recover_writer_with_report_and_limits(path, limits))
+    };
+    let open_recover_writer_report_trusted_body = if typed_api_enabled {
+        let writer_name = format_ident!("{}Writer", name);
+        quote! {
+            {
+                let (writer, report) = Self::spec()
+                    .open_recover_writer_with_report_trusted_unbounded(path)?;
+                ::core::result::Result::Ok((#writer_name::from_inner(writer)?, report))
+            }
+        }
+    } else {
+        quote!(Self::spec().open_recover_writer_with_report_trusted_unbounded(path))
+    };
     let open_reader_body = if typed_api_enabled {
         let reader_name = format_ident!("{}Reader", name);
         quote!(::core::result::Result::Ok(#reader_name::from_inner(Self::spec().open_reader(path)?)))
     } else {
         quote!(Self::spec().open_reader(path))
+    };
+    let open_reader_with_limits_body = if typed_api_enabled {
+        let reader_name = format_ident!("{}Reader", name);
+        quote!(::core::result::Result::Ok(#reader_name::from_inner(Self::spec().open_reader_with_limits(path, limits)?)))
+    } else {
+        quote!(Self::spec().open_reader_with_limits(path, limits))
+    };
+    let open_reader_trusted_body = if typed_api_enabled {
+        let reader_name = format_ident!("{}Reader", name);
+        quote!(::core::result::Result::Ok(#reader_name::from_inner(Self::spec().open_reader_trusted_unbounded(path)?)))
+    } else {
+        quote!(Self::spec().open_reader_trusted_unbounded(path))
     };
     let matrix_spec_step =
         matrix_spec_tokens(&dims, matrix_commit.as_ref(), &matrix_aux, &inline_blocks);
@@ -1973,6 +2252,7 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 .with_extension(#extension)
                 .with_commit_policy(#commit)
                 .with_compression_policy(#compression)
+                .with_read_limits(#read_limits)
                 #matrix_spec_step
                 .with_layout(#layout)
                 #schema_hash_step
@@ -1982,12 +2262,51 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 Self::spec().create(path)
             }
 
+            pub fn create_with_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ReadLimits,
+            ) -> ::varve::__core::Result<::varve::__core::VarveFile> {
+                Self::spec().create_with_limits(path, limits)
+            }
+
+            pub fn create_trusted_unbounded<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::Result<::varve::__core::VarveFile> {
+                Self::spec().create_trusted_unbounded(path)
+            }
+
             pub fn create_writer<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<#writer_return> {
                 #create_writer_body
             }
 
+            pub fn create_writer_with_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ReadLimits,
+            ) -> ::varve::__core::Result<#writer_return> {
+                #create_writer_with_limits_body
+            }
+
+            pub fn create_writer_trusted_unbounded<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::Result<#writer_return> {
+                #create_writer_trusted_body
+            }
+
             pub fn create_layout_writer<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<#layout_writer_return> {
                 #create_layout_writer_body
+            }
+
+            pub fn create_layout_writer_with_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ReadLimits,
+            ) -> ::varve::__core::Result<#layout_writer_return> {
+                #create_layout_writer_with_limits_body
+            }
+
+            pub fn create_layout_writer_trusted_unbounded<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::Result<#layout_writer_return> {
+                #create_layout_writer_trusted_body
             }
 
             pub fn create_layout_writer_with_header<P: AsRef<::std::path::Path>>(
@@ -1997,46 +2316,191 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 #create_layout_writer_with_header_body
             }
 
+            pub fn create_layout_writer_with_header_and_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                fields: &[::varve::__core::LayoutFieldValue],
+                limits: ::varve::__core::ReadLimits,
+            ) -> ::varve::__core::Result<#layout_writer_return> {
+                #create_layout_writer_with_header_and_limits_body
+            }
+
+            pub fn create_layout_writer_with_header_trusted_unbounded<P: AsRef<::std::path::Path>>(
+                path: P,
+                fields: &[::varve::__core::LayoutFieldValue],
+            ) -> ::varve::__core::Result<#layout_writer_return> {
+                #create_layout_writer_with_header_trusted_body
+            }
+
             #create_writer_with_dims_method
 
             pub fn open<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::VarveFile> {
                 Self::spec().open(path)
             }
 
+            pub fn open_with_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ReadLimits,
+            ) -> ::varve::__core::Result<::varve::__core::VarveFile> {
+                Self::spec().open_with_limits(path, limits)
+            }
+
+            pub fn open_trusted_unbounded<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::Result<::varve::__core::VarveFile> {
+                Self::spec().open_trusted_unbounded(path)
+            }
+
             pub fn open_writer<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<#writer_return> {
                 #open_writer_body
+            }
+
+            pub fn open_writer_with_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ReadLimits,
+            ) -> ::varve::__core::Result<#writer_return> {
+                #open_writer_with_limits_body
+            }
+
+            pub fn open_writer_trusted_unbounded<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::Result<#writer_return> {
+                #open_writer_trusted_body
             }
 
             pub fn open_layout_writer<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<#layout_writer_return> {
                 #open_layout_writer_body
             }
 
+            pub fn open_layout_writer_with_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ReadLimits,
+            ) -> ::varve::__core::Result<#layout_writer_return> {
+                #open_layout_writer_with_limits_body
+            }
+
+            pub fn open_layout_writer_trusted_unbounded<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::Result<#layout_writer_return> {
+                #open_layout_writer_trusted_body
+            }
+
             pub fn open_readonly<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::VarveFile> {
                 Self::spec().open_readonly(path)
+            }
+
+            pub fn open_readonly_with_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ReadLimits,
+            ) -> ::varve::__core::Result<::varve::__core::VarveFile> {
+                Self::spec().open_readonly_with_limits(path, limits)
+            }
+
+            pub fn open_readonly_trusted_unbounded<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::Result<::varve::__core::VarveFile> {
+                Self::spec().open_readonly_trusted_unbounded(path)
             }
 
             pub fn open_reader<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<#reader_return> {
                 #open_reader_body
             }
 
+            pub fn open_reader_with_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ReadLimits,
+            ) -> ::varve::__core::Result<#reader_return> {
+                #open_reader_with_limits_body
+            }
+
+            pub fn open_reader_trusted_unbounded<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::Result<#reader_return> {
+                #open_reader_trusted_body
+            }
+
             pub fn open_layout_reader<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<#layout_reader_return> {
                 #open_layout_reader_body
+            }
+
+            pub fn open_layout_reader_with_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ReadLimits,
+            ) -> ::varve::__core::Result<#layout_reader_return> {
+                #open_layout_reader_with_limits_body
+            }
+
+            pub fn open_layout_reader_trusted_unbounded<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::Result<#layout_reader_return> {
+                #open_layout_reader_trusted_body
             }
 
             pub fn inspect_layout_file<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::LayoutFileInfo> {
                 Self::spec().inspect_layout_file(path)
             }
 
+            pub fn inspect_layout_file_with_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ReadLimits,
+            ) -> ::varve::__core::Result<::varve::__core::LayoutFileInfo> {
+                Self::spec().inspect_layout_file_with_limits(path, limits)
+            }
+
+            pub fn inspect_layout_file_trusted_unbounded<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::Result<::varve::__core::LayoutFileInfo> {
+                Self::spec().inspect_layout_file_trusted_unbounded(path)
+            }
+
             pub fn inspect_layout_file_report<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::LayoutScanReport> {
                 Self::spec().inspect_layout_file_report(path)
+            }
+
+            pub fn inspect_layout_file_report_with_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ReadLimits,
+            ) -> ::varve::__core::Result<::varve::__core::LayoutScanReport> {
+                Self::spec().inspect_layout_file_report_with_limits(path, limits)
+            }
+
+            pub fn inspect_layout_file_report_trusted_unbounded<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::Result<::varve::__core::LayoutScanReport> {
+                Self::spec().inspect_layout_file_report_trusted_unbounded(path)
             }
 
             pub fn open_recover<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::VarveFile> {
                 Self::spec().open_recover(path)
             }
 
+            pub fn open_recover_with_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ReadLimits,
+            ) -> ::varve::__core::Result<::varve::__core::VarveFile> {
+                Self::spec().open_recover_with_limits(path, limits)
+            }
+
+            pub fn open_recover_trusted_unbounded<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::Result<::varve::__core::VarveFile> {
+                Self::spec().open_recover_trusted_unbounded(path)
+            }
+
             pub fn open_recover_writer<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<#writer_return> {
                 #open_recover_writer_body
+            }
+
+            pub fn open_recover_writer_with_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ReadLimits,
+            ) -> ::varve::__core::Result<#writer_return> {
+                #open_recover_writer_with_limits_body
+            }
+
+            pub fn open_recover_writer_trusted_unbounded<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::Result<#writer_return> {
+                #open_recover_writer_trusted_body
             }
 
             pub fn open_recover_with_report<P: AsRef<::std::path::Path>>(
@@ -2045,10 +2509,36 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 Self::spec().open_recover_with_report(path)
             }
 
+            pub fn open_recover_with_report_and_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ReadLimits,
+            ) -> ::varve::__core::Result<(::varve::__core::VarveFile, ::varve::__core::RecoveryReport)> {
+                Self::spec().open_recover_with_report_and_limits(path, limits)
+            }
+
+            pub fn open_recover_with_report_trusted_unbounded<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::Result<(::varve::__core::VarveFile, ::varve::__core::RecoveryReport)> {
+                Self::spec().open_recover_with_report_trusted_unbounded(path)
+            }
+
             pub fn open_recover_writer_with_report<P: AsRef<::std::path::Path>>(
                 path: P,
             ) -> ::varve::__core::Result<(#writer_return, ::varve::__core::RecoveryReport)> {
                 #open_recover_writer_report_body
+            }
+
+            pub fn open_recover_writer_with_report_and_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ReadLimits,
+            ) -> ::varve::__core::Result<(#writer_return, ::varve::__core::RecoveryReport)> {
+                #open_recover_writer_report_with_limits_body
+            }
+
+            pub fn open_recover_writer_with_report_trusted_unbounded<P: AsRef<::std::path::Path>>(
+                path: P,
+            ) -> ::varve::__core::Result<(#writer_return, ::varve::__core::RecoveryReport)> {
+                #open_recover_writer_report_trusted_body
             }
 
             pub fn diagnostics() -> ::varve::__core::FormatDiagnostics {
@@ -2519,18 +3009,39 @@ fn create_writer_with_dims_tokens(
     let body = if typed_api {
         let writer_name = format_ident!("{}Writer", format_name);
         quote!(#writer_name::from_inner(
-            ::varve::__core::VarveWriter::create_with_dims(
-                Self::spec(),
+            Self::spec().create_writer_with_dims(path, dims.into_matrix_dims())?
+        ))
+    } else {
+        quote!(Self::spec().create_writer_with_dims(path, dims.into_matrix_dims()))
+    };
+    let with_limits_body = if typed_api {
+        let writer_name = format_ident!("{}Writer", format_name);
+        quote!(#writer_name::from_inner(
+            Self::spec().create_writer_with_dims_and_limits(
+                path,
+                dims.into_matrix_dims(),
+                limits,
+            )?
+        ))
+    } else {
+        quote!(Self::spec().create_writer_with_dims_and_limits(
+            path,
+            dims.into_matrix_dims(),
+            limits,
+        ))
+    };
+    let trusted_body = if typed_api {
+        let writer_name = format_ident!("{}Writer", format_name);
+        quote!(#writer_name::from_inner(
+            Self::spec().create_writer_with_dims_trusted_unbounded(
                 path,
                 dims.into_matrix_dims(),
             )?
         ))
     } else {
-        quote!(::varve::__core::VarveWriter::create_with_dims(
-            Self::spec(),
-            path,
-            dims.into_matrix_dims(),
-        ))
+        quote!(
+            Self::spec().create_writer_with_dims_trusted_unbounded(path, dims.into_matrix_dims(),)
+        )
     };
     quote! {
         pub fn create_writer_with_dims<P: AsRef<::std::path::Path>>(
@@ -2538,6 +3049,21 @@ fn create_writer_with_dims_tokens(
             dims: #dims_name,
         ) -> ::varve::__core::Result<#writer_return> {
             #body
+        }
+
+        pub fn create_writer_with_dims_and_limits<P: AsRef<::std::path::Path>>(
+            path: P,
+            dims: #dims_name,
+            limits: ::varve::__core::ReadLimits,
+        ) -> ::varve::__core::Result<#writer_return> {
+            #with_limits_body
+        }
+
+        pub fn create_writer_with_dims_trusted_unbounded<P: AsRef<::std::path::Path>>(
+            path: P,
+            dims: #dims_name,
+        ) -> ::varve::__core::Result<#writer_return> {
+            #trusted_body
         }
     }
 }
@@ -4080,6 +4606,43 @@ fn compression_tokens(choice: CompressionChoice) -> TokenStream2 {
     }
 }
 
+fn read_limits_tokens(choice: LimitsChoice) -> TokenStream2 {
+    match choice {
+        LimitsChoice::TrustedUnbounded => {
+            quote!(::varve::__core::ReadLimits::trusted_unbounded())
+        }
+        LimitsChoice::Finite(entries) => {
+            let setters = entries.into_iter().map(|entry| {
+                let method = match entry.key.to_string().as_str() {
+                    "file_len" => format_ident!("with_max_file_len"),
+                    "records" => format_ident!("with_max_records"),
+                    "index_bytes" => format_ident!("with_max_index_bytes"),
+                    "scan_bytes" => format_ident!("with_max_scan_bytes"),
+                    "record_payload" => format_ident!("with_max_record_payload_len"),
+                    "logical_payload" => format_ident!("with_max_logical_payload_len"),
+                    "materialized_bytes" => format_ident!("with_max_materialized_bytes"),
+                    "segments" => format_ident!("with_max_segments"),
+                    "matrix_dimension" => format_ident!("with_max_matrix_dimension"),
+                    "matrix_cells" => format_ident!("with_max_matrix_cells"),
+                    "matrix_bitmap" => format_ident!("with_max_matrix_bitmap_bytes"),
+                    "matrix_crc" => format_ident!("with_max_matrix_crc_bytes"),
+                    "matrix_metadata" => format_ident!("with_max_matrix_metadata_bytes"),
+                    "matrix_slot_region" => format_ident!("with_max_matrix_slot_region_len"),
+                    "sidecar" => format_ident!("with_max_sidecar_len"),
+                    "mmap" => format_ident!("with_max_mmap_len"),
+                    _ => unreachable!("read limit keys are validated while parsing"),
+                };
+                let value = entry.value;
+                quote!(.#method(#value))
+            });
+            quote! {
+                ::varve::__core::ReadLimits::missing()
+                #(#setters)*
+            }
+        }
+    }
+}
+
 fn pairwise<T>(items: &[T]) -> Vec<(&T, &T)> {
     let mut pairs = Vec::new();
     for left in 0..items.len() {
@@ -4101,6 +4664,7 @@ mod tests {
             pub format AnalysisFormat {
                 magic: b"ANALYSIS";
                 version: 1;
+                limits: trusted_unbounded;
                 endian: little;
                 schema_hash: computed;
                 extension: "vrv";

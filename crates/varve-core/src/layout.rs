@@ -1,11 +1,14 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
 use crate::{
     Endian, Error, FileHeaderDescriptor, FormatSpec, LayoutAnchor, LayoutFieldDescriptor,
     LayoutFieldSource, LayoutFieldType, LayoutFinalize, LayoutPartKind, LayoutPlan, LayoutPreset,
-    Result, SegmentDescriptor, SegmentRepeat,
+    ReadLimits, Result, SegmentDescriptor, SegmentRepeat,
+    format::ReadLimitKey,
+    snapshot::{SnapshotCursor, SnapshotFile},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,6 +210,7 @@ pub struct LayoutWriter {
     path: PathBuf,
     file: File,
     segment_counts: Vec<SegmentCount>,
+    index_bytes: u64,
     poisoned: bool,
     _lock: crate::file::WriterLock,
 }
@@ -215,6 +219,7 @@ pub struct LayoutWriter {
 pub struct LayoutReader {
     spec: FormatSpec,
     path: PathBuf,
+    snapshot: SnapshotFile,
     file_header_len: u64,
     file_header_fields: Vec<LayoutFieldValue>,
     segments: Vec<LayoutSegmentInfo>,
@@ -250,26 +255,161 @@ struct SegmentCount {
     count: u64,
 }
 
+struct LayoutFileHeaderRead {
+    len: u64,
+    fields: Vec<LayoutFieldValue>,
+    index_bytes: u64,
+}
+
+#[derive(Debug)]
+struct LayoutSegmentReadError {
+    error: Error,
+    recoverable_tail: bool,
+}
+
+impl LayoutSegmentReadError {
+    fn recoverable(error: Error) -> Self {
+        Self {
+            error,
+            recoverable_tail: true,
+        }
+    }
+}
+
+impl From<Error> for LayoutSegmentReadError {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            recoverable_tail: false,
+        }
+    }
+}
+
 struct CountingWriter<'a, W: Write> {
     inner: &'a mut W,
     bytes_written: u64,
+    start_offset: u64,
+    max_region_len: Option<u64>,
+    max_file_len: Option<u64>,
+    max_scan_len: Option<u64>,
+    failure: Option<CountingWriteFailure>,
 }
 
 impl<'a, W: Write> CountingWriter<'a, W> {
-    fn new(inner: &'a mut W) -> Self {
+    fn new(
+        inner: &'a mut W,
+        start_offset: u64,
+        max_region_len: Option<u64>,
+        max_file_len: Option<u64>,
+        max_scan_len: Option<u64>,
+    ) -> Self {
         Self {
             inner,
             bytes_written: 0,
+            start_offset,
+            max_region_len,
+            max_file_len,
+            max_scan_len,
+            failure: None,
         }
     }
 
     fn bytes_written(&self) -> u64 {
         self.bytes_written
     }
+
+    fn take_failure(&mut self) -> Option<Error> {
+        self.failure.take().map(CountingWriteFailure::into_error)
+    }
+
+    fn reject(&mut self, failure: CountingWriteFailure) -> io::Result<usize> {
+        self.failure = Some(failure);
+        Err(io::Error::other("layout stream exceeded configured bounds"))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CountingWriteFailure {
+    LimitExceeded {
+        resource: &'static str,
+        actual: u64,
+        limit: u64,
+    },
+    ArithmeticOverflow {
+        resource: &'static str,
+    },
+}
+
+impl CountingWriteFailure {
+    fn into_error(self) -> Error {
+        match self {
+            Self::LimitExceeded {
+                resource,
+                actual,
+                limit,
+            } => Error::LimitExceeded {
+                resource,
+                actual,
+                limit,
+            },
+            Self::ArithmeticOverflow { resource } => Error::ResourceArithmeticOverflow { resource },
+        }
+    }
 }
 
 impl<W: Write> Write for CountingWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let requested = match u64::try_from(buf.len()) {
+            Ok(requested) => requested,
+            Err(_) => {
+                return self.reject(CountingWriteFailure::ArithmeticOverflow {
+                    resource: "layout stream length",
+                });
+            }
+        };
+        let prospective_region_len = match self.bytes_written.checked_add(requested) {
+            Some(len) => len,
+            None => {
+                return self.reject(CountingWriteFailure::ArithmeticOverflow {
+                    resource: "layout region length",
+                });
+            }
+        };
+        if let Some(limit) = self.max_region_len
+            && prospective_region_len > limit
+        {
+            return self.reject(CountingWriteFailure::LimitExceeded {
+                resource: "record payload length",
+                actual: prospective_region_len,
+                limit,
+            });
+        }
+        let prospective_file_len = match self.start_offset.checked_add(prospective_region_len) {
+            Some(len) => len,
+            None => {
+                return self.reject(CountingWriteFailure::ArithmeticOverflow {
+                    resource: "layout file growth",
+                });
+            }
+        };
+        if let Some(limit) = self.max_file_len
+            && prospective_file_len > limit
+        {
+            return self.reject(CountingWriteFailure::LimitExceeded {
+                resource: "file length",
+                actual: prospective_file_len,
+                limit,
+            });
+        }
+        if let Some(limit) = self.max_scan_len
+            && prospective_file_len > limit
+        {
+            return self.reject(CountingWriteFailure::LimitExceeded {
+                resource: "scan bytes",
+                actual: prospective_file_len,
+                limit,
+            });
+        }
         let written = self.inner.write(buf)?;
         self.bytes_written = self
             .bytes_written
@@ -285,8 +425,26 @@ impl<W: Write> Write for CountingWriter<'_, W> {
 
 impl FormatSpec {
     pub fn create_layout_writer<P: AsRef<Path>>(self, path: P) -> Result<LayoutWriter> {
-        self.validate()?;
-        LayoutWriter::create(self, path)
+        let spec = ordinary_layout_spec(self);
+        spec.validate()?;
+        LayoutWriter::create_inner(spec, path, &[])
+    }
+
+    pub fn create_layout_writer_with_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ReadLimits,
+    ) -> Result<LayoutWriter> {
+        self.tighten_read_limits(limits).create_layout_writer(path)
+    }
+
+    pub fn create_layout_writer_trusted_unbounded<P: AsRef<Path>>(
+        self,
+        path: P,
+    ) -> Result<LayoutWriter> {
+        let spec = self.authorize_trusted_read();
+        spec.validate()?;
+        LayoutWriter::create_inner(spec, path, &[])
     }
 
     pub fn create_layout_writer_with_header<P: AsRef<Path>>(
@@ -294,87 +452,210 @@ impl FormatSpec {
         path: P,
         fields: &[LayoutFieldValue],
     ) -> Result<LayoutWriter> {
-        self.validate()?;
-        LayoutWriter::create_with_header(self, path, fields)
+        let spec = ordinary_layout_spec(self);
+        spec.validate()?;
+        LayoutWriter::create_inner(spec, path, fields)
+    }
+
+    pub fn create_layout_writer_with_header_and_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        fields: &[LayoutFieldValue],
+        limits: ReadLimits,
+    ) -> Result<LayoutWriter> {
+        self.tighten_read_limits(limits)
+            .create_layout_writer_with_header(path, fields)
+    }
+
+    pub fn create_layout_writer_with_header_trusted_unbounded<P: AsRef<Path>>(
+        self,
+        path: P,
+        fields: &[LayoutFieldValue],
+    ) -> Result<LayoutWriter> {
+        let spec = self.authorize_trusted_read();
+        spec.validate()?;
+        LayoutWriter::create_inner(spec, path, fields)
     }
 
     pub fn open_layout_writer<P: AsRef<Path>>(self, path: P) -> Result<LayoutWriter> {
-        self.validate()?;
-        LayoutWriter::open(self, path)
+        let spec = ordinary_layout_spec(self);
+        spec.validate()?;
+        LayoutWriter::open_inner(spec, path)
+    }
+
+    pub fn open_layout_writer_with_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ReadLimits,
+    ) -> Result<LayoutWriter> {
+        self.tighten_read_limits(limits).open_layout_writer(path)
+    }
+
+    pub fn open_layout_writer_trusted_unbounded<P: AsRef<Path>>(
+        self,
+        path: P,
+    ) -> Result<LayoutWriter> {
+        let spec = self.authorize_trusted_read();
+        spec.validate()?;
+        LayoutWriter::open_inner(spec, path)
     }
 
     pub fn open_layout_reader<P: AsRef<Path>>(self, path: P) -> Result<LayoutReader> {
-        self.validate()?;
-        LayoutReader::open(self, path)
+        let spec = ordinary_layout_spec(self);
+        spec.validate()?;
+        LayoutReader::open_inner(spec, path)
+    }
+
+    pub fn open_layout_reader_with_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ReadLimits,
+    ) -> Result<LayoutReader> {
+        self.tighten_read_limits(limits).open_layout_reader(path)
+    }
+
+    pub fn open_layout_reader_trusted_unbounded<P: AsRef<Path>>(
+        self,
+        path: P,
+    ) -> Result<LayoutReader> {
+        let spec = self.authorize_trusted_read();
+        spec.validate()?;
+        LayoutReader::open_inner(spec, path)
     }
 
     pub fn inspect_layout_file<P: AsRef<Path>>(self, path: P) -> Result<LayoutFileInfo> {
-        self.validate()?;
-        if self.layout.is_varve_native_default() {
-            inspect_native_layout_file(self, path)
-        } else {
-            let reader = LayoutReader::open(self, path)?;
-            Ok(LayoutFileInfo {
-                plan: self.effective_layout(),
-                file_header_len: reader.file_header_len,
-                file_header_fields: reader.file_header_fields,
-                segments: reader.segments,
-            })
-        }
+        let spec = ordinary_layout_spec(self);
+        spec.validate()?;
+        inspect_layout_file_inner(spec, path)
+    }
+
+    pub fn inspect_layout_file_with_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ReadLimits,
+    ) -> Result<LayoutFileInfo> {
+        self.tighten_read_limits(limits).inspect_layout_file(path)
+    }
+
+    pub fn inspect_layout_file_trusted_unbounded<P: AsRef<Path>>(
+        self,
+        path: P,
+    ) -> Result<LayoutFileInfo> {
+        let spec = self.authorize_trusted_read();
+        spec.validate()?;
+        inspect_layout_file_inner(spec, path)
     }
 
     pub fn inspect_layout_file_report<P: AsRef<Path>>(self, path: P) -> Result<LayoutScanReport> {
-        self.validate()?;
-        if self.layout.is_varve_native_default() {
-            let info = inspect_native_layout_file(self, path)?;
-            return Ok(LayoutScanReport {
-                plan: info.plan,
-                file_header_len: info.file_header_len,
-                file_header_fields: info.file_header_fields,
-                segments: info.segments,
-                tail: None,
-            });
-        }
+        let spec = ordinary_layout_spec(self);
+        spec.validate()?;
+        inspect_layout_file_report_inner(spec, path)
+    }
 
-        ensure_custom_layout_spec(self)?;
-        let path = path.as_ref();
-        let mut file = File::open(path)?;
-        let file_len = file.metadata()?.len();
-        let (file_header_len, file_header_fields) = match read_file_header(self, &mut file) {
-            Ok(header) => header,
-            Err(error) => {
-                if let Some(tail) = layout_tail_info(&error, 0, file_len) {
-                    let file_header_len = self
-                        .layout
-                        .file_header()
-                        .map(file_header_len)
-                        .transpose()?
-                        .unwrap_or(0);
-                    return Ok(LayoutScanReport {
-                        plan: self.effective_layout(),
-                        file_header_len,
-                        file_header_fields: Vec::new(),
-                        segments: Vec::new(),
-                        tail: Some(tail),
-                    });
-                }
-                return Err(error);
-            }
-        };
-        let (segments, tail) = scan_layout_segments_report(self, &mut file, file_header_len)?;
-        Ok(LayoutScanReport {
-            plan: self.effective_layout(),
-            file_header_len,
-            file_header_fields,
-            segments,
-            tail,
+    pub fn inspect_layout_file_report_with_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ReadLimits,
+    ) -> Result<LayoutScanReport> {
+        self.tighten_read_limits(limits)
+            .inspect_layout_file_report(path)
+    }
+
+    pub fn inspect_layout_file_report_trusted_unbounded<P: AsRef<Path>>(
+        self,
+        path: P,
+    ) -> Result<LayoutScanReport> {
+        let spec = self.authorize_trusted_read();
+        spec.validate()?;
+        inspect_layout_file_report_inner(spec, path)
+    }
+}
+
+fn inspect_layout_file_inner<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<LayoutFileInfo> {
+    if spec.layout.is_varve_native_default() {
+        inspect_native_layout_file(spec, path)
+    } else {
+        let reader = LayoutReader::open_inner(spec, path)?;
+        Ok(LayoutFileInfo {
+            plan: spec.effective_layout(),
+            file_header_len: reader.file_header_len,
+            file_header_fields: reader.file_header_fields,
+            segments: reader.segments,
         })
     }
 }
 
+fn inspect_layout_file_report_inner<P: AsRef<Path>>(
+    spec: FormatSpec,
+    path: P,
+) -> Result<LayoutScanReport> {
+    if spec.layout.is_varve_native_default() {
+        let info = inspect_native_layout_file(spec, path)?;
+        return Ok(LayoutScanReport {
+            plan: info.plan,
+            file_header_len: info.file_header_len,
+            file_header_fields: info.file_header_fields,
+            segments: info.segments,
+            tail: None,
+        });
+    }
+
+    ensure_custom_layout_spec(spec)?;
+    ensure_layout_open_limits(spec)?;
+    let snapshot = SnapshotFile::new(File::open(path.as_ref())?)?;
+    spec.read_limits
+        .check(ReadLimitKey::FileLen, snapshot.len())?;
+    let file_len = snapshot.len();
+    let header = match read_file_header(spec, &snapshot) {
+        Ok(header) => header,
+        Err(error) => {
+            if let Some(tail) = layout_tail_info(&error, 0, file_len) {
+                let file_header_len = spec
+                    .layout
+                    .file_header()
+                    .map(file_header_len)
+                    .transpose()?
+                    .unwrap_or(0);
+                return Ok(LayoutScanReport {
+                    plan: spec.effective_layout(),
+                    file_header_len,
+                    file_header_fields: Vec::new(),
+                    segments: Vec::new(),
+                    tail: Some(tail),
+                });
+            }
+            return Err(error);
+        }
+    };
+    let (segments, tail) =
+        scan_layout_segments_report(spec, &snapshot, header.len, header.index_bytes)?;
+    Ok(LayoutScanReport {
+        plan: spec.effective_layout(),
+        file_header_len: header.len,
+        file_header_fields: header.fields,
+        segments,
+        tail,
+    })
+}
+
 impl LayoutWriter {
     pub fn create<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
-        Self::create_with_header(spec, path, &[])
+        spec.validate()?;
+        Self::create_inner(spec, path, &[])
+    }
+
+    pub fn create_with_limits<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        limits: ReadLimits,
+    ) -> Result<Self> {
+        Self::create(spec.tighten_read_limits(limits), path)
+    }
+
+    pub fn create_trusted_unbounded<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        let spec = spec.authorize_trusted_read();
+        spec.validate()?;
+        Self::create_inner(spec, path, &[])
     }
 
     pub fn create_with_header<P: AsRef<Path>>(
@@ -382,7 +663,52 @@ impl LayoutWriter {
         path: P,
         fields: &[LayoutFieldValue],
     ) -> Result<Self> {
+        spec.validate()?;
+        Self::create_inner(spec, path, fields)
+    }
+
+    pub fn create_with_header_and_limits<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        fields: &[LayoutFieldValue],
+        limits: ReadLimits,
+    ) -> Result<Self> {
+        Self::create_with_header(spec.tighten_read_limits(limits), path, fields)
+    }
+
+    pub fn create_with_header_trusted_unbounded<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        fields: &[LayoutFieldValue],
+    ) -> Result<Self> {
+        let spec = spec.authorize_trusted_read();
+        spec.validate()?;
+        Self::create_inner(spec, path, fields)
+    }
+
+    fn create_inner<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        fields: &[LayoutFieldValue],
+    ) -> Result<Self> {
         ensure_custom_layout_spec(spec)?;
+        ensure_layout_writer_create_limits(spec)?;
+        let (header_len, index_bytes) = match spec.layout.file_header() {
+            Some(header) => {
+                ensure_no_unexpected_fields_for(header.fields, fields)?;
+                (
+                    file_header_len(header)?,
+                    layout_fields_resident_bytes(header.fields)?,
+                )
+            }
+            None if fields.is_empty() => (0, 0),
+            None => return Err(Error::LayoutFieldUnexpected(fields[0].name.to_string())),
+        };
+        spec.read_limits.check(ReadLimitKey::FileLen, header_len)?;
+        spec.read_limits
+            .check(ReadLimitKey::ScanBytes, header_len)?;
+        spec.read_limits
+            .check(ReadLimitKey::IndexBytes, index_bytes)?;
         let path = path.as_ref().to_path_buf();
         let lock = crate::file::WriterLock::acquire(&path)?;
         let mut file = OpenOptions::new()
@@ -393,33 +719,57 @@ impl LayoutWriter {
             .open(&path)?;
         if let Some(header) = spec.layout.file_header() {
             write_static_layout_fields(&mut file, header.fields, fields, spec.endian)?;
-        } else if !fields.is_empty() {
-            return Err(Error::LayoutFieldUnexpected(fields[0].name.to_string()));
         }
         Ok(Self {
             spec,
             path,
             file,
             segment_counts: initial_segment_counts(spec)?,
+            index_bytes,
             poisoned: false,
             _lock: lock,
         })
     }
 
     pub fn open<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        spec.validate()?;
+        Self::open_inner(spec, path)
+    }
+
+    pub fn open_with_limits<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        limits: ReadLimits,
+    ) -> Result<Self> {
+        Self::open(spec.tighten_read_limits(limits), path)
+    }
+
+    pub fn open_trusted_unbounded<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        let spec = spec.authorize_trusted_read();
+        spec.validate()?;
+        Self::open_inner(spec, path)
+    }
+
+    fn open_inner<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
         ensure_custom_layout_spec(spec)?;
+        ensure_layout_writer_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
         let lock = crate::file::WriterLock::acquire(&path)?;
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-        let (file_header_len, _) = read_file_header(spec, &mut file)?;
-        let segments = scan_layout_segments(spec, &mut file, file_header_len)?;
+        let snapshot = SnapshotFile::new(file.try_clone()?)?;
+        spec.read_limits
+            .check(ReadLimitKey::FileLen, snapshot.len())?;
+        let header = read_file_header(spec, &snapshot)?;
+        let (segments, index_bytes) =
+            scan_layout_segments(spec, &snapshot, header.len, header.index_bytes)?;
         let segment_counts = segment_counts_from_infos(spec, &segments)?;
-        file.seek(SeekFrom::End(0))?;
+        file.seek(SeekFrom::Start(snapshot.len()))?;
         Ok(Self {
             spec,
             path,
             file,
             segment_counts,
+            index_bytes,
             poisoned: false,
             _lock: lock,
         })
@@ -430,7 +780,7 @@ impl LayoutWriter {
     }
 
     pub fn spec(&self) -> FormatSpec {
-        self.spec
+        self.spec.ordinary_read()
     }
 
     pub fn write_segment(&mut self, segment: SegmentWrite<'_>) -> Result<LayoutSegmentInfo> {
@@ -474,18 +824,46 @@ impl LayoutWriter {
         let lead_in_len = descriptor_lead_in_len(descriptor)?;
         let footer_len = descriptor_footer_len(descriptor)?;
         let original_eof = self.file.metadata()?.len();
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::FileLen, original_eof)?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::ScanBytes, original_eof)?;
         let original_cursor = self.file.stream_position()?;
         let after_lead_in =
             original_eof
                 .checked_add(lead_in_len)
-                .ok_or(Error::LayoutInvalidSegmentBounds {
-                    offset: original_eof,
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "layout file growth",
                 })?;
-        after_lead_in
-            .checked_add(footer_len)
-            .ok_or(Error::LayoutInvalidSegmentBounds {
-                offset: original_eof,
+        let minimum_segment_end =
+            after_lead_in
+                .checked_add(footer_len)
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "layout file growth",
+                })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::FileLen, minimum_segment_end)?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::ScanBytes, minimum_segment_end)?;
+        let next_index_bytes = self
+            .index_bytes
+            .checked_add(layout_segment_resident_bytes(descriptor)?)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "layout index bytes",
             })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::IndexBytes, next_index_bytes)?;
+        let max_payload_len = self
+            .spec
+            .read_limits
+            .require(ReadLimitKey::RecordPayloadLen)?;
+        let max_file_len = self.spec.read_limits.require(ReadLimitKey::FileLen)?;
+        let max_scan_len = self.spec.read_limits.require(ReadLimitKey::ScanBytes)?;
         let (segment_count_index, original_segment_count, next_segment_count) =
             self.segment_count_checkpoint(descriptor.name)?;
 
@@ -502,23 +880,55 @@ impl LayoutWriter {
                 &mut patches,
             )?;
             let metadata_offset = after_lead_in;
-            let mut metadata_writer = CountingWriter::new(&mut self.file);
-            (segment.write_metadata)(&mut metadata_writer)?;
+            let mut metadata_writer = CountingWriter::new(
+                &mut self.file,
+                metadata_offset,
+                max_payload_len,
+                max_file_len,
+                max_scan_len,
+            );
+            let metadata_result = (segment.write_metadata)(&mut metadata_writer);
+            if let Some(error) = metadata_writer.take_failure() {
+                return Err(error);
+            }
+            metadata_result?;
             let metadata_len = metadata_writer.bytes_written();
             let raw_offset = metadata_offset.checked_add(metadata_len).ok_or(
-                Error::LayoutInvalidSegmentBounds {
-                    offset: segment_start,
+                Error::ResourceArithmeticOverflow {
+                    resource: "layout file growth",
                 },
             )?;
-            let mut raw_writer = CountingWriter::new(&mut self.file);
-            (segment.write_raw)(&mut raw_writer)?;
+            let mut raw_writer = CountingWriter::new(
+                &mut self.file,
+                raw_offset,
+                max_payload_len,
+                max_file_len,
+                max_scan_len,
+            );
+            let raw_result = (segment.write_raw)(&mut raw_writer);
+            if let Some(error) = raw_writer.take_failure() {
+                return Err(error);
+            }
+            raw_result?;
             let raw_len = raw_writer.bytes_written();
             let footer_offset =
                 raw_offset
                     .checked_add(raw_len)
-                    .ok_or(Error::LayoutInvalidSegmentBounds {
-                        offset: segment_start,
+                    .ok_or(Error::ResourceArithmeticOverflow {
+                        resource: "layout file growth",
                     })?;
+            let footer_end =
+                footer_offset
+                    .checked_add(footer_len)
+                    .ok_or(Error::ResourceArithmeticOverflow {
+                        resource: "layout file growth",
+                    })?;
+            self.spec
+                .read_limits
+                .check(ReadLimitKey::FileLen, footer_end)?;
+            self.spec
+                .read_limits
+                .check(ReadLimitKey::ScanBytes, footer_end)?;
             if let Some(footer) = descriptor.footer {
                 write_patchable_layout_fields(
                     &mut self.file,
@@ -528,12 +938,6 @@ impl LayoutWriter {
                     &mut patches,
                 )?;
             }
-            let footer_end =
-                footer_offset
-                    .checked_add(footer_len)
-                    .ok_or(Error::LayoutInvalidSegmentBounds {
-                        offset: segment_start,
-                    })?;
             let segment_end = footer_end;
             let anchors = Anchors {
                 segment_start,
@@ -579,6 +983,7 @@ impl LayoutWriter {
         match result {
             Ok(info) => {
                 self.segment_counts[segment_count_index].count = next_segment_count;
+                self.index_bytes = next_index_bytes;
                 self.poisoned = false;
                 Ok(info)
             }
@@ -632,6 +1037,22 @@ impl LayoutWriter {
                 offset: self.file.metadata()?.len(),
             });
         }
+        let segment_count = self.segment_counts.iter().try_fold(0u64, |total, count| {
+            total
+                .checked_add(count.count)
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "layout segment count",
+                })
+        })?;
+        let prospective_count =
+            segment_count
+                .checked_add(1)
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "layout segment count",
+                })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::Segments, prospective_count)?;
         Ok(())
     }
 
@@ -672,22 +1093,45 @@ impl LayoutWriter {
 
 impl LayoutReader {
     pub fn open<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        spec.validate()?;
+        Self::open_inner(spec, path)
+    }
+
+    pub fn open_with_limits<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        limits: ReadLimits,
+    ) -> Result<Self> {
+        Self::open(spec.tighten_read_limits(limits), path)
+    }
+
+    pub fn open_trusted_unbounded<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        let spec = spec.authorize_trusted_read();
+        spec.validate()?;
+        Self::open_inner(spec, path)
+    }
+
+    fn open_inner<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
         ensure_custom_layout_spec(spec)?;
+        ensure_layout_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
-        let mut file = OpenOptions::new().read(true).open(&path)?;
-        let (file_header_len, file_header_fields) = read_file_header(spec, &mut file)?;
-        let segments = scan_layout_segments(spec, &mut file, file_header_len)?;
+        let snapshot = SnapshotFile::new(File::open(&path)?)?;
+        spec.read_limits
+            .check(ReadLimitKey::FileLen, snapshot.len())?;
+        let header = read_file_header(spec, &snapshot)?;
+        let (segments, _) = scan_layout_segments(spec, &snapshot, header.len, header.index_bytes)?;
         Ok(Self {
             spec,
             path,
-            file_header_len,
-            file_header_fields,
+            snapshot,
+            file_header_len: header.len,
+            file_header_fields: header.fields,
             segments,
         })
     }
 
     pub fn spec(&self) -> FormatSpec {
-        self.spec
+        self.spec.ordinary_read()
     }
 
     pub fn path(&self) -> &Path {
@@ -718,7 +1162,7 @@ impl LayoutReader {
             .segments
             .get(index)
             .ok_or(Error::LayoutInvalidSegmentBounds { offset: 0 })?;
-        read_range(&self.path, segment.metadata_offset, segment.metadata_len)
+        self.read_snapshot_range(segment.metadata_offset, segment.metadata_len)
     }
 
     pub fn read_metadata_range(&self, index: usize, offset: u64, len: u64) -> Result<Vec<u8>> {
@@ -733,7 +1177,7 @@ impl LayoutReader {
             len,
             segment.segment_start,
         )?;
-        read_range(&self.path, absolute, len)
+        self.read_snapshot_range(absolute, len)
     }
 
     pub fn read_raw(&self, index: usize) -> Result<Vec<u8>> {
@@ -741,7 +1185,7 @@ impl LayoutReader {
             .segments
             .get(index)
             .ok_or(Error::LayoutInvalidSegmentBounds { offset: 0 })?;
-        read_range(&self.path, segment.raw_offset, segment.raw_len)
+        self.read_snapshot_range(segment.raw_offset, segment.raw_len)
     }
 
     pub fn read_raw_range(&self, index: usize, offset: u64, len: u64) -> Result<Vec<u8>> {
@@ -756,7 +1200,17 @@ impl LayoutReader {
             len,
             segment.segment_start,
         )?;
-        read_range(&self.path, absolute, len)
+        self.read_snapshot_range(absolute, len)
+    }
+
+    fn read_snapshot_range(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let limit = self
+            .spec
+            .read_limits
+            .require(ReadLimitKey::RecordPayloadLen)?
+            .unwrap_or(u64::MAX);
+        self.snapshot
+            .read_vec_at(offset, len, limit, "record payload length")
     }
 }
 
@@ -781,6 +1235,34 @@ fn checked_subrange(
         .ok_or(Error::LayoutInvalidSegmentBounds {
             offset: error_offset,
         })
+}
+
+fn ordinary_layout_spec(spec: FormatSpec) -> FormatSpec {
+    spec.ordinary_read()
+}
+
+fn ensure_layout_open_limits(spec: FormatSpec) -> Result<()> {
+    for key in [
+        ReadLimitKey::FileLen,
+        ReadLimitKey::ScanBytes,
+        ReadLimitKey::Segments,
+        ReadLimitKey::IndexBytes,
+    ] {
+        spec.read_limits.require(key)?;
+    }
+    Ok(())
+}
+
+fn ensure_layout_writer_create_limits(spec: FormatSpec) -> Result<()> {
+    ensure_layout_open_limits(spec)?;
+    spec.read_limits.require(ReadLimitKey::RecordPayloadLen)?;
+    Ok(())
+}
+
+fn ensure_layout_writer_open_limits(spec: FormatSpec) -> Result<()> {
+    ensure_layout_open_limits(spec)?;
+    spec.read_limits.require(ReadLimitKey::RecordPayloadLen)?;
+    Ok(())
 }
 
 fn ensure_custom_layout_spec(spec: FormatSpec) -> Result<()> {
@@ -1030,9 +1512,7 @@ fn segment_counts_from_infos(
 ) -> Result<Vec<SegmentCount>> {
     let mut counts = initial_segment_counts(spec)?;
     for segment in segments {
-        if let Some(count) = counts.iter_mut().find(|count| count.name == segment.name) {
-            count.count += 1;
-        }
+        increment_segment_count(&mut counts, segment.name)?;
     }
     Ok(counts)
 }
@@ -1214,17 +1694,31 @@ fn collect_written_layout_values(
         .collect()
 }
 
-fn read_file_header(spec: FormatSpec, file: &mut File) -> Result<(u64, Vec<LayoutFieldValue>)> {
+fn read_file_header(spec: FormatSpec, snapshot: &SnapshotFile) -> Result<LayoutFileHeaderRead> {
     let Some(header) = spec.layout.file_header() else {
-        return Ok((0, Vec::new()));
+        spec.read_limits.check(ReadLimitKey::ScanBytes, 0)?;
+        spec.read_limits.check(ReadLimitKey::IndexBytes, 0)?;
+        return Ok(LayoutFileHeaderRead {
+            len: 0,
+            fields: Vec::new(),
+            index_bytes: 0,
+        });
     };
     let header_len = file_header_len(header)?;
-    let file_len = file.metadata()?.len();
-    if file_len < header_len {
+    let index_bytes = layout_fields_resident_bytes(header.fields)?;
+    spec.read_limits
+        .check(ReadLimitKey::ScanBytes, header_len)?;
+    spec.read_limits
+        .check(ReadLimitKey::IndexBytes, index_bytes)?;
+    if snapshot.len() < header_len {
         return Err(Error::LayoutTruncatedHeader { offset: 0 });
     }
-    let fields = read_static_layout_fields(file, header.fields, 0, spec.endian)?;
-    Ok((header_len, fields))
+    let fields = read_static_layout_fields(snapshot, header.fields, 0, spec.endian)?;
+    Ok(LayoutFileHeaderRead {
+        len: header_len,
+        fields,
+        index_bytes,
+    })
 }
 
 fn file_header_len(header: FileHeaderDescriptor) -> Result<u64> {
@@ -1232,16 +1726,29 @@ fn file_header_len(header: FileHeaderDescriptor) -> Result<u64> {
 }
 
 fn read_static_layout_fields(
-    file: &mut File,
+    snapshot: &SnapshotFile,
     descriptors: &[LayoutFieldDescriptor],
     start_offset: u64,
     endian: Endian,
 ) -> Result<Vec<LayoutFieldValue>> {
-    file.seek(SeekFrom::Start(start_offset))?;
+    let byte_len = descriptor_fields_len(descriptors)?;
+    let bytes = snapshot.read_vec_at(
+        start_offset,
+        byte_len,
+        byte_len,
+        "layout file-header fields",
+    )?;
     let mut position = start_offset;
+    let mut relative = 0usize;
     let mut fields = Vec::new();
+    fields
+        .try_reserve_exact(descriptors.len())
+        .map_err(|_| Error::AllocationFailed {
+            resource: "layout field index",
+            requested: layout_fields_resident_bytes(descriptors).unwrap_or(u64::MAX),
+        })?;
     for field in descriptors {
-        let value = read_layout_value(file, *field, endian)?;
+        let value = read_layout_value_from_slice(&bytes, relative, *field, endian)?;
         let stored_value = value.clone();
         match field.source {
             LayoutFieldSource::LiteralBytes(expected) => match value {
@@ -1283,25 +1790,43 @@ fn read_static_layout_fields(
         position =
             position
                 .checked_add(field.ty.byte_len())
-                .ok_or(Error::LayoutInvalidSegmentBounds {
-                    offset: start_offset,
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "layout field offset",
                 })?;
+        relative = relative
+            .checked_add(usize::try_from(field.ty.byte_len()).map_err(|_| {
+                Error::LengthOverflow {
+                    value: field.ty.byte_len(),
+                }
+            })?)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "layout field offset",
+            })?;
     }
     Ok(fields)
 }
 
 fn scan_layout_segments(
     spec: FormatSpec,
-    file: &mut File,
+    snapshot: &SnapshotFile,
     start_offset: u64,
-) -> Result<Vec<LayoutSegmentInfo>> {
+    initial_index_bytes: u64,
+) -> Result<(Vec<LayoutSegmentInfo>, u64)> {
     let dispatch = segment_dispatch_table(spec)?;
-    let file_len = file.metadata()?.len();
+    let file_len = snapshot.len();
+    spec.read_limits
+        .check(ReadLimitKey::ScanBytes, start_offset)?;
+    spec.read_limits
+        .check(ReadLimitKey::IndexBytes, initial_index_bytes)?;
     let mut offset = start_offset;
+    let mut index_bytes = initial_index_bytes;
     let mut segments = Vec::new();
     let mut segment_counts = initial_segment_counts(spec)?;
+    let mut cursor = snapshot.cursor_at(start_offset)?;
     while offset < file_len {
-        let dispatch_index = select_segment_descriptor(&dispatch, file, offset, file_len)?;
+        check_pending_layout_segment_limits(spec, &dispatch, segments.len(), index_bytes)?;
+        let dispatch_index =
+            select_segment_descriptor(spec, &dispatch, &mut cursor, offset, file_len)?;
         let descriptor = dispatch[dispatch_index].descriptor;
         if descriptor.repeat == SegmentRepeat::Once
             && segment_counts
@@ -1313,104 +1838,220 @@ fn scan_layout_segments(
                 offset,
             });
         }
-        let info = read_layout_segment_at(spec, file, descriptor, offset, file_len)?;
+        let next_index_bytes =
+            reserve_layout_segment(spec, &mut segments, descriptor, index_bytes)?;
+        let info = read_layout_segment_at(spec, &mut cursor, descriptor, offset, file_len)
+            .map_err(|failure| failure.error)?;
         if info.segment_end <= offset {
             return Err(Error::LayoutInvalidSegmentBounds { offset });
         }
         offset = info.segment_end;
-        if let Some(count) = segment_counts
-            .iter_mut()
-            .find(|count| count.name == descriptor.name)
-        {
-            count.count += 1;
-        }
+        increment_segment_count(&mut segment_counts, descriptor.name)?;
         segments.push(info);
+        index_bytes = next_index_bytes;
     }
     if offset != file_len {
         return Err(Error::LayoutInvalidSegmentBounds { offset });
     }
-    Ok(segments)
+    Ok((segments, index_bytes))
 }
 
 fn scan_layout_segments_report(
     spec: FormatSpec,
-    file: &mut File,
+    snapshot: &SnapshotFile,
     start_offset: u64,
+    initial_index_bytes: u64,
 ) -> Result<(Vec<LayoutSegmentInfo>, Option<LayoutTailInfo>)> {
     let dispatch = segment_dispatch_table(spec)?;
-    let file_len = file.metadata()?.len();
+    let file_len = snapshot.len();
+    spec.read_limits
+        .check(ReadLimitKey::ScanBytes, start_offset)?;
+    spec.read_limits
+        .check(ReadLimitKey::IndexBytes, initial_index_bytes)?;
     let mut offset = start_offset;
+    let mut index_bytes = initial_index_bytes;
     let mut segments = Vec::new();
     let mut segment_counts = initial_segment_counts(spec)?;
+    let mut cursor = snapshot.cursor_at(start_offset)?;
     while offset < file_len {
-        let dispatch_index = match select_segment_descriptor(&dispatch, file, offset, file_len) {
-            Ok(index) => index,
-            Err(error) => {
-                if let Some(tail) = layout_tail_info(&error, offset, file_len) {
-                    return Ok((segments, Some(tail)));
+        check_pending_layout_segment_limits(spec, &dispatch, segments.len(), index_bytes)?;
+        let dispatch_index =
+            match select_segment_descriptor(spec, &dispatch, &mut cursor, offset, file_len) {
+                Ok(index) => index,
+                Err(error) => {
+                    if let Some(tail) = layout_tail_info(&error, offset, file_len) {
+                        return Ok((segments, Some(tail)));
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
         let descriptor = dispatch[dispatch_index].descriptor;
         if descriptor.repeat == SegmentRepeat::Once
             && segment_counts
                 .iter()
                 .any(|count| count.name == descriptor.name && count.count > 0)
         {
-            return Ok((
-                segments,
-                Some(LayoutTailInfo {
-                    offset,
-                    file_len,
-                    kind: LayoutTailKind::RepeatedOnceSegment,
-                }),
-            ));
+            return Err(Error::LayoutRepeatedOnceSegment {
+                segment: descriptor.name.to_string(),
+                offset,
+            });
         }
-        let info = match read_layout_segment_at(spec, file, descriptor, offset, file_len) {
+        let next_index_bytes =
+            reserve_layout_segment(spec, &mut segments, descriptor, index_bytes)?;
+        let info = match read_layout_segment_at(spec, &mut cursor, descriptor, offset, file_len) {
             Ok(info) => info,
-            Err(error) => {
-                if let Some(tail) = layout_tail_info(&error, offset, file_len) {
+            Err(failure) if failure.recoverable_tail => {
+                return Ok((
+                    segments,
+                    Some(LayoutTailInfo {
+                        offset,
+                        file_len,
+                        kind: LayoutTailKind::InvalidSegmentBounds,
+                    }),
+                ));
+            }
+            Err(failure) => {
+                if let Some(tail) = layout_tail_info(&failure.error, offset, file_len) {
                     return Ok((segments, Some(tail)));
                 }
-                return Err(error);
+                return Err(failure.error);
             }
         };
         if info.segment_end <= offset {
-            return Ok((
-                segments,
-                Some(LayoutTailInfo {
-                    offset,
-                    file_len,
-                    kind: LayoutTailKind::InvalidSegmentBounds,
-                }),
-            ));
+            return Err(Error::LayoutInvalidSegmentBounds { offset });
         }
         offset = info.segment_end;
-        if let Some(count) = segment_counts
-            .iter_mut()
-            .find(|count| count.name == descriptor.name)
-        {
-            count.count += 1;
-        }
+        increment_segment_count(&mut segment_counts, descriptor.name)?;
         segments.push(info);
+        index_bytes = next_index_bytes;
     }
     Ok((segments, None))
+}
+
+fn check_pending_layout_segment_limits(
+    spec: FormatSpec,
+    dispatch: &[SegmentDispatch],
+    segment_count: usize,
+    index_bytes: u64,
+) -> Result<()> {
+    let prospective_count = u64::try_from(segment_count)
+        .map_err(|_| Error::LengthOverflow { value: u64::MAX })?
+        .checked_add(1)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "layout segment count",
+        })?;
+    spec.read_limits
+        .check(ReadLimitKey::Segments, prospective_count)?;
+
+    let minimum_entry_bytes = dispatch
+        .iter()
+        .map(|candidate| layout_segment_resident_bytes(candidate.descriptor))
+        .try_fold(None, |minimum, bytes| {
+            let bytes = bytes?;
+            Ok::<_, Error>(Some(
+                minimum.map_or(bytes, |current: u64| current.min(bytes)),
+            ))
+        })?
+        .ok_or(Error::InvalidFormatSpec("missing layout segment"))?;
+    let minimum_index_bytes =
+        index_bytes
+            .checked_add(minimum_entry_bytes)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "layout index bytes",
+            })?;
+    spec.read_limits
+        .check(ReadLimitKey::IndexBytes, minimum_index_bytes)?;
+    Ok(())
+}
+
+fn reserve_layout_segment(
+    spec: FormatSpec,
+    segments: &mut Vec<LayoutSegmentInfo>,
+    descriptor: SegmentDescriptor,
+    index_bytes: u64,
+) -> Result<u64> {
+    let segment_count = u64::try_from(segments.len())
+        .map_err(|_| Error::LengthOverflow { value: u64::MAX })?
+        .checked_add(1)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "layout segment count",
+        })?;
+    spec.read_limits
+        .check(ReadLimitKey::Segments, segment_count)?;
+    let entry_bytes = layout_segment_resident_bytes(descriptor)?;
+    let next_index_bytes =
+        index_bytes
+            .checked_add(entry_bytes)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "layout index bytes",
+            })?;
+    spec.read_limits
+        .check(ReadLimitKey::IndexBytes, next_index_bytes)?;
+    segments
+        .try_reserve(1)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "layout segment index",
+            requested: next_index_bytes,
+        })?;
+    Ok(next_index_bytes)
+}
+
+fn increment_segment_count(counts: &mut [SegmentCount], name: &'static str) -> Result<()> {
+    let count = counts
+        .iter_mut()
+        .find(|count| count.name == name)
+        .ok_or(Error::InvalidFormatSpec("layout segment count is missing"))?;
+    count.count = count
+        .count
+        .checked_add(1)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "layout segment count",
+        })?;
+    Ok(())
+}
+
+fn layout_segment_resident_bytes(descriptor: SegmentDescriptor) -> Result<u64> {
+    let base = u64::try_from(size_of::<LayoutSegmentInfo>())
+        .map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+    let lead_in = layout_fields_resident_bytes(descriptor.lead_in.fields)?;
+    let footer = descriptor
+        .footer
+        .map(|footer| layout_fields_resident_bytes(footer.fields))
+        .unwrap_or(Ok(0))?;
+    base.checked_add(lead_in)
+        .and_then(|bytes| bytes.checked_add(footer))
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "layout index bytes",
+        })
+}
+
+fn layout_fields_resident_bytes(descriptors: &[LayoutFieldDescriptor]) -> Result<u64> {
+    let field_size = u64::try_from(size_of::<LayoutFieldValue>())
+        .map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+    let field_count =
+        u64::try_from(descriptors.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+    let values = field_count
+        .checked_mul(field_size)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "layout index bytes",
+        })?;
+    descriptors.iter().try_fold(values, |bytes, descriptor| {
+        let owned_bytes = match descriptor.ty {
+            LayoutFieldType::Bytes { len } => len,
+            _ => 0,
+        };
+        bytes
+            .checked_add(owned_bytes)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "layout index bytes",
+            })
+    })
 }
 
 fn layout_tail_info(error: &Error, default_offset: u64, file_len: u64) -> Option<LayoutTailInfo> {
     let (offset, kind) = match error {
         Error::LayoutTruncatedHeader { offset } => (*offset, LayoutTailKind::TruncatedHeader),
         Error::LayoutTruncatedLeadIn { offset } => (*offset, LayoutTailKind::TruncatedLeadIn),
-        Error::LayoutInvalidSegmentBounds { offset } => {
-            (*offset, LayoutTailKind::InvalidSegmentBounds)
-        }
-        Error::LayoutLiteralMismatch { offset, .. } => (*offset, LayoutTailKind::LiteralMismatch),
-        Error::LayoutAmbiguousSegment { offset } => (*offset, LayoutTailKind::AmbiguousSegment),
-        Error::LayoutNoMatchingSegment { offset } => (*offset, LayoutTailKind::NoMatchingSegment),
-        Error::LayoutRepeatedOnceSegment { offset, .. } => {
-            (*offset, LayoutTailKind::RepeatedOnceSegment)
-        }
         _ => return None,
     };
     Some(LayoutTailInfo {
@@ -1434,13 +2075,15 @@ fn segment_dispatch_table(spec: FormatSpec) -> Result<Vec<SegmentDispatch>> {
 }
 
 fn select_segment_descriptor(
+    spec: FormatSpec,
     dispatch: &[SegmentDispatch],
-    file: &mut File,
+    cursor: &mut SnapshotCursor,
     offset: u64,
     file_len: u64,
 ) -> Result<usize> {
     if dispatch.len() == 1 {
         let lead_in_len = dispatch[0].lead_in_len;
+        check_layout_scan_extent(spec, offset, lead_in_len)?;
         if file_len - offset < lead_in_len {
             return Err(Error::LayoutTruncatedLeadIn { offset });
         }
@@ -1448,15 +2091,25 @@ fn select_segment_descriptor(
     }
 
     let mut matches = Vec::new();
+    matches
+        .try_reserve_exact(dispatch.len())
+        .map_err(|_| Error::AllocationFailed {
+            resource: "layout segment dispatch",
+            requested: u64::try_from(dispatch.len()).unwrap_or(u64::MAX),
+        })?;
     let mut fallback = None;
     let mut saw_truncated = false;
     for (index, candidate) in dispatch.iter().enumerate() {
         if let Some(key) = &candidate.key {
-            if file_len - offset < key.len() as u64 {
+            let key_len =
+                u64::try_from(key.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+            check_layout_scan_extent(spec, offset, key_len)?;
+            if file_len - offset < key_len {
                 saw_truncated = true;
                 continue;
             }
-            if bytes_at(file, offset, key.len())? == *key {
+            if bytes_at(cursor, offset, key.len())? == *key {
+                check_layout_scan_extent(spec, offset, candidate.lead_in_len)?;
                 if file_len - offset < candidate.lead_in_len {
                     return Err(Error::LayoutTruncatedLeadIn { offset });
                 }
@@ -1477,6 +2130,7 @@ fn select_segment_descriptor(
         n if n > 1 => Err(Error::LayoutAmbiguousSegment { offset }),
         _ => {
             if let Some(index) = fallback {
+                check_layout_scan_extent(spec, offset, dispatch[index].lead_in_len)?;
                 if file_len - offset < dispatch[index].lead_in_len {
                     return Err(Error::LayoutTruncatedLeadIn { offset });
                 }
@@ -1490,11 +2144,19 @@ fn select_segment_descriptor(
     }
 }
 
-fn bytes_at(file: &mut File, offset: u64, len: usize) -> Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(offset))?;
-    let mut bytes = vec![0; len];
-    file.read_exact(&mut bytes)?;
-    Ok(bytes)
+fn check_layout_scan_extent(spec: FormatSpec, offset: u64, len: u64) -> Result<u64> {
+    let end = offset
+        .checked_add(len)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "layout scan bytes",
+        })?;
+    spec.read_limits.check(ReadLimitKey::ScanBytes, end)?;
+    Ok(end)
+}
+
+fn bytes_at(cursor: &mut SnapshotCursor, offset: u64, len: usize) -> Result<Vec<u8>> {
+    let len = u64::try_from(len).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+    cursor.read_vec_at(offset, len, len, "layout dispatch key")
 }
 
 fn segment_dispatch_key(
@@ -1554,26 +2216,39 @@ fn dispatch_keys_overlap(left: Option<&[u8]>, right: Option<&[u8]>) -> bool {
 
 fn read_layout_segment_at(
     spec: FormatSpec,
-    file: &mut File,
+    cursor: &mut SnapshotCursor,
     descriptor: SegmentDescriptor,
     segment_start: u64,
     file_len: u64,
-) -> Result<LayoutSegmentInfo> {
+) -> std::result::Result<LayoutSegmentInfo, LayoutSegmentReadError> {
     let lead_in_len = descriptor_lead_in_len(descriptor)?;
     let footer_len = descriptor_footer_len(descriptor)?;
-    let after_lead_in =
-        segment_start
-            .checked_add(lead_in_len)
-            .ok_or(Error::LayoutInvalidSegmentBounds {
-                offset: segment_start,
-            })?;
-    file.seek(SeekFrom::Start(segment_start))?;
+    let after_lead_in = check_layout_scan_extent(spec, segment_start, lead_in_len)?;
+    let lead_in_bytes = cursor.read_vec_at(
+        segment_start,
+        lead_in_len,
+        lead_in_len,
+        "layout lead-in fields",
+    )?;
     let mut position = segment_start;
+    let mut relative = 0usize;
     let mut finalized = Vec::new();
+    finalized
+        .try_reserve_exact(descriptor.lead_in.fields.len())
+        .map_err(|_| Error::AllocationFailed {
+            resource: "layout finalized fields",
+            requested: u64::try_from(descriptor.lead_in.fields.len()).unwrap_or(u64::MAX),
+        })?;
     let mut fields = Vec::new();
+    fields
+        .try_reserve_exact(descriptor.lead_in.fields.len())
+        .map_err(|_| Error::AllocationFailed {
+            resource: "layout field index",
+            requested: layout_fields_resident_bytes(descriptor.lead_in.fields).unwrap_or(u64::MAX),
+        })?;
     for field in descriptor.lead_in.fields {
         let value_offset = position;
-        let value = read_layout_value(file, *field, spec.endian)?;
+        let value = read_layout_value_from_slice(&lead_in_bytes, relative, *field, spec.endian)?;
         let stored_value = value.clone();
         match field.source {
             LayoutFieldSource::LiteralBytes(expected) => match value {
@@ -1582,7 +2257,8 @@ fn read_layout_segment_at(
                     return Err(Error::LayoutLiteralMismatch {
                         field: field.name,
                         offset: value_offset,
-                    });
+                    }
+                    .into());
                 }
             },
             LayoutFieldSource::LiteralU64(expected) => {
@@ -1590,7 +2266,8 @@ fn read_layout_segment_at(
                     return Err(Error::LayoutLiteralMismatch {
                         field: field.name,
                         offset: value_offset,
-                    });
+                    }
+                    .into());
                 }
             }
             LayoutFieldSource::LiteralI64(expected) => {
@@ -1598,7 +2275,8 @@ fn read_layout_segment_at(
                     return Err(Error::LayoutLiteralMismatch {
                         field: field.name,
                         offset: value_offset,
-                    });
+                    }
+                    .into());
                 }
             }
             LayoutFieldSource::Caller => {}
@@ -1611,9 +2289,18 @@ fn read_layout_segment_at(
         position =
             position
                 .checked_add(field.ty.byte_len())
-                .ok_or(Error::LayoutInvalidSegmentBounds {
-                    offset: segment_start,
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "layout field offset",
                 })?;
+        relative = relative
+            .checked_add(usize::try_from(field.ty.byte_len()).map_err(|_| {
+                Error::LengthOverflow {
+                    value: field.ty.byte_len(),
+                }
+            })?)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "layout field offset",
+            })?;
     }
 
     let metadata_offset = after_lead_in;
@@ -1637,14 +2324,11 @@ fn read_layout_segment_at(
             .ok_or(Error::LayoutInvalidSegmentBounds {
                 offset: segment_start,
             })?;
-    if raw_offset < metadata_offset
-        || footer_offset < raw_offset
-        || segment_end < footer_offset
-        || segment_end > file_len
-    {
+    if raw_offset < metadata_offset || footer_offset < raw_offset || segment_end < footer_offset {
         return Err(Error::LayoutInvalidSegmentBounds {
             offset: segment_start,
-        });
+        }
+        .into());
     }
     let metadata_len = raw_offset - metadata_offset;
     let raw_len = footer_offset - raw_offset;
@@ -1667,11 +2351,20 @@ fn read_layout_segment_at(
             return Err(Error::LayoutLiteralMismatch {
                 field: field.name,
                 offset: segment_start,
-            });
+            }
+            .into());
         }
     }
+    check_layout_scan_extent(spec, 0, segment_end)?;
+    if segment_end > file_len {
+        return Err(LayoutSegmentReadError::recoverable(
+            Error::LayoutInvalidSegmentBounds {
+                offset: segment_start,
+            },
+        ));
+    }
     let footer_fields = if let Some(footer) = descriptor.footer {
-        read_footer_layout_fields(file, footer.fields, footer_offset, spec.endian, anchors)?
+        read_footer_layout_fields(cursor, footer.fields, footer_offset, spec.endian, anchors)?
     } else {
         Vec::new()
     };
@@ -1692,17 +2385,30 @@ fn read_layout_segment_at(
 }
 
 fn read_footer_layout_fields(
-    file: &mut File,
+    cursor: &mut SnapshotCursor,
     descriptors: &[LayoutFieldDescriptor],
     footer_offset: u64,
     endian: Endian,
     anchors: Anchors,
 ) -> Result<Vec<LayoutFieldValue>> {
-    file.seek(SeekFrom::Start(footer_offset))?;
+    let footer_len = descriptor_fields_len(descriptors)?;
+    let bytes = cursor.read_vec_at(
+        footer_offset,
+        footer_len,
+        footer_len,
+        "layout footer fields",
+    )?;
     let mut position = footer_offset;
+    let mut relative = 0usize;
     let mut fields = Vec::new();
+    fields
+        .try_reserve_exact(descriptors.len())
+        .map_err(|_| Error::AllocationFailed {
+            resource: "layout field index",
+            requested: layout_fields_resident_bytes(descriptors).unwrap_or(u64::MAX),
+        })?;
     for field in descriptors {
-        let value = read_layout_value(file, *field, endian)?;
+        let value = read_layout_value_from_slice(&bytes, relative, *field, endian)?;
         let stored_value = value.clone();
         match field.source {
             LayoutFieldSource::LiteralBytes(expected) => match value {
@@ -1748,9 +2454,18 @@ fn read_footer_layout_fields(
         position =
             position
                 .checked_add(field.ty.byte_len())
-                .ok_or(Error::LayoutInvalidSegmentBounds {
-                    offset: footer_offset,
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "layout footer field offset",
                 })?;
+        relative = relative
+            .checked_add(usize::try_from(field.ty.byte_len()).map_err(|_| {
+                Error::LengthOverflow {
+                    value: field.ty.byte_len(),
+                }
+            })?)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "layout footer field offset",
+            })?;
     }
     Ok(fields)
 }
@@ -2024,34 +2739,79 @@ fn write_numeric<W: Write>(
     }
 }
 
-fn read_layout_value(
-    file: &mut File,
+fn read_layout_value_from_slice(
+    bytes: &[u8],
+    offset: usize,
     field: LayoutFieldDescriptor,
     format_endian: Endian,
 ) -> Result<LayoutValue> {
     let endian = field.endian.unwrap_or(format_endian);
+    let field_len = usize::try_from(field.ty.byte_len()).map_err(|_| Error::LengthOverflow {
+        value: field.ty.byte_len(),
+    })?;
+    let end = offset
+        .checked_add(field_len)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "layout field range",
+        })?;
+    let field_bytes = bytes.get(offset..end).ok_or(Error::UnexpectedEof)?;
     Ok(match field.ty {
         LayoutFieldType::Bytes { len } => {
-            let len = usize::try_from(len).map_err(|_| Error::LengthOverflow { value: len })?;
-            let mut bytes = vec![0; len];
-            file.read_exact(&mut bytes)?;
-            LayoutValue::Bytes(bytes)
+            let mut value = Vec::new();
+            value
+                .try_reserve_exact(field_len)
+                .map_err(|_| Error::AllocationFailed {
+                    resource: "layout field bytes",
+                    requested: len,
+                })?;
+            value.extend_from_slice(field_bytes);
+            LayoutValue::Bytes(value)
         }
-        LayoutFieldType::U8 => {
-            let mut bytes = [0; 1];
-            file.read_exact(&mut bytes)?;
-            LayoutValue::U8(bytes[0])
+        LayoutFieldType::U8 => LayoutValue::U8(field_bytes[0]),
+        LayoutFieldType::U16 => {
+            let bytes = field_bytes.try_into().map_err(|_| Error::UnexpectedEof)?;
+            LayoutValue::U16(match endian {
+                Endian::Little => u16::from_le_bytes(bytes),
+                Endian::Big => u16::from_be_bytes(bytes),
+            })
         }
-        LayoutFieldType::U16 => LayoutValue::U16(read_u16(file, endian)?),
-        LayoutFieldType::U32 => LayoutValue::U32(read_u32(file, endian)?),
-        LayoutFieldType::U64 => LayoutValue::U64(read_u64(file, endian)?),
-        LayoutFieldType::I64 => LayoutValue::I64(read_i64(file, endian)?),
+        LayoutFieldType::U32 => {
+            let bytes = field_bytes.try_into().map_err(|_| Error::UnexpectedEof)?;
+            LayoutValue::U32(match endian {
+                Endian::Little => u32::from_le_bytes(bytes),
+                Endian::Big => u32::from_be_bytes(bytes),
+            })
+        }
+        LayoutFieldType::U64 => {
+            let bytes = field_bytes.try_into().map_err(|_| Error::UnexpectedEof)?;
+            LayoutValue::U64(match endian {
+                Endian::Little => u64::from_le_bytes(bytes),
+                Endian::Big => u64::from_be_bytes(bytes),
+            })
+        }
+        LayoutFieldType::I64 => {
+            let bytes = field_bytes.try_into().map_err(|_| Error::UnexpectedEof)?;
+            LayoutValue::I64(match endian {
+                Endian::Little => i64::from_le_bytes(bytes),
+                Endian::Big => i64::from_be_bytes(bytes),
+            })
+        }
     })
 }
 
 fn write_zeroes(file: &mut File, len: u64) -> Result<()> {
-    let len = usize::try_from(len).map_err(|_| Error::LengthOverflow { value: len })?;
-    file.write_all(&vec![0; len])?;
+    let zeroes = [0; 64];
+    let mut written = 0u64;
+    while written < len {
+        let chunk_len = usize::try_from((len - written).min(zeroes.len() as u64))
+            .map_err(|_| Error::LengthOverflow { value: len })?;
+        file.write_all(&zeroes[..chunk_len])?;
+        written = written
+            .checked_add(u64::try_from(chunk_len).unwrap_or(u64::MAX))
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "layout zero-fill length",
+            })?;
+    }
     Ok(())
 }
 
@@ -2089,49 +2849,4 @@ fn write_i64<W: Write>(writer: &mut W, value: i64, endian: Endian) -> Result<()>
     };
     writer.write_all(&bytes)?;
     Ok(())
-}
-
-fn read_u16(file: &mut File, endian: Endian) -> Result<u16> {
-    let mut bytes = [0; 2];
-    file.read_exact(&mut bytes)?;
-    Ok(match endian {
-        Endian::Little => u16::from_le_bytes(bytes),
-        Endian::Big => u16::from_be_bytes(bytes),
-    })
-}
-
-fn read_u32(file: &mut File, endian: Endian) -> Result<u32> {
-    let mut bytes = [0; 4];
-    file.read_exact(&mut bytes)?;
-    Ok(match endian {
-        Endian::Little => u32::from_le_bytes(bytes),
-        Endian::Big => u32::from_be_bytes(bytes),
-    })
-}
-
-fn read_u64(file: &mut File, endian: Endian) -> Result<u64> {
-    let mut bytes = [0; 8];
-    file.read_exact(&mut bytes)?;
-    Ok(match endian {
-        Endian::Little => u64::from_le_bytes(bytes),
-        Endian::Big => u64::from_be_bytes(bytes),
-    })
-}
-
-fn read_i64(file: &mut File, endian: Endian) -> Result<i64> {
-    let mut bytes = [0; 8];
-    file.read_exact(&mut bytes)?;
-    Ok(match endian {
-        Endian::Little => i64::from_le_bytes(bytes),
-        Endian::Big => i64::from_be_bytes(bytes),
-    })
-}
-
-fn read_range(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
-    let len = usize::try_from(len).map_err(|_| Error::LengthOverflow { value: len })?;
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut bytes = vec![0; len];
-    file.read_exact(&mut bytes)?;
-    Ok(bytes)
 }

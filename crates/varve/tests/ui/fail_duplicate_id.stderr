@@ -7,5 +7,5 @@ error[E0080]: evaluation panicked: assertion failed: <A as ::varve::__core::Varv
 17 | |         magic: b"BAD";
 18 | |         version: 1;
 ...  |
-22 | | }
+40 | | }
    | |_^ evaluation of `_` failed here

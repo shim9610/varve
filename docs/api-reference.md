@@ -10,7 +10,17 @@ For a format declared as:
 ```rust
 varve_format! {
     pub format AppFormat {
-        // ...
+        magic: b"APP";
+        version: 1;
+        limits {
+            file_len: 1_073_741_824;
+            records: 1_000_000;
+            index_bytes: 134_217_728;
+            scan_bytes: 1_073_741_824;
+            record_payload: 16_777_216;
+            logical_payload: 67_108_864;
+            materialized_bytes: 268_435_456;
+        }
         blocks {
             fixed Point(id = 1) { x: u32, y: u32 }
             variable User(id = 2, key = [id]) { id: u64, name: String }
@@ -31,6 +41,10 @@ the macro generates:
 | `AppFormat::open_writer(path)` | open read-write typed writer |
 | `AppFormat::open_readonly(path)` | open raw read-only `VarveFile` |
 | `AppFormat::open_reader(path)` | open typed snapshot reader |
+| `AppFormat::open_reader_with_limits(path, limits)` | open with limits tightened below the declaration |
+| `AppFormat::open_reader_trusted_unbounded(path)` | explicit trusted-input open; never called by ordinary open |
+| `AppFormat::open_writer_with_limits(path, limits)` | writer open with field-wise tighter limits |
+| `AppFormat::open_writer_trusted_unbounded(path)` | explicit trusted-input writer open |
 | `AppFormat::open_recover(path)` | explicit recovery open |
 | `AppFormat::open_recover_with_report(path)` | recovery open plus report |
 | `AppFormat::diagnostics()` | static format diagnostics |
@@ -59,6 +73,8 @@ Generated typed methods depend on block names:
 | `with_compression_policy(policy)` | global variable-block compression |
 | `with_block_compression(descriptors)` | per-variable-block record-explicit compression |
 | `with_computed_schema_hash()` | pin computed schema hash into the header contract |
+| `with_read_limits(limits)` | set declaration-level resource policy without changing schema identity |
+| `tighten_read_limits(limits)` | component-wise meet; a finite ceiling can never be widened |
 | `with_matrix_spec(dims, commits, blocks)` | manual matrix registry |
 | `with_matrix_aux(aux)` | manual matrix aux registry |
 | `validate()` | check static spec consistency |
@@ -72,6 +88,21 @@ Generated typed methods depend on block names:
 
 Use the generated `Format::spec()` path unless you need derive-first or manual
 registry construction.
+
+### ReadLimit And ReadLimits
+
+`ReadLimit` is `Missing`, `Finite(u64)`, or `TrustedUnbounded`. `ReadLimits`
+contains the ceilings documented in the format declaration guide. Ordinary
+APIs return `Error::MissingResourceLimit` for a required missing ceiling and
+`Error::TrustedUnboundedRequiresExplicitApi` when a trusted policy is presented
+to an ordinary entrypoint. Values above a finite ceiling return
+`Error::LimitExceeded` before a claim-sized allocation or read begins.
+
+`ReadLimits::missing()` is a fail-closed builder base,
+`ReadLimits::finite_all(n)` sets every ceiling to `n`, and the const
+`with_max_*` builders set individual finite values. Runtime policies are met
+with declaration policies, so `Finite(64 MiB)` tightened by `Finite(16 MiB)` is
+`Finite(16 MiB)`. Missing policy cannot be promoted into trust by tightening.
 
 For omitted or explicit `preset: varve_native`, `effective_layout()` returns a
 synthetic plan containing the native `VarveFileHeader` and repeated
@@ -96,7 +127,8 @@ Common `VarveWriter` APIs:
 | `delete::<T>(&key)` | append keyed tombstone |
 | `push_op::<T>(&key, &op)` | append user-defined merge op |
 | `write_metadata(key, bytes)` | append internal metadata record |
-| `replace_fixed(index, &block)` | same-size in-place fixed replacement |
+| `replace_fixed(index, &block)` | same-size copy-on-write replacement; already-open readers keep their snapshot |
+| `unsafe replace_fixed_in_place_exclusive(index, &block)` | expert-only in-place replacement; caller must exclude readers and writers |
 | `replace_rewrite(index, &block)` | rewrite whole file through temp file |
 | `commit()` | write explicit transaction marker without an implied fsync |
 | `commit_durable()` | write an explicit transaction marker with ordered flush/sync barriers |
@@ -119,6 +151,11 @@ Common `VarveReader` APIs:
 stored-byte ceiling and
 `read_logical_payload_limited(spec, path, physical_limit, logical_limit)` to
 bound both the stored allocation and decoded logical allocation.
+All path-taking `RecordIndexEntry` helpers are deliberately low-level and
+non-snapshot: they reopen whatever object the pathname currently names. The
+unlimited variants are for trusted, prevalidated tooling only. Generated
+readers and typed collections do not use them; they retain the originally
+opened object and captured logical EOF.
 `checked_physical_end()` is the overflow-reporting extent API; `physical_end()`
 remains a saturating compatibility helper.
 
@@ -128,6 +165,13 @@ After `u64::MAX` is published once, further append operations return
 layout write error is rolled back to the prior EOF when possible. If rollback
 fails, the handle returns `WriteRollbackFailed`, becomes poisoned, and rejects
 later mutation, `flush`, and `sync` with `WriterPoisoned`.
+
+Copy-on-write replacement has a distinct post-publication failure state.
+`PublishedButRebindFailed { sequence, source }` means the new generation was
+already atomically published, but the current writer could not reopen and bind
+to it. Discard the poisoned writer and reopen the path to inspect the published
+state. Do not blindly retry the same logical update: publication may already
+have applied it.
 
 `varve::Error` is `#[non_exhaustive]`. Downstream exhaustive matches must keep a
 wildcard arm so new diagnostics can be added without another enum-shape break.
@@ -256,6 +300,15 @@ metadata and raw regions.
 | `LayoutReader::read_raw(index)` | read contiguous raw-region bytes for a segment |
 | `LayoutReader::read_raw_range(index, offset, len)` | read a checked raw byte range without loading the whole region |
 | `LayoutScanReport` | tolerant scan result with complete segments and optional `LayoutTailInfo` |
+| `Format::open_layout_reader_with_limits(path, limits)` | open the typed physical reader with runtime tightening |
+| `Format::open_layout_reader_trusted_unbounded(path)` | explicit trusted physical-reader boundary |
+| `Format::open_layout_writer_with_limits(path, limits)` | open the typed physical writer with runtime tightening |
+| `Format::inspect_layout_file_report_with_limits(path, limits)` | bounded tolerant physical scan |
+
+Layout readers retain the opened object and captured length. Whole/range reads
+use positional I/O on that object, so replacing the pathname after open does
+not redirect the reader. `LayoutReader::spec()` returns a sanitized ordinary
+spec; private trusted authorization is never exported from a handle.
 
 Stream callbacks are prevalidated before the first file mutation. A returned
 callback error rolls back the partial segment when possible. A callback panic is
@@ -273,6 +326,13 @@ varve_format! {
     pub format FramedFormat {
         magic: b"FRAM";
         version: 1;
+        limits {
+            file_len: 1_073_741_824;
+            scan_bytes: 1_073_741_824;
+            segments: 1_000_000;
+            index_bytes: 134_217_728;
+            record_payload: 67_108_864;
+        }
         schema_hash: computed;
         preset: none;
 

@@ -1,0 +1,49 @@
+[package]
+name = "varve-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.varve]
+path = "../crates/varve"
+version = "0.2.0"
+features = ["integrity", "mmap", "zero-copy", "compression-zstd"]
+
+# Use independent workspace for fuzzers
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "native_arbitrary"
+path = "fuzz_targets/native_arbitrary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_arbitrary"
+path = "fuzz_targets/codec_arbitrary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "layout_arbitrary"
+path = "fuzz_targets/layout_arbitrary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "matrix_arbitrary"
+path = "fuzz_targets/matrix_arbitrary.rs"
+test = false
+doc = false
+bench = false

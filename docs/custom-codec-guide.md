@@ -50,7 +50,7 @@ struct Event {
 If the custom type is part of a key, it must also satisfy the key bounds:
 `Eq + Hash + Clone + Send + Sync + 'static`.
 
-Enum-like values should use this same explicit pattern in v0.1. Pick a stable
+Enum-like values should use this same explicit pattern in 0.2. Pick a stable
 integer or string representation, reject unknown discriminants unless they are
 part of the format contract, and bump the block or field-level semantic version
 when the meaning changes.

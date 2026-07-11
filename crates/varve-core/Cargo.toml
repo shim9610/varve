@@ -5,6 +5,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+description = "Runtime, codecs, and storage primitives for Varve binary formats"
+documentation = "https://docs.rs/varve-core"
 
 [features]
 default = []

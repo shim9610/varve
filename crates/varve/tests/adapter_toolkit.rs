@@ -4,14 +4,32 @@ use std::path::PathBuf;
 use varve::{
     AdapterCheckReport, AdapterCheckStatus, AdapterInputFile, AdapterTailStatus, BinaryCursor,
     BinaryWriter, ChunkEntry, ChunkIndexBuilder, ChunkLayout, Endian, Error, LayoutSegmentInfo,
-    LayoutTailInfo, LayoutTailKind, SegmentReducer, SidecarIdentity, SidecarMode, SidecarPolicy,
-    TaggedValueCodec, reduce_segments_by_ref, varve_format,
+    LayoutTailInfo, LayoutTailKind, ReadLimits, SegmentReducer, SidecarIdentity, SidecarMode,
+    SidecarPolicy, TaggedValueCodec, reduce_segments_by_ref, varve_format,
 };
 
 varve_format! {
     pub format AdapterTailFormat {
         magic: b"ATK";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: computed;
         preset: none;
@@ -276,6 +294,101 @@ fn adapter_report_preserves_layout_tail_status() -> varve::Result<()> {
     assert_eq!(adapter_report.status(), AdapterCheckStatus::Warning);
 
     cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn layout_segment_and_index_limits_stop_scans_before_growth() -> varve::Result<()> {
+    let path = temp_path("adapter_toolkit_limits", "atk");
+    cleanup(&path);
+
+    {
+        let mut writer = AdapterTailFormat::create_layout_writer(&path)?;
+        for kind in [1, 2] {
+            writer.write_data(AdapterTailFormatDataLayoutWrite {
+                fields: AdapterTailFormatDataLayoutFields { kind },
+                footer_fields: AdapterTailFormatDataLayoutFooterFields,
+                metadata: b"meta",
+                raw: b"raw",
+            })?;
+        }
+        writer.flush()?;
+    }
+    let spec = AdapterTailFormat::spec();
+
+    assert!(matches!(
+        spec.open_layout_reader_with_limits(&path, ReadLimits::missing().with_max_segments(1),),
+        Err(Error::LimitExceeded {
+            resource: "segment count",
+            actual: 2,
+            limit: 1,
+        })
+    ));
+    assert!(matches!(
+        spec.open_layout_reader_with_limits(&path, ReadLimits::missing().with_max_index_bytes(0),),
+        Err(Error::LimitExceeded {
+            resource: "index bytes",
+            ..
+        })
+    ));
+    assert!(matches!(
+        spec.inspect_layout_file_report_with_limits(
+            &path,
+            ReadLimits::missing().with_max_segments(1),
+        ),
+        Err(Error::LimitExceeded {
+            resource: "segment count",
+            ..
+        })
+    ));
+    assert!(matches!(
+        spec.open_layout_writer_with_limits(&path, ReadLimits::missing().with_max_segments(1),),
+        Err(Error::LimitExceeded {
+            resource: "segment count",
+            ..
+        })
+    ));
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn layout_report_rejects_complete_malformed_segments_as_fatal() -> varve::Result<()> {
+    let bad_tag = temp_path("adapter_toolkit_bad_tag", "atk");
+    let bad_bounds = temp_path("adapter_toolkit_bad_bounds", "atk");
+    cleanup(&bad_tag);
+    cleanup(&bad_bounds);
+
+    for path in [&bad_tag, &bad_bounds] {
+        let mut writer = AdapterTailFormat::create_layout_writer(path)?;
+        writer.write_data(AdapterTailFormatDataLayoutWrite {
+            fields: AdapterTailFormatDataLayoutFields { kind: 7 },
+            footer_fields: AdapterTailFormatDataLayoutFooterFields,
+            metadata: b"meta",
+            raw: b"raw",
+        })?;
+        writer.flush()?;
+    }
+
+    let mut bytes = std::fs::read(&bad_tag)?;
+    bytes[0] = b'X';
+    write(&bad_tag, bytes)?;
+    assert!(matches!(
+        AdapterTailFormat::inspect_layout_file_report(&bad_tag),
+        Err(Error::LayoutLiteralMismatch { .. })
+    ));
+
+    let mut bytes = std::fs::read(&bad_bounds)?;
+    bytes[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+    write(&bad_bounds, bytes)?;
+    assert!(matches!(
+        AdapterTailFormat::inspect_layout_file_report(&bad_bounds),
+        Err(Error::LayoutInvalidSegmentBounds { .. })
+    ));
+
+    cleanup(&bad_tag);
+    cleanup(&bad_bounds);
     Ok(())
 }
 

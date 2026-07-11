@@ -6,7 +6,7 @@ use varve::{
     BlockCompressionDescriptor, BlockDescriptor, BlockKind, CommitPolicy, CompressionAlgorithm,
     CompressionHeaderMode, CompressionLevel, CompressionPolicy, Endian, FormatSpec, IndexPolicy,
     IntegrityPolicy, LayoutPlanFieldSource, LayoutPlanFieldType, LayoutPlanLen, LayoutPlanPartKind,
-    ManifestPolicy, RecoveryPolicy, VariableCompression, encode_to_vec,
+    ManifestPolicy, ReadLimits, RecoveryPolicy, VariableCompression, encode_to_vec,
 };
 #[cfg(all(feature = "compression-zstd", feature = "integrity"))]
 use varve::{ChunkedBytes, decode_from_slice};
@@ -59,6 +59,24 @@ varve_format! {
     pub struct RecordCompressionFormat {
         magic: b"COMPR";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         extension: "vcz";
         manifest: embedded;
@@ -78,6 +96,24 @@ varve_format! {
     pub struct FileExplicitCompressionFormat {
         magic: b"COMPF";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         compression: variable_blocks(
             zstd,
@@ -95,6 +131,24 @@ varve_format! {
     pub struct FileExplicitFooterCompressionFormat {
         magic: b"COMPF3";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         commit: record_footer;
         compression: variable_blocks(
@@ -113,6 +167,24 @@ varve_format! {
     pub struct ContractCompressionFormat {
         magic: b"COMPC";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: 1;
         compression: variable_blocks(
@@ -131,6 +203,24 @@ varve_format! {
     pub struct CheckpointCompressionFormat {
         magic: b"COMPIX";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         index: checkpoint_on_flush;
         compression: variable_blocks(
@@ -369,6 +459,7 @@ fn block_specific_record_explicit_compression_overrides_global_none() -> varve::
         ManifestPolicy::None,
         MANUAL_COMPRESSION_BLOCKS,
     )
+    .with_read_limits(ReadLimits::finite_all(1 << 30))
     .with_block_compression(BLOCK_COMPRESSION);
     let path = temp_path("block_specific");
     cleanup(&path);

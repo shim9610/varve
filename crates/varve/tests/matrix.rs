@@ -8,8 +8,8 @@ use varve::{
     BlockDescriptor, BlockKind, Endian, Error, FormatSpec, IndexPolicy, MatrixAuxDescriptor,
     MatrixBlockDescriptor, MatrixCellStatus, MatrixCommitDescriptor, MatrixCommitKind,
     MatrixDimensionDescriptor, MatrixDimensions, MatrixDurabilityBarrier, MatrixKey,
-    MatrixResumeSignal, PackedBitmap, VarveBlock, VarveDecode, VarveEncode, VarveMatrixBlock,
-    varve_format,
+    MatrixResumeSignal, PackedBitmap, ReadLimits, VarveBlock, VarveDecode, VarveEncode,
+    VarveMatrixBlock, varve_format,
 };
 #[cfg(feature = "integrity")]
 use varve::{MatrixCorruptionKind, MatrixCorruptionSeverity};
@@ -18,6 +18,24 @@ varve_format! {
     pub format GeneratedMatrixFormat {
         magic: b"GMTX";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: computed;
         dims {
@@ -231,6 +249,7 @@ fn other_matrix_spec() -> FormatSpec {
         BLOCKS,
     )
     .with_matrix_spec(DIMS, COMMITS, MATRIX_BLOCKS)
+    .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }
 
 #[test]
@@ -315,6 +334,7 @@ fn matrix_spec_with_integrity(integrity: varve::IntegrityPolicy) -> FormatSpec {
         BLOCKS,
     )
     .with_matrix_spec(DIMS, COMMITS, MATRIX_BLOCKS)
+    .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }
 
 #[cfg(feature = "zero-copy")]
@@ -352,6 +372,7 @@ fn raw_matrix_spec() -> FormatSpec {
         BLOCKS,
     )
     .with_matrix_spec(DIMS, COMMITS, MATRIX_BLOCKS)
+    .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }
 
 #[cfg(feature = "integrity")]

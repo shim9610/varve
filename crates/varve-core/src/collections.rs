@@ -1,16 +1,41 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::path::PathBuf;
 
 use crate::{
-    BlockKind, FormatSpec, RecordIndexEntry, Result, VarveBlock, VarveKeyedBlock, decode_from_slice,
+    BlockKind, FormatSpec, RecordIndexEntry, Result, SnapshotFile, VarveBlock, VarveKeyedBlock,
+    decode_from_slice, format::ReadLimitKey,
 };
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MaterializationBudget {
+    spec: FormatSpec,
+    consumed: u64,
+}
+
+impl MaterializationBudget {
+    pub(crate) const fn new(spec: FormatSpec) -> Self {
+        Self { spec, consumed: 0 }
+    }
+
+    pub(crate) fn consume(&mut self, logical_len: u64) -> Result<()> {
+        let consumed = self.consumed.checked_add(logical_len).ok_or(
+            crate::Error::ResourceArithmeticOverflow {
+                resource: "materialized bytes",
+            },
+        )?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::MaterializedBytes, consumed)?;
+        self.consumed = consumed;
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub struct BlockVec<T> {
     spec: FormatSpec,
-    path: PathBuf,
+    snapshot: SnapshotFile,
     entries: Vec<RecordIndexEntry>,
     _marker: PhantomData<T>,
 }
@@ -19,7 +44,7 @@ impl<T> Clone for BlockVec<T> {
     fn clone(&self) -> Self {
         Self {
             spec: self.spec,
-            path: self.path.clone(),
+            snapshot: self.snapshot.clone(),
             entries: self.entries.clone(),
             _marker: PhantomData,
         }
@@ -30,10 +55,14 @@ impl<T> BlockVec<T>
 where
     T: VarveBlock,
 {
-    pub(crate) fn new(spec: FormatSpec, path: PathBuf, entries: Vec<RecordIndexEntry>) -> Self {
+    pub(crate) fn new(
+        spec: FormatSpec,
+        snapshot: SnapshotFile,
+        entries: Vec<RecordIndexEntry>,
+    ) -> Self {
         Self {
             spec,
-            path,
+            snapshot,
             entries,
             _marker: PhantomData,
         }
@@ -48,6 +77,15 @@ where
     }
 
     pub fn get(&self, index: usize) -> Result<Option<T>> {
+        let mut budget = MaterializationBudget::new(self.spec);
+        self.get_with_budget(index, &mut budget)
+    }
+
+    pub(crate) fn get_with_budget(
+        &self,
+        index: usize,
+        budget: &mut MaterializationBudget,
+    ) -> Result<Option<T>> {
         let Some(entry) = self.entries.get(index) else {
             return Ok(None);
         };
@@ -58,7 +96,9 @@ where
                 actual: entry.block_version,
             });
         }
-        let payload = entry.read_logical_payload(self.spec, &self.path)?;
+        let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
+        budget.consume(logical_len)?;
+        let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
         Ok(Some(decode_from_slice(
             &payload,
             T::ENDIAN.unwrap_or(self.spec.endian),
@@ -69,6 +109,7 @@ where
         BlockIter {
             collection: self,
             index: 0,
+            budget: MaterializationBudget::new(self.spec),
         }
     }
 }
@@ -76,6 +117,7 @@ where
 pub struct BlockIter<'a, T> {
     collection: &'a BlockVec<T>,
     index: usize,
+    budget: MaterializationBudget,
 }
 
 impl<T> Iterator for BlockIter<'_, T>
@@ -88,7 +130,10 @@ where
         if self.index >= self.collection.len() {
             return None;
         }
-        let result = self.collection.get(self.index).transpose();
+        let result = self
+            .collection
+            .get_with_budget(self.index, &mut self.budget)
+            .transpose();
         self.index += 1;
         result
     }
@@ -118,6 +163,7 @@ where
     }
 
     pub fn get(&self, key: &K) -> Result<Option<T>> {
+        let mut budget = MaterializationBudget::new(self.inner.spec);
         let Some(entry) = self.by_key.get(key) else {
             return Ok(None);
         };
@@ -128,7 +174,10 @@ where
                 actual: entry.block_version,
             });
         }
-        let payload = entry.read_logical_payload(self.inner.spec, &self.inner.path)?;
+        let logical_len =
+            entry.logical_payload_len_snapshot(self.inner.spec, &self.inner.snapshot)?;
+        budget.consume(logical_len)?;
+        let payload = entry.read_logical_payload_snapshot(self.inner.spec, &self.inner.snapshot)?;
         Ok(Some(decode_from_slice(
             &payload,
             T::ENDIAN.unwrap_or(self.inner.spec.endian),

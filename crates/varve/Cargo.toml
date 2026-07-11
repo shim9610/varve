@@ -5,6 +5,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+description = "Format-first, append-friendly custom binary formats for Rust"
+documentation = "https://docs.rs/varve"
+keywords = ["binary", "serialization", "storage", "format", "append"]
+categories = ["encoding", "filesystem", "data-structures"]
 
 [features]
 default = []
@@ -14,8 +18,8 @@ zero-copy = ["mmap", "varve-core/zero-copy"]
 compression-zstd = ["varve-core/compression-zstd"]
 
 [dependencies]
-varve-core = { path = "../varve-core", version = "0.1.0" }
-varve-macros = { path = "../varve-macros", version = "0.1.0" }
+varve-core = { path = "../varve-core", version = "0.2.0" }
+varve-macros = { path = "../varve-macros", version = "0.2.0" }
 
 [dev-dependencies]
 proptest.workspace = true

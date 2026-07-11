@@ -6,14 +6,32 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use varve::{
-    AdapterInputFile, BinaryCursor, Endian, Error, LayoutFieldValue, LayoutValue, SegmentWrite,
-    SegmentWriteStream, varve_format,
+    AdapterInputFile, BinaryCursor, Endian, Error, LayoutFieldValue, LayoutValue, ReadLimits,
+    SegmentWrite, SegmentWriteStream, varve_format,
 };
 
 varve_format! {
     pub format LayoutHardeningFormat {
         magic: b"HRDN";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: computed;
         preset: none;
@@ -182,6 +200,238 @@ fn callback_panic_leaves_layout_writer_poisoned() -> varve::Result<()> {
 }
 
 #[test]
+fn layout_reader_payloads_stay_bound_to_the_open_object() -> varve::Result<()> {
+    let path = temp_path("snapshot_original", "hard");
+    let replacement = temp_path("snapshot_replacement", "hard");
+    cleanup(&path);
+    cleanup(&replacement);
+    write_layout_data(&path, b"old metadata", b"old raw")?;
+    write_layout_data(&replacement, b"new metadata", b"new raw")?;
+
+    let old_reader = LayoutHardeningFormat::open_layout_reader(&path)?;
+    fs::remove_file(&path)?;
+    fs::rename(&replacement, &path)?;
+
+    assert_eq!(old_reader.read_metadata(0)?, b"old metadata");
+    assert_eq!(old_reader.read_raw(0)?, b"old raw");
+    let new_reader = LayoutHardeningFormat::open_layout_reader(&path)?;
+    assert_eq!(new_reader.read_metadata(0)?, b"new metadata");
+    assert_eq!(new_reader.read_raw(0)?, b"new raw");
+
+    drop(old_reader);
+    drop(new_reader);
+    cleanup(&path);
+    cleanup(&replacement);
+    Ok(())
+}
+
+#[test]
+fn layout_open_and_region_reads_enforce_runtime_limits() -> varve::Result<()> {
+    let path = temp_path("runtime_limits", "hard");
+    cleanup(&path);
+    write_layout_data(&path, b"metadata", b"raw")?;
+    let file_len = fs::metadata(&path)?.len();
+    let spec = LayoutHardeningFormat::spec();
+
+    assert_limit(
+        spec.open_layout_reader_with_limits(
+            &path,
+            ReadLimits::missing().with_max_file_len(file_len - 1),
+        ),
+        "file length",
+    );
+    assert_limit(
+        spec.open_layout_reader_with_limits(
+            &path,
+            ReadLimits::missing().with_max_scan_bytes(file_len - 1),
+        ),
+        "scan bytes",
+    );
+    assert_limit(
+        spec.open_layout_reader_with_limits(&path, ReadLimits::missing().with_max_segments(0)),
+        "segment count",
+    );
+    assert_limit(
+        spec.open_layout_reader_with_limits(&path, ReadLimits::missing().with_max_index_bytes(0)),
+        "index bytes",
+    );
+
+    let reader = spec.open_layout_reader_with_limits(
+        &path,
+        ReadLimits::missing().with_max_record_payload_len(4),
+    )?;
+    assert_limit(reader.read_metadata(0), "record payload length");
+    assert_eq!(reader.read_metadata_range(0, 1, 4)?, b"etad");
+    assert_limit(reader.read_metadata_range(0, 0, 5), "record payload length");
+    assert_eq!(reader.read_raw(0)?, b"raw");
+
+    drop(reader);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn layout_writer_limits_fail_before_unbounded_growth_and_roll_back() -> varve::Result<()> {
+    let payload_path = temp_path("writer_payload_limit", "hard");
+    let file_path = temp_path("writer_file_limit", "hard");
+    let scan_path = temp_path("writer_scan_limit", "hard");
+    let index_path = temp_path("writer_index_limit", "hard");
+    let segment_path = temp_path("writer_segment_limit", "hard");
+    cleanup(&payload_path);
+    cleanup(&file_path);
+    cleanup(&scan_path);
+    cleanup(&index_path);
+    cleanup(&segment_path);
+    let spec = LayoutHardeningFormat::spec();
+    let fields = data_fields(17);
+
+    let mut payload_writer = spec.create_layout_writer_with_limits(
+        &payload_path,
+        ReadLimits::missing().with_max_record_payload_len(4),
+    )?;
+    assert_limit(
+        payload_writer.write_segment(SegmentWrite {
+            name: "Data",
+            fields: &fields,
+            footer_fields: &[],
+            metadata: b"12345",
+            raw: b"",
+        }),
+        "record payload length",
+    );
+    assert_eq!(fs::metadata(&payload_path)?.len(), 0);
+    payload_writer.write_segment(SegmentWrite {
+        name: "Data",
+        fields: &fields,
+        footer_fields: &[],
+        metadata: b"1234",
+        raw: b"5678",
+    })?;
+    drop(payload_writer);
+
+    let mut file_writer = spec.create_layout_writer_with_limits(
+        &file_path,
+        ReadLimits::missing().with_max_file_len(35),
+    )?;
+    assert_limit(
+        file_writer.write_segment(SegmentWrite {
+            name: "Data",
+            fields: &fields,
+            footer_fields: &[],
+            metadata: b"",
+            raw: b"",
+        }),
+        "file length",
+    );
+    assert_eq!(fs::metadata(&file_path)?.len(), 0);
+    drop(file_writer);
+
+    let mut scan_writer = spec.create_layout_writer_with_limits(
+        &scan_path,
+        ReadLimits::missing().with_max_scan_bytes(35),
+    )?;
+    assert_limit(
+        scan_writer.write_segment(SegmentWrite {
+            name: "Data",
+            fields: &fields,
+            footer_fields: &[],
+            metadata: b"",
+            raw: b"",
+        }),
+        "scan bytes",
+    );
+    assert_eq!(fs::metadata(&scan_path)?.len(), 0);
+    drop(scan_writer);
+
+    let mut index_writer = spec.create_layout_writer_with_limits(
+        &index_path,
+        ReadLimits::missing().with_max_index_bytes(0),
+    )?;
+    assert_limit(
+        index_writer.write_segment(SegmentWrite {
+            name: "Data",
+            fields: &fields,
+            footer_fields: &[],
+            metadata: b"",
+            raw: b"",
+        }),
+        "index bytes",
+    );
+    assert_eq!(fs::metadata(&index_path)?.len(), 0);
+    drop(index_writer);
+
+    let mut segment_writer = spec.create_layout_writer_with_limits(
+        &segment_path,
+        ReadLimits::missing().with_max_segments(0),
+    )?;
+    assert_limit(
+        segment_writer.write_segment(SegmentWrite {
+            name: "Data",
+            fields: &fields,
+            footer_fields: &[],
+            metadata: b"",
+            raw: b"",
+        }),
+        "segment count",
+    );
+    assert_eq!(fs::metadata(&segment_path)?.len(), 0);
+    drop(segment_writer);
+
+    cleanup(&payload_path);
+    cleanup(&file_path);
+    cleanup(&scan_path);
+    cleanup(&index_path);
+    cleanup(&segment_path);
+    Ok(())
+}
+
+#[test]
+fn ordinary_layout_open_fails_closed_and_handle_specs_are_sanitized() -> varve::Result<()> {
+    let path = temp_path("trusted_spec", "hard");
+    cleanup(&path);
+    write_layout_data(&path, b"metadata", b"raw")?;
+    let unbounded = LayoutHardeningFormat::spec().with_read_limits(ReadLimits::trusted_unbounded());
+
+    assert!(matches!(
+        unbounded.open_layout_reader(&path),
+        Err(Error::TrustedUnboundedRequiresExplicitApi {
+            resource: "file length"
+        })
+    ));
+    let reader = unbounded.open_layout_reader_trusted_unbounded(&path)?;
+    assert_eq!(reader.read_metadata(0)?, b"metadata");
+    let reader_spec = reader.spec();
+    drop(reader);
+    assert!(matches!(
+        reader_spec.open_layout_reader(&path),
+        Err(Error::TrustedUnboundedRequiresExplicitApi {
+            resource: "file length"
+        })
+    ));
+
+    let writer = unbounded.open_layout_writer_trusted_unbounded(&path)?;
+    let writer_spec = writer.spec();
+    drop(writer);
+    assert!(matches!(
+        writer_spec.open_layout_writer(&path),
+        Err(Error::TrustedUnboundedRequiresExplicitApi {
+            resource: "file length"
+        })
+    ));
+
+    let missing = LayoutHardeningFormat::spec().with_read_limits(ReadLimits::missing());
+    assert!(matches!(
+        missing.open_layout_reader(&path),
+        Err(Error::MissingResourceLimit {
+            resource: "file length"
+        })
+    ));
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
 fn array_f64_checks_complete_extent_before_allocation_or_cursor_movement() {
     let bytes = [0; 9];
     let mut cursor = BinaryCursor::new(&bytes, Endian::Little);
@@ -301,6 +551,30 @@ fn data_fields(kind: u32) -> [LayoutFieldValue; 1] {
         name: "kind",
         value: LayoutValue::U32(kind),
     }]
+}
+
+fn write_layout_data(path: &Path, metadata: &[u8], raw: &[u8]) -> varve::Result<()> {
+    let fields = data_fields(7);
+    let mut writer = LayoutHardeningFormat::create_layout_writer(path)?;
+    writer.write_segment(SegmentWrite {
+        name: "Data",
+        fields: &fields,
+        footer_fields: &[],
+        metadata,
+        raw,
+    })?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn assert_limit<T>(result: varve::Result<T>, resource: &'static str) {
+    assert!(matches!(
+        result,
+        Err(Error::LimitExceeded {
+            resource: actual,
+            ..
+        }) if actual == resource
+    ));
 }
 
 fn assert_layout_poisoned<T>(result: varve::Result<T>) {

@@ -12,6 +12,7 @@ mod layout;
 mod matrix;
 mod merge;
 mod native_layout;
+mod snapshot;
 mod traits;
 
 pub use adapter::{
@@ -54,7 +55,8 @@ pub use format::{
     LayoutPlanRegionSource, LayoutPlanSegment, LayoutPreset, LayoutSpec, LeadInDescriptor,
     ManifestPolicy, MatrixAuxDescriptor, MatrixBlockDescriptor, MatrixCommitDescriptor,
     MatrixCommitKind, MatrixDimensionDescriptor, MetadataDescriptor, RawRegionDescriptor,
-    RecoveryPolicy, SegmentDescriptor, SegmentRepeat, TransactionMarkerMode, VariableCompression,
+    ReadLimit, ReadLimits, RecoveryPolicy, SegmentDescriptor, SegmentRepeat, TransactionMarkerMode,
+    VariableCompression,
 };
 pub use layout::{
     LayoutFieldValue, LayoutFileInfo, LayoutReader, LayoutScanReport, LayoutSegmentInfo,
@@ -66,6 +68,8 @@ pub use matrix::{
     MatrixRecoveryReport, MatrixResumeSignal, PackedBitmap,
 };
 pub use merge::{MergeAction, SequencedMergeAction, VarveMerge, compact_keyed_file};
+#[allow(unused_imports)]
+pub(crate) use snapshot::SnapshotFile;
 pub use traits::{VarveBlock, VarveKey, VarveKeyedBlock, VarveMatrixBlock, VarveMigration};
 #[cfg(feature = "zero-copy")]
 pub use traits::{VarveRawFixedBlock, VarveRawMatrixBlock};

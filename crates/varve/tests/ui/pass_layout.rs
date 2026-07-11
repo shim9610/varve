@@ -1,11 +1,19 @@
 use varve::{
-    LayoutFieldSource, LayoutFieldType, LayoutPartKind, LayoutPreset, SegmentRepeat, varve_format,
+    LayoutFieldSource, LayoutFieldType, LayoutPartKind, LayoutPreset, ReadLimits, SegmentRepeat,
+    varve_format,
 };
 
 varve_format! {
     pub format LayoutOnlyFormat {
         magic: b"LAY";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            segments: 4_000_000;
+        }
         endian: little;
         schema_hash: computed;
         extension: "tdms";
@@ -72,4 +80,15 @@ fn main() {
     };
     fn _accept_writer(_: LayoutOnlyFormatLayoutWriter) {}
     fn _accept_reader(_: LayoutOnlyFormatLayoutReader) {}
+
+    fn _typecheck_limit_boundaries(path: &std::path::Path) {
+        let limits = ReadLimits::finite_all(1024);
+        let _ = LayoutOnlyFormat::create_layout_writer_with_limits(path, limits);
+        let _ = LayoutOnlyFormat::open_layout_writer_with_limits(path, limits);
+        let _ = LayoutOnlyFormat::open_layout_reader_with_limits(path, limits);
+        let _ = LayoutOnlyFormat::inspect_layout_file_with_limits(path, limits);
+        let _ = LayoutOnlyFormat::inspect_layout_file_report_with_limits(path, limits);
+        let _ = LayoutOnlyFormat::open_layout_reader_trusted_unbounded(path);
+    }
+    let _ = _typecheck_limit_boundaries;
 }

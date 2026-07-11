@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap, btree_map, hash_map};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 
 use crate::{Endian, Error, Result};
@@ -128,6 +129,8 @@ pub struct Decoder<'a> {
     endian: Endian,
     input: &'a [u8],
     position: usize,
+    small_field_ids: u64,
+    large_field_ids: Option<HashSet<u32>>,
 }
 
 impl<'a> Decoder<'a> {
@@ -136,6 +139,8 @@ impl<'a> Decoder<'a> {
             endian,
             input,
             position: 0,
+            small_field_ids: 0,
+            large_field_ids: None,
         }
     }
 
@@ -201,6 +206,34 @@ impl<'a> Decoder<'a> {
         let value = self.read_u64()?;
         usize::try_from(value).map_err(|_| Error::LengthOverflow { value })
     }
+
+    fn note_field_id(&mut self, field_id: u32) -> Result<()> {
+        if field_id < u64::BITS {
+            let mask = 1u64 << field_id;
+            if self.small_field_ids & mask != 0 {
+                return Err(Error::InvalidCanonicalEncoding("duplicate variable field"));
+            }
+            self.small_field_ids |= mask;
+            return Ok(());
+        }
+
+        let field_ids = self.large_field_ids.get_or_insert_with(HashSet::new);
+        if field_ids.contains(&field_id) {
+            return Err(Error::InvalidCanonicalEncoding("duplicate variable field"));
+        }
+        let requested = u64::try_from(field_ids.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1)
+            .saturating_mul(4);
+        field_ids
+            .try_reserve(1)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "variable field ids",
+                requested,
+            })?;
+        field_ids.insert(field_id);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,11 +260,20 @@ pub fn write_field(
 pub fn read_field_header(decoder: &mut Decoder<'_>) -> Result<FieldHeader> {
     let field_id = decoder.read_u32()?;
     let wire_type = decoder.read_u16()?;
-    let _flags = decoder.read_u16()?;
+    let flags = decoder.read_u16()?;
     let payload_len = decoder.read_u64()?;
+    if flags != 0 {
+        return Err(Error::InvalidCanonicalEncoding(
+            "variable field flags must be zero",
+        ));
+    }
+    let wire_type = WireType::from_u16(wire_type).ok_or(Error::UnknownWireType(wire_type))?;
+    let _: usize =
+        usize::try_from(payload_len).map_err(|_| Error::LengthOverflow { value: payload_len })?;
+    decoder.note_field_id(field_id)?;
     Ok(FieldHeader {
         field_id,
-        wire_type: WireType::from_u16(wire_type).ok_or(Error::UnknownWireType(wire_type))?,
+        wire_type,
         payload_len,
     })
 }
@@ -509,17 +551,34 @@ where
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         let len = decoder.read_len()?;
         let mut values = BTreeMap::new();
-        for _ in 0..len {
-            let key = K::decode_varve(decoder)?;
-            match values.entry(key) {
-                btree_map::Entry::Vacant(entry) => {
-                    let value = V::decode_varve(decoder)?;
-                    entry.insert(value);
-                }
-                btree_map::Entry::Occupied(_) => {
+        if len == 0 {
+            return Ok(values);
+        }
+
+        let mut pending_key = K::decode_varve(decoder)?;
+        for _ in 1..len {
+            let pending_value = V::decode_varve(decoder)?;
+            let next_key = K::decode_varve(decoder)?;
+            match pending_key.cmp(&next_key) {
+                Ordering::Less => {}
+                Ordering::Equal => {
                     return Err(Error::InvalidCanonicalEncoding("duplicate BTreeMap key"));
                 }
+                Ordering::Greater => {
+                    return Err(Error::InvalidCanonicalEncoding(
+                        "BTreeMap keys must be strictly increasing",
+                    ));
+                }
             }
+            if values.insert(pending_key, pending_value).is_some() {
+                return Err(Error::InvalidCanonicalEncoding("duplicate BTreeMap key"));
+            }
+            pending_key = next_key;
+        }
+
+        let pending_value = V::decode_varve(decoder)?;
+        if values.insert(pending_key, pending_value).is_some() {
+            return Err(Error::InvalidCanonicalEncoding("duplicate BTreeMap key"));
         }
         Ok(values)
     }
@@ -546,7 +605,7 @@ where
 
 impl<K, V> VarveDecode for HashMap<K, V>
 where
-    K: VarveDecode + Eq + Hash,
+    K: VarveDecode + Ord + Eq + Hash,
     V: VarveDecode,
 {
     const WIRE_TYPE: WireType = WireType::Nested;
@@ -554,17 +613,34 @@ where
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         let len = decoder.read_len()?;
         let mut values = HashMap::new();
-        for _ in 0..len {
-            let key = K::decode_varve(decoder)?;
-            match values.entry(key) {
-                hash_map::Entry::Vacant(entry) => {
-                    let value = V::decode_varve(decoder)?;
-                    entry.insert(value);
-                }
-                hash_map::Entry::Occupied(_) => {
+        if len == 0 {
+            return Ok(values);
+        }
+
+        let mut pending_key = K::decode_varve(decoder)?;
+        for _ in 1..len {
+            let pending_value = V::decode_varve(decoder)?;
+            let next_key = K::decode_varve(decoder)?;
+            match pending_key.cmp(&next_key) {
+                Ordering::Less => {}
+                Ordering::Equal => {
                     return Err(Error::InvalidCanonicalEncoding("duplicate HashMap key"));
                 }
+                Ordering::Greater => {
+                    return Err(Error::InvalidCanonicalEncoding(
+                        "HashMap keys must be strictly increasing",
+                    ));
+                }
             }
+            if values.insert(pending_key, pending_value).is_some() {
+                return Err(Error::InvalidCanonicalEncoding("duplicate HashMap key"));
+            }
+            pending_key = next_key;
+        }
+
+        let pending_value = V::decode_varve(decoder)?;
+        if values.insert(pending_key, pending_value).is_some() {
+            return Err(Error::InvalidCanonicalEncoding("duplicate HashMap key"));
         }
         Ok(values)
     }

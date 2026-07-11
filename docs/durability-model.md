@@ -15,6 +15,20 @@ durability model:
 - a returned write may be visible through the current writer handle before it is
   crash-durable
 
+Safe append-log fixed replacement is copy-on-write. The replacement generation
+is written in the target directory, flushed and synced, fully reopened and
+validated, then atomically published. Publication failure leaves the original
+path generation unchanged. An already-open reader remains bound to its retained
+file object and captured logical EOF rather than reopening the pathname.
+If publication succeeds but the writer cannot reopen the published pathname,
+Varve returns `PublishedButRebindFailed` and poisons that writer. This is not a
+publication rollback: callers must reopen and reconcile instead of blindly
+retrying the operation.
+
+The unsafe exclusive in-place replacement method does not provide that snapshot
+guarantee. Its safety contract requires process-wide and cross-process
+exclusion, including mmap and raw references.
+
 Even under the default policy, readers trust only commit maps. A clear commit
 bit means `NotCommitted` regardless of slot bytes.
 

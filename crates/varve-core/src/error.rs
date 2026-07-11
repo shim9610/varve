@@ -47,6 +47,30 @@ pub enum Error {
         limit: u64,
     },
 
+    #[error("missing finite read limit for {resource}")]
+    MissingResourceLimit { resource: &'static str },
+
+    #[error("trusted-unbounded {resource} access requires a named trusted-unbounded API")]
+    TrustedUnboundedRequiresExplicitApi { resource: &'static str },
+
+    #[error("{resource} arithmetic overflow")]
+    ResourceArithmeticOverflow { resource: &'static str },
+
+    #[error("failed to reserve {requested} bytes for {resource}")]
+    AllocationFailed {
+        resource: &'static str,
+        requested: u64,
+    },
+
+    #[error(
+        "snapshot range is out of bounds: offset {offset}, len {len}, snapshot_len {snapshot_len}"
+    )]
+    SnapshotRangeOutOfBounds {
+        offset: u64,
+        len: u64,
+        snapshot_len: u64,
+    },
+
     #[error("missing required field {field} ({field_id})")]
     MissingField { field: &'static str, field_id: u32 },
 
@@ -159,6 +183,15 @@ pub enum Error {
         operation: &'static str,
         #[source]
         source: io::Error,
+    },
+
+    #[error(
+        "replacement generation with sequence {sequence} was published, but the writer could not rebind: {source}"
+    )]
+    PublishedButRebindFailed {
+        sequence: u64,
+        #[source]
+        source: Box<Error>,
     },
 
     #[error("merge op referenced a missing target")]

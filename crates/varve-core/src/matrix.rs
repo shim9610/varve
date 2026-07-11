@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
 
+use crate::format::ReadLimitKey;
 use crate::{
-    BlockKind, Error, FormatSpec, IntegrityPolicy, MatrixCommitKind, Result, VarveMatrixBlock,
-    decode_from_slice, encode_to_vec,
+    BlockKind, Error, FormatSpec, IntegrityPolicy, MatrixCommitKind, ReadLimits, Result,
+    VarveMatrixBlock, decode_from_slice, encode_to_vec,
 };
 
 const VMAT_MAGIC: &[u8; 4] = b"VMAT";
@@ -14,6 +16,10 @@ const MCRC_MAGIC: &[u8; 4] = b"MCRC";
 const MCRC_VERSION: u16 = 1;
 const MCRC_HEADER_LEN: u64 = 16;
 const CRC_LEN: u64 = 4;
+const MATRIX_BYTES_RESOURCE: &str = "matrix bytes";
+const MATRIX_DESCRIPTOR_RESOURCE: &str = "matrix descriptors";
+#[allow(dead_code)]
+const MATRIX_SIDECAR_RESOURCE: &str = "matrix sidecar";
 
 type CommitPlan = (String, MatrixCommitKind, u64);
 type StoredCommitPlan = (String, MatrixCommitKind, u64, u64, u64);
@@ -236,6 +242,8 @@ pub struct MatrixLayout {
     aux: Vec<MatrixAuxLayout>,
     crc_findings: Vec<MatrixRecoveryFinding>,
     append_log_start: u64,
+    read_limits: ReadLimits,
+    resident_bitmap_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -244,8 +252,8 @@ struct MatrixCommitLayout {
     kind: MatrixCommitKind,
     bit_count: u64,
     map_offset: u64,
-    bits: Vec<u8>,
-    quarantined_raw_bits: Option<Vec<u8>>,
+    bits: Arc<Vec<u8>>,
+    quarantined_raw_bits: Option<Arc<Vec<u8>>>,
     quarantine_finding: Option<MatrixRecoveryFinding>,
     crc_offset: Option<u64>,
 }
@@ -259,9 +267,9 @@ struct MatrixBlockLayout {
     cell_count: u64,
     crc_offset: Option<u64>,
     crc_valid_offset: Option<u64>,
-    crc_valid_bits: Vec<u8>,
-    written_bits: Vec<u8>,
-    current_write_bits: Vec<u8>,
+    crc_valid_bits: Arc<Vec<u8>>,
+    written_bits: Arc<Vec<u8>>,
+    current_write_bits: Arc<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -275,7 +283,6 @@ struct MatrixAuxLayout {
 struct MatrixCrcLayout {
     region_offset: u64,
     region_len: u64,
-    metadata_crc_offset: u64,
 }
 
 #[derive(Default)]
@@ -353,25 +360,35 @@ pub(crate) fn create_layout(
     dims: &MatrixDimensions,
 ) -> Result<MatrixLayout> {
     let crc_enabled = matrix_crc_enabled(spec)?;
-    let dimensions = dimension_values(spec, dims)?;
-    let mut dimension_index = HashMap::with_capacity(dimensions.len());
-    for (index, value) in dimensions.iter().enumerate() {
-        dimension_index.insert(
-            value.name.clone(),
-            u16::try_from(index).map_err(|_| Error::InvalidMatrixLayout)?,
-        );
-    }
-    let cell_counts = matrix_cell_counts(spec, &dimensions)?;
-    let commit_plans = matrix_commit_plans(spec, &dimensions, &cell_counts)?;
-
-    let dimension_table = encode_dimension_table(&dimensions)?;
     let (dimension_table_len, block_table_len, category_table_len) =
         matrix_descriptor_table_lengths(spec)?;
-    if usize_to_u64(dimension_table.len())? != dimension_table_len {
-        return Err(Error::InvalidMatrixLayout);
-    }
+    check_matrix_metadata_limit(
+        spec.read_limits,
+        dimension_table_len,
+        block_table_len,
+        category_table_len,
+    )?;
+    let dimensions = dimension_values(spec, dims)?;
+    check_matrix_dimensions(spec.read_limits, &dimensions)?;
+    let cell_counts = matrix_cell_counts(spec, &dimensions)?;
+    let commit_plans = matrix_commit_plans(spec, &dimensions, &cell_counts)?;
     let commit_map_len = matrix_commit_map_len(&commit_plans)?;
     let slot_region_len = matrix_slot_region_len(spec, &cell_counts)?;
+    spec.read_limits
+        .check(ReadLimitKey::MatrixSlotRegionLen, slot_region_len)?;
+    let block_bitmap_len = matrix_block_bitmap_len(spec, &cell_counts)?;
+    let resident_bitmap_bytes = matrix_resident_bitmap_len(commit_map_len, block_bitmap_len)?;
+    spec.read_limits
+        .check(ReadLimitKey::MatrixBitmapBytes, resident_bitmap_bytes)?;
+    let region_crc_len = if crc_enabled {
+        crc_table_len(spec, &cell_counts)?
+    } else {
+        0
+    };
+    let accounted_crc_bytes =
+        matrix_accounted_crc_len(crc_enabled, region_crc_len, block_bitmap_len)?;
+    spec.read_limits
+        .check(ReadLimitKey::MatrixCrcBytes, accounted_crc_bytes)?;
 
     let dimension_table_off = header_len
         .checked_add(u64::from(VMAT_HEADER_LEN))
@@ -396,11 +413,6 @@ pub(crate) fn create_layout(
     let aux_region_end = slot_region_end
         .checked_add(aux_region_len)
         .ok_or(Error::InvalidMatrixLayout)?;
-    let region_crc_len = if crc_enabled {
-        crc_table_len(spec, &cell_counts)?
-    } else {
-        0
-    };
     let region_crc_off = if crc_enabled { aux_region_end } else { 0 };
     let append_log_start = if crc_enabled {
         region_crc_off
@@ -409,8 +421,29 @@ pub(crate) fn create_layout(
     } else {
         aux_region_end
     };
+    spec.read_limits
+        .check(ReadLimitKey::FileLen, append_log_start)?;
+
+    let dimension_table = encode_dimension_table(&dimensions, dimension_table_len)?;
+    let mut dimension_index = HashMap::new();
+    try_reserve_map(
+        &mut dimension_index,
+        dimensions.len(),
+        MATRIX_DESCRIPTOR_RESOURCE,
+    )?;
+    for (index, value) in dimensions.iter().enumerate() {
+        dimension_index.insert(
+            value.name.clone(),
+            u16::try_from(index).map_err(|_| Error::InvalidMatrixLayout)?,
+        );
+    }
 
     let mut commit_offsets = HashMap::new();
+    try_reserve_map(
+        &mut commit_offsets,
+        commit_plans.len(),
+        MATRIX_DESCRIPTOR_RESOURCE,
+    )?;
     let mut next_commit_offset = commit_map_off;
     for (name, _, bit_count) in &commit_plans {
         let len = bit_bytes(*bit_count)?;
@@ -421,6 +454,11 @@ pub(crate) fn create_layout(
     }
 
     let mut block_offsets = HashMap::new();
+    try_reserve_map(
+        &mut block_offsets,
+        spec.matrix_blocks.len(),
+        MATRIX_DESCRIPTOR_RESOURCE,
+    )?;
     let mut next_slot_offset = slot_region_off;
     for block in spec.matrix_blocks {
         let cell_count = *cell_counts
@@ -449,17 +487,6 @@ pub(crate) fn create_layout(
         &commit_plans,
         &block_offsets,
     )?;
-    let crc_table = match &crc_layout {
-        Some(_) => Some(encode_crc_table(
-            spec,
-            &commit_plans,
-            &block_offsets,
-            &dimension_table,
-            &block_table,
-            &category_table,
-        )?),
-        None => None,
-    };
     let header = encode_header(MatrixHeaderFields {
         dimension_count: u32::try_from(dimensions.len()).map_err(|_| Error::InvalidMatrixLayout)?,
         matrix_block_count: u32::try_from(spec.matrix_blocks.len())
@@ -480,6 +507,23 @@ pub(crate) fn create_layout(
         region_crc_len,
         append_log_start,
     });
+    let has_crc = crc_layout.is_some();
+    let initial_crc_valid_bits = zero_crc_valid_bitmaps(spec, has_crc, &block_offsets)?;
+    let layout = layout_from_parts(
+        dimensions,
+        spec,
+        &commit_plans,
+        &commit_offsets,
+        &block_offsets,
+        &aux_offsets,
+        zero_commit_bitmaps(&commit_plans)?,
+        crc_layout,
+        initial_crc_valid_bits,
+        HashMap::new(),
+        Vec::new(),
+        append_log_start,
+        resident_bitmap_bytes,
+    )?;
 
     file.seek(SeekFrom::Start(header_len))?;
     file.write_all(&header)?;
@@ -488,45 +532,52 @@ pub(crate) fn create_layout(
     file.write_all(&category_table)?;
     write_zeros(file, commit_map_len)?;
     file.set_len(append_log_start)?;
-    if let Some(crc_table) = crc_table {
+    if has_crc {
         file.seek(SeekFrom::Start(region_crc_off))?;
-        file.write_all(&crc_table)?;
+        write_crc_table(
+            file,
+            spec,
+            &commit_plans,
+            &block_offsets,
+            &dimension_table,
+            &block_table,
+            &category_table,
+        )?;
     }
     file.seek(SeekFrom::Start(append_log_start))?;
-
-    layout_from_parts(
-        dimensions,
-        spec,
-        &commit_plans,
-        &commit_offsets,
-        &block_offsets,
-        &aux_offsets,
-        commit_map_off,
-        filled_bytes(commit_map_len, 0)?,
-        crc_layout,
-        HashMap::new(),
-        HashMap::new(),
-        Vec::new(),
-        append_log_start,
-    )
+    Ok(layout)
 }
 
-pub(crate) fn read_layout(
+pub(crate) fn read_layout_at_len(
     spec: FormatSpec,
     file: &mut File,
     header_len: u64,
+    file_len: u64,
 ) -> Result<MatrixLayout> {
+    spec.read_limits.check(ReadLimitKey::FileLen, file_len)?;
+    validate_range(header_len, u64::from(VMAT_HEADER_LEN), file_len)?;
     let crc_enabled = matrix_crc_enabled(spec)?;
     let header = read_header(file, header_len)?;
     validate_header_descriptor_shape(spec, &header)?;
-    let file_len = file.metadata()?.len();
+    check_matrix_metadata_limit(
+        spec.read_limits,
+        header.dimension_table_len,
+        header.block_table_len,
+        header.commit_category_len,
+    )?;
     let aux_region_len = matrix_aux_region_len(spec)?;
     validate_layout_ranges(header_len, file_len, &header, aux_region_len)?;
     validate_crc_presence(crc_enabled, &header)?;
 
-    let dimension_table = read_range(file, header.dimension_table_off, header.dimension_table_len)?;
+    let dimension_table = read_range(
+        file,
+        header.dimension_table_off,
+        header.dimension_table_len,
+        MATRIX_DESCRIPTOR_RESOURCE,
+    )?;
     let dimensions = decode_dimension_table(&dimension_table, header.dimension_count)?;
     validate_dimension_names(spec, &dimensions)?;
+    check_matrix_dimensions(spec.read_limits, &dimensions)?;
     let cell_counts = matrix_cell_counts(spec, &dimensions)?;
     let expected_commit_plans = matrix_commit_plans(spec, &dimensions, &cell_counts)?;
     validate_dimension_derived_lengths(
@@ -536,8 +587,24 @@ pub(crate) fn read_layout(
         &expected_commit_plans,
         &cell_counts,
     )?;
+    spec.read_limits
+        .check(ReadLimitKey::MatrixSlotRegionLen, header.slot_region_len)?;
+    let block_bitmap_len = matrix_block_bitmap_len(spec, &cell_counts)?;
+    let resident_bitmap_bytes =
+        matrix_resident_bitmap_len(header.commit_map_len, block_bitmap_len)?;
+    spec.read_limits
+        .check(ReadLimitKey::MatrixBitmapBytes, resident_bitmap_bytes)?;
+    let accounted_crc_bytes =
+        matrix_accounted_crc_len(crc_enabled, header.region_crc_len, block_bitmap_len)?;
+    spec.read_limits
+        .check(ReadLimitKey::MatrixCrcBytes, accounted_crc_bytes)?;
 
-    let category_table = read_range(file, header.commit_category_off, header.commit_category_len)?;
+    let category_table = read_range(
+        file,
+        header.commit_category_off,
+        header.commit_category_len,
+        MATRIX_DESCRIPTOR_RESOURCE,
+    )?;
     let commit_plans = decode_category_table(&category_table, header.commit_category_count)?;
     let commit_offsets = validate_commit_table(
         &expected_commit_plans,
@@ -545,9 +612,13 @@ pub(crate) fn read_layout(
         header.commit_map_off,
         header.commit_map_len,
     )?;
-    let commit_bits = read_range(file, header.commit_map_off, header.commit_map_len)?;
 
-    let block_table = read_range(file, header.block_table_off, header.block_table_len)?;
+    let block_table = read_range(
+        file,
+        header.block_table_off,
+        header.block_table_len,
+        MATRIX_DESCRIPTOR_RESOURCE,
+    )?;
     let block_offsets = decode_block_table(
         spec,
         &dimensions,
@@ -569,13 +640,13 @@ pub(crate) fn read_layout(
         &expected_commit_plans,
         &block_offsets,
     )?;
+    let commit_bits = read_commit_bitmaps(file, &commit_plans)?;
     let crc_verification = verify_crc_table(
         file,
         crc_layout.as_ref(),
         &[&dimension_table, &block_table, &category_table],
         &commit_plans,
         &commit_bits,
-        header.commit_map_off,
     )?;
     let crc_valid_bits = read_crc_valid_bits(spec, file, crc_layout.as_ref(), &block_offsets)?;
 
@@ -586,13 +657,13 @@ pub(crate) fn read_layout(
         &commit_offsets,
         &block_offsets,
         &aux_offsets,
-        header.commit_map_off,
         commit_bits,
         crc_layout,
         crc_valid_bits,
         crc_verification.commit_findings,
         crc_verification.findings,
         header.append_log_start,
+        resident_bitmap_bytes,
     )
 }
 
@@ -616,10 +687,6 @@ pub(crate) fn write_cell<T: VarveMatrixBlock>(
             actual: payload.len() as u64,
         });
     }
-    let mut written_bits = layout.blocks[block_index].written_bits.clone();
-    let mut current_write_bits = layout.blocks[block_index].current_write_bits.clone();
-    set_bit(&mut written_bits, ordinal, true)?;
-    set_bit(&mut current_write_bits, ordinal, true)?;
     let (commit_index, commit_update) = prepare_cell_commit(layout, T::CATEGORY, ordinal, false)?;
     let crc_valid_update = prepare_cell_crc_valid(layout, block_index, ordinal, false)?;
 
@@ -629,8 +696,16 @@ pub(crate) fn write_cell<T: VarveMatrixBlock>(
     }
     file.seek(SeekFrom::Start(offset))?;
     write_slot_payload(file, &payload)?;
-    layout.blocks[block_index].written_bits = written_bits;
-    layout.blocks[block_index].current_write_bits = current_write_bits;
+    set_bit(
+        Arc::make_mut(&mut layout.blocks[block_index].written_bits).as_mut_slice(),
+        ordinal,
+        true,
+    )?;
+    set_bit(
+        Arc::make_mut(&mut layout.blocks[block_index].current_write_bits).as_mut_slice(),
+        ordinal,
+        true,
+    )?;
     Ok(())
 }
 
@@ -653,10 +728,6 @@ pub(crate) fn write_cell_payload<T: VarveMatrixBlock>(
             actual: payload.len() as u64,
         });
     }
-    let mut written_bits = layout.blocks[block_index].written_bits.clone();
-    let mut current_write_bits = layout.blocks[block_index].current_write_bits.clone();
-    set_bit(&mut written_bits, ordinal, true)?;
-    set_bit(&mut current_write_bits, ordinal, true)?;
     let (commit_index, commit_update) = prepare_cell_commit(layout, T::CATEGORY, ordinal, false)?;
     let crc_valid_update = prepare_cell_crc_valid(layout, block_index, ordinal, false)?;
 
@@ -666,8 +737,16 @@ pub(crate) fn write_cell_payload<T: VarveMatrixBlock>(
     }
     file.seek(SeekFrom::Start(offset))?;
     write_slot_payload(file, payload)?;
-    layout.blocks[block_index].written_bits = written_bits;
-    layout.blocks[block_index].current_write_bits = current_write_bits;
+    set_bit(
+        Arc::make_mut(&mut layout.blocks[block_index].written_bits).as_mut_slice(),
+        ordinal,
+        true,
+    )?;
+    set_bit(
+        Arc::make_mut(&mut layout.blocks[block_index].current_write_bits).as_mut_slice(),
+        ordinal,
+        true,
+    )?;
     Ok(())
 }
 
@@ -772,37 +851,54 @@ pub(crate) fn clear_category(
 ) -> Result<u64> {
     let commit_index = layout.commit_index(category)?;
     let cleared = count_committed(&layout.commits[commit_index])?;
-    let cleared_bits = vec![0; layout.commits[commit_index].bits.len()];
     let commit_kind = layout.commits[commit_index].kind;
     let map_offset = layout.commits[commit_index].map_offset;
     let crc_offset = layout.commits[commit_index].crc_offset;
+    let quarantined_len = layout.commits[commit_index]
+        .quarantined_raw_bits
+        .as_ref()
+        .map(|bits| usize_to_u64(bits.len()))
+        .transpose()?
+        .unwrap_or(0);
     let cleared_valid = if commit_kind == MatrixCommitKind::Cell {
         let block_index = block_index_for_category(spec, layout, category)?;
-        let bits = vec![0; layout.blocks[block_index].crc_valid_bits.len()];
-        Some((
-            block_index,
-            layout.blocks[block_index].crc_valid_offset,
-            bits,
-        ))
+        layout.blocks[block_index]
+            .crc_valid_offset
+            .map(|valid_offset| (block_index, valid_offset))
     } else {
         None
     };
 
-    if let Some((_, Some(valid_offset), bits)) = &cleared_valid {
-        file.seek(SeekFrom::Start(*valid_offset))?;
-        file.write_all(bits)?;
+    if let Some((block_index, valid_offset)) = cleared_valid {
+        file.seek(SeekFrom::Start(valid_offset))?;
+        write_zeros(
+            file,
+            usize_to_u64(layout.blocks[block_index].crc_valid_bits.len())?,
+        )?;
     }
-    write_commit_crc(file, crc_offset, &cleared_bits)?;
+    if let Some(crc_offset) = crc_offset {
+        write_crc_at(
+            file,
+            crc_offset,
+            crc32_zeroes(usize_to_u64(layout.commits[commit_index].bits.len())?)?,
+        )?;
+    }
     file.seek(SeekFrom::Start(map_offset))?;
-    file.write_all(&cleared_bits)?;
+    write_zeros(file, usize_to_u64(layout.commits[commit_index].bits.len())?)?;
 
-    if let Some((block_index, _, bits)) = cleared_valid {
-        layout.blocks[block_index].crc_valid_bits = bits;
+    if let Some((block_index, _)) = cleared_valid {
+        Arc::make_mut(&mut layout.blocks[block_index].crc_valid_bits).fill(0);
     }
-    let commit = &mut layout.commits[commit_index];
-    commit.bits = cleared_bits;
-    commit.quarantined_raw_bits = None;
-    commit.quarantine_finding = None;
+    {
+        let commit = &mut layout.commits[commit_index];
+        Arc::make_mut(&mut commit.bits).fill(0);
+        commit.quarantined_raw_bits = None;
+        commit.quarantine_finding = None;
+    }
+    layout.resident_bitmap_bytes = layout
+        .resident_bitmap_bytes
+        .checked_sub(quarantined_len)
+        .ok_or(Error::InvalidMatrixLayout)?;
     Ok(cleared)
 }
 
@@ -849,29 +945,32 @@ pub(crate) fn aux_len(layout: &MatrixLayout, name: &str) -> Result<u64> {
     Ok(layout.aux(name)?.byte_len)
 }
 
-pub(crate) fn read_aux(
+pub(crate) fn read_aux_at_len(
     layout: &MatrixLayout,
     file: &mut File,
+    logical_file_len: u64,
     name: &str,
     offset: u64,
     len: u64,
 ) -> Result<Vec<u8>> {
+    layout
+        .read_limits
+        .check(ReadLimitKey::FileLen, logical_file_len)?;
+    layout
+        .read_limits
+        .check(ReadLimitKey::RecordPayloadLen, len)?;
     let absolute = aux_absolute_offset(layout.aux(name)?, offset, len)?;
+    validate_range(absolute, len, logical_file_len)?;
     file.seek(SeekFrom::Start(absolute))?;
-    let len = usize::try_from(len).map_err(|_| Error::MatrixAuxOutOfBounds {
-        name: name.to_string(),
-        offset,
-        len,
-        byte_len: layout.aux(name).map(|aux| aux.byte_len).unwrap_or(0),
-    })?;
-    let mut payload = vec![0; len];
+    let mut payload = filled_bytes(len, 0)?;
     file.read_exact(&mut payload)?;
     Ok(payload)
 }
 
-pub(crate) fn write_aux(
+pub(crate) fn write_aux_at_len(
     layout: &MatrixLayout,
     file: &mut File,
+    logical_file_len: u64,
     name: &str,
     offset: u64,
     payload: &[u8],
@@ -880,7 +979,14 @@ pub(crate) fn write_aux(
         .len()
         .try_into()
         .map_err(|_| Error::InvalidMatrixLayout)?;
+    layout
+        .read_limits
+        .check(ReadLimitKey::FileLen, logical_file_len)?;
+    layout
+        .read_limits
+        .check(ReadLimitKey::RecordPayloadLen, len)?;
     let absolute = aux_absolute_offset(layout.aux(name)?, offset, len)?;
+    validate_range(absolute, len, logical_file_len)?;
     file.seek(SeekFrom::Start(absolute))?;
     file.write_all(payload)?;
     Ok(())
@@ -942,6 +1048,7 @@ pub(crate) fn sidecar_resume_signal(
     category: &str,
     sidecar_exists: bool,
 ) -> Result<MatrixResumeSignal> {
+    layout.read_limits.check(ReadLimitKey::SidecarLen, 0)?;
     let commit = &layout.commits[layout.commit_index(category)?];
     let committed = count_committed(commit)?;
     if committed == 0 || committed == commit.bit_count {
@@ -958,6 +1065,94 @@ pub(crate) fn sidecar_resume_signal(
     } else {
         Ok(MatrixResumeSignal::RestartRecommended)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct MatrixSidecarReadPlan {
+    pub(crate) format_magic_offset: u64,
+    pub(crate) category_offset: u64,
+    pub(crate) payload_offset: u64,
+    pub(crate) payload_len: u64,
+    pub(crate) total_len: u64,
+}
+
+#[allow(dead_code)]
+pub(crate) fn check_matrix_sidecar_file_len(spec: FormatSpec, file_len: u64) -> Result<()> {
+    spec.read_limits.check(ReadLimitKey::SidecarLen, file_len)
+}
+
+#[allow(dead_code)]
+pub(crate) fn matrix_sidecar_write_len(
+    spec: FormatSpec,
+    fixed_header_len: u64,
+    format_magic_len: u64,
+    category_len: u64,
+    payload_len: u64,
+) -> Result<u64> {
+    spec.read_limits
+        .check(ReadLimitKey::MaterializedBytes, payload_len)?;
+    let metadata_len = fixed_header_len
+        .checked_add(format_magic_len)
+        .and_then(|len| len.checked_add(category_len))
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: MATRIX_SIDECAR_RESOURCE,
+        })?;
+    let total_len =
+        metadata_len
+            .checked_add(payload_len)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: MATRIX_SIDECAR_RESOURCE,
+            })?;
+    check_matrix_sidecar_file_len(spec, total_len)?;
+    Ok(total_len)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(crate) fn matrix_sidecar_read_plan(
+    spec: FormatSpec,
+    file_len: u64,
+    fixed_header_len: u64,
+    format_magic_len: u64,
+    category_len: u64,
+    payload_len: u64,
+    flags: u16,
+    reserved: u16,
+    trailing_reserved: u32,
+) -> Result<MatrixSidecarReadPlan> {
+    check_matrix_sidecar_file_len(spec, file_len)?;
+    if flags != 0 || reserved != 0 || trailing_reserved != 0 {
+        return Err(Error::InvalidMatrixSidecar);
+    }
+    let total_len = matrix_sidecar_write_len(
+        spec,
+        fixed_header_len,
+        format_magic_len,
+        category_len,
+        payload_len,
+    )?;
+    if total_len != file_len {
+        return Err(Error::InvalidMatrixSidecar);
+    }
+    let category_offset = fixed_header_len.checked_add(format_magic_len).ok_or(
+        Error::ResourceArithmeticOverflow {
+            resource: MATRIX_SIDECAR_RESOURCE,
+        },
+    )?;
+    let payload_offset =
+        category_offset
+            .checked_add(category_len)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: MATRIX_SIDECAR_RESOURCE,
+            })?;
+    Ok(MatrixSidecarReadPlan {
+        format_magic_offset: fixed_header_len,
+        category_offset,
+        payload_offset,
+        payload_len,
+        total_len,
+    })
 }
 
 pub(crate) fn recovery_report(layout: &MatrixLayout) -> MatrixRecoveryReport {
@@ -1024,12 +1219,22 @@ pub(crate) fn rebuild_commit_map_from_crc<T: VarveMatrixBlock>(
         return Err(Error::InvalidMatrixLayout);
     }
 
-    let mut rebuilt = vec![0; layout.commits[commit_index].bits.len()];
+    let rebuilt_len = usize_to_u64(layout.commits[commit_index].bits.len())?;
+    let peak_bitmap_bytes = layout
+        .resident_bitmap_bytes
+        .checked_add(rebuilt_len)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: ReadLimitKey::MatrixBitmapBytes.resource(),
+        })?;
+    layout
+        .read_limits
+        .check(ReadLimitKey::MatrixBitmapBytes, peak_bitmap_bytes)?;
+    let mut rebuilt = filled_bytes(rebuilt_len, 0)?;
+    let mut payload = filled_bytes(block.slot_stride, 0)?;
     let mut committed = 0u64;
     for ordinal in 0..block.cell_count {
         let slot_offset = layout.slot_offset(block_index, ordinal)?;
         file.seek(SeekFrom::Start(slot_offset))?;
-        let mut payload = filled_bytes(block.slot_stride, 0)?;
         file.read_exact(&mut payload)?;
         let actual = crc32_bytes(&payload)?;
         let stored = read_crc_at(file, indexed_crc_offset(crc_offset, ordinal)?)?;
@@ -1045,9 +1250,19 @@ pub(crate) fn rebuild_commit_map_from_crc<T: VarveMatrixBlock>(
     file.seek(SeekFrom::Start(commit.map_offset))?;
     file.write_all(&rebuilt)?;
     let commit = &mut layout.commits[commit_index];
-    commit.bits = rebuilt;
+    let quarantined_len = commit
+        .quarantined_raw_bits
+        .as_ref()
+        .map(|bits| usize_to_u64(bits.len()))
+        .transpose()?
+        .unwrap_or(0);
+    commit.bits = Arc::new(rebuilt);
     commit.quarantined_raw_bits = None;
     commit.quarantine_finding = None;
+    layout.resident_bitmap_bytes = layout
+        .resident_bitmap_bytes
+        .checked_sub(quarantined_len)
+        .ok_or(Error::InvalidMatrixLayout)?;
     Ok(committed)
 }
 
@@ -1189,7 +1404,7 @@ fn set_commit_bit(
 }
 
 struct BitmapByteUpdate {
-    bits: Vec<u8>,
+    byte_index: usize,
     byte_offset: u64,
     byte_value: u8,
 }
@@ -1209,15 +1424,19 @@ fn prepare_bitmap_update(
     if ordinal >= bit_count {
         return Err(Error::InvalidMatrixLayout);
     }
-    let mut staged = bits.to_vec();
-    set_bit(&mut staged, ordinal, value)?;
     let byte_index = usize::try_from(ordinal / 8).map_err(|_| Error::InvalidMatrixLayout)?;
-    let byte_value = *staged.get(byte_index).ok_or(Error::InvalidMatrixLayout)?;
+    let current = *bits.get(byte_index).ok_or(Error::InvalidMatrixLayout)?;
+    let mask = 1u8 << (ordinal % 8);
+    let byte_value = if value {
+        current | mask
+    } else {
+        current & !mask
+    };
     let byte_offset = base_offset
         .checked_add(u64::try_from(byte_index).map_err(|_| Error::InvalidMatrixLayout)?)
         .ok_or(Error::InvalidMatrixLayout)?;
     Ok(BitmapByteUpdate {
-        bits: staged,
+        byte_index,
         byte_offset,
         byte_value,
     })
@@ -1254,7 +1473,10 @@ fn prepare_commit_bit(
         value,
     )?;
     let crc = match commit.crc_offset {
-        Some(offset) => Some((offset, crc32_bytes(&bitmap.bits)?)),
+        Some(offset) => Some((
+            offset,
+            crc32_bytes_with_replacement(&commit.bits, bitmap.byte_index, bitmap.byte_value)?,
+        )),
         None => None,
     };
     Ok(CommitBitUpdate { bitmap, crc })
@@ -1270,7 +1492,9 @@ fn apply_commit_bit(
         write_crc_at(file, offset, crc)?;
     }
     write_bitmap_byte(file, &update.bitmap)?;
-    layout.commits[commit_index].bits = update.bitmap.bits;
+    *Arc::make_mut(&mut layout.commits[commit_index].bits)
+        .get_mut(update.bitmap.byte_index)
+        .ok_or(Error::InvalidMatrixLayout)? = update.bitmap.byte_value;
     Ok(())
 }
 
@@ -1353,7 +1577,9 @@ fn apply_cell_crc_valid(
     update: BitmapByteUpdate,
 ) -> Result<()> {
     write_bitmap_byte(file, &update)?;
-    layout.blocks[block_index].crc_valid_bits = update.bits;
+    *Arc::make_mut(&mut layout.blocks[block_index].crc_valid_bits)
+        .get_mut(update.byte_index)
+        .ok_or(Error::InvalidMatrixLayout)? = update.byte_value;
     Ok(())
 }
 
@@ -1407,7 +1633,12 @@ fn dimension_values(
     spec: FormatSpec,
     dims: &MatrixDimensions,
 ) -> Result<Vec<MatrixDimensionValue>> {
-    let mut values = Vec::with_capacity(spec.matrix_dimensions.len());
+    let mut values = Vec::new();
+    try_reserve_vec(
+        &mut values,
+        spec.matrix_dimensions.len(),
+        MATRIX_DESCRIPTOR_RESOURCE,
+    )?;
     for dimension in spec.matrix_dimensions {
         let value = dims
             .get(dimension.name)
@@ -1424,19 +1655,37 @@ fn matrix_cell_counts(
     spec: FormatSpec,
     dimensions: &[MatrixDimensionValue],
 ) -> Result<HashMap<String, u64>> {
-    let values = dimensions
-        .iter()
-        .map(|dimension| (dimension.name.as_str(), dimension.value))
-        .collect::<HashMap<_, _>>();
     let mut counts = HashMap::new();
+    try_reserve_map(
+        &mut counts,
+        spec.matrix_blocks.len(),
+        ReadLimitKey::MatrixCells.resource(),
+    )?;
+    let mut aggregate = 0u64;
     for block in spec.matrix_blocks {
-        let dim0 = *values
-            .get(block.dimensions[0])
+        let dim0 = dimensions
+            .iter()
+            .find(|dimension| dimension.name == block.dimensions[0])
+            .map(|dimension| dimension.value)
             .ok_or_else(|| Error::MatrixDimensionMissing(block.dimensions[0].to_string()))?;
-        let dim1 = *values
-            .get(block.dimensions[1])
+        let dim1 = dimensions
+            .iter()
+            .find(|dimension| dimension.name == block.dimensions[1])
+            .map(|dimension| dimension.value)
             .ok_or_else(|| Error::MatrixDimensionMissing(block.dimensions[1].to_string()))?;
-        let count = dim0.checked_mul(dim1).ok_or(Error::InvalidMatrixLayout)?;
+        let count = dim0
+            .checked_mul(dim1)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: ReadLimitKey::MatrixCells.resource(),
+            })?;
+        spec.read_limits.check(ReadLimitKey::MatrixCells, count)?;
+        aggregate = aggregate
+            .checked_add(count)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: ReadLimitKey::MatrixCells.resource(),
+            })?;
+        spec.read_limits
+            .check(ReadLimitKey::MatrixCells, aggregate)?;
         match counts.insert(block.category.to_string(), count) {
             Some(existing) if existing != count => return Err(Error::InvalidMatrixLayout),
             _ => {}
@@ -1450,7 +1699,12 @@ fn matrix_commit_plans(
     dimensions: &[MatrixDimensionValue],
     cell_counts: &HashMap<String, u64>,
 ) -> Result<Vec<CommitPlan>> {
-    let mut plans = Vec::with_capacity(spec.matrix_commits.len());
+    let mut plans = Vec::new();
+    try_reserve_vec(
+        &mut plans,
+        spec.matrix_commits.len(),
+        MATRIX_DESCRIPTOR_RESOURCE,
+    )?;
     for commit in spec.matrix_commits {
         let bit_count = match commit.kind {
             MatrixCommitKind::Cell => *cell_counts
@@ -1495,6 +1749,103 @@ fn matrix_commit_map_len(commit_plans: &[CommitPlan]) -> Result<u64> {
         })
 }
 
+fn check_matrix_dimensions(limits: ReadLimits, dimensions: &[MatrixDimensionValue]) -> Result<()> {
+    for dimension in dimensions {
+        limits.check(ReadLimitKey::MatrixDimension, dimension.value)?;
+    }
+    Ok(())
+}
+
+fn check_matrix_metadata_limit(
+    limits: ReadLimits,
+    dimension_table_len: u64,
+    block_table_len: u64,
+    category_table_len: u64,
+) -> Result<()> {
+    let metadata_len = u64::from(VMAT_HEADER_LEN)
+        .checked_add(dimension_table_len)
+        .and_then(|len| len.checked_add(block_table_len))
+        .and_then(|len| len.checked_add(category_table_len))
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: ReadLimitKey::MatrixMetadataBytes.resource(),
+        })?;
+    limits.check(ReadLimitKey::MatrixMetadataBytes, metadata_len)
+}
+
+fn matrix_block_bitmap_len(spec: FormatSpec, cell_counts: &HashMap<String, u64>) -> Result<u64> {
+    spec.matrix_blocks.iter().try_fold(0u64, |total, block| {
+        let cell_count = *cell_counts
+            .get(block.category)
+            .ok_or_else(|| Error::MatrixCommitMissing(block.category.to_string()))?;
+        total
+            .checked_add(bit_bytes(cell_count)?)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: ReadLimitKey::MatrixBitmapBytes.resource(),
+            })
+    })
+}
+
+fn matrix_resident_bitmap_len(commit_map_len: u64, block_bitmap_len: u64) -> Result<u64> {
+    block_bitmap_len
+        .checked_mul(2)
+        .and_then(|write_maps| write_maps.checked_add(commit_map_len))
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: ReadLimitKey::MatrixBitmapBytes.resource(),
+        })
+}
+
+fn matrix_accounted_crc_len(
+    crc_enabled: bool,
+    region_crc_len: u64,
+    block_bitmap_len: u64,
+) -> Result<u64> {
+    if crc_enabled {
+        region_crc_len
+            .checked_add(block_bitmap_len)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: ReadLimitKey::MatrixCrcBytes.resource(),
+            })
+    } else {
+        Ok(0)
+    }
+}
+
+fn zero_commit_bitmaps(commit_plans: &[CommitPlan]) -> Result<Vec<Vec<u8>>> {
+    let mut bitmaps = Vec::new();
+    try_reserve_vec(
+        &mut bitmaps,
+        commit_plans.len(),
+        ReadLimitKey::MatrixBitmapBytes.resource(),
+    )?;
+    for (_, _, bit_count) in commit_plans {
+        bitmaps.push(filled_bytes(bit_bytes(*bit_count)?, 0)?);
+    }
+    Ok(bitmaps)
+}
+
+fn zero_crc_valid_bitmaps(
+    spec: FormatSpec,
+    crc_enabled: bool,
+    block_offsets: &HashMap<u32, (u64, u64, u64)>,
+) -> Result<HashMap<u32, Vec<u8>>> {
+    let mut bitmaps = HashMap::new();
+    if !crc_enabled {
+        return Ok(bitmaps);
+    }
+    try_reserve_map(
+        &mut bitmaps,
+        spec.matrix_blocks.len(),
+        ReadLimitKey::MatrixCrcBytes.resource(),
+    )?;
+    for block in spec.matrix_blocks {
+        let (_, _, cell_count) = *block_offsets
+            .get(&block.block_id)
+            .ok_or(Error::MatrixBlockMissing(block.block_id))?;
+        bitmaps.insert(block.block_id, filled_bytes(bit_bytes(cell_count)?, 0)?);
+    }
+    Ok(bitmaps)
+}
+
 fn matrix_slot_region_len(spec: FormatSpec, cell_counts: &HashMap<String, u64>) -> Result<u64> {
     spec.matrix_blocks.iter().try_fold(0u64, |len, block| {
         let cell_count = *cell_counts
@@ -1529,7 +1880,12 @@ fn matrix_aux_region_len(spec: FormatSpec) -> Result<u64> {
 }
 
 fn matrix_aux_offsets(spec: FormatSpec, start: u64) -> Result<HashMap<String, (u64, u64)>> {
-    let mut offsets = HashMap::with_capacity(spec.matrix_aux.len());
+    let mut offsets = HashMap::new();
+    try_reserve_map(
+        &mut offsets,
+        spec.matrix_aux.len(),
+        MATRIX_DESCRIPTOR_RESOURCE,
+    )?;
     let mut next = start;
     for aux in spec.matrix_aux {
         offsets.insert(aux.name.to_string(), (next, aux.byte_len));
@@ -1570,35 +1926,43 @@ fn layout_from_parts(
     commit_offsets: &HashMap<String, (u64, u64)>,
     block_offsets: &HashMap<u32, (u64, u64, u64)>,
     aux_offsets: &HashMap<String, (u64, u64)>,
-    commit_map_base: u64,
-    commit_bits: Vec<u8>,
+    commit_bits: Vec<Vec<u8>>,
     crc: Option<MatrixCrcLayout>,
-    crc_valid_bits: HashMap<u32, Vec<u8>>,
+    mut crc_valid_bits: HashMap<u32, Vec<u8>>,
     mut commit_findings: HashMap<String, MatrixRecoveryFinding>,
     crc_findings: Vec<MatrixRecoveryFinding>,
     append_log_start: u64,
+    mut resident_bitmap_bytes: u64,
 ) -> Result<MatrixLayout> {
-    let mut commits = Vec::with_capacity(commit_plans.len());
-    for (commit_index, (name, kind, bit_count)) in commit_plans.iter().enumerate() {
+    if commit_bits.len() != commit_plans.len() {
+        return Err(Error::InvalidMatrixLayout);
+    }
+    let mut commits = Vec::new();
+    try_reserve_vec(&mut commits, commit_plans.len(), MATRIX_DESCRIPTOR_RESOURCE)?;
+    for (commit_index, ((name, kind, bit_count), raw_bits)) in
+        commit_plans.iter().zip(commit_bits).enumerate()
+    {
         let (map_offset, map_len) = *commit_offsets
             .get(name)
             .ok_or_else(|| Error::MatrixCommitMissing(name.clone()))?;
-        let relative_offset = map_offset
-            .checked_sub(commit_map_base)
-            .ok_or(Error::InvalidMatrixLayout)?;
-        let start = usize::try_from(relative_offset).map_err(|_| Error::InvalidMatrixLayout)?;
-        let end = start
-            .checked_add(usize::try_from(map_len).map_err(|_| Error::InvalidMatrixLayout)?)
-            .ok_or(Error::InvalidMatrixLayout)?;
-        let raw_bits = commit_bits
-            .get(start..end)
-            .ok_or(Error::InvalidMatrixLayout)?
-            .to_vec();
+        if usize_to_u64(raw_bits.len())? != map_len {
+            return Err(Error::InvalidMatrixLayout);
+        }
         let quarantine_finding = commit_findings.remove(name);
         let (bits, quarantined_raw_bits) = if quarantine_finding.is_some() {
-            (vec![0; raw_bits.len()], Some(raw_bits))
+            resident_bitmap_bytes = resident_bitmap_bytes.checked_add(map_len).ok_or(
+                Error::ResourceArithmeticOverflow {
+                    resource: ReadLimitKey::MatrixBitmapBytes.resource(),
+                },
+            )?;
+            spec.read_limits
+                .check(ReadLimitKey::MatrixBitmapBytes, resident_bitmap_bytes)?;
+            (
+                Arc::new(filled_bytes(map_len, 0)?),
+                Some(Arc::new(raw_bits)),
+            )
         } else {
-            (raw_bits, None)
+            (Arc::new(raw_bits), None)
         };
         commits.push(MatrixCommitLayout {
             name: name.clone(),
@@ -1621,7 +1985,12 @@ fn layout_from_parts(
     if !commit_findings.is_empty() {
         return Err(Error::InvalidMatrixLayout);
     }
-    let mut blocks = Vec::with_capacity(spec.matrix_blocks.len());
+    let mut blocks = Vec::new();
+    try_reserve_vec(
+        &mut blocks,
+        spec.matrix_blocks.len(),
+        MATRIX_DESCRIPTOR_RESOURCE,
+    )?;
     for (block_index, block) in spec.matrix_blocks.iter().enumerate() {
         let (slot_region_offset, slot_region_len, cell_count) = *block_offsets
             .get(&block.block_id)
@@ -1634,11 +2003,13 @@ fn layout_from_parts(
             return Err(Error::InvalidMatrixLayout);
         }
         let crc_valid_len = bit_bytes(cell_count)?;
-        let crc_valid_bits_for_block = match crc_valid_bits.get(&block.block_id) {
-            Some(bits) => bits.clone(),
-            None => filled_bytes(crc_valid_len, 0)?,
+        let crc_valid_bits_for_block = match &crc {
+            Some(_) => crc_valid_bits
+                .remove(&block.block_id)
+                .ok_or(Error::InvalidMatrixLayout)?,
+            None => Vec::new(),
         };
-        if usize_to_u64(crc_valid_bits_for_block.len())? != crc_valid_len {
+        if crc.is_some() && usize_to_u64(crc_valid_bits_for_block.len())? != crc_valid_len {
             return Err(Error::InvalidMatrixLayout);
         }
         let written_bits = filled_bytes(crc_valid_len, 0xFF)?;
@@ -1660,12 +2031,16 @@ fn layout_from_parts(
                 .as_ref()
                 .map(|crc| crc.block_valid_offset(spec, block_offsets, block_index))
                 .transpose()?,
-            crc_valid_bits: crc_valid_bits_for_block,
-            written_bits,
-            current_write_bits,
+            crc_valid_bits: Arc::new(crc_valid_bits_for_block),
+            written_bits: Arc::new(written_bits),
+            current_write_bits: Arc::new(current_write_bits),
         });
     }
-    let mut aux = Vec::with_capacity(spec.matrix_aux.len());
+    if !crc_valid_bits.is_empty() {
+        return Err(Error::InvalidMatrixLayout);
+    }
+    let mut aux = Vec::new();
+    try_reserve_vec(&mut aux, spec.matrix_aux.len(), MATRIX_DESCRIPTOR_RESOURCE)?;
     for descriptor in spec.matrix_aux {
         let (offset, byte_len) = *aux_offsets
             .get(descriptor.name)
@@ -1686,6 +2061,8 @@ fn layout_from_parts(
         aux,
         crc_findings,
         append_log_start,
+        read_limits: spec.read_limits,
+        resident_bitmap_bytes,
     })
 }
 
@@ -1864,56 +2241,42 @@ fn crc_layout_from_parts(
     Ok(Some(MatrixCrcLayout {
         region_offset: region_crc_off,
         region_len: region_crc_len,
-        metadata_crc_offset: region_crc_off
-            .checked_add(8)
-            .ok_or(Error::InvalidMatrixLayout)?,
     }))
 }
 
-fn encode_crc_table(
+fn write_crc_table(
+    file: &mut File,
     spec: FormatSpec,
     commit_plans: &[CommitPlan],
     block_offsets: &HashMap<u32, (u64, u64, u64)>,
     dimension_table: &[u8],
     block_table: &[u8],
     category_table: &[u8],
-) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(MCRC_MAGIC);
-    bytes.extend_from_slice(&MCRC_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&0u16.to_le_bytes());
-    bytes.extend_from_slice(
+) -> Result<()> {
+    let mut header = [0u8; MCRC_HEADER_LEN as usize];
+    header[0..4].copy_from_slice(MCRC_MAGIC);
+    header[4..6].copy_from_slice(&MCRC_VERSION.to_le_bytes());
+    header[8..12].copy_from_slice(
         &crc32_segments(&[dimension_table, block_table, category_table])?.to_le_bytes(),
     );
-    bytes.extend_from_slice(&0u32.to_le_bytes());
+    file.write_all(&header)?;
     for (_, _, bit_count) in commit_plans {
-        bytes.extend_from_slice(&crc32_zeroes(bit_bytes(*bit_count)?)?.to_le_bytes());
+        file.write_all(&crc32_zeroes(bit_bytes(*bit_count)?)?.to_le_bytes())?;
     }
     for block in spec.matrix_blocks {
         let (_, _, cell_count) = *block_offsets
             .get(&block.block_id)
             .ok_or(Error::MatrixBlockMissing(block.block_id))?;
         let zero_crc = crc32_zeroes(block.slot_stride)?;
-        for _ in 0..cell_count {
-            bytes.extend_from_slice(&zero_crc.to_le_bytes());
-        }
+        write_repeated_u32(file, zero_crc, cell_count)?;
     }
     for block in spec.matrix_blocks {
         let (_, _, cell_count) = *block_offsets
             .get(&block.block_id)
             .ok_or(Error::MatrixBlockMissing(block.block_id))?;
-        bytes.resize(
-            bytes
-                .len()
-                .checked_add(
-                    usize::try_from(bit_bytes(cell_count)?)
-                        .map_err(|_| Error::InvalidMatrixLayout)?,
-                )
-                .ok_or(Error::InvalidMatrixLayout)?,
-            0,
-        );
+        write_zeros(file, bit_bytes(cell_count)?)?;
     }
-    Ok(bytes)
+    Ok(())
 }
 
 fn verify_crc_table(
@@ -1921,8 +2284,7 @@ fn verify_crc_table(
     crc: Option<&MatrixCrcLayout>,
     metadata_segments: &[&[u8]],
     commit_plans: &[StoredCommitPlan],
-    commit_bits: &[u8],
-    commit_map_base: u64,
+    commit_bits: &[Vec<u8>],
 ) -> Result<MatrixCrcVerification> {
     let Some(crc) = crc else {
         return Ok(MatrixCrcVerification::default());
@@ -1936,16 +2298,24 @@ fn verify_crc_table(
     if prefix_len > crc.region_len {
         return Err(Error::InvalidMatrixLayout);
     }
-    let table = read_range(file, crc.region_offset, prefix_len)?;
-    if table.len() < usize::try_from(MCRC_HEADER_LEN).map_err(|_| Error::InvalidMatrixLayout)?
-        || &table[0..4] != MCRC_MAGIC
-        || u16::from_le_bytes(table[4..6].try_into().expect("slice")) != MCRC_VERSION
+    file.seek(SeekFrom::Start(crc.region_offset))?;
+    let mut header = [0u8; MCRC_HEADER_LEN as usize];
+    file.read_exact(&mut header)?;
+    if &header[0..4] != MCRC_MAGIC
+        || u16::from_le_bytes(header[4..6].try_into().expect("slice")) != MCRC_VERSION
+        || header[6..8] != [0; 2]
+        || header[12..16] != [0; 4]
     {
         return Err(Error::InvalidMatrixLayout);
     }
 
     let mut verification = MatrixCrcVerification::default();
-    let stored_metadata = read_u32_from_table(&table, crc.metadata_crc_offset - crc.region_offset)?;
+    try_reserve_map(
+        &mut verification.commit_findings,
+        commit_plans.len(),
+        MATRIX_DESCRIPTOR_RESOURCE,
+    )?;
+    let stored_metadata = u32::from_le_bytes(header[8..12].try_into().expect("slice"));
     let actual_metadata = crc32_segments(metadata_segments)?;
     if stored_metadata != actual_metadata {
         verification.findings.push(MatrixRecoveryFinding {
@@ -1957,29 +2327,17 @@ fn verify_crc_table(
         });
     }
 
-    let commit_start = MCRC_HEADER_LEN;
-    for (index, (name, _, _, map_offset, map_len)) in commit_plans.iter().enumerate() {
-        let crc_delta = usize_to_u64(index)?
-            .checked_mul(CRC_LEN)
-            .ok_or(Error::InvalidMatrixLayout)?;
-        let stored = read_u32_from_table(
-            &table,
-            commit_start
-                .checked_add(crc_delta)
-                .ok_or(Error::InvalidMatrixLayout)?,
-        )?;
-        let relative_offset = map_offset
-            .checked_sub(commit_map_base)
-            .ok_or(Error::InvalidMatrixLayout)?;
-        let start = usize::try_from(relative_offset).map_err(|_| Error::InvalidMatrixLayout)?;
-        let end = start
-            .checked_add(usize::try_from(*map_len).map_err(|_| Error::InvalidMatrixLayout)?)
-            .ok_or(Error::InvalidMatrixLayout)?;
-        let actual = crc32_bytes(
-            commit_bits
-                .get(start..end)
-                .ok_or(Error::InvalidMatrixLayout)?,
-        )?;
+    if commit_bits.len() != commit_plans.len() {
+        return Err(Error::InvalidMatrixLayout);
+    }
+    for (index, ((name, _, _, _, map_len), bits)) in
+        commit_plans.iter().zip(commit_bits).enumerate()
+    {
+        if usize_to_u64(bits.len())? != *map_len {
+            return Err(Error::InvalidMatrixLayout);
+        }
+        let stored = read_crc_at(file, crc.commit_crc_offset(usize_to_u64(index)?)?)?;
+        let actual = crc32_bytes(bits)?;
         if stored != actual {
             let finding = MatrixRecoveryFinding {
                 kind: MatrixCorruptionKind::CommitMap,
@@ -2004,6 +2362,11 @@ fn read_crc_valid_bits(
         return Ok(HashMap::new());
     };
     let mut valid_bits = HashMap::new();
+    try_reserve_map(
+        &mut valid_bits,
+        spec.matrix_blocks.len(),
+        ReadLimitKey::MatrixCrcBytes.resource(),
+    )?;
     for (block_index, block) in spec.matrix_blocks.iter().enumerate() {
         let (_, _, cell_count) = *block_offsets
             .get(&block.block_id)
@@ -2011,7 +2374,12 @@ fn read_crc_valid_bits(
         let offset = crc.block_valid_offset(spec, block_offsets, block_index)?;
         valid_bits.insert(
             block.block_id,
-            read_range(file, offset, bit_bytes(cell_count)?)?,
+            read_range(
+                file,
+                offset,
+                bit_bytes(cell_count)?,
+                ReadLimitKey::MatrixCrcBytes.resource(),
+            )?,
         );
     }
     Ok(valid_bits)
@@ -2076,7 +2444,11 @@ fn read_header(file: &mut File, header_len: u64) -> Result<MatrixHeaderFields> {
     }
     let version = u16::from_le_bytes(bytes[4..6].try_into().expect("slice"));
     let header_len = u32::from_le_bytes(bytes[8..12].try_into().expect("slice"));
-    if version != VMAT_VERSION || header_len != VMAT_HEADER_LEN {
+    if version != VMAT_VERSION
+        || header_len != VMAT_HEADER_LEN
+        || bytes[6..8] != [0; 2]
+        || bytes[128..160] != [0; 32]
+    {
         return Err(Error::InvalidMatrixLayout);
     }
     let mut pos = 12;
@@ -2113,11 +2485,18 @@ fn read_header(file: &mut File, header_len: u64) -> Result<MatrixHeaderFields> {
     })
 }
 
-fn encode_dimension_table(dimensions: &[MatrixDimensionValue]) -> Result<Vec<u8>> {
+fn encode_dimension_table(
+    dimensions: &[MatrixDimensionValue],
+    expected_len: u64,
+) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
+    try_reserve_bytes(&mut bytes, expected_len, MATRIX_DESCRIPTOR_RESOURCE)?;
     for dimension in dimensions {
         write_name(&mut bytes, &dimension.name)?;
         bytes.extend_from_slice(&dimension.value.to_le_bytes());
+    }
+    if usize_to_u64(bytes.len())? != expected_len {
+        return Err(Error::InvalidMatrixLayout);
     }
     Ok(bytes)
 }
@@ -2125,6 +2504,11 @@ fn encode_dimension_table(dimensions: &[MatrixDimensionValue]) -> Result<Vec<u8>
 fn decode_dimension_table(bytes: &[u8], count: u32) -> Result<Vec<MatrixDimensionValue>> {
     let mut cursor = Cursor::new(bytes);
     let mut dimensions = Vec::new();
+    try_reserve_vec(
+        &mut dimensions,
+        usize::try_from(count).map_err(|_| Error::InvalidMatrixLayout)?,
+        MATRIX_DESCRIPTOR_RESOURCE,
+    )?;
     for _ in 0..count {
         let name = cursor.read_name()?;
         let value = cursor.read_u64()?;
@@ -2143,6 +2527,12 @@ fn encode_block_table(
     block_offsets: &HashMap<u32, (u64, u64, u64)>,
 ) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
+    let expected_len = usize_to_u64(spec.matrix_blocks.len())?
+        .checked_mul(44)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: MATRIX_DESCRIPTOR_RESOURCE,
+        })?;
+    try_reserve_bytes(&mut bytes, expected_len, MATRIX_DESCRIPTOR_RESOURCE)?;
     for block in spec.matrix_blocks {
         let descriptor = spec
             .block(block.block_id)
@@ -2171,6 +2561,9 @@ fn encode_block_table(
         bytes.extend_from_slice(&slot_region_off.to_le_bytes());
         bytes.extend_from_slice(&slot_region_len.to_le_bytes());
     }
+    if usize_to_u64(bytes.len())? != expected_len {
+        return Err(Error::InvalidMatrixLayout);
+    }
     Ok(bytes)
 }
 
@@ -2192,6 +2585,7 @@ fn decode_block_table(
         return Err(Error::InvalidMatrixLayout);
     }
     let mut offsets = HashMap::new();
+    try_reserve_map(&mut offsets, count_usize, MATRIX_DESCRIPTOR_RESOURCE)?;
     let mut cursor = Cursor::new(bytes);
     let (slot_region_base, slot_region_len) = slot_region;
     let mut next_slot_offset = slot_region_base;
@@ -2269,6 +2663,17 @@ fn encode_category_table(
     offsets: &HashMap<String, (u64, u64)>,
 ) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
+    let expected_len = commits.iter().try_fold(0u64, |len, (name, _, _)| {
+        len.checked_add(usize_to_u64(name.len())?.checked_add(30).ok_or(
+            Error::ResourceArithmeticOverflow {
+                resource: MATRIX_DESCRIPTOR_RESOURCE,
+            },
+        )?)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: MATRIX_DESCRIPTOR_RESOURCE,
+        })
+    })?;
+    try_reserve_bytes(&mut bytes, expected_len, MATRIX_DESCRIPTOR_RESOURCE)?;
     for (name, kind, bit_count) in commits {
         let (map_off, map_len) = *offsets
             .get(name)
@@ -2280,16 +2685,26 @@ fn encode_category_table(
         bytes.extend_from_slice(&map_off.to_le_bytes());
         bytes.extend_from_slice(&map_len.to_le_bytes());
     }
+    if usize_to_u64(bytes.len())? != expected_len {
+        return Err(Error::InvalidMatrixLayout);
+    }
     Ok(bytes)
 }
 
 fn decode_category_table(bytes: &[u8], count: u32) -> Result<Vec<StoredCommitPlan>> {
     let mut cursor = Cursor::new(bytes);
     let mut commits = Vec::new();
+    try_reserve_vec(
+        &mut commits,
+        usize::try_from(count).map_err(|_| Error::InvalidMatrixLayout)?,
+        MATRIX_DESCRIPTOR_RESOURCE,
+    )?;
     for _ in 0..count {
         let name = cursor.read_name()?;
         let kind = commit_kind_from_byte(cursor.read_u8()?)?;
-        cursor.read_exact(3)?;
+        if cursor.read_exact(3)? != [0; 3] {
+            return Err(Error::InvalidMatrixLayout);
+        }
         let bit_count = cursor.read_u64()?;
         let map_off = cursor.read_u64()?;
         let map_len = cursor.read_u64()?;
@@ -2361,7 +2776,8 @@ fn validate_commit_table(
     if stored.len() != expected.len() {
         return Err(Error::InvalidMatrixLayout);
     }
-    let mut offsets = HashMap::with_capacity(expected.len());
+    let mut offsets = HashMap::new();
+    try_reserve_map(&mut offsets, expected.len(), MATRIX_DESCRIPTOR_RESOURCE)?;
     let mut next_offset = commit_map_base;
     for ((expected_name, expected_kind, expected_bits), actual) in expected.iter().zip(stored) {
         let expected_map_len = bit_bytes(*expected_bits)?;
@@ -2390,6 +2806,24 @@ fn validate_commit_table(
         return Err(Error::InvalidMatrixLayout);
     }
     Ok(offsets)
+}
+
+fn read_commit_bitmaps(file: &mut File, commits: &[StoredCommitPlan]) -> Result<Vec<Vec<u8>>> {
+    let mut bitmaps = Vec::new();
+    try_reserve_vec(
+        &mut bitmaps,
+        commits.len(),
+        ReadLimitKey::MatrixBitmapBytes.resource(),
+    )?;
+    for (_, _, _, map_offset, map_len) in commits {
+        bitmaps.push(read_range(
+            file,
+            *map_offset,
+            *map_len,
+            ReadLimitKey::MatrixBitmapBytes.resource(),
+        )?);
+    }
+    Ok(bitmaps)
 }
 
 fn validate_layout_ranges(
@@ -2445,17 +2879,73 @@ fn validate_range(offset: u64, len: u64, file_len: u64) -> Result<u64> {
     Ok(end)
 }
 
-fn read_range(file: &mut File, offset: u64, len: u64) -> Result<Vec<u8>> {
-    let len = usize::try_from(len).map_err(|_| Error::InvalidMatrixLayout)?;
+fn read_range(file: &mut File, offset: u64, len: u64, resource: &'static str) -> Result<Vec<u8>> {
     file.seek(SeekFrom::Start(offset))?;
-    let mut bytes = vec![0; len];
+    let mut bytes = filled_bytes_for(len, 0, resource)?;
     file.read_exact(&mut bytes)?;
     Ok(bytes)
 }
 
 fn filled_bytes(len: u64, value: u8) -> Result<Vec<u8>> {
-    let len = usize::try_from(len).map_err(|_| Error::InvalidMatrixLayout)?;
-    Ok(vec![value; len])
+    filled_bytes_for(len, value, MATRIX_BYTES_RESOURCE)
+}
+
+fn filled_bytes_for(len: u64, value: u8, resource: &'static str) -> Result<Vec<u8>> {
+    let len_usize = usize::try_from(len).map_err(|_| Error::LengthOverflow { value: len })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len_usize)
+        .map_err(|_| Error::AllocationFailed {
+            resource,
+            requested: len,
+        })?;
+    bytes.resize(len_usize, value);
+    Ok(bytes)
+}
+
+fn try_reserve_bytes(bytes: &mut Vec<u8>, requested: u64, resource: &'static str) -> Result<()> {
+    let requested_usize =
+        usize::try_from(requested).map_err(|_| Error::LengthOverflow { value: requested })?;
+    bytes
+        .try_reserve_exact(requested_usize)
+        .map_err(|_| Error::AllocationFailed {
+            resource,
+            requested,
+        })
+}
+
+fn try_reserve_vec<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    resource: &'static str,
+) -> Result<()> {
+    let requested = additional
+        .checked_mul(std::mem::size_of::<T>().max(1))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(Error::ResourceArithmeticOverflow { resource })?;
+    values
+        .try_reserve_exact(additional)
+        .map_err(|_| Error::AllocationFailed {
+            resource,
+            requested,
+        })
+}
+
+fn try_reserve_map<K: Eq + std::hash::Hash, V>(
+    values: &mut HashMap<K, V>,
+    additional: usize,
+    resource: &'static str,
+) -> Result<()> {
+    let requested = additional
+        .checked_mul(std::mem::size_of::<(K, V)>().max(1))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(Error::ResourceArithmeticOverflow { resource })?;
+    values
+        .try_reserve(additional)
+        .map_err(|_| Error::AllocationFailed {
+            resource,
+            requested,
+        })
 }
 
 fn usize_to_u64(value: usize) -> Result<u64> {
@@ -2482,13 +2972,6 @@ fn indexed_crc_offset(crc_offset: u64, ordinal: u64) -> Result<u64> {
         .ok_or(Error::InvalidMatrixLayout)
 }
 
-fn read_u32_from_table(table: &[u8], offset: u64) -> Result<u32> {
-    let offset = usize::try_from(offset).map_err(|_| Error::InvalidMatrixLayout)?;
-    let end = offset.checked_add(4).ok_or(Error::InvalidMatrixLayout)?;
-    let bytes = table.get(offset..end).ok_or(Error::InvalidMatrixLayout)?;
-    Ok(u32::from_le_bytes(bytes.try_into().expect("slice")))
-}
-
 #[cfg(feature = "integrity")]
 fn crc32_bytes(bytes: &[u8]) -> Result<u32> {
     Ok(crc32fast::hash(bytes))
@@ -2496,6 +2979,24 @@ fn crc32_bytes(bytes: &[u8]) -> Result<u32> {
 
 #[cfg(not(feature = "integrity"))]
 fn crc32_bytes(_bytes: &[u8]) -> Result<u32> {
+    Err(Error::IntegrityFeatureDisabled)
+}
+
+#[cfg(feature = "integrity")]
+fn crc32_bytes_with_replacement(bytes: &[u8], index: usize, value: u8) -> Result<u32> {
+    let suffix = index.checked_add(1).ok_or(Error::InvalidMatrixLayout)?;
+    if suffix > bytes.len() {
+        return Err(Error::InvalidMatrixLayout);
+    }
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&bytes[..index]);
+    hasher.update(&[value]);
+    hasher.update(&bytes[suffix..]);
+    Ok(hasher.finalize())
+}
+
+#[cfg(not(feature = "integrity"))]
+fn crc32_bytes_with_replacement(_bytes: &[u8], _index: usize, _value: u8) -> Result<u32> {
     Err(Error::IntegrityFeatureDisabled)
 }
 
@@ -2538,6 +3039,26 @@ fn write_zeros(file: &mut File, len: u64) -> Result<()> {
         let chunk = remaining.min(ZERO_CHUNK.len() as u64);
         file.write_all(&ZERO_CHUNK[..chunk as usize])?;
         remaining -= chunk;
+    }
+    Ok(())
+}
+
+fn write_repeated_u32(file: &mut File, value: u32, count: u64) -> Result<()> {
+    const ENTRIES_PER_CHUNK: usize = 2048;
+    let value = value.to_le_bytes();
+    let mut chunk = [0u8; ENTRIES_PER_CHUNK * 4];
+    for entry in chunk.chunks_exact_mut(4) {
+        entry.copy_from_slice(&value);
+    }
+    let mut remaining = count;
+    while remaining > 0 {
+        let entries = remaining.min(ENTRIES_PER_CHUNK as u64);
+        let bytes = usize::try_from(entries)
+            .map_err(|_| Error::InvalidMatrixLayout)?
+            .checked_mul(4)
+            .ok_or(Error::InvalidMatrixLayout)?;
+        file.write_all(&chunk[..bytes])?;
+        remaining -= entries;
     }
     Ok(())
 }
@@ -2643,6 +3164,75 @@ impl<'a> Cursor<'a> {
     fn read_name(&mut self) -> Result<String> {
         let len = self.read_u16()? as usize;
         let bytes = self.read_exact(len)?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidMatrixLayout)
+        let mut owned = Vec::new();
+        try_reserve_vec(&mut owned, len, MATRIX_DESCRIPTOR_RESOURCE)?;
+        owned.extend_from_slice(bytes);
+        String::from_utf8(owned).map_err(|_| Error::InvalidMatrixLayout)
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    fn sidecar_spec(limits: ReadLimits) -> FormatSpec {
+        FormatSpec::new(
+            b"SIDE",
+            1,
+            crate::Endian::Little,
+            0,
+            crate::IndexPolicy::ScanOnOpen,
+            IntegrityPolicy::None,
+            crate::RecoveryPolicy::Strict,
+            crate::ManifestPolicy::None,
+            &[],
+        )
+        .with_read_limits(limits)
+    }
+
+    #[test]
+    fn sidecar_plan_checks_exact_lengths_limits_and_reserved_fields() {
+        let spec = sidecar_spec(ReadLimits::finite_all(100));
+        let plan = matrix_sidecar_read_plan(spec, 60, 48, 4, 4, 4, 0, 0, 0).unwrap();
+        assert_eq!(
+            plan,
+            MatrixSidecarReadPlan {
+                format_magic_offset: 48,
+                category_offset: 52,
+                payload_offset: 56,
+                payload_len: 4,
+                total_len: 60,
+            }
+        );
+
+        assert!(matches!(
+            matrix_sidecar_read_plan(spec, 61, 48, 4, 4, 4, 0, 0, 0),
+            Err(Error::InvalidMatrixSidecar)
+        ));
+        assert!(matches!(
+            matrix_sidecar_read_plan(spec, 60, 48, 4, 4, 4, 1, 0, 0),
+            Err(Error::InvalidMatrixSidecar)
+        ));
+
+        let sidecar_limited = sidecar_spec(ReadLimits::finite_all(100).with_max_sidecar_len(59));
+        assert!(matches!(
+            matrix_sidecar_read_plan(sidecar_limited, 60, 48, 4, 4, 4, 0, 0, 0),
+            Err(Error::LimitExceeded {
+                resource: "sidecar length",
+                actual: 60,
+                limit: 59,
+            })
+        ));
+
+        let payload_limited =
+            sidecar_spec(ReadLimits::finite_all(100).with_max_materialized_bytes(3));
+        assert!(matches!(
+            matrix_sidecar_read_plan(payload_limited, 60, 48, 4, 4, 4, 0, 0, 0),
+            Err(Error::LimitExceeded {
+                resource: "materialized bytes",
+                actual: 4,
+                limit: 3,
+            })
+        ));
     }
 }

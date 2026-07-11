@@ -20,6 +20,15 @@ varve_format! {
     pub format AppFormat {
         magic: b"APPDATA";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+        }
         endian: little;
         schema_hash: computed;
         extension: "vrv";
@@ -50,6 +59,14 @@ when enabled, and offset-chain footers are handled by the generated code and
 runtime writer. Application code should not hand-build Varve record headers or
 offset chains in normal use.
 
+The `limits` block is part of the runtime safety contract, not the wire schema.
+Choose ceilings from the largest legitimate dataset the application accepts,
+including cumulative materialization rather than only one record. Runtime code
+may pass a tighter `ReadLimits` value to generated `*_with_limits` methods. Do
+not use `limits: trusted_unbounded;` for files supplied by users, networks, or
+other processes; that policy is reached only through visibly named trusted
+open methods.
+
 Choose `fixed` for records whose canonical encoded payload size should stay
 stable. Fixed blocks still use Varve's canonical field codec, not Rust memory
 layout. Choose `variable` for evolvable records. Variable fields are encoded as
@@ -70,6 +87,18 @@ varve_format! {
     pub format AnalysisFormat {
         magic: b"ANALYSIS";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            record_payload: 67_108_864;
+            materialized_bytes: 268_435_456;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+        }
         schema_hash: computed;
 
         dims {
@@ -142,6 +171,15 @@ varve_format! {
     pub struct AppFormat {
         magic: b"APPDATA";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+        }
         endian: little;
         index: checkpoint_on_flush;
         manifest: embedded;
@@ -153,7 +191,7 @@ varve_format! {
 ## Register A Format
 
 `varve_format!` pins the file contract: magic bytes, format version, endian,
-optional schema hash, optional extension, optional integrity, optional commit
+required resource limits, optional schema hash, optional extension, optional integrity, optional commit
 policy, optional checkpoint/offset-chain index, optional recovery policy,
 optional embedded manifest, optional variable-block compression, and registered
 blocks.
@@ -194,6 +232,15 @@ varve_format! {
     pub struct CompressedFormat {
         magic: b"APPDATA";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+        }
         endian: little;
         extension: "vrv";
         compression: variable_blocks(
@@ -341,6 +388,13 @@ varve_format! {
     pub format PhysicalFormat {
         magic: b"PHYS";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            scan_bytes: 8_589_934_592;
+            segments: 4_000_000;
+            index_bytes: 536_870_912;
+            record_payload: 268_435_456;
+        }
         schema_hash: computed;
         preset: none;
 

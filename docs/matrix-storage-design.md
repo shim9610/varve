@@ -30,6 +30,18 @@ varve_format! {
     pub format AnalysisFormat {
         magic: b"ANALYSIS";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            record_payload: 67_108_864;
+            materialized_bytes: 268_435_456;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+        }
         endian: little;
         schema_hash: computed;
         extension: "vrv";

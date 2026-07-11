@@ -24,6 +24,15 @@ varve_format! {
     pub format AppFormat {
         magic: b"APPDATA";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+        }
         endian: little;
         schema_hash: computed;
         extension: "vrv";
@@ -57,6 +66,7 @@ scan, and decode files.
 | --- | --- | --- |
 | `magic` | User file signature bytes. | Required. Native files start with these bytes before the Varve container marker. Custom `preset: none` layouts use their declared physical bytes instead. |
 | `version` | Format version. | Required. This is the whole-format version, not the per-block version. |
+| `limits` | Hostile-input resource ceilings or explicit `trusted_unbounded`. | Required. Finite keys are runtime policy and do not change schema hashes or wire bytes. |
 | `endian` | `little` or `big`. | Optional in simple cases, but recommended. Block override wins over format endian; otherwise little-endian is the default. |
 | `schema_hash` | `computed` or a literal integer. | `computed` hashes the declared policies, blocks, fields, and custom layout descriptors. Pin a literal after release if you want exact schema locking. |
 | `extension` | Recommended extension metadata. | Informational and embedded in manifests when enabled. It does not rename files. |
@@ -70,6 +80,45 @@ scan, and decode files.
 | `dims`, `aux`, `matrix` blocks | Matrix storage declarations. | Used for bounded direct-addressed grids, not append-log records. |
 | `layout` | Custom physical file layout. | Used for external formats with custom segment framing. |
 
+## Read Limits
+
+Every declaration must select a resource policy. Ordinary generated open APIs
+accept only finite values for the storage surfaces they use. A finite policy is
+written as a `limits { ... }` block; unknown and duplicate keys are compile
+errors. The macro also rejects a missing key that is required by the declared
+native, custom-layout, or matrix preset.
+
+| DSL key | Runtime ceiling |
+| --- | --- |
+| `file_len`, `scan_bytes` | snapshot file length and bytes advanced by one scan |
+| `records`, `index_bytes` | native record count and resident index storage |
+| `record_payload`, `logical_payload` | stored and decoded size of one payload |
+| `materialized_bytes` | cumulative bytes decoded by one lookup, merge, compact, migration, or diagnostic operation |
+| `segments` | custom-layout segment count |
+| `matrix_dimension`, `matrix_cells` | one dimension and checked derived cell count |
+| `matrix_bitmap`, `matrix_crc`, `matrix_metadata`, `matrix_slot_region` | matrix allocation and physical-region ceilings |
+| `sidecar` | complete matrix sidecar size |
+| `mmap` | bytes owned by one mmap handle |
+
+Runtime limits can only tighten declaration limits:
+
+```rust
+use varve::ReadLimits;
+
+let tighter = ReadLimits::missing()
+    .with_max_file_len(512 * 1024 * 1024)
+    .with_max_records(100_000);
+let reader = AppFormat::open_reader_with_limits("data.vrv", tighter)?;
+# Ok::<(), varve::Error>(())
+```
+
+`Missing`, `Finite(u64)`, and `TrustedUnbounded` are distinct states, and zero
+is a valid finite ceiling. `limits: trusted_unbounded;` is reserved for inputs
+whose provenance is already trusted. Such a declaration still requires a
+visibly named `*_trusted_unbounded` open method; an ordinary method never
+silently selects that path. Finite fields supplied alongside a trusted policy
+remain enforced.
+
 ## What The Macro Generates
 
 For the `AppFormat` declaration above, the macro generates:
@@ -82,6 +131,8 @@ For the `AppFormat` declaration above, the macro generates:
 | `impl VarveKeyedBlock for User` | Key extraction because `key = [id]` was declared. |
 | `AppFormat` | Zero-sized namespace for the format. |
 | `AppFormat::spec()` | Static runtime `FormatSpec`. |
+| `open_*_with_limits` | Typed open with field-wise runtime tightening. |
+| `open_*_trusted_unbounded` | Explicit trusted-input boundary; finite fields remain active. |
 | `AppFormatWriter` and `AppFormatReader` | Typed wrappers over `VarveWriter` and `VarveReader`. |
 | `AppFormatWrite` and `AppFormatRead` | Generated typed traits for the format methods. |
 | `push_point`, `push_user` | Typed append methods. |
@@ -114,11 +165,13 @@ Use fixed blocks for:
 
 - small stable records;
 - records where all fields are always present;
-- in-place replacement, when the replacement encodes to the same payload size.
+- copy-on-write replacement, when the replacement encodes to the same payload
+  size and already-open readers must retain their snapshots.
 
 Important detail: if you put variable-length field types in a fixed block,
 Varve will still use canonical encoding. Same-size replacement may fail because
-the encoded payload size can change.
+the encoded payload size can change. The separately named unsafe exclusive API
+is the only append-log path that overwrites the existing generation in place.
 
 ### Variable Blocks
 
@@ -186,6 +239,15 @@ varve_format! {
     pub struct AppFormat {
         magic: b"APPDATA";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+        }
         endian: little;
         blocks: [User];
     }
@@ -252,6 +314,11 @@ Physical APIs such as `scan()`, `RecordIndexEntry::read_payload`, and mmap
 payload windows expose stored physical bytes. Typed collections expose logical
 decoded values.
 
+The path-taking `RecordIndexEntry` convenience methods are explicitly
+non-snapshot and reopen the current pathname. Use their limited variants only
+for low-level tools that establish entry provenance, and use generated readers
+or typed collections when snapshot identity is required.
+
 When the file uses `VARVE3`, each visible user record can have a 32-byte footer:
 
 | Footer field | Meaning |
@@ -306,6 +373,13 @@ let latest_for_id_7 = users.get(&7)?;
 
 Readers do not live-tail a writer. Open a new reader when you need a later
 committed snapshot.
+
+For append logs, snapshot means the originally opened file object plus the
+validated logical EOF. Renaming or replacing the pathname does not rebind lazy
+reads. It is not a byte copy or an OS write lease: a process that can mutate the
+same underlying object can still change bytes in place. Coordinate all writers
+and enable `crc32` or `crc32_with_header` when covered-byte corruption must be
+detected.
 
 Writers are single-writer per file. Varve uses a sidecar lock file by default.
 Stale lock breaking is explicit; normal create/open/recover paths refuse an
@@ -426,6 +500,18 @@ varve_format! {
     pub format AnalysisFormat {
         magic: b"ANALYSIS";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            record_payload: 67_108_864;
+            materialized_bytes: 268_435_456;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+        }
         schema_hash: computed;
 
         dims {
@@ -469,6 +555,13 @@ varve_format! {
     pub format FramedFormat {
         magic: b"FRAM";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            scan_bytes: 8_589_934_592;
+            segments: 4_000_000;
+            index_bytes: 536_870_912;
+            record_payload: 268_435_456;
+        }
         schema_hash: computed;
         extension: "frame";
         preset: none;
@@ -577,6 +670,7 @@ invariant.
 
 ## Current Stability
 
-Varve is alpha software before the first pinned v0.1 release. The design goal
-is wire-format stability after v0.1. Until then, treat native bytes as
-pre-stabilization and keep migration tests around any data you care about.
+Varve 0.2 remains alpha software at the Rust API layer. Valid native 0.1 wire
+bytes remain readable, and incompatible future wire changes require an explicit
+migration path. Keep representative byte fixtures and migration tests around
+data that matters even when a release promises wire compatibility.
