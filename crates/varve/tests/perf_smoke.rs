@@ -7,8 +7,8 @@ use varve::{
     BinaryCursor, BinaryWriter, BlockDescriptor, BlockKind, ChunkEntry, ChunkIndexBuilder,
     ChunkLayout, Endian, FormatSpec, IndexPolicy, LayoutSegmentInfo, MatrixAuxDescriptor,
     MatrixBlockDescriptor, MatrixCommitDescriptor, MatrixCommitKind, MatrixDimensionDescriptor,
-    MatrixDimensions, MatrixKey, RecoveryPolicy, SegmentReducer, SegmentWrite, VarveBlock,
-    VarveDecode, VarveEncode, VarveMatrixBlock, VarveMerge, compact_keyed_file,
+    MatrixDimensions, MatrixKey, ReadLimits, RecoveryPolicy, SegmentReducer, SegmentWrite,
+    VarveBlock, VarveDecode, VarveEncode, VarveMatrixBlock, VarveMerge, compact_keyed_file,
     compact_keyed_files, merge_keyed_files, reduce_segments_by_ref, varve_format,
 };
 
@@ -108,6 +108,24 @@ varve_format! {
     pub struct PerfFormat {
         magic: b"PERFSMK";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         blocks: [PerfPoint, PerfRawPoint, PerfUser, PerfUserOp];
     }
@@ -164,12 +182,31 @@ fn perf_matrix_spec_with_integrity(integrity: varve::IntegrityPolicy) -> FormatS
         BLOCKS,
     )
     .with_matrix_spec(DIMS, COMMITS, MATRIX_BLOCKS)
+    .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }
 
 varve_format! {
     pub struct PerfCheckpointFormat {
         magic: b"PERFCHK";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         index: checkpoint_on_flush;
         blocks: [PerfPoint];
@@ -180,6 +217,24 @@ varve_format! {
     pub format PerfVarve3Format {
         magic: b"PERFV3";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         index: [scan_on_open, block_offset_chain, keyed_offset_chain];
         commit: transaction_marker(on_flush);
@@ -197,6 +252,24 @@ varve_format! {
     pub format PerfPhysicalLayoutFormat {
         magic: b"PERFPHY";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: computed;
         preset: none;
@@ -232,6 +305,24 @@ varve_format! {
     pub struct PerfCompressedFormat {
         magic: b"PERFCMP";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         compression: variable_blocks(
             zstd,
@@ -467,7 +558,8 @@ fn mmap_payload_window_scan(case: PerfCase) -> varve::Result<()> {
 
     let elapsed = timed(|| {
         let file = PerfFormat::open_readonly(&path)?;
-        let mmap = file.mmap_payloads()?;
+        // SAFETY: The benchmark does not mutate the fixture while mapped.
+        let mmap = unsafe { file.mmap_payloads()? };
         assert_eq!(mmap.len(), case.records);
 
         let mut total_len = 0usize;
@@ -507,7 +599,8 @@ fn zero_copy_raw_fixed_reads(case: PerfCase) -> varve::Result<()> {
 
     let elapsed = timed(|| {
         let file = PerfFormat::open_readonly(&path)?;
-        let mmap = file.mmap_payloads()?;
+        // SAFETY: The benchmark does not mutate the fixture while mapped.
+        let mmap = unsafe { file.mmap_payloads()? };
         for index in 0..case.records {
             let Some(point) = unsafe { mmap.raw_fixed::<PerfRawPoint>(index) }? else {
                 panic!("missing raw fixed block at index {index}");
@@ -897,7 +990,8 @@ fn matrix_direct_access_with_spec(
     {
         let elapsed = timed(|| {
             let reader = spec.open_reader(&path)?;
-            let mmap = reader.mmap_matrix()?;
+            // SAFETY: The benchmark does not mutate the fixture while mapped.
+            let mmap = unsafe { reader.mmap_matrix()? };
             for index in 0..case.records {
                 let key = MatrixKey::new((index / channels) as u64, (index % channels) as u64);
                 let payload = mmap.cell_payload_window::<PerfMatrixCell>(key)?;
@@ -917,7 +1011,8 @@ fn matrix_direct_access_with_spec(
 
         let elapsed = timed(|| {
             let reader = spec.open_reader(&path)?;
-            let mmap = reader.mmap_matrix()?;
+            // SAFETY: The benchmark does not mutate the fixture while mapped.
+            let mmap = unsafe { reader.mmap_matrix()? };
             for index in 0..case.records {
                 let key = MatrixKey::new((index / channels) as u64, (index % channels) as u64);
                 let value = mmap.cell_numeric::<PerfMatrixCell, u32>(key)?;

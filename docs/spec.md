@@ -1,4 +1,4 @@
-# Varve v0.1 Implementation Spec
+# Varve 0.2 Implementation Spec
 
 ## Goal
 
@@ -88,7 +88,7 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 ## Runtime Policy
 
 - Writer model is single-writer per file, enforced with a sidecar lock file.
-- Reader model is snapshot-on-open; live tailing is out of scope for v0.1.
+- Reader model is snapshot-on-open; live tailing is out of scope for 0.2.
 - `FormatSpec::create_layout_writer`,
   `FormatSpec::create_layout_writer_with_header`, and
   `FormatSpec::open_layout_writer`, and `FormatSpec::open_layout_reader` are
@@ -117,9 +117,13 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 
 ## Update And Merge
 
-- `replace_fixed` allows in-place replacement only when encoded payload size is unchanged.
+- `replace_fixed` performs snapshot-preserving copy-on-write replacement and
+  requires an unchanged encoded payload size.
 - `replace_rewrite` rewrites through a completed temporary file and atomically replaces the original file path.
-- `replace(index, block, ReplaceStrategy)` is the policy-facing wrapper over fixed in-place replacement and full-file rewrite replacement.
+- `replace(index, block, ReplaceStrategy)` is the policy-facing wrapper over
+  fixed copy-on-write replacement and full-file rewrite replacement.
+- `unsafe replace_fixed_in_place_exclusive` is the explicitly unsafe expert
+  path for coordinated callers that exclude all overlapping readers/writers.
 - Keyed deletes use a common internal tombstone record.
 - Keyed ops use user-defined `VarveMerge::Op`.
 - Merge conflict ordering is shard order, then local sequence, then record ordinal; later delta shards win over base.
@@ -131,10 +135,12 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 
 - Scalar, option, fixed array, selected vector, tuple, `BTreeMap`, and `HashMap` codecs are canonical and endian-aware.
 - `BTreeMap<K, V>` encodes in native sorted key order.
-- `HashMap<K, V>` encodes keys in sorted order, requiring `K: Ord + Clone`, so equivalent maps produce stable bytes independent of insertion or hash iteration order.
+- `HashMap<K, V>` encodes borrowed entries in sorted key order, requiring
+  `K: Ord` but not `Clone`, so equivalent maps produce stable bytes independent
+  of insertion or hash iteration order.
 - Decoding `HashMap<K, V>` preserves values but not insertion order.
 - Custom field codecs are supported by implementing `VarveEncode` and `VarveDecode` for the field type. The derive macro uses the type's `WIRE_TYPE` in field descriptors and manifests.
-- Enum-like values should use explicit custom codecs in v0.1; automatic enum representation inference is out of scope.
+- Enum-like values should use explicit custom codecs in 0.2; automatic enum representation inference is out of scope.
 - Length and count limits are format-author policy. Varve's built-in decoders
   avoid large allocation-before-validation patterns where the remaining bytes
   can be checked generically, but domain-specific maximum string, sequence,
@@ -142,6 +148,13 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   codecs, compression policy, adapter, or caller validation.
 - `ChunkedBytes::decode_to_vec_limited(limit)` is provided for callers that
   need an explicit decompressed-size ceiling.
+- `RecordIndexEntry::read_payload_limited(path, limit)` validates the stored
+  extent and caller byte ceiling before allocation.
+- `RecordIndexEntry::read_logical_payload_limited(spec, path, physical_limit,
+  logical_limit)` applies both caller ceilings before allocating the complete
+  stored payload or decompressed logical payload.
+- Boolean decoders accept only canonical bytes `0` and `1`. Map decoders reject
+  duplicate destination keys before decoding a duplicate value.
 
 ## Macro Contract
 
@@ -151,7 +164,13 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Duplicate key fields, missing key fields, duplicate block ids, and reserved block ids fail at compile time where macro input makes that possible.
 - `varve_format!` supports the legacy registry form `pub struct Format { blocks: [A, B]; }` and the format-first form `pub format Format { blocks { fixed A(...) { ... } } }`.
 - In format-first form, block structs, `VarveBlock` implementations, typed reader/writer wrappers, and typed read/write traits are generated from the format declaration.
-- `varve_format!` supports `magic`, `version`, `endian`, optional `schema_hash`, optional `commit`, optional `integrity`, optional `index`, optional `recovery`, optional `manifest`, and `blocks`.
+- `varve_format!` supports `magic`, `version`, required `limits`, `endian`, optional `schema_hash`, optional `commit`, optional `integrity`, optional `index`, optional `recovery`, optional `manifest`, and `blocks`.
+- `limits { ... }` declares finite hostile-input ceilings. Unknown and
+  duplicate keys are compile errors, as are missing keys required by the
+  selected native, custom-layout, or matrix surface. The explicit alternative
+  is `limits: trusted_unbounded;`, usable only through generated methods whose
+  names include `trusted_unbounded`. Limits do not affect wire bytes, schema
+  hashes, or manifests; runtime `ReadLimits` can only tighten them.
 - `integrity` accepts `none`, `crc32`, or `crc32_with_header`. `crc32`
   covers payload plus native record footer when present. `crc32_with_header`
   additionally covers the native 32-byte record header with the checksum field
@@ -192,10 +211,10 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   `commit_durable()` writes commit-covered metadata/checkpoints, flushes and
   syncs data, writes the marker, then syncs the marker.
 - `varve_format!` also supports optional `extension` and global `compression`. Compression syntax is `compression: none;` or `compression: variable_blocks(zstd, level = default|fast|best|N, header = record_explicit|file_explicit|format_contract, min_len = N, only_if_smaller = true|false, max_len = N);`.
-- Per-block compression overrides are a runtime `FormatSpec::with_block_compression` API in v0.1, not a macro DSL clause.
+- Per-block compression overrides are a runtime `FormatSpec::with_block_compression` API in 0.2, not a macro DSL clause.
 - Legacy registry formats expose raw `VarveReader`/`VarveWriter` handles. Format-first declarations expose typed `FormatReader`/`FormatWriter` wrappers where methods such as `push_user`, `delete_user`, `users`, `commit`, `commit_durable`, `flush`, and `sync` are generated from block declarations.
 - Duplicate top-level `varve_format!` keys are compile errors. The derive
-  macro rejects generic block structs in v0.1 with a direct diagnostic; use a
+  macro rejects generic block structs in 0.2 with a direct diagnostic; use a
   concrete block type or manual trait implementations.
 - The derive macro emits `VarveBlock::FIELDS`, including field id, field name, wire type, and required/defaulted presence.
 - `#[varve(default)]` is variable-block-only. Fixed blocks are positional canonical payloads and cannot omit fields.
@@ -375,9 +394,13 @@ CRC integrity is a corruption-detection aid, not an authenticity or tamper-proof
 
 ### Compact And Replace
 
-- `replace_fixed` remains same-size in-place only.
+- `replace_fixed` performs a same-size, snapshot-preserving copy-on-write
+  publication.
 - `replace_rewrite` is explicit full-file rewrite for direct replacement.
-- `replace(index, block, ReplaceStrategy::{FixedInPlace, RewriteFile})` exposes the policy choice directly.
+- `replace(index, block, ReplaceStrategy::{FixedCopyOnWrite, RewriteFile})`
+  exposes the safe policy choice directly.
+- `unsafe replace_fixed_in_place_exclusive` retains the lower-copy path under
+  an explicit exclusivity contract.
 - Delta/op append remains the recommended append-friendly update path.
 - Compact API: `compact_keyed_file::<T, P>(spec, input, output)`.
 - Compact reads one file, materializes final keyed state for `T`, drops tombstones and ops, writes only final values to a new output file, and writes metadata/checkpoint according to output format policy.
@@ -393,7 +416,7 @@ CRC integrity is a corruption-detection aid, not an authenticity or tamper-proof
 - Stale-lock breaking is not automatic by default. `FormatSpec::open_with_lock_policy(path, policy)` is the explicit opt-in entry point.
 - `WriterLockBreakPolicy::Refuse` preserves the default behavior and returns `WriterLockHeld`.
 - `BreakIfOlderThan` is timestamp based; `BreakIfProcessAbsent` is best-effort and conservative when process liveness cannot be determined.
-- Malformed locks are never automatically broken in v0.1.
+- Malformed locks are never automatically broken in 0.2.
 - Atomic rewrite/compact output uses same-directory temp files, flushes and syncs temp contents, then replaces or renames into place.
 - Reader behavior remains snapshot-on-open; readers do not tail live writers.
 
@@ -406,12 +429,21 @@ CRC integrity is a corruption-detection aid, not an authenticity or tamper-proof
 
 - Mmap and zero-copy are opt-in features only. The `zero-copy` crate feature implies the `mmap` feature because the first raw-read API is mmap-backed.
 - Default typed decode remains owned canonical decoding.
-- Initial mmap scope exposes read-only payload windows from `VarveFile::mmap_payloads() -> MmapPayloads`.
+- Initial mmap scope exposes read-only payload windows from unsafe
+  `VarveFile::mmap_payloads() -> MmapPayloads`.
 - `MmapPayloads` owns a read-only mmap plus a cloned snapshot index and `FormatSpec`.
 - `MmapPayloads::payload_window(entry)` accepts only entries that exactly match the cloned snapshot index, preventing forged public offsets from exposing arbitrary file bytes.
 - `MmapPayloads::block_payload_window::<T>(index)` returns the typed block ordinal payload bytes or `None` when out of range.
-- `VarveFile::mmap_matrix()` and `VarveReader::mmap_matrix()` expose
+- Unsafe `VarveFile::mmap_matrix()` and `VarveReader::mmap_matrix()` expose
   `MmapMatrix`, a read-only mmap plus a cloned VMAT layout snapshot.
+- Every file-backed mmap constructor requires the caller to prevent mutation,
+  truncation, replacement, or backing-object invalidation through every handle,
+  thread, and process for the mapping's complete lifetime.
+- Under that precondition, safe mmap accessors rely on a cloned existing handle,
+  a read-only mapping, checked extents against mapped length, copied snapshot
+  metadata, exact record membership, checked slices, and owner-bounded Rust
+  lifetimes. Raw views additionally validate kind, version, endian, exact size,
+  and alignment.
 - `MmapMatrix::cell_payload_window::<T>(key)` returns a committed matrix slot
   payload window and verifies the per-cell CRC when matrix integrity is enabled.
 - Initial zero-copy scope is limited to explicit raw fixed blocks whose implementor promises endian, alignment, and layout compatibility.

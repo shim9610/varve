@@ -1,0 +1,31 @@
+error[E0133]: call to unsafe function `VarveReader::mmap_payloads` is unsafe and requires unsafe block
+ --> tests/ui/fail_mmap_requires_unsafe.rs:4:20
+  |
+4 |     let _mapping = reader.mmap_payloads();
+  |                    ^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+  |
+  = note: consult the function's documentation for information on how to avoid undefined behavior
+
+error[E0133]: call to unsafe function `VarveReader::mmap_matrix` is unsafe and requires unsafe block
+ --> tests/ui/fail_mmap_requires_unsafe.rs:8:20
+  |
+8 |     let _mapping = reader.mmap_matrix();
+  |                    ^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+  |
+  = note: consult the function's documentation for information on how to avoid undefined behavior
+
+error[E0133]: call to unsafe function `VarveFile::mmap_payloads` is unsafe and requires unsafe block
+  --> tests/ui/fail_mmap_requires_unsafe.rs:12:20
+   |
+12 |     let _mapping = file.mmap_payloads();
+   |                    ^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+   |
+   = note: consult the function's documentation for information on how to avoid undefined behavior
+
+error[E0133]: call to unsafe function `VarveFile::mmap_matrix` is unsafe and requires unsafe block
+  --> tests/ui/fail_mmap_requires_unsafe.rs:16:20
+   |
+16 |     let _mapping = file.mmap_matrix();
+   |                    ^^^^^^^^^^^^^^^^^^ call to unsafe function
+   |
+   = note: consult the function's documentation for information on how to avoid undefined behavior

@@ -104,12 +104,29 @@ flush/sync, and atomic replacement.
 
 ## Direct Replacement
 
-`replace_fixed` and `replace(index, block, ReplaceStrategy::FixedInPlace)` are
-for fixed blocks whose canonical encoded payload size is unchanged.
+`replace_fixed` and
+`replace(index, block, ReplaceStrategy::FixedCopyOnWrite)` are the safe fixed
+replacement paths. The canonical payload size must be unchanged. Varve copies
+the current opened generation to a same-directory temporary file, patches the
+record header/payload and checksum, validates the complete new generation,
+syncs it, and atomically publishes it. Readers opened before publication keep
+their original file object and value; new readers observe the replacement.
+
+`unsafe replace_fixed_in_place_exclusive` retains the lower-copy expert path.
+The caller must exclude every reader, writer, mmap, raw reference, handle,
+thread, and process for the operation and for every affected view's lifetime.
+It is deliberately not represented as a safe `ReplaceStrategy` variant.
 
 `replace_rewrite` and `ReplaceStrategy::RewriteFile` rewrite the file through a
 temporary file and atomically publish it. Prefer append plus compact for routine
 updates because replacement gives up the append-friendly history model.
+
+An error before atomic publication leaves the old pathname generation in
+place. `PublishedButRebindFailed`, however, explicitly means publication
+succeeded and only the writer's post-publication reopen/rebind failed. That
+writer is poisoned. Drop it, reopen the pathname, and reconcile the published
+sequence before issuing another logical update; a blind retry can apply the
+operation twice.
 
 ## Performance Check
 

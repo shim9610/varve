@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     Error, FormatSpec, MatrixCellStatus, MatrixDimensions, MatrixKey, Result, VarveBlock,
-    VarveFile, VarveKeyedBlock, VarveMatrixBlock,
+    VarveFile, VarveKeyedBlock, VarveMatrixBlock, collections::MaterializationBudget,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -614,8 +614,16 @@ pub fn diagnose_file<P: AsRef<Path>>(spec: FormatSpec, path: P) -> FormatDiagnos
         "file opened with the supplied format spec",
     ));
 
+    let mut materialization = MaterializationBudget::new(spec);
     for entry in file.index_entries() {
-        if let Err(error) = entry.read_logical_payload(spec, path) {
+        let validation = (|| {
+            let logical_len = entry.logical_payload_len_snapshot(spec, file.snapshot())?;
+            materialization.consume(logical_len)?;
+            entry
+                .read_logical_payload_snapshot(spec, file.snapshot())
+                .map(|_| ())
+        })();
+        if let Err(error) = validation {
             let (domain, hint) = classify_error_with_hint(&error);
             report.push(
                 Diagnostic::error(
@@ -746,6 +754,10 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::LayoutRepeatedOnceSegment { .. }
         | Error::LayoutSegmentIndexOutOfBounds { .. }
         | Error::AdapterDiagnostic(_)
+        | Error::InvalidAdapterExtension(_)
+        | Error::SequenceExhausted
+        | Error::MissingResourceLimit { .. }
+        | Error::TrustedUnboundedRequiresExplicitApi { .. }
         | Error::ZeroCopyBlockKindMismatch { .. }
         | Error::ZeroCopyEndianMismatch { .. }
         | Error::ZeroCopyPayloadSizeMismatch { .. }
@@ -755,9 +767,13 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
             DiagnosticDomain::FeatureGate
         }
 
-        Error::Io(_) | Error::WriterLockHeld(_) | Error::WriterLockMalformed(_) => {
-            DiagnosticDomain::Environment
-        }
+        Error::Io(_)
+        | Error::AllocationFailed { .. }
+        | Error::WriterLockHeld(_)
+        | Error::WriterLockMalformed(_)
+        | Error::WriterPoisoned(_)
+        | Error::WriteRollbackFailed { .. }
+        | Error::PublishedButRebindFailed { .. } => DiagnosticDomain::Environment,
 
         Error::InvalidMagic
         | Error::UnsupportedContainer
@@ -766,6 +782,10 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::LengthOverflow { .. }
         | Error::InvalidUtf8
         | Error::TrailingBytes { .. }
+        | Error::InvalidCanonicalEncoding(_)
+        | Error::LimitExceeded { .. }
+        | Error::ResourceArithmeticOverflow { .. }
+        | Error::SnapshotRangeOutOfBounds { .. }
         | Error::MissingField { .. }
         | Error::WireTypeMismatch { .. }
         | Error::UnknownWireType(_)
@@ -788,6 +808,7 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::MatrixSidecarMismatch(_)
         | Error::MatrixSidecarChecksumMismatch { .. }
         | Error::MatrixChecksumMismatch { .. }
+        | Error::MatrixCommitQuarantined(_)
         | Error::InvalidMatrixLayout
         | Error::LayoutLiteralMismatch { .. }
         | Error::LayoutAmbiguousSegment { .. }

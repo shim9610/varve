@@ -13,6 +13,7 @@ const CONTAINER_MARKER_V2: &[u8; 6] = b"VARVE2";
 const CONTAINER_MARKER_V3: &[u8; 6] = b"VARVE3";
 const FILE_HEADER_FIXED_LEN: u64 = 6 + 2 + 1 + 1 + 8;
 const FILE_EXPLICIT_COMPRESSION_HEADER_LEN: u64 = 28;
+const INTERNAL_PREFIX_LEN: usize = 4 + 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeFieldSource {
@@ -168,12 +169,25 @@ pub(crate) fn native_file_header_plan_fields(spec: FormatSpec) -> Vec<LayoutPlan
 }
 
 pub(crate) fn native_file_header_len(spec: FormatSpec, extension_len: u64) -> u64 {
+    checked_native_file_header_len(spec, extension_len)
+        .expect("native file-header length is constrained to u32 extensions")
+}
+
+fn checked_native_file_header_len(spec: FormatSpec, extension_len: u64) -> Result<u64> {
     let ext_len_field = if extension_len == 0 && !spec.spec_needs_record_footer() {
         0
     } else {
         4
     };
-    spec.magic.len() as u64 + FILE_HEADER_FIXED_LEN + ext_len_field + extension_len
+    let magic_len =
+        u64::try_from(spec.magic.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+    magic_len
+        .checked_add(FILE_HEADER_FIXED_LEN)
+        .and_then(|len| len.checked_add(ext_len_field))
+        .and_then(|len| len.checked_add(extension_len))
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "native file-header length",
+        })
 }
 
 pub(crate) fn write_native_file_header<W: Write>(
@@ -192,7 +206,7 @@ pub(crate) fn write_native_file_header<W: Write>(
             &value,
         )
     })?;
-    Ok(native_file_header_len(spec, extension_len))
+    checked_native_file_header_len(spec, extension_len)
 }
 
 pub(crate) fn read_native_file_header<R: Read>(
@@ -245,10 +259,15 @@ pub(crate) fn read_native_file_header<R: Read>(
         });
     }
 
-    let _flags = read_native_value(
+    let flags = read_native_value(
         reader,
         native_file_header_field(spec, NativeFileHeaderField::Flags, 0),
     )?;
+    if value_as_u8("flags", &flags)? != 0 {
+        return Err(Error::InvalidCanonicalEncoding(
+            "native file-header reserved flags must be zero",
+        ));
+    }
 
     let hash = read_native_value(
         reader,
@@ -283,7 +302,7 @@ pub(crate) fn read_native_file_header<R: Read>(
         schema_hash,
         extensions,
         has_extension_len,
-        header_len: native_file_header_len(spec, extension_len),
+        header_len: checked_native_file_header_len(spec, extension_len)?,
     })
 }
 
@@ -332,7 +351,7 @@ pub(crate) fn ensure_native_file_header_layout_contract(spec: FormatSpec) -> Res
             ))?;
         Ok(())
     })?;
-    if visited_len != native_file_header_len(spec, plan_extension_len) {
+    if visited_len != checked_native_file_header_len(spec, plan_extension_len)? {
         return Err(Error::InvalidFormatSpec(
             "native file header layout length mismatch",
         ));
@@ -403,6 +422,11 @@ pub(crate) fn read_native_record_header<R: Read>(
             }
         }
     }
+    if !cursor.is_empty() {
+        return Err(Error::InvalidFormatSpec(
+            "native record header fields did not consume the header",
+        ));
+    }
 
     Ok(DecodedRecordHeader {
         fields: RecordHeaderFields {
@@ -420,7 +444,16 @@ pub(crate) fn read_native_record_header<R: Read>(
 }
 
 pub(crate) fn encode_native_record_footer(footer: RecordFooterFields) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(native_record_footer_len() as usize);
+    let footer_len = native_record_footer_len();
+    let footer_len =
+        usize::try_from(footer_len).map_err(|_| Error::LengthOverflow { value: footer_len })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(footer_len)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "native record footer",
+            requested: u64::try_from(footer_len).unwrap_or(u64::MAX),
+        })?;
     for field in RECORD_FOOTER_FIELDS {
         let value = native_footer_value(*field, footer)?;
         write_native_value(&mut bytes, *field, &value)?;
@@ -433,7 +466,11 @@ pub(crate) fn decode_native_record_footer(
     footer_offset: u64,
     record_offset: u64,
 ) -> Result<RecordFooterFields> {
-    if bytes.len() as u64 != native_record_footer_len() {
+    let footer_len =
+        usize::try_from(native_record_footer_len()).map_err(|_| Error::InvalidRecordFooter {
+            offset: footer_offset,
+        })?;
+    if bytes.len() != footer_len {
         return Err(Error::InvalidRecordFooter {
             offset: footer_offset,
         });
@@ -491,6 +528,11 @@ pub(crate) fn decode_native_record_footer(
                 });
             }
         }
+    }
+    if !cursor.is_empty() {
+        return Err(Error::InvalidRecordFooter {
+            offset: footer_offset,
+        });
     }
 
     let flags = flags.ok_or(Error::InvalidRecordFooter {
@@ -628,11 +670,116 @@ fn validate_footer_offset(
 ) -> Result<Option<u64>> {
     match flags & flag {
         0 if value == 0 => Ok(None),
-        set if set == flag && value < record_offset => Ok(Some(value)),
+        set if set == flag && value != 0 && value < record_offset => Ok(Some(value)),
         _ => Err(Error::InvalidRecordFooter {
             offset: footer_offset,
         }),
     }
+}
+
+pub(crate) fn decode_native_internal_key_envelope(
+    payload: &[u8],
+    target_block_id: u32,
+) -> Result<Option<&[u8]>> {
+    let (target, key_len) = decode_internal_prefix(payload)?;
+    let key_end =
+        checked_internal_payload_end(INTERNAL_PREFIX_LEN, key_len, "internal key payload range")?;
+    ensure_internal_payload_consumed(key_end, payload.len())?;
+    let key = payload
+        .get(INTERNAL_PREFIX_LEN..key_end)
+        .ok_or(Error::UnexpectedEof)?;
+    if target != target_block_id {
+        return Ok(None);
+    }
+    Ok(Some(key))
+}
+
+pub(crate) fn decode_native_internal_op_envelope(
+    payload: &[u8],
+    target_block_id: u32,
+) -> Result<Option<(&[u8], &[u8])>> {
+    let (target, key_len) = decode_internal_prefix(payload)?;
+    let key_end =
+        checked_internal_payload_end(INTERNAL_PREFIX_LEN, key_len, "internal op key range")?;
+    let op_len_end = key_end
+        .checked_add(8)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "internal op length range",
+        })?;
+    if op_len_end > payload.len() {
+        return Err(Error::UnexpectedEof);
+    }
+    let key = payload
+        .get(INTERNAL_PREFIX_LEN..key_end)
+        .ok_or(Error::UnexpectedEof)?;
+    let op_len = read_internal_u64(payload, key_end)?;
+    let op_end = checked_internal_payload_end(op_len_end, op_len, "internal op payload range")?;
+    ensure_internal_payload_consumed(op_end, payload.len())?;
+    let op = payload
+        .get(op_len_end..op_end)
+        .ok_or(Error::UnexpectedEof)?;
+    if target != target_block_id {
+        return Ok(None);
+    }
+    Ok(Some((key, op)))
+}
+
+fn decode_internal_prefix(payload: &[u8]) -> Result<(u32, u64)> {
+    if payload.len() < INTERNAL_PREFIX_LEN {
+        return Err(Error::UnexpectedEof);
+    }
+    Ok((
+        read_internal_u32(payload, 0)?,
+        read_internal_u64(payload, 4)?,
+    ))
+}
+
+fn read_internal_u32(payload: &[u8], offset: usize) -> Result<u32> {
+    let end = offset
+        .checked_add(4)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "internal u32 range",
+        })?;
+    let bytes = payload.get(offset..end).ok_or(Error::UnexpectedEof)?;
+    Ok(u32::from_le_bytes(
+        bytes.try_into().map_err(|_| Error::UnexpectedEof)?,
+    ))
+}
+
+fn read_internal_u64(payload: &[u8], offset: usize) -> Result<u64> {
+    let end = offset
+        .checked_add(8)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "internal u64 range",
+        })?;
+    let bytes = payload.get(offset..end).ok_or(Error::UnexpectedEof)?;
+    Ok(u64::from_le_bytes(
+        bytes.try_into().map_err(|_| Error::UnexpectedEof)?,
+    ))
+}
+
+fn checked_internal_payload_end(
+    start: usize,
+    encoded_len: u64,
+    resource: &'static str,
+) -> Result<usize> {
+    let len =
+        usize::try_from(encoded_len).map_err(|_| Error::LengthOverflow { value: encoded_len })?;
+    start
+        .checked_add(len)
+        .ok_or(Error::ResourceArithmeticOverflow { resource })
+}
+
+fn ensure_internal_payload_consumed(end: usize, payload_len: usize) -> Result<()> {
+    if end > payload_len {
+        return Err(Error::UnexpectedEof);
+    }
+    if end < payload_len {
+        return Err(Error::TrailingBytes {
+            remaining: payload_len - end,
+        });
+    }
+    Ok(())
 }
 
 fn visit_native_file_header_fields<F>(
@@ -667,7 +814,8 @@ fn native_file_header_field(
         NativeFileHeaderField::Magic => NativeField {
             name: "magic",
             ty: NativeFieldType::Bytes {
-                len: spec.magic.len() as u64,
+                len: u64::try_from(spec.magic.len())
+                    .expect("native file-header magic length must fit u64"),
             },
             source: NativeFieldSource::Native("magic"),
         },
@@ -719,7 +867,10 @@ fn native_file_header_field_to_plan(
         name: native_field.name.to_string(),
         ty: match field {
             NativeFileHeaderField::Magic => LayoutPlanFieldType::Bytes {
-                len: LayoutPlanLen::Fixed(spec.magic.len() as u64),
+                len: LayoutPlanLen::Fixed(
+                    u64::try_from(spec.magic.len())
+                        .expect("native file-header magic length must fit u64"),
+                ),
             },
             _ => native_field_type_to_plan(native_field.ty),
         },
@@ -855,7 +1006,7 @@ fn write_native_value<W: Write>(
 ) -> Result<()> {
     match (field.ty, value) {
         (NativeFieldType::Bytes { len }, LayoutValue::Bytes(bytes))
-            if len == bytes.len() as u64 =>
+            if usize::try_from(len).ok() == Some(bytes.len()) =>
         {
             writer.write_all(bytes)?;
             Ok(())

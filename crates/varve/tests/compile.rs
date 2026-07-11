@@ -7,6 +7,7 @@ fn macro_compile_contracts() {
     tests.pass("tests/ui/pass_matrix_aux.rs");
     tests.pass("tests/ui/pass_layout.rs");
     tests.pass("tests/ui/pass_macro_hygiene.rs");
+    tests.pass("tests/ui/pass_read_limits.rs");
     tests.compile_fail("tests/ui/fail_duplicate_id.rs");
     tests.compile_fail("tests/ui/fail_duplicate_field_id.rs");
     tests.compile_fail("tests/ui/fail_zero_field_id.rs");
@@ -26,4 +27,16 @@ fn macro_compile_contracts() {
     tests.compile_fail("tests/ui/fail_matrix_unbounded_field.rs");
     tests.compile_fail("tests/ui/fail_duplicate_format_key.rs");
     tests.compile_fail("tests/ui/fail_generic_derive.rs");
+    tests.compile_fail("tests/ui/fail_missing_limits.rs");
+    tests.compile_fail("tests/ui/fail_unknown_limit_key.rs");
+    tests.compile_fail("tests/ui/fail_duplicate_limit_key.rs");
+    tests.compile_fail("tests/ui/fail_missing_limit_key.rs");
+}
+
+#[cfg(feature = "mmap")]
+#[test]
+fn mmap_safety_contracts() {
+    let tests = trybuild::TestCases::new();
+    tests.pass("tests/ui/pass_mmap_unsafe.rs");
+    tests.compile_fail("tests/ui/fail_mmap_requires_unsafe.rs");
 }

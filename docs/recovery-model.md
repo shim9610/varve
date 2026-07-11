@@ -112,6 +112,15 @@ failures. Committed cell reads verify the corresponding per-cell slot CRC and
 return `MatrixChecksumMismatch` if slot bytes no longer match the committed CRC
 evidence.
 
+A commit-map CRC mismatch never leaves the unverified bits reader-visible. Open
+preserves the raw map bytes as quarantined recovery evidence and substitutes an
+all-clear internal map. Status and value reads return
+`MatrixCommitQuarantined(category)` rather than `NotCommitted`; commits and
+per-cell clear operations also reject the category until an explicit
+whole-category recovery action is applied. Cell categories may use typed CRC
+rebuild; single and per-channel categories have no per-entry reconstruction
+evidence and therefore recommend `ClearCategory`.
+
 ## Rebuild Commit Map
 
 `RebuildCommitMap` treats commit bits as damaged and reconstructs them from
@@ -133,6 +142,9 @@ The current write API exposes this primitive as
 slot CRC matches the stored per-cell CRC and the MCRC slot-valid bit says the
 slot was committed. The slot-valid evidence distinguishes a legitimate
 committed all-zero payload from an untouched all-zero slot.
+
+Successful rebuild writes the new map and CRC before publishing it in memory,
+then removes the quarantine evidence for that category.
 
 If no per-entry CRC or equivalent evidence exists, Varve must not claim that a
 rebuilt bit proves the cell is valid. It may offer a weaker `ClearCategory`

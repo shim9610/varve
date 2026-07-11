@@ -67,6 +67,23 @@ let report = MatrixFormat::self_test("matrix-check.varve")
 
 Use a temporary path. Self-test creation truncates the target file.
 
+## Resource-Limit Failures
+
+Resource errors are policy results, not automatically library defects:
+
+| Error | Meaning | First action |
+| --- | --- | --- |
+| `MissingResourceLimit` | The ordinary API needs a finite ceiling that the declaration/runtime policy omitted. | Add the applicable DSL key or pass a finite runtime limit. |
+| `TrustedUnboundedRequiresExplicitApi` | An ordinary API received a trusted-unbounded field. | Use finite limits for untrusted data; use the visibly named trusted API only for controlled input. |
+| `LimitExceeded` | A decoded claim or cumulative operation exceeded a finite ceiling before the large read/allocation. | Verify the file claim, then raise the format ceiling only if the dataset is legitimate. |
+| `ResourceArithmeticOverflow` | A claimed range/product cannot be represented safely. | Treat the file as invalid; do not retry with a larger limit. |
+| `AllocationFailed` | A checked reservation failed even though the numeric ceiling allowed it. | Reduce the operation/dataset or available-memory pressure. |
+
+When reporting a suspected Varve bug, include the selected `ReadLimits`, the
+failing API, and whether the input was opened through an ordinary or explicitly
+trusted method. This distinguishes a format-policy mistake from an allocation
+or validation ordering defect.
+
 ## External Compatibility Harnesses
 
 When custom physical layout behavior is in question, run the optional Python

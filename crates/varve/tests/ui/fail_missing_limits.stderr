@@ -1,0 +1,5 @@
+error: unexpected end of input, missing limits policy; declare limits { ... } or limits: trusted_unbounded;
+  --> tests/ui/fail_missing_limits.rs:12:5
+   |
+12 |     }
+   |     ^

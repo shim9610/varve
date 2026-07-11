@@ -12,6 +12,24 @@ varve_format! {
     pub format DslFormat {
         magic: b"DSLF";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: computed;
         extension: "vdsl";
@@ -37,6 +55,24 @@ varve_format! {
     pub format ExplicitCommitFormat {
         magic: b"EXPL";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         index: [scan_on_open, block_offset_chain];
         commit: transaction_marker(explicit);
@@ -52,6 +88,24 @@ varve_format! {
     pub format CrcFooterFormat {
         magic: b"CRCF";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         index: [scan_on_open, block_offset_chain];
         commit: record_footer;
@@ -69,6 +123,24 @@ varve_format! {
     pub format CrcTxnFormat {
         magic: b"CRCT";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         index: [scan_on_open, block_offset_chain];
         commit: transaction_marker(on_flush);
@@ -86,6 +158,24 @@ varve_format! {
     pub format CrcHeaderFormat {
         magic: b"CRCH";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         integrity: crc32_with_header;
         blocks {
@@ -306,6 +396,38 @@ fn transaction_marker_crc_tail_after_latest_marker_is_ignored() -> varve::Result
     assert_eq!(points.len(), 1);
     assert_eq!(points.get(0)?.unwrap(), CrcTxnPoint { value: 1 });
 
+    cleanup(&path);
+    Ok(())
+}
+
+#[cfg(feature = "integrity")]
+#[test]
+fn crc_transaction_fixed_cow_preserves_old_snapshot_and_footer_chain() -> varve::Result<()> {
+    let path = temp_path("crc_transaction_cow");
+    cleanup(&path);
+
+    {
+        let mut writer = CrcTxnFormat::create_writer(&path)?;
+        writer.push_crc_txn_point(&CrcTxnPoint { value: 1 })?;
+        writer.flush()?;
+    }
+    let old_reader = CrcTxnFormat::open_reader(&path)?;
+    {
+        let mut writer = CrcTxnFormat::spec().open(&path)?;
+        writer.replace_fixed(0, &CrcTxnPoint { value: 2 })?;
+        writer.flush()?;
+    }
+
+    assert_eq!(
+        old_reader.crc_txn_points()?.get(0)?,
+        Some(CrcTxnPoint { value: 1 })
+    );
+    assert_eq!(
+        CrcTxnFormat::open_reader(&path)?.crc_txn_points()?.get(0)?,
+        Some(CrcTxnPoint { value: 2 })
+    );
+
+    drop(old_reader);
     cleanup(&path);
     Ok(())
 }

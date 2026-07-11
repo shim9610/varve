@@ -16,6 +16,15 @@ varve_format! {
     pub format AppFormat {
         magic: b"APP";
         version: 1;
+        limits {
+            file_len: 1_073_741_824;
+            records: 1_000_000;
+            index_bytes: 134_217_728;
+            scan_bytes: 1_073_741_824;
+            record_payload: 16_777_216;
+            logical_payload: 67_108_864;
+            materialized_bytes: 268_435_456;
+        }
         endian: little;
         schema_hash: computed;
         manifest: embedded;
@@ -45,6 +54,12 @@ Generated items include:
 - `AppFormatReader`, `AppFormatWriter`
 - `AppFormatRead`, `AppFormatWrite`
 - typed methods such as `push_point`, `push_user`, `points`, and `users`
+
+The `limits` block is required for ordinary opens. It caps attacker-controlled
+file claims before Varve allocates or reads their full size. Choose values from
+the application's legitimate maximums; use `open_reader_with_limits` to tighten
+them for one operation. The separate `*_trusted_unbounded` methods are only for
+inputs whose provenance is already trusted.
 
 ## 2. Self-Check The Format
 
@@ -100,8 +115,13 @@ let users = reader.users()?;
 let ada = users.get(&7)?;
 ```
 
-Readers are snapshot-on-open. They do not live-tail a writer. Open a new reader
-when you want a later committed snapshot.
+Append-log readers are snapshot-on-open. They do not live-tail a writer. Open a
+new reader when you want a later committed append snapshot. The snapshot pins
+the opened object and logical EOF; it does not block another process from
+mutating that same object, so coordinate writers and select an integrity policy
+when corruption detection is required. Matrix commit maps are also captured on
+open, but matrix slot bytes are in-place storage; do not overlap a matrix reader
+with writes to slots it may read.
 
 ## 5. Diagnose Existing Files
 
@@ -128,6 +148,18 @@ varve_format! {
     pub format AnalysisFormat {
         magic: b"ANL";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            record_payload: 67_108_864;
+            materialized_bytes: 268_435_456;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+        }
         endian: little;
         schema_hash: computed;
 

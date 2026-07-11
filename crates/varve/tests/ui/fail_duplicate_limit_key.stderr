@@ -1,0 +1,5 @@
+error: duplicate Varve read limit key "file_len"
+ --> tests/ui/fail_duplicate_limit_key.rs:9:13
+  |
+9 |             file_len: 2;
+  |             ^^^^^^^^

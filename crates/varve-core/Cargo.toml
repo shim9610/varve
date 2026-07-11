@@ -5,6 +5,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+description = "Runtime, codecs, and storage primitives for Varve binary formats"
+documentation = "https://docs.rs/varve-core"
 
 [features]
 default = []
@@ -16,6 +18,7 @@ compression-zstd = ["dep:zstd"]
 [dependencies]
 crc32fast = { workspace = true, optional = true }
 memmap2 = { workspace = true, optional = true }
+tempfile.workspace = true
 thiserror.workspace = true
 zerocopy = { workspace = true, optional = true, features = ["derive"] }
 zstd = { workspace = true, optional = true }

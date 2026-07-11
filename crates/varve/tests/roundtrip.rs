@@ -2,8 +2,8 @@ use std::fs::{read_dir, remove_file};
 use std::path::PathBuf;
 
 use varve::{
-    OP_BLOCK_ID, ReplaceStrategy, TOMBSTONE_BLOCK_ID, VarveBlock, VarveMerge, compact_keyed_file,
-    compact_keyed_files, merge_keyed_files, varve_format,
+    OP_BLOCK_ID, ReadLimits, ReplaceStrategy, TOMBSTONE_BLOCK_ID, VarveBlock, VarveMerge,
+    compact_keyed_file, compact_keyed_files, merge_keyed_files, varve_format,
 };
 
 #[derive(Clone, Debug, PartialEq, VarveBlock)]
@@ -62,6 +62,24 @@ varve_format! {
     pub struct TestFormat {
         magic: b"TVARVE";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         blocks: [Point, User, UserOp, Nested];
     }
@@ -71,6 +89,24 @@ varve_format! {
     pub struct TestFormatV2 {
         magic: b"TVARVE";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         blocks: [UserV2];
     }
@@ -161,14 +197,14 @@ fn reader_writer_handles_cover_common_workflow() -> varve::Result<()> {
 }
 
 #[test]
-fn fixed_replace_updates_existing_record_in_place() -> varve::Result<()> {
+fn fixed_replace_publishes_copy_on_write_generation() -> varve::Result<()> {
     let path = temp_path("replace");
     cleanup(&path);
 
     {
         let mut file = TestFormat::create(&path)?;
         file.push(&Point { x: 1, y: 2 })?;
-        file.replace(0, &Point { x: 3, y: 4 }, ReplaceStrategy::FixedInPlace)?;
+        file.replace(0, &Point { x: 3, y: 4 }, ReplaceStrategy::FixedCopyOnWrite)?;
         file.flush()?;
     }
 
@@ -564,6 +600,69 @@ fn compact_keyed_files_materializes_base_and_delta_shards() -> varve::Result<()>
     cleanup(&base);
     cleanup(&delta);
     cleanup(&output);
+    Ok(())
+}
+
+#[test]
+fn keyed_materialization_merge_and_compact_share_one_cumulative_budget() -> varve::Result<()> {
+    let base = temp_path("materialized_limit_base");
+    let delta = temp_path("materialized_limit_delta");
+    let merge_output = temp_path("materialized_limit_merge");
+    let compact_output = temp_path("materialized_limit_compact");
+    for path in [&base, &delta, &merge_output, &compact_output] {
+        cleanup(path);
+    }
+
+    {
+        let mut file = TestFormat::create(&base)?;
+        file.push(&User {
+            user_id: 1,
+            region: 1,
+            name: "base materialization".to_string(),
+        })?;
+        file.flush()?;
+    }
+    {
+        let mut file = TestFormat::create(&delta)?;
+        file.push(&User {
+            user_id: 2,
+            region: 1,
+            name: "delta materialization".to_string(),
+        })?;
+        file.flush()?;
+    }
+
+    let runtime = ReadLimits::finite_all(u64::MAX).with_max_materialized_bytes(1);
+    let limited = TestFormat::spec().tighten_read_limits(runtime);
+    assert!(matches!(
+        limited
+            .open_readonly(&base)?
+            .materialized_keyed_blocks::<User>(),
+        Err(varve::Error::LimitExceeded {
+            resource: "materialized bytes",
+            ..
+        })
+    ));
+    assert!(matches!(
+        merge_keyed_files::<User, _>(limited, &base, &[&delta], &merge_output),
+        Err(varve::Error::LimitExceeded {
+            resource: "materialized bytes",
+            ..
+        })
+    ));
+    assert!(matches!(
+        compact_keyed_files::<User, _>(limited, &base, &[&delta], &compact_output),
+        Err(varve::Error::LimitExceeded {
+            resource: "materialized bytes",
+            ..
+        })
+    ));
+    assert!(!merge_output.exists());
+    assert!(!compact_output.exists());
+
+    for path in [&base, &delta, &merge_output, &compact_output] {
+        cleanup(path);
+    }
     Ok(())
 }
 

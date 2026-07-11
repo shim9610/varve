@@ -50,7 +50,7 @@ struct Event {
 If the custom type is part of a key, it must also satisfy the key bounds:
 `Eq + Hash + Clone + Send + Sync + 'static`.
 
-Enum-like values should use this same explicit pattern in v0.1. Pick a stable
+Enum-like values should use this same explicit pattern in 0.2. Pick a stable
 integer or string representation, reject unknown discriminants unless they are
 part of the format contract, and bump the block or field-level semantic version
 when the meaning changes.
@@ -110,11 +110,14 @@ Default typed reads do not use this path. Callers opt in through unsafe raw
 access:
 
 ```rust
-let mmap = file.mmap_payloads()?;
+// SAFETY: every handle and process keeps the backing file immutable and valid
+// until `mmap` is dropped.
+let mmap = unsafe { file.mmap_payloads()? };
 let point = unsafe { mmap.raw_fixed::<RawPoint>(index) }?;
 ```
 
-The unsafe call requires the mapped file bytes to remain immutable for the
+The mapping constructor requires backing-file immutability for the mapping's
+entire lifetime. The raw view has an additional representation contract for the
 returned reference lifetime.
 
 ## Performance Check

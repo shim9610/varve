@@ -159,7 +159,7 @@ Use fixed blocks for:
 
 - small records
 - stable positional fields
-- in-place same-size replacement
+- snapshot-preserving, copy-on-write same-size replacement
 
 Changing a fixed block field layout should bump the block version.
 

@@ -30,6 +30,18 @@ varve_format! {
     pub format AnalysisFormat {
         magic: b"ANALYSIS";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            record_payload: 67_108_864;
+            materialized_bytes: 268_435_456;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+        }
         endian: little;
         schema_hash: computed;
         extension: "vrv";
@@ -277,6 +289,12 @@ caller-managed blobs such as variable fields or aux payloads. VMAT-native
 direct-slot chunk compression, numeric batch slice helpers, and bulk migration
 publication remain future work.
 
+Matrix mmap construction is unsafe because external file mutation cannot be
+enforced across processes. Under the caller's immutability guarantee, Varve
+maps the existing handle read-only, validates the complete VMAT extent before
+construction, checks every slot range, verifies configured CRC evidence, and
+ties returned slices to the mapping owner.
+
 ## Slot Addressing
 
 For dense rectangular keyspaces, deterministic addressing is preferred:
@@ -378,6 +396,10 @@ durably synced before the commit bit is synced and hooks are emitted.
 ## Reader Semantics
 
 Opening a matrix file creates a snapshot of layout metadata and commit maps.
+It does not copy the preallocated slot region. Applications must not overlap a
+reader with an in-place write to a slot that reader may access. True immutable
+concurrent snapshots require versioned slots/generations or a read-lease design
+outside VMAT v1.
 Reading a cell:
 
 1. validates the key

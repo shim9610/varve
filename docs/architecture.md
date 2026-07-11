@@ -7,8 +7,14 @@
   log so bounded in-place matrix datasets can be hosted without changing
   append-log semantics.
 - The workspace starts with three crates: `varve`, `varve-core`, and `varve-macros`.
-- The v0.1 model is synchronous I/O, single-writer per file, and snapshot-read.
+- The 0.2 release model is synchronous I/O and single-writer per file. Append-log
+  readers are snapshot-on-open. Matrix metadata and commit maps are snapshotted,
+  but in-place slot bytes require caller coordination with readers.
 - The first stable goal is a conservative owned-decoding core, with mmap and zero-copy as explicit opt-in features.
+- Every ordinary read surface is governed by declaration-time `ReadLimits` and
+  optional runtime tightening. Limits are not persisted and do not participate
+  in schema hashes; explicitly named trusted-unbounded entrypoints are the only
+  bypass for missing or unbounded fields.
 
 ## Core Model
 
@@ -37,6 +43,10 @@
   after tombstones. `materialized_keyed_blocks::<T>()` applies puts, ops, and
   tombstones.
 - `VarveReader` and `VarveWriter` provide clearer read-only and write-capable handle workflows while preserving the lower-level `VarveFile` API.
+- Readers retain the opened file object and a captured logical EOF. Lazy native
+  and custom-layout reads use positional I/O through that object instead of
+  reopening the pathname, so path replacement cannot redirect an existing
+  snapshot.
 - Fixed blocks use canonical field encoding by default, not Rust memory layout copying.
 - Variable blocks use `field_id + wire_type + length + payload`, so unknown field ids with known wire types can be skipped.
 - Variable user blocks may opt into compression after canonical field encoding through a global policy or block-specific record-explicit descriptors. Fixed blocks and Varve internal records stay uncompressed.
@@ -85,13 +95,30 @@
 - Writers are append-oriented and protected by a sidecar writer lock.
 - Default open/create/recover paths refuse an existing writer lock.
 - Explicit stale-lock handling is available through `FormatSpec::inspect_writer_lock` and `FormatSpec::open_with_lock_policy`.
-- Readers are snapshot-on-open. Live tailing is out of scope for v0.1.
+- Append-log readers are snapshot-on-open. Live tailing is out of scope for
+  0.2. A snapshot retains the opened object and validated logical EOF; it does
+  not copy bytes or prevent an uncoordinated external writer from mutating that
+  same object. Matrix readers must not overlap reads with writes to the same
+  in-place slot; true immutable matrix snapshots require versioned slots,
+  generations, or read leases that are outside VMAT v1.
 - Durability is explicit: `flush` pushes buffered bytes to the OS, and `sync` performs durable fsync.
-- `replace_fixed` is allowed only when the canonical payload size is unchanged.
+- Native append and streamed custom-layout writes snapshot EOF and in-memory
+  publication state. Returned write errors roll back when possible; rollback
+  failure poisons the handle and prevents later mutation, flush, or sync.
+- Sequence publication occurs only after a complete record is indexed. Empty
+  files start at sequence `0`, and exhaustion at `u64::MAX` is explicit rather
+  than saturating into duplicate sequence numbers.
+- `replace_fixed` is copy-on-write and is allowed only when the canonical
+  payload size is unchanged. The unsafe exclusive variant is the only native
+  append-log API that mutates an existing generation in place.
 - `replace_rewrite` performs a same-directory temp rewrite, syncs, and atomically publishes the new file.
 - `replace(index, block, ReplaceStrategy)` exposes the selected replacement policy.
 - `CommitPolicy::RecordFooter` uses the record footer as the per-record commit flag.
 - `CommitPolicy::TransactionMarker(on_flush|explicit)` exposes only marker-covered snapshots; read-write open truncates uncommitted tail after the latest marker.
+- Matrix overwrite first withdraws the old commit and CRC-valid evidence, then
+  writes the slot, and requires a later explicit commit. Matrix bitmap changes
+  are staged and published in memory only after their disk write succeeds;
+  partial matrix I/O poisons the writer.
 
 ## Update, Merge, And Compact
 
@@ -113,13 +140,17 @@
 - `FormatSpec::computed_schema_hash()` computes a deterministic schema fingerprint excluding the pinned header `schema_hash`.
 - `FormatSpec::schema_debug_dump()` emits a human-readable view for inspection and support.
 - Migration is explicit with `VarveMigration<From, To>` and `blocks_migrated::<From, To, M>()`.
-- After v0.1, wire format changes should require a migration path.
+- Valid native 0.1 wire contracts remain stable in 0.2. Future incompatible
+  wire changes require an explicit migration path.
 
 ## Codec Policy
 
 - Encoding is canonical and endian-aware.
 - Supported core shapes include scalars, option, fixed arrays, selected vectors, tuples, `BTreeMap`, and `HashMap`.
-- `HashMap` encoding sorts cloned keys before writing, so equivalent maps produce stable bytes regardless of insertion or hash iteration order.
+- `HashMap` encoding sorts borrowed entries by key before writing, so equivalent
+  maps produce stable bytes without requiring key clones or a second lookup.
+- Boolean decoding accepts only canonical bytes `0` and `1`, and map decoding
+  rejects duplicate destination keys before decoding the duplicate value.
 - Raw zero-copy representation is never the default codec.
 - Allocation limits are format-author policy. Built-in decoders avoid avoidable
   allocation-before-validation, while custom codecs/adapters should enforce
@@ -127,8 +158,18 @@
 
 ## Optional Mmap And Zero-Copy
 
-- `mmap` exposes read-only payload windows through `VarveFile::mmap_payloads()`.
+- `mmap` exposes read-only payload windows through unsafe
+  `VarveFile::mmap_payloads()` and matrix windows through unsafe
+  `VarveFile::mmap_matrix()`.
 - `MmapPayloads` owns a cloned snapshot index and rejects forged public index entries.
+- Mapping constructors clone the already-open file handle and validate all
+  snapshot extents against the mapped length. Callers must still prevent every
+  external mutation or invalidation for the mapping's full lifetime.
+- Given that caller boundary, safe mapping access is preserved by read-only OS
+  mappings, owned snapshot metadata, exact membership checks, checked slicing,
+  matrix CRC verification, and Rust lifetimes that keep borrowed windows within
+  the mapping owner. Raw typed views add kind, version, endian, size, and
+  alignment checks.
 - `zero-copy` implies `mmap`.
 - `VarveRawFixedBlock` is an unsafe opt-in trait for raw fixed blocks whose implementor promises layout, endian, and alignment compatibility.
 - `MmapPayloads::raw_fixed::<T>()` and `MmapMatrix::raw_cell::<T>()` are unsafe
@@ -164,7 +205,9 @@
 
 ## Dependencies And License
 
-- Direct dependencies are permissive OSS candidates: `syn`, `quote`, `proc-macro2`, `thiserror`, optional `crc32fast`, `memmap2`, `zerocopy`, and `zstd`.
+- Direct dependencies are permissive OSS candidates: `syn`, `quote`,
+  `proc-macro2`, `thiserror`, `tempfile`, optional `crc32fast`, `memmap2`,
+  `zerocopy`, and `zstd`.
 - Test dependencies include `trybuild` and `proptest`.
 - The optional compatibility harnesses use Python `npTDMS` and Pillow only
   outside the Rust crate dependency graph. `pip show nptdms` reports LGPL, and

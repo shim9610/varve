@@ -15,8 +15,28 @@ durability model:
 - a returned write may be visible through the current writer handle before it is
   crash-durable
 
+Safe append-log fixed replacement is copy-on-write. The replacement generation
+is written in the target directory, flushed and synced, fully reopened and
+validated, then atomically published. Publication failure leaves the original
+path generation unchanged. An already-open reader remains bound to its retained
+file object and captured logical EOF rather than reopening the pathname.
+If publication succeeds but the writer cannot reopen the published pathname,
+Varve returns `PublishedButRebindFailed` and poisons that writer. This is not a
+publication rollback: callers must reopen and reconcile instead of blindly
+retrying the operation.
+
+The unsafe exclusive in-place replacement method does not provide that snapshot
+guarantee. Its safety contract requires process-wide and cross-process
+exclusion, including mmap and raw references.
+
 Even under the default policy, readers trust only commit maps. A clear commit
 bit means `NotCommitted` regardless of slot bytes.
+
+For overwrite, Varve clears the old commit and CRC-valid evidence before the
+first slot byte is changed. A partial slot write therefore remains hidden and
+poisons the writer. Matrix readers must still be coordinated with in-place
+writes: an already-open reader owns a commit-map snapshot but does not own a copy
+of the slot region.
 
 Append-log transaction markers follow the same explicit durability principle.
 `commit()` writes a logical visibility marker for
@@ -51,12 +71,13 @@ durability: ordered_barrier {
 
 The required order for a committed cell write is:
 
-1. write data slot bytes
-2. `sync_data` the data range or portable file handle
-3. write affected CRC metadata if enabled and set the commit bit
-4. write commit map CRC metadata if enabled
-5. `sync_all` the commit map and required metadata
-6. invoke the post-commit hook
+1. withdraw any old commit and CRC-valid evidence
+2. write data slot bytes
+3. `sync_data` the data range or portable file handle
+4. write affected CRC metadata and CRC-valid evidence if enabled
+5. write commit map CRC metadata and publish the commit bit last
+6. `sync_all` the commit map and required metadata
+7. invoke the post-commit hook
 
 The hook must never run before the commit map sync completes successfully.
 

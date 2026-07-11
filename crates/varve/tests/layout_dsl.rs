@@ -18,6 +18,24 @@ varve_format! {
     pub struct NativeDefaultFormat {
         magic: b"NATV";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: computed;
         blocks: [NativePoint];
@@ -28,6 +46,24 @@ varve_format! {
     pub struct NativeExplicitFormat {
         magic: b"NATV";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: computed;
         preset: varve_native;
@@ -39,6 +75,24 @@ varve_format! {
     pub struct NativeFooterFormat {
         magic: b"NATV3";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: computed;
         commit: record_footer;
@@ -50,6 +104,24 @@ varve_format! {
     pub struct NativeChainFormat {
         magic: b"NATVC";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: computed;
         index: [scan_on_open, block_offset_chain];
@@ -61,6 +133,24 @@ varve_format! {
     pub format TdmsPhysicalFormat {
         magic: b"TDMS";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: computed;
         extension: "tdms";
@@ -87,6 +177,24 @@ varve_format! {
     pub format BmpPhysicalFormat {
         magic: b"BMPX";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: computed;
         extension: "bmp";
@@ -123,6 +231,24 @@ varve_format! {
     pub format FramedPhysicalFormat {
         magic: b"FRAM";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: computed;
         extension: "frame";
@@ -158,6 +284,24 @@ varve_format! {
     pub format HeaderCallerPhysicalFormat {
         magic: b"HEAD";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: computed;
         extension: "head";
@@ -188,6 +332,24 @@ varve_format! {
     pub format ImplicitPhysicalFormat {
         magic: b"IMPL";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: computed;
 
@@ -211,6 +373,24 @@ varve_format! {
     pub format MultiPhysicalFormat {
         magic: b"MULT";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: computed;
 
@@ -252,6 +432,24 @@ varve_format! {
     pub format SameTagPhysicalFormat {
         magic: b"STAG";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: computed;
 

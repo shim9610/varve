@@ -1,0 +1,5 @@
+error: unknown Varve read limit key
+ --> tests/ui/fail_unknown_limit_key.rs:9:13
+  |
+9 |             mystery_bytes: 1;
+  |             ^^^^^^^^^^^^^

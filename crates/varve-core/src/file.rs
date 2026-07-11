@@ -4,6 +4,7 @@ use std::fs::{File, OpenOptions, remove_file};
 use std::hash::Hash;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,9 +13,13 @@ use crate::{
     CompressionHeaderMode, CompressionLevel, CompressionPolicy, Endian, Error, FormatSpec,
     IndexPolicy, IntegrityPolicy, KeyedBlockVec, ManifestPolicy, MatrixCellStatus,
     MatrixCommitEvent, MatrixDimensions, MatrixKey, MatrixRecoveryAction, MatrixRecoveryReport,
-    MatrixResumeSignal, RecoveryPolicy, Result, VariableCompression, VarveBlock, VarveKeyedBlock,
-    VarveMatrixBlock, VarveMerge, VarveMigration, WireType, decode_from_slice, encode_to_vec,
+    MatrixResumeSignal, RecoveryPolicy, Result, SnapshotFile, VariableCompression, VarveBlock,
+    VarveKeyedBlock, VarveMatrixBlock, VarveMerge, VarveMigration, WireType,
+    collections::MaterializationBudget,
+    decode_from_slice, encode_to_vec,
+    format::ReadLimitKey,
     native_layout::{
+        decode_native_internal_key_envelope, decode_native_internal_op_envelope,
         decode_native_record_footer, encode_native_record_footer, encode_native_record_header,
         native_file_header_len, native_record_footer_len, native_record_header_len,
         read_native_file_header, read_native_record_header, write_native_file_header,
@@ -52,6 +57,12 @@ const FILE_COMPRESSION_VERSION: u8 = 1;
 const MATRIX_SIDECAR_MAGIC: &[u8; 4] = b"VSID";
 const MATRIX_SIDECAR_VERSION: u16 = 1;
 const MATRIX_SIDECAR_FIXED_LEN: usize = 48;
+#[cfg(feature = "integrity")]
+const STREAM_BUFFER_LEN: usize = 64 * 1024;
+const WRITER_LOCK_MAX_LEN: u64 = 16 * 1024;
+const PHYSICAL_PAYLOAD_RESOURCE: &str = "payload";
+const LOGICAL_PAYLOAD_RESOURCE: &str = "logical payload";
+const WRITER_POISON_CONTEXT: &str = "file";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SchemaManifest {
@@ -206,24 +217,138 @@ pub struct RecordIndexEntry {
 }
 
 impl RecordIndexEntry {
+    /// Reads stored payload bytes by reopening the object currently named by
+    /// `path`.
+    ///
+    /// This is a low-level, non-snapshot convenience API. It does not prove
+    /// that the path still names the object from which this entry was indexed,
+    /// does not establish index membership or checksum validity, and permits an
+    /// allocation as large as `self.payload_len`. Prefer a typed
+    /// reader/collection, which remains bound to its opened snapshot. For an
+    /// explicitly path-based untrusted-input tool, use
+    /// [`Self::read_payload_limited`] after establishing the entry's provenance.
     pub fn read_payload(&self, path: &Path) -> Result<Vec<u8>> {
         let mut file = File::open(path)?;
-        file.seek(SeekFrom::Start(self.payload_offset))?;
-        let payload_len = usize::try_from(self.payload_len).map_err(|_| Error::LengthOverflow {
-            value: self.payload_len,
-        })?;
-        let mut payload = vec![0; payload_len];
-        file.read_exact(&mut payload)?;
-        Ok(payload)
+        self.read_payload_file(&mut file)
+    }
+
+    /// Reads stored payload bytes from the object currently named by `path`
+    /// after applying an allocation ceiling.
+    ///
+    /// This remains path-based and non-snapshot: pathname replacement can make
+    /// it read a different object with a compatible extent. The limit does not
+    /// establish index membership or checksum validity. High-level readers do
+    /// not use this method.
+    pub fn read_payload_limited(&self, path: &Path, limit: u64) -> Result<Vec<u8>> {
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        self.validate_payload_extent(file_len)?;
+        ensure_payload_limit(PHYSICAL_PAYLOAD_RESOURCE, self.payload_len, limit)?;
+        self.read_payload_file_validated(&mut file)
     }
 
     pub fn is_compressed(&self) -> bool {
         self.flags & RECORD_FLAG_COMPRESSED != 0
     }
 
+    /// Reads and decodes logical payload bytes through the current pathname.
+    ///
+    /// This low-level method is non-snapshot and has no physical or logical
+    /// allocation ceiling. It also does not replace index-membership or record
+    /// integrity validation. Use a typed snapshot reader for ordinary reads,
+    /// or [`Self::read_logical_payload_limited`] for explicitly path-based
+    /// tooling that has separately established entry provenance.
     pub fn read_logical_payload(&self, spec: FormatSpec, path: &Path) -> Result<Vec<u8>> {
         let payload = self.read_payload(path)?;
         decode_record_payload(spec, self, &payload)
+    }
+
+    /// Reads and decodes through the current pathname with separate stored and
+    /// logical allocation ceilings.
+    ///
+    /// The limits bound allocation but do not turn this path-based helper into
+    /// an opened-object snapshot API.
+    pub fn read_logical_payload_limited(
+        &self,
+        spec: FormatSpec,
+        path: &Path,
+        physical_limit: u64,
+        logical_limit: u64,
+    ) -> Result<Vec<u8>> {
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        self.validate_payload_extent(file_len)?;
+        ensure_payload_limit(PHYSICAL_PAYLOAD_RESOURCE, self.payload_len, physical_limit)?;
+        let logical_len = self.logical_payload_len_before_allocation(spec, &mut file)?;
+        ensure_payload_limit(LOGICAL_PAYLOAD_RESOURCE, logical_len, logical_limit)?;
+        let payload = self.read_payload_file_validated(&mut file)?;
+        decode_record_payload(spec, self, &payload)
+    }
+
+    pub(crate) fn logical_payload_len_snapshot(
+        &self,
+        spec: FormatSpec,
+        snapshot: &SnapshotFile,
+    ) -> Result<u64> {
+        spec.read_limits
+            .check(ReadLimitKey::RecordPayloadLen, self.payload_len)?;
+        self.validate_payload_extent(snapshot.len())?;
+        let logical_len = if !self.is_compressed() {
+            self.payload_len
+        } else {
+            self.logical_payload_len_from_snapshot(spec, snapshot)?
+        };
+        spec.read_limits
+            .check(ReadLimitKey::LogicalPayloadLen, logical_len)?;
+        Ok(logical_len)
+    }
+
+    pub(crate) fn read_payload_snapshot(
+        &self,
+        spec: FormatSpec,
+        snapshot: &SnapshotFile,
+    ) -> Result<Vec<u8>> {
+        spec.read_limits
+            .check(ReadLimitKey::RecordPayloadLen, self.payload_len)?;
+        self.validate_payload_extent(snapshot.len())?;
+        let payload = snapshot.read_vec_at(
+            self.payload_offset,
+            self.payload_len,
+            limit_or_max(spec.read_limits.require(ReadLimitKey::RecordPayloadLen)?),
+            ReadLimitKey::RecordPayloadLen.resource(),
+        )?;
+        self.verify_snapshot_record(spec, snapshot, &payload)?;
+        Ok(payload)
+    }
+
+    pub(crate) fn read_logical_payload_snapshot(
+        &self,
+        spec: FormatSpec,
+        snapshot: &SnapshotFile,
+    ) -> Result<Vec<u8>> {
+        let logical_len = self.logical_payload_len_snapshot(spec, snapshot)?;
+        let payload = self.read_payload_snapshot(spec, snapshot)?;
+        let decoded = decode_record_payload(spec, self, &payload)?;
+        let actual =
+            u64::try_from(decoded.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+        if actual != logical_len {
+            return Err(Error::DecompressedLengthMismatch {
+                expected: logical_len,
+                actual,
+            });
+        }
+        Ok(decoded)
+    }
+
+    pub fn checked_physical_end(&self) -> Result<u64> {
+        self.payload_offset
+            .checked_add(self.payload_len)
+            .and_then(|end| {
+                end.checked_add(u64::from(self.footer_offset.is_some()) * RECORD_FOOTER_LEN)
+            })
+            .ok_or(Error::LengthOverflow {
+                value: self.payload_len,
+            })
     }
 
     pub fn physical_end(&self) -> u64 {
@@ -314,6 +439,108 @@ struct StoredPayload {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SequenceState {
+    Available(u64),
+    Exhausted,
+}
+
+impl SequenceState {
+    fn from_index(index: &[RecordIndexEntry]) -> Self {
+        match index.iter().map(|entry| entry.sequence).max() {
+            None => Self::Available(0),
+            Some(u64::MAX) => Self::Exhausted,
+            Some(sequence) => Self::Available(sequence + 1),
+        }
+    }
+
+    fn available(self) -> Result<u64> {
+        match self {
+            Self::Available(sequence) => Ok(sequence),
+            Self::Exhausted => Err(Error::SequenceExhausted),
+        }
+    }
+
+    fn after_publishing(sequence: u64) -> Self {
+        match sequence.checked_add(1) {
+            Some(next) => Self::Available(next),
+            None => Self::Exhausted,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AppendSnapshot {
+    eof: u64,
+    cursor: u64,
+    sequence_state: SequenceState,
+    index_len: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WriteFault {
+    #[default]
+    None,
+    AppendAfterHeader,
+    AppendAfterHeaderWithRollbackFailure,
+    RollbackFailure,
+    RebindAfterPublish,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static WRITE_FAULT: std::cell::Cell<WriteFault> = const {
+        std::cell::Cell::new(WriteFault::None)
+    };
+}
+
+#[cfg(test)]
+fn inject_write_fault(fault: WriteFault) {
+    WRITE_FAULT.set(fault);
+}
+
+#[cfg(test)]
+fn fail_append_after_header_if_requested() -> std::io::Result<()> {
+    WRITE_FAULT.with(|fault| match fault.get() {
+        WriteFault::AppendAfterHeader => {
+            fault.set(WriteFault::None);
+            Err(std::io::Error::other("injected append write failure"))
+        }
+        WriteFault::AppendAfterHeaderWithRollbackFailure => {
+            fault.set(WriteFault::RollbackFailure);
+            Err(std::io::Error::other("injected append write failure"))
+        }
+        _ => Ok(()),
+    })
+}
+
+#[cfg(test)]
+fn fail_rollback_if_requested() -> std::io::Result<()> {
+    WRITE_FAULT.with(|fault| {
+        if fault.get() == WriteFault::RollbackFailure {
+            fault.set(WriteFault::None);
+            Err(std::io::Error::other("injected rollback failure"))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(test)]
+fn fail_rebind_after_publish_if_requested() -> std::io::Result<()> {
+    WRITE_FAULT.with(|fault| {
+        if fault.get() == WriteFault::RebindAfterPublish {
+            fault.set(WriteFault::None);
+            Err(std::io::Error::other(
+                "injected post-publication rebind failure",
+            ))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RecordHeaderFields {
     pub(crate) block_id: u32,
     pub(crate) block_version: u16,
@@ -332,11 +559,23 @@ pub(crate) struct RecordFooterFields {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplaceStrategy {
-    FixedInPlace,
+    FixedCopyOnWrite,
     RewriteFile,
 }
 
 #[cfg(feature = "mmap")]
+/// A read-only mapping paired with an immutable snapshot of the validated
+/// append-log index.
+///
+/// Varve constructs this type only after mapping the already-open backing
+/// object, validating every record extent against the mapped length, and
+/// copying the index into the owner. Safe window methods accept only entries in
+/// that copied snapshot and use checked slice bounds. The mapping owns its OS
+/// mapping, so returned slices cannot outlive it.
+///
+/// These guarantees rely on the caller having upheld the unsafe constructor's
+/// requirement that the backing object remains immutable and valid for this
+/// value's full lifetime.
 #[derive(Debug)]
 pub struct MmapPayloads {
     spec: FormatSpec,
@@ -463,6 +702,17 @@ impl MmapPayloads {
 }
 
 #[cfg(feature = "mmap")]
+/// A read-only mapping paired with an immutable snapshot of a validated matrix
+/// layout.
+///
+/// Varve validates the complete matrix extent against the mapped length before
+/// constructing this type. Safe accessors use checked slot offsets and verify
+/// configured CRC evidence. The mapping owns its OS mapping, so returned slices
+/// cannot outlive it.
+///
+/// These guarantees rely on the caller having upheld the unsafe constructor's
+/// requirement that the backing object remains immutable and valid for this
+/// value's full lifetime.
 #[derive(Debug)]
 pub struct MmapMatrix {
     spec: FormatSpec,
@@ -582,15 +832,74 @@ impl MmapMatrix {
     }
 }
 
+#[cfg(feature = "mmap")]
+fn validate_mmap_range(offset: u64, len: u64, mapped_len: u64) -> Result<()> {
+    let end = offset
+        .checked_add(len)
+        .ok_or(Error::MmapPayloadOutOfBounds { offset, len })?;
+    if end > mapped_len {
+        return Err(Error::MmapPayloadOutOfBounds { offset, len });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "mmap")]
+fn validate_mmap_index_entry(entry: &RecordIndexEntry, mapped_len: u64) -> Result<()> {
+    let expected_payload_offset = entry.record_offset.checked_add(RECORD_HEADER_LEN).ok_or(
+        Error::MmapPayloadOutOfBounds {
+            offset: entry.record_offset,
+            len: RECORD_HEADER_LEN,
+        },
+    )?;
+    if entry.payload_offset != expected_payload_offset {
+        return Err(Error::MmapPayloadOutOfBounds {
+            offset: entry.record_offset,
+            len: RECORD_HEADER_LEN,
+        });
+    }
+    validate_mmap_range(entry.payload_offset, entry.payload_len, mapped_len)?;
+    let payload_end = entry.payload_offset.checked_add(entry.payload_len).ok_or(
+        Error::MmapPayloadOutOfBounds {
+            offset: entry.payload_offset,
+            len: entry.payload_len,
+        },
+    )?;
+    if let Some(footer_offset) = entry.footer_offset {
+        if footer_offset != payload_end {
+            return Err(Error::MmapPayloadOutOfBounds {
+                offset: footer_offset,
+                len: RECORD_FOOTER_LEN,
+            });
+        }
+        validate_mmap_range(footer_offset, RECORD_FOOTER_LEN, mapped_len)?;
+    }
+    let physical_end = entry
+        .checked_physical_end()
+        .map_err(|_| Error::MmapPayloadOutOfBounds {
+            offset: entry.record_offset,
+            len: u64::MAX,
+        })?;
+    let record_len =
+        physical_end
+            .checked_sub(entry.record_offset)
+            .ok_or(Error::MmapPayloadOutOfBounds {
+                offset: entry.record_offset,
+                len: u64::MAX,
+            })?;
+    validate_mmap_range(entry.record_offset, record_len, mapped_len)
+}
+
 #[derive(Debug)]
 pub struct VarveFile {
     spec: FormatSpec,
     path: PathBuf,
     file: File,
+    snapshot: SnapshotFile,
     mode: OpenMode,
     index: Vec<RecordIndexEntry>,
     matrix: Option<crate::matrix::MatrixLayout>,
-    next_sequence: u64,
+    sequence_state: SequenceState,
+    poisoned: bool,
     _lock: Option<WriterLock>,
 }
 
@@ -768,13 +1077,41 @@ impl VarveReader {
     }
 
     #[cfg(feature = "mmap")]
-    pub fn mmap_payloads(&self) -> Result<MmapPayloads> {
-        self.file.mmap_payloads()
+    /// Maps the file's indexed record payloads as a read-only snapshot.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prevent mutation, truncation, replacement, backing-file
+    /// invalidation, and any other modification through every handle, thread,
+    /// and process for the full lifetime of the returned mapping.
+    ///
+    /// Once that condition holds, Varve keeps safe accessors sound by cloning
+    /// the existing backing handle, creating a read-only mapping, validating
+    /// every indexed extent with checked arithmetic, rejecting entries outside
+    /// the copied snapshot, and tying every returned slice to the mapping owner.
+    /// Use owned reads instead when external immutability cannot be guaranteed.
+    pub unsafe fn mmap_payloads(&self) -> Result<MmapPayloads> {
+        // SAFETY: The caller accepts the complete file-backed mapping contract.
+        unsafe { self.file.mmap_payloads() }
     }
 
     #[cfg(feature = "mmap")]
-    pub fn mmap_matrix(&self) -> Result<MmapMatrix> {
-        self.file.mmap_matrix()
+    /// Maps the file's matrix regions as a read-only snapshot.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prevent mutation, truncation, replacement, backing-file
+    /// invalidation, and any other modification through every handle, thread,
+    /// and process for the full lifetime of the returned mapping.
+    ///
+    /// Once that condition holds, Varve keeps safe accessors sound by cloning
+    /// the existing backing handle, creating a read-only mapping, validating
+    /// the complete matrix extent, checking every requested slot, and tying
+    /// every returned slice to the mapping owner. Use owned reads instead when
+    /// external immutability cannot be guaranteed.
+    pub unsafe fn mmap_matrix(&self) -> Result<MmapMatrix> {
+        // SAFETY: The caller accepts the complete file-backed mapping contract.
+        unsafe { self.file.mmap_matrix() }
     }
 }
 
@@ -905,10 +1242,35 @@ impl VarveWriter {
         self.file.write_metadata(key, value)
     }
 
+    /// Publishes a same-size fixed replacement through a copy-on-write file
+    /// generation.
+    ///
+    /// [`Error::PublishedButRebindFailed`] means publication already succeeded.
+    /// Do not retry blindly; discard this poisoned writer and reopen the path.
     pub fn replace_fixed<T: VarveBlock>(&mut self, index: usize, block: &T) -> Result<u64> {
         self.file.replace_fixed(index, block)
     }
 
+    /// Replaces a fixed record by mutating the backing object directly.
+    ///
+    /// # Safety
+    ///
+    /// The caller must exclude every reader, writer, mapping, raw reference,
+    /// handle, thread, and process for this operation and for the lifetime of
+    /// every view that could observe the affected object.
+    pub unsafe fn replace_fixed_in_place_exclusive<T: VarveBlock>(
+        &mut self,
+        index: usize,
+        block: &T,
+    ) -> Result<u64> {
+        // SAFETY: The caller accepts the exclusivity contract documented above.
+        unsafe { self.file.replace_fixed_in_place_exclusive(index, block) }
+    }
+
+    /// Publishes a replacement by rewriting the complete file generation.
+    ///
+    /// [`Error::PublishedButRebindFailed`] means publication already succeeded.
+    /// Do not retry blindly; discard this poisoned writer and reopen the path.
     pub fn replace_rewrite<T: VarveBlock>(&mut self, index: usize, block: &T) -> Result<u64> {
         self.file.replace_rewrite(index, block)
     }
@@ -1135,6 +1497,8 @@ impl VarveWriter {
 impl VarveFile {
     pub fn create<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
         spec.validate()?;
+        ensure_native_write_limits(spec)?;
+        check_initial_native_file_len(spec)?;
         if spec.has_matrix_blocks() {
             return Err(Error::MatrixDimensionsRequired);
         }
@@ -1147,14 +1511,17 @@ impl VarveFile {
             .truncate(true)
             .open(&path)?;
         write_file_header(spec, &mut file)?;
+        let snapshot = SnapshotFile::new(file.try_clone()?)?;
         let mut file = Self {
             spec,
             path,
             file,
+            snapshot,
             mode: OpenMode::ReadWrite,
             index: Vec::new(),
             matrix: None,
-            next_sequence: 0,
+            sequence_state: SequenceState::Available(0),
+            poisoned: false,
             _lock: Some(lock),
         };
         file.write_embedded_manifest_if_needed()?;
@@ -1167,6 +1534,8 @@ impl VarveFile {
         dims: MatrixDimensions,
     ) -> Result<Self> {
         spec.validate()?;
+        ensure_native_write_limits(spec)?;
+        check_initial_native_file_len(spec)?;
         if !spec.has_matrix_blocks() {
             return Self::create(spec, path);
         }
@@ -1181,14 +1550,17 @@ impl VarveFile {
         write_file_header(spec, &mut file)?;
         let header_len = file.stream_position()?;
         let matrix = crate::matrix::create_layout(spec, &mut file, header_len, &dims)?;
+        let snapshot = SnapshotFile::new(file.try_clone()?)?;
         let mut file = Self {
             spec,
             path,
             file,
+            snapshot,
             mode: OpenMode::ReadWrite,
             index: Vec::new(),
             matrix: Some(matrix),
-            next_sequence: 0,
+            sequence_state: SequenceState::Available(0),
+            poisoned: false,
             _lock: Some(lock),
         };
         file.write_embedded_manifest_if_needed()?;
@@ -1197,23 +1569,28 @@ impl VarveFile {
 
     pub fn open<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
         spec.validate()?;
+        ensure_native_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
         let lock = WriterLock::acquire(&path)?;
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let captured_len = check_open_file_len(spec, &file)?;
         let header_len = read_file_header(spec, &mut file)?;
-        let matrix = read_matrix_layout_if_needed(spec, &mut file, header_len)?;
+        let matrix = read_matrix_layout_if_needed(spec, &mut file, header_len, captured_len)?;
         let append_start = append_log_start(header_len, matrix.as_ref());
-        let index = load_index(spec, &mut file, append_start, RecoveryPolicy::Strict)?;
+        let index = load_index(spec, &mut file, append_start, ScanIntent::Writer)?;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
-        let next_sequence = index.iter().map(|entry| entry.sequence).max().unwrap_or(0) + 1;
+        let sequence_state = SequenceState::from_index(&index);
+        let snapshot = SnapshotFile::new(file.try_clone()?)?;
         Ok(Self {
             spec,
             path,
             file,
+            snapshot,
             mode: OpenMode::ReadWrite,
             index,
             matrix,
-            next_sequence,
+            sequence_state,
+            poisoned: false,
             _lock: Some(lock),
         })
     }
@@ -1224,44 +1601,55 @@ impl VarveFile {
         policy: WriterLockBreakPolicy,
     ) -> Result<Self> {
         spec.validate()?;
+        ensure_native_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
         let lock = WriterLock::acquire_with_policy(&path, policy)?;
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let captured_len = check_open_file_len(spec, &file)?;
         let header_len = read_file_header(spec, &mut file)?;
-        let matrix = read_matrix_layout_if_needed(spec, &mut file, header_len)?;
+        let matrix = read_matrix_layout_if_needed(spec, &mut file, header_len, captured_len)?;
         let append_start = append_log_start(header_len, matrix.as_ref());
-        let index = load_index(spec, &mut file, append_start, RecoveryPolicy::Strict)?;
+        let index = load_index(spec, &mut file, append_start, ScanIntent::Writer)?;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
-        let next_sequence = index.iter().map(|entry| entry.sequence).max().unwrap_or(0) + 1;
+        let sequence_state = SequenceState::from_index(&index);
+        let snapshot = SnapshotFile::new(file.try_clone()?)?;
         Ok(Self {
             spec,
             path,
             file,
+            snapshot,
             mode: OpenMode::ReadWrite,
             index,
             matrix,
-            next_sequence,
+            sequence_state,
+            poisoned: false,
             _lock: Some(lock),
         })
     }
 
     pub fn open_readonly<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
         spec.validate()?;
+        ensure_native_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new().read(true).open(&path)?;
+        let captured_len = check_open_file_len(spec, &file)?;
         let header_len = read_file_header(spec, &mut file)?;
-        let matrix = read_matrix_layout_if_needed(spec, &mut file, header_len)?;
+        let matrix = read_matrix_layout_if_needed(spec, &mut file, header_len, captured_len)?;
         let append_start = append_log_start(header_len, matrix.as_ref());
-        let index = load_index(spec, &mut file, append_start, RecoveryPolicy::Strict)?;
-        let next_sequence = index.iter().map(|entry| entry.sequence).max().unwrap_or(0) + 1;
+        let index = load_index(spec, &mut file, append_start, ScanIntent::ReadOnly)?;
+        let sequence_state = SequenceState::from_index(&index);
+        let logical_len = validated_snapshot_len(append_start, &index)?;
+        let snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, logical_len)?;
         Ok(Self {
             spec,
             path,
             file,
+            snapshot,
             mode: OpenMode::ReadOnly,
             index,
             matrix,
-            next_sequence,
+            sequence_state,
+            poisoned: false,
             _lock: None,
         })
     }
@@ -1275,27 +1663,33 @@ impl VarveFile {
         path: P,
     ) -> Result<(Self, RecoveryReport)> {
         spec.validate()?;
+        ensure_native_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
         let lock = WriterLock::acquire(&path)?;
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
         let original_len = file.metadata()?.len();
+        spec.read_limits
+            .check(ReadLimitKey::FileLen, original_len)?;
         let header_len = read_file_header(spec, &mut file)?;
-        let matrix = read_matrix_layout_if_needed(spec, &mut file, header_len)?;
+        let matrix = read_matrix_layout_if_needed(spec, &mut file, header_len, original_len)?;
         let append_start = append_log_start(header_len, matrix.as_ref());
-        let index = load_index(spec, &mut file, append_start, spec.recovery_policy)?;
+        let index = load_index(spec, &mut file, append_start, ScanIntent::Recover)?;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
         let recovered_len = file.metadata()?.len();
-        let next_sequence = index.iter().map(|entry| entry.sequence).max().unwrap_or(0) + 1;
+        let sequence_state = SequenceState::from_index(&index);
         let records_preserved = index.len();
+        let snapshot = SnapshotFile::new(file.try_clone()?)?;
         Ok((
             Self {
                 spec,
                 path,
                 file,
+                snapshot,
                 mode: OpenMode::ReadWrite,
                 index,
                 matrix,
-                next_sequence,
+                sequence_state,
+                poisoned: false,
                 _lock: Some(lock),
             },
             RecoveryReport {
@@ -1307,11 +1701,15 @@ impl VarveFile {
     }
 
     pub fn spec(&self) -> FormatSpec {
-        self.spec
+        self.spec.ordinary_read()
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn snapshot(&self) -> &SnapshotFile {
+        &self.snapshot
     }
 
     pub fn mode(&self) -> OpenMode {
@@ -1393,20 +1791,23 @@ impl VarveFile {
 
     pub fn metadata(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let mut found = None;
-        for entry in self
-            .index
-            .iter()
-            .filter(|entry| entry.block_id == METADATA_BLOCK_ID)
-        {
-            let payload = entry.read_payload(&self.path)?;
+        let mut budget = MaterializationBudget::new(self.spec);
+        for (record_ordinal, entry) in self.index.iter().enumerate() {
+            if entry.block_id != METADATA_BLOCK_ID {
+                continue;
+            }
+            let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
+            budget.consume(logical_len)?;
+            let payload = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
             let (stored_key, value): (String, Vec<u8>) =
                 decode_from_slice(&payload, self.spec.endian)?;
             if stored_key == key {
+                let order = MergeOrder::for_record(0, entry.sequence, record_ordinal);
                 let should_replace = found
                     .as_ref()
-                    .is_none_or(|(sequence, _): &(u64, Vec<u8>)| entry.sequence >= *sequence);
+                    .is_none_or(|(old_order, _): &(MergeOrder, Vec<u8>)| order >= *old_order);
                 if should_replace {
-                    found = Some((entry.sequence, value));
+                    found = Some((order, value));
                 }
             }
         }
@@ -1415,12 +1816,19 @@ impl VarveFile {
 
     pub fn all_metadata(&self) -> Result<Vec<(String, Vec<u8>)>> {
         let mut values = Vec::new();
+        let mut budget = MaterializationBudget::new(self.spec);
         for entry in self
             .index
             .iter()
             .filter(|entry| entry.block_id == METADATA_BLOCK_ID)
         {
-            let payload = entry.read_payload(&self.path)?;
+            let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
+            budget.consume(logical_len)?;
+            let payload = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
+            values.try_reserve(1).map_err(|_| Error::AllocationFailed {
+                resource: "metadata entries",
+                requested: logical_len,
+            })?;
             values.push(decode_from_slice(&payload, self.spec.endian)?);
         }
         Ok(values)
@@ -1430,22 +1838,29 @@ impl VarveFile {
         let Some(entry) = self
             .index
             .iter()
-            .filter(|entry| entry.block_id == MANIFEST_BLOCK_ID)
-            .max_by_key(|entry| entry.sequence)
+            .enumerate()
+            .filter(|(_, entry)| entry.block_id == MANIFEST_BLOCK_ID)
+            .max_by_key(|(record_ordinal, entry)| {
+                MergeOrder::for_record(0, entry.sequence, *record_ordinal)
+            })
+            .map(|(_, entry)| entry)
         else {
             return Ok(None);
         };
-        let payload = entry.read_payload(&self.path)?;
+        let mut budget = MaterializationBudget::new(self.spec);
+        let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
+        budget.consume(logical_len)?;
+        let payload = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
         Ok(Some(decode_schema_manifest(&payload)?))
     }
 
+    /// Publishes a same-size fixed replacement through a copy-on-write file
+    /// generation.
+    ///
+    /// [`Error::PublishedButRebindFailed`] means publication already succeeded.
+    /// Do not retry blindly; discard this poisoned writer and reopen the path.
     pub fn replace_fixed<T: VarveBlock>(&mut self, index: usize, block: &T) -> Result<u64> {
         self.ensure_write()?;
-        if self.spec.spec_needs_record_footer() {
-            return Err(Error::InvalidFormatSpec(
-                "replace is not supported for record-footer formats",
-            ));
-        }
         self.ensure_user_block::<T>()?;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         if T::KIND != BlockKind::Fixed {
@@ -1465,16 +1880,43 @@ impl VarveFile {
 
         let endian = T::ENDIAN.unwrap_or(self.spec.endian);
         let payload = encode_to_vec(block, endian)?;
+        let payload_len =
+            u64::try_from(payload.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::RecordPayloadLen, payload_len)?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::LogicalPayloadLen, payload_len)?;
         let old_len = self.index[target_position].payload_len;
-        if old_len != payload.len() as u64 {
+        if old_len != payload_len {
             return Err(Error::ReplaceSizeMismatch {
                 old: old_len,
-                new: payload.len() as u64,
+                new: payload_len,
             });
         }
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::FileLen, self.snapshot.len())?;
+        self.validate_source_generation()?;
 
-        let sequence = self.next_sequence();
-        let entry = &mut self.index[target_position];
+        let sequence = self.sequence_state.available()?;
+        let entry = &self.index[target_position];
+        if entry.block_version != T::VERSION {
+            return Err(Error::BlockVersionMismatch {
+                block_id: T::ID,
+                expected: T::VERSION,
+                actual: entry.block_version,
+            });
+        }
+        let mut footer_bytes = [0; RECORD_FOOTER_LEN as usize];
+        let footer = if let Some(footer_offset) = entry.footer_offset {
+            self.snapshot
+                .read_exact_at(footer_offset, &mut footer_bytes)?;
+            &footer_bytes[..]
+        } else {
+            &[]
+        };
         let header = RecordHeaderFields {
             block_id: entry.block_id,
             block_version: entry.block_version,
@@ -1485,26 +1927,164 @@ impl VarveFile {
             uncompressed_len_hint: entry.uncompressed_len_hint,
         };
         let checksum =
-            checksum_record_fields(self.spec, entry.record_offset, header, &payload, &[])?;
-        entry.sequence = sequence;
-        entry.checksum = checksum;
-        self.file.seek(SeekFrom::Start(entry.record_offset))?;
-        write_record_header(
-            &mut self.file,
-            self.spec,
-            entry.record_offset,
+            checksum_record_fields(self.spec, entry.record_offset, header, &payload, footer)?;
+        let header_bytes = encode_native_record_header(
             RecordHeaderFields { checksum, ..header },
+            entry.record_offset,
+            record_footer_len(self.spec),
         )?;
-        self.file.seek(SeekFrom::Start(entry.payload_offset))?;
-        self.file.write_all(&payload)?;
+        let record_offset = entry.record_offset;
+        let payload_offset = entry.payload_offset;
+
+        let mut new_index = clone_matching_entries(self.spec, &self.index, |_| true)?;
+        new_index[target_position].sequence = sequence;
+        new_index[target_position].checksum = checksum;
+
+        let (temp_path, mut temp_file) = create_rewrite_temp_file(&self.path)?;
+        let prepare_result = (|| -> Result<()> {
+            if let Ok(metadata) = self.file.metadata() {
+                temp_file.set_permissions(metadata.permissions())?;
+            }
+            self.snapshot
+                .copy_range_to(0, self.snapshot.len(), &mut temp_file)?;
+            temp_file.seek(SeekFrom::Start(record_offset))?;
+            temp_file.write_all(&header_bytes)?;
+            temp_file.seek(SeekFrom::Start(payload_offset))?;
+            temp_file.write_all(&payload)?;
+            temp_file.flush()?;
+            temp_file.sync_all()?;
+            validate_generation_file(
+                self.spec,
+                &mut temp_file,
+                append_log_start_for_file(self)?,
+                &new_index,
+            )?;
+            Ok(())
+        })();
+        match prepare_result {
+            Ok(()) => {}
+            Err(error) => {
+                drop(temp_file);
+                let _ = remove_file(&temp_path);
+                return Err(error);
+            }
+        }
+        drop(temp_file);
+
+        if let Err(error) = replace_path_atomically(&temp_path, &self.path) {
+            let _ = remove_file(&temp_path);
+            return Err(error);
+        }
+
+        self.rebind_published_generation(sequence, new_index)
+    }
+
+    /// Replaces a fixed record by mutating this file object directly.
+    ///
+    /// # Safety
+    ///
+    /// The caller must exclude every reader, writer, mapping, raw reference,
+    /// handle, thread, and process for this operation and for the lifetime of
+    /// every view that could observe the affected object.
+    pub unsafe fn replace_fixed_in_place_exclusive<T: VarveBlock>(
+        &mut self,
+        index: usize,
+        block: &T,
+    ) -> Result<u64> {
+        self.ensure_write()?;
+        self.ensure_user_block::<T>()?;
+        crate::collections::ensure_registered_block::<T>(self.spec)?;
+        if T::KIND != BlockKind::Fixed {
+            return Err(Error::BlockKindMismatch {
+                expected: BlockKind::Fixed,
+                actual: T::KIND,
+            });
+        }
+        let target_position = self
+            .index
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.block_id == T::ID)
+            .nth(index)
+            .map(|(position, _)| position)
+            .ok_or(Error::UnexpectedEof)?;
+        let payload = encode_to_vec(block, T::ENDIAN.unwrap_or(self.spec.endian))?;
+        let payload_len =
+            u64::try_from(payload.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::RecordPayloadLen, payload_len)?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::LogicalPayloadLen, payload_len)?;
+        let entry = &self.index[target_position];
+        if entry.payload_len != payload_len {
+            return Err(Error::ReplaceSizeMismatch {
+                old: entry.payload_len,
+                new: payload_len,
+            });
+        }
+        self.validate_source_generation()?;
+        let sequence = self.sequence_state.available()?;
+        let entry = &self.index[target_position];
+        let mut footer_bytes = [0; RECORD_FOOTER_LEN as usize];
+        let footer = if let Some(footer_offset) = entry.footer_offset {
+            self.snapshot
+                .read_exact_at(footer_offset, &mut footer_bytes)?;
+            &footer_bytes[..]
+        } else {
+            &[]
+        };
+        let header = RecordHeaderFields {
+            block_id: entry.block_id,
+            block_version: entry.block_version,
+            flags: entry.flags,
+            sequence,
+            payload_len,
+            checksum: 0,
+            uncompressed_len_hint: entry.uncompressed_len_hint,
+        };
+        let checksum =
+            checksum_record_fields(self.spec, entry.record_offset, header, &payload, footer)?;
+        let header_bytes = encode_native_record_header(
+            RecordHeaderFields { checksum, ..header },
+            entry.record_offset,
+            record_footer_len(self.spec),
+        )?;
+        let record_offset = entry.record_offset;
+        let payload_offset = entry.payload_offset;
+        let write_result = (|| -> Result<()> {
+            self.file.seek(SeekFrom::Start(record_offset))?;
+            self.file.write_all(&header_bytes)?;
+            self.file.seek(SeekFrom::Start(payload_offset))?;
+            self.file.write_all(&payload)?;
+            self.file.flush()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.index[target_position].sequence = sequence;
+        self.index[target_position].checksum = checksum;
+        self.publish_sequence(sequence);
         Ok(sequence)
     }
 
+    /// Publishes a replacement by rewriting the complete file generation.
+    ///
+    /// [`Error::PublishedButRebindFailed`] means publication already succeeded.
+    /// Do not retry blindly; discard this poisoned writer and reopen the path.
     pub fn replace_rewrite<T: VarveBlock>(&mut self, index: usize, block: &T) -> Result<u64> {
         self.ensure_write()?;
         if self.spec.spec_needs_record_footer() {
             return Err(Error::InvalidFormatSpec(
                 "replace is not supported for record-footer formats",
+            ));
+        }
+        if self.matrix.is_some() {
+            return Err(Error::InvalidFormatSpec(
+                "native rewrite is not supported for matrix files",
             ));
         }
         self.ensure_user_block::<T>()?;
@@ -1517,63 +2097,90 @@ impl VarveFile {
             .nth(index)
             .map(|(position, _)| position)
             .ok_or(Error::UnexpectedEof)?;
-        let sequence = self.next_sequence;
+        let sequence = self.sequence_state.available()?;
         let endian = T::ENDIAN.unwrap_or(self.spec.endian);
         let replacement = encode_to_vec(block, endian)?;
         let replacement = prepare_user_record_payload(self.spec, T::ID, T::KIND, &replacement)?;
+        let replacement_len = u64::try_from(replacement.bytes.len())
+            .map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::RecordPayloadLen, replacement_len)?;
+        self.validate_source_generation()?;
 
-        let mut records = Vec::with_capacity(self.index.len());
-        for (position, entry) in self.index.iter().enumerate() {
-            let payload = if position == target_position {
-                replacement.bytes.clone()
-            } else {
-                entry.read_payload(&self.path)?
-            };
-            let mut updated = entry.clone();
-            if position == target_position {
-                updated.sequence = sequence;
-                updated.flags = replacement.flags;
-                updated.payload_len = payload.len() as u64;
-                updated.uncompressed_len_hint = replacement.uncompressed_len_hint;
-            }
-            records.push((updated, payload));
-        }
+        let index_bytes = index_bytes_for_count(self.index.len())?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::IndexBytes, index_bytes)?;
+        let mut new_index = Vec::new();
+        new_index
+            .try_reserve_exact(self.index.len())
+            .map_err(|_| Error::AllocationFailed {
+                resource: "rewrite index",
+                requested: index_bytes,
+            })?;
 
         let (temp_path, mut temp_file) = create_rewrite_temp_file(&self.path)?;
-        if let Ok(metadata) = self.file.metadata() {
-            temp_file.set_permissions(metadata.permissions())?;
-        }
-        write_file_header(self.spec, &mut temp_file)?;
-        let mut new_index = Vec::with_capacity(records.len());
-        for (mut entry, payload) in records {
-            let offset = temp_file.stream_position()?;
-            let header = RecordHeaderFields {
-                block_id: entry.block_id,
-                block_version: entry.block_version,
-                flags: entry.flags,
-                sequence: entry.sequence,
-                payload_len: payload.len() as u64,
-                checksum: 0,
-                uncompressed_len_hint: entry.uncompressed_len_hint,
-            };
-            entry.checksum = checksum_record_fields(self.spec, offset, header, &payload, &[])?;
-            write_record_header(
-                &mut temp_file,
+        let prepare_result = (|| -> Result<()> {
+            if let Ok(metadata) = self.file.metadata() {
+                temp_file.set_permissions(metadata.permissions())?;
+            }
+            write_file_header(self.spec, &mut temp_file)?;
+            for (position, source_entry) in self.index.iter().enumerate() {
+                let mut updated = source_entry.clone();
+                let checkpoint_payload;
+                let payload = if position == target_position {
+                    updated.sequence = sequence;
+                    updated.flags = replacement.flags;
+                    updated.uncompressed_len_hint = replacement.uncompressed_len_hint;
+                    RewritePayload::Bytes(&replacement.bytes)
+                } else if source_entry.block_id == INDEX_BLOCK_ID {
+                    checkpoint_payload = encode_index_checkpoint_payload(
+                        self.spec,
+                        &new_index,
+                        temp_file.stream_position()?,
+                    )?;
+                    RewritePayload::Bytes(&checkpoint_payload)
+                } else {
+                    RewritePayload::Snapshot {
+                        offset: source_entry.payload_offset,
+                        len: source_entry.payload_len,
+                    }
+                };
+                updated = rewrite_record_streaming(
+                    self.spec,
+                    &self.snapshot,
+                    &mut temp_file,
+                    updated,
+                    payload,
+                )?;
+                new_index.push(updated);
+            }
+            temp_file.flush()?;
+            temp_file.sync_all()?;
+            validate_generation_file(
                 self.spec,
-                offset,
-                RecordHeaderFields {
-                    checksum: entry.checksum,
-                    ..header
-                },
+                &mut temp_file,
+                native_file_header_len(
+                    self.spec,
+                    u64::try_from(file_header_extensions(self.spec)?.len()).map_err(|_| {
+                        Error::ResourceArithmeticOverflow {
+                            resource: "file-header length",
+                        }
+                    })?,
+                ),
+                &new_index,
             )?;
-            temp_file.write_all(&payload)?;
-            entry.record_offset = offset;
-            entry.payload_offset = offset + native_record_header_len();
-            entry.payload_len = payload.len() as u64;
-            new_index.push(entry);
+            Ok(())
+        })();
+        match prepare_result {
+            Ok(()) => {}
+            Err(error) => {
+                drop(temp_file);
+                let _ = remove_file(&temp_path);
+                return Err(error);
+            }
         }
-        temp_file.flush()?;
-        temp_file.sync_all()?;
         drop(temp_file);
 
         if let Err(error) = replace_path_atomically(&temp_path, &self.path) {
@@ -1581,10 +2188,7 @@ impl VarveFile {
             return Err(error);
         }
 
-        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
-        self.index = new_index;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        Ok(sequence)
+        self.rebind_published_generation(sequence, new_index)
     }
 
     pub fn replace<T: VarveBlock>(
@@ -1594,12 +2198,13 @@ impl VarveFile {
         strategy: ReplaceStrategy,
     ) -> Result<u64> {
         match strategy {
-            ReplaceStrategy::FixedInPlace => self.replace_fixed(index, block),
+            ReplaceStrategy::FixedCopyOnWrite => self.replace_fixed(index, block),
             ReplaceStrategy::RewriteFile => self.replace_rewrite(index, block),
         }
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        self.ensure_not_poisoned()?;
         self.write_embedded_manifest_if_needed()?;
         if self.mode == OpenMode::ReadWrite
             && self.spec.index_policy.checkpoint_on_flush
@@ -1671,19 +2276,16 @@ impl VarveFile {
     }
 
     pub fn sync(&mut self) -> Result<()> {
+        self.ensure_not_poisoned()?;
         self.file.sync_all()?;
         Ok(())
     }
 
     pub fn blocks<T: VarveBlock>(&self) -> Result<BlockVec<T>> {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
-        let entries = self
-            .index
-            .iter()
-            .filter(|entry| entry.block_id == T::ID)
-            .cloned()
-            .collect();
-        Ok(BlockVec::new(self.spec, self.path.clone(), entries))
+        let entries =
+            clone_matching_entries(self.spec, &self.index, |entry| entry.block_id == T::ID)?;
+        Ok(BlockVec::new(self.spec, self.snapshot.clone(), entries))
     }
 
     pub fn blocks_migrated<From, To, M>(&self) -> Result<Vec<To>>
@@ -1699,13 +2301,22 @@ impl VarveFile {
             });
         }
         let mut migrated = Vec::new();
+        let mut budget = MaterializationBudget::new(self.spec);
         for entry in self
             .index
             .iter()
             .filter(|entry| entry.block_id == From::ID && entry.block_version == From::VERSION)
         {
-            let payload = entry.read_logical_payload(self.spec, &self.path)?;
+            let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
+            budget.consume(logical_len)?;
+            let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
             let from: From = decode_from_slice(&payload, From::ENDIAN.unwrap_or(self.spec.endian))?;
+            migrated
+                .try_reserve(1)
+                .map_err(|_| Error::AllocationFailed {
+                    resource: "migrated blocks",
+                    requested: logical_len,
+                })?;
             migrated.push(M::migrate(from)?);
         }
         Ok(migrated)
@@ -1718,8 +2329,10 @@ impl VarveFile {
     {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         let mut entries = Vec::new();
-        let mut by_key: HashMap<T::Key, RecordIndexEntry> = HashMap::new();
-        for entry in &self.index {
+        let mut state: HashMap<T::Key, (MergeOrder, Option<RecordIndexEntry>)> = HashMap::new();
+        let mut budget = MaterializationBudget::new(self.spec);
+        for (record_ordinal, entry) in self.index.iter().enumerate() {
+            let order = MergeOrder::for_record(0, entry.sequence, record_ordinal);
             match entry.block_id {
                 id if id == T::ID => {
                     if entry.block_version != T::VERSION {
@@ -1729,34 +2342,63 @@ impl VarveFile {
                             actual: entry.block_version,
                         });
                     }
-                    let payload = entry.read_logical_payload(self.spec, &self.path)?;
+                    let logical_len =
+                        entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
+                    budget.consume(logical_len)?;
+                    let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
                     let block: T =
                         decode_from_slice(&payload, T::ENDIAN.unwrap_or(self.spec.endian))?;
                     let key = block.key();
-                    let should_replace = by_key
-                        .get(&key)
-                        .is_none_or(|old| entry.sequence > old.sequence);
-                    if should_replace {
-                        by_key.insert(key, entry.clone());
+                    if should_apply(state.get(&key), order) {
+                        let requested = index_bytes_for_count(state.len().saturating_add(1))?;
+                        state.try_reserve(1).map_err(|_| Error::AllocationFailed {
+                            resource: "keyed index",
+                            requested,
+                        })?;
+                        state.insert(key, (order, Some(entry.clone())));
                     }
+                    let requested = index_bytes_for_count(entries.len().saturating_add(1))?;
+                    entries
+                        .try_reserve(1)
+                        .map_err(|_| Error::AllocationFailed {
+                            resource: "block index",
+                            requested,
+                        })?;
                     entries.push(entry.clone());
                 }
                 TOMBSTONE_BLOCK_ID => {
-                    let payload = entry.read_payload(&self.path)?;
+                    let logical_len =
+                        entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
+                    budget.consume(logical_len)?;
+                    let payload = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
                     if let Some(key) = decode_internal_key_payload::<T>(self.spec.endian, &payload)?
+                        && should_apply(state.get(&key), order)
                     {
-                        let should_remove = by_key
-                            .get(&key)
-                            .is_none_or(|old| entry.sequence > old.sequence);
-                        if should_remove {
-                            by_key.remove(&key);
-                        }
+                        let requested = index_bytes_for_count(state.len().saturating_add(1))?;
+                        state.try_reserve(1).map_err(|_| Error::AllocationFailed {
+                            resource: "keyed index",
+                            requested,
+                        })?;
+                        state.insert(key, (order, None));
                     }
                 }
                 _ => {}
             }
         }
-        let blocks = BlockVec::new(self.spec, self.path.clone(), entries);
+        let mut by_key = HashMap::new();
+        let requested = index_bytes_for_count(state.len())?;
+        by_key
+            .try_reserve(state.len())
+            .map_err(|_| Error::AllocationFailed {
+                resource: "keyed index",
+                requested,
+            })?;
+        for (key, (_, entry)) in state {
+            if let Some(entry) = entry {
+                by_key.insert(key, entry);
+            }
+        }
+        let blocks = BlockVec::new(self.spec, self.snapshot.clone(), entries);
         Ok(KeyedBlockVec::from_parts(blocks, by_key))
     }
 
@@ -1767,17 +2409,29 @@ impl VarveFile {
     {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         let mut state: HashMap<T::Key, (MergeOrder, Option<T>)> = HashMap::new();
+        let mut budget = MaterializationBudget::new(self.spec);
         apply_merge_entries::<T>(
             self.spec,
-            &self.path,
+            &self.snapshot,
             &self.index,
             MergeShard::single_file(),
             &mut state,
+            &mut budget,
         )?;
-        Ok(state
-            .into_iter()
-            .filter_map(|(key, (_, value))| value.map(|value| (key, value)))
-            .collect())
+        let requested = allocation_bytes::<(T::Key, T)>(state.len(), "materialized keyed map")?;
+        let mut values = HashMap::new();
+        values
+            .try_reserve(state.len())
+            .map_err(|_| Error::AllocationFailed {
+                resource: "materialized keyed map",
+                requested,
+            })?;
+        for (key, (_, value)) in state {
+            if let Some(value) = value {
+                values.insert(key, value);
+            }
+        }
+        Ok(values)
     }
 
     pub fn scan(&self) -> impl Iterator<Item = BlockEvent> + '_ {
@@ -1794,26 +2448,63 @@ impl VarveFile {
         T::Key: Eq + Hash,
     {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
-        let mut tails = HashMap::new();
-        for entry in &self.index {
+        let mut tails: HashMap<T::Key, (MergeOrder, u64)> = HashMap::new();
+        let mut budget = MaterializationBudget::new(self.spec);
+        for (record_ordinal, entry) in self.index.iter().enumerate() {
+            let order = MergeOrder::for_record(0, entry.sequence, record_ordinal);
             match entry.block_id {
                 id if id == T::ID => {
-                    let payload = entry.read_logical_payload(self.spec, &self.path)?;
+                    let logical_len =
+                        entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
+                    budget.consume(logical_len)?;
+                    let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
                     let block: T =
                         decode_from_slice(&payload, T::ENDIAN.unwrap_or(self.spec.endian))?;
-                    tails.insert(block.key(), entry.record_offset);
+                    let key = block.key();
+                    if tails.get(&key).is_none_or(|(old, _)| order >= *old) {
+                        let requested = allocation_bytes::<(T::Key, (MergeOrder, u64))>(
+                            tails.len().saturating_add(1),
+                            "key tail offsets",
+                        )?;
+                        tails.try_reserve(1).map_err(|_| Error::AllocationFailed {
+                            resource: "key tail offsets",
+                            requested,
+                        })?;
+                        tails.insert(key, (order, entry.record_offset));
+                    }
                 }
                 TOMBSTONE_BLOCK_ID => {
-                    let payload = entry.read_payload(&self.path)?;
+                    let logical_len =
+                        entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
+                    budget.consume(logical_len)?;
+                    let payload = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
                     if let Some(key) = decode_internal_key_payload::<T>(self.spec.endian, &payload)?
+                        && tails.get(&key).is_none_or(|(old, _)| order >= *old)
                     {
-                        tails.insert(key, entry.record_offset);
+                        let requested = allocation_bytes::<(T::Key, (MergeOrder, u64))>(
+                            tails.len().saturating_add(1),
+                            "key tail offsets",
+                        )?;
+                        tails.try_reserve(1).map_err(|_| Error::AllocationFailed {
+                            resource: "key tail offsets",
+                            requested,
+                        })?;
+                        tails.insert(key, (order, entry.record_offset));
                     }
                 }
                 _ => {}
             }
         }
-        Ok(tails)
+        let requested = allocation_bytes::<(T::Key, u64)>(tails.len(), "key tail offsets")?;
+        let mut offsets = HashMap::new();
+        offsets
+            .try_reserve(tails.len())
+            .map_err(|_| Error::AllocationFailed {
+                resource: "key tail offsets",
+                requested,
+            })?;
+        offsets.extend(tails.into_iter().map(|(key, (_, offset))| (key, offset)));
+        Ok(offsets)
     }
 
     pub fn write_matrix_cell<T: VarveMatrixBlock>(
@@ -1822,8 +2513,11 @@ impl VarveFile {
         value: &T,
     ) -> Result<()> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::write_cell(self.spec, matrix, &mut self.file, key, value)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::write_cell(self.spec, matrix, &mut self.file, key, value)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn write_matrix_cell_payload<T: VarveMatrixBlock>(
@@ -1832,8 +2526,11 @@ impl VarveFile {
         payload: &[u8],
     ) -> Result<()> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::write_cell_payload::<T>(self.spec, matrix, &mut self.file, key, payload)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::write_cell_payload::<T>(self.spec, matrix, &mut self.file, key, payload)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn copy_matrix_cell_bytes_from<From, To>(
@@ -1878,9 +2575,11 @@ impl VarveFile {
         F: FnOnce(MatrixCommitEvent) -> Result<()>,
     {
         self.write_matrix_cell(key, value)?;
-        barrier.sync_matrix_data(&mut self.file)?;
+        let sync_data = barrier.sync_matrix_data(&mut self.file);
+        self.poison_after_started_matrix_error(sync_data)?;
         self.commit_matrix_cell::<T>(key)?;
-        barrier.sync_matrix_commit(&mut self.file)?;
+        let sync_commit = barrier.sync_matrix_commit(&mut self.file);
+        self.poison_after_started_matrix_error(sync_commit)?;
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
         let event = crate::matrix::commit_event::<T>(self.spec, matrix, key)?;
         hook(event)
@@ -1903,13 +2602,30 @@ impl VarveFile {
 
     pub fn read_matrix_aux(&mut self, name: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::read_aux(matrix, &mut self.file, name, offset, len)
+        crate::matrix::read_aux_at_len(
+            matrix,
+            &mut self.file,
+            self.snapshot.len(),
+            name,
+            offset,
+            len,
+        )
     }
 
     pub fn write_matrix_aux(&mut self, name: &str, offset: u64, payload: &[u8]) -> Result<()> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::write_aux(matrix, &mut self.file, name, offset, payload)
+        let result = {
+            let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::write_aux_at_len(
+                matrix,
+                &mut self.file,
+                self.snapshot.len(),
+                name,
+                offset,
+                payload,
+            )
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn matrix_cell_status<T: VarveMatrixBlock>(
@@ -1922,26 +2638,38 @@ impl VarveFile {
 
     pub fn commit_matrix_cell<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<()> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::commit_cell::<T>(self.spec, matrix, &mut self.file, key)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::commit_cell::<T>(self.spec, matrix, &mut self.file, key)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn clear_matrix_cell<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<()> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::clear_cell::<T>(self.spec, matrix, &mut self.file, key)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::clear_cell::<T>(self.spec, matrix, &mut self.file, key)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn clear_matrix_cell_by_category(&mut self, category: &str, key: MatrixKey) -> Result<()> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::clear_cell_by_category(self.spec, matrix, &mut self.file, category, key)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::clear_cell_by_category(self.spec, matrix, &mut self.file, category, key)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn clear_matrix_category(&mut self, category: &str) -> Result<u64> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::clear_category(self.spec, matrix, &mut self.file, category)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::clear_category(self.spec, matrix, &mut self.file, category)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn apply_matrix_recovery_action(&mut self, action: &MatrixRecoveryAction) -> Result<()> {
@@ -1963,8 +2691,11 @@ impl VarveFile {
 
     pub fn rebuild_matrix_commit_from_crc<T: VarveMatrixBlock>(&mut self) -> Result<u64> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::rebuild_commit_map_from_crc::<T>(self.spec, matrix, &mut self.file)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::rebuild_commit_map_from_crc::<T>(self.spec, matrix, &mut self.file)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn is_matrix_single_committed(&self, name: &str) -> Result<bool> {
@@ -1974,8 +2705,11 @@ impl VarveFile {
 
     pub fn set_matrix_single_committed(&mut self, name: &str, value: bool) -> Result<()> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::set_single_committed(matrix, &mut self.file, name, value)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::set_single_committed(matrix, &mut self.file, name, value)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn is_matrix_channel_committed(&self, name: &str, channel: u64) -> Result<bool> {
@@ -1990,8 +2724,11 @@ impl VarveFile {
         value: bool,
     ) -> Result<()> {
         self.ensure_write()?;
-        let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::set_channel_committed(matrix, &mut self.file, name, channel, value)
+        let result = {
+            let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::set_channel_committed(matrix, &mut self.file, name, channel, value)
+        };
+        self.finish_matrix_mutation(result)
     }
 
     pub fn matrix_resume_signal(&self, category: &str) -> Result<MatrixResumeSignal> {
@@ -2042,6 +2779,12 @@ impl VarveFile {
         match read_matrix_sidecar_file(self.spec, category, path, expected_generation) {
             Ok(_) => crate::matrix::sidecar_resume_signal(matrix, category, true),
             Err(Error::IntegrityFeatureDisabled) => Err(Error::IntegrityFeatureDisabled),
+            Err(error @ Error::LimitExceeded { .. })
+            | Err(error @ Error::MissingResourceLimit { .. })
+            | Err(error @ Error::TrustedUnboundedRequiresExplicitApi { .. })
+            | Err(error @ Error::ResourceArithmeticOverflow { .. })
+            | Err(error @ Error::LengthOverflow { .. })
+            | Err(error @ Error::AllocationFailed { .. }) => Err(error),
             Err(_) => Ok(MatrixResumeSignal::DiscardRecommended),
         }
     }
@@ -2095,20 +2838,94 @@ impl VarveFile {
     }
 
     #[cfg(feature = "mmap")]
-    pub fn mmap_payloads(&self) -> Result<MmapPayloads> {
-        let file = File::open(&self.path)?;
-        // Mmap access is opt-in and read-only. Varve keeps owned canonical
-        // decoding as the default path and treats this mapping as a snapshot
-        // of the file/index at the time this method is called.
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-        let entry_set = self.index.iter().cloned().collect();
+    /// Maps the file's indexed record payloads as a read-only snapshot.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prevent mutation, truncation, replacement, backing-file
+    /// invalidation, and any other modification through every handle, thread,
+    /// and process for the full lifetime of the returned mapping. The mapping
+    /// remains tied to this already-open backing object even if its path is
+    /// renamed or replaced.
+    ///
+    /// Once that condition holds, Varve keeps safe accessors sound by creating
+    /// a read-only mapping from a clone of the existing handle, validating every
+    /// indexed extent with checked arithmetic, rejecting entries outside the
+    /// copied snapshot, and tying every returned slice to the mapping owner.
+    /// Use owned reads instead when external immutability cannot be guaranteed.
+    pub unsafe fn mmap_payloads(&self) -> Result<MmapPayloads> {
+        let mapped_len = self.snapshot.len();
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::FileLen, mapped_len)?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::MmapLen, mapped_len)?;
+        let record_count =
+            u64::try_from(self.index.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+                resource: "record count",
+            })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::Records, record_count)?;
+        let mmap_index_bytes = mmap_index_bytes_for_count(self.index.len())?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::IndexBytes, mmap_index_bytes)?;
+
+        let file = self.snapshot.try_clone_file()?;
+        let current_len = file.metadata()?.len();
+        for entry in &self.index {
+            validate_mmap_index_entry(entry, current_len)?;
+        }
+        let map_len =
+            usize::try_from(mapped_len).map_err(|_| Error::LengthOverflow { value: mapped_len })?;
+        // SAFETY: The caller guarantees that the cloned backing object remains
+        // immutable and valid for the mapping's entire lifetime.
+        let mmap = unsafe { memmap2::MmapOptions::new().len(map_len).map(&file)? };
+        for entry in &self.index {
+            validate_mmap_index_entry(entry, mapped_len)?;
+        }
+        let mut index = Vec::new();
+        index
+            .try_reserve_exact(self.index.len())
+            .map_err(|_| Error::AllocationFailed {
+                resource: "mmap index",
+                requested: mmap_index_bytes,
+            })?;
+        index.extend(self.index.iter().cloned());
+        let mut entry_set = std::collections::HashSet::new();
+        entry_set
+            .try_reserve(self.index.len())
+            .map_err(|_| Error::AllocationFailed {
+                resource: "mmap entry set",
+                requested: mmap_index_bytes,
+            })?;
+        entry_set.extend(self.index.iter().cloned());
         let mut by_block: HashMap<u32, Vec<usize>> = HashMap::new();
+        by_block
+            .try_reserve(
+                self.index
+                    .len()
+                    .min(self.spec.blocks.len().saturating_add(6)),
+            )
+            .map_err(|_| Error::AllocationFailed {
+                resource: "mmap block lookup",
+                requested: mmap_index_bytes,
+            })?;
         for (position, entry) in self.index.iter().enumerate() {
-            by_block.entry(entry.block_id).or_default().push(position);
+            let positions = by_block.entry(entry.block_id).or_default();
+            positions
+                .try_reserve(1)
+                .map_err(|_| Error::AllocationFailed {
+                    resource: "mmap block positions",
+                    requested: mmap_index_bytes,
+                })?;
+            positions.push(position);
         }
         Ok(MmapPayloads {
             spec: self.spec,
-            index: self.index.clone(),
+            index,
             entry_set,
             by_block,
             mmap,
@@ -2116,16 +2933,54 @@ impl VarveFile {
     }
 
     #[cfg(feature = "mmap")]
-    pub fn mmap_matrix(&self) -> Result<MmapMatrix> {
+    /// Maps the file's matrix regions as a read-only snapshot.
+    ///
+    /// # Safety
+    ///
+    /// The caller must prevent mutation, truncation, replacement, backing-file
+    /// invalidation, and any other modification through every handle, thread,
+    /// and process for the full lifetime of the returned mapping. The mapping
+    /// remains tied to this already-open backing object even if its path is
+    /// renamed or replaced.
+    ///
+    /// Once that condition holds, Varve keeps safe accessors sound by creating
+    /// a read-only mapping from a clone of the existing handle, validating the
+    /// complete matrix extent, checking every requested slot, and tying every
+    /// returned slice to the mapping owner. Use owned reads instead when
+    /// external immutability cannot be guaranteed.
+    pub unsafe fn mmap_matrix(&self) -> Result<MmapMatrix> {
         let layout = self
             .matrix
             .as_ref()
             .ok_or(Error::MatrixLayoutMissing)?
             .clone();
-        let file = File::open(&self.path)?;
-        // Matrix mmap is a read-only snapshot of the current file contents and
-        // VMAT layout, separate from append-log payload mmap windows.
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let mapped_len = self.snapshot.len();
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::FileLen, mapped_len)?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::MmapLen, mapped_len)?;
+        let record_count =
+            u64::try_from(self.index.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+                resource: "record count",
+            })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::Records, record_count)?;
+        self.spec.read_limits.check(
+            ReadLimitKey::IndexBytes,
+            index_bytes_for_count(self.index.len())?,
+        )?;
+        let file = self.snapshot.try_clone_file()?;
+        let current_len = file.metadata()?.len();
+        validate_mmap_range(0, layout.append_log_start(), current_len)?;
+        let map_len =
+            usize::try_from(mapped_len).map_err(|_| Error::LengthOverflow { value: mapped_len })?;
+        // SAFETY: The caller guarantees that the cloned backing object remains
+        // immutable and valid for the mapping's entire lifetime.
+        let mmap = unsafe { memmap2::MmapOptions::new().len(map_len).map(&file)? };
+        validate_mmap_range(0, layout.append_log_start(), mapped_len)?;
         Ok(MmapMatrix {
             spec: self.spec,
             layout,
@@ -2134,6 +2989,7 @@ impl VarveFile {
     }
 
     fn ensure_write(&self) -> Result<()> {
+        self.ensure_not_poisoned()?;
         match self.mode {
             OpenMode::ReadWrite => Ok(()),
             OpenMode::ReadOnly => Err(Error::Io(std::io::Error::new(
@@ -2143,6 +2999,75 @@ impl VarveFile {
         }
     }
 
+    fn rebind_published_generation(
+        &mut self,
+        sequence: u64,
+        new_index: Vec<RecordIndexEntry>,
+    ) -> Result<u64> {
+        let rebind = (|| -> Result<(File, SnapshotFile)> {
+            #[cfg(test)]
+            fail_rebind_after_publish_if_requested()?;
+            let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+            let snapshot = SnapshotFile::new(file.try_clone()?)?;
+            Ok((file, snapshot))
+        })();
+
+        match rebind {
+            Ok((file, snapshot)) => {
+                self.file = file;
+                self.snapshot = snapshot;
+                self.index = new_index;
+                self.publish_sequence(sequence);
+                Ok(sequence)
+            }
+            Err(source) => {
+                self.poisoned = true;
+                Err(Error::PublishedButRebindFailed {
+                    sequence,
+                    source: Box::new(source),
+                })
+            }
+        }
+    }
+
+    fn validate_source_generation(&self) -> Result<()> {
+        let current_len = self.file.metadata()?.len();
+        if current_len != self.snapshot.len() {
+            return Err(Error::InvalidCanonicalEncoding(
+                "native file changed after it was indexed",
+            ));
+        }
+        let mut file = self.snapshot.try_clone_file()?;
+        validate_generation_file(
+            self.spec,
+            &mut file,
+            append_log_start_for_file(self)?,
+            &self.index,
+        )
+    }
+
+    fn ensure_not_poisoned(&self) -> Result<()> {
+        if self.poisoned {
+            Err(Error::WriterPoisoned(WRITER_POISON_CONTEXT))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn finish_matrix_mutation<T>(&mut self, result: Result<T>) -> Result<T> {
+        if matches!(&result, Err(Error::Io(_))) {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn poison_after_started_matrix_error<T>(&mut self, result: Result<T>) -> Result<T> {
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
     fn ensure_user_block<T: VarveBlock>(&self) -> Result<()> {
         if T::ID >= RESERVED_BLOCK_ID_START {
             return Err(Error::ReservedBlockId(T::ID));
@@ -2150,10 +3075,9 @@ impl VarveFile {
         Ok(())
     }
 
-    fn next_sequence(&mut self) -> u64 {
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        sequence
+    fn publish_sequence(&mut self, sequence: u64) {
+        debug_assert_eq!(self.sequence_state, SequenceState::Available(sequence));
+        self.sequence_state = SequenceState::after_publishing(sequence);
     }
 
     fn write_record(
@@ -2196,9 +3120,74 @@ impl VarveFile {
         payload: &[u8],
         prev_same_key_offset: Option<u64>,
     ) -> Result<AppendInfo> {
-        let sequence = self.next_sequence();
-        self.file.seek(SeekFrom::End(0))?;
-        let record_offset = self.file.stream_position()?;
+        self.ensure_write()?;
+        let payload_len =
+            u64::try_from(payload.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::RecordPayloadLen, payload_len)?;
+        let logical_len = record_logical_len_from_parts(
+            self.spec,
+            block_id,
+            flags,
+            uncompressed_len_hint,
+            payload,
+        )?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::LogicalPayloadLen, logical_len)?;
+
+        let record_count =
+            self.index
+                .len()
+                .checked_add(1)
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "record count",
+                })?;
+        self.spec.read_limits.check(
+            ReadLimitKey::Records,
+            u64::try_from(record_count).map_err(|_| Error::ResourceArithmeticOverflow {
+                resource: "record count",
+            })?,
+        )?;
+        let index_bytes = index_bytes_for_count(record_count)?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::IndexBytes, index_bytes)?;
+        self.index
+            .try_reserve(1)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "record index",
+                requested: index_bytes,
+            })?;
+
+        let sequence = self.sequence_state.available()?;
+        let snapshot = AppendSnapshot {
+            eof: self.file.metadata()?.len(),
+            cursor: self.file.stream_position()?,
+            sequence_state: self.sequence_state,
+            index_len: self.index.len(),
+        };
+        let record_offset = snapshot.eof;
+        let payload_offset = record_offset.checked_add(RECORD_HEADER_LEN).ok_or(
+            Error::ResourceArithmeticOverflow {
+                resource: "file length",
+            },
+        )?;
+        let payload_end =
+            payload_offset
+                .checked_add(payload_len)
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "file length",
+                })?;
+        let prospective_len = payload_end
+            .checked_add(record_footer_len(self.spec))
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "file length",
+            })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::FileLen, prospective_len)?;
         let prev_same_block_offset = if self.spec.index_policy.block_offset_chain {
             self.index
                 .iter()
@@ -2226,27 +3215,43 @@ impl VarveFile {
             block_version,
             flags,
             sequence,
-            payload_len: payload.len() as u64,
+            payload_len,
             checksum: 0,
             uncompressed_len_hint,
         };
         let footer_bytes = footer.as_deref().unwrap_or(&[]);
         let checksum =
             checksum_record_fields(self.spec, record_offset, header, payload, footer_bytes)?;
-        write_record_header(
-            &mut self.file,
-            self.spec,
-            record_offset,
+        let header_bytes = encode_native_record_header(
             RecordHeaderFields { checksum, ..header },
+            record_offset,
+            record_footer_len(self.spec),
         )?;
-        self.file.write_all(payload)?;
-        let footer_offset = if let Some(footer) = footer {
-            let footer_offset = record_offset + RECORD_HEADER_LEN + payload.len() as u64;
-            self.file.write_all(&footer)?;
-            Some(footer_offset)
+        let footer_offset = if footer.is_some() {
+            payload_end
+                .checked_add(RECORD_FOOTER_LEN)
+                .ok_or(Error::LengthOverflow { value: payload_len })?;
+            Some(payload_end)
         } else {
             None
         };
+        let write_result = (|| -> Result<()> {
+            self.file.seek(SeekFrom::Start(record_offset))?;
+            self.file.write_all(&header_bytes)?;
+            #[cfg(test)]
+            fail_append_after_header_if_requested()?;
+            self.file.write_all(payload)?;
+            if let Some(footer) = &footer {
+                self.file.write_all(footer)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            return Err(self.rollback_append(snapshot, error));
+        }
+
+        let new_snapshot = self.snapshot.with_len(prospective_len);
+
         let committed =
             !self.spec.commit_policy.is_transaction_marker() || block_id == COMMIT_BLOCK_ID;
         let entry = RecordIndexEntry {
@@ -2255,8 +3260,8 @@ impl VarveFile {
             flags,
             sequence,
             record_offset,
-            payload_offset: record_offset + RECORD_HEADER_LEN,
-            payload_len: payload.len() as u64,
+            payload_offset,
+            payload_len,
             checksum,
             uncompressed_len_hint,
             footer_offset,
@@ -2266,19 +3271,69 @@ impl VarveFile {
         };
         let info = AppendInfo::from(&entry);
         self.index.push(entry);
+        self.snapshot = new_snapshot;
+        self.publish_sequence(sequence);
         Ok(info)
     }
 
+    fn rollback_append(&mut self, snapshot: AppendSnapshot, operation_error: Error) -> Error {
+        self.index.truncate(snapshot.index_len);
+        self.sequence_state = snapshot.sequence_state;
+
+        #[cfg(test)]
+        let truncate_result =
+            fail_rollback_if_requested().and_then(|()| self.file.set_len(snapshot.eof));
+        #[cfg(not(test))]
+        let truncate_result = self.file.set_len(snapshot.eof);
+        let cursor_result = self.file.seek(SeekFrom::Start(snapshot.cursor)).map(|_| ());
+        if let Some(source) = truncate_result.err().or_else(|| cursor_result.err()) {
+            self.poisoned = true;
+            Error::WriteRollbackFailed {
+                operation: "append record",
+                source,
+            }
+        } else {
+            operation_error
+        }
+    }
+
     fn write_index_checkpoint(&mut self) -> Result<u64> {
-        self.file.seek(SeekFrom::End(0))?;
-        let covered_offset = self.file.stream_position()?;
+        const CHECKPOINT_PREFIX_LEN: u64 = 4 + 2 + 8 + 8;
+        const CHECKPOINT_ENTRY_LEN: u64 = 4 + 2 + 2 + 8 + 8 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 1;
+        let covered_offset = self.file.metadata()?.len();
+        let entry_count =
+            u64::try_from(self.index.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+                resource: "checkpoint entry count",
+            })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::Records, entry_count)?;
+        let payload_len = entry_count
+            .checked_mul(CHECKPOINT_ENTRY_LEN)
+            .and_then(|bytes| bytes.checked_add(CHECKPOINT_PREFIX_LEN))
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "checkpoint payload length",
+            })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::RecordPayloadLen, payload_len)?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::LogicalPayloadLen, payload_len)?;
         let mut payload = Vec::new();
-        let entries: Vec<_> = self.index.iter().collect();
+        let payload_capacity = usize::try_from(payload_len)
+            .map_err(|_| Error::LengthOverflow { value: payload_len })?;
+        payload
+            .try_reserve_exact(payload_capacity)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "checkpoint payload",
+                requested: payload_len,
+            })?;
         payload.extend_from_slice(INDEX_CHECKPOINT_MAGIC);
         payload.extend_from_slice(&INDEX_CHECKPOINT_VERSION.to_le_bytes());
         payload.extend_from_slice(&covered_offset.to_le_bytes());
-        payload.extend_from_slice(&(entries.len() as u64).to_le_bytes());
-        for entry in entries {
+        payload.extend_from_slice(&entry_count.to_le_bytes());
+        for entry in &self.index {
             payload.extend_from_slice(&entry.block_id.to_le_bytes());
             payload.extend_from_slice(&entry.block_version.to_le_bytes());
             payload.extend_from_slice(&entry.flags.to_le_bytes());
@@ -2350,6 +3405,229 @@ impl VarveFile {
             .iter()
             .any(|entry| entry.block_id != COMMIT_BLOCK_ID)
     }
+}
+
+fn append_log_start_for_file(file: &VarveFile) -> Result<u64> {
+    if let Some(matrix) = &file.matrix {
+        return Ok(matrix.append_log_start());
+    }
+    let extension_len = u64::try_from(file_header_extensions(file.spec)?.len()).map_err(|_| {
+        Error::ResourceArithmeticOverflow {
+            resource: "file-header length",
+        }
+    })?;
+    Ok(native_file_header_len(file.spec, extension_len))
+}
+
+fn validate_generation_file(
+    spec: FormatSpec,
+    file: &mut File,
+    append_start: u64,
+    expected_entries: &[RecordIndexEntry],
+) -> Result<()> {
+    let file_len = check_open_file_len(spec, file)?;
+    let header_len = read_file_header(spec, file)?;
+    if append_start < header_len || append_start > file_len {
+        return Err(Error::InvalidCanonicalEncoding(
+            "invalid native append-log boundary",
+        ));
+    }
+    let mut accounting = ScanAccounting::default();
+    accounting.advance(spec, append_start)?;
+    let mut offset = append_start;
+    for (position, expected) in expected_entries.iter().enumerate() {
+        if expected.record_offset != offset {
+            return Err(Error::InvalidCanonicalEncoding(
+                "native record offsets are not contiguous",
+            ));
+        }
+        let actual = match read_record_entry_at(
+            spec,
+            file,
+            file_len,
+            offset,
+            None,
+            None,
+            &mut accounting,
+        )? {
+            RecordRead::Entry(entry) => entry,
+            RecordRead::RecoverableTail(tail) => {
+                return Err(Error::CorruptTail {
+                    offset: tail.offset,
+                });
+            }
+        };
+        if !record_headers_match(expected, &actual) {
+            return Err(Error::InvalidCanonicalEncoding(
+                "native record changed after it was indexed",
+            ));
+        }
+        if actual.block_id == INDEX_BLOCK_ID
+            && (1..=INDEX_CHECKPOINT_VERSION).contains(&actual.block_version)
+        {
+            let payload = actual.read_payload_file_with_len(file, file_len)?;
+            inspect_index_checkpoint(
+                spec,
+                &payload,
+                append_start,
+                file_len,
+                &actual,
+                &expected_entries[..position],
+            )?;
+        }
+        offset = actual.checked_physical_end()?;
+    }
+    if offset != file_len {
+        return Err(Error::CorruptTail { offset });
+    }
+    validate_unique_sequences(expected_entries)
+}
+
+#[derive(Clone, Copy)]
+enum RewritePayload<'a> {
+    Bytes(&'a [u8]),
+    Snapshot { offset: u64, len: u64 },
+}
+
+fn rewrite_record_streaming(
+    spec: FormatSpec,
+    snapshot: &SnapshotFile,
+    output: &mut File,
+    mut entry: RecordIndexEntry,
+    payload: RewritePayload<'_>,
+) -> Result<RecordIndexEntry> {
+    let payload_len = match payload {
+        RewritePayload::Bytes(bytes) => {
+            u64::try_from(bytes.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?
+        }
+        RewritePayload::Snapshot { len, .. } => len,
+    };
+    spec.read_limits
+        .check(ReadLimitKey::RecordPayloadLen, payload_len)?;
+    let logical_len = match payload {
+        RewritePayload::Bytes(bytes) => record_logical_len_from_parts(
+            spec,
+            entry.block_id,
+            entry.flags,
+            entry.uncompressed_len_hint,
+            bytes,
+        )?,
+        RewritePayload::Snapshot { .. } => entry.logical_payload_len_snapshot(spec, snapshot)?,
+    };
+    spec.read_limits
+        .check(ReadLimitKey::LogicalPayloadLen, logical_len)?;
+
+    let record_offset = output.stream_position()?;
+    let payload_offset =
+        record_offset
+            .checked_add(RECORD_HEADER_LEN)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "rewrite file length",
+            })?;
+    let record_end =
+        payload_offset
+            .checked_add(payload_len)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "rewrite file length",
+            })?;
+    spec.read_limits.check(ReadLimitKey::FileLen, record_end)?;
+    let header = RecordHeaderFields {
+        block_id: entry.block_id,
+        block_version: entry.block_version,
+        flags: entry.flags,
+        sequence: entry.sequence,
+        payload_len,
+        checksum: 0,
+        uncompressed_len_hint: entry.uncompressed_len_hint,
+    };
+    write_record_header(output, spec, record_offset, header)?;
+    match payload {
+        RewritePayload::Bytes(bytes) => output.write_all(bytes)?,
+        RewritePayload::Snapshot { offset, len } => {
+            snapshot.copy_range_to(offset, len, output)?;
+        }
+    }
+
+    entry.record_offset = record_offset;
+    entry.payload_offset = payload_offset;
+    entry.payload_len = payload_len;
+    entry.footer_offset = None;
+    entry.prev_same_block_offset = None;
+    entry.prev_same_key_offset = None;
+    entry.checksum = match spec.integrity_policy {
+        IntegrityPolicy::None => 0,
+        IntegrityPolicy::Crc32 | IntegrityPolicy::Crc32WithHeader => {
+            checksum_record_file(spec, output, &entry, &[])?
+        }
+    };
+    output.seek(SeekFrom::Start(record_offset))?;
+    write_record_header(
+        output,
+        spec,
+        record_offset,
+        RecordHeaderFields {
+            checksum: entry.checksum,
+            ..header
+        },
+    )?;
+    output.seek(SeekFrom::Start(record_end))?;
+    Ok(entry)
+}
+
+fn encode_index_checkpoint_payload(
+    spec: FormatSpec,
+    entries: &[RecordIndexEntry],
+    covered_offset: u64,
+) -> Result<Vec<u8>> {
+    const PREFIX_LEN: u64 = 4 + 2 + 8 + 8;
+    const ENTRY_LEN: u64 = 4 + 2 + 2 + 8 + 8 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 1;
+    let count = u64::try_from(entries.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+        resource: "checkpoint entry count",
+    })?;
+    let payload_len = count
+        .checked_mul(ENTRY_LEN)
+        .and_then(|bytes| bytes.checked_add(PREFIX_LEN))
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "checkpoint payload length",
+        })?;
+    spec.read_limits.check(ReadLimitKey::Records, count)?;
+    spec.read_limits.check(
+        ReadLimitKey::IndexBytes,
+        index_bytes_for_count(entries.len())?,
+    )?;
+    spec.read_limits
+        .check(ReadLimitKey::RecordPayloadLen, payload_len)?;
+    spec.read_limits
+        .check(ReadLimitKey::LogicalPayloadLen, payload_len)?;
+    let capacity =
+        usize::try_from(payload_len).map_err(|_| Error::LengthOverflow { value: payload_len })?;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(capacity)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "checkpoint payload",
+            requested: payload_len,
+        })?;
+    payload.extend_from_slice(INDEX_CHECKPOINT_MAGIC);
+    payload.extend_from_slice(&INDEX_CHECKPOINT_VERSION.to_le_bytes());
+    payload.extend_from_slice(&covered_offset.to_le_bytes());
+    payload.extend_from_slice(&count.to_le_bytes());
+    for entry in entries {
+        payload.extend_from_slice(&entry.block_id.to_le_bytes());
+        payload.extend_from_slice(&entry.block_version.to_le_bytes());
+        payload.extend_from_slice(&entry.flags.to_le_bytes());
+        payload.extend_from_slice(&entry.sequence.to_le_bytes());
+        payload.extend_from_slice(&entry.record_offset.to_le_bytes());
+        payload.extend_from_slice(&entry.payload_offset.to_le_bytes());
+        payload.extend_from_slice(&entry.payload_len.to_le_bytes());
+        payload.extend_from_slice(&entry.checksum.to_le_bytes());
+        payload.extend_from_slice(&entry.uncompressed_len_hint.to_le_bytes());
+        payload.extend_from_slice(&entry.footer_offset.unwrap_or(0).to_le_bytes());
+        payload.extend_from_slice(&entry.prev_same_block_offset.unwrap_or(0).to_le_bytes());
+        payload.extend_from_slice(&entry.prev_same_key_offset.unwrap_or(0).to_le_bytes());
+        payload.push(u8::from(entry.committed));
+    }
+    Ok(payload)
 }
 
 fn encode_schema_manifest(spec: FormatSpec) -> Result<Vec<u8>> {
@@ -2734,6 +4012,11 @@ fn prepare_user_record_payload(
     kind: BlockKind,
     logical_payload: &[u8],
 ) -> Result<StoredPayload> {
+    spec.read_limits.check(
+        ReadLimitKey::LogicalPayloadLen,
+        u64::try_from(logical_payload.len())
+            .map_err(|_| Error::LengthOverflow { value: u64::MAX })?,
+    )?;
     let Some(compression) = variable_compression_for_block(spec, block_id) else {
         return Ok(uncompressed_user_payload(logical_payload));
     };
@@ -2756,7 +4039,7 @@ fn prepare_user_record_payload(
         compress_with_algorithm(compression.algorithm, compression.level, logical_payload)?;
     let stored_bytes = match compression.header_mode {
         CompressionHeaderMode::RecordExplicit => {
-            encode_compression_envelope(compression, logical_len, &compressed)
+            encode_compression_envelope(compression, logical_len, &compressed)?
         }
         CompressionHeaderMode::FileExplicit | CompressionHeaderMode::FormatContract => compressed,
     };
@@ -2783,6 +4066,39 @@ fn uncompressed_user_payload(logical_payload: &[u8]) -> StoredPayload {
         uncompressed_len_hint: 0,
         bytes: logical_payload.to_vec(),
     }
+}
+
+fn record_logical_len_from_parts(
+    spec: FormatSpec,
+    block_id: u32,
+    flags: u16,
+    uncompressed_len_hint: u32,
+    payload: &[u8],
+) -> Result<u64> {
+    if flags & RECORD_FLAG_COMPRESSED == 0 {
+        return u64::try_from(payload.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX });
+    }
+    let compression =
+        variable_compression_for_block(spec, block_id).ok_or(Error::InvalidCompressionHeader)?;
+    let logical_len = match compression.header_mode {
+        CompressionHeaderMode::RecordExplicit => {
+            let (_, logical_len, _) = decode_compression_envelope(payload)?;
+            logical_len
+        }
+        CompressionHeaderMode::FileExplicit | CompressionHeaderMode::FormatContract => {
+            if uncompressed_len_hint == 0 {
+                return Err(Error::InvalidCompressionHeader);
+            }
+            u64::from(uncompressed_len_hint)
+        }
+    };
+    if logical_len > compression.max_uncompressed_len {
+        return Err(Error::DecompressedLengthLimitExceeded {
+            actual: logical_len,
+            limit: compression.max_uncompressed_len,
+        });
+    }
+    Ok(logical_len)
 }
 
 fn decode_record_payload(
@@ -2830,8 +4146,21 @@ fn encode_compression_envelope(
     compression: VariableCompression,
     uncompressed_len: u64,
     compressed_payload: &[u8],
-) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(20 + compressed_payload.len());
+) -> Result<Vec<u8>> {
+    let capacity =
+        compressed_payload
+            .len()
+            .checked_add(20)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "compression envelope",
+            })?;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(capacity)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "compression envelope",
+            requested: u64::try_from(capacity).unwrap_or(u64::MAX),
+        })?;
     payload.extend_from_slice(COMPRESSION_ENVELOPE_MAGIC);
     payload.push(COMPRESSION_ENVELOPE_VERSION);
     payload.push(compression_algorithm_byte(compression.algorithm));
@@ -2840,7 +4169,7 @@ fn encode_compression_envelope(
     payload.extend_from_slice(&compression_level_exact(compression.level).to_le_bytes());
     payload.extend_from_slice(&uncompressed_len.to_le_bytes());
     payload.extend_from_slice(compressed_payload);
-    payload
+    Ok(payload)
 }
 
 fn decode_compression_envelope(payload: &[u8]) -> Result<(CompressionAlgorithm, u64, &[u8])> {
@@ -3101,15 +4430,37 @@ where
 {
     crate::collections::ensure_registered_block::<T>(spec)?;
     let mut state: HashMap<T::Key, (MergeOrder, Option<T>)> = HashMap::new();
-    apply_merge_file::<T, _>(spec, base, MergeShard { ordinal: 0 }, &mut state)?;
+    let mut budget = MaterializationBudget::new(spec);
+    apply_merge_file::<T, _>(
+        spec,
+        base,
+        MergeShard { ordinal: 0 },
+        &mut state,
+        &mut budget,
+    )?;
     for (index, delta) in deltas.iter().enumerate() {
-        apply_merge_file::<T, _>(spec, delta, MergeShard { ordinal: index + 1 }, &mut state)?;
+        apply_merge_file::<T, _>(
+            spec,
+            delta,
+            MergeShard { ordinal: index + 1 },
+            &mut state,
+            &mut budget,
+        )?;
     }
 
-    let mut final_values: Vec<(MergeOrder, T)> = state
-        .into_values()
-        .filter_map(|(order, value)| value.map(|value| (order, value)))
-        .collect();
+    let requested = allocation_bytes::<(MergeOrder, T)>(state.len(), "merged values")?;
+    let mut final_values = Vec::new();
+    final_values
+        .try_reserve_exact(state.len())
+        .map_err(|_| Error::AllocationFailed {
+            resource: "merged values",
+            requested,
+        })?;
+    final_values.extend(
+        state
+            .into_values()
+            .filter_map(|(order, value)| value.map(|value| (order, value))),
+    );
     final_values.sort_by_key(|(order, _)| *order);
     Ok(final_values)
 }
@@ -3151,6 +4502,7 @@ fn apply_merge_file<T, P>(
     path: P,
     shard: MergeShard,
     state: &mut HashMap<T::Key, (MergeOrder, Option<T>)>,
+    budget: &mut MaterializationBudget,
 ) -> Result<()>
 where
     T: VarveMerge,
@@ -3158,26 +4510,23 @@ where
     P: AsRef<Path>,
 {
     let file = VarveFile::open_readonly(spec, path)?;
-    apply_merge_entries::<T>(spec, &file.path, &file.index, shard, state)
+    apply_merge_entries::<T>(spec, &file.snapshot, &file.index, shard, state, budget)
 }
 
 fn apply_merge_entries<T>(
     spec: FormatSpec,
-    path: &Path,
+    snapshot: &SnapshotFile,
     entries: &[RecordIndexEntry],
     shard: MergeShard,
     state: &mut HashMap<T::Key, (MergeOrder, Option<T>)>,
+    budget: &mut MaterializationBudget,
 ) -> Result<()>
 where
     T: VarveMerge,
     T::Key: Eq + Hash,
 {
     for (record_ordinal, entry) in entries.iter().enumerate() {
-        let order = MergeOrder {
-            shard_ordinal: shard.ordinal,
-            sequence: entry.sequence,
-            record_ordinal,
-        };
+        let order = MergeOrder::for_record(shard.ordinal, entry.sequence, record_ordinal);
         match entry.block_id {
             id if id == T::ID => {
                 if entry.block_version != T::VERSION {
@@ -3187,24 +4536,38 @@ where
                         actual: entry.block_version,
                     });
                 }
-                let payload = entry.read_logical_payload(spec, path)?;
+                let logical_len = entry.logical_payload_len_snapshot(spec, snapshot)?;
+                budget.consume(logical_len)?;
+                let payload = entry.read_logical_payload_snapshot(spec, snapshot)?;
                 let block: T = decode_from_slice(&payload, T::ENDIAN.unwrap_or(spec.endian))?;
                 let key = block.key();
                 if should_apply(state.get(&key), order) {
+                    state.try_reserve(1).map_err(|_| Error::AllocationFailed {
+                        resource: "merge state",
+                        requested: logical_len,
+                    })?;
                     state.insert(key, (order, Some(block)));
                 }
             }
             TOMBSTONE_BLOCK_ID => {
-                let payload = entry.read_payload(path)?;
+                let logical_len = entry.logical_payload_len_snapshot(spec, snapshot)?;
+                budget.consume(logical_len)?;
+                let payload = entry.read_payload_snapshot(spec, snapshot)?;
                 let Some(key) = decode_internal_key_payload::<T>(spec.endian, &payload)? else {
                     continue;
                 };
                 if should_apply(state.get(&key), order) {
+                    state.try_reserve(1).map_err(|_| Error::AllocationFailed {
+                        resource: "merge state",
+                        requested: logical_len,
+                    })?;
                     state.insert(key, (order, None));
                 }
             }
             OP_BLOCK_ID => {
-                let payload = entry.read_payload(path)?;
+                let logical_len = entry.logical_payload_len_snapshot(spec, snapshot)?;
+                budget.consume(logical_len)?;
+                let payload = entry.read_payload_snapshot(spec, snapshot)?;
                 let Some((key, op)) = decode_internal_op_payload::<T>(spec.endian, &payload)?
                 else {
                     continue;
@@ -3242,6 +4605,16 @@ struct MergeOrder {
     record_ordinal: usize,
 }
 
+impl MergeOrder {
+    const fn for_record(shard_ordinal: usize, sequence: u64, record_ordinal: usize) -> Self {
+        Self {
+            shard_ordinal,
+            sequence,
+            record_ordinal,
+        }
+    }
+}
+
 fn should_apply<T>(current: Option<&(MergeOrder, Option<T>)>, order: MergeOrder) -> bool {
     current.is_none_or(|(old_order, _)| order >= *old_order)
 }
@@ -3262,28 +4635,10 @@ fn decode_internal_key_payload<T>(endian: Endian, payload: &[u8]) -> Result<Opti
 where
     T: VarveKeyedBlock,
 {
-    if payload.len() < 12 {
-        return Err(Error::UnexpectedEof);
-    }
-    let mut target = [0; 4];
-    target.copy_from_slice(&payload[..4]);
-    if u32::from_le_bytes(target) != T::ID {
+    let Some(key) = decode_native_internal_key_envelope(payload, T::ID)? else {
         return Ok(None);
-    }
-    let mut len = [0; 8];
-    len.copy_from_slice(&payload[4..12]);
-    let key_len = usize::try_from(u64::from_le_bytes(len)).map_err(|_| Error::LengthOverflow {
-        value: u64::from_le_bytes(len),
-    })?;
-    let key_start: usize = 12;
-    let key_end = key_start.checked_add(key_len).ok_or(Error::UnexpectedEof)?;
-    if key_end > payload.len() {
-        return Err(Error::UnexpectedEof);
-    }
-    Ok(Some(decode_from_slice(
-        &payload[key_start..key_end],
-        endian,
-    )?))
+    };
+    Ok(Some(decode_from_slice(key, endian)?))
 }
 
 fn encode_internal_op_payload<T>(endian: Endian, key: &T::Key, op: &T::Op) -> Result<Vec<u8>>
@@ -3305,39 +4660,11 @@ fn decode_internal_op_payload<T>(endian: Endian, payload: &[u8]) -> Result<Optio
 where
     T: VarveMerge,
 {
-    if payload.len() < 12 {
-        return Err(Error::UnexpectedEof);
-    }
-    let mut target = [0; 4];
-    target.copy_from_slice(&payload[..4]);
-    if u32::from_le_bytes(target) != T::ID {
+    let Some((key, op)) = decode_native_internal_op_envelope(payload, T::ID)? else {
         return Ok(None);
-    }
-    let mut key_len = [0; 8];
-    key_len.copy_from_slice(&payload[4..12]);
-    let key_len_value = u64::from_le_bytes(key_len);
-    let key_len = usize::try_from(key_len_value).map_err(|_| Error::LengthOverflow {
-        value: key_len_value,
-    })?;
-    let key_start: usize = 12;
-    let key_end = key_start.checked_add(key_len).ok_or(Error::UnexpectedEof)?;
-    let op_len_end = key_end.checked_add(8).ok_or(Error::UnexpectedEof)?;
-    if op_len_end > payload.len() {
-        return Err(Error::UnexpectedEof);
-    }
-    let key = decode_from_slice(&payload[key_start..key_end], endian)?;
-    let mut op_len = [0; 8];
-    op_len.copy_from_slice(&payload[key_end..op_len_end]);
-    let op_len_value = u64::from_le_bytes(op_len);
-    let op_len = usize::try_from(op_len_value).map_err(|_| Error::LengthOverflow {
-        value: op_len_value,
-    })?;
-    let op_start = op_len_end;
-    let op_end = op_start.checked_add(op_len).ok_or(Error::UnexpectedEof)?;
-    if op_end > payload.len() {
-        return Err(Error::UnexpectedEof);
-    }
-    let op = decode_from_slice(&payload[op_start..op_end], endian)?;
+    };
+    let key = decode_from_slice(key, endian)?;
+    let op = decode_from_slice(op, endian)?;
     Ok(Some((key, op)))
 }
 
@@ -3381,9 +4708,15 @@ fn read_matrix_layout_if_needed(
     spec: FormatSpec,
     file: &mut File,
     header_len: u64,
+    captured_len: u64,
 ) -> Result<Option<crate::matrix::MatrixLayout>> {
     if spec.has_matrix_blocks() {
-        Ok(Some(crate::matrix::read_layout(spec, file, header_len)?))
+        Ok(Some(crate::matrix::read_layout_at_len(
+            spec,
+            file,
+            header_len,
+            captured_len,
+        )?))
     } else {
         Ok(None)
     }
@@ -3391,6 +4724,41 @@ fn read_matrix_layout_if_needed(
 
 fn append_log_start(header_len: u64, matrix: Option<&crate::matrix::MatrixLayout>) -> u64 {
     matrix.map_or(header_len, crate::matrix::MatrixLayout::append_log_start)
+}
+
+fn ensure_native_write_limits(spec: FormatSpec) -> Result<()> {
+    for key in [
+        ReadLimitKey::FileLen,
+        ReadLimitKey::Records,
+        ReadLimitKey::IndexBytes,
+        ReadLimitKey::RecordPayloadLen,
+        ReadLimitKey::LogicalPayloadLen,
+    ] {
+        spec.read_limits.require(key)?;
+    }
+    Ok(())
+}
+
+fn ensure_native_open_limits(spec: FormatSpec) -> Result<()> {
+    ensure_native_write_limits(spec)?;
+    spec.read_limits.require(ReadLimitKey::ScanBytes)?;
+    Ok(())
+}
+
+fn check_initial_native_file_len(spec: FormatSpec) -> Result<()> {
+    let extension_len = u64::try_from(file_header_extensions(spec)?.len()).map_err(|_| {
+        Error::ResourceArithmeticOverflow {
+            resource: "file length",
+        }
+    })?;
+    let header_len = native_file_header_len(spec, extension_len);
+    spec.read_limits.check(ReadLimitKey::FileLen, header_len)
+}
+
+fn check_open_file_len(spec: FormatSpec, file: &File) -> Result<u64> {
+    let file_len = file.metadata()?.len();
+    spec.read_limits.check(ReadLimitKey::FileLen, file_len)?;
+    Ok(file_len)
 }
 
 fn ensure_matrix_byte_copy_compatible<From, To>() -> Result<()>
@@ -3418,19 +4786,42 @@ fn nonzero_offset(offset: u64) -> Option<u64> {
     if offset == 0 { None } else { Some(offset) }
 }
 
-fn handle_structural_tail(
-    file: &mut File,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanIntent {
+    ReadOnly,
+    Writer,
+    Recover,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecoverableTail {
     offset: u64,
-    allow_tail: bool,
-    recovery_policy: RecoveryPolicy,
-) -> Result<Option<RecordIndexEntry>> {
-    if allow_tail || recovery_policy == RecoveryPolicy::TruncateTail {
-        if recovery_policy == RecoveryPolicy::TruncateTail {
-            file.set_len(offset)?;
-        }
-        return Ok(None);
+    truncate_to: u64,
+}
+
+#[derive(Debug)]
+enum RecordRead {
+    Entry(RecordIndexEntry),
+    RecoverableTail(RecoverableTail),
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ScanAccounting {
+    advanced: u64,
+}
+
+impl ScanAccounting {
+    fn advance(&mut self, spec: FormatSpec, bytes: u64) -> Result<()> {
+        let advanced =
+            self.advanced
+                .checked_add(bytes)
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "scan bytes",
+                })?;
+        spec.read_limits.check(ReadLimitKey::ScanBytes, advanced)?;
+        self.advanced = advanced;
+        Ok(())
     }
-    Err(Error::CorruptTail { offset })
 }
 
 fn read_record_entry_at(
@@ -3438,25 +4829,60 @@ fn read_record_entry_at(
     file: &mut File,
     file_len: u64,
     offset: u64,
-    allow_tail: bool,
-    recovery_policy: RecoveryPolicy,
-) -> Result<Option<RecordIndexEntry>> {
-    if file_len - offset < RECORD_HEADER_LEN {
-        return handle_structural_tail(file, offset, allow_tail, recovery_policy);
+    partial_boundary: Option<u64>,
+    checksum_boundary: Option<u64>,
+    accounting: &mut ScanAccounting,
+) -> Result<RecordRead> {
+    let remaining = file_len
+        .checked_sub(offset)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "scan offset",
+        })?;
+    if remaining < RECORD_HEADER_LEN {
+        accounting.advance(spec, remaining)?;
+        return Ok(RecordRead::RecoverableTail(RecoverableTail {
+            offset,
+            truncate_to: offset,
+        }));
     }
     file.seek(SeekFrom::Start(offset))?;
     let mut entry = read_record_header(file, spec, offset)?;
     validate_record_entry(spec, &entry)?;
-    let payload_end = entry
-        .payload_offset
-        .checked_add(entry.payload_len)
-        .ok_or(Error::CorruptTail { offset })?;
-    let record_end = payload_end
-        .checked_add(record_footer_len(spec))
-        .ok_or(Error::CorruptTail { offset })?;
-    if record_end > file_len {
-        return handle_structural_tail(file, offset, allow_tail, recovery_policy);
+    spec.read_limits
+        .check(ReadLimitKey::RecordPayloadLen, entry.payload_len)?;
+    if !entry.is_compressed() {
+        spec.read_limits
+            .check(ReadLimitKey::LogicalPayloadLen, entry.payload_len)?;
     }
+    let payload_end = entry.payload_offset.checked_add(entry.payload_len).ok_or(
+        Error::ResourceArithmeticOverflow {
+            resource: "record extent",
+        },
+    )?;
+    let record_end = payload_end.checked_add(record_footer_len(spec)).ok_or(
+        Error::ResourceArithmeticOverflow {
+            resource: "record extent",
+        },
+    )?;
+    let record_len = record_end
+        .checked_sub(offset)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "record extent",
+        })?;
+    accounting.advance(spec, record_len)?;
+    if record_end > file_len {
+        let Some(truncate_to) = partial_boundary else {
+            return Err(Error::CorruptTail { offset });
+        };
+        return Ok(RecordRead::RecoverableTail(RecoverableTail {
+            offset,
+            truncate_to,
+        }));
+    }
+
+    let logical_len = entry.logical_payload_len_before_allocation(spec, file)?;
+    spec.read_limits
+        .check(ReadLimitKey::LogicalPayloadLen, logical_len)?;
 
     let footer = if spec.spec_needs_record_footer() {
         let footer_offset = payload_end;
@@ -3474,63 +4900,54 @@ fn read_record_entry_at(
         spec.integrity_policy,
         IntegrityPolicy::Crc32 | IntegrityPolicy::Crc32WithHeader
     ) {
-        let payload = entry.read_payload_file(file)?;
-        let header = RecordHeaderFields {
-            block_id: entry.block_id,
-            block_version: entry.block_version,
-            flags: entry.flags,
-            sequence: entry.sequence,
-            payload_len: entry.payload_len,
-            checksum: 0,
-            uncompressed_len_hint: entry.uncompressed_len_hint,
-        };
-        let expected = checksum_record_fields(
+        let expected = checksum_record_file(
             spec,
-            entry.record_offset,
-            header,
-            &payload,
-            footer.as_deref().unwrap_or(&[]),
+            file,
+            &entry,
+            footer.as_ref().map(|bytes| &bytes[..]).unwrap_or(&[]),
         )?;
         if expected != entry.checksum {
-            if spec.commit_policy.is_transaction_marker() && allow_tail {
-                if recovery_policy == RecoveryPolicy::TruncateTail {
-                    file.set_len(offset)?;
-                }
-                return Ok(None);
+            if let Some(truncate_to) = checksum_boundary {
+                return Ok(RecordRead::RecoverableTail(RecoverableTail {
+                    offset,
+                    truncate_to,
+                }));
             }
             return Err(Error::ChecksumMismatch { offset });
         }
     }
 
     if entry.block_id == COMMIT_BLOCK_ID {
-        let payload = entry.read_payload_file(file)?;
-        if payload != COMMIT_PAYLOAD_MAGIC {
+        if entry.payload_len != COMMIT_PAYLOAD_MAGIC.len() as u64 {
+            return Err(Error::InvalidCommitMarker { offset });
+        }
+        let mut payload = [0; COMMIT_PAYLOAD_MAGIC.len()];
+        file.seek(SeekFrom::Start(entry.payload_offset))?;
+        file.read_exact(&mut payload)?;
+        if &payload != COMMIT_PAYLOAD_MAGIC {
             return Err(Error::InvalidCommitMarker { offset });
         }
     }
 
-    Ok(Some(entry))
+    Ok(RecordRead::Entry(entry))
 }
 
 fn load_index(
     spec: FormatSpec,
     file: &mut File,
     header_len: u64,
-    recovery_policy: RecoveryPolicy,
+    intent: ScanIntent,
 ) -> Result<Vec<RecordIndexEntry>> {
-    if spec.commit_policy.is_transaction_marker() {
-        return scan_records_from(spec, file, header_len, recovery_policy);
+    let entries = scan_records_from(spec, file, header_len, intent)?;
+    validate_unique_sequences(&entries)?;
+    Ok(entries)
+}
+
+fn validated_snapshot_len(append_start: u64, entries: &[RecordIndexEntry]) -> Result<u64> {
+    match entries.last() {
+        Some(entry) => entry.checked_physical_end(),
+        None => Ok(append_start),
     }
-    if spec.index_policy.checkpoint_on_flush
-        && let Some(checkpoint) =
-            find_latest_valid_checkpoint(spec, file, header_len, recovery_policy)?
-    {
-        let mut entries = checkpoint.entries;
-        let mut tail = scan_records_from(spec, file, checkpoint.covered_offset, recovery_policy)?;
-        entries.append(&mut tail);
-        return Ok(entries);
-    }
-    scan_records_from(spec, file, header_len, recovery_policy)
 }
 
 fn truncate_uncommitted_tail_if_needed(
@@ -3542,11 +4959,14 @@ fn truncate_uncommitted_tail_if_needed(
     if !spec.commit_policy.is_transaction_marker() {
         return Ok(());
     }
-    let committed_end = entries
+    let committed_end = match entries
         .iter()
         .rev()
         .find(|entry| entry.block_id == COMMIT_BLOCK_ID)
-        .map_or(header_len, RecordIndexEntry::physical_end);
+    {
+        Some(entry) => entry.checked_physical_end()?,
+        None => header_len,
+    };
     if file.metadata()?.len() > committed_end {
         file.set_len(committed_end)?;
     }
@@ -3559,49 +4979,7 @@ struct IndexCheckpoint {
     entries: Vec<RecordIndexEntry>,
 }
 
-fn find_latest_valid_checkpoint(
-    spec: FormatSpec,
-    file: &mut File,
-    header_len: u64,
-    recovery_policy: RecoveryPolicy,
-) -> Result<Option<IndexCheckpoint>> {
-    let file_len = file.metadata()?.len();
-    let mut offset = header_len;
-    let mut latest = None;
-    let mut prefix_entries = Vec::new();
-    while offset < file_len {
-        let allow_tail = spec.commit_policy == CommitPolicy::RecordFooter;
-        let Some(entry) =
-            read_record_entry_at(spec, file, file_len, offset, allow_tail, recovery_policy)?
-        else {
-            break;
-        };
-        if entry.block_id == INDEX_BLOCK_ID
-            && (1..=INDEX_CHECKPOINT_VERSION).contains(&entry.block_version)
-        {
-            let payload = entry.read_payload_file(file)?;
-            if let Ok(checkpoint) = decode_index_checkpoint(&payload)
-                && validate_index_checkpoint(
-                    spec,
-                    file,
-                    header_len,
-                    file_len,
-                    &entry,
-                    &checkpoint,
-                    &prefix_entries,
-                )
-                .is_ok()
-            {
-                latest = Some(checkpoint);
-            }
-        }
-        offset = entry.physical_end();
-        prefix_entries.push(entry);
-    }
-    Ok(latest)
-}
-
-fn decode_index_checkpoint(payload: &[u8]) -> Result<IndexCheckpoint> {
+fn decode_index_checkpoint(spec: FormatSpec, payload: &[u8]) -> Result<IndexCheckpoint> {
     const PREFIX_LEN: usize = 4 + 2 + 8 + 8;
     const ENTRY_LEN_V1: usize = 4 + 2 + 2 + 8 + 8 + 8 + 8 + 4;
     const ENTRY_LEN_V2: usize = ENTRY_LEN_V1 + 4;
@@ -3627,7 +5005,11 @@ fn decode_index_checkpoint(payload: &[u8]) -> Result<IndexCheckpoint> {
     let mut count = [0; 8];
     count.copy_from_slice(&payload[14..22]);
     let count = u64::from_le_bytes(count);
+    spec.read_limits.check(ReadLimitKey::Records, count)?;
     let count_usize = usize::try_from(count).map_err(|_| Error::LengthOverflow { value: count })?;
+    let resident_bytes = index_bytes_for_count(count_usize)?;
+    spec.read_limits
+        .check(ReadLimitKey::IndexBytes, resident_bytes)?;
     let expected_len = PREFIX_LEN
         .checked_add(
             count_usize
@@ -3639,7 +5021,13 @@ fn decode_index_checkpoint(payload: &[u8]) -> Result<IndexCheckpoint> {
         return Err(Error::InvalidIndexCheckpoint);
     }
 
-    let mut entries = Vec::with_capacity(count_usize);
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(count_usize)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "checkpoint index",
+            requested: resident_bytes,
+        })?;
     let mut position = PREFIX_LEN;
     for _ in 0..count_usize {
         entries.push(read_index_entry_payload(
@@ -3652,6 +5040,35 @@ fn decode_index_checkpoint(payload: &[u8]) -> Result<IndexCheckpoint> {
         covered_offset,
         entries,
     })
+}
+
+fn inspect_index_checkpoint(
+    spec: FormatSpec,
+    payload: &[u8],
+    header_len: u64,
+    file_len: u64,
+    checkpoint_record: &RecordIndexEntry,
+    observed_prefix: &[RecordIndexEntry],
+) -> Result<()> {
+    match decode_index_checkpoint(spec, payload) {
+        Ok(checkpoint) => {
+            let _ = validate_index_checkpoint(
+                header_len,
+                file_len,
+                checkpoint_record,
+                &checkpoint,
+                observed_prefix,
+            );
+            Ok(())
+        }
+        Err(error @ Error::LimitExceeded { .. })
+        | Err(error @ Error::MissingResourceLimit { .. })
+        | Err(error @ Error::TrustedUnboundedRequiresExplicitApi { .. })
+        | Err(error @ Error::ResourceArithmeticOverflow { .. })
+        | Err(error @ Error::LengthOverflow { .. })
+        | Err(error @ Error::AllocationFailed { .. }) => Err(error),
+        Err(_) => Ok(()),
+    }
 }
 
 fn read_index_entry_payload(payload: &[u8], checkpoint_version: u16) -> RecordIndexEntry {
@@ -3718,8 +5135,6 @@ fn read_index_entry_payload(payload: &[u8], checkpoint_version: u16) -> RecordIn
 }
 
 fn validate_index_checkpoint(
-    spec: FormatSpec,
-    file: &mut File,
     header_len: u64,
     file_len: u64,
     checkpoint_record: &RecordIndexEntry,
@@ -3744,30 +5159,21 @@ fn validate_index_checkpoint(
 
     let mut previous_offset = header_len;
     for entry in &checkpoint.entries {
+        let expected_payload_offset = entry
+            .record_offset
+            .checked_add(RECORD_HEADER_LEN)
+            .ok_or(Error::InvalidIndexCheckpoint)?;
         if entry.record_offset < header_len
             || entry.record_offset < previous_offset
-            || entry.payload_offset != entry.record_offset + RECORD_HEADER_LEN
+            || entry.payload_offset != expected_payload_offset
             || entry.record_offset == checkpoint_record.record_offset
         {
             return Err(Error::InvalidIndexCheckpoint);
         }
-        let physical_end = entry.physical_end();
+        let physical_end = entry
+            .checked_physical_end()
+            .map_err(|_| Error::InvalidIndexCheckpoint)?;
         if physical_end > checkpoint.covered_offset || physical_end > file_len {
-            return Err(Error::InvalidIndexCheckpoint);
-        }
-        file.seek(SeekFrom::Start(entry.record_offset))?;
-        let actual = read_record_entry_at(
-            spec,
-            file,
-            file_len,
-            entry.record_offset,
-            false,
-            RecoveryPolicy::Strict,
-        )?;
-        let Some(actual) = actual else {
-            return Err(Error::InvalidIndexCheckpoint);
-        };
-        if !record_headers_match(entry, &actual) {
             return Err(Error::InvalidIndexCheckpoint);
         }
         previous_offset = physical_end;
@@ -3795,41 +5201,100 @@ fn scan_records_from(
     spec: FormatSpec,
     file: &mut File,
     header_len: u64,
-    recovery_policy: RecoveryPolicy,
+    intent: ScanIntent,
 ) -> Result<Vec<RecordIndexEntry>> {
     let file_len = file.metadata()?.len();
+    spec.read_limits.check(ReadLimitKey::FileLen, file_len)?;
     let mut offset = header_len;
     let mut entries = Vec::new();
     let mut latest_commit_position = None;
+    let mut latest_commit_end = None;
+    let mut accounting = ScanAccounting::default();
+    accounting.advance(spec, header_len)?;
     while offset < file_len {
-        let allow_tail = spec.commit_policy == CommitPolicy::RecordFooter
-            || (spec.commit_policy.is_transaction_marker() && latest_commit_position.is_some());
-        let entry =
-            match read_record_entry_at(spec, file, file_len, offset, allow_tail, recovery_policy) {
-                Ok(Some(entry)) => entry,
-                Ok(None) => break,
-                Err(_error)
-                    if spec.commit_policy.is_transaction_marker()
-                        && latest_commit_position.is_some() =>
-                {
-                    if recovery_policy == RecoveryPolicy::TruncateTail {
-                        file.set_len(offset)?;
-                    }
+        let partial_boundary = match spec.commit_policy {
+            CommitPolicy::None
+                if intent == ScanIntent::Recover
+                    && spec.recovery_policy == RecoveryPolicy::TruncateTail =>
+            {
+                Some(offset)
+            }
+            CommitPolicy::None => None,
+            CommitPolicy::RecordFooter => Some(offset),
+            CommitPolicy::TransactionMarker(_) => Some(latest_commit_end.unwrap_or(header_len)),
+        };
+        let checksum_boundary = if spec.commit_policy.is_transaction_marker() {
+            latest_commit_end
+        } else {
+            None
+        };
+        let entry = match read_record_entry_at(
+            spec,
+            file,
+            file_len,
+            offset,
+            partial_boundary,
+            checksum_boundary,
+            &mut accounting,
+        )? {
+            RecordRead::Entry(entry) => entry,
+            RecordRead::RecoverableTail(tail) => match intent {
+                ScanIntent::ReadOnly => break,
+                ScanIntent::Recover if spec.recovery_policy == RecoveryPolicy::TruncateTail => {
+                    file.set_len(tail.truncate_to)?;
                     break;
                 }
-                Err(error) => return Err(error),
-            };
-        offset = entry.physical_end();
+                ScanIntent::Writer if spec.commit_policy.is_transaction_marker() => break,
+                ScanIntent::Writer | ScanIntent::Recover => {
+                    return Err(Error::CorruptTail {
+                        offset: tail.offset,
+                    });
+                }
+            },
+        };
+        offset = entry
+            .checked_physical_end()
+            .map_err(|_| Error::ResourceArithmeticOverflow {
+                resource: "record extent",
+            })?;
+        let record_count = u64::try_from(entries.len())
+            .map_err(|_| Error::ResourceArithmeticOverflow {
+                resource: "record count",
+            })?
+            .checked_add(1)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "record count",
+            })?;
+        spec.read_limits
+            .check(ReadLimitKey::Records, record_count)?;
+        let index_bytes = index_bytes_for_count(usize::try_from(record_count).map_err(|_| {
+            Error::LengthOverflow {
+                value: record_count,
+            }
+        })?)?;
+        spec.read_limits
+            .check(ReadLimitKey::IndexBytes, index_bytes)?;
+        entries
+            .try_reserve(1)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "record index",
+                requested: index_bytes,
+            })?;
+        if entry.block_id == INDEX_BLOCK_ID
+            && (1..=INDEX_CHECKPOINT_VERSION).contains(&entry.block_version)
+        {
+            let payload = entry.read_payload_file_with_len(file, file_len)?;
+            inspect_index_checkpoint(spec, &payload, header_len, file_len, &entry, &entries)?;
+        }
         if entry.block_id == COMMIT_BLOCK_ID {
             latest_commit_position = Some(entries.len());
+            latest_commit_end = Some(offset);
         }
         entries.push(entry);
     }
+    validate_unique_sequences(&entries)?;
     if spec.commit_policy.is_transaction_marker() {
         let Some(position) = latest_commit_position else {
-            if recovery_policy == RecoveryPolicy::TruncateTail {
-                file.set_len(header_len)?;
-            }
             return Ok(Vec::new());
         };
         entries.truncate(position + 1);
@@ -3842,14 +5307,289 @@ fn scan_records_from(
 
 impl RecordIndexEntry {
     fn read_payload_file(&self, file: &mut File) -> Result<Vec<u8>> {
+        let file_len = file.metadata()?.len();
+        self.read_payload_file_with_len(file, file_len)
+    }
+
+    fn read_payload_file_with_len(&self, file: &mut File, file_len: u64) -> Result<Vec<u8>> {
+        self.validate_payload_extent(file_len)?;
+        self.read_payload_file_validated(file)
+    }
+
+    fn read_payload_file_validated(&self, file: &mut File) -> Result<Vec<u8>> {
         file.seek(SeekFrom::Start(self.payload_offset))?;
-        let payload_len = usize::try_from(self.payload_len).map_err(|_| Error::LengthOverflow {
-            value: self.payload_len,
-        })?;
-        let mut payload = vec![0; payload_len];
+        let mut payload = try_alloc_bytes(self.payload_len, PHYSICAL_PAYLOAD_RESOURCE)?;
         file.read_exact(&mut payload)?;
         Ok(payload)
     }
+
+    fn validate_payload_extent(&self, file_len: u64) -> Result<()> {
+        let payload_end =
+            self.payload_offset
+                .checked_add(self.payload_len)
+                .ok_or(Error::LengthOverflow {
+                    value: self.payload_len,
+                })?;
+        if payload_end > file_len {
+            return Err(Error::UnexpectedEof);
+        }
+        if let Some(footer_offset) = self.footer_offset {
+            if footer_offset != payload_end {
+                return Err(Error::CorruptTail {
+                    offset: self.record_offset,
+                });
+            }
+            if self.checked_physical_end()? > file_len {
+                return Err(Error::UnexpectedEof);
+            }
+        }
+        Ok(())
+    }
+
+    fn logical_payload_len_before_allocation(
+        &self,
+        spec: FormatSpec,
+        file: &mut File,
+    ) -> Result<u64> {
+        if !self.is_compressed() {
+            return Ok(self.payload_len);
+        }
+        validate_record_entry(spec, self)?;
+        let compression = variable_compression_for_block(spec, self.block_id)
+            .ok_or(Error::InvalidCompressionHeader)?;
+        let expected_len = match compression.header_mode {
+            CompressionHeaderMode::RecordExplicit => {
+                if self.payload_len < 20 {
+                    return Err(Error::InvalidCompressionHeader);
+                }
+                let mut prefix = [0; 20];
+                file.seek(SeekFrom::Start(self.payload_offset))?;
+                file.read_exact(&mut prefix)?;
+                let (_, expected_len, _) = decode_compression_envelope(&prefix)?;
+                expected_len
+            }
+            CompressionHeaderMode::FileExplicit | CompressionHeaderMode::FormatContract => {
+                if self.uncompressed_len_hint == 0 {
+                    return Err(Error::InvalidCompressionHeader);
+                }
+                u64::from(self.uncompressed_len_hint)
+            }
+        };
+        if expected_len > compression.max_uncompressed_len {
+            return Err(Error::DecompressedLengthLimitExceeded {
+                actual: expected_len,
+                limit: compression.max_uncompressed_len,
+            });
+        }
+        Ok(expected_len)
+    }
+
+    fn logical_payload_len_from_snapshot(
+        &self,
+        spec: FormatSpec,
+        snapshot: &SnapshotFile,
+    ) -> Result<u64> {
+        validate_record_entry(spec, self)?;
+        let compression = variable_compression_for_block(spec, self.block_id)
+            .ok_or(Error::InvalidCompressionHeader)?;
+        let expected_len = match compression.header_mode {
+            CompressionHeaderMode::RecordExplicit => {
+                if self.payload_len < 20 {
+                    return Err(Error::InvalidCompressionHeader);
+                }
+                let mut prefix = [0; 20];
+                snapshot.read_exact_at(self.payload_offset, &mut prefix)?;
+                let (_, expected_len, _) = decode_compression_envelope(&prefix)?;
+                expected_len
+            }
+            CompressionHeaderMode::FileExplicit | CompressionHeaderMode::FormatContract => {
+                if self.uncompressed_len_hint == 0 {
+                    return Err(Error::InvalidCompressionHeader);
+                }
+                u64::from(self.uncompressed_len_hint)
+            }
+        };
+        if expected_len > compression.max_uncompressed_len {
+            return Err(Error::DecompressedLengthLimitExceeded {
+                actual: expected_len,
+                limit: compression.max_uncompressed_len,
+            });
+        }
+        Ok(expected_len)
+    }
+
+    fn verify_snapshot_record(
+        &self,
+        spec: FormatSpec,
+        snapshot: &SnapshotFile,
+        payload: &[u8],
+    ) -> Result<()> {
+        if spec.integrity_policy == IntegrityPolicy::None {
+            return Ok(());
+        }
+
+        let mut header_bytes = [0; RECORD_HEADER_LEN as usize];
+        snapshot.read_exact_at(self.record_offset, &mut header_bytes)?;
+        let mut header_reader = header_bytes.as_slice();
+        let actual = read_native_record_header(&mut header_reader, self.record_offset)?.fields;
+        if actual.block_id != self.block_id
+            || actual.block_version != self.block_version
+            || actual.flags != self.flags
+            || actual.sequence != self.sequence
+            || actual.payload_len != self.payload_len
+            || actual.checksum != self.checksum
+            || actual.uncompressed_len_hint != self.uncompressed_len_hint
+        {
+            return Err(Error::ChecksumMismatch {
+                offset: self.record_offset,
+            });
+        }
+
+        let mut footer_bytes = [0; RECORD_FOOTER_LEN as usize];
+        let footer = if let Some(footer_offset) = self.footer_offset {
+            snapshot.read_exact_at(footer_offset, &mut footer_bytes)?;
+            let decoded = decode_record_footer(&footer_bytes, footer_offset, self.record_offset)?;
+            if decoded.prev_same_block_offset != self.prev_same_block_offset
+                || decoded.prev_same_key_offset != self.prev_same_key_offset
+            {
+                return Err(Error::ChecksumMismatch {
+                    offset: self.record_offset,
+                });
+            }
+            &footer_bytes[..]
+        } else {
+            &[]
+        };
+        let header = RecordHeaderFields {
+            block_id: self.block_id,
+            block_version: self.block_version,
+            flags: self.flags,
+            sequence: self.sequence,
+            payload_len: self.payload_len,
+            checksum: 0,
+            uncompressed_len_hint: self.uncompressed_len_hint,
+        };
+        let actual_checksum =
+            checksum_record_fields(spec, self.record_offset, header, payload, footer)?;
+        if actual_checksum != self.checksum {
+            return Err(Error::ChecksumMismatch {
+                offset: self.record_offset,
+            });
+        }
+        Ok(())
+    }
+}
+
+const fn limit_or_max(limit: Option<u64>) -> u64 {
+    match limit {
+        Some(limit) => limit,
+        None => u64::MAX,
+    }
+}
+
+fn ensure_payload_limit(resource: &'static str, actual: u64, limit: u64) -> Result<()> {
+    if actual > limit {
+        Err(Error::LimitExceeded {
+            resource,
+            actual,
+            limit,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn index_bytes_for_count(count: usize) -> Result<u64> {
+    let count = u64::try_from(count).map_err(|_| Error::ResourceArithmeticOverflow {
+        resource: "index bytes",
+    })?;
+    let entry_size = u64::try_from(size_of::<RecordIndexEntry>()).map_err(|_| {
+        Error::ResourceArithmeticOverflow {
+            resource: "index bytes",
+        }
+    })?;
+    count
+        .checked_mul(entry_size)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "index bytes",
+        })
+}
+
+fn allocation_bytes<T>(count: usize, resource: &'static str) -> Result<u64> {
+    u64::try_from(count)
+        .map_err(|_| Error::ResourceArithmeticOverflow { resource })?
+        .checked_mul(size_of::<T>() as u64)
+        .ok_or(Error::ResourceArithmeticOverflow { resource })
+}
+
+#[cfg(feature = "mmap")]
+fn mmap_index_bytes_for_count(count: usize) -> Result<u64> {
+    let count = u64::try_from(count).map_err(|_| Error::ResourceArithmeticOverflow {
+        resource: "mmap index bytes",
+    })?;
+    let entry_bytes = u64::try_from(size_of::<RecordIndexEntry>())
+        .map_err(|_| Error::ResourceArithmeticOverflow {
+            resource: "mmap index bytes",
+        })?
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(size_of::<usize>() as u64))
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "mmap index bytes",
+        })?;
+    count
+        .checked_mul(entry_bytes)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "mmap index bytes",
+        })
+}
+
+fn validate_unique_sequences(entries: &[RecordIndexEntry]) -> Result<()> {
+    let requested = u64::try_from(entries.len())
+        .map_err(|_| Error::ResourceArithmeticOverflow {
+            resource: "sequence uniqueness index",
+        })?
+        .checked_mul(size_of::<u64>() as u64)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "sequence uniqueness index",
+        })?;
+    let mut sequences = Vec::new();
+    sequences
+        .try_reserve_exact(entries.len())
+        .map_err(|_| Error::AllocationFailed {
+            resource: "sequence uniqueness index",
+            requested,
+        })?;
+    sequences.extend(entries.iter().map(|entry| entry.sequence));
+    sequences.sort_unstable();
+    if sequences.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(Error::InvalidCanonicalEncoding(
+            "duplicate native record sequence",
+        ));
+    }
+    Ok(())
+}
+
+fn clone_matching_entries<F>(
+    spec: FormatSpec,
+    source: &[RecordIndexEntry],
+    mut matches: F,
+) -> Result<Vec<RecordIndexEntry>>
+where
+    F: FnMut(&RecordIndexEntry) -> bool,
+{
+    let count = source.iter().filter(|entry| matches(entry)).count();
+    let requested = index_bytes_for_count(count)?;
+    spec.read_limits
+        .check(ReadLimitKey::IndexBytes, requested)?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(count)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "block index",
+            requested,
+        })?;
+    entries.extend(source.iter().filter(|entry| matches(entry)).cloned());
+    Ok(entries)
 }
 
 fn read_record_header(file: &mut File, _spec: FormatSpec, offset: u64) -> Result<RecordIndexEntry> {
@@ -3862,7 +5602,9 @@ fn read_record_header(file: &mut File, _spec: FormatSpec, offset: u64) -> Result
         flags: header.flags,
         sequence: header.sequence,
         record_offset: offset,
-        payload_offset: offset + decoded.lead_in_len,
+        payload_offset: offset
+            .checked_add(decoded.lead_in_len)
+            .ok_or(Error::CorruptTail { offset })?,
         payload_len: header.payload_len,
         checksum: header.checksum,
         uncompressed_len_hint: header.uncompressed_len_hint,
@@ -3890,9 +5632,12 @@ fn encode_record_footer(footer: RecordFooterFields) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn read_record_footer_bytes(file: &mut File, offset: u64) -> Result<Vec<u8>> {
+fn read_record_footer_bytes(
+    file: &mut File,
+    offset: u64,
+) -> Result<[u8; RECORD_FOOTER_LEN as usize]> {
     file.seek(SeekFrom::Start(offset))?;
-    let mut footer = vec![0; RECORD_FOOTER_LEN as usize];
+    let mut footer = [0; RECORD_FOOTER_LEN as usize];
     file.read_exact(&mut footer)?;
     Ok(footer)
 }
@@ -3930,6 +5675,77 @@ fn checksum_record_fields(
     )
 }
 
+fn checksum_record_file(
+    spec: FormatSpec,
+    file: &mut File,
+    entry: &RecordIndexEntry,
+    footer: &[u8],
+) -> Result<u32> {
+    let header = RecordHeaderFields {
+        block_id: entry.block_id,
+        block_version: entry.block_version,
+        flags: entry.flags,
+        sequence: entry.sequence,
+        payload_len: entry.payload_len,
+        checksum: 0,
+        uncompressed_len_hint: entry.uncompressed_len_hint,
+    };
+    let header_bytes = if spec.integrity_policy == IntegrityPolicy::Crc32WithHeader {
+        Some(encode_native_record_header(
+            header,
+            entry.record_offset,
+            record_footer_len(spec),
+        )?)
+    } else {
+        None
+    };
+    crc32_record_file(
+        file,
+        entry.payload_offset,
+        entry.payload_len,
+        header_bytes.as_ref().map(|bytes| &bytes[..]).unwrap_or(&[]),
+        footer,
+    )
+}
+
+#[cfg(feature = "integrity")]
+fn crc32_record_file(
+    file: &mut File,
+    payload_offset: u64,
+    payload_len: u64,
+    header: &[u8],
+    footer: &[u8],
+) -> Result<u32> {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(header);
+    file.seek(SeekFrom::Start(payload_offset))?;
+    let mut remaining = payload_len;
+    let mut buffer = [0; STREAM_BUFFER_LEN];
+    while remaining != 0 {
+        let chunk_len = usize::try_from(remaining.min(STREAM_BUFFER_LEN as u64)).map_err(|_| {
+            Error::ResourceArithmeticOverflow {
+                resource: "checksum buffer length",
+            }
+        })?;
+        file.read_exact(&mut buffer[..chunk_len])?;
+        hasher.update(&buffer[..chunk_len]);
+        remaining -= chunk_len as u64;
+    }
+    hasher.update(footer);
+    Ok(hasher.finalize())
+}
+
+#[cfg(not(feature = "integrity"))]
+fn crc32_record_file(
+    _file: &mut File,
+    _payload_offset: u64,
+    _payload_len: u64,
+    _header: &[u8],
+    _footer: &[u8],
+) -> Result<u32> {
+    Err(Error::IntegrityFeatureDisabled)
+}
+
 fn checksum_record_bytes(
     spec: FormatSpec,
     header: &[u8],
@@ -3950,13 +5766,41 @@ fn write_matrix_sidecar_file<P: AsRef<Path>>(
     generation: u64,
     payload: &[u8],
 ) -> Result<MatrixSidecarManifest> {
+    let payload_len =
+        u64::try_from(payload.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+    let format_magic_len =
+        u64::try_from(spec.magic.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+            resource: "matrix sidecar",
+        })?;
+    let category_len_u64 =
+        u64::try_from(category.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+            resource: "matrix sidecar",
+        })?;
+    crate::matrix::matrix_sidecar_write_len(
+        spec,
+        MATRIX_SIDECAR_FIXED_LEN as u64,
+        format_magic_len,
+        category_len_u64,
+        payload_len,
+    )?;
     let manifest = matrix_sidecar_manifest_for(spec, category, generation, payload)?;
     let magic_len =
         u16::try_from(manifest.format_magic.len()).map_err(|_| Error::InvalidMatrixSidecar)?;
     let category_len =
         u16::try_from(manifest.category.len()).map_err(|_| Error::InvalidMatrixSidecar)?;
-    let mut bytes =
-        Vec::with_capacity(MATRIX_SIDECAR_FIXED_LEN + magic_len as usize + category_len as usize);
+    let header_len = MATRIX_SIDECAR_FIXED_LEN
+        .checked_add(magic_len as usize)
+        .and_then(|len| len.checked_add(category_len as usize))
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "sidecar header length",
+        })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(header_len)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "sidecar header",
+            requested: header_len as u64,
+        })?;
     bytes.extend_from_slice(MATRIX_SIDECAR_MAGIC);
     bytes.extend_from_slice(&MATRIX_SIDECAR_VERSION.to_le_bytes());
     bytes.extend_from_slice(&0u16.to_le_bytes());
@@ -3972,10 +5816,10 @@ fn write_matrix_sidecar_file<P: AsRef<Path>>(
     debug_assert_eq!(bytes.len(), MATRIX_SIDECAR_FIXED_LEN);
     bytes.extend_from_slice(&manifest.format_magic);
     bytes.extend_from_slice(manifest.category.as_bytes());
-    bytes.extend_from_slice(payload);
 
     let mut file = File::create(sidecar_path)?;
     file.write_all(&bytes)?;
+    file.write_all(payload)?;
     file.sync_all()?;
     Ok(manifest)
 }
@@ -3986,49 +5830,53 @@ fn read_matrix_sidecar_file<P: AsRef<Path>>(
     sidecar_path: P,
     expected_generation: Option<u64>,
 ) -> Result<(MatrixSidecarManifest, Vec<u8>)> {
-    let bytes = std::fs::read(sidecar_path)?;
-    if bytes.len() < MATRIX_SIDECAR_FIXED_LEN || &bytes[0..4] != MATRIX_SIDECAR_MAGIC {
+    let mut file = File::open(sidecar_path)?;
+    let file_len = file.metadata()?.len();
+    crate::matrix::check_matrix_sidecar_file_len(spec, file_len)?;
+    if file_len < MATRIX_SIDECAR_FIXED_LEN as u64 {
         return Err(Error::InvalidMatrixSidecar);
     }
-    let version = u16::from_le_bytes(bytes[4..6].try_into().expect("slice"));
+    let mut fixed = [0; MATRIX_SIDECAR_FIXED_LEN];
+    file.read_exact(&mut fixed)?;
+    if &fixed[0..4] != MATRIX_SIDECAR_MAGIC {
+        return Err(Error::InvalidMatrixSidecar);
+    }
+    let version = u16::from_le_bytes(fixed[4..6].try_into().expect("slice"));
     if version != MATRIX_SIDECAR_VERSION {
         return Err(Error::InvalidMatrixSidecar);
     }
-    let format_version = u16::from_le_bytes(bytes[8..10].try_into().expect("slice"));
-    let magic_len = u16::from_le_bytes(bytes[10..12].try_into().expect("slice")) as usize;
-    let category_len = u16::from_le_bytes(bytes[12..14].try_into().expect("slice")) as usize;
-    let schema_hash = u64::from_le_bytes(bytes[16..24].try_into().expect("slice"));
-    let generation = u64::from_le_bytes(bytes[24..32].try_into().expect("slice"));
-    let payload_len = u64::from_le_bytes(bytes[32..40].try_into().expect("slice"));
-    let payload_crc32 = u32::from_le_bytes(bytes[40..44].try_into().expect("slice"));
-    let magic_start = MATRIX_SIDECAR_FIXED_LEN;
-    let category_start = magic_start
-        .checked_add(magic_len)
-        .ok_or(Error::InvalidMatrixSidecar)?;
-    let payload_start = category_start
-        .checked_add(category_len)
-        .ok_or(Error::InvalidMatrixSidecar)?;
-    let payload_len_usize =
-        usize::try_from(payload_len).map_err(|_| Error::InvalidMatrixSidecar)?;
-    let payload_end = payload_start
-        .checked_add(payload_len_usize)
-        .ok_or(Error::InvalidMatrixSidecar)?;
-    if payload_end != bytes.len() {
-        return Err(Error::InvalidMatrixSidecar);
-    }
-    let format_magic = bytes
-        .get(magic_start..category_start)
-        .ok_or(Error::InvalidMatrixSidecar)?
-        .to_vec();
-    let category_bytes = bytes
-        .get(category_start..payload_start)
-        .ok_or(Error::InvalidMatrixSidecar)?;
+    let format_version = u16::from_le_bytes(fixed[8..10].try_into().expect("slice"));
+    let flags = u16::from_le_bytes(fixed[6..8].try_into().expect("slice"));
+    let magic_len = u64::from(u16::from_le_bytes(fixed[10..12].try_into().expect("slice")));
+    let category_len = u64::from(u16::from_le_bytes(fixed[12..14].try_into().expect("slice")));
+    let reserved = u16::from_le_bytes(fixed[14..16].try_into().expect("slice"));
+    let schema_hash = u64::from_le_bytes(fixed[16..24].try_into().expect("slice"));
+    let generation = u64::from_le_bytes(fixed[24..32].try_into().expect("slice"));
+    let payload_len = u64::from_le_bytes(fixed[32..40].try_into().expect("slice"));
+    let payload_crc32 = u32::from_le_bytes(fixed[40..44].try_into().expect("slice"));
+    let trailing_reserved = u32::from_le_bytes(fixed[44..48].try_into().expect("slice"));
+    let plan = crate::matrix::matrix_sidecar_read_plan(
+        spec,
+        file_len,
+        MATRIX_SIDECAR_FIXED_LEN as u64,
+        magic_len,
+        category_len,
+        payload_len,
+        flags,
+        reserved,
+        trailing_reserved,
+    )?;
+    file.seek(SeekFrom::Start(plan.format_magic_offset))?;
+    let mut format_magic = try_alloc_bytes(magic_len, "sidecar format magic")?;
+    file.read_exact(&mut format_magic)?;
+    file.seek(SeekFrom::Start(plan.category_offset))?;
+    let mut category_bytes = try_alloc_bytes(category_len, "sidecar category")?;
+    file.read_exact(&mut category_bytes)?;
     let category_text =
-        String::from_utf8(category_bytes.to_vec()).map_err(|_| Error::InvalidMatrixSidecar)?;
-    let payload = bytes
-        .get(payload_start..payload_end)
-        .ok_or(Error::InvalidMatrixSidecar)?
-        .to_vec();
+        String::from_utf8(category_bytes).map_err(|_| Error::InvalidMatrixSidecar)?;
+    file.seek(SeekFrom::Start(plan.payload_offset))?;
+    let mut payload = try_alloc_bytes(plan.payload_len, "sidecar payload")?;
+    file.read_exact(&mut payload)?;
     let actual = crc32_bytes(&payload)?;
     if actual != payload_crc32 {
         return Err(Error::MatrixSidecarChecksumMismatch {
@@ -4049,6 +5897,19 @@ fn read_matrix_sidecar_file<P: AsRef<Path>>(
     Ok((manifest, payload))
 }
 
+fn try_alloc_bytes(len: u64, resource: &'static str) -> Result<Vec<u8>> {
+    let len = usize::try_from(len).map_err(|_| Error::LengthOverflow { value: len })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| Error::AllocationFailed {
+            resource,
+            requested: u64::try_from(len).unwrap_or(u64::MAX),
+        })?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
 fn matrix_sidecar_manifest_for(
     spec: FormatSpec,
     category: &str,
@@ -4058,11 +5919,30 @@ fn matrix_sidecar_manifest_for(
     if category.is_empty() {
         return Err(Error::InvalidMatrixSidecar);
     }
+    let mut format_magic = try_alloc_bytes(
+        u64::try_from(spec.magic.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+            resource: "matrix sidecar",
+        })?,
+        "sidecar format magic",
+    )?;
+    format_magic.copy_from_slice(spec.magic);
+    let category_len =
+        u64::try_from(category.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+            resource: "matrix sidecar",
+        })?;
+    let mut category_text = String::new();
+    category_text
+        .try_reserve_exact(category.len())
+        .map_err(|_| Error::AllocationFailed {
+            resource: "sidecar category",
+            requested: category_len,
+        })?;
+    category_text.push_str(category);
     Ok(MatrixSidecarManifest {
-        format_magic: spec.magic.to_vec(),
+        format_magic,
         format_version: spec.version,
         schema_hash: spec.computed_schema_hash(),
-        category: category.to_string(),
+        category: category_text,
         generation,
         payload_len: payload
             .len()
@@ -4112,6 +5992,7 @@ pub(crate) fn create_rewrite_temp_file(path: &Path) -> Result<(PathBuf, File)> {
             .map(|parent| parent.join(&file_name))
             .unwrap_or_else(|| PathBuf::from(&file_name));
         match OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(&temp_path)
@@ -4223,6 +6104,9 @@ impl WriterLock {
                     return Ok(Self { path, _file: file });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if policy == WriterLockBreakPolicy::Refuse {
+                        return Err(Error::WriterLockHeld(path.display().to_string()));
+                    }
                     let Some(info) = read_writer_lock_info(target_path)? else {
                         continue;
                     };
@@ -4259,14 +6143,33 @@ fn write_writer_lock_info(file: &mut File, info: &WriterLockInfo) -> Result<()> 
 
 fn read_writer_lock_info(target_path: &Path) -> Result<Option<WriterLockInfo>> {
     let path = lock_path(target_path);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(contents) => contents,
+    let file = match File::open(&path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(Error::WriterLockMalformed(path.display().to_string())),
     };
+    let len = file
+        .metadata()
+        .map_err(|_| Error::WriterLockMalformed(path.display().to_string()))?
+        .len();
+    if len > WRITER_LOCK_MAX_LEN {
+        return Err(Error::WriterLockMalformed(path.display().to_string()));
+    }
+    let capacity =
+        usize::try_from(len).map_err(|_| Error::WriterLockMalformed(path.display().to_string()))?;
+    let mut contents = String::new();
+    contents
+        .try_reserve_exact(capacity)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "writer lock metadata",
+            requested: len,
+        })?;
+    file.take(WRITER_LOCK_MAX_LEN.saturating_add(1))
+        .read_to_string(&mut contents)
+        .map_err(|_| Error::WriterLockMalformed(path.display().to_string()))?;
+    if contents.len() as u64 > WRITER_LOCK_MAX_LEN {
+        return Err(Error::WriterLockMalformed(path.display().to_string()));
+    }
     parse_writer_lock_info(&path, &contents).map(Some)
 }
 
@@ -4399,3 +6302,541 @@ fn _descriptor_for<T: VarveBlock>() -> BlockDescriptor {
 
 #[allow(dead_code)]
 struct TypedMarker<T>(PhantomData<T>);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{VarveDecode, VarveEncode};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct MatrixTestCell {
+        value: u32,
+    }
+
+    impl VarveEncode for MatrixTestCell {
+        const WIRE_TYPE: crate::WireType = crate::WireType::U32;
+
+        fn encode_varve(&self, encoder: &mut crate::Encoder) -> Result<()> {
+            self.value.encode_varve(encoder)
+        }
+    }
+
+    impl VarveDecode for MatrixTestCell {
+        const WIRE_TYPE: crate::WireType = crate::WireType::U32;
+
+        fn decode_varve(decoder: &mut crate::Decoder<'_>) -> Result<Self> {
+            Ok(Self {
+                value: u32::decode_varve(decoder)?,
+            })
+        }
+    }
+
+    impl VarveBlock for MatrixTestCell {
+        const ID: u32 = 41;
+        const VERSION: u16 = 1;
+        const KIND: BlockKind = BlockKind::Matrix;
+        const ENDIAN: Option<Endian> = None;
+    }
+
+    impl VarveMatrixBlock for MatrixTestCell {
+        const DIMENSIONS: [&'static str; 2] = ["scan", "ch"];
+        const CATEGORY: &'static str = "cells";
+        const SLOT_STRIDE: u64 = 4;
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct ReplaceTestBlock {
+        value: u64,
+    }
+
+    impl VarveEncode for ReplaceTestBlock {
+        const WIRE_TYPE: crate::WireType = crate::WireType::U64;
+
+        fn encode_varve(&self, encoder: &mut crate::Encoder) -> Result<()> {
+            self.value.encode_varve(encoder)
+        }
+    }
+
+    impl VarveDecode for ReplaceTestBlock {
+        const WIRE_TYPE: crate::WireType = crate::WireType::U64;
+
+        fn decode_varve(decoder: &mut crate::Decoder<'_>) -> Result<Self> {
+            Ok(Self {
+                value: u64::decode_varve(decoder)?,
+            })
+        }
+    }
+
+    impl VarveBlock for ReplaceTestBlock {
+        const ID: u32 = 42;
+        const VERSION: u16 = 1;
+        const KIND: BlockKind = BlockKind::Fixed;
+        const ENDIAN: Option<Endian> = None;
+    }
+
+    fn test_spec() -> FormatSpec {
+        FormatSpec::new(
+            b"VSTEST",
+            1,
+            Endian::Little,
+            0,
+            IndexPolicy::ScanOnOpen,
+            IntegrityPolicy::None,
+            RecoveryPolicy::Strict,
+            ManifestPolicy::None,
+            &[],
+        )
+        .with_read_limits(crate::ReadLimits::finite_all(u64::MAX))
+    }
+
+    fn matrix_test_spec() -> FormatSpec {
+        static BLOCKS: &[BlockDescriptor] = &[BlockDescriptor {
+            id: MatrixTestCell::ID,
+            name: "MatrixTestCell",
+            version: MatrixTestCell::VERSION,
+            kind: BlockKind::Matrix,
+            fields: MatrixTestCell::FIELDS,
+        }];
+        static DIMENSIONS: &[crate::MatrixDimensionDescriptor] = &[
+            crate::MatrixDimensionDescriptor { name: "scan" },
+            crate::MatrixDimensionDescriptor { name: "ch" },
+        ];
+        static COMMITS: &[crate::MatrixCommitDescriptor] = &[crate::MatrixCommitDescriptor {
+            name: "cells",
+            kind: crate::MatrixCommitKind::Cell,
+        }];
+        static MATRIX_BLOCKS: &[crate::MatrixBlockDescriptor] = &[crate::MatrixBlockDescriptor {
+            block_id: MatrixTestCell::ID,
+            dimensions: MatrixTestCell::DIMENSIONS,
+            category: MatrixTestCell::CATEGORY,
+            slot_stride: MatrixTestCell::SLOT_STRIDE,
+        }];
+
+        FormatSpec::new(
+            b"VSMTX",
+            1,
+            Endian::Little,
+            0,
+            IndexPolicy::ScanOnOpen,
+            IntegrityPolicy::None,
+            RecoveryPolicy::Strict,
+            ManifestPolicy::None,
+            BLOCKS,
+        )
+        .with_matrix_spec(DIMENSIONS, COMMITS, MATRIX_BLOCKS)
+        .with_read_limits(crate::ReadLimits::finite_all(u64::MAX))
+    }
+
+    fn replace_test_spec() -> FormatSpec {
+        static BLOCKS: &[BlockDescriptor] = &[BlockDescriptor {
+            id: ReplaceTestBlock::ID,
+            name: "ReplaceTestBlock",
+            version: ReplaceTestBlock::VERSION,
+            kind: BlockKind::Fixed,
+            fields: ReplaceTestBlock::FIELDS,
+        }];
+
+        FormatSpec::new(
+            b"VSRPL",
+            1,
+            Endian::Little,
+            0,
+            IndexPolicy::ScanOnOpen,
+            IntegrityPolicy::None,
+            RecoveryPolicy::Strict,
+            ManifestPolicy::None,
+            BLOCKS,
+        )
+        .with_read_limits(crate::ReadLimits::finite_all(u64::MAX))
+    }
+
+    #[test]
+    fn max_sequence_publishes_once_then_reopens_exhausted() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("max.varve");
+        let mut file = VarveFile::create(test_spec(), &path)?;
+        file.sequence_state = SequenceState::Available(u64::MAX);
+
+        assert_eq!(
+            file.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, b"max")?,
+            u64::MAX
+        );
+        assert_eq!(file.sequence_state, SequenceState::Exhausted);
+        let original_len = file.file.metadata()?.len();
+        let original_cursor = file.file.stream_position()?;
+        let original_index_len = file.index.len();
+        assert!(matches!(
+            file.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, b"again"),
+            Err(Error::SequenceExhausted)
+        ));
+        assert_eq!(file.file.metadata()?.len(), original_len);
+        assert_eq!(file.file.stream_position()?, original_cursor);
+        assert_eq!(file.index.len(), original_index_len);
+        drop(file);
+
+        let mut reopened = VarveFile::open(test_spec(), &path)?;
+        assert_eq!(reopened.sequence_state, SequenceState::Exhausted);
+        assert!(matches!(
+            reopened.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, b"again"),
+            Err(Error::SequenceExhausted)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn append_failure_rolls_back_and_preserves_sequence() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("rollback.varve");
+        let mut file = VarveFile::create(test_spec(), &path)?;
+        file.file.seek(SeekFrom::Start(0))?;
+        let original_len = file.file.metadata()?.len();
+        inject_write_fault(WriteFault::AppendAfterHeader);
+
+        assert!(matches!(
+            file.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, b"failed"),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(file.file.metadata()?.len(), original_len);
+        assert_eq!(file.file.stream_position()?, 0);
+        assert!(file.index.is_empty());
+        assert_eq!(file.sequence_state, SequenceState::Available(0));
+        assert!(!file.poisoned);
+        assert_eq!(
+            file.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, b"ok")?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_failure_poisons_mutation_flush_and_sync() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("poison.varve");
+        let mut file = VarveFile::create(test_spec(), &path)?;
+        inject_write_fault(WriteFault::AppendAfterHeaderWithRollbackFailure);
+
+        assert!(matches!(
+            file.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, b"failed"),
+            Err(Error::WriteRollbackFailed {
+                operation: "append record",
+                ..
+            })
+        ));
+        assert!(matches!(
+            file.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, b"again"),
+            Err(Error::WriterPoisoned("file"))
+        ));
+        assert!(matches!(file.flush(), Err(Error::WriterPoisoned("file"))));
+        assert!(matches!(file.sync(), Err(Error::WriterPoisoned("file"))));
+        Ok(())
+    }
+
+    #[test]
+    fn partial_matrix_overwrite_is_withdrawn_and_poisons_writer() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("matrix-partial.varve");
+        let spec = matrix_test_spec();
+        let key = MatrixKey::new(0, 0);
+        let mut file = VarveFile::create_with_dims(
+            spec,
+            &path,
+            MatrixDimensions::from_pairs([("scan", 1), ("ch", 1)]),
+        )?;
+        file.write_matrix_cell(key, &MatrixTestCell { value: 11 })?;
+        file.commit_matrix_cell::<MatrixTestCell>(key)?;
+        let original_len = file.file.metadata()?.len();
+
+        crate::matrix::inject_partial_slot_write_failure();
+        assert!(matches!(
+            file.write_matrix_cell(key, &MatrixTestCell { value: 22 }),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(file.file.metadata()?.len(), original_len);
+        assert_eq!(
+            file.matrix_cell_status::<MatrixTestCell>(key)?,
+            MatrixCellStatus::NotCommitted
+        );
+        assert!(matches!(
+            file.write_matrix_cell(key, &MatrixTestCell { value: 33 }),
+            Err(Error::WriterPoisoned("file"))
+        ));
+        assert!(matches!(file.flush(), Err(Error::WriterPoisoned("file"))));
+        assert!(matches!(file.sync(), Err(Error::WriterPoisoned("file"))));
+        drop(file);
+
+        let mut reopened = VarveFile::open_readonly(spec, &path)?;
+        assert_eq!(
+            reopened.matrix_cell_status::<MatrixTestCell>(key)?,
+            MatrixCellStatus::NotCommitted
+        );
+        assert!(matches!(
+            reopened.read_matrix_cell::<MatrixTestCell>(key),
+            Err(Error::MatrixNotCommitted)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_publish_rebind_failure_is_explicit_and_poisoned() -> Result<()> {
+        assert_publish_rebind_failure(false)
+    }
+
+    #[test]
+    fn rewrite_publish_rebind_failure_is_explicit_and_poisoned() -> Result<()> {
+        assert_publish_rebind_failure(true)
+    }
+
+    fn assert_publish_rebind_failure(rewrite: bool) -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join(if rewrite {
+            "rewrite-rebind.varve"
+        } else {
+            "fixed-rebind.varve"
+        });
+        let spec = replace_test_spec();
+        {
+            let mut initial = VarveFile::create(spec, &path)?;
+            initial.push(&ReplaceTestBlock { value: 1 })?;
+            initial.flush()?;
+        }
+
+        let old_reader = VarveFile::open_readonly(spec, &path)?;
+        let old_blocks = old_reader.blocks::<ReplaceTestBlock>()?;
+        let mut writer = VarveFile::open(spec, &path)?;
+        inject_write_fault(WriteFault::RebindAfterPublish);
+        let error = if rewrite {
+            writer
+                .replace_rewrite(0, &ReplaceTestBlock { value: 2 })
+                .expect_err("injected rewrite rebind failure must be returned")
+        } else {
+            writer
+                .replace_fixed(0, &ReplaceTestBlock { value: 2 })
+                .expect_err("injected fixed rebind failure must be returned")
+        };
+        match error {
+            Error::PublishedButRebindFailed { sequence, source } => {
+                assert_eq!(sequence, 1);
+                assert!(matches!(*source, Error::Io(_)));
+            }
+            other => panic!("unexpected publication error: {other:?}"),
+        }
+
+        assert_eq!(old_blocks.get(0)?, Some(ReplaceTestBlock { value: 1 }));
+        assert_eq!(
+            VarveFile::open_readonly(spec, &path)?
+                .blocks::<ReplaceTestBlock>()?
+                .get(0)?,
+            Some(ReplaceTestBlock { value: 2 })
+        );
+        assert!(matches!(
+            writer.push(&ReplaceTestBlock { value: 3 }),
+            Err(Error::WriterPoisoned("file"))
+        ));
+        assert_no_rewrite_temps(directory.path())?;
+
+        drop(writer);
+        let mut reopened = VarveFile::open(spec, &path)?;
+        assert_eq!(reopened.push(&ReplaceTestBlock { value: 3 })?, 2);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sharing_violation_preserves_generation_and_allows_retry() -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("sharing.varve");
+        let spec = replace_test_spec();
+        {
+            let mut initial = VarveFile::create(spec, &path)?;
+            initial.push(&ReplaceTestBlock { value: 1 })?;
+            initial.flush()?;
+        }
+
+        let old_reader = VarveFile::open_readonly(spec, &path)?;
+        let old_blocks = old_reader.blocks::<ReplaceTestBlock>()?;
+        let mut writer = VarveFile::open(spec, &path)?;
+        let blocker = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)?;
+
+        assert!(matches!(
+            writer.replace_fixed(0, &ReplaceTestBlock { value: 2 }),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(
+            writer.blocks::<ReplaceTestBlock>()?.get(0)?,
+            Some(ReplaceTestBlock { value: 1 })
+        );
+        assert_eq!(old_blocks.get(0)?, Some(ReplaceTestBlock { value: 1 }));
+        assert_no_rewrite_temps(directory.path())?;
+
+        drop(blocker);
+        writer.replace_fixed(0, &ReplaceTestBlock { value: 2 })?;
+        assert_eq!(old_blocks.get(0)?, Some(ReplaceTestBlock { value: 1 }));
+        assert_eq!(
+            VarveFile::open_readonly(spec, &path)?
+                .blocks::<ReplaceTestBlock>()?
+                .get(0)?,
+            Some(ReplaceTestBlock { value: 2 })
+        );
+        assert_no_rewrite_temps(directory.path())?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_concurrent_replacefilew_keeps_whole_generations_and_old_handle() -> Result<()> {
+        use std::sync::{Arc, Barrier};
+
+        for round in 0..64u32 {
+            let directory = tempfile::tempdir()?;
+            let target = directory.path().join("target.bin");
+            let replacement_a = directory.path().join("a.bin");
+            let replacement_b = directory.path().join("b.bin");
+            let old = vec![0x11; 16 * 1024];
+            let a = vec![0xA5; 16 * 1024];
+            let b = vec![0x5A; 16 * 1024];
+            std::fs::write(&target, &old)?;
+            std::fs::write(&replacement_a, &a)?;
+            std::fs::write(&replacement_b, &b)?;
+            let mut old_handle = File::open(&target)?;
+
+            let barrier = Arc::new(Barrier::new(3));
+            let first_barrier = Arc::clone(&barrier);
+            let first_target = target.clone();
+            let first = std::thread::spawn(move || {
+                first_barrier.wait();
+                replace_path_atomically(&replacement_a, &first_target)
+            });
+            let second_barrier = Arc::clone(&barrier);
+            let second_target = target.clone();
+            let second = std::thread::spawn(move || {
+                second_barrier.wait();
+                replace_path_atomically(&replacement_b, &second_target)
+            });
+            barrier.wait();
+            let first = first.join().expect("first ReplaceFileW thread panicked");
+            let second = second.join().expect("second ReplaceFileW thread panicked");
+
+            assert!(
+                first.is_ok() || second.is_ok(),
+                "round {round}: both replacements failed"
+            );
+            let published = std::fs::read(&target)?;
+            assert!(
+                published == old || published == a || published == b,
+                "round {round}: target was a partial or mixed generation (len={}, first={:?}, first_result={first:?}, second_result={second:?})",
+                published.len(),
+                published.first()
+            );
+            let mut retained = Vec::new();
+            old_handle.seek(SeekFrom::Start(0))?;
+            old_handle.read_to_end(&mut retained)?;
+            assert_eq!(retained, old, "round {round}: old handle was rebound");
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replacefilew_rejects_retained_replacement_handle() -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("target.bin");
+        let replacement = directory.path().join("replacement.bin");
+        let old = vec![0x11; 4 * 1024];
+        let new = vec![0xA5; 4 * 1024];
+        std::fs::write(&target, &old)?;
+        std::fs::write(&replacement, &new)?;
+        let mut retained = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&replacement)?;
+
+        assert!(matches!(
+            replace_path_atomically(&replacement, &target),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(std::fs::read(&target)?, old);
+        retained.seek(SeekFrom::Start(0))?;
+        let mut retained_bytes = Vec::new();
+        retained.read_to_end(&mut retained_bytes)?;
+        assert_eq!(retained_bytes, new);
+        drop(retained);
+        replace_path_atomically(&replacement, &target)?;
+        assert_eq!(std::fs::read(&target)?, new);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_external_truncate_returns_error_without_rebinding_or_panicking() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("truncate.varve");
+        let spec = replace_test_spec();
+        {
+            let mut writer = VarveFile::create(spec, &path)?;
+            writer.push(&ReplaceTestBlock { value: 7 })?;
+            writer.flush()?;
+        }
+
+        let reader = VarveFile::open_readonly(spec, &path)?;
+        let blocks = reader.blocks::<ReplaceTestBlock>()?;
+        OpenOptions::new().write(true).open(&path)?.set_len(0)?;
+        assert!(blocks.get(0).is_err());
+        Ok(())
+    }
+
+    fn assert_no_rewrite_temps(directory: &Path) -> Result<()> {
+        for entry in std::fs::read_dir(directory)? {
+            let name = entry?.file_name();
+            assert!(
+                !name.to_string_lossy().contains(".rewrite."),
+                "rewrite temp leaked after failed publication"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_matrix_commit_publish_keeps_memory_uncommitted_and_poisons_writer() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("matrix-commit-failure.varve");
+        let spec = matrix_test_spec();
+        let key = MatrixKey::new(0, 0);
+        let mut file = VarveFile::create_with_dims(
+            spec,
+            &path,
+            MatrixDimensions::from_pairs([("scan", 1), ("ch", 1)]),
+        )?;
+        file.write_matrix_cell(key, &MatrixTestCell { value: 44 })?;
+
+        crate::matrix::inject_bitmap_write_failure();
+        assert!(matches!(
+            file.commit_matrix_cell::<MatrixTestCell>(key),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(
+            file.matrix_cell_status::<MatrixTestCell>(key)?,
+            MatrixCellStatus::NotCommitted
+        );
+        assert!(matches!(file.sync(), Err(Error::WriterPoisoned("file"))));
+        drop(file);
+
+        let reopened = VarveFile::open_readonly(spec, &path)?;
+        assert_eq!(
+            reopened.matrix_cell_status::<MatrixTestCell>(key)?,
+            MatrixCellStatus::NotCommitted
+        );
+        Ok(())
+    }
+}

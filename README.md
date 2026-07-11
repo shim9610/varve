@@ -18,6 +18,8 @@ The workspace contains:
   layout copying by default.
 - Append-friendly record framing, offset-chain metadata, commit policies,
   checksum hooks, keyed collections, and lazy scan/index support.
+- Declarative hostile-input ceilings for file, scan, payload, index, matrix,
+  sidecar, materialization, and mmap resources.
 - Variable payload compression policies that can be declared globally, per
   block, or left unspecified for caller-defined behavior.
 - Adapter primitives for physical formats that need custom lead-ins, table of
@@ -33,11 +35,17 @@ remain caller code.
 | Document | Use it for |
 | --- | --- |
 | [Quickstart](docs/quickstart.md) | shortest path from format declaration to write/read |
+| [Changelog](CHANGELOG.md) | release changes and source-compatibility notes |
 | [Declaration And Internals](docs/declaration-and-internals.md) | how the DSL maps to generated Rust API, native bytes, records, fields, indexes, commits, and custom physical layouts |
 | [How Varve Works](docs/how-it-works.md) | mental model of generated code, append logs, matrix storage, durability |
 | [API Reference](docs/api-reference.md) | practical public API map |
 | [Format Author Guide](docs/format-author-guide.md) | policy choices, compression, commit modes, matrix blocks |
 | [Self-Check Guide](docs/self-check-guide.md) | deciding whether a failure is format, caller, data, feature, environment, or library |
+| [Security Review](docs/adversarial-security-review-2026-07-10.md) | hostile-input threat model, remediated findings, and residual caller obligations |
+| [Security Validation](docs/security-remediation-validation.md) | exact verification commands, compatibility evidence, and assurance limits |
+| [Fuzzing And Fault Injection](docs/fuzzing-and-fault-injection.md) | ASan fuzz targets, Miri checks, Windows race tests, and reproducible commands |
+| [Performance](docs/performance.md) | repeatable regression protocol, benchmark paths, and integration gate |
+| [Durability Model](docs/durability-model.md) | flush, sync, transaction-marker, matrix, and replacement ordering |
 | [Architecture](docs/architecture.md) | current architectural outline and implementation status |
 | [Requirements Boundary](docs/requirements-boundary.md) | what Varve owns versus what callers should implement |
 | [Adapter Toolkit Design](docs/adapter-toolkit-design.md) | generic adapter primitives for external binary formats |
@@ -52,6 +60,15 @@ varve_format! {
     pub format AppFormat {
         magic: b"APP";
         version: 1;
+        limits {
+            file_len: 1_073_741_824;
+            records: 1_000_000;
+            index_bytes: 134_217_728;
+            scan_bytes: 1_073_741_824;
+            record_payload: 16_777_216;
+            logical_payload: 67_108_864;
+            materialized_bytes: 268_435_456;
+        }
         schema_hash: computed;
         commit: transaction_marker(on_flush);
 
@@ -82,6 +99,11 @@ let user = reader.users()?.get(&7)?;
 The user declares the format and block types. Varve generates the typed
 methods, block metadata, required field encoding, record headers, commit
 handling, offset-chain metadata, and diagnostics.
+
+The finite `limits` policy is required for ordinary opens and is enforced
+before claim-sized reads or allocations. Applications may tighten it at open
+time with generated `*_with_limits` methods. Trusted-unbounded operation is a
+separate, visibly named API and is not selected by ordinary open methods.
 
 ## Examples
 
@@ -121,20 +143,20 @@ gate, file data, environment, or library invariant issues. See
 
 ## Status
 
-Varve is usable as an alpha library for experimentation and controlled internal
-projects. It already includes append-log blocks, keyed collections,
+Varve 0.2.0 is usable as an alpha library for experimentation and controlled
+deployments. It includes append-log blocks, keyed collections,
 transaction/footer commit policies, schema manifests, diagnostics, merge and
 compact helpers, variable-block compression, matrix storage, mmap, and opt-in
-zero-copy. Treat the wire format as pre-stabilization until the first v0.1
-release is cut and pinned.
+zero-copy. Valid native 0.1 wire bytes remain readable in 0.2.0, but the Rust API
+is still pre-1.0 and may evolve through semver-signaled minor releases.
 
 ## Local Verification
 
 ```powershell
-cargo fmt --check
-cargo test
-cargo test --all-features
-cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
+cargo test --workspace
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 Optional compatibility harnesses use Python reference libraries:

@@ -4,7 +4,9 @@ use std::fs::remove_file;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use varve::{Endian, Error, RecordIndexEntry, VarveBlock, decode_from_slice, varve_format};
+use varve::{
+    Endian, Error, ReadLimits, RecordIndexEntry, VarveBlock, decode_from_slice, varve_format,
+};
 
 #[cfg(feature = "zero-copy")]
 use varve::{BlockKind, Decoder, Encoder, VarveDecode, VarveEncode};
@@ -142,6 +144,24 @@ varve_format! {
     pub struct MmapFormat {
         magic: b"MZ";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         blocks: [
             MmapPoint,
@@ -159,6 +179,24 @@ varve_format! {
     pub struct MmapFormat {
         magic: b"MZ";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         blocks: [MmapPoint, MmapMessage];
     }
@@ -181,7 +219,8 @@ fn mmap_payload_windows_match_indexed_payload_reads() -> varve::Result<()> {
     }
 
     let file = MmapFormat::open_readonly(&path)?;
-    let mmap = file.mmap_payloads()?;
+    // SAFETY: The fixture is not modified while the mapping is alive.
+    let mmap = unsafe { file.mmap_payloads()? };
 
     for entry in file.index_entries() {
         assert_eq!(mmap.payload_window(entry)?, entry.read_payload(&path)?);
@@ -216,6 +255,8 @@ fn mmap_payload_windows_match_indexed_payload_reads() -> varve::Result<()> {
     );
     assert!(mmap.block_payload_window::<MmapMessage>(1)?.is_none());
 
+    drop(mmap);
+    drop(file);
     cleanup(&path);
     Ok(())
 }
@@ -232,7 +273,8 @@ fn mmap_rejects_entries_outside_snapshot() -> varve::Result<()> {
     }
 
     let file = MmapFormat::open_readonly(&path)?;
-    let mmap = file.mmap_payloads()?;
+    // SAFETY: The fixture is not modified while the mapping is alive.
+    let mmap = unsafe { file.mmap_payloads()? };
     let mut forged: RecordIndexEntry = mmap.index_entries()[0].clone();
     forged.sequence = forged.sequence.saturating_add(1);
 
@@ -241,12 +283,41 @@ fn mmap_rejects_entries_outside_snapshot() -> varve::Result<()> {
         Err(Error::MmapEntryNotInSnapshot)
     ));
 
+    drop(mmap);
+    drop(file);
     cleanup(&path);
     Ok(())
 }
 
 #[test]
-fn mmap_snapshot_does_not_expose_later_appends() -> varve::Result<()> {
+fn mmap_constructor_enforces_captured_mapping_length_limit() -> varve::Result<()> {
+    let path = temp_path("mapping_limit");
+    cleanup(&path);
+
+    {
+        let mut file = MmapFormat::create(&path)?;
+        file.push(&MmapPoint { x: 1, y: 2 })?;
+        file.flush()?;
+    }
+    let file_len = std::fs::metadata(&path)?.len();
+    let runtime = ReadLimits::finite_all(u64::MAX).with_max_mmap_len(file_len - 1);
+    let reader = MmapFormat::open_reader_with_limits(&path, runtime)?;
+
+    // SAFETY: No mapping is created because the constructor rejects the limit.
+    assert!(matches!(
+        unsafe { reader.mmap_payloads() },
+        Err(Error::LimitExceeded {
+            resource: "mmap length",
+            ..
+        })
+    ));
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn mmap_snapshot_refreshes_after_append() -> varve::Result<()> {
     let path = temp_path("snapshot_append");
     cleanup(&path);
 
@@ -257,16 +328,16 @@ fn mmap_snapshot_does_not_expose_later_appends() -> varve::Result<()> {
     }
 
     let mut file = MmapFormat::open(&path)?;
-    let snapshot = file.mmap_payloads()?;
+    // SAFETY: Appends occur only after the snapshot mapping is dropped.
+    let snapshot = unsafe { file.mmap_payloads()? };
     assert_eq!(snapshot.len(), 1);
+    drop(snapshot);
 
     file.push(&MmapPoint { x: 3, y: 4 })?;
     file.flush()?;
 
-    assert_eq!(snapshot.len(), 1);
-    assert!(snapshot.block_payload_window::<MmapPoint>(1)?.is_none());
-
-    let fresh = file.mmap_payloads()?;
+    // SAFETY: No mutation occurs while the fresh mapping is alive.
+    let fresh = unsafe { file.mmap_payloads()? };
     assert_eq!(fresh.len(), 2);
     let appended = fresh
         .block_payload_window::<MmapPoint>(1)?
@@ -276,6 +347,8 @@ fn mmap_snapshot_does_not_expose_later_appends() -> varve::Result<()> {
         MmapPoint { x: 3, y: 4 }
     );
 
+    drop(fresh);
+    drop(file);
     cleanup(&path);
     Ok(())
 }
@@ -296,7 +369,8 @@ fn zero_copy_raw_fixed_successfully_views_canonical_little_endian_payload() -> v
     }
 
     let file = MmapFormat::open_readonly(&path)?;
-    let mmap = file.mmap_payloads()?;
+    // SAFETY: The fixture is not modified while the mapping is alive.
+    let mmap = unsafe { file.mmap_payloads()? };
     assert_eq!(
         unsafe { mmap.raw_fixed::<RawPoint>(0) }?,
         Some(&RawPoint {
@@ -306,6 +380,8 @@ fn zero_copy_raw_fixed_successfully_views_canonical_little_endian_payload() -> v
     );
     assert!(unsafe { mmap.raw_fixed::<RawPoint>(1) }?.is_none());
 
+    drop(mmap);
+    drop(file);
     cleanup(&path);
     Ok(())
 }
@@ -323,7 +399,8 @@ fn zero_copy_rejects_variable_raw_block() -> varve::Result<()> {
     }
 
     let file = MmapFormat::open_readonly(&path)?;
-    let mmap = file.mmap_payloads()?;
+    // SAFETY: The fixture is not modified while the mapping is alive.
+    let mmap = unsafe { file.mmap_payloads()? };
 
     assert!(matches!(
         unsafe { mmap.raw_fixed::<RawVariable>(0) },
@@ -332,6 +409,8 @@ fn zero_copy_rejects_variable_raw_block() -> varve::Result<()> {
         })
     ));
 
+    drop(mmap);
+    drop(file);
     cleanup(&path);
     Ok(())
 }
@@ -349,7 +428,8 @@ fn zero_copy_rejects_raw_endian_mismatch() -> varve::Result<()> {
     }
 
     let file = MmapFormat::open_readonly(&path)?;
-    let mmap = file.mmap_payloads()?;
+    // SAFETY: The fixture is not modified while the mapping is alive.
+    let mmap = unsafe { file.mmap_payloads()? };
 
     assert!(matches!(
         unsafe { mmap.raw_fixed::<BigEndianRawPoint>(0) },
@@ -359,6 +439,8 @@ fn zero_copy_rejects_raw_endian_mismatch() -> varve::Result<()> {
         })
     ));
 
+    drop(mmap);
+    drop(file);
     cleanup(&path);
     Ok(())
 }
@@ -376,7 +458,8 @@ fn zero_copy_rejects_raw_payload_size_mismatch() -> varve::Result<()> {
     }
 
     let file = MmapFormat::open_readonly(&path)?;
-    let mmap = file.mmap_payloads()?;
+    // SAFETY: The fixture is not modified while the mapping is alive.
+    let mmap = unsafe { file.mmap_payloads()? };
 
     assert!(matches!(
         unsafe { mmap.raw_fixed::<SizeMismatchRawPoint>(0) },
@@ -386,6 +469,8 @@ fn zero_copy_rejects_raw_payload_size_mismatch() -> varve::Result<()> {
         })
     ));
 
+    drop(mmap);
+    drop(file);
     cleanup(&path);
     Ok(())
 }

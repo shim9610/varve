@@ -4,6 +4,52 @@ Varve migrations are explicit. Normal typed reads reject block version
 mismatches; migration code names both the source and target block types and
 performs semantic conversion in Rust.
 
+## Migrate Declarations To Explicit Limits
+
+Every `varve_format!` declaration must now choose finite hostile-input ceilings
+with `limits { ... }`. Manual `FormatSpec` construction must likewise install a
+complete `ReadLimits` policy before ordinary create/open methods are used.
+Runtime limits can only tighten declaration limits; they cannot silently widen
+them.
+
+Code that constructs `FormatSpec` with a public struct literal must add the new
+`read_limits` field. Prefer `FormatSpec::new(...)`, `FormatSpec::builder()`, or
+the generated `Format::spec()` method so future policy additions do not require
+editing a literal.
+
+Use `limits: trusted_unbounded;` and the visibly named
+`*_trusted_unbounded` methods only when the complete input provenance is under
+your control. Omission is intentionally a compile-time error in the macro and a
+fail-closed runtime error for manual specifications.
+
+## Migrate Fixed Replacement
+
+`ReplaceStrategy::FixedInPlace` was removed. Use
+`ReplaceStrategy::FixedCopyOnWrite` or `replace_fixed` for the safe same-size
+path. These publish a validated replacement generation atomically, so readers
+opened before replacement continue to observe their original snapshot.
+
+The lower-copy path is available only as
+`unsafe replace_fixed_in_place_exclusive`. Its caller must prove that no reader
+or writer can overlap the operation and must accept that it does not preserve
+old snapshots.
+
+## Canonical Map Decoding
+
+Variable-field map decoding now rejects duplicate and non-canonical key order.
+Consequently, decoded `HashMap<K, V>` keys require `K: Ord` in addition to the
+normal codec bounds. Custom map-like codecs must enforce equivalent duplicate
+and ordering rules if they accept hostile input.
+
+## Migrate From 0.1 To 0.2
+
+The 0.2 release intentionally changes three source contracts from 0.1:
+`FormatSpec` requires `read_limits`, `ReplaceStrategy::FixedInPlace` is removed,
+and `ReplaceStrategy::FixedCopyOnWrite` is added. Facade users of the re-exported
+core types are source-affected even when they depend only on `varve`. These
+changes avoid preserving a misleading safe in-place contract. Existing valid
+native 0.1 files do not require a wire migration.
+
 ## Version Blocks Deliberately
 
 Keep the same block id when the new type represents the same logical block, and

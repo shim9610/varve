@@ -20,6 +20,15 @@ varve_format! {
     pub format AppFormat {
         magic: b"APPDATA";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+        }
         endian: little;
         schema_hash: computed;
         extension: "vrv";
@@ -50,6 +59,14 @@ when enabled, and offset-chain footers are handled by the generated code and
 runtime writer. Application code should not hand-build Varve record headers or
 offset chains in normal use.
 
+The `limits` block is part of the runtime safety contract, not the wire schema.
+Choose ceilings from the largest legitimate dataset the application accepts,
+including cumulative materialization rather than only one record. Runtime code
+may pass a tighter `ReadLimits` value to generated `*_with_limits` methods. Do
+not use `limits: trusted_unbounded;` for files supplied by users, networks, or
+other processes; that policy is reached only through visibly named trusted
+open methods.
+
 Choose `fixed` for records whose canonical encoded payload size should stay
 stable. Fixed blocks still use Varve's canonical field codec, not Rust memory
 layout. Choose `variable` for evolvable records. Variable fields are encoded as
@@ -70,6 +87,18 @@ varve_format! {
     pub format AnalysisFormat {
         magic: b"ANALYSIS";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            record_payload: 67_108_864;
+            materialized_bytes: 268_435_456;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+        }
         schema_hash: computed;
 
         dims {
@@ -95,6 +124,14 @@ varve_format! {
 The first implementation focuses on dense `(scan, ch)` addressing, bounded slot
 payloads, `NotCommitted` reads, and same-size in-place overwrites. Append-log
 blocks may coexist after the preallocated matrix regions.
+
+Same-size overwrite is fail-safe within one writer: Varve clears the old commit
+and CRC-valid evidence before writing slot bytes, and a later explicit commit is
+the final visibility step. Partial matrix I/O poisons the writer and leaves the
+cell uncommitted. Matrix readers snapshot layout and commit maps, not immutable
+copies of every slot. Applications must not overlap a reader with in-place
+writes to slots it may read; use external read leases or a higher-level
+generation/version scheme when concurrent immutable snapshots are required.
 
 Rules to keep stable:
 
@@ -134,6 +171,15 @@ varve_format! {
     pub struct AppFormat {
         magic: b"APPDATA";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+        }
         endian: little;
         index: checkpoint_on_flush;
         manifest: embedded;
@@ -145,7 +191,7 @@ varve_format! {
 ## Register A Format
 
 `varve_format!` pins the file contract: magic bytes, format version, endian,
-optional schema hash, optional extension, optional integrity, optional commit
+required resource limits, optional schema hash, optional extension, optional integrity, optional commit
 policy, optional checkpoint/offset-chain index, optional recovery policy,
 optional embedded manifest, optional variable-block compression, and registered
 blocks.
@@ -186,6 +232,15 @@ varve_format! {
     pub struct CompressedFormat {
         magic: b"APPDATA";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+        }
         endian: little;
         extension: "vrv";
         compression: variable_blocks(
@@ -263,6 +318,14 @@ For caller-managed compressed blobs, prefer
 `ChunkedBytes::decode_to_vec_limited(limit)` over unbounded decoding when the
 limit is part of the format contract.
 
+For physical records, use
+`RecordIndexEntry::read_payload_limited(path, physical_limit)` to cap stored
+bytes, or
+`read_logical_payload_limited(spec, path, physical_limit, logical_limit)` to cap
+both the stored compressed allocation and post-decompression logical allocation
+before either allocation. These are caller policy controls; Varve does not guess
+a global domain ceiling.
+
 ## Integrity Policy
 
 `integrity: none` performs structural parsing only. It does not detect payload
@@ -325,6 +388,13 @@ varve_format! {
     pub format PhysicalFormat {
         magic: b"PHYS";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            scan_bytes: 8_589_934_592;
+            segments: 4_000_000;
+            index_bytes: 536_870_912;
+            record_payload: 268_435_456;
+        }
         schema_hash: computed;
         preset: none;
 
@@ -392,6 +462,12 @@ fields, header/footer bounds, exposes typed getters on generated
 an adapter needs to separate a valid complete prefix from a truncated or invalid
 tail before deciding whether the file should be rejected or reported as an
 incomplete external-format file.
+
+Returned callback errors trigger truncation back to the original EOF and leave
+the writer reusable only when rollback succeeds. A failed rollback poisons the
+writer. Panics are not caught; unwinding through a streaming callback also
+leaves that handle poisoned. Do not retain or reuse it after catching such a
+panic outside Varve.
 
 For concrete compatibility checks, `crates/varve/examples/tdms_physical/common.rs`
 is a façade over split TDMS example modules. The physical adapter implementation

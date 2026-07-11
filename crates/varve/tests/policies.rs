@@ -124,6 +124,24 @@ varve_format! {
     pub struct ContractFormat {
         magic: b"CONTRACT";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: 99;
         blocks: [ContractBlock, RichBlock, MapBlock, CustomCodecBlock];
@@ -134,6 +152,24 @@ varve_format! {
     pub struct CheckpointFormat {
         magic: b"CHECKPT";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         index: checkpoint_on_flush;
         blocks: [ContractBlock];
@@ -144,6 +180,24 @@ varve_format! {
     pub struct ManifestFormat {
         magic: b"MANIFEST";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         schema_hash: 77;
         manifest: embedded;
@@ -164,6 +218,24 @@ varve_format! {
     pub struct CrcFormat {
         magic: b"CRC";
         version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
         endian: little;
         integrity: crc32;
         blocks: [ContractBlock];
@@ -625,10 +697,10 @@ fn strict_open_rejects_and_recover_truncates_partial_tail() -> varve::Result<()>
         Err(Error::CorruptTail { .. })
     ));
     assert_eq!(std::fs::metadata(&path)?.len(), corrupt_len);
-    assert!(matches!(
-        recovering_spec.open_readonly(&path),
-        Err(Error::CorruptTail { .. })
-    ));
+    let readonly = recovering_spec.open_readonly(&path)?;
+    assert_eq!(readonly.blocks::<ContractBlock>()?.len(), 2);
+    drop(readonly);
+    assert_eq!(std::fs::metadata(&path)?.len(), corrupt_len);
 
     {
         let (file, report) = recovering_spec.open_recover_with_report(&path)?;
