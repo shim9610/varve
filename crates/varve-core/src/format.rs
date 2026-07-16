@@ -41,6 +41,20 @@ impl ReadLimit {
             Self::Missing | Self::TrustedUnbounded => None,
         }
     }
+
+    const fn overlay(self, value: Self) -> Self {
+        match value {
+            Self::Missing => self,
+            value => value,
+        }
+    }
+
+    const fn tighten(self, value: Self) -> Self {
+        match value {
+            Self::Missing => self,
+            value => self.meet(value),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +93,25 @@ macro_rules! read_limit_setters {
 impl ReadLimits {
     pub const MISSING: Self = Self::all(ReadLimit::Missing);
     pub const TRUSTED_UNBOUNDED: Self = Self::all(ReadLimit::TrustedUnbounded);
+    pub const STANDARD: Self = Self {
+        max_file_len: ReadLimit::Finite(u64::MAX),
+        max_records: ReadLimit::Finite(u64::MAX),
+        max_index_bytes: ReadLimit::Finite(u64::MAX),
+        max_scan_bytes: ReadLimit::Finite(u64::MAX),
+        max_record_payload_len: ReadLimit::Finite(64 * 1024 * 1024),
+        max_logical_payload_len: ReadLimit::Finite(256 * 1024 * 1024),
+        max_materialized_bytes: ReadLimit::Finite(1024 * 1024 * 1024),
+        max_segments: ReadLimit::Finite(u64::MAX),
+        max_matrix_dimension: ReadLimit::Finite(16_000_000),
+        max_matrix_cells: ReadLimit::Finite(16_000_000),
+        max_matrix_bitmap_bytes: ReadLimit::Finite(64 * 1024 * 1024),
+        max_matrix_crc_bytes: ReadLimit::Finite(128 * 1024 * 1024),
+        max_matrix_metadata_bytes: ReadLimit::Finite(256 * 1024 * 1024),
+        max_matrix_slot_region_len: ReadLimit::Finite(8 * 1024 * 1024 * 1024),
+        max_sidecar_len: ReadLimit::Finite(256 * 1024 * 1024),
+        max_mmap_len: ReadLimit::Finite(8 * 1024 * 1024 * 1024),
+        trusted_api: false,
+    };
 
     const fn all(value: ReadLimit) -> Self {
         Self {
@@ -114,6 +147,10 @@ impl ReadLimits {
         Self::all(ReadLimit::Finite(value))
     }
 
+    pub const fn standard() -> Self {
+        Self::STANDARD
+    }
+
     read_limit_setters! {
         (with_max_file_len, max_file_len),
         (with_max_records, max_records),
@@ -135,36 +172,84 @@ impl ReadLimits {
 
     pub const fn tighten(self, runtime: Self) -> Self {
         Self {
-            max_file_len: self.max_file_len.meet(runtime.max_file_len),
-            max_records: self.max_records.meet(runtime.max_records),
-            max_index_bytes: self.max_index_bytes.meet(runtime.max_index_bytes),
-            max_scan_bytes: self.max_scan_bytes.meet(runtime.max_scan_bytes),
+            max_file_len: self.max_file_len.tighten(runtime.max_file_len),
+            max_records: self.max_records.tighten(runtime.max_records),
+            max_index_bytes: self.max_index_bytes.tighten(runtime.max_index_bytes),
+            max_scan_bytes: self.max_scan_bytes.tighten(runtime.max_scan_bytes),
             max_record_payload_len: self
                 .max_record_payload_len
-                .meet(runtime.max_record_payload_len),
+                .tighten(runtime.max_record_payload_len),
             max_logical_payload_len: self
                 .max_logical_payload_len
-                .meet(runtime.max_logical_payload_len),
+                .tighten(runtime.max_logical_payload_len),
             max_materialized_bytes: self
                 .max_materialized_bytes
-                .meet(runtime.max_materialized_bytes),
-            max_segments: self.max_segments.meet(runtime.max_segments),
-            max_matrix_dimension: self.max_matrix_dimension.meet(runtime.max_matrix_dimension),
-            max_matrix_cells: self.max_matrix_cells.meet(runtime.max_matrix_cells),
+                .tighten(runtime.max_materialized_bytes),
+            max_segments: self.max_segments.tighten(runtime.max_segments),
+            max_matrix_dimension: self
+                .max_matrix_dimension
+                .tighten(runtime.max_matrix_dimension),
+            max_matrix_cells: self.max_matrix_cells.tighten(runtime.max_matrix_cells),
             max_matrix_bitmap_bytes: self
                 .max_matrix_bitmap_bytes
-                .meet(runtime.max_matrix_bitmap_bytes),
-            max_matrix_crc_bytes: self.max_matrix_crc_bytes.meet(runtime.max_matrix_crc_bytes),
+                .tighten(runtime.max_matrix_bitmap_bytes),
+            max_matrix_crc_bytes: self
+                .max_matrix_crc_bytes
+                .tighten(runtime.max_matrix_crc_bytes),
             max_matrix_metadata_bytes: self
                 .max_matrix_metadata_bytes
-                .meet(runtime.max_matrix_metadata_bytes),
+                .tighten(runtime.max_matrix_metadata_bytes),
             max_matrix_slot_region_len: self
                 .max_matrix_slot_region_len
-                .meet(runtime.max_matrix_slot_region_len),
-            max_sidecar_len: self.max_sidecar_len.meet(runtime.max_sidecar_len),
-            max_mmap_len: self.max_mmap_len.meet(runtime.max_mmap_len),
+                .tighten(runtime.max_matrix_slot_region_len),
+            max_sidecar_len: self.max_sidecar_len.tighten(runtime.max_sidecar_len),
+            max_mmap_len: self.max_mmap_len.tighten(runtime.max_mmap_len),
             trusted_api: false,
         }
+    }
+
+    /// Overlays explicitly supplied fields without treating the existing
+    /// values as permanent format ceilings.
+    pub const fn overlay(self, runtime: Self) -> Self {
+        Self {
+            max_file_len: self.max_file_len.overlay(runtime.max_file_len),
+            max_records: self.max_records.overlay(runtime.max_records),
+            max_index_bytes: self.max_index_bytes.overlay(runtime.max_index_bytes),
+            max_scan_bytes: self.max_scan_bytes.overlay(runtime.max_scan_bytes),
+            max_record_payload_len: self
+                .max_record_payload_len
+                .overlay(runtime.max_record_payload_len),
+            max_logical_payload_len: self
+                .max_logical_payload_len
+                .overlay(runtime.max_logical_payload_len),
+            max_materialized_bytes: self
+                .max_materialized_bytes
+                .overlay(runtime.max_materialized_bytes),
+            max_segments: self.max_segments.overlay(runtime.max_segments),
+            max_matrix_dimension: self
+                .max_matrix_dimension
+                .overlay(runtime.max_matrix_dimension),
+            max_matrix_cells: self.max_matrix_cells.overlay(runtime.max_matrix_cells),
+            max_matrix_bitmap_bytes: self
+                .max_matrix_bitmap_bytes
+                .overlay(runtime.max_matrix_bitmap_bytes),
+            max_matrix_crc_bytes: self
+                .max_matrix_crc_bytes
+                .overlay(runtime.max_matrix_crc_bytes),
+            max_matrix_metadata_bytes: self
+                .max_matrix_metadata_bytes
+                .overlay(runtime.max_matrix_metadata_bytes),
+            max_matrix_slot_region_len: self
+                .max_matrix_slot_region_len
+                .overlay(runtime.max_matrix_slot_region_len),
+            max_sidecar_len: self.max_sidecar_len.overlay(runtime.max_sidecar_len),
+            max_mmap_len: self.max_mmap_len.overlay(runtime.max_mmap_len),
+            trusted_api: false,
+        }
+    }
+
+    pub const fn resolve(self) -> Self {
+        Self::STANDARD.overlay(self)
     }
 
     pub(crate) const fn authorize_trusted_api(mut self) -> Self {
@@ -210,6 +295,11 @@ impl Default for ReadLimits {
         Self::MISSING
     }
 }
+
+/// Runtime resource policy for readers and writers.
+///
+/// `ReadLimits` remains the canonical name for source compatibility.
+pub type ResourceLimits = ReadLimits;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadLimitKey {
@@ -993,8 +1083,20 @@ impl FormatSpec {
         self
     }
 
+    /// Sets optional format-level defaults. These are operational defaults,
+    /// not wire-format or schema ceilings.
+    pub const fn with_resource_defaults(self, limits: ResourceLimits) -> Self {
+        self.with_read_limits(limits)
+    }
+
+    /// Resolves standard and format defaults, then overlays call-time policy.
+    pub const fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
+        self.read_limits = self.read_limits.resolve().overlay(limits);
+        self
+    }
+
     pub const fn tighten_read_limits(mut self, read_limits: ReadLimits) -> Self {
-        self.read_limits = self.read_limits.tighten(read_limits);
+        self.read_limits = self.read_limits.resolve().tighten(read_limits);
         self
     }
 
@@ -1004,8 +1106,16 @@ impl FormatSpec {
     }
 
     pub(crate) const fn ordinary_read(mut self) -> Self {
-        self.read_limits = self.read_limits.clear_trusted_api();
+        self.read_limits = self.read_limits.resolve().clear_trusted_api();
         self
+    }
+
+    pub(crate) const fn resolve_entrypoint(self) -> Self {
+        if self.read_limits.trusted_api {
+            self
+        } else {
+            self.ordinary_read()
+        }
     }
 
     pub const fn builder() -> FormatSpecBuilder {
@@ -1026,6 +1136,14 @@ impl FormatSpec {
         self.tighten_read_limits(limits).create(path)
     }
 
+    pub fn create_with_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<VarveFile> {
+        self.with_resource_limits(limits).create(path)
+    }
+
     pub fn create_trusted_unbounded<P: AsRef<Path>>(self, path: P) -> Result<VarveFile> {
         let self_ = self.authorize_trusted_read();
         self_.validate()?;
@@ -1044,6 +1162,14 @@ impl FormatSpec {
         limits: ReadLimits,
     ) -> Result<VarveWriter> {
         self.tighten_read_limits(limits).create_writer(path)
+    }
+
+    pub fn create_writer_with_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<VarveWriter> {
+        self.with_resource_limits(limits).create_writer(path)
     }
 
     pub fn create_writer_trusted_unbounded<P: AsRef<Path>>(self, path: P) -> Result<VarveWriter> {
@@ -1069,6 +1195,16 @@ impl FormatSpec {
         limits: ReadLimits,
     ) -> Result<VarveFile> {
         self.tighten_read_limits(limits)
+            .create_with_dims(path, dims)
+    }
+
+    pub fn create_with_dims_and_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        dims: MatrixDimensions,
+        limits: ResourceLimits,
+    ) -> Result<VarveFile> {
+        self.with_resource_limits(limits)
             .create_with_dims(path, dims)
     }
 
@@ -1102,6 +1238,16 @@ impl FormatSpec {
             .create_writer_with_dims(path, dims)
     }
 
+    pub fn create_writer_with_dims_and_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        dims: MatrixDimensions,
+        limits: ResourceLimits,
+    ) -> Result<VarveWriter> {
+        self.with_resource_limits(limits)
+            .create_writer_with_dims(path, dims)
+    }
+
     pub fn create_writer_with_dims_trusted_unbounded<P: AsRef<Path>>(
         self,
         path: P,
@@ -1126,6 +1272,14 @@ impl FormatSpec {
         self.tighten_read_limits(limits).open(path)
     }
 
+    pub fn open_with_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<VarveFile> {
+        self.with_resource_limits(limits).open(path)
+    }
+
     pub fn open_trusted_unbounded<P: AsRef<Path>>(self, path: P) -> Result<VarveFile> {
         let self_ = self.authorize_trusted_read();
         self_.validate()?;
@@ -1144,6 +1298,14 @@ impl FormatSpec {
         limits: ReadLimits,
     ) -> Result<VarveWriter> {
         self.tighten_read_limits(limits).open_writer(path)
+    }
+
+    pub fn open_writer_with_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<VarveWriter> {
+        self.with_resource_limits(limits).open_writer(path)
     }
 
     pub fn open_writer_trusted_unbounded<P: AsRef<Path>>(self, path: P) -> Result<VarveWriter> {
@@ -1186,6 +1348,14 @@ impl FormatSpec {
         self.tighten_read_limits(limits).open_readonly(path)
     }
 
+    pub fn open_readonly_with_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<VarveFile> {
+        self.with_resource_limits(limits).open_readonly(path)
+    }
+
     pub fn open_readonly_trusted_unbounded<P: AsRef<Path>>(self, path: P) -> Result<VarveFile> {
         let self_ = self.authorize_trusted_read();
         self_.validate()?;
@@ -1204,6 +1374,14 @@ impl FormatSpec {
         limits: ReadLimits,
     ) -> Result<VarveReader> {
         self.tighten_read_limits(limits).open_reader(path)
+    }
+
+    pub fn open_reader_with_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<VarveReader> {
+        self.with_resource_limits(limits).open_reader(path)
     }
 
     pub fn open_reader_trusted_unbounded<P: AsRef<Path>>(self, path: P) -> Result<VarveReader> {
@@ -1226,6 +1404,14 @@ impl FormatSpec {
         self.tighten_read_limits(limits).open_recover(path)
     }
 
+    pub fn open_recover_with_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<VarveFile> {
+        self.with_resource_limits(limits).open_recover(path)
+    }
+
     pub fn open_recover_trusted_unbounded<P: AsRef<Path>>(self, path: P) -> Result<VarveFile> {
         let self_ = self.authorize_trusted_read();
         self_.validate()?;
@@ -1244,6 +1430,14 @@ impl FormatSpec {
         limits: ReadLimits,
     ) -> Result<VarveWriter> {
         self.tighten_read_limits(limits).open_recover_writer(path)
+    }
+
+    pub fn open_recover_writer_with_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<VarveWriter> {
+        self.with_resource_limits(limits).open_recover_writer(path)
     }
 
     pub fn open_recover_writer_trusted_unbounded<P: AsRef<Path>>(
@@ -1273,6 +1467,15 @@ impl FormatSpec {
             .open_recover_with_report(path)
     }
 
+    pub fn open_recover_with_report_and_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<(VarveFile, crate::RecoveryReport)> {
+        self.with_resource_limits(limits)
+            .open_recover_with_report(path)
+    }
+
     pub fn open_recover_with_report_trusted_unbounded<P: AsRef<Path>>(
         self,
         path: P,
@@ -1297,6 +1500,15 @@ impl FormatSpec {
         limits: ReadLimits,
     ) -> Result<(VarveWriter, crate::RecoveryReport)> {
         self.tighten_read_limits(limits)
+            .open_recover_writer_with_report(path)
+    }
+
+    pub fn open_recover_writer_with_report_and_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<(VarveWriter, crate::RecoveryReport)> {
+        self.with_resource_limits(limits)
             .open_recover_writer_with_report(path)
     }
 
@@ -2546,6 +2758,69 @@ mod read_limit_tests {
         assert_eq!(effective.max_file_len, ReadLimit::Finite(50));
         assert_eq!(effective.max_records, ReadLimit::Finite(0));
         assert!(!effective.trusted_api);
+    }
+
+    #[test]
+    fn missing_fields_resolve_from_standard_policy() {
+        let resolved = ReadLimits::missing()
+            .with_max_record_payload_len(7)
+            .resolve();
+
+        assert_eq!(resolved.max_record_payload_len, ReadLimit::Finite(7));
+        assert_eq!(resolved.max_file_len, ReadLimit::Finite(u64::MAX));
+        assert_eq!(resolved.max_scan_bytes, ReadLimit::Finite(u64::MAX));
+        assert_eq!(resolved.max_records, ReadLimit::Finite(u64::MAX));
+        assert_eq!(resolved.max_segments, ReadLimit::Finite(u64::MAX));
+        assert_eq!(resolved.max_index_bytes, ReadLimit::Finite(u64::MAX));
+        assert_eq!(
+            resolved.max_logical_payload_len,
+            ReadLimits::STANDARD.max_logical_payload_len
+        );
+    }
+
+    #[test]
+    fn resource_overlay_can_raise_or_lower_format_defaults() {
+        let spec = FormatSpec::new(
+            b"LIMITS",
+            1,
+            Endian::Little,
+            0,
+            IndexPolicy::ScanOnOpen,
+            IntegrityPolicy::None,
+            RecoveryPolicy::Strict,
+            ManifestPolicy::None,
+            &[],
+        )
+        .with_resource_defaults(
+            ReadLimits::missing()
+                .with_max_record_payload_len(10)
+                .with_max_materialized_bytes(100),
+        );
+
+        let raised =
+            spec.with_resource_limits(ReadLimits::missing().with_max_record_payload_len(20));
+        assert_eq!(
+            raised.read_limits.max_record_payload_len,
+            ReadLimit::Finite(20)
+        );
+        assert_eq!(
+            raised.read_limits.max_materialized_bytes,
+            ReadLimit::Finite(100)
+        );
+
+        let lowered =
+            spec.with_resource_limits(ReadLimits::missing().with_max_record_payload_len(5));
+        assert_eq!(
+            lowered.read_limits.max_record_payload_len,
+            ReadLimit::Finite(5)
+        );
+
+        let tightened =
+            spec.tighten_read_limits(ReadLimits::missing().with_max_record_payload_len(20));
+        assert_eq!(
+            tightened.read_limits.max_record_payload_len,
+            ReadLimit::Finite(10)
+        );
     }
 
     #[test]

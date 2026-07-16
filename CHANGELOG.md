@@ -4,6 +4,44 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
+## 0.3.0 - 2026-07-17
+
+### Added
+
+- Runtime `ResourceLimits` policy APIs that may raise or lower optional format
+  defaults for a specific open or create operation.
+- Sequence-preserving `replace_block` and generated typed replacement methods
+  for native records whose encoded size grows or shrinks.
+- Replacement validation for keyed identity, snapshots, offset chains,
+  checkpoints, CRC/footer records, transaction visibility, and publication
+  failures.
+
+### Changed
+
+- `limits { ... }` is optional and may be partial. It supplies operational
+  defaults only and is not a wire-format or schema ceiling.
+- Standard append-log totals are uncapped: file length, scan bytes, record
+  count, segment count, and index bytes default to `u64::MAX`.
+- Finite standard limits remain on one-shot payload decoding, decompression,
+  materialization, mmap, sidecar, and matrix allocation surfaces.
+- Ordinary native, custom-layout, merge, and compact entrypoints resolve the
+  same runtime policy, including low-level reader and writer constructors.
+- All owned read results now validate complete extents and finite one-shot
+  limits before allocation. Nested codec decoding shares one materialization
+  budget, adapter cursors account owned values cumulatively, custom-layout
+  headers and payload reads honor it, and matrix CRC/zero scans stream through a
+  fixed buffer.
+- The TDMS byte-backed example captures and bounds an exact file extent instead
+  of reading to a moving EOF.
+
+### Compatibility
+
+- Existing complete `limits` declarations remain accepted, and legacy
+  `*_with_limits` methods retain tightening-only behavior.
+- Runtime limits are not persisted and do not change existing valid wire bytes
+  or schema hashes. No file migration is required from 0.2 solely for this
+  release.
+
 ## 0.2.0 - 2026-07-11
 
 ### Added

@@ -1,4 +1,4 @@
-use crate::{CompressionLevel, Error, Result, VarveDecode, VarveEncode, WireType};
+use crate::{CompressionLevel, Error, ReadLimits, Result, VarveDecode, VarveEncode, WireType};
 
 const CHUNKED_MAGIC: &[u8; 4] = b"VCHK";
 const CHUNKED_VERSION: u16 = 1;
@@ -80,30 +80,39 @@ impl ChunkedBytes {
     }
 
     pub fn decode_to_vec(&self) -> Result<Vec<u8>> {
-        self.decode_to_vec_limited(u64::MAX)
+        let limit = ReadLimits::STANDARD
+            .max_logical_payload_len
+            .require_finite("logical payload bytes")?;
+        self.decode_to_vec_limited(limit)
     }
 
     pub fn decode_to_vec_limited(&self, max_uncompressed_len: u64) -> Result<Vec<u8>> {
         let header = parse_header(&self.encoded)?;
+        validate_chunked_bytes(&self.encoded)?;
         if header.uncompressed_len > max_uncompressed_len {
             return Err(Error::DecompressedLengthLimitExceeded {
                 actual: header.uncompressed_len,
                 limit: max_uncompressed_len,
             });
         }
-        let mut entries = Vec::new();
-        let mut entry_offset = CHUNKED_HEADER_LEN;
-        for _ in 0..header.chunk_count {
-            entries.push(parse_entry(&self.encoded, entry_offset)?);
-            entry_offset = entry_offset
-                .checked_add(CHUNK_ENTRY_LEN)
-                .ok_or(Error::InvalidChunkedBytes)?;
-        }
-        let mut payload_offset = entry_offset;
-        let mut output = Vec::with_capacity(
-            usize::try_from(header.uncompressed_len).map_err(|_| Error::InvalidChunkedBytes)?,
-        );
-        for (index, entry) in entries.iter().enumerate() {
+        let output_len =
+            usize::try_from(header.uncompressed_len).map_err(|_| Error::InvalidChunkedBytes)?;
+        let entries_len = (header.chunk_count as usize)
+            .checked_mul(CHUNK_ENTRY_LEN)
+            .ok_or(Error::InvalidChunkedBytes)?;
+        let mut payload_offset = CHUNKED_HEADER_LEN
+            .checked_add(entries_len)
+            .ok_or(Error::InvalidChunkedBytes)?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(output_len)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "chunked bytes output",
+                requested: header.uncompressed_len,
+            })?;
+        for index in 0..header.chunk_count as usize {
+            let entry_offset = CHUNKED_HEADER_LEN + index * CHUNK_ENTRY_LEN;
+            let entry = parse_entry(&self.encoded, entry_offset)?;
             let stored_len = entry.stored_len as usize;
             let end = payload_offset
                 .checked_add(stored_len)
@@ -162,22 +171,48 @@ impl VarveDecode for ChunkedBytes {
 #[derive(Clone, Copy)]
 struct ChunkedHeader {
     algorithm: u8,
+    chunk_len: u32,
     uncompressed_len: u64,
     chunk_count: u32,
 }
 
 fn validate_chunked_bytes(encoded: &[u8]) -> Result<()> {
     let header = parse_header(encoded)?;
+    let expected_chunk_count = if header.uncompressed_len == 0 {
+        0
+    } else {
+        ((header.uncompressed_len - 1) / u64::from(header.chunk_len)) + 1
+    };
+    if u64::from(header.chunk_count) != expected_chunk_count {
+        return Err(Error::InvalidChunkedBytes);
+    }
     let entries_len = (header.chunk_count as usize)
         .checked_mul(CHUNK_ENTRY_LEN)
         .ok_or(Error::InvalidChunkedBytes)?;
     let entries_end = CHUNKED_HEADER_LEN
         .checked_add(entries_len)
         .ok_or(Error::InvalidChunkedBytes)?;
+    if entries_end > encoded.len() {
+        return Err(Error::InvalidChunkedBytes);
+    }
     let mut payload_len = 0usize;
     let mut uncompressed_len = 0u64;
-    for offset in (CHUNKED_HEADER_LEN..entries_end).step_by(CHUNK_ENTRY_LEN) {
+    for (index, offset) in (CHUNKED_HEADER_LEN..entries_end)
+        .step_by(CHUNK_ENTRY_LEN)
+        .enumerate()
+    {
         let entry = parse_entry(encoded, offset)?;
+        let expected_uncompressed_len = if index + 1 == header.chunk_count as usize {
+            header
+                .uncompressed_len
+                .checked_sub(u64::from(header.chunk_len) * index as u64)
+                .ok_or(Error::InvalidChunkedBytes)?
+        } else {
+            u64::from(header.chunk_len)
+        };
+        if u64::from(entry.uncompressed_len) != expected_uncompressed_len || entry.stored_len == 0 {
+            return Err(Error::InvalidChunkedBytes);
+        }
         payload_len = payload_len
             .checked_add(entry.stored_len as usize)
             .ok_or(Error::InvalidChunkedBytes)?;
@@ -207,11 +242,16 @@ fn parse_header(encoded: &[u8]) -> Result<ChunkedHeader> {
         return Err(Error::InvalidCompressionHeader);
     }
     let chunk_len = u64::from_le_bytes(encoded[8..16].try_into().expect("slice"));
-    if chunk_len == 0 || chunk_len > u64::from(u32::MAX) {
+    if encoded[7] != 0
+        || encoded[28..32] != [0; 4]
+        || chunk_len == 0
+        || chunk_len > u64::from(u32::MAX)
+    {
         return Err(Error::InvalidChunkedBytes);
     }
     Ok(ChunkedHeader {
         algorithm,
+        chunk_len: chunk_len as u32,
         uncompressed_len: u64::from_le_bytes(encoded[16..24].try_into().expect("slice")),
         chunk_count: u32::from_le_bytes(encoded[24..28].try_into().expect("slice")),
     })
@@ -222,6 +262,9 @@ fn parse_entry(encoded: &[u8], offset: usize) -> Result<ChunkEntry> {
         .checked_add(CHUNK_ENTRY_LEN)
         .ok_or(Error::InvalidChunkedBytes)?;
     let entry = encoded.get(offset..end).ok_or(Error::InvalidChunkedBytes)?;
+    if entry[12..16] != [0; 4] {
+        return Err(Error::InvalidChunkedBytes);
+    }
     Ok(ChunkEntry {
         uncompressed_len: u32::from_le_bytes(entry[0..4].try_into().expect("slice")),
         stored_len: u32::from_le_bytes(entry[4..8].try_into().expect("slice")),

@@ -66,7 +66,7 @@ scan, and decode files.
 | --- | --- | --- |
 | `magic` | User file signature bytes. | Required. Native files start with these bytes before the Varve container marker. Custom `preset: none` layouts use their declared physical bytes instead. |
 | `version` | Format version. | Required. This is the whole-format version, not the per-block version. |
-| `limits` | Hostile-input resource ceilings or explicit `trusted_unbounded`. | Required. Finite keys are runtime policy and do not change schema hashes or wire bytes. |
+| `limits` | Optional operational defaults or explicit `trusted_unbounded`. | Optional and partial. Runtime policy does not change schema hashes or wire bytes. |
 | `endian` | `little` or `big`. | Optional in simple cases, but recommended. Block override wins over format endian; otherwise little-endian is the default. |
 | `schema_hash` | `computed` or a literal integer. | `computed` hashes the declared policies, blocks, fields, and custom layout descriptors. Pin a literal after release if you want exact schema locking. |
 | `extension` | Recommended extension metadata. | Informational and embedded in manifests when enabled. It does not rename files. |
@@ -82,11 +82,12 @@ scan, and decode files.
 
 ## Read Limits
 
-Every declaration must select a resource policy. Ordinary generated open APIs
-accept only finite values for the storage surfaces they use. A finite policy is
-written as a `limits { ... }` block; unknown and duplicate keys are compile
-errors. The macro also rejects a missing key that is required by the declared
-native, custom-layout, or matrix preset.
+Resource policy is selected when a reader or writer is opened. A declaration
+may provide optional, partial defaults in `limits { ... }`; unknown and
+duplicate keys remain compile errors. Missing fields fall back to
+`ReadLimits::STANDARD`. Standard policy does not cap total append-log file
+length, scan length, record count, segment count, or cumulative index bytes.
+It limits one-shot payload allocation and materialization.
 
 | DSL key | Runtime ceiling |
 | --- | --- |
@@ -100,7 +101,7 @@ native, custom-layout, or matrix preset.
 | `sidecar` | complete matrix sidecar size |
 | `mmap` | bytes owned by one mmap handle |
 
-Runtime limits can only tighten declaration limits:
+Compatibility APIs tighten the resolved policy:
 
 ```rust
 use varve::ReadLimits;
@@ -109,6 +110,17 @@ let tighter = ReadLimits::missing()
     .with_max_file_len(512 * 1024 * 1024)
     .with_max_records(100_000);
 let reader = AppFormat::open_reader_with_limits("data.vrv", tighter)?;
+# Ok::<(), varve::Error>(())
+```
+
+Use the resource-policy APIs when a runtime decision must raise or lower an
+optional declaration default:
+
+```rust
+let runtime = ReadLimits::missing()
+    .with_max_record_payload_len(512 * 1024 * 1024)
+    .with_max_logical_payload_len(1024 * 1024 * 1024);
+let reader = AppFormat::open_reader_with_resource_limits("data.vrv", runtime)?;
 # Ok::<(), varve::Error>(())
 ```
 
@@ -132,6 +144,7 @@ For the `AppFormat` declaration above, the macro generates:
 | `AppFormat` | Zero-sized namespace for the format. |
 | `AppFormat::spec()` | Static runtime `FormatSpec`. |
 | `open_*_with_limits` | Typed open with field-wise runtime tightening. |
+| `open_*_with_resource_limits` | Typed open with runtime override that may raise or lower defaults. |
 | `open_*_trusted_unbounded` | Explicit trusted-input boundary; finite fields remain active. |
 | `AppFormatWriter` and `AppFormatReader` | Typed wrappers over `VarveWriter` and `VarveReader`. |
 | `AppFormatWrite` and `AppFormatRead` | Generated typed traits for the format methods. |

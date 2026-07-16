@@ -73,9 +73,9 @@ Resource errors are policy results, not automatically library defects:
 
 | Error | Meaning | First action |
 | --- | --- | --- |
-| `MissingResourceLimit` | The ordinary API needs a finite ceiling that the declaration/runtime policy omitted. | Add the applicable DSL key or pass a finite runtime limit. |
+| `MissingResourceLimit` | A low-level or explicitly unresolved policy reached an operation that requires a resolved value. Ordinary generated open/create APIs resolve standard runtime defaults automatically. | Report this if it occurs through an ordinary generated API; otherwise resolve the `FormatSpec` or use a generated runtime-policy method. |
 | `TrustedUnboundedRequiresExplicitApi` | An ordinary API received a trusted-unbounded field. | Use finite limits for untrusted data; use the visibly named trusted API only for controlled input. |
-| `LimitExceeded` | A decoded claim or cumulative operation exceeded a finite ceiling before the large read/allocation. | Verify the file claim, then raise the format ceiling only if the dataset is legitimate. |
+| `LimitExceeded` | A decoded claim or operation exceeded a selected runtime ceiling before the large read/allocation. | Verify the file claim, then raise the call-time resource policy only if the dataset is legitimate. |
 | `ResourceArithmeticOverflow` | A claimed range/product cannot be represented safely. | Treat the file as invalid; do not retry with a larger limit. |
 | `AllocationFailed` | A checked reservation failed even though the numeric ceiling allowed it. | Reduce the operation/dataset or available-memory pressure. |
 

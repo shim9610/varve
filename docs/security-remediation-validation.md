@@ -121,9 +121,10 @@ the current writer and requires reopen/reconciliation instead of blind retry.
 
 ## Residual Assurance Boundary
 
-- Format authors must choose finite ceilings that fit their domain. Values that
-  are technically finite but excessively large can still permit denial of
-  service.
+- Ordinary APIs impose finite defaults on one-shot allocation and
+  materialization. Append totals are uncapped by default so valid logs can keep
+  growing; services accepting hostile files should select finite aggregate
+  scan, record, segment, and index work quotas at open time.
 - Custom `VarveEncode` and `VarveDecode` implementations are trusted code and
   must enforce equivalent canonical and allocation rules.
 - Unsafe mmap/raw-layout/zero-copy APIs and

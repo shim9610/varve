@@ -1,6 +1,6 @@
 use std::hash::Hash;
 
-use crate::{BlockKind, Endian, FieldDescriptor, VarveDecode, VarveEncode};
+use crate::{BlockKind, Endian, FieldDescriptor, Result, VarveDecode, VarveEncode};
 
 pub trait VarveBlock: VarveEncode + VarveDecode {
     const ID: u32;
@@ -8,6 +8,14 @@ pub trait VarveBlock: VarveEncode + VarveDecode {
     const KIND: BlockKind;
     const ENDIAN: Option<Endian>;
     const FIELDS: &'static [FieldDescriptor] = &[];
+}
+
+/// Opts a block into sequence-preserving copy-on-write replacement.
+///
+/// Implementations may reject a replacement before any new generation is
+/// published. Generated keyed blocks use this hook to require equal keys.
+pub trait VarveReplaceBlock: VarveBlock {
+    fn validate_replacement(old: &Self, new: &Self) -> Result<()>;
 }
 
 pub trait VarveKey: Eq + Hash + Clone + VarveEncode + VarveDecode + Send + Sync + 'static {}

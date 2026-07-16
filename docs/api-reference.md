@@ -12,15 +12,6 @@ varve_format! {
     pub format AppFormat {
         magic: b"APP";
         version: 1;
-        limits {
-            file_len: 1_073_741_824;
-            records: 1_000_000;
-            index_bytes: 134_217_728;
-            scan_bytes: 1_073_741_824;
-            record_payload: 16_777_216;
-            logical_payload: 67_108_864;
-            materialized_bytes: 268_435_456;
-        }
         blocks {
             fixed Point(id = 1) { x: u32, y: u32 }
             variable User(id = 2, key = [id]) { id: u64, name: String }
@@ -42,8 +33,10 @@ the macro generates:
 | `AppFormat::open_readonly(path)` | open raw read-only `VarveFile` |
 | `AppFormat::open_reader(path)` | open typed snapshot reader |
 | `AppFormat::open_reader_with_limits(path, limits)` | open with limits tightened below the declaration |
+| `AppFormat::open_reader_with_resource_limits(path, limits)` | open with runtime policy that may raise or lower optional defaults |
 | `AppFormat::open_reader_trusted_unbounded(path)` | explicit trusted-input open; never called by ordinary open |
 | `AppFormat::open_writer_with_limits(path, limits)` | writer open with field-wise tighter limits |
+| `AppFormat::open_writer_with_resource_limits(path, limits)` | writer open with runtime resource-policy override |
 | `AppFormat::open_writer_trusted_unbounded(path)` | explicit trusted-input writer open |
 | `AppFormat::open_recover(path)` | explicit recovery open |
 | `AppFormat::open_recover_with_report(path)` | recovery open plus report |
@@ -55,8 +48,8 @@ Generated typed methods depend on block names:
 
 | Declaration | Writer method | Reader method |
 | --- | --- | --- |
-| `fixed Point` | `push_point(&Point)` | `points() -> BlockVec<Point>` |
-| `variable User(key=[id])` | `push_user(&User)`, `delete_user(&key)` | `users() -> KeyedBlockVec<K, User>` |
+| `fixed Point` | `push_point(&Point)`, `replace_point(index, &Point)` | `points() -> BlockVec<Point>` |
+| `variable User(key=[id])` | `push_user(&User)`, `replace_user(index, &User)`, `delete_user(&key)` | `users() -> KeyedBlockVec<K, User>` |
 | `matrix Cell` | `write_cell(key, &Cell)`, `commit_cell(key)` | `cell(key)`, `cell_status(key)` |
 | `aux { thumbnail: 16 }` | `write_thumbnail_aux(offset, bytes)` | `read_thumbnail_aux(offset, len)` |
 
@@ -74,6 +67,7 @@ Generated typed methods depend on block names:
 | `with_block_compression(descriptors)` | per-variable-block record-explicit compression |
 | `with_computed_schema_hash()` | pin computed schema hash into the header contract |
 | `with_read_limits(limits)` | set declaration-level resource policy without changing schema identity |
+| `with_resource_limits(limits)` | resolve standard/default policy and overlay runtime values |
 | `tighten_read_limits(limits)` | component-wise meet; a finite ceiling can never be widened |
 | `with_matrix_spec(dims, commits, blocks)` | manual matrix registry |
 | `with_matrix_aux(aux)` | manual matrix aux registry |
@@ -92,17 +86,21 @@ registry construction.
 ### ReadLimit And ReadLimits
 
 `ReadLimit` is `Missing`, `Finite(u64)`, or `TrustedUnbounded`. `ReadLimits`
-contains the ceilings documented in the format declaration guide. Ordinary
-APIs return `Error::MissingResourceLimit` for a required missing ceiling and
+contains operational policy fields documented in the format declaration guide.
+Missing fields are resolved when a handle opens. Ordinary
+APIs return `Error::MissingResourceLimit` only for an explicitly unresolved policy and
 `Error::TrustedUnboundedRequiresExplicitApi` when a trusted policy is presented
 to an ordinary entrypoint. Values above a finite ceiling return
 `Error::LimitExceeded` before a claim-sized allocation or read begins.
 
-`ReadLimits::missing()` is a fail-closed builder base,
+`ReadLimits::missing()` is a partial-overlay builder base,
 `ReadLimits::finite_all(n)` sets every ceiling to `n`, and the const
-`with_max_*` builders set individual finite values. Runtime policies are met
-with declaration policies, so `Finite(64 MiB)` tightened by `Finite(16 MiB)` is
-`Finite(16 MiB)`. Missing policy cannot be promoted into trust by tightening.
+`with_max_*` builders set individual finite values. `ReadLimits::STANDARD`
+places no total ceiling on append-log file length, scan length, record count,
+segment count, or cumulative index bytes; it limits one-shot payload decoding
+and materialization. Compatibility `*_with_limits` methods perform a meet, so
+`Finite(64 MiB)` tightened by `Finite(16 MiB)` is `Finite(16 MiB)`.
+`*_with_resource_limits` overlays fields and may raise or lower defaults.
 
 For omitted or explicit `preset: varve_native`, `effective_layout()` returns a
 synthetic plan containing the native `VarveFileHeader` and repeated
@@ -127,6 +125,7 @@ Common `VarveWriter` APIs:
 | `delete::<T>(&key)` | append keyed tombstone |
 | `push_op::<T>(&key, &op)` | append user-defined merge op |
 | `write_metadata(key, bytes)` | append internal metadata record |
+| `replace_block(index, &block)` | sequence-preserving copy-on-write replacement; encoded size may grow or shrink |
 | `replace_fixed(index, &block)` | same-size copy-on-write replacement; already-open readers keep their snapshot |
 | `unsafe replace_fixed_in_place_exclusive(index, &block)` | expert-only in-place replacement; caller must exclude readers and writers |
 | `replace_rewrite(index, &block)` | rewrite whole file through temp file |
@@ -152,8 +151,9 @@ stored-byte ceiling and
 `read_logical_payload_limited(spec, path, physical_limit, logical_limit)` to
 bound both the stored allocation and decoded logical allocation.
 All path-taking `RecordIndexEntry` helpers are deliberately low-level and
-non-snapshot: they reopen whatever object the pathname currently names. The
-unlimited variants are for trusted, prevalidated tooling only. Generated
+non-snapshot: they reopen whatever object the pathname currently names. Their
+default forms resolve finite standard/spec limits; `*_limited` lets tooling
+supply stricter or deliberately raised ceilings after validating provenance. Generated
 readers and typed collections do not use them; they retain the originally
 opened object and captured logical EOF.
 `checked_physical_end()` is the overflow-reporting extent API; `physical_end()`
@@ -188,7 +188,8 @@ wildcard arm so new diagnostics can be added without another enum-shape break.
 | `KeyedBlockVec::get(&key)` | decode latest value for key |
 | `KeyedBlockVec::keys()` | iterate known keys |
 
-`BlockVec` and `KeyedBlockVec` read payload bytes lazily from the file path.
+`BlockVec` and `KeyedBlockVec` read payload bytes lazily from the captured file
+snapshot, even if the pathname is later replaced.
 
 ## Blocks And Codecs
 
@@ -429,6 +430,8 @@ formats provide their own domain codecs and models.
 | API | Meaning |
 | --- | --- |
 | `BinaryCursor::new(bytes, endian)` | checked endian-aware metadata/raw byte reader |
+| `BinaryCursor::with_materialization_limit(bytes, endian, limit)` | cursor with an explicit cumulative ceiling for all owned arrays/strings |
+| `Decoder::decode_from_slice_limited(bytes, endian, limit)` | canonical decode with a cumulative nested allocation budget |
 | `BinaryWriter::new(endian)` | endian-aware byte builder for external metadata/raw payloads |
 | `LengthPrefix` | implemented for `u8`, `u16`, `u32`, and `u64` length-prefixed values |
 | `cursor.len_prefixed_bytes::<u32>()` | read a length-prefixed byte slice |
@@ -439,6 +442,9 @@ formats provide their own domain codecs and models.
 | `SegmentReducer` | user-owned stateful reducer for segmented metadata |
 | `reduce_segments_by_ref::<R, _>(...)` | run a reducer over segment metadata without copying segment info |
 | `SidecarPolicy` | derive/check companion sidecar paths and main-file identity |
+| `SidecarPolicy::inspect_with_scan_limit(...)` | inspect with an explicit fingerprint I/O ceiling |
+| `SidecarIdentity::from_main_file(...)` | fingerprint the captured extent up to the finite 256 MiB default |
+| `SidecarIdentity::from_main_file_with_scan_limit(...)` | fingerprint with a caller-selected scan ceiling |
 | `AdapterCheckReport` | compose physical tail status and adapter diagnostics |
 | `AdapterTailStatus` | summarize expected end, available tail length, and evidence for damaged tails |
 | `AdapterInputFile` | bridge path-backed and temporary byte-backed adapter inputs |
@@ -500,6 +506,8 @@ mmap.
 | `CompressionHeaderMode::FileExplicit` | file-header compression metadata |
 | `CompressionHeaderMode::FormatContract` | no metadata; static spec is contract |
 | `ChunkedBytes::from_zstd_chunks` | caller-managed chunked blob helper |
+| `ChunkedBytes::decode_to_vec()` | decode with the finite standard logical-payload ceiling |
+| `ChunkedBytes::decode_to_vec_limited(limit)` | decode with an explicit caller ceiling |
 
 Compression requires the `compression-zstd` feature when records are actually
 compressed or decompressed. `ChunkedBytes` additionally requires `integrity` for

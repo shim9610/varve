@@ -6,19 +6,35 @@ use std::sync::Arc;
 
 use crate::{Endian, Error, LayoutScanReport, LayoutSegmentInfo, LayoutTailInfo, Result};
 
+pub const DEFAULT_SIDECAR_FINGERPRINT_SCAN_LIMIT: u64 = 256 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct BinaryCursor<'a> {
     bytes: &'a [u8],
     position: usize,
     endian: Endian,
+    materialization_limit: usize,
+    materialized_bytes: usize,
 }
 
 impl<'a> BinaryCursor<'a> {
+    pub const DEFAULT_MATERIALIZATION_LIMIT: usize = 256 * 1024 * 1024;
+
     pub const fn new(bytes: &'a [u8], endian: Endian) -> Self {
+        Self::with_materialization_limit(bytes, endian, Self::DEFAULT_MATERIALIZATION_LIMIT)
+    }
+
+    pub const fn with_materialization_limit(
+        bytes: &'a [u8],
+        endian: Endian,
+        materialization_limit: usize,
+    ) -> Self {
         Self {
             bytes,
             position: 0,
             endian,
+            materialization_limit,
+            materialized_bytes: 0,
         }
     }
 
@@ -28,6 +44,15 @@ impl<'a> BinaryCursor<'a> {
 
     pub const fn position(&self) -> usize {
         self.position
+    }
+
+    pub const fn materialization_limit(&self) -> usize {
+        self.materialization_limit
+    }
+
+    pub const fn materialization_remaining(&self) -> usize {
+        self.materialization_limit
+            .saturating_sub(self.materialized_bytes)
     }
 
     pub fn remaining(&self) -> usize {
@@ -134,12 +159,16 @@ impl<'a> BinaryCursor<'a> {
         let byte_len = count
             .checked_mul(8)
             .ok_or(Error::LengthOverflow { value: u64::MAX })?;
-        if byte_len > self.remaining() {
-            return Err(Error::UnexpectedEof);
-        }
+        let bytes = self.materialized_bytes(byte_len)?;
 
-        let mut values = Vec::with_capacity(count);
-        let bytes = self.bytes(byte_len)?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(count)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "binary cursor materialization",
+                requested: usize_to_u64(byte_len),
+            })?;
+        self.position += byte_len;
         for bytes in bytes.chunks_exact(8) {
             let mut value = [0; 8];
             value.copy_from_slice(bytes);
@@ -148,6 +177,7 @@ impl<'a> BinaryCursor<'a> {
                 Endian::Big => u64::from_be_bytes(value),
             }));
         }
+        self.materialized_bytes += byte_len;
         Ok(values)
     }
 
@@ -157,9 +187,53 @@ impl<'a> BinaryCursor<'a> {
     }
 
     pub fn len_prefixed_string<P: LengthPrefix>(&mut self) -> Result<String> {
-        let bytes = self.len_prefixed_bytes::<P>()?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidUtf8)
+        let prefix_position = self.position;
+        let len = P::read(self)?;
+        let bytes = match self.materialized_bytes(len) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.position = prefix_position;
+                return Err(error);
+            }
+        };
+        self.position += len;
+        let value = std::str::from_utf8(bytes).map_err(|_| Error::InvalidUtf8)?;
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(len)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "binary cursor materialization",
+                requested: usize_to_u64(len),
+            })?;
+        owned.push_str(value);
+        self.materialized_bytes += len;
+        Ok(owned)
     }
+
+    fn materialized_bytes(&self, len: usize) -> Result<&'a [u8]> {
+        let end = self
+            .position
+            .checked_add(len)
+            .ok_or(Error::LengthOverflow { value: u64::MAX })?;
+        let total = self
+            .materialized_bytes
+            .checked_add(len)
+            .ok_or(Error::LengthOverflow { value: u64::MAX })?;
+        if total > self.materialization_limit {
+            return Err(Error::LimitExceeded {
+                resource: "binary cursor materialization",
+                actual: usize_to_u64(total),
+                limit: usize_to_u64(self.materialization_limit),
+            });
+        }
+        self.bytes
+            .get(self.position..end)
+            .ok_or(Error::UnexpectedEof)
+    }
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Debug)]
@@ -535,11 +609,23 @@ impl SidecarPolicy {
         main: P,
         expected: Option<&SidecarIdentity>,
     ) -> Result<SidecarReport> {
+        self.inspect_with_scan_limit(main, expected, DEFAULT_SIDECAR_FINGERPRINT_SCAN_LIMIT)
+    }
+
+    pub fn inspect_with_scan_limit<P: AsRef<Path>>(
+        &self,
+        main: P,
+        expected: Option<&SidecarIdentity>,
+        max_scan_bytes: u64,
+    ) -> Result<SidecarReport> {
         let main = main.as_ref();
         let path = self.sidecar_path(main);
         let present = path.exists();
         let actual = if present {
-            Some(SidecarIdentity::from_main_file(main)?)
+            Some(SidecarIdentity::from_main_file_with_scan_limit(
+                main,
+                max_scan_bytes,
+            )?)
         } else {
             None
         };
@@ -576,11 +662,29 @@ pub struct SidecarIdentity {
 
 impl SidecarIdentity {
     pub fn from_main_file<P: AsRef<Path>>(main: P) -> Result<Self> {
-        let main = main.as_ref();
-        let metadata = fs::metadata(main)?;
+        Self::from_main_file_with_scan_limit(main, DEFAULT_SIDECAR_FINGERPRINT_SCAN_LIMIT)
+    }
+
+    pub fn from_main_file_with_scan_limit<P: AsRef<Path>>(
+        main: P,
+        max_scan_bytes: u64,
+    ) -> Result<Self> {
+        Self::from_main_file_inner(main.as_ref(), max_scan_bytes)
+    }
+
+    fn from_main_file_inner(main: &Path, max_scan_bytes: u64) -> Result<Self> {
+        let mut file = fs::File::open(main)?;
+        let main_len = file.metadata()?.len();
+        if main_len > max_scan_bytes {
+            return Err(Error::LimitExceeded {
+                resource: "sidecar fingerprint scan bytes",
+                actual: main_len,
+                limit: max_scan_bytes,
+            });
+        }
         Ok(Self {
-            main_len: metadata.len(),
-            main_fingerprint: fingerprint_file(main)?,
+            main_len,
+            main_fingerprint: fingerprint_file_extent(&mut file, main_len)?,
         })
     }
 }
@@ -759,16 +863,19 @@ fn normalize_adapter_extension(extension: &str) -> Result<&str> {
     }
 }
 
-fn fingerprint_file(path: &Path) -> Result<u64> {
-    let mut file = fs::File::open(path)?;
+fn fingerprint_file_extent(file: &mut fs::File, extent: u64) -> Result<u64> {
     let mut hasher = StableHasher::default();
     let mut buffer = [0; 8192];
-    loop {
-        let read = file.read(&mut buffer)?;
+    let mut remaining = extent;
+    while remaining != 0 {
+        let requested = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| Error::LengthOverflow { value: remaining })?;
+        let read = file.read(&mut buffer[..requested])?;
         if read == 0 {
-            break;
+            return Err(Error::UnexpectedEof);
         }
         hasher.write(&buffer[..read]);
+        remaining -= u64::try_from(read).unwrap_or(u64::MAX);
     }
     Ok(hasher.finish())
 }

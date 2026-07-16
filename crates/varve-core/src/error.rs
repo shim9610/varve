@@ -115,6 +115,9 @@ pub enum Error {
     #[error("replace payload length changed from {old} to {new}")]
     ReplaceSizeMismatch { old: u64, new: u64 },
 
+    #[error("replacement changed the block key")]
+    ReplacementKeyMismatch,
+
     #[error("checksum requested, but the integrity feature is not enabled")]
     IntegrityFeatureDisabled,
 

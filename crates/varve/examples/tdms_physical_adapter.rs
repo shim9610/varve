@@ -1,5 +1,7 @@
 use std::env;
-use std::fs::read;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 use std::path::PathBuf;
 
 #[path = "tdms_physical/common.rs"]
@@ -34,7 +36,7 @@ fn main() -> varve::Result<()> {
             );
         }
         "read-bytes" => {
-            let bytes = read(&path)?;
+            let bytes = read_snapshot(&path, 256 * 1024 * 1024)?;
             common::read_and_verify_bytes(&bytes)?;
             println!(
                 "Varve-based byte-backed adapter example parsed TDMS file {}",
@@ -58,4 +60,27 @@ fn main() -> varve::Result<()> {
         }
     }
     Ok(())
+}
+
+fn read_snapshot(path: &Path, max_len: u64) -> varve::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > max_len {
+        return Err(varve::Error::LimitExceeded {
+            resource: "TDMS byte-backed example input",
+            actual: len,
+            limit: max_len,
+        });
+    }
+    let len = usize::try_from(len).map_err(|_| varve::Error::LengthOverflow { value: len })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| varve::Error::AllocationFailed {
+            resource: "TDMS byte-backed example input",
+            requested: len as u64,
+        })?;
+    bytes.resize(len, 0);
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
 }

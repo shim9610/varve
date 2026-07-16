@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
+use std::mem::size_of;
 
 use crate::{Endian, Error, Result};
 
@@ -131,17 +132,47 @@ pub struct Decoder<'a> {
     position: usize,
     small_field_ids: u64,
     large_field_ids: Option<HashSet<u32>>,
+    materialization_limit: u64,
+    materialization_remaining: u64,
 }
 
 impl<'a> Decoder<'a> {
+    pub const STANDARD_MATERIALIZATION_LIMIT: u64 = 1024 * 1024 * 1024;
+
     pub fn new(input: &'a [u8], endian: Endian) -> Self {
+        Self::new_limited(input, endian, Self::STANDARD_MATERIALIZATION_LIMIT)
+    }
+
+    pub fn new_limited(input: &'a [u8], endian: Endian, materialization_limit: u64) -> Self {
         Self {
             endian,
             input,
             position: 0,
             small_field_ids: 0,
             large_field_ids: None,
+            materialization_limit,
+            materialization_remaining: materialization_limit,
         }
+    }
+
+    pub fn decode_from_slice_limited<T: VarveDecode>(
+        input: &'a [u8],
+        endian: Endian,
+        materialization_limit: u64,
+    ) -> Result<T> {
+        let mut decoder = Self::new_limited(input, endian, materialization_limit);
+        decoder.decode_complete()
+    }
+
+    pub fn decode_from_slice_accounted<T: VarveDecode>(
+        input: &'a [u8],
+        endian: Endian,
+        materialization_remaining: &mut u64,
+    ) -> Result<T> {
+        let mut decoder = Self::new_limited(input, endian, *materialization_remaining);
+        let result = decoder.decode_complete();
+        *materialization_remaining = decoder.materialization_remaining;
+        result
     }
 
     pub fn endian(&self) -> Endian {
@@ -150,6 +181,46 @@ impl<'a> Decoder<'a> {
 
     pub fn remaining(&self) -> usize {
         self.input.len().saturating_sub(self.position)
+    }
+
+    pub fn materialization_remaining(&self) -> u64 {
+        self.materialization_remaining
+    }
+
+    pub fn decode_nested<T: VarveDecode>(&mut self, input: &[u8]) -> Result<T> {
+        let mut nested = Decoder::new_limited(input, self.endian, self.materialization_remaining);
+        let result = nested.decode_complete();
+        self.materialization_remaining = nested.materialization_remaining;
+        result
+    }
+
+    pub fn charge_materialization(&mut self, bytes: u64, resource: &'static str) -> Result<()> {
+        let consumed = self
+            .materialization_limit
+            .checked_sub(self.materialization_remaining)
+            .ok_or(Error::ResourceArithmeticOverflow { resource })?;
+        let actual = consumed
+            .checked_add(bytes)
+            .ok_or(Error::ResourceArithmeticOverflow { resource })?;
+        if actual > self.materialization_limit {
+            return Err(Error::LimitExceeded {
+                resource,
+                actual,
+                limit: self.materialization_limit,
+            });
+        }
+        self.materialization_remaining -= bytes;
+        Ok(())
+    }
+
+    fn decode_complete<T: VarveDecode>(&mut self) -> Result<T> {
+        let value = T::decode_varve(self)?;
+        if self.remaining() != 0 {
+            return Err(Error::TrailingBytes {
+                remaining: self.remaining(),
+            });
+        }
+        Ok(value)
     }
 
     pub fn read_exact(&mut self, len: usize) -> Result<&'a [u8]> {
@@ -205,6 +276,49 @@ impl<'a> Decoder<'a> {
     pub fn read_len(&mut self) -> Result<usize> {
         let value = self.read_u64()?;
         usize::try_from(value).map_err(|_| Error::LengthOverflow { value })
+    }
+
+    fn preflight_count(
+        &mut self,
+        len: usize,
+        minimum_wire_bytes: usize,
+        materialized_entry_bytes: usize,
+        resource: &'static str,
+    ) -> Result<()> {
+        if minimum_wire_bytes != 0 && len > self.remaining() / minimum_wire_bytes {
+            return Err(Error::UnexpectedEof);
+        }
+        if minimum_wire_bytes == 0
+            && u64::try_from(len).unwrap_or(u64::MAX) > self.materialization_remaining
+        {
+            return Err(Error::InvalidCanonicalEncoding(
+                "collection count cannot make bounded input progress",
+            ));
+        }
+        let charged_entry_bytes = materialized_entry_bytes.max(1);
+        let bytes = len
+            .checked_mul(charged_entry_bytes)
+            .ok_or(Error::ResourceArithmeticOverflow { resource })?;
+        self.charge_materialization(
+            u64::try_from(bytes).map_err(|_| Error::ResourceArithmeticOverflow { resource })?,
+            resource,
+        )
+    }
+
+    fn preflight_map_count<K: VarveDecode, V: VarveDecode>(
+        &mut self,
+        len: usize,
+        resource: &'static str,
+    ) -> Result<()> {
+        let key_bytes = minimum_wire_size(K::WIRE_TYPE);
+        let entry_bytes = key_bytes.saturating_add(minimum_wire_size(V::WIRE_TYPE));
+        let minimum_wire_bytes = len
+            .checked_mul(entry_bytes)
+            .ok_or(Error::ResourceArithmeticOverflow { resource })?;
+        if minimum_wire_bytes > self.remaining() {
+            return Err(Error::UnexpectedEof);
+        }
+        self.preflight_count(len, 0, size_of::<(K, V)>(), resource)
     }
 
     fn note_field_id(&mut self, field_id: u32) -> Result<()> {
@@ -268,8 +382,11 @@ pub fn read_field_header(decoder: &mut Decoder<'_>) -> Result<FieldHeader> {
         ));
     }
     let wire_type = WireType::from_u16(wire_type).ok_or(Error::UnknownWireType(wire_type))?;
-    let _: usize =
+    let payload_len_usize: usize =
         usize::try_from(payload_len).map_err(|_| Error::LengthOverflow { value: payload_len })?;
+    if payload_len_usize > decoder.remaining() {
+        return Err(Error::UnexpectedEof);
+    }
     decoder.note_field_id(field_id)?;
     Ok(FieldHeader {
         field_id,
@@ -285,14 +402,7 @@ pub fn encode_to_vec<T: VarveEncode>(value: &T, endian: Endian) -> Result<Vec<u8
 }
 
 pub fn decode_from_slice<T: VarveDecode>(bytes: &[u8], endian: Endian) -> Result<T> {
-    let mut decoder = Decoder::new(bytes, endian);
-    let value = T::decode_varve(&mut decoder)?;
-    if decoder.remaining() != 0 {
-        return Err(Error::TrailingBytes {
-            remaining: decoder.remaining(),
-        });
-    }
-    Ok(value)
+    Decoder::decode_from_slice_limited(bytes, endian, Decoder::STANDARD_MATERIALIZATION_LIMIT)
 }
 
 impl VarveEncode for () {
@@ -436,7 +546,20 @@ impl VarveDecode for Vec<u8> {
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         let len = decoder.read_len()?;
-        Ok(decoder.read_exact(len)?.to_vec())
+        if len > decoder.remaining() {
+            return Err(Error::UnexpectedEof);
+        }
+        decoder.charge_materialization(len as u64, "byte vector")?;
+        let bytes = decoder.read_exact(len)?;
+        let mut value = Vec::new();
+        value
+            .try_reserve_exact(len)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "byte vector",
+                requested: len as u64,
+            })?;
+        value.extend_from_slice(bytes);
+        Ok(value)
     }
 }
 
@@ -455,8 +578,20 @@ impl VarveDecode for String {
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         let len = decoder.read_len()?;
+        if len > decoder.remaining() {
+            return Err(Error::UnexpectedEof);
+        }
+        decoder.charge_materialization(len as u64, "string")?;
         let bytes = decoder.read_exact(len)?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidUtf8)
+        let mut value = Vec::new();
+        value
+            .try_reserve_exact(len)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "string",
+                requested: len as u64,
+            })?;
+        value.extend_from_slice(bytes);
+        String::from_utf8(value).map_err(|_| Error::InvalidUtf8)
     }
 }
 
@@ -516,7 +651,14 @@ where
     const WIRE_TYPE: WireType = WireType::Seq;
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
-        let mut values = Vec::with_capacity(N);
+        decoder.preflight_count(N, minimum_wire_size(T::WIRE_TYPE), size_of::<T>(), "array")?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(N)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "array",
+                requested: allocation_request::<T>(N),
+            })?;
         for _ in 0..N {
             values.push(T::decode_varve(decoder)?);
         }
@@ -550,6 +692,7 @@ where
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         let len = decoder.read_len()?;
+        decoder.preflight_map_count::<K, V>(len, "BTreeMap entries")?;
         let mut values = BTreeMap::new();
         if len == 0 {
             return Ok(values);
@@ -612,7 +755,14 @@ where
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         let len = decoder.read_len()?;
+        decoder.preflight_map_count::<K, V>(len, "HashMap entries")?;
         let mut values = HashMap::new();
+        values
+            .try_reserve(len)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "HashMap entries",
+                requested: allocation_request::<(K, V)>(len),
+            })?;
         if len == 0 {
             return Ok(values);
         }
@@ -647,7 +797,7 @@ where
 }
 
 macro_rules! vec_seq_codec {
-    ($($ty:ty),+ $(,)?) => {
+    ($(($ty:ty, $minimum_wire_bytes:expr)),+ $(,)?) => {
         $(
             impl VarveEncode for Vec<$ty> {
                 const WIRE_TYPE: WireType = WireType::Seq;
@@ -666,7 +816,17 @@ macro_rules! vec_seq_codec {
 
                 fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
                     let len = decoder.read_len()?;
+                    decoder.preflight_count(
+                        len,
+                        $minimum_wire_bytes,
+                        size_of::<$ty>(),
+                        "sequence entries",
+                    )?;
                     let mut values = Vec::new();
+                    values.try_reserve_exact(len).map_err(|_| Error::AllocationFailed {
+                        resource: "sequence entries",
+                        requested: allocation_request::<$ty>(len),
+                    })?;
                     for _ in 0..len {
                         values.push(<$ty>::decode_varve(decoder)?);
                     }
@@ -678,8 +838,37 @@ macro_rules! vec_seq_codec {
 }
 
 vec_seq_codec!(
-    bool, i8, u16, i16, u32, i32, u64, i64, u128, i128, f32, f64, String
+    (bool, 1),
+    (i8, 1),
+    (u16, 2),
+    (i16, 2),
+    (u32, 4),
+    (i32, 4),
+    (u64, 8),
+    (i64, 8),
+    (u128, 16),
+    (i128, 16),
+    (f32, 4),
+    (f64, 8),
+    (String, 8)
 );
+
+const fn minimum_wire_size(wire_type: WireType) -> usize {
+    match wire_type {
+        WireType::Unit => 0,
+        WireType::Bool | WireType::U8 | WireType::I8 => 1,
+        WireType::U16 | WireType::I16 => 2,
+        WireType::U32 | WireType::I32 | WireType::F32 => 4,
+        WireType::U64 | WireType::I64 | WireType::F64 => 8,
+        WireType::U128 | WireType::I128 => 16,
+        WireType::Bytes | WireType::String => 8,
+        WireType::Seq | WireType::Nested => 0,
+    }
+}
+
+fn allocation_request<T>(len: usize) -> u64 {
+    u64::try_from(len.saturating_mul(size_of::<T>())).unwrap_or(u64::MAX)
+}
 
 macro_rules! tuple_codec {
     ($($name:ident),+) => {

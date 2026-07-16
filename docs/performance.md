@@ -102,6 +102,29 @@ are outside production hot paths. `PublishedButRebindFailed` handling affects
 only the already-published replacement rebind/error path; this benchmark does
 not measure `ReplaceFileW` replacement latency.
 
+## Runtime Policy And Resized Replacement Check (2026-07-16)
+
+The all-feature debug smoke test was run with the primary append format's
+`limits` declaration omitted. Append, open/scan, merge, compact, and recovery
+completed under the runtime standard policy. This specifically guards against
+reintroducing a declaration-time or default total append ceiling.
+
+Sequence-preserving resized replacement rewrites one complete generation and
+is therefore O(file size), while ordinary append remains unchanged. Observed
+single-run debug timings were:
+
+| Existing records | Resized COW replacement ms | Records/sec |
+| ---: | ---: | ---: |
+| 128 | 34.597 | 3,700 |
+| 2,048 | 143.766 | 14,245 |
+| 10,000 | 671.040 | 14,902 |
+
+These are smoke observations, not release-mode product benchmarks. The
+approximately linear large-case behavior is expected for atomic whole-file
+publication. A future implementation may add an append-only replacement event
+strategy, but it must preserve sequence, keyed-event ordering, snapshot, CRC,
+footer-chain, checkpoint, and transaction visibility semantics.
+
 ## Covered Paths
 
 - fixed append, open, scan, and lazy typed lookup
@@ -121,6 +144,8 @@ not measure `ReplaceFileW` replacement latency.
 - snapshot-bound lazy reads after pathname replacement
 - copy-on-write fixed replacement plus the separately unsafe exclusive
   in-place replacement path
+- sequence-preserving resized replacement for grow, shrink, CRC/footer chains,
+  checkpoints, transaction markers, keyed identity, and old snapshots
 - mmap payload window scans
 - zero-copy raw fixed reads
 - matrix random-order write/read smoke paths
@@ -144,6 +169,10 @@ The smoke suite reports wall time, records/sec, and file size. Compare small, me
 - Mmap typed ordinal lookup must use the precomputed block-id map.
 - Direct base+delta compact should avoid writing a merge output before compacting.
 - Atomic publish paths may sync for durability, but should not perform per-record fsync.
+- Ordinary append must not inherit a default total file, record, segment, scan,
+  or index ceiling. Finite aggregate quotas are selected per handle by callers.
+- Resized replacement may scan and copy one complete generation once; it must
+  not introduce per-record full-index scans or affect the append hot path.
 - Compression should not decompress during index scan or `scan()`. Decompression belongs on typed logical read paths.
 - Block-specific compression lookup must be per-record metadata work only and
   must not trigger payload reads or full-file scans.

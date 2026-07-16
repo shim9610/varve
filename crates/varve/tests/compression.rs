@@ -1,6 +1,8 @@
 use std::fs::remove_file;
 use std::path::{Path, PathBuf};
 
+#[cfg(all(feature = "compression-zstd", feature = "integrity"))]
+use varve::decode_from_slice;
 #[cfg(feature = "compression-zstd")]
 use varve::{
     BlockCompressionDescriptor, BlockDescriptor, BlockKind, CommitPolicy, CompressionAlgorithm,
@@ -8,9 +10,7 @@ use varve::{
     IntegrityPolicy, LayoutPlanFieldSource, LayoutPlanFieldType, LayoutPlanLen, LayoutPlanPartKind,
     ManifestPolicy, ReadLimits, RecoveryPolicy, VariableCompression, encode_to_vec,
 };
-#[cfg(all(feature = "compression-zstd", feature = "integrity"))]
-use varve::{ChunkedBytes, decode_from_slice};
-use varve::{Error, VarveBlock, varve_format};
+use varve::{ChunkedBytes, Error, VarveBlock, varve_format};
 
 #[derive(Clone, Debug, PartialEq, VarveBlock)]
 #[varve(id = 600, version = 1, kind = "variable")]
@@ -603,6 +603,83 @@ fn chunked_bytes_roundtrip_and_chunk_crc_detection() -> varve::Result<()> {
     assert!(matches!(
         corrupt.decode_to_vec(),
         Err(Error::ChunkChecksumMismatch { chunk_index: 0, .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn chunked_bytes_rejects_hostile_header_extents_before_decode_allocation() {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(b"VCHK");
+    encoded.extend_from_slice(&1u16.to_le_bytes());
+    encoded.push(1);
+    encoded.push(0);
+    encoded.extend_from_slice(&1u64.to_le_bytes());
+    encoded.extend_from_slice(&u64::MAX.to_le_bytes());
+    encoded.extend_from_slice(&u32::MAX.to_le_bytes());
+    encoded.extend_from_slice(&0u32.to_le_bytes());
+    assert!(matches!(
+        varve::ChunkedBytes::from_encoded(encoded),
+        Err(Error::InvalidChunkedBytes)
+    ));
+}
+
+#[test]
+fn chunked_bytes_rejects_inconsistent_count_and_chunk_extents() {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(b"VCHK");
+    encoded.extend_from_slice(&1u16.to_le_bytes());
+    encoded.push(1);
+    encoded.push(0);
+    encoded.extend_from_slice(&4u64.to_le_bytes());
+    encoded.extend_from_slice(&1u64.to_le_bytes());
+    encoded.extend_from_slice(&0u32.to_le_bytes());
+    encoded.extend_from_slice(&0u32.to_le_bytes());
+    assert!(matches!(
+        varve::ChunkedBytes::from_encoded(encoded),
+        Err(Error::InvalidChunkedBytes)
+    ));
+}
+
+#[test]
+fn chunked_bytes_default_decode_enforces_standard_logical_limit() -> varve::Result<()> {
+    const LOGICAL_LEN: u32 = 256 * 1024 * 1024 + 1;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(b"VCHK");
+    encoded.extend_from_slice(&1u16.to_le_bytes());
+    encoded.push(1);
+    encoded.push(0);
+    encoded.extend_from_slice(&u64::from(LOGICAL_LEN).to_le_bytes());
+    encoded.extend_from_slice(&u64::from(LOGICAL_LEN).to_le_bytes());
+    encoded.extend_from_slice(&1u32.to_le_bytes());
+    encoded.extend_from_slice(&0u32.to_le_bytes());
+    encoded.extend_from_slice(&LOGICAL_LEN.to_le_bytes());
+    encoded.extend_from_slice(&1u32.to_le_bytes());
+    encoded.extend_from_slice(&0u32.to_le_bytes());
+    encoded.extend_from_slice(&0u32.to_le_bytes());
+    encoded.push(0);
+
+    let chunked = ChunkedBytes::from_encoded(encoded)?;
+    assert!(matches!(
+        chunked.decode_to_vec(),
+        Err(Error::DecompressedLengthLimitExceeded {
+            actual: 268_435_457,
+            limit: 268_435_456,
+        })
+    ));
+    Ok(())
+}
+
+#[cfg(all(feature = "compression-zstd", feature = "integrity"))]
+#[test]
+fn chunked_bytes_limited_decode_checks_logical_len_before_allocation() -> varve::Result<()> {
+    let chunked = ChunkedBytes::from_zstd_chunks(&[1, 2, 3, 4], 2, CompressionLevel::Fast)?;
+    assert!(matches!(
+        chunked.decode_to_vec_limited(3),
+        Err(Error::DecompressedLengthLimitExceeded {
+            actual: 4,
+            limit: 3
+        })
     ));
     Ok(())
 }

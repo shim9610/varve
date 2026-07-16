@@ -1,6 +1,12 @@
 # Security Remediation Specification
 
-Status: Final Spec; clean-context validator required edits integrated
+Status: Superseded by `runtime-limits-replacement-spec.md`
+
+> Historical design record. Its mandatory finite declaration limits and
+> tightening-only runtime policy are no longer current. Limits are optional
+> operational defaults, ordinary APIs resolve safe one-shot limits at runtime,
+> append totals are uncapped by default, and `*_with_resource_limits` may set
+> the policy for a particular open/create operation.
 
 ## Objective
 

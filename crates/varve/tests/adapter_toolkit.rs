@@ -1,11 +1,15 @@
-use std::fs::{remove_file, write};
+use std::fs::{OpenOptions, remove_file, write};
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use varve::{
     AdapterCheckReport, AdapterCheckStatus, AdapterInputFile, AdapterTailStatus, BinaryCursor,
-    BinaryWriter, ChunkEntry, ChunkIndexBuilder, ChunkLayout, Endian, Error, LayoutSegmentInfo,
-    LayoutTailInfo, LayoutTailKind, ReadLimits, SegmentReducer, SidecarIdentity, SidecarMode,
-    SidecarPolicy, TaggedValueCodec, reduce_segments_by_ref, varve_format,
+    BinaryWriter, ChunkEntry, ChunkIndexBuilder, ChunkLayout,
+    DEFAULT_SIDECAR_FINGERPRINT_SCAN_LIMIT, Endian, Error, LayoutSegmentInfo, LayoutTailInfo,
+    LayoutTailKind, ReadLimits, SegmentReducer, SidecarIdentity, SidecarMode, SidecarPolicy,
+    TaggedValueCodec, reduce_segments_by_ref, varve_format,
 };
 
 varve_format! {
@@ -260,6 +264,86 @@ fn sidecar_policy_checks_presence_and_identity() -> varve::Result<()> {
 }
 
 #[test]
+fn sidecar_identity_scan_limit_is_explicit() -> varve::Result<()> {
+    let main = temp_path("adapter_toolkit_sidecar_limit", "bin");
+    cleanup(&main);
+    write(&main, b"main")?;
+
+    assert!(matches!(
+        SidecarIdentity::from_main_file_with_scan_limit(&main, 3),
+        Err(Error::LimitExceeded {
+            resource: "sidecar fingerprint scan bytes",
+            actual: 4,
+            limit: 3,
+        })
+    ));
+    assert_eq!(SidecarIdentity::from_main_file(&main)?.main_len, 4);
+
+    cleanup(&main);
+    Ok(())
+}
+
+#[test]
+fn sidecar_identity_default_rejects_large_extent_before_scanning() -> varve::Result<()> {
+    let main = temp_path("adapter_toolkit_sidecar_default_limit", "bin");
+    cleanup(&main);
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&main)?;
+    file.set_len(DEFAULT_SIDECAR_FINGERPRINT_SCAN_LIMIT + 1)?;
+    drop(file);
+
+    assert!(matches!(
+        SidecarIdentity::from_main_file(&main),
+        Err(Error::LimitExceeded {
+            resource: "sidecar fingerprint scan bytes",
+            actual,
+            limit: DEFAULT_SIDECAR_FINGERPRINT_SCAN_LIMIT,
+        }) if actual == DEFAULT_SIDECAR_FINGERPRINT_SCAN_LIMIT + 1
+    ));
+
+    cleanup(&main);
+    Ok(())
+}
+
+#[test]
+fn sidecar_identity_hashes_exactly_the_captured_extent_during_growth() -> varve::Result<()> {
+    let main = temp_path("adapter_toolkit_sidecar_growth", "bin");
+    cleanup(&main);
+    write(&main, vec![0x5a; 32 * 1024 * 1024])?;
+
+    let barrier = Arc::new(Barrier::new(2));
+    let writer_barrier = Arc::clone(&barrier);
+    let writer_path = main.clone();
+    let writer = thread::spawn(move || -> std::io::Result<()> {
+        let mut file = OpenOptions::new().append(true).open(writer_path)?;
+        writer_barrier.wait();
+        let chunk = [0xa5; 64 * 1024];
+        for _ in 0..256 {
+            file.write_all(&chunk)?;
+            thread::yield_now();
+        }
+        file.flush()
+    });
+
+    barrier.wait();
+    let identity = SidecarIdentity::from_main_file(&main)?;
+    writer.join().expect("append thread panicked")?;
+
+    let final_bytes = std::fs::read(&main)?;
+    let captured_len = usize::try_from(identity.main_len).expect("test file fits in usize");
+    assert!(captured_len <= final_bytes.len());
+    assert_eq!(
+        identity.main_fingerprint,
+        stable_fingerprint(&final_bytes[..captured_len])
+    );
+
+    cleanup(&main);
+    Ok(())
+}
+
+#[test]
 fn adapter_report_preserves_layout_tail_status() -> varve::Result<()> {
     let path = temp_path("adapter_toolkit_tail", "atk");
     cleanup(&path);
@@ -451,6 +535,16 @@ fn segment_info(raw_offset: u64, raw_len: u64) -> LayoutSegmentInfo {
         fields: Vec::new(),
         footer_fields: Vec::new(),
     }
+}
+
+fn stable_fingerprint(bytes: &[u8]) -> u64 {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 fn temp_path(name: &str, extension: &str) -> PathBuf {

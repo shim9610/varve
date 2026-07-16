@@ -16,15 +16,6 @@ varve_format! {
     pub format AppFormat {
         magic: b"APP";
         version: 1;
-        limits {
-            file_len: 1_073_741_824;
-            records: 1_000_000;
-            index_bytes: 134_217_728;
-            scan_bytes: 1_073_741_824;
-            record_payload: 16_777_216;
-            logical_payload: 67_108_864;
-            materialized_bytes: 268_435_456;
-        }
         endian: little;
         schema_hash: computed;
         manifest: embedded;
@@ -55,11 +46,12 @@ Generated items include:
 - `AppFormatRead`, `AppFormatWrite`
 - typed methods such as `push_point`, `push_user`, `points`, and `users`
 
-The `limits` block is required for ordinary opens. It caps attacker-controlled
-file claims before Varve allocates or reads their full size. Choose values from
-the application's legitimate maximums; use `open_reader_with_limits` to tighten
-them for one operation. The separate `*_trusted_unbounded` methods are only for
-inputs whose provenance is already trusted.
+The `limits` block is optional and may contain only the defaults a format author
+wants to suggest. Limits are resolved when a reader or writer is opened; they
+are not encoded into the file or schema. Ordinary opens use an allocation-safe
+standard policy. Use `open_reader_with_resource_limits` or
+`create_writer_with_resource_limits` to raise or lower policy for that handle.
+Legacy `*_with_limits` calls only tighten the resolved policy.
 
 ## 2. Self-Check The Format
 
@@ -102,6 +94,21 @@ writer.sync()?;  // asks the OS for durable persistence
 
 `create_writer` truncates the target file. Use `open_writer` to append to an
 existing file.
+
+Native records can be replaced even when their encoded size changes. Varve
+streams a new file generation and publishes it atomically; already-open readers
+keep their previous snapshot.
+
+```rust
+writer.replace_user(
+    0,
+    &User {
+        id: 7, // keyed replacement must preserve the key
+        name: "Ada Lovelace".to_string(),
+        flags: 0,
+    },
+)?;
+```
 
 ## 4. Read Data
 

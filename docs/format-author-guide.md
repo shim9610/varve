@@ -59,13 +59,13 @@ when enabled, and offset-chain footers are handled by the generated code and
 runtime writer. Application code should not hand-build Varve record headers or
 offset chains in normal use.
 
-The `limits` block is part of the runtime safety contract, not the wire schema.
-Choose ceilings from the largest legitimate dataset the application accepts,
-including cumulative materialization rather than only one record. Runtime code
-may pass a tighter `ReadLimits` value to generated `*_with_limits` methods. Do
-not use `limits: trusted_unbounded;` for files supplied by users, networks, or
-other processes; that policy is reached only through visibly named trusted
-open methods.
+The `limits` block is optional operational policy, not wire schema. Prefer
+choosing limits where a reader or writer is opened. Standard policy leaves the
+append log itself uncapped and bounds one-shot payload/materialization work.
+Generated `*_with_resource_limits` methods may raise or lower optional format
+defaults; compatibility `*_with_limits` methods only tighten. Do not use
+trusted-unbounded methods for files supplied by users, networks, or other
+processes.
 
 Choose `fixed` for records whose canonical encoded payload size should stay
 stable. Fixed blocks still use Varve's canonical field codec, not Rust memory
@@ -191,7 +191,7 @@ varve_format! {
 ## Register A Format
 
 `varve_format!` pins the file contract: magic bytes, format version, endian,
-required resource limits, optional schema hash, optional extension, optional integrity, optional commit
+optional resource defaults, optional schema hash, optional extension, optional integrity, optional commit
 policy, optional checkpoint/offset-chain index, optional recovery policy,
 optional embedded manifest, optional variable-block compression, and registered
 blocks.

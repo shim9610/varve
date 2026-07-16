@@ -2,6 +2,7 @@
 use std::fs::read;
 use std::fs::{OpenOptions, remove_file};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::panic::catch_unwind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -308,8 +309,10 @@ fn category_map_offset_offset(entry: u64, name: &str) -> u64 {
 }
 
 fn assert_invalid_layout(spec: FormatSpec, path: &Path) {
+    let opened = catch_unwind(|| spec.open_readonly(path));
+    assert!(opened.is_ok(), "hostile matrix extent caused a panic");
     assert!(matches!(
-        spec.open_readonly(path),
+        opened.expect("checked above"),
         Err(Error::InvalidMatrixLayout)
     ));
 }
@@ -343,6 +346,24 @@ fn stored_commit_bit_counts_must_match_descriptor_keyspaces() {
             8,
         );
         assert_invalid_layout(spec, fixture.path());
+    }
+}
+
+#[test]
+fn every_hostile_vmat_header_extent_fails_without_panicking() {
+    let spec = matrix_spec(varve::IntegrityPolicy::None);
+    for index in 0..=APPEND_LOG_START {
+        let fixture = TempMatrix::new("matrix_hardening_header_extent");
+        create_empty(spec, fixture.path());
+        let header = read_vmat_header(fixture.path(), spec);
+        patch_header_u64(fixture.path(), header, index, u64::MAX);
+
+        let opened = catch_unwind(|| spec.open_readonly(fixture.path()));
+        assert!(opened.is_ok(), "VMAT header field {index} caused a panic");
+        assert!(
+            opened.expect("checked above").is_err(),
+            "VMAT header field {index} accepted u64::MAX"
+        );
     }
 }
 

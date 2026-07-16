@@ -14,9 +14,9 @@ use crate::{
     IndexPolicy, IntegrityPolicy, KeyedBlockVec, ManifestPolicy, MatrixCellStatus,
     MatrixCommitEvent, MatrixDimensions, MatrixKey, MatrixRecoveryAction, MatrixRecoveryReport,
     MatrixResumeSignal, RecoveryPolicy, Result, SnapshotFile, VariableCompression, VarveBlock,
-    VarveKeyedBlock, VarveMatrixBlock, VarveMerge, VarveMigration, WireType,
+    VarveKeyedBlock, VarveMatrixBlock, VarveMerge, VarveMigration, VarveReplaceBlock, WireType,
     collections::MaterializationBudget,
-    decode_from_slice, encode_to_vec,
+    encode_to_vec,
     format::ReadLimitKey,
     native_layout::{
         decode_native_internal_key_envelope, decode_native_internal_op_envelope,
@@ -222,14 +222,17 @@ impl RecordIndexEntry {
     ///
     /// This is a low-level, non-snapshot convenience API. It does not prove
     /// that the path still names the object from which this entry was indexed,
-    /// does not establish index membership or checksum validity, and permits an
-    /// allocation as large as `self.payload_len`. Prefer a typed
+    /// does not establish index membership or checksum validity, and applies
+    /// the standard physical payload ceiling. Prefer a typed
     /// reader/collection, which remains bound to its opened snapshot. For an
     /// explicitly path-based untrusted-input tool, use
     /// [`Self::read_payload_limited`] after establishing the entry's provenance.
     pub fn read_payload(&self, path: &Path) -> Result<Vec<u8>> {
         let mut file = File::open(path)?;
-        self.read_payload_file(&mut file)
+        let file_len = file.metadata()?.len();
+        self.validate_payload_extent(file_len)?;
+        crate::ReadLimits::STANDARD.check(ReadLimitKey::RecordPayloadLen, self.payload_len)?;
+        self.read_payload_file_validated(&mut file)
     }
 
     /// Reads stored payload bytes from the object currently named by `path`
@@ -253,14 +256,13 @@ impl RecordIndexEntry {
 
     /// Reads and decodes logical payload bytes through the current pathname.
     ///
-    /// This low-level method is non-snapshot and has no physical or logical
-    /// allocation ceiling. It also does not replace index-membership or record
+    /// This low-level method is non-snapshot and resolves the format's runtime
+    /// physical and logical allocation ceilings. It does not replace index-membership or record
     /// integrity validation. Use a typed snapshot reader for ordinary reads,
     /// or [`Self::read_logical_payload_limited`] for explicitly path-based
     /// tooling that has separately established entry provenance.
     pub fn read_logical_payload(&self, spec: FormatSpec, path: &Path) -> Result<Vec<u8>> {
-        let payload = self.read_payload(path)?;
-        decode_record_payload(spec, self, &payload)
+        self.read_logical_payload_limited(spec, path, u64::MAX, u64::MAX)
     }
 
     /// Reads and decodes through the current pathname with separate stored and
@@ -275,14 +277,19 @@ impl RecordIndexEntry {
         physical_limit: u64,
         logical_limit: u64,
     ) -> Result<Vec<u8>> {
+        let spec = spec.resolve_entrypoint();
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
         self.validate_payload_extent(file_len)?;
+        spec.read_limits
+            .check(ReadLimitKey::RecordPayloadLen, self.payload_len)?;
         ensure_payload_limit(PHYSICAL_PAYLOAD_RESOURCE, self.payload_len, physical_limit)?;
         let logical_len = self.logical_payload_len_before_allocation(spec, &mut file)?;
+        spec.read_limits
+            .check(ReadLimitKey::LogicalPayloadLen, logical_len)?;
         ensure_payload_limit(LOGICAL_PAYLOAD_RESOURCE, logical_len, logical_limit)?;
         let payload = self.read_payload_file_validated(&mut file)?;
-        decode_record_payload(spec, self, &payload)
+        decode_record_payload(spec, self, payload)
     }
 
     pub(crate) fn logical_payload_len_snapshot(
@@ -328,7 +335,7 @@ impl RecordIndexEntry {
     ) -> Result<Vec<u8>> {
         let logical_len = self.logical_payload_len_snapshot(spec, snapshot)?;
         let payload = self.read_payload_snapshot(spec, snapshot)?;
-        let decoded = decode_record_payload(spec, self, &payload)?;
+        let decoded = decode_record_payload(spec, self, payload)?;
         let actual =
             u64::try_from(decoded.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
         if actual != logical_len {
@@ -393,6 +400,35 @@ pub struct AppendInfo {
     pub prev_same_block_offset: Option<u64>,
     pub prev_same_key_offset: Option<u64>,
     pub committed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplacementInfo {
+    pub sequence: u64,
+    pub record_offset: u64,
+    pub old_payload_len: u64,
+    pub new_payload_len: u64,
+    pub old_physical_len: u64,
+    pub new_physical_len: u64,
+}
+
+impl ReplacementInfo {
+    pub fn translate_record_offset(&self, old: u64) -> Result<u64> {
+        if old <= self.record_offset {
+            return Ok(old);
+        }
+        if self.new_physical_len >= self.old_physical_len {
+            old.checked_add(self.new_physical_len - self.old_physical_len)
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "replacement record offset",
+                })
+        } else {
+            old.checked_sub(self.old_physical_len - self.new_physical_len)
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "replacement record offset",
+                })
+        }
+    }
 }
 
 impl From<&RecordIndexEntry> for BlockEvent {
@@ -1242,6 +1278,18 @@ impl VarveWriter {
         self.file.write_metadata(key, value)
     }
 
+    /// Replaces a native user record while preserving its sequence number.
+    ///
+    /// [`Error::PublishedButRebindFailed`] means publication already succeeded.
+    /// Do not retry blindly; discard this poisoned writer and reopen the path.
+    pub fn replace_block<T: VarveReplaceBlock>(
+        &mut self,
+        index: usize,
+        block: &T,
+    ) -> Result<ReplacementInfo> {
+        self.file.replace_block(index, block)
+    }
+
     /// Publishes a same-size fixed replacement through a copy-on-write file
     /// generation.
     ///
@@ -1496,6 +1544,7 @@ impl VarveWriter {
 
 impl VarveFile {
     pub fn create<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        let spec = spec.resolve_entrypoint();
         spec.validate()?;
         ensure_native_write_limits(spec)?;
         check_initial_native_file_len(spec)?;
@@ -1533,6 +1582,7 @@ impl VarveFile {
         path: P,
         dims: MatrixDimensions,
     ) -> Result<Self> {
+        let spec = spec.resolve_entrypoint();
         spec.validate()?;
         ensure_native_write_limits(spec)?;
         check_initial_native_file_len(spec)?;
@@ -1568,6 +1618,7 @@ impl VarveFile {
     }
 
     pub fn open<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        let spec = spec.resolve_entrypoint();
         spec.validate()?;
         ensure_native_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
@@ -1600,6 +1651,7 @@ impl VarveFile {
         path: P,
         policy: WriterLockBreakPolicy,
     ) -> Result<Self> {
+        let spec = spec.resolve_entrypoint();
         spec.validate()?;
         ensure_native_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
@@ -1628,6 +1680,7 @@ impl VarveFile {
     }
 
     pub fn open_readonly<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        let spec = spec.resolve_entrypoint();
         spec.validate()?;
         ensure_native_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
@@ -1662,6 +1715,7 @@ impl VarveFile {
         spec: FormatSpec,
         path: P,
     ) -> Result<(Self, RecoveryReport)> {
+        let spec = spec.resolve_entrypoint();
         spec.validate()?;
         ensure_native_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
@@ -1800,7 +1854,7 @@ impl VarveFile {
             budget.consume(logical_len)?;
             let payload = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
             let (stored_key, value): (String, Vec<u8>) =
-                decode_from_slice(&payload, self.spec.endian)?;
+                budget.decode(&payload, self.spec.endian)?;
             if stored_key == key {
                 let order = MergeOrder::for_record(0, entry.sequence, record_ordinal);
                 let should_replace = found
@@ -1829,7 +1883,7 @@ impl VarveFile {
                 resource: "metadata entries",
                 requested: logical_len,
             })?;
-            values.push(decode_from_slice(&payload, self.spec.endian)?);
+            values.push(budget.decode(&payload, self.spec.endian)?);
         }
         Ok(values)
     }
@@ -1851,7 +1905,155 @@ impl VarveFile {
         let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
         budget.consume(logical_len)?;
         let payload = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
-        Ok(Some(decode_schema_manifest(&payload)?))
+        Ok(Some(decode_schema_manifest(&payload, &mut budget)?))
+    }
+
+    /// Replaces a native user record while preserving its sequence number.
+    ///
+    /// The new generation is validated and synced before atomic publication.
+    /// Existing readers remain attached to the old generation.
+    pub fn replace_block<T: VarveReplaceBlock>(
+        &mut self,
+        index: usize,
+        block: &T,
+    ) -> Result<ReplacementInfo> {
+        self.ensure_write()?;
+        if !self.spec.layout.is_varve_native_default() {
+            return Err(Error::InvalidFormatSpec(
+                "replacement is not supported for custom physical layouts",
+            ));
+        }
+        if self.matrix.is_some() || T::KIND == BlockKind::Matrix {
+            return Err(Error::InvalidFormatSpec(
+                "replacement is not supported for matrix storage",
+            ));
+        }
+        self.ensure_user_block::<T>()?;
+        crate::collections::ensure_registered_block::<T>(self.spec)?;
+        let target_position = self
+            .index
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.block_id == T::ID)
+            .nth(index)
+            .map(|(position, _)| position)
+            .ok_or(Error::UnexpectedEof)?;
+        let target = &self.index[target_position];
+        if target.block_version != T::VERSION {
+            return Err(Error::BlockVersionMismatch {
+                block_id: T::ID,
+                expected: T::VERSION,
+                actual: target.block_version,
+            });
+        }
+
+        let mut materialization = MaterializationBudget::new(self.spec);
+        let old_logical_len = target.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
+        materialization.consume(old_logical_len)?;
+        let old_payload = target.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
+        let old: T = materialization.decode(&old_payload, T::ENDIAN.unwrap_or(self.spec.endian))?;
+        T::validate_replacement(&old, block)?;
+
+        let encoded = encode_to_vec(block, T::ENDIAN.unwrap_or(self.spec.endian))?;
+        let replacement = prepare_user_record_payload(self.spec, T::ID, T::KIND, &encoded)?;
+        let replacement_len = u64::try_from(replacement.bytes.len())
+            .map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::RecordPayloadLen, replacement_len)?;
+        let old_physical_len = target
+            .checked_physical_end()?
+            .checked_sub(target.record_offset)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "replacement physical length",
+            })?;
+        let new_physical_len = RECORD_HEADER_LEN
+            .checked_add(replacement_len)
+            .and_then(|len| len.checked_add(record_footer_len(self.spec)))
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "replacement physical length",
+            })?;
+        let info = ReplacementInfo {
+            sequence: target.sequence,
+            record_offset: target.record_offset,
+            old_payload_len: target.payload_len,
+            new_payload_len: replacement_len,
+            old_physical_len,
+            new_physical_len,
+        };
+
+        self.validate_source_generation()?;
+        let index_bytes = index_bytes_for_count(self.index.len())?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::IndexBytes, index_bytes)?;
+        let mut new_index = Vec::new();
+        new_index
+            .try_reserve_exact(self.index.len())
+            .map_err(|_| Error::AllocationFailed {
+                resource: "replacement index",
+                requested: index_bytes,
+            })?;
+
+        let (temp_path, mut temp_file) = create_rewrite_temp_file(&self.path)?;
+        let prepare_result = (|| -> Result<()> {
+            if let Ok(metadata) = self.file.metadata() {
+                temp_file.set_permissions(metadata.permissions())?;
+            }
+            write_file_header(self.spec, &mut temp_file)?;
+            for (position, source_entry) in self.index.iter().enumerate() {
+                let mut updated = source_entry.clone();
+                let checkpoint_payload;
+                let payload = if position == target_position {
+                    updated.flags = replacement.flags;
+                    updated.uncompressed_len_hint = replacement.uncompressed_len_hint;
+                    RewritePayload::Bytes(&replacement.bytes)
+                } else if source_entry.block_id == INDEX_BLOCK_ID {
+                    checkpoint_payload = encode_index_checkpoint_payload(
+                        self.spec,
+                        &new_index,
+                        temp_file.stream_position()?,
+                    )?;
+                    RewritePayload::Bytes(&checkpoint_payload)
+                } else {
+                    RewritePayload::Snapshot {
+                        offset: source_entry.payload_offset,
+                        len: source_entry.payload_len,
+                    }
+                };
+                updated = rewrite_replacement_record_streaming(
+                    self.spec,
+                    &self.snapshot,
+                    &mut temp_file,
+                    updated,
+                    payload,
+                    info,
+                    &new_index,
+                )?;
+                new_index.push(updated);
+            }
+            temp_file.flush()?;
+            temp_file.sync_all()?;
+            validate_replacement_generation_file(
+                self.spec,
+                &mut temp_file,
+                append_log_start_for_file(self)?,
+                &new_index,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = prepare_result {
+            drop(temp_file);
+            let _ = remove_file(&temp_path);
+            return Err(error);
+        }
+        drop(temp_file);
+
+        if let Err(error) = replace_path_atomically(&temp_path, &self.path) {
+            let _ = remove_file(&temp_path);
+            return Err(error);
+        }
+        self.rebind_replacement_generation(info, new_index)
     }
 
     /// Publishes a same-size fixed replacement through a copy-on-write file
@@ -2310,7 +2512,7 @@ impl VarveFile {
             let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
             budget.consume(logical_len)?;
             let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
-            let from: From = decode_from_slice(&payload, From::ENDIAN.unwrap_or(self.spec.endian))?;
+            let from: From = budget.decode(&payload, From::ENDIAN.unwrap_or(self.spec.endian))?;
             migrated
                 .try_reserve(1)
                 .map_err(|_| Error::AllocationFailed {
@@ -2347,7 +2549,7 @@ impl VarveFile {
                     budget.consume(logical_len)?;
                     let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
                     let block: T =
-                        decode_from_slice(&payload, T::ENDIAN.unwrap_or(self.spec.endian))?;
+                        budget.decode(&payload, T::ENDIAN.unwrap_or(self.spec.endian))?;
                     let key = block.key();
                     if should_apply(state.get(&key), order) {
                         let requested = index_bytes_for_count(state.len().saturating_add(1))?;
@@ -2371,7 +2573,8 @@ impl VarveFile {
                         entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
                     budget.consume(logical_len)?;
                     let payload = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
-                    if let Some(key) = decode_internal_key_payload::<T>(self.spec.endian, &payload)?
+                    if let Some(key) =
+                        decode_internal_key_payload::<T>(self.spec.endian, &payload, &mut budget)?
                         && should_apply(state.get(&key), order)
                     {
                         let requested = index_bytes_for_count(state.len().saturating_add(1))?;
@@ -2459,7 +2662,7 @@ impl VarveFile {
                     budget.consume(logical_len)?;
                     let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
                     let block: T =
-                        decode_from_slice(&payload, T::ENDIAN.unwrap_or(self.spec.endian))?;
+                        budget.decode(&payload, T::ENDIAN.unwrap_or(self.spec.endian))?;
                     let key = block.key();
                     if tails.get(&key).is_none_or(|(old, _)| order >= *old) {
                         let requested = allocation_bytes::<(T::Key, (MergeOrder, u64))>(
@@ -2478,7 +2681,8 @@ impl VarveFile {
                         entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
                     budget.consume(logical_len)?;
                     let payload = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
-                    if let Some(key) = decode_internal_key_payload::<T>(self.spec.endian, &payload)?
+                    if let Some(key) =
+                        decode_internal_key_payload::<T>(self.spec.endian, &payload, &mut budget)?
                         && tails.get(&key).is_none_or(|(old, _)| order >= *old)
                     {
                         let requested = allocation_bytes::<(T::Key, (MergeOrder, u64))>(
@@ -2875,6 +3079,12 @@ impl VarveFile {
 
         let file = self.snapshot.try_clone_file()?;
         let current_len = file.metadata()?.len();
+        if mapped_len > current_len {
+            return Err(Error::MmapPayloadOutOfBounds {
+                offset: 0,
+                len: mapped_len,
+            });
+        }
         for entry in &self.index {
             validate_mmap_index_entry(entry, current_len)?;
         }
@@ -2974,6 +3184,12 @@ impl VarveFile {
         )?;
         let file = self.snapshot.try_clone_file()?;
         let current_len = file.metadata()?.len();
+        if mapped_len > current_len {
+            return Err(Error::MmapPayloadOutOfBounds {
+                offset: 0,
+                len: mapped_len,
+            });
+        }
         validate_mmap_range(0, layout.append_log_start(), current_len)?;
         let map_len =
             usize::try_from(mapped_len).map_err(|_| Error::LengthOverflow { value: mapped_len })?;
@@ -3024,6 +3240,36 @@ impl VarveFile {
                 self.poisoned = true;
                 Err(Error::PublishedButRebindFailed {
                     sequence,
+                    source: Box::new(source),
+                })
+            }
+        }
+    }
+
+    fn rebind_replacement_generation(
+        &mut self,
+        info: ReplacementInfo,
+        new_index: Vec<RecordIndexEntry>,
+    ) -> Result<ReplacementInfo> {
+        let rebind = (|| -> Result<(File, SnapshotFile)> {
+            #[cfg(test)]
+            fail_rebind_after_publish_if_requested()?;
+            let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+            let snapshot = SnapshotFile::new(file.try_clone()?)?;
+            Ok((file, snapshot))
+        })();
+
+        match rebind {
+            Ok((file, snapshot)) => {
+                self.file = file;
+                self.snapshot = snapshot;
+                self.index = new_index;
+                Ok(info)
+            }
+            Err(source) => {
+                self.poisoned = true;
+                Err(Error::PublishedButRebindFailed {
+                    sequence: info.sequence,
                     source: Box::new(source),
                 })
             }
@@ -3425,6 +3671,25 @@ fn validate_generation_file(
     append_start: u64,
     expected_entries: &[RecordIndexEntry],
 ) -> Result<()> {
+    validate_generation_file_inner(spec, file, append_start, expected_entries, false)
+}
+
+fn validate_replacement_generation_file(
+    spec: FormatSpec,
+    file: &mut File,
+    append_start: u64,
+    expected_entries: &[RecordIndexEntry],
+) -> Result<()> {
+    validate_generation_file_inner(spec, file, append_start, expected_entries, true)
+}
+
+fn validate_generation_file_inner(
+    spec: FormatSpec,
+    file: &mut File,
+    append_start: u64,
+    expected_entries: &[RecordIndexEntry],
+    strict_checkpoints: bool,
+) -> Result<()> {
     let file_len = check_open_file_len(spec, file)?;
     let header_len = read_file_header(spec, file)?;
     if append_start < header_len || append_start > file_len {
@@ -3457,7 +3722,7 @@ fn validate_generation_file(
                 });
             }
         };
-        if !record_headers_match(expected, &actual) {
+        if !physical_record_headers_match(expected, &actual) {
             return Err(Error::InvalidCanonicalEncoding(
                 "native record changed after it was indexed",
             ));
@@ -3474,6 +3739,16 @@ fn validate_generation_file(
                 &actual,
                 &expected_entries[..position],
             )?;
+            if strict_checkpoints {
+                let checkpoint = decode_index_checkpoint(spec, &payload, file_len)?;
+                validate_index_checkpoint(
+                    append_start,
+                    file_len,
+                    &actual,
+                    &checkpoint,
+                    &expected_entries[..position],
+                )?;
+            }
         }
         offset = actual.checked_physical_end()?;
     }
@@ -3481,6 +3756,21 @@ fn validate_generation_file(
         return Err(Error::CorruptTail { offset });
     }
     validate_unique_sequences(expected_entries)
+}
+
+fn physical_record_headers_match(left: &RecordIndexEntry, right: &RecordIndexEntry) -> bool {
+    left.block_id == right.block_id
+        && left.block_version == right.block_version
+        && left.flags == right.flags
+        && left.sequence == right.sequence
+        && left.record_offset == right.record_offset
+        && left.payload_offset == right.payload_offset
+        && left.payload_len == right.payload_len
+        && left.checksum == right.checksum
+        && left.uncompressed_len_hint == right.uncompressed_len_hint
+        && left.footer_offset == right.footer_offset
+        && left.prev_same_block_offset == right.prev_same_block_offset
+        && left.prev_same_key_offset == right.prev_same_key_offset
 }
 
 #[derive(Clone, Copy)]
@@ -3572,6 +3862,163 @@ fn rewrite_record_streaming(
     )?;
     output.seek(SeekFrom::Start(record_end))?;
     Ok(entry)
+}
+
+fn rewrite_replacement_record_streaming(
+    spec: FormatSpec,
+    snapshot: &SnapshotFile,
+    output: &mut File,
+    mut entry: RecordIndexEntry,
+    payload: RewritePayload<'_>,
+    replacement: ReplacementInfo,
+    rewritten_prefix: &[RecordIndexEntry],
+) -> Result<RecordIndexEntry> {
+    let payload_len = match payload {
+        RewritePayload::Bytes(bytes) => {
+            u64::try_from(bytes.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?
+        }
+        RewritePayload::Snapshot { len, .. } => len,
+    };
+    spec.read_limits
+        .check(ReadLimitKey::RecordPayloadLen, payload_len)?;
+    let logical_len = match payload {
+        RewritePayload::Bytes(bytes) => record_logical_len_from_parts(
+            spec,
+            entry.block_id,
+            entry.flags,
+            entry.uncompressed_len_hint,
+            bytes,
+        )?,
+        RewritePayload::Snapshot { .. } => entry.logical_payload_len_snapshot(spec, snapshot)?,
+    };
+    spec.read_limits
+        .check(ReadLimitKey::LogicalPayloadLen, logical_len)?;
+
+    let record_offset = output.stream_position()?;
+    let payload_offset =
+        record_offset
+            .checked_add(RECORD_HEADER_LEN)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "replacement file length",
+            })?;
+    let payload_end =
+        payload_offset
+            .checked_add(payload_len)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "replacement file length",
+            })?;
+    let record_end = payload_end.checked_add(record_footer_len(spec)).ok_or(
+        Error::ResourceArithmeticOverflow {
+            resource: "replacement file length",
+        },
+    )?;
+    spec.read_limits.check(ReadLimitKey::FileLen, record_end)?;
+
+    entry.record_offset = record_offset;
+    entry.payload_offset = payload_offset;
+    entry.payload_len = payload_len;
+    entry.footer_offset = spec.spec_needs_record_footer().then_some(payload_end);
+    entry.prev_same_block_offset = entry
+        .prev_same_block_offset
+        .map(|offset| replacement.translate_record_offset(offset))
+        .transpose()?;
+    entry.prev_same_key_offset = entry
+        .prev_same_key_offset
+        .map(|offset| replacement.translate_record_offset(offset))
+        .transpose()?;
+
+    let header = RecordHeaderFields {
+        block_id: entry.block_id,
+        block_version: entry.block_version,
+        flags: entry.flags,
+        sequence: entry.sequence,
+        payload_len,
+        checksum: 0,
+        uncompressed_len_hint: entry.uncompressed_len_hint,
+    };
+    write_record_header(output, spec, record_offset, header)?;
+    match payload {
+        RewritePayload::Bytes(bytes) => output.write_all(bytes)?,
+        RewritePayload::Snapshot { offset, len } => snapshot.copy_range_to(offset, len, output)?,
+    }
+    let footer = if spec.spec_needs_record_footer() {
+        let footer = encode_record_footer(RecordFooterFields {
+            prev_same_block_offset: entry.prev_same_block_offset,
+            prev_same_key_offset: entry.prev_same_key_offset,
+        })?;
+        output.write_all(&footer)?;
+        footer
+    } else {
+        Vec::new()
+    };
+    validate_replacement_predecessors(output, &entry, rewritten_prefix)?;
+
+    entry.checksum = match spec.integrity_policy {
+        IntegrityPolicy::None => 0,
+        IntegrityPolicy::Crc32 | IntegrityPolicy::Crc32WithHeader => {
+            checksum_record_file(spec, output, &entry, &footer)?
+        }
+    };
+    output.seek(SeekFrom::Start(record_offset))?;
+    write_record_header(
+        output,
+        spec,
+        record_offset,
+        RecordHeaderFields {
+            checksum: entry.checksum,
+            ..header
+        },
+    )?;
+    output.seek(SeekFrom::Start(record_end))?;
+    Ok(entry)
+}
+
+fn validate_replacement_predecessors(
+    output: &mut File,
+    entry: &RecordIndexEntry,
+    rewritten_prefix: &[RecordIndexEntry],
+) -> Result<()> {
+    if let Some(offset) = entry.prev_same_block_offset {
+        let Some(previous) = rewritten_prefix
+            .iter()
+            .find(|candidate| candidate.record_offset == offset)
+        else {
+            return Err(Error::InvalidRecordFooter { offset });
+        };
+        if offset >= entry.record_offset || previous.block_id != entry.block_id {
+            return Err(Error::InvalidRecordFooter { offset });
+        }
+    }
+    if let Some(offset) = entry.prev_same_key_offset {
+        let Some(previous) = rewritten_prefix
+            .iter()
+            .find(|candidate| candidate.record_offset == offset)
+        else {
+            return Err(Error::InvalidRecordFooter { offset });
+        };
+        if offset >= entry.record_offset
+            || replacement_chain_block_id(output, previous)?
+                != replacement_chain_block_id(output, entry)?
+        {
+            return Err(Error::InvalidRecordFooter { offset });
+        }
+    }
+    Ok(())
+}
+
+fn replacement_chain_block_id(file: &mut File, entry: &RecordIndexEntry) -> Result<u32> {
+    if !matches!(entry.block_id, TOMBSTONE_BLOCK_ID | OP_BLOCK_ID) {
+        return Ok(entry.block_id);
+    }
+    if entry.payload_len < 4 {
+        return Err(Error::InvalidRecordFooter {
+            offset: entry.record_offset,
+        });
+    }
+    file.seek(SeekFrom::Start(entry.payload_offset))?;
+    let mut block_id = [0; 4];
+    file.read_exact(&mut block_id)?;
+    Ok(u32::from_le_bytes(block_id))
 }
 
 fn encode_index_checkpoint_payload(
@@ -3676,7 +4123,10 @@ fn encode_schema_manifest(spec: FormatSpec) -> Result<Vec<u8>> {
     Ok(payload)
 }
 
-fn decode_schema_manifest(payload: &[u8]) -> Result<SchemaManifest> {
+fn decode_schema_manifest(
+    payload: &[u8],
+    budget: &mut MaterializationBudget,
+) -> Result<SchemaManifest> {
     let mut cursor = ManifestCursor { payload, offset: 0 };
     let payload_version = cursor.read_u16()?;
     if !(1..=MANIFEST_PAYLOAD_VERSION).contains(&payload_version) {
@@ -3699,7 +4149,7 @@ fn decode_schema_manifest(payload: &[u8]) -> Result<SchemaManifest> {
             0 => None,
             1 => {
                 let len = cursor.read_u16()? as usize;
-                Some(cursor.read_string(len)?)
+                Some(cursor.read_string(len, budget)?)
             }
             _ => return Err(Error::InvalidSchemaManifest),
         };
@@ -3709,22 +4159,33 @@ fn decode_schema_manifest(payload: &[u8]) -> Result<SchemaManifest> {
         (None, CompressionPolicy::None)
     };
     let block_count = cursor.read_u32()? as usize;
+    let minimum_block_len = if payload_version >= 2 { 13 } else { 9 };
+    preflight_manifest_count(block_count, minimum_block_len, cursor.remaining())?;
+    consume_manifest_items::<SchemaBlockDescriptor>(budget, block_count)?;
     let mut blocks = Vec::new();
+    blocks
+        .try_reserve_exact(block_count)
+        .map_err(|_| manifest_allocation_failed::<SchemaBlockDescriptor>(block_count))?;
     for _ in 0..block_count {
         let id = cursor.read_u32()?;
         let version = cursor.read_u16()?;
         let kind = block_kind_from_byte(cursor.read_u8()?)?;
         let name_len = cursor.read_u16()? as usize;
-        let name = cursor.read_string(name_len)?;
+        let name = cursor.read_string(name_len, budget)?;
         let fields = if payload_version >= 2 {
             let field_count = cursor.read_u32()? as usize;
+            preflight_manifest_count(field_count, 8, cursor.remaining())?;
+            consume_manifest_items::<SchemaFieldDescriptor>(budget, field_count)?;
             let mut fields = Vec::new();
+            fields
+                .try_reserve_exact(field_count)
+                .map_err(|_| manifest_allocation_failed::<SchemaFieldDescriptor>(field_count))?;
             for _ in 0..field_count {
                 let id = cursor.read_u32()?;
                 let wire_type = wire_type_from_byte(cursor.read_u8()?)?;
                 let presence = field_presence_from_byte(cursor.read_u8()?)?;
                 let name_len = cursor.read_u16()? as usize;
-                let name = cursor.read_string(name_len)?;
+                let name = cursor.read_string(name_len, budget)?;
                 fields.push(SchemaFieldDescriptor {
                     id,
                     name,
@@ -3814,8 +4275,53 @@ impl ManifestCursor<'_> {
         Ok(i32::from_le_bytes(bytes))
     }
 
-    fn read_string(&mut self, len: usize) -> Result<String> {
-        String::from_utf8(self.read_exact(len)?.to_vec()).map_err(|_| Error::InvalidSchemaManifest)
+    fn read_string(&mut self, len: usize, budget: &mut MaterializationBudget) -> Result<String> {
+        let bytes = self.read_exact(len)?;
+        let value = std::str::from_utf8(bytes).map_err(|_| Error::InvalidSchemaManifest)?;
+        let requested = u64::try_from(len).map_err(|_| Error::ResourceArithmeticOverflow {
+            resource: "schema manifest string",
+        })?;
+        budget.consume(requested)?;
+        let mut output = String::new();
+        output
+            .try_reserve_exact(len)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "schema manifest string",
+                requested,
+            })?;
+        output.push_str(value);
+        Ok(output)
+    }
+}
+
+fn preflight_manifest_count(count: usize, minimum_item_len: usize, remaining: usize) -> Result<()> {
+    let minimum_extent = count
+        .checked_mul(minimum_item_len)
+        .ok_or(Error::InvalidSchemaManifest)?;
+    if minimum_extent > remaining {
+        return Err(Error::InvalidSchemaManifest);
+    }
+    Ok(())
+}
+
+fn consume_manifest_items<T>(budget: &mut MaterializationBudget, count: usize) -> Result<()> {
+    let requested = count
+        .checked_mul(size_of::<T>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "schema manifest output",
+        })?;
+    budget.consume(requested)
+}
+
+fn manifest_allocation_failed<T>(count: usize) -> Error {
+    let requested = count
+        .checked_mul(size_of::<T>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .unwrap_or(u64::MAX);
+    Error::AllocationFailed {
+        resource: "schema manifest output",
+        requested,
     }
 }
 
@@ -4104,16 +4610,16 @@ fn record_logical_len_from_parts(
 fn decode_record_payload(
     spec: FormatSpec,
     entry: &RecordIndexEntry,
-    physical_payload: &[u8],
+    physical_payload: Vec<u8>,
 ) -> Result<Vec<u8>> {
     if !entry.is_compressed() {
-        return Ok(physical_payload.to_vec());
+        return Ok(physical_payload);
     }
     validate_record_entry(spec, entry)?;
     let compression = variable_compression_for_block(spec, entry.block_id)
         .ok_or(Error::InvalidCompressionHeader)?;
     let (algorithm, expected_len, compressed_payload) = match compression.header_mode {
-        CompressionHeaderMode::RecordExplicit => decode_compression_envelope(physical_payload)?,
+        CompressionHeaderMode::RecordExplicit => decode_compression_envelope(&physical_payload)?,
         CompressionHeaderMode::FileExplicit | CompressionHeaderMode::FormatContract => {
             if entry.uncompressed_len_hint == 0 {
                 return Err(Error::InvalidCompressionHeader);
@@ -4121,7 +4627,7 @@ fn decode_record_payload(
             (
                 compression.algorithm,
                 u64::from(entry.uncompressed_len_hint),
-                physical_payload,
+                physical_payload.as_slice(),
             )
         }
     };
@@ -4396,6 +4902,8 @@ where
     T::Key: Eq + Hash,
     P: AsRef<Path>,
 {
+    let spec = spec.ordinary_read();
+    spec.validate()?;
     let final_values = collect_merged_keyed_values::<T, P>(spec, base, deltas)?;
     write_keyed_values_atomically(
         spec,
@@ -4410,6 +4918,8 @@ where
     T::Key: Eq + Hash,
     P: AsRef<Path>,
 {
+    let spec = spec.ordinary_read();
+    spec.validate()?;
     let final_values = collect_merged_keyed_values::<T, P>(spec, base, deltas)?;
     write_keyed_values_atomically(
         spec,
@@ -4539,7 +5049,7 @@ where
                 let logical_len = entry.logical_payload_len_snapshot(spec, snapshot)?;
                 budget.consume(logical_len)?;
                 let payload = entry.read_logical_payload_snapshot(spec, snapshot)?;
-                let block: T = decode_from_slice(&payload, T::ENDIAN.unwrap_or(spec.endian))?;
+                let block: T = budget.decode(&payload, T::ENDIAN.unwrap_or(spec.endian))?;
                 let key = block.key();
                 if should_apply(state.get(&key), order) {
                     state.try_reserve(1).map_err(|_| Error::AllocationFailed {
@@ -4553,7 +5063,8 @@ where
                 let logical_len = entry.logical_payload_len_snapshot(spec, snapshot)?;
                 budget.consume(logical_len)?;
                 let payload = entry.read_payload_snapshot(spec, snapshot)?;
-                let Some(key) = decode_internal_key_payload::<T>(spec.endian, &payload)? else {
+                let Some(key) = decode_internal_key_payload::<T>(spec.endian, &payload, budget)?
+                else {
                     continue;
                 };
                 if should_apply(state.get(&key), order) {
@@ -4568,7 +5079,8 @@ where
                 let logical_len = entry.logical_payload_len_snapshot(spec, snapshot)?;
                 budget.consume(logical_len)?;
                 let payload = entry.read_payload_snapshot(spec, snapshot)?;
-                let Some((key, op)) = decode_internal_op_payload::<T>(spec.endian, &payload)?
+                let Some((key, op)) =
+                    decode_internal_op_payload::<T>(spec.endian, &payload, budget)?
                 else {
                     continue;
                 };
@@ -4631,14 +5143,18 @@ where
     Ok(payload)
 }
 
-fn decode_internal_key_payload<T>(endian: Endian, payload: &[u8]) -> Result<Option<T::Key>>
+fn decode_internal_key_payload<T>(
+    endian: Endian,
+    payload: &[u8],
+    budget: &mut MaterializationBudget,
+) -> Result<Option<T::Key>>
 where
     T: VarveKeyedBlock,
 {
     let Some(key) = decode_native_internal_key_envelope(payload, T::ID)? else {
         return Ok(None);
     };
-    Ok(Some(decode_from_slice(key, endian)?))
+    Ok(Some(budget.decode(key, endian)?))
 }
 
 fn encode_internal_op_payload<T>(endian: Endian, key: &T::Key, op: &T::Op) -> Result<Vec<u8>>
@@ -4656,15 +5172,19 @@ where
     Ok(payload)
 }
 
-fn decode_internal_op_payload<T>(endian: Endian, payload: &[u8]) -> Result<Option<(T::Key, T::Op)>>
+fn decode_internal_op_payload<T>(
+    endian: Endian,
+    payload: &[u8],
+    budget: &mut MaterializationBudget,
+) -> Result<Option<(T::Key, T::Op)>>
 where
     T: VarveMerge,
 {
     let Some((key, op)) = decode_native_internal_op_envelope(payload, T::ID)? else {
         return Ok(None);
     };
-    let key = decode_from_slice(key, endian)?;
-    let op = decode_from_slice(op, endian)?;
+    let key = budget.decode(key, endian)?;
+    let op = budget.decode(op, endian)?;
     Ok(Some((key, op)))
 }
 
@@ -4979,7 +5499,11 @@ struct IndexCheckpoint {
     entries: Vec<RecordIndexEntry>,
 }
 
-fn decode_index_checkpoint(spec: FormatSpec, payload: &[u8]) -> Result<IndexCheckpoint> {
+fn decode_index_checkpoint(
+    spec: FormatSpec,
+    payload: &[u8],
+    file_len: u64,
+) -> Result<IndexCheckpoint> {
     const PREFIX_LEN: usize = 4 + 2 + 8 + 8;
     const ENTRY_LEN_V1: usize = 4 + 2 + 2 + 8 + 8 + 8 + 8 + 4;
     const ENTRY_LEN_V2: usize = ENTRY_LEN_V1 + 4;
@@ -5021,6 +5545,16 @@ fn decode_index_checkpoint(spec: FormatSpec, payload: &[u8]) -> Result<IndexChec
         return Err(Error::InvalidIndexCheckpoint);
     }
 
+    let mut position = PREFIX_LEN;
+    for _ in 0..count_usize {
+        let entry =
+            read_index_entry_payload(&payload[position..position + entry_len], checkpoint_version);
+        if entry.checked_physical_end()? > file_len {
+            return Err(Error::InvalidIndexCheckpoint);
+        }
+        position += entry_len;
+    }
+
     let mut entries = Vec::new();
     entries
         .try_reserve_exact(count_usize)
@@ -5050,7 +5584,7 @@ fn inspect_index_checkpoint(
     checkpoint_record: &RecordIndexEntry,
     observed_prefix: &[RecordIndexEntry],
 ) -> Result<()> {
-    match decode_index_checkpoint(spec, payload) {
+    match decode_index_checkpoint(spec, payload, file_len) {
         Ok(checkpoint) => {
             let _ = validate_index_checkpoint(
                 header_len,
@@ -5306,11 +5840,6 @@ fn scan_records_from(
 }
 
 impl RecordIndexEntry {
-    fn read_payload_file(&self, file: &mut File) -> Result<Vec<u8>> {
-        let file_len = file.metadata()?.len();
-        self.read_payload_file_with_len(file, file_len)
-    }
-
     fn read_payload_file_with_len(&self, file: &mut File, file_len: u64) -> Result<Vec<u8>> {
         self.validate_payload_extent(file_len)?;
         self.read_payload_file_validated(file)
@@ -6374,6 +6903,92 @@ mod tests {
         const ENDIAN: Option<Endian> = None;
     }
 
+    impl VarveReplaceBlock for ReplaceTestBlock {
+        fn validate_replacement(_old: &Self, _new: &Self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ReplaceString(String);
+
+    impl VarveEncode for ReplaceString {
+        const WIRE_TYPE: crate::WireType = crate::WireType::String;
+
+        fn encode_varve(&self, encoder: &mut crate::Encoder) -> Result<()> {
+            self.0.encode_varve(encoder)
+        }
+    }
+
+    impl VarveDecode for ReplaceString {
+        const WIRE_TYPE: crate::WireType = crate::WireType::String;
+
+        fn decode_varve(decoder: &mut crate::Decoder<'_>) -> Result<Self> {
+            Ok(Self(String::decode_varve(decoder)?))
+        }
+    }
+
+    impl VarveBlock for ReplaceString {
+        const ID: u32 = 43;
+        const VERSION: u16 = 1;
+        const KIND: BlockKind = BlockKind::Variable;
+        const ENDIAN: Option<Endian> = None;
+    }
+
+    impl VarveReplaceBlock for ReplaceString {
+        fn validate_replacement(_old: &Self, _new: &Self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ReplaceKeyed {
+        key: u64,
+        value: String,
+    }
+
+    impl VarveEncode for ReplaceKeyed {
+        const WIRE_TYPE: crate::WireType = <(u64, String) as VarveEncode>::WIRE_TYPE;
+
+        fn encode_varve(&self, encoder: &mut crate::Encoder) -> Result<()> {
+            (self.key, self.value.clone()).encode_varve(encoder)
+        }
+    }
+
+    impl VarveDecode for ReplaceKeyed {
+        const WIRE_TYPE: crate::WireType = <(u64, String) as VarveDecode>::WIRE_TYPE;
+
+        fn decode_varve(decoder: &mut crate::Decoder<'_>) -> Result<Self> {
+            let (key, value) = <(u64, String)>::decode_varve(decoder)?;
+            Ok(Self { key, value })
+        }
+    }
+
+    impl VarveBlock for ReplaceKeyed {
+        const ID: u32 = 44;
+        const VERSION: u16 = 1;
+        const KIND: BlockKind = BlockKind::Variable;
+        const ENDIAN: Option<Endian> = None;
+    }
+
+    impl VarveKeyedBlock for ReplaceKeyed {
+        type Key = u64;
+
+        fn key(&self) -> Self::Key {
+            self.key
+        }
+    }
+
+    impl VarveReplaceBlock for ReplaceKeyed {
+        fn validate_replacement(old: &Self, new: &Self) -> Result<()> {
+            if old.key == new.key {
+                Ok(())
+            } else {
+                Err(Error::ReplacementKeyMismatch)
+            }
+        }
+    }
+
     fn test_spec() -> FormatSpec {
         FormatSpec::new(
             b"VSTEST",
@@ -6428,13 +7043,29 @@ mod tests {
     }
 
     fn replace_test_spec() -> FormatSpec {
-        static BLOCKS: &[BlockDescriptor] = &[BlockDescriptor {
-            id: ReplaceTestBlock::ID,
-            name: "ReplaceTestBlock",
-            version: ReplaceTestBlock::VERSION,
-            kind: BlockKind::Fixed,
-            fields: ReplaceTestBlock::FIELDS,
-        }];
+        static BLOCKS: &[BlockDescriptor] = &[
+            BlockDescriptor {
+                id: ReplaceTestBlock::ID,
+                name: "ReplaceTestBlock",
+                version: ReplaceTestBlock::VERSION,
+                kind: BlockKind::Fixed,
+                fields: ReplaceTestBlock::FIELDS,
+            },
+            BlockDescriptor {
+                id: ReplaceString::ID,
+                name: "ReplaceString",
+                version: ReplaceString::VERSION,
+                kind: BlockKind::Variable,
+                fields: ReplaceString::FIELDS,
+            },
+            BlockDescriptor {
+                id: ReplaceKeyed::ID,
+                name: "ReplaceKeyed",
+                version: ReplaceKeyed::VERSION,
+                kind: BlockKind::Variable,
+                fields: ReplaceKeyed::FIELDS,
+            },
+        ];
 
         FormatSpec::new(
             b"VSRPL",
@@ -6448,6 +7079,244 @@ mod tests {
             BLOCKS,
         )
         .with_read_limits(crate::ReadLimits::finite_all(u64::MAX))
+    }
+
+    fn replacement_policy_spec() -> FormatSpec {
+        let spec = replace_test_spec()
+            .with_index_policy(IndexPolicy::new(true, true, true, false))
+            .with_commit_policy(CommitPolicy::RecordFooter);
+        #[cfg(feature = "integrity")]
+        {
+            spec.with_integrity_policy(IntegrityPolicy::Crc32WithHeader)
+        }
+        #[cfg(not(feature = "integrity"))]
+        {
+            spec
+        }
+    }
+
+    #[test]
+    fn replacement_info_translates_grow_and_shrink_offsets() -> Result<()> {
+        let grow = ReplacementInfo {
+            sequence: 7,
+            record_offset: 100,
+            old_payload_len: 8,
+            new_payload_len: 18,
+            old_physical_len: 40,
+            new_physical_len: 50,
+        };
+        assert_eq!(grow.translate_record_offset(99)?, 99);
+        assert_eq!(grow.translate_record_offset(100)?, 100);
+        assert_eq!(grow.translate_record_offset(140)?, 150);
+
+        let shrink = ReplacementInfo {
+            old_payload_len: 18,
+            new_payload_len: 8,
+            old_physical_len: 50,
+            new_physical_len: 40,
+            ..grow
+        };
+        assert_eq!(shrink.translate_record_offset(150)?, 140);
+        Ok(())
+    }
+
+    #[test]
+    fn replace_block_grows_shrinks_and_preserves_sequence_chains_and_snapshot() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("resized.varve");
+        let spec = replacement_policy_spec();
+        let mut writer = VarveFile::create(spec, &path)?;
+        writer.push(&ReplaceString("a".into()))?;
+        writer.flush()?;
+        writer.push(&ReplaceTestBlock { value: 9 })?;
+        writer.push(&ReplaceString("tail".into()))?;
+        writer.flush()?;
+
+        let old_reader = VarveFile::open_readonly(spec, &path)?;
+        let old_values = old_reader.blocks::<ReplaceString>()?;
+        let old_tail_offset = writer
+            .index_entries()
+            .iter()
+            .filter(|entry| entry.block_id == ReplaceString::ID)
+            .nth(1)
+            .expect("tail record")
+            .record_offset;
+        let sequence = writer
+            .index_entries()
+            .iter()
+            .find(|entry| entry.block_id == ReplaceString::ID)
+            .expect("target record")
+            .sequence;
+
+        let grown = writer.replace_block(
+            0,
+            &ReplaceString("a replacement that is substantially longer".into()),
+        )?;
+        assert_eq!(grown.sequence, sequence);
+        assert!(grown.new_physical_len > grown.old_physical_len);
+        let translated_tail = grown.translate_record_offset(old_tail_offset)?;
+        let entries = writer.index_entries();
+        let tail = entries
+            .iter()
+            .filter(|entry| entry.block_id == ReplaceString::ID)
+            .nth(1)
+            .expect("rewritten tail");
+        assert_eq!(tail.record_offset, translated_tail);
+        assert_eq!(tail.prev_same_block_offset, Some(grown.record_offset));
+        assert_eq!(old_values.get(0)?, Some(ReplaceString("a".into())));
+
+        let shrunk = writer.replace_block(0, &ReplaceString(String::new()))?;
+        assert_eq!(shrunk.sequence, sequence);
+        assert!(shrunk.new_physical_len < shrunk.old_physical_len);
+        let equal = writer.replace_block(0, &ReplaceString("x".into()))?;
+        let equal_again = writer.replace_block(0, &ReplaceString("y".into()))?;
+        assert_eq!(equal.new_physical_len, equal_again.new_physical_len);
+
+        let reopened = VarveFile::open_readonly(spec, &path)?;
+        assert_eq!(
+            reopened.blocks::<ReplaceString>()?.get(0)?,
+            Some(ReplaceString("y".into()))
+        );
+        assert_eq!(
+            reopened.blocks::<ReplaceString>()?.get(1)?,
+            Some(ReplaceString("tail".into()))
+        );
+        assert_no_rewrite_temps(directory.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn replace_block_validates_key_before_publication() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("keyed.varve");
+        let spec = replace_test_spec();
+        let mut writer = VarveFile::create(spec, &path)?;
+        writer.push(&ReplaceKeyed {
+            key: 1,
+            value: "old".into(),
+        })?;
+        let original = std::fs::read(&path)?;
+
+        assert!(matches!(
+            writer.replace_block(
+                0,
+                &ReplaceKeyed {
+                    key: 2,
+                    value: "new".into(),
+                },
+            ),
+            Err(Error::ReplacementKeyMismatch)
+        ));
+        assert_eq!(std::fs::read(&path)?, original);
+        assert_no_rewrite_temps(directory.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn replace_block_translates_keyed_predecessors_after_target() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("keyed-chain.varve");
+        let spec =
+            replacement_policy_spec().with_index_policy(IndexPolicy::new(true, true, true, true));
+        let mut writer = VarveFile::create(spec, &path)?;
+        let first = writer.push_info(&ReplaceKeyed {
+            key: 1,
+            value: "a".into(),
+        })?;
+        let second = writer.push_with_prev_key_info(
+            &ReplaceKeyed {
+                key: 1,
+                value: "b".into(),
+            },
+            Some(first.record_offset),
+        )?;
+        writer.push_with_prev_key_info(
+            &ReplaceKeyed {
+                key: 1,
+                value: "c".into(),
+            },
+            Some(second.record_offset),
+        )?;
+        writer.flush()?;
+
+        let info = writer.replace_block(
+            0,
+            &ReplaceKeyed {
+                key: 1,
+                value: "a much longer first value".into(),
+            },
+        )?;
+        let keyed: Vec<_> = writer
+            .index_entries()
+            .iter()
+            .filter(|entry| entry.block_id == ReplaceKeyed::ID)
+            .collect();
+        assert_eq!(
+            keyed[2].prev_same_key_offset,
+            Some(info.translate_record_offset(second.record_offset)?)
+        );
+        VarveFile::open_readonly(spec, &path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn replace_block_preserves_transaction_visibility_and_next_sequence() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("transaction.varve");
+        let spec = replace_test_spec()
+            .with_index_policy(IndexPolicy::new(true, true, true, false))
+            .with_commit_policy(CommitPolicy::TransactionMarker(
+                crate::TransactionMarkerMode::Explicit,
+            ));
+        let mut writer = VarveFile::create(spec, &path)?;
+        writer.push(&ReplaceString("committed-old".into()))?;
+        writer.commit()?;
+        let old_reader = VarveFile::open_readonly(spec, &path)?;
+        writer.push(&ReplaceString("uncommitted".into()))?;
+        let next_sequence = writer.sequence_state.available()?;
+
+        let info = writer.replace_block(0, &ReplaceString("committed-new".into()))?;
+        assert_eq!(info.sequence, 0);
+        assert_eq!(writer.sequence_state.available()?, next_sequence);
+        assert_eq!(
+            old_reader.blocks::<ReplaceString>()?.get(0)?,
+            Some(ReplaceString("committed-old".into()))
+        );
+        let new_reader = VarveFile::open_readonly(spec, &path)?;
+        let visible = new_reader.blocks::<ReplaceString>()?;
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible.get(0)?, Some(ReplaceString("committed-new".into())));
+        assert_eq!(writer.push(&ReplaceTestBlock { value: 11 })?, next_sequence);
+        Ok(())
+    }
+
+    #[test]
+    fn replacement_publish_rebind_failure_is_explicit_and_poisoned() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("replacement-rebind.varve");
+        let spec = replace_test_spec();
+        let mut writer = VarveFile::create(spec, &path)?;
+        writer.push(&ReplaceString("old".into()))?;
+        let old_reader = VarveFile::open_readonly(spec, &path)?;
+        inject_write_fault(WriteFault::RebindAfterPublish);
+
+        assert!(matches!(
+            writer.replace_block(0, &ReplaceString("new and longer".into())),
+            Err(Error::PublishedButRebindFailed { sequence: 0, .. })
+        ));
+        assert_eq!(
+            old_reader.blocks::<ReplaceString>()?.get(0)?,
+            Some(ReplaceString("old".into()))
+        );
+        assert_eq!(
+            VarveFile::open_readonly(spec, &path)?
+                .blocks::<ReplaceString>()?
+                .get(0)?,
+            Some(ReplaceString("new and longer".into()))
+        );
+        assert!(matches!(writer.flush(), Err(Error::WriterPoisoned("file"))));
+        assert_no_rewrite_temps(directory.path())?;
+        Ok(())
     }
 
     #[test]
@@ -6837,6 +7706,65 @@ mod tests {
             reopened.matrix_cell_status::<MatrixTestCell>(key)?,
             MatrixCellStatus::NotCommitted
         );
+        Ok(())
+    }
+
+    #[test]
+    fn schema_manifest_rejects_huge_and_truncated_counts_before_iteration() {
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(&1u16.to_le_bytes());
+        prefix.extend_from_slice(&1u16.to_le_bytes());
+        prefix.push(Endian::Little.to_byte());
+        prefix.extend_from_slice(&0u64.to_le_bytes());
+        prefix.extend_from_slice(&[0, 0, 0, 0]);
+
+        let mut huge = prefix.clone();
+        huge.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut budget = MaterializationBudget::new(test_spec());
+        assert!(matches!(
+            decode_schema_manifest(&huge, &mut budget),
+            Err(Error::InvalidSchemaManifest)
+        ));
+
+        let mut truncated = prefix;
+        truncated.extend_from_slice(&1u32.to_le_bytes());
+        truncated.extend_from_slice(&[0; 8]);
+        let mut budget = MaterializationBudget::new(test_spec());
+        assert!(matches!(
+            decode_schema_manifest(&truncated, &mut budget),
+            Err(Error::InvalidSchemaManifest)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_rejects_oversized_extent_before_index_allocation() -> Result<()> {
+        let entry = RecordIndexEntry {
+            block_id: ReplaceTestBlock::ID,
+            block_version: ReplaceTestBlock::VERSION,
+            flags: 0,
+            sequence: 0,
+            record_offset: 32,
+            payload_offset: u64::MAX - 1,
+            payload_len: 4,
+            checksum: 0,
+            uncompressed_len_hint: 0,
+            footer_offset: None,
+            prev_same_block_offset: None,
+            prev_same_key_offset: None,
+            committed: true,
+        };
+        let payload = encode_index_checkpoint_payload(test_spec(), &[entry], 128)?;
+
+        let decoded =
+            std::panic::catch_unwind(|| decode_index_checkpoint(test_spec(), &payload, 128));
+        assert!(
+            decoded.is_ok(),
+            "oversized checkpoint extent caused a panic"
+        );
+        assert!(matches!(
+            decoded.expect("checked above"),
+            Err(Error::LengthOverflow { .. }) | Err(Error::InvalidIndexCheckpoint)
+        ));
         Ok(())
     }
 }

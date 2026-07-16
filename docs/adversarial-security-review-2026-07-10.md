@@ -42,20 +42,21 @@ below as the evidence and threat rationale.
 | ADV-003 whole-payload CRC allocation | Remediated | bounded 64 KiB streaming CRC and CRC+COW/footer regressions |
 | ADV-004 matrix-derived bitmap allocation | Remediated | `matrix_limits` covers dimension, aggregate cells, bitmap, CRC, metadata, slot, aux, quarantine, and sidecar budgets |
 | ADV-005 duplicate sequence ambiguity | Remediated | duplicate sequences rejected; conflict order is shard, sequence, physical ordinal |
-| ADV-006 generated limit gap | Remediated | required `limits` DSL, `ReadLimits`, generated `*_with_limits` and `*_trusted_unbounded`, trybuild coverage |
+| ADV-006 generated limit gap | Remediated, policy revised | optional runtime `ReadLimits`, generated `*_with_resource_limits`, tightening and trusted boundaries, trybuild coverage |
 | ADV-007 whole sidecar/lock reads | Remediated | metadata-first length checks, bounded lock `take`, strict sidecar read plan |
 | ADV-008 32-bit field-length truncation | Remediated | checked `u64 -> usize` before field access; oversized-field regression |
 | ADV-009 non-canonical accepted bytes | Remediated | zero flags, duplicate fields, ordered map keys, exact internal envelopes, strict native/matrix reserved fields |
-| ADV-010 unbounded record/segment indexes | Remediated | record, segment, scan, resident-index, and cumulative materialization budgets |
+| ADV-010 hostile aggregate work | Caller-controlled | append totals are intentionally uncapped by default; services can set runtime record, segment, scan, and index budgets while one-shot materialization remains bounded |
 
 Verification completed with workspace all-feature tests, strict Clippy, Cargo
 audit/deny, npTDMS/Pillow compatibility harnesses, performance comparison,
 ASan fuzzing, Miri, and Windows replacement fault injection.
 Exact commands, measurements, and residual assurance boundaries are recorded in
 `security-remediation-validation.md` and `fuzzing-and-fault-injection.md`.
-The hostile-input claim still assumes format authors choose finite limits
-appropriate for their domain; custom codecs and explicitly unsafe mmap/raw or
-exclusive in-place APIs retain their documented caller obligations.
+For hostile-input services, aggregate work quotas are a call-time deployment
+choice rather than a format-schema requirement. Standard one-shot allocation
+limits remain active; custom codecs and explicitly unsafe mmap/raw or exclusive
+in-place APIs retain their documented caller obligations.
 
 ## Threat Model
 

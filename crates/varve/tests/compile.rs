@@ -8,6 +8,8 @@ fn macro_compile_contracts() {
     tests.pass("tests/ui/pass_layout.rs");
     tests.pass("tests/ui/pass_macro_hygiene.rs");
     tests.pass("tests/ui/pass_read_limits.rs");
+    tests.pass("tests/ui/pass_optional_partial_limits.rs");
+    tests.pass("tests/ui/pass_replacement_api.rs");
     tests.compile_fail("tests/ui/fail_duplicate_id.rs");
     tests.compile_fail("tests/ui/fail_duplicate_field_id.rs");
     tests.compile_fail("tests/ui/fail_zero_field_id.rs");
@@ -27,10 +29,8 @@ fn macro_compile_contracts() {
     tests.compile_fail("tests/ui/fail_matrix_unbounded_field.rs");
     tests.compile_fail("tests/ui/fail_duplicate_format_key.rs");
     tests.compile_fail("tests/ui/fail_generic_derive.rs");
-    tests.compile_fail("tests/ui/fail_missing_limits.rs");
     tests.compile_fail("tests/ui/fail_unknown_limit_key.rs");
     tests.compile_fail("tests/ui/fail_duplicate_limit_key.rs");
-    tests.compile_fail("tests/ui/fail_missing_limit_key.rs");
 }
 
 #[cfg(feature = "mmap")]

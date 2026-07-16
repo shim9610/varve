@@ -10,8 +10,8 @@ use varve::{
     decode_from_slice, encode_to_vec, read_field_header, write_field,
 };
 
-const DUPLICATE_MAP_BYTES: [u8; 11] = [2, 0, 0, 0, 0, 0, 0, 0, 7, 9, 7];
-const DESCENDING_MAP_BYTES: [u8; 11] = [2, 0, 0, 0, 0, 0, 0, 0, 2, 20, 1];
+const DUPLICATE_MAP_BYTES: [u8; 12] = [2, 0, 0, 0, 0, 0, 0, 0, 7, 9, 7, 99];
+const DESCENDING_MAP_BYTES: [u8; 12] = [2, 0, 0, 0, 0, 0, 0, 0, 2, 20, 1, 99];
 const CANONICAL_U8_MAP_BYTES: [u8; 12] = [2, 0, 0, 0, 0, 0, 0, 0, 1, 10, 2, 20];
 const VALID_MAP_BYTES: [u8; 20] = [2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 10, 0, 0, 0, 2, 0, 20, 0, 0, 0];
 
@@ -188,6 +188,19 @@ fn zero_width_maps_terminate_on_hostile_counts() {
 }
 
 #[test]
+fn map_preflight_includes_the_final_value_before_budget_or_reserve() {
+    let truncated = [2, 0, 0, 0, 0, 0, 0, 0, 1, 10, 2];
+    assert!(matches!(
+        Decoder::decode_from_slice_limited::<BTreeMap<u8, u8>>(&truncated, Endian::Little, 0,),
+        Err(Error::UnexpectedEof)
+    ));
+    assert!(matches!(
+        Decoder::decode_from_slice_limited::<HashMap<u8, u8>>(&truncated, Endian::Little, 0,),
+        Err(Error::UnexpectedEof)
+    ));
+}
+
+#[test]
 fn truncated_and_oversized_payloads_return_errors_without_panicking() {
     assert_truncations_error_without_panicking::<BTreeMap<u16, u32>>(&VALID_MAP_BYTES);
     assert_truncations_error_without_panicking::<HashMap<u16, u32>>(&VALID_MAP_BYTES);
@@ -217,14 +230,72 @@ fn variable_field_lengths_are_checked_before_payload_access() {
 }
 
 #[test]
-fn duplicate_known_variable_field_is_rejected_before_its_value() {
+fn truncated_duplicate_variable_field_is_rejected_before_field_id_allocation() {
     let mut encoded = Vec::new();
     append_field(&mut encoded, 1, WireType::U8, 0, 1, &[7]);
     append_field(&mut encoded, 1, WireType::U8, 0, 1, &[]);
 
-    assert_invalid_canonical(decode_from_slice::<HardenedVariable>(
-        &encoded,
-        Endian::Little,
+    assert!(matches!(
+        decode_from_slice::<HardenedVariable>(&encoded, Endian::Little),
+        Err(Error::UnexpectedEof)
+    ));
+}
+
+#[test]
+fn built_in_allocations_share_a_finite_decoder_budget() {
+    let encoded = encode_to_vec(&(vec![1u8, 2, 3], "four".to_string()), Endian::Little)
+        .expect("encode fixture");
+    assert!(matches!(
+        Decoder::decode_from_slice_limited::<(Vec<u8>, String)>(&encoded, Endian::Little, 6),
+        Err(Error::LimitExceeded {
+            resource: "string",
+            actual: 7,
+            limit: 6
+        })
+    ));
+    assert_eq!(
+        Decoder::decode_from_slice_limited::<(Vec<u8>, String)>(&encoded, Endian::Little, 7)
+            .expect("exact budget"),
+        (vec![1, 2, 3], "four".to_string())
+    );
+
+    let first = encode_to_vec(&vec![1u8, 2, 3], Endian::Little).expect("encode first value");
+    let second = encode_to_vec(&"four".to_string(), Endian::Little).expect("encode second value");
+    let mut remaining = 7;
+    assert_eq!(
+        Decoder::decode_from_slice_accounted::<Vec<u8>>(&first, Endian::Little, &mut remaining)
+            .expect("accounted first value"),
+        vec![1, 2, 3]
+    );
+    assert_eq!(remaining, 4);
+    assert_eq!(
+        Decoder::decode_from_slice_accounted::<String>(&second, Endian::Little, &mut remaining)
+            .expect("accounted second value"),
+        "four"
+    );
+    assert_eq!(remaining, 0);
+}
+
+#[test]
+fn byte_derived_counts_are_rejected_before_loops_or_allocations() {
+    let hostile = u64::MAX.to_le_bytes();
+    for result in [
+        decode_from_slice::<Vec<u64>>(&hostile, Endian::Little).map(|_| ()),
+        decode_from_slice::<Vec<String>>(&hostile, Endian::Little).map(|_| ()),
+        decode_from_slice::<HashMap<u64, u64>>(&hostile, Endian::Little).map(|_| ()),
+    ] {
+        assert!(result.is_err());
+    }
+}
+
+#[test]
+fn field_extent_is_checked_before_large_field_id_bookkeeping() {
+    let mut encoded = Vec::new();
+    append_field(&mut encoded, u32::MAX, WireType::U8, 0, 1, &[]);
+    let mut decoder = Decoder::new(&encoded, Endian::Little);
+    assert!(matches!(
+        read_field_header(&mut decoder),
+        Err(Error::UnexpectedEof)
     ));
 }
 
@@ -280,7 +351,7 @@ fn nested_field_and_top_level_map_decoders_report_exact_trailing_bytes() {
 fn field_headers_decode_checked_lengths_while_writers_emit_zero_flags() -> varve::Result<()> {
     let canonical_header = [
         0x44, 0x33, 0x22, 0x11, 0x0f, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00,
+        0x00, 0xaa, 0xbb, 0xcc,
     ];
     let mut decoder = Decoder::new(&canonical_header, Endian::Little);
     assert_eq!(
@@ -291,7 +362,7 @@ fn field_headers_decode_checked_lengths_while_writers_emit_zero_flags() -> varve
             payload_len: 3,
         }
     );
-    assert_eq!(decoder.remaining(), 0);
+    assert_eq!(decoder.remaining(), 3);
 
     let mut encoder = Encoder::new(Endian::Little);
     write_field(

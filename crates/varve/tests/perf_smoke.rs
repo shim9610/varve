@@ -108,24 +108,6 @@ varve_format! {
     pub struct PerfFormat {
         magic: b"PERFSMK";
         version: 1;
-        limits {
-            file_len: 8_589_934_592;
-            records: 4_000_000;
-            index_bytes: 536_870_912;
-            scan_bytes: 8_589_934_592;
-            record_payload: 67_108_864;
-            logical_payload: 268_435_456;
-            materialized_bytes: 1_073_741_824;
-            segments: 4_000_000;
-            matrix_dimension: 16_000_000;
-            matrix_cells: 16_000_000;
-            matrix_bitmap: 64_000_000;
-            matrix_crc: 128_000_000;
-            matrix_metadata: 268_435_456;
-            matrix_slot_region: 8_589_934_592;
-            sidecar: 268_435_456;
-            mmap: 8_589_934_592;
-        }
         endian: little;
         blocks: [PerfPoint, PerfRawPoint, PerfUser, PerfUserOp];
     }
@@ -346,6 +328,7 @@ fn perf_smoke_core_paths() -> varve::Result<()> {
     ] {
         println!("\n== {}: {} records ==", case.name, case.records);
         append_open_and_scan(case)?;
+        resized_replacement(case)?;
         #[cfg(feature = "mmap")]
         mmap_payload_window_scan(case)?;
         #[cfg(feature = "zero-copy")]
@@ -539,6 +522,39 @@ fn append_open_and_scan(case: PerfCase) -> varve::Result<()> {
     })?;
     report("open/scan fixed", case.records, &path, elapsed);
 
+    cleanup(&path);
+    Ok(())
+}
+
+fn resized_replacement(case: PerfCase) -> varve::Result<()> {
+    let path = temp_path(&format!("{}_resized_replace", case.name));
+    cleanup(&path);
+
+    {
+        let mut file = PerfFormat::create(&path)?;
+        for index in 0..case.records {
+            file.push(&perf_user(index))?;
+        }
+        file.flush()?;
+    }
+
+    let target = case.records / 2;
+    let replacement = PerfUser {
+        user_id: target as u64,
+        region: 9,
+        name: "resized replacement".to_string(),
+        payload: vec![0xA5; 256 * 1024],
+    };
+    let elapsed = timed(|| {
+        let mut file = PerfFormat::open(&path)?;
+        let info = file.replace_block(target, &replacement)?;
+        assert!(info.new_payload_len > info.old_payload_len);
+        Ok(())
+    })?;
+    report("replace resized COW", case.records, &path, elapsed);
+
+    let file = PerfFormat::open_readonly(&path)?;
+    assert_eq!(file.blocks::<PerfUser>()?.get(target)?, Some(replacement));
     cleanup(&path);
     Ok(())
 }
