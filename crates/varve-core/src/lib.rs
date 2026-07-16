@@ -18,9 +18,10 @@ mod traits;
 pub use adapter::{
     AdapterCheckReport, AdapterCheckStatus, AdapterDiagnostic, AdapterDiagnosticDomain,
     AdapterInputFile, AdapterTailStatus, BinaryCursor, BinaryWriter, ChunkEntry, ChunkIndex,
-    ChunkIndexBuilder, ChunkIndexEntry, ChunkLayout, LengthPrefix, SegmentReducer,
-    SegmentReductionReport, SidecarIdentity, SidecarMode, SidecarPolicy, SidecarReport,
-    TaggedValue, TaggedValueCodec, reduce_segments, reduce_segments_by_ref,
+    ChunkIndexBuilder, ChunkIndexEntry, ChunkLayout, DEFAULT_SIDECAR_FINGERPRINT_SCAN_LIMIT,
+    LengthPrefix, SegmentReducer, SegmentReductionReport, SidecarIdentity, SidecarMode,
+    SidecarPolicy, SidecarReport, TaggedValue, TaggedValueCodec, reduce_segments,
+    reduce_segments_by_ref,
 };
 pub use chunks::ChunkedBytes;
 pub use codec::{
@@ -38,7 +39,7 @@ pub use file::{
     AppendInfo, BlockEvent, COMMIT_BLOCK_ID, FileMatrixDurabilityBarrier, INDEX_BLOCK_ID,
     MANIFEST_BLOCK_ID, METADATA_BLOCK_ID, MatrixDurabilityBarrier, MatrixNumeric,
     MatrixSidecarManifest, OP_BLOCK_ID, OpenMode, RecordIndexEntry, RecoveryReport,
-    ReplaceStrategy, SchemaBlockDescriptor, SchemaFieldDescriptor, SchemaManifest,
+    ReplaceStrategy, ReplacementInfo, SchemaBlockDescriptor, SchemaFieldDescriptor, SchemaManifest,
     TOMBSTONE_BLOCK_ID, VarveFile, VarveReader, VarveWriter, WriterLockBreakPolicy, WriterLockInfo,
     compact_keyed_files, merge_keyed_files,
 };
@@ -55,8 +56,8 @@ pub use format::{
     LayoutPlanRegionSource, LayoutPlanSegment, LayoutPreset, LayoutSpec, LeadInDescriptor,
     ManifestPolicy, MatrixAuxDescriptor, MatrixBlockDescriptor, MatrixCommitDescriptor,
     MatrixCommitKind, MatrixDimensionDescriptor, MetadataDescriptor, RawRegionDescriptor,
-    ReadLimit, ReadLimits, RecoveryPolicy, SegmentDescriptor, SegmentRepeat, TransactionMarkerMode,
-    VariableCompression,
+    ReadLimit, ReadLimits, RecoveryPolicy, ResourceLimits, SegmentDescriptor, SegmentRepeat,
+    TransactionMarkerMode, VariableCompression,
 };
 pub use layout::{
     LayoutFieldValue, LayoutFileInfo, LayoutReader, LayoutScanReport, LayoutSegmentInfo,
@@ -70,7 +71,9 @@ pub use matrix::{
 pub use merge::{MergeAction, SequencedMergeAction, VarveMerge, compact_keyed_file};
 #[allow(unused_imports)]
 pub(crate) use snapshot::SnapshotFile;
-pub use traits::{VarveBlock, VarveKey, VarveKeyedBlock, VarveMatrixBlock, VarveMigration};
+pub use traits::{
+    VarveBlock, VarveKey, VarveKeyedBlock, VarveMatrixBlock, VarveMigration, VarveReplaceBlock,
+};
 #[cfg(feature = "zero-copy")]
 pub use traits::{VarveRawFixedBlock, VarveRawMatrixBlock};
 #[cfg(feature = "zero-copy")]

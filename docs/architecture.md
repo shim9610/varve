@@ -11,10 +11,12 @@
   readers are snapshot-on-open. Matrix metadata and commit maps are snapshotted,
   but in-place slot bytes require caller coordination with readers.
 - The first stable goal is a conservative owned-decoding core, with mmap and zero-copy as explicit opt-in features.
-- Every ordinary read surface is governed by declaration-time `ReadLimits` and
-  optional runtime tightening. Limits are not persisted and do not participate
-  in schema hashes; explicitly named trusted-unbounded entrypoints are the only
-  bypass for missing or unbounded fields.
+- Every ordinary read surface resolves a runtime resource policy. The format
+  declaration may provide optional defaults, but limits are not persisted and
+  do not participate in schema hashes. Append totals (file length, scan bytes,
+  record count, segment count, and index bytes) are uncapped by default;
+  one-shot allocation and materialization limits remain finite. Applications
+  handling hostile files can set finite aggregate work quotas at open time.
 
 ## Core Model
 

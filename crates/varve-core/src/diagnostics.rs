@@ -733,6 +733,7 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::FormatVersionMismatch { .. }
         | Error::EndianMismatch { .. }
         | Error::ReplaceSizeMismatch { .. }
+        | Error::ReplacementKeyMismatch
         | Error::MissingMergeTarget
         | Error::MigrationBlockIdMismatch { .. }
         | Error::MatrixDimensionsRequired

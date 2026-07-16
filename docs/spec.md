@@ -120,6 +120,10 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - `replace_fixed` performs snapshot-preserving copy-on-write replacement and
   requires an unchanged encoded payload size.
 - `replace_rewrite` rewrites through a completed temporary file and atomically replaces the original file path.
+- `replace_block` is the generated/core sequence-preserving replacement path.
+  It permits a native fixed or variable payload to grow or shrink, rebuilds
+  headers, CRCs, checkpoints, and offset-chain footers, and publishes a new
+  snapshot generation. Keyed replacement must preserve the key.
 - `replace(index, block, ReplaceStrategy)` is the policy-facing wrapper over
   fixed copy-on-write replacement and full-file rewrite replacement.
 - `unsafe replace_fixed_in_place_exclusive` is the explicitly unsafe expert
@@ -164,13 +168,13 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Duplicate key fields, missing key fields, duplicate block ids, and reserved block ids fail at compile time where macro input makes that possible.
 - `varve_format!` supports the legacy registry form `pub struct Format { blocks: [A, B]; }` and the format-first form `pub format Format { blocks { fixed A(...) { ... } } }`.
 - In format-first form, block structs, `VarveBlock` implementations, typed reader/writer wrappers, and typed read/write traits are generated from the format declaration.
-- `varve_format!` supports `magic`, `version`, required `limits`, `endian`, optional `schema_hash`, optional `commit`, optional `integrity`, optional `index`, optional `recovery`, optional `manifest`, and `blocks`.
-- `limits { ... }` declares finite hostile-input ceilings. Unknown and
-  duplicate keys are compile errors, as are missing keys required by the
-  selected native, custom-layout, or matrix surface. The explicit alternative
-  is `limits: trusted_unbounded;`, usable only through generated methods whose
-  names include `trusted_unbounded`. Limits do not affect wire bytes, schema
-  hashes, or manifests; runtime `ReadLimits` can only tighten them.
+- `varve_format!` supports `magic`, `version`, optional `limits`, `endian`, optional `schema_hash`, optional `commit`, optional `integrity`, optional `index`, optional `recovery`, optional `manifest`, and `blocks`.
+- `limits { ... }` is an optional, partial set of operational defaults. Unknown
+  and duplicate keys are compile errors. Limits do not affect wire bytes,
+  schema hashes, or manifests. Ordinary handles fill missing fields from
+  `ReadLimits::STANDARD`; `*_with_resource_limits` may raise or lower defaults,
+  while compatibility `*_with_limits` methods only tighten them. The explicit
+  trusted-unbounded APIs remain separately named.
 - `integrity` accepts `none`, `crc32`, or `crc32_with_header`. `crc32`
   covers payload plus native record footer when present. `crc32_with_header`
   additionally covers the native 32-byte record header with the checksum field

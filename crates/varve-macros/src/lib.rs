@@ -245,7 +245,7 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
                     });
                 }
                 #var = ::core::option::Option::Some(
-                    ::varve::__core::decode_from_slice::<#ty>(payload, decoder.endian())?
+                    decoder.decode_nested::<#ty>(payload)?
                 );
             }
         }
@@ -335,6 +335,36 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
             }
         }
     };
+    let replace_impl = if key_fields.is_empty() {
+        quote! {
+            impl ::varve::__core::VarveReplaceBlock for #ident {
+                fn validate_replacement(
+                    _old: &Self,
+                    _new: &Self,
+                ) -> ::varve::__core::Result<()> {
+                    ::core::result::Result::Ok(())
+                }
+            }
+        }
+    } else {
+        quote! {
+            impl ::varve::__core::VarveReplaceBlock for #ident {
+                fn validate_replacement(
+                    old: &Self,
+                    new: &Self,
+                ) -> ::varve::__core::Result<()> {
+                    if <Self as ::varve::__core::VarveKeyedBlock>::key(old)
+                        != <Self as ::varve::__core::VarveKeyedBlock>::key(new)
+                    {
+                        return ::core::result::Result::Err(
+                            ::varve::__core::Error::ReplacementKeyMismatch,
+                        );
+                    }
+                    ::core::result::Result::Ok(())
+                }
+            }
+        }
+    };
 
     Ok(quote! {
         impl ::varve::__core::VarveEncode for #ident {
@@ -364,6 +394,7 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
         }
 
         #keyed_impl
+        #replace_impl
     })
 }
 
@@ -884,79 +915,12 @@ impl Parse for FormatInput {
         let registry_blocks = registry_blocks.unwrap_or_default();
         let inline_blocks = inline_blocks.unwrap_or_default();
         let layout_segments = layout_segments.unwrap_or_default();
-        let limits = limits.ok_or_else(|| {
-            content.error(
-                "missing limits policy; declare limits { ... } or limits: trusted_unbounded;",
-            )
-        })?;
+        let limits = limits.unwrap_or_else(|| LimitsChoice::Finite(Vec::new()));
         if typed_api && inline_blocks.is_empty() && layout_segments.is_empty() {
             return Err(content.error("format syntax requires inline blocks"));
         }
         if !typed_api && registry_blocks.is_empty() {
             return Err(content.error("missing blocks"));
-        }
-        if let LimitsChoice::Finite(entries) = &limits {
-            let has_custom_layout = !layout_segments.is_empty()
-                || matches!(
-                    layout_preset,
-                    Some(LayoutPresetChoice::Custom | LayoutPresetChoice::None)
-                );
-            let has_matrix = !dims.is_empty()
-                || inline_blocks
-                    .iter()
-                    .any(|block| matches!(block.kind, InlineBlockKind::Matrix(_)));
-            let has_native_blocks = !registry_blocks.is_empty()
-                || inline_blocks
-                    .iter()
-                    .any(|block| !matches!(block.kind, InlineBlockKind::Matrix(_)));
-            let has_native = has_native_blocks || (!has_custom_layout && !has_matrix);
-
-            if has_native {
-                require_read_limit_keys(
-                    entries,
-                    &[
-                        "file_len",
-                        "records",
-                        "index_bytes",
-                        "scan_bytes",
-                        "record_payload",
-                        "logical_payload",
-                        "materialized_bytes",
-                    ],
-                    &content,
-                )?;
-            }
-            if has_custom_layout {
-                require_read_limit_keys(
-                    entries,
-                    &[
-                        "file_len",
-                        "scan_bytes",
-                        "segments",
-                        "index_bytes",
-                        "record_payload",
-                    ],
-                    &content,
-                )?;
-            }
-            if has_matrix {
-                require_read_limit_keys(
-                    entries,
-                    &[
-                        "file_len",
-                        "record_payload",
-                        "materialized_bytes",
-                        "matrix_dimension",
-                        "matrix_cells",
-                        "matrix_bitmap",
-                        "matrix_crc",
-                        "matrix_metadata",
-                        "matrix_slot_region",
-                        "sidecar",
-                    ],
-                    &content,
-                )?;
-            }
         }
         validate_matrix_format(&dims, matrix_commit.as_ref(), &matrix_aux, &inline_blocks)?;
 
@@ -1031,19 +995,6 @@ fn parse_read_limits(input: ParseStream<'_>) -> Result<Vec<LimitEntry>> {
     }
 
     Ok(entries)
-}
-
-fn require_read_limit_keys(
-    entries: &[LimitEntry],
-    required: &[&str],
-    input: ParseStream<'_>,
-) -> Result<()> {
-    for required in required {
-        if !entries.iter().any(|entry| entry.key == *required) {
-            return Err(input.error(format!("missing Varve read limit key {required:?}")));
-        }
-    }
-    Ok(())
 }
 
 fn note_format_key(seen: &mut Vec<String>, key: &Ident) -> Result<()> {
@@ -2050,6 +2001,12 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     } else {
         quote!(Self::spec().create_layout_writer_with_limits(path, limits))
     };
+    let create_layout_writer_with_resource_limits_body = if has_typed_layout_api {
+        let writer_name = format_ident!("{}LayoutWriter", name);
+        quote!(::core::result::Result::Ok(#writer_name::from_inner(Self::spec().create_layout_writer_with_resource_limits(path, limits)?)))
+    } else {
+        quote!(Self::spec().create_layout_writer_with_resource_limits(path, limits))
+    };
     let create_layout_writer_trusted_body = if has_typed_layout_api {
         let writer_name = format_ident!("{}LayoutWriter", name);
         quote!(::core::result::Result::Ok(#writer_name::from_inner(Self::spec().create_layout_writer_trusted_unbounded(path)?)))
@@ -2067,6 +2024,14 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
         quote!(::core::result::Result::Ok(#writer_name::from_inner(Self::spec().create_layout_writer_with_header_and_limits(path, fields, limits)?)))
     } else {
         quote!(Self::spec().create_layout_writer_with_header_and_limits(path, fields, limits))
+    };
+    let create_layout_writer_with_header_and_resource_limits_body = if has_typed_layout_api {
+        let writer_name = format_ident!("{}LayoutWriter", name);
+        quote!(::core::result::Result::Ok(#writer_name::from_inner(Self::spec().create_layout_writer_with_header_and_resource_limits(path, fields, limits)?)))
+    } else {
+        quote!(
+            Self::spec().create_layout_writer_with_header_and_resource_limits(path, fields, limits)
+        )
     };
     let create_layout_writer_with_header_trusted_body = if has_typed_layout_api {
         let writer_name = format_ident!("{}LayoutWriter", name);
@@ -2086,6 +2051,12 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     } else {
         quote!(Self::spec().open_layout_writer_with_limits(path, limits))
     };
+    let open_layout_writer_with_resource_limits_body = if has_typed_layout_api {
+        let writer_name = format_ident!("{}LayoutWriter", name);
+        quote!(::core::result::Result::Ok(#writer_name::from_inner(Self::spec().open_layout_writer_with_resource_limits(path, limits)?)))
+    } else {
+        quote!(Self::spec().open_layout_writer_with_resource_limits(path, limits))
+    };
     let open_layout_writer_trusted_body = if has_typed_layout_api {
         let writer_name = format_ident!("{}LayoutWriter", name);
         quote!(::core::result::Result::Ok(#writer_name::from_inner(Self::spec().open_layout_writer_trusted_unbounded(path)?)))
@@ -2103,6 +2074,12 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
         quote!(::core::result::Result::Ok(#reader_name::from_inner(Self::spec().open_layout_reader_with_limits(path, limits)?)))
     } else {
         quote!(Self::spec().open_layout_reader_with_limits(path, limits))
+    };
+    let open_layout_reader_with_resource_limits_body = if has_typed_layout_api {
+        let reader_name = format_ident!("{}LayoutReader", name);
+        quote!(::core::result::Result::Ok(#reader_name::from_inner(Self::spec().open_layout_reader_with_resource_limits(path, limits)?)))
+    } else {
+        quote!(Self::spec().open_layout_reader_with_resource_limits(path, limits))
     };
     let open_layout_reader_trusted_body = if has_typed_layout_api {
         let reader_name = format_ident!("{}LayoutReader", name);
@@ -2122,6 +2099,12 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     } else {
         quote!(Self::spec().create_writer_with_limits(path, limits))
     };
+    let create_writer_with_resource_limits_body = if typed_api_enabled {
+        let writer_name = format_ident!("{}Writer", name);
+        quote!(#writer_name::from_inner(Self::spec().create_writer_with_resource_limits(path, limits)?))
+    } else {
+        quote!(Self::spec().create_writer_with_resource_limits(path, limits))
+    };
     let create_writer_trusted_body = if typed_api_enabled {
         let writer_name = format_ident!("{}Writer", name);
         quote!(#writer_name::from_inner(Self::spec().create_writer_trusted_unbounded(path)?))
@@ -2140,6 +2123,12 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     } else {
         quote!(Self::spec().open_writer_with_limits(path, limits))
     };
+    let open_writer_with_resource_limits_body = if typed_api_enabled {
+        let writer_name = format_ident!("{}Writer", name);
+        quote!(#writer_name::from_inner(Self::spec().open_writer_with_resource_limits(path, limits)?))
+    } else {
+        quote!(Self::spec().open_writer_with_resource_limits(path, limits))
+    };
     let open_writer_trusted_body = if typed_api_enabled {
         let writer_name = format_ident!("{}Writer", name);
         quote!(#writer_name::from_inner(Self::spec().open_writer_trusted_unbounded(path)?))
@@ -2157,6 +2146,12 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
         quote!(#writer_name::from_inner(Self::spec().open_recover_writer_with_limits(path, limits)?))
     } else {
         quote!(Self::spec().open_recover_writer_with_limits(path, limits))
+    };
+    let open_recover_writer_with_resource_limits_body = if typed_api_enabled {
+        let writer_name = format_ident!("{}Writer", name);
+        quote!(#writer_name::from_inner(Self::spec().open_recover_writer_with_resource_limits(path, limits)?))
+    } else {
+        quote!(Self::spec().open_recover_writer_with_resource_limits(path, limits))
     };
     let open_recover_writer_trusted_body = if typed_api_enabled {
         let writer_name = format_ident!("{}Writer", name);
@@ -2187,6 +2182,18 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     } else {
         quote!(Self::spec().open_recover_writer_with_report_and_limits(path, limits))
     };
+    let open_recover_writer_report_with_resource_limits_body = if typed_api_enabled {
+        let writer_name = format_ident!("{}Writer", name);
+        quote! {
+            {
+                let (writer, report) = Self::spec()
+                    .open_recover_writer_with_report_and_resource_limits(path, limits)?;
+                ::core::result::Result::Ok((#writer_name::from_inner(writer)?, report))
+            }
+        }
+    } else {
+        quote!(Self::spec().open_recover_writer_with_report_and_resource_limits(path, limits))
+    };
     let open_recover_writer_report_trusted_body = if typed_api_enabled {
         let writer_name = format_ident!("{}Writer", name);
         quote! {
@@ -2210,6 +2217,12 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
         quote!(::core::result::Result::Ok(#reader_name::from_inner(Self::spec().open_reader_with_limits(path, limits)?)))
     } else {
         quote!(Self::spec().open_reader_with_limits(path, limits))
+    };
+    let open_reader_with_resource_limits_body = if typed_api_enabled {
+        let reader_name = format_ident!("{}Reader", name);
+        quote!(::core::result::Result::Ok(#reader_name::from_inner(Self::spec().open_reader_with_resource_limits(path, limits)?)))
+    } else {
+        quote!(Self::spec().open_reader_with_resource_limits(path, limits))
     };
     let open_reader_trusted_body = if typed_api_enabled {
         let reader_name = format_ident!("{}Reader", name);
@@ -2269,6 +2282,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 Self::spec().create_with_limits(path, limits)
             }
 
+            pub fn create_with_resource_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ResourceLimits,
+            ) -> ::varve::__core::Result<::varve::__core::VarveFile> {
+                Self::spec().create_with_resource_limits(path, limits)
+            }
+
             pub fn create_trusted_unbounded<P: AsRef<::std::path::Path>>(
                 path: P,
             ) -> ::varve::__core::Result<::varve::__core::VarveFile> {
@@ -2286,6 +2306,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 #create_writer_with_limits_body
             }
 
+            pub fn create_writer_with_resource_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ResourceLimits,
+            ) -> ::varve::__core::Result<#writer_return> {
+                #create_writer_with_resource_limits_body
+            }
+
             pub fn create_writer_trusted_unbounded<P: AsRef<::std::path::Path>>(
                 path: P,
             ) -> ::varve::__core::Result<#writer_return> {
@@ -2301,6 +2328,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 limits: ::varve::__core::ReadLimits,
             ) -> ::varve::__core::Result<#layout_writer_return> {
                 #create_layout_writer_with_limits_body
+            }
+
+            pub fn create_layout_writer_with_resource_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ResourceLimits,
+            ) -> ::varve::__core::Result<#layout_writer_return> {
+                #create_layout_writer_with_resource_limits_body
             }
 
             pub fn create_layout_writer_trusted_unbounded<P: AsRef<::std::path::Path>>(
@@ -2324,6 +2358,14 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 #create_layout_writer_with_header_and_limits_body
             }
 
+            pub fn create_layout_writer_with_header_and_resource_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                fields: &[::varve::__core::LayoutFieldValue],
+                limits: ::varve::__core::ResourceLimits,
+            ) -> ::varve::__core::Result<#layout_writer_return> {
+                #create_layout_writer_with_header_and_resource_limits_body
+            }
+
             pub fn create_layout_writer_with_header_trusted_unbounded<P: AsRef<::std::path::Path>>(
                 path: P,
                 fields: &[::varve::__core::LayoutFieldValue],
@@ -2344,6 +2386,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 Self::spec().open_with_limits(path, limits)
             }
 
+            pub fn open_with_resource_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ResourceLimits,
+            ) -> ::varve::__core::Result<::varve::__core::VarveFile> {
+                Self::spec().open_with_resource_limits(path, limits)
+            }
+
             pub fn open_trusted_unbounded<P: AsRef<::std::path::Path>>(
                 path: P,
             ) -> ::varve::__core::Result<::varve::__core::VarveFile> {
@@ -2359,6 +2408,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 limits: ::varve::__core::ReadLimits,
             ) -> ::varve::__core::Result<#writer_return> {
                 #open_writer_with_limits_body
+            }
+
+            pub fn open_writer_with_resource_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ResourceLimits,
+            ) -> ::varve::__core::Result<#writer_return> {
+                #open_writer_with_resource_limits_body
             }
 
             pub fn open_writer_trusted_unbounded<P: AsRef<::std::path::Path>>(
@@ -2378,6 +2434,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 #open_layout_writer_with_limits_body
             }
 
+            pub fn open_layout_writer_with_resource_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ResourceLimits,
+            ) -> ::varve::__core::Result<#layout_writer_return> {
+                #open_layout_writer_with_resource_limits_body
+            }
+
             pub fn open_layout_writer_trusted_unbounded<P: AsRef<::std::path::Path>>(
                 path: P,
             ) -> ::varve::__core::Result<#layout_writer_return> {
@@ -2393,6 +2456,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 limits: ::varve::__core::ReadLimits,
             ) -> ::varve::__core::Result<::varve::__core::VarveFile> {
                 Self::spec().open_readonly_with_limits(path, limits)
+            }
+
+            pub fn open_readonly_with_resource_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ResourceLimits,
+            ) -> ::varve::__core::Result<::varve::__core::VarveFile> {
+                Self::spec().open_readonly_with_resource_limits(path, limits)
             }
 
             pub fn open_readonly_trusted_unbounded<P: AsRef<::std::path::Path>>(
@@ -2412,6 +2482,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 #open_reader_with_limits_body
             }
 
+            pub fn open_reader_with_resource_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ResourceLimits,
+            ) -> ::varve::__core::Result<#reader_return> {
+                #open_reader_with_resource_limits_body
+            }
+
             pub fn open_reader_trusted_unbounded<P: AsRef<::std::path::Path>>(
                 path: P,
             ) -> ::varve::__core::Result<#reader_return> {
@@ -2427,6 +2504,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 limits: ::varve::__core::ReadLimits,
             ) -> ::varve::__core::Result<#layout_reader_return> {
                 #open_layout_reader_with_limits_body
+            }
+
+            pub fn open_layout_reader_with_resource_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ResourceLimits,
+            ) -> ::varve::__core::Result<#layout_reader_return> {
+                #open_layout_reader_with_resource_limits_body
             }
 
             pub fn open_layout_reader_trusted_unbounded<P: AsRef<::std::path::Path>>(
@@ -2446,6 +2530,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 Self::spec().inspect_layout_file_with_limits(path, limits)
             }
 
+            pub fn inspect_layout_file_with_resource_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ResourceLimits,
+            ) -> ::varve::__core::Result<::varve::__core::LayoutFileInfo> {
+                Self::spec().inspect_layout_file_with_resource_limits(path, limits)
+            }
+
             pub fn inspect_layout_file_trusted_unbounded<P: AsRef<::std::path::Path>>(
                 path: P,
             ) -> ::varve::__core::Result<::varve::__core::LayoutFileInfo> {
@@ -2461,6 +2552,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 limits: ::varve::__core::ReadLimits,
             ) -> ::varve::__core::Result<::varve::__core::LayoutScanReport> {
                 Self::spec().inspect_layout_file_report_with_limits(path, limits)
+            }
+
+            pub fn inspect_layout_file_report_with_resource_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ResourceLimits,
+            ) -> ::varve::__core::Result<::varve::__core::LayoutScanReport> {
+                Self::spec().inspect_layout_file_report_with_resource_limits(path, limits)
             }
 
             pub fn inspect_layout_file_report_trusted_unbounded<P: AsRef<::std::path::Path>>(
@@ -2480,6 +2578,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 Self::spec().open_recover_with_limits(path, limits)
             }
 
+            pub fn open_recover_with_resource_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ResourceLimits,
+            ) -> ::varve::__core::Result<::varve::__core::VarveFile> {
+                Self::spec().open_recover_with_resource_limits(path, limits)
+            }
+
             pub fn open_recover_trusted_unbounded<P: AsRef<::std::path::Path>>(
                 path: P,
             ) -> ::varve::__core::Result<::varve::__core::VarveFile> {
@@ -2495,6 +2600,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 limits: ::varve::__core::ReadLimits,
             ) -> ::varve::__core::Result<#writer_return> {
                 #open_recover_writer_with_limits_body
+            }
+
+            pub fn open_recover_writer_with_resource_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ResourceLimits,
+            ) -> ::varve::__core::Result<#writer_return> {
+                #open_recover_writer_with_resource_limits_body
             }
 
             pub fn open_recover_writer_trusted_unbounded<P: AsRef<::std::path::Path>>(
@@ -2516,6 +2628,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 Self::spec().open_recover_with_report_and_limits(path, limits)
             }
 
+            pub fn open_recover_with_report_and_resource_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ResourceLimits,
+            ) -> ::varve::__core::Result<(::varve::__core::VarveFile, ::varve::__core::RecoveryReport)> {
+                Self::spec().open_recover_with_report_and_resource_limits(path, limits)
+            }
+
             pub fn open_recover_with_report_trusted_unbounded<P: AsRef<::std::path::Path>>(
                 path: P,
             ) -> ::varve::__core::Result<(::varve::__core::VarveFile, ::varve::__core::RecoveryReport)> {
@@ -2533,6 +2652,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 limits: ::varve::__core::ReadLimits,
             ) -> ::varve::__core::Result<(#writer_return, ::varve::__core::RecoveryReport)> {
                 #open_recover_writer_report_with_limits_body
+            }
+
+            pub fn open_recover_writer_with_report_and_resource_limits<P: AsRef<::std::path::Path>>(
+                path: P,
+                limits: ::varve::__core::ResourceLimits,
+            ) -> ::varve::__core::Result<(#writer_return, ::varve::__core::RecoveryReport)> {
+                #open_recover_writer_report_with_resource_limits_body
             }
 
             pub fn open_recover_writer_with_report_trusted_unbounded<P: AsRef<::std::path::Path>>(
@@ -3030,6 +3156,22 @@ fn create_writer_with_dims_tokens(
             limits,
         ))
     };
+    let with_resource_limits_body = if typed_api {
+        let writer_name = format_ident!("{}Writer", format_name);
+        quote!(#writer_name::from_inner(
+            Self::spec().create_writer_with_dims_and_resource_limits(
+                path,
+                dims.into_matrix_dims(),
+                limits,
+            )?
+        ))
+    } else {
+        quote!(Self::spec().create_writer_with_dims_and_resource_limits(
+            path,
+            dims.into_matrix_dims(),
+            limits,
+        ))
+    };
     let trusted_body = if typed_api {
         let writer_name = format_ident!("{}Writer", format_name);
         quote!(#writer_name::from_inner(
@@ -3057,6 +3199,14 @@ fn create_writer_with_dims_tokens(
             limits: ::varve::__core::ReadLimits,
         ) -> ::varve::__core::Result<#writer_return> {
             #with_limits_body
+        }
+
+        pub fn create_writer_with_dims_and_resource_limits<P: AsRef<::std::path::Path>>(
+            path: P,
+            dims: #dims_name,
+            limits: ::varve::__core::ResourceLimits,
+        ) -> ::varve::__core::Result<#writer_return> {
+            #with_resource_limits_body
         }
 
         pub fn create_writer_with_dims_trusted_unbounded<P: AsRef<::std::path::Path>>(
@@ -3740,6 +3890,14 @@ fn typed_api_tokens(
         let field = tail_map_ident(&block.name);
         quote!(#field,)
     });
+    let translate_writer_tails = keyed_blocks.iter().map(|block| {
+        let field = tail_map_ident(&block.name);
+        quote! {
+            for offset in self.#field.values_mut() {
+                *offset = info.translate_record_offset(*offset)?;
+            }
+        }
+    });
 
     let reader_inherent_methods = append_blocks.iter().flat_map(|block| reader_methods(block));
     let reader_trait_methods = append_blocks
@@ -3873,6 +4031,14 @@ fn typed_api_tokens(
 
             pub fn sync(&mut self) -> ::varve::__core::Result<()> {
                 self.inner.sync()
+            }
+
+            fn __varve_translate_tail_offsets(
+                &mut self,
+                info: &::varve::__core::ReplacementInfo,
+            ) -> ::varve::__core::Result<()> {
+                #(#translate_writer_tails)*
+                ::core::result::Result::Ok(())
             }
 
             #(#writer_inherent_methods)*
@@ -4410,15 +4576,30 @@ fn reader_trait_impl_methods(block: &InlineBlock) -> Vec<TokenStream2> {
 fn writer_methods(block: &InlineBlock) -> Vec<TokenStream2> {
     let ty = &block.name;
     let push = format_ident!("push_{}", singular_method_name(ty));
+    let replace = format_ident!("replace_{}", singular_method_name(ty));
+    let replace_method = quote! {
+        pub fn #replace(
+            &mut self,
+            index: usize,
+            value: &#ty,
+        ) -> ::varve::__core::Result<::varve::__core::ReplacementInfo> {
+            let info = self.inner.replace_block::<#ty>(index, value)?;
+            self.__varve_translate_tail_offsets(&info)?;
+            ::core::result::Result::Ok(info)
+        }
+    };
     if block.key_fields.is_empty() {
-        vec![quote! {
-            pub fn #push(
-                &mut self,
-                value: &#ty,
-            ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
-                self.inner.push_info(value)
-            }
-        }]
+        vec![
+            quote! {
+                pub fn #push(
+                    &mut self,
+                    value: &#ty,
+                ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
+                    self.inner.push_info(value)
+                }
+            },
+            replace_method,
+        ]
     } else {
         let delete = format_ident!("delete_{}", singular_method_name(ty));
         let tails = tail_map_ident(ty);
@@ -4446,6 +4627,7 @@ fn writer_methods(block: &InlineBlock) -> Vec<TokenStream2> {
                     ::core::result::Result::Ok(info)
                 }
             },
+            replace_method,
         ]
     }
 }
@@ -4453,13 +4635,24 @@ fn writer_methods(block: &InlineBlock) -> Vec<TokenStream2> {
 fn writer_trait_methods(block: &InlineBlock) -> Vec<TokenStream2> {
     let ty = &block.name;
     let push = format_ident!("push_{}", singular_method_name(ty));
+    let replace = format_ident!("replace_{}", singular_method_name(ty));
+    let replace_method = quote! {
+        fn #replace(
+            &mut self,
+            index: usize,
+            value: &#ty,
+        ) -> ::varve::__core::Result<::varve::__core::ReplacementInfo>;
+    };
     if block.key_fields.is_empty() {
-        vec![quote! {
-            fn #push(
-                &mut self,
-                value: &#ty,
-            ) -> ::varve::__core::Result<::varve::__core::AppendInfo>;
-        }]
+        vec![
+            quote! {
+                fn #push(
+                    &mut self,
+                    value: &#ty,
+                ) -> ::varve::__core::Result<::varve::__core::AppendInfo>;
+            },
+            replace_method,
+        ]
     } else {
         let delete = format_ident!("delete_{}", singular_method_name(ty));
         vec![
@@ -4475,6 +4668,7 @@ fn writer_trait_methods(block: &InlineBlock) -> Vec<TokenStream2> {
                     key: &<#ty as ::varve::__core::VarveKeyedBlock>::Key,
                 ) -> ::varve::__core::Result<::varve::__core::AppendInfo>;
             },
+            replace_method,
         ]
     }
 }
@@ -4482,15 +4676,28 @@ fn writer_trait_methods(block: &InlineBlock) -> Vec<TokenStream2> {
 fn writer_trait_impl_methods(block: &InlineBlock) -> Vec<TokenStream2> {
     let ty = &block.name;
     let push = format_ident!("push_{}", singular_method_name(ty));
+    let replace = format_ident!("replace_{}", singular_method_name(ty));
+    let replace_method = quote! {
+        fn #replace(
+            &mut self,
+            index: usize,
+            value: &#ty,
+        ) -> ::varve::__core::Result<::varve::__core::ReplacementInfo> {
+            self.#replace(index, value)
+        }
+    };
     if block.key_fields.is_empty() {
-        vec![quote! {
-            fn #push(
-                &mut self,
-                value: &#ty,
-            ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
-                self.inner.push_info(value)
-            }
-        }]
+        vec![
+            quote! {
+                fn #push(
+                    &mut self,
+                    value: &#ty,
+                ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
+                    self.inner.push_info(value)
+                }
+            },
+            replace_method,
+        ]
     } else {
         let delete = format_ident!("delete_{}", singular_method_name(ty));
         let tails = tail_map_ident(ty);
@@ -4518,6 +4725,7 @@ fn writer_trait_impl_methods(block: &InlineBlock) -> Vec<TokenStream2> {
                     ::core::result::Result::Ok(info)
                 }
             },
+            replace_method,
         ]
     }
 }

@@ -18,8 +18,8 @@ zero-copy = ["mmap", "varve-core/zero-copy"]
 compression-zstd = ["varve-core/compression-zstd"]
 
 [dependencies]
-varve-core = { path = "../varve-core", version = "0.2.0" }
-varve-macros = { path = "../varve-macros", version = "0.2.0" }
+varve-core = { path = "../varve-core", version = "0.3.0" }
+varve-macros = { path = "../varve-macros", version = "0.3.0" }
 
 [dev-dependencies]
 proptest.workspace = true

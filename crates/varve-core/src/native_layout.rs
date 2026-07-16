@@ -1053,7 +1053,14 @@ fn read_native_value<R: Read>(reader: &mut R, field: NativeField) -> Result<Layo
     Ok(match field.ty {
         NativeFieldType::Bytes { len } => {
             let len = usize::try_from(len).map_err(|_| Error::LengthOverflow { value: len })?;
-            let mut bytes = vec![0; len];
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(len)
+                .map_err(|_| Error::AllocationFailed {
+                    resource: "native layout byte field",
+                    requested: u64::try_from(len).unwrap_or(u64::MAX),
+                })?;
+            bytes.resize(len, 0);
             reader.read_exact(&mut bytes)?;
             LayoutValue::Bytes(bytes)
         }

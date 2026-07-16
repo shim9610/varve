@@ -2,8 +2,8 @@ use std::fs::{read_dir, remove_file};
 use std::path::PathBuf;
 
 use varve::{
-    OP_BLOCK_ID, ReadLimits, ReplaceStrategy, TOMBSTONE_BLOCK_ID, VarveBlock, VarveMerge,
-    compact_keyed_file, compact_keyed_files, merge_keyed_files, varve_format,
+    OP_BLOCK_ID, ReadLimits, ReplaceStrategy, TOMBSTONE_BLOCK_ID, VarveBlock, VarveFile,
+    VarveMerge, compact_keyed_file, compact_keyed_files, merge_keyed_files, varve_format,
 };
 
 #[derive(Clone, Debug, PartialEq, VarveBlock)]
@@ -62,24 +62,6 @@ varve_format! {
     pub struct TestFormat {
         magic: b"TVARVE";
         version: 1;
-        limits {
-            file_len: 8_589_934_592;
-            records: 4_000_000;
-            index_bytes: 536_870_912;
-            scan_bytes: 8_589_934_592;
-            record_payload: 67_108_864;
-            logical_payload: 268_435_456;
-            materialized_bytes: 1_073_741_824;
-            segments: 4_000_000;
-            matrix_dimension: 16_000_000;
-            matrix_cells: 16_000_000;
-            matrix_bitmap: 64_000_000;
-            matrix_crc: 128_000_000;
-            matrix_metadata: 268_435_456;
-            matrix_slot_region: 8_589_934_592;
-            sidecar: 268_435_456;
-            mmap: 8_589_934_592;
-        }
         endian: little;
         blocks: [Point, User, UserOp, Nested];
     }
@@ -89,24 +71,6 @@ varve_format! {
     pub struct TestFormatV2 {
         magic: b"TVARVE";
         version: 1;
-        limits {
-            file_len: 8_589_934_592;
-            records: 4_000_000;
-            index_bytes: 536_870_912;
-            scan_bytes: 8_589_934_592;
-            record_payload: 67_108_864;
-            logical_payload: 268_435_456;
-            materialized_bytes: 1_073_741_824;
-            segments: 4_000_000;
-            matrix_dimension: 16_000_000;
-            matrix_cells: 16_000_000;
-            matrix_bitmap: 64_000_000;
-            matrix_crc: 128_000_000;
-            matrix_metadata: 268_435_456;
-            matrix_slot_region: 8_589_934_592;
-            sidecar: 268_435_456;
-            mmap: 8_589_934_592;
-        }
         endian: little;
         blocks: [UserV2];
     }
@@ -155,6 +119,27 @@ fn fixed_variable_nested_roundtrip_and_lazy_collections() -> varve::Result<()> {
             score: -5,
         })
     );
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn low_level_native_entrypoints_resolve_missing_runtime_policy() -> varve::Result<()> {
+    let path = temp_path("low_level_missing_limits");
+    cleanup(&path);
+
+    let mut file = VarveFile::create(TestFormat::spec(), &path)?;
+    file.push(&Point { x: 1, y: 2 })?;
+    file.flush()?;
+    drop(file);
+
+    let file = VarveFile::open_readonly(TestFormat::spec(), &path)?;
+    assert_eq!(
+        file.spec().read_limits.max_records,
+        varve::ReadLimit::Finite(u64::MAX)
+    );
+    assert_eq!(file.blocks::<Point>()?.get(0)?, Some(Point { x: 1, y: 2 }));
 
     cleanup(&path);
     Ok(())
@@ -272,6 +257,220 @@ fn variable_replace_rewrite_preserves_records_and_cleans_temp() -> varve::Result
             name.contains("rewrite_variable") && name.contains(".rewrite.")
         });
     assert!(!leaked_temp);
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn native_replace_block_resizes_preserves_sequence_and_rejects_key_changes() -> varve::Result<()> {
+    let path = temp_path("native_replace_block");
+    cleanup(&path);
+
+    let mut file = TestFormat::create(&path)?;
+    file.push(&User {
+        user_id: 7,
+        region: 82,
+        name: "old".to_string(),
+    })?;
+    file.push(&Point { x: 10, y: 20 })?;
+    let old_reader = TestFormat::open_readonly(&path)?;
+
+    let grown = file.replace_block(
+        0,
+        &User {
+            user_id: 7,
+            region: 82,
+            name: "a substantially longer replacement value".to_string(),
+        },
+    )?;
+    assert_eq!(grown.sequence, 0);
+    assert!(grown.new_physical_len > grown.old_physical_len);
+    assert_eq!(file.index_entries()[1].sequence, 1);
+    assert_eq!(
+        old_reader.keyed_blocks::<User>()?.get(&(7, 82))?,
+        Some(User {
+            user_id: 7,
+            region: 82,
+            name: "old".to_string(),
+        })
+    );
+
+    let shrunk = file.replace_block(
+        0,
+        &User {
+            user_id: 7,
+            region: 82,
+            name: "x".to_string(),
+        },
+    )?;
+    assert_eq!(shrunk.sequence, 0);
+    assert!(shrunk.new_physical_len < shrunk.old_physical_len);
+    assert!(matches!(
+        file.replace_block(
+            0,
+            &User {
+                user_id: 8,
+                region: 82,
+                name: "different key".to_string(),
+            },
+        ),
+        Err(varve::Error::ReplacementKeyMismatch)
+    ));
+
+    let reopened = TestFormat::open_readonly(&path)?;
+    assert_eq!(
+        reopened.keyed_blocks::<User>()?.get(&(7, 82))?,
+        Some(User {
+            user_id: 7,
+            region: 82,
+            name: "x".to_string(),
+        })
+    );
+    assert_eq!(reopened.keyed_blocks::<User>()?.get(&(8, 82))?, None);
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn native_replace_block_honors_materialization_budget_before_decode() -> varve::Result<()> {
+    let path = temp_path("replace_materialization_budget");
+    cleanup(&path);
+
+    {
+        let mut file = TestFormat::create(&path)?;
+        file.push(&User {
+            user_id: 7,
+            region: 82,
+            name: "payload larger than one byte".to_string(),
+        })?;
+        file.flush()?;
+    }
+
+    let limits = ReadLimits::missing().with_max_materialized_bytes(1);
+    let mut file = TestFormat::open_writer_with_resource_limits(&path, limits)?;
+    assert!(matches!(
+        file.replace_block(
+            0,
+            &User {
+                user_id: 7,
+                region: 82,
+                name: "replacement".to_string(),
+            },
+        ),
+        Err(varve::Error::LimitExceeded {
+            resource: "materialized bytes",
+            ..
+        })
+    ));
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn typed_decode_charges_nested_allocations_to_handle_budget() -> varve::Result<()> {
+    let path = temp_path("nested_decode_materialization_budget");
+    cleanup(&path);
+    let value = User {
+        user_id: 7,
+        region: 82,
+        name: "nested allocation amplification".repeat(8),
+    };
+
+    let payload_len = {
+        let mut file = TestFormat::create(&path)?;
+        file.push(&value)?;
+        file.flush()?;
+        file.index_entries()[0].payload_len
+    };
+    let limits = ReadLimits::missing()
+        .with_max_materialized_bytes(payload_len + value.name.len() as u64 - 1);
+    let file = TestFormat::open_readonly_with_resource_limits(&path, limits)?;
+    assert!(matches!(
+        file.blocks::<User>()?.get(0),
+        Err(varve::Error::LimitExceeded {
+            resource: "string",
+            actual,
+            limit,
+        })
+        if actual == value.name.len() as u64 && limit == value.name.len() as u64 - 1
+    ));
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn replacement_keeps_older_put_behind_later_keyed_events() -> varve::Result<()> {
+    let path = temp_path("replacement_sequence_order");
+    cleanup(&path);
+
+    let mut file = TestFormat::create(&path)?;
+    file.push(&User {
+        user_id: 1,
+        region: 82,
+        name: "old-put".into(),
+    })?;
+    file.push(&User {
+        user_id: 1,
+        region: 82,
+        name: "later-put".into(),
+    })?;
+    file.push(&User {
+        user_id: 2,
+        region: 82,
+        name: "before-op".into(),
+    })?;
+    file.push_op::<User>(
+        &(2, 82),
+        &UserOp {
+            rename_to: "after-op".into(),
+        },
+    )?;
+    file.push(&User {
+        user_id: 3,
+        region: 82,
+        name: "before-delete".into(),
+    })?;
+    file.delete::<User>(&(3, 82))?;
+
+    file.replace_block(
+        0,
+        &User {
+            user_id: 1,
+            region: 82,
+            name: "replacement-must-stay-old".into(),
+        },
+    )?;
+    file.replace_block(
+        2,
+        &User {
+            user_id: 2,
+            region: 82,
+            name: "replacement-before-op".into(),
+        },
+    )?;
+    file.replace_block(
+        3,
+        &User {
+            user_id: 3,
+            region: 82,
+            name: "replacement-before-delete".into(),
+        },
+    )?;
+
+    let state = file.materialized_keyed_blocks::<User>()?;
+    assert_eq!(
+        state.get(&(1, 82)).map(|user| user.name.as_str()),
+        Some("later-put")
+    );
+    assert_eq!(
+        state.get(&(2, 82)).map(|user| user.name.as_str()),
+        Some("after-op")
+    );
+    assert!(!state.contains_key(&(3, 82)));
 
     cleanup(&path);
     Ok(())

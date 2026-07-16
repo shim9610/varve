@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use varve::{
-    AdapterInputFile, BinaryCursor, Endian, Error, LayoutFieldValue, LayoutValue, ReadLimits,
-    SegmentWrite, SegmentWriteStream, varve_format,
+    AdapterInputFile, BinaryCursor, Endian, Error, LayoutFieldValue, LayoutReader, LayoutValue,
+    ReadLimits, SegmentWrite, SegmentWriteStream, varve_format,
 };
 
 varve_format! {
@@ -271,6 +271,23 @@ fn layout_open_and_region_reads_enforce_runtime_limits() -> varve::Result<()> {
 }
 
 #[test]
+fn layout_owned_reads_apply_materialization_limit_after_bounded_open() -> varve::Result<()> {
+    let path = temp_path("materialized_read_limit", "hard");
+    cleanup(&path);
+    let raw = [0x5a; 32];
+    write_layout_data(&path, b"metadata", &raw)?;
+    let reader = LayoutHardeningFormat::spec().open_layout_reader_with_limits(
+        &path,
+        ReadLimits::missing().with_max_materialized_bytes(24),
+    )?;
+    assert_limit(reader.read_raw(0), "materialized bytes");
+    assert_eq!(reader.read_raw_range(0, 0, 24)?, vec![0x5a; 24]);
+    drop(reader);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
 fn layout_writer_limits_fail_before_unbounded_growth_and_roll_back() -> varve::Result<()> {
     let payload_path = temp_path("writer_payload_limit", "hard");
     let file_path = temp_path("writer_file_limit", "hard");
@@ -386,7 +403,7 @@ fn layout_writer_limits_fail_before_unbounded_growth_and_roll_back() -> varve::R
 }
 
 #[test]
-fn ordinary_layout_open_fails_closed_and_handle_specs_are_sanitized() -> varve::Result<()> {
+fn ordinary_layout_open_resolves_missing_and_handle_specs_sanitize_trust() -> varve::Result<()> {
     let path = temp_path("trusted_spec", "hard");
     cleanup(&path);
     write_layout_data(&path, b"metadata", b"raw")?;
@@ -420,12 +437,14 @@ fn ordinary_layout_open_fails_closed_and_handle_specs_are_sanitized() -> varve::
     ));
 
     let missing = LayoutHardeningFormat::spec().with_read_limits(ReadLimits::missing());
-    assert!(matches!(
-        missing.open_layout_reader(&path),
-        Err(Error::MissingResourceLimit {
-            resource: "file length"
-        })
-    ));
+    let reader = missing.open_layout_reader(&path)?;
+    assert_eq!(reader.read_metadata(0)?, b"metadata");
+    assert_eq!(
+        reader.spec().read_limits.max_records,
+        varve::ReadLimit::Finite(u64::MAX)
+    );
+    let reader = LayoutReader::open(missing, &path)?;
+    assert_eq!(reader.read_metadata(0)?, b"metadata");
 
     cleanup(&path);
     Ok(())
@@ -444,6 +463,55 @@ fn array_f64_checks_complete_extent_before_allocation_or_cursor_movement() {
         Err(Error::LengthOverflow { value: u64::MAX })
     ));
     assert_eq!(cursor.position(), 1);
+}
+
+#[test]
+fn binary_cursor_materialization_ceiling_rejects_hostile_counts_before_allocation() {
+    let bytes = [0; 16];
+    let mut cursor = BinaryCursor::with_materialization_limit(&bytes, Endian::Little, 8);
+    assert_eq!(cursor.materialization_limit(), 8);
+    assert_eq!(cursor.materialization_remaining(), 8);
+
+    assert!(matches!(
+        cursor.array_f64(2),
+        Err(Error::LimitExceeded {
+            resource: "binary cursor materialization",
+            actual: 16,
+            limit: 8,
+        })
+    ));
+    assert_eq!(cursor.position(), 0);
+
+    assert!(matches!(
+        cursor.array_f64(usize::MAX),
+        Err(Error::LengthOverflow { value: u64::MAX })
+    ));
+    assert_eq!(cursor.position(), 0);
+    assert_eq!(cursor.materialization_remaining(), 8);
+}
+
+#[test]
+fn len_prefixed_string_checks_extent_and_ceiling_before_allocation() {
+    let over_limit = [4, 0, b't', b'e', b's', b't'];
+    let mut cursor = BinaryCursor::with_materialization_limit(&over_limit, Endian::Little, 3);
+    assert!(matches!(
+        cursor.len_prefixed_string::<u16>(),
+        Err(Error::LimitExceeded {
+            resource: "binary cursor materialization",
+            actual: 4,
+            limit: 3,
+        })
+    ));
+    assert_eq!(cursor.position(), 0);
+
+    let truncated = [u8::MAX, u8::MAX];
+    let mut cursor =
+        BinaryCursor::with_materialization_limit(&truncated, Endian::Little, usize::MAX);
+    assert!(matches!(
+        cursor.len_prefixed_string::<u16>(),
+        Err(Error::UnexpectedEof)
+    ));
+    assert_eq!(cursor.position(), 0);
 }
 
 #[test]
@@ -575,6 +643,23 @@ fn assert_limit<T>(result: varve::Result<T>, resource: &'static str) {
             ..
         }) if actual == resource
     ));
+}
+
+#[test]
+fn binary_cursor_materialization_budget_is_cumulative() -> varve::Result<()> {
+    let bytes = [1, 0, b'a', 1, 0, b'b'];
+    let mut cursor = BinaryCursor::with_materialization_limit(&bytes, Endian::Little, 1);
+    assert_eq!(cursor.len_prefixed_string::<u16>()?, "a");
+    assert_eq!(cursor.materialization_remaining(), 0);
+    assert!(matches!(
+        cursor.len_prefixed_string::<u16>(),
+        Err(Error::LimitExceeded {
+            resource: "binary cursor materialization",
+            actual: 2,
+            limit: 1,
+        })
+    ));
+    Ok(())
 }
 
 fn assert_layout_poisoned<T>(result: varve::Result<T>) {

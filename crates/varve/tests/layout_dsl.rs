@@ -1,4 +1,5 @@
 use std::fs::{OpenOptions, read, remove_file, write};
+use std::panic::catch_unwind;
 use std::path::PathBuf;
 
 use varve::{
@@ -1542,18 +1543,23 @@ fn tdms_style_layout_rejects_corrupt_physical_segments() -> varve::Result<()> {
         Err(Error::LayoutTruncatedLeadIn { .. })
     ));
 
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"TDSm");
-    bytes.extend_from_slice(&0x1110u32.to_le_bytes());
-    bytes.extend_from_slice(&4713u32.to_le_bytes());
-    bytes.extend_from_slice(&4u64.to_le_bytes());
-    bytes.extend_from_slice(&8u64.to_le_bytes());
-    bytes.extend_from_slice(&[0; 8]);
-    write(&bad_bounds, &bytes)?;
-    assert!(matches!(
-        TdmsPhysicalFormat::open_layout_reader(&bad_bounds),
-        Err(Error::LayoutInvalidSegmentBounds { .. })
-    ));
+    for (next_offset, raw_offset) in [(4, 8), (u64::MAX, 0), (0, u64::MAX)] {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"TDSm");
+        bytes.extend_from_slice(&0x1110u32.to_le_bytes());
+        bytes.extend_from_slice(&4713u32.to_le_bytes());
+        bytes.extend_from_slice(&next_offset.to_le_bytes());
+        bytes.extend_from_slice(&raw_offset.to_le_bytes());
+        bytes.extend_from_slice(&[0; 8]);
+        write(&bad_bounds, &bytes)?;
+        let opened = catch_unwind(|| TdmsPhysicalFormat::open_layout_reader(&bad_bounds));
+        assert!(opened.is_ok(), "hostile layout offset caused a panic");
+        assert!(matches!(
+            opened.expect("checked above"),
+            Err(Error::LayoutInvalidSegmentBounds { .. })
+                | Err(Error::ResourceArithmeticOverflow { .. })
+        ));
+    }
 
     cleanup(&bad_tag);
     cleanup(&truncated);

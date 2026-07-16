@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::fs::{read, remove_file, write};
+use std::fs::{File, remove_file, write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use super::example_data::{
@@ -15,6 +16,7 @@ use varve::{
 };
 
 const TDMS_VERSION: u32 = 4713;
+const TDMS_INDEX_SIDECAR_LEN: usize = 32;
 const TDMS_TOC_METADATA: u32 = 1 << 1;
 const TDMS_TOC_NEW_OBJECT_LIST: u32 = 1 << 2;
 const TDMS_TOC_RAW_DATA: u32 = 1 << 3;
@@ -422,13 +424,34 @@ fn write_raw_data_index(writer: &mut BinaryWriter, index: RawDataIndex) -> varve
 
 fn parse_tdms_metadata(bytes: &[u8]) -> varve::Result<TdmsMetadata> {
     let mut cursor = BinaryCursor::new(bytes, Endian::Little);
-    let object_count = cursor.u32()?;
+    let object_count = usize::try_from(cursor.u32()?)
+        .map_err(|_| varve::Error::LengthOverflow { value: u64::MAX })?;
+    ensure_wire_extent(&cursor, object_count, 12)?;
+    let mut container_budget = BinaryCursor::DEFAULT_MATERIALIZATION_LIMIT;
+    charge_container::<TdmsDecodedObject>(&mut container_budget, object_count)?;
+    let object_bytes = container_bytes::<TdmsDecodedObject>(object_count)?;
     let mut objects = Vec::new();
+    objects
+        .try_reserve_exact(object_count)
+        .map_err(|_| varve::Error::AllocationFailed {
+            resource: "TDMS metadata containers",
+            requested: object_bytes as u64,
+        })?;
     for _ in 0..object_count {
         let path = cursor.len_prefixed_string::<u32>()?;
         let raw_data_index = read_raw_data_index(&mut cursor)?;
-        let property_count = cursor.u32()?;
+        let property_count = usize::try_from(cursor.u32()?)
+            .map_err(|_| varve::Error::LengthOverflow { value: u64::MAX })?;
+        ensure_wire_extent(&cursor, property_count, 9)?;
+        charge_container::<(String, TdmsPropertyValue)>(&mut container_budget, property_count)?;
+        let property_bytes = container_bytes::<(String, TdmsPropertyValue)>(property_count)?;
         let mut properties = HashMap::new();
+        properties
+            .try_reserve(property_count)
+            .map_err(|_| varve::Error::AllocationFailed {
+                resource: "TDMS metadata containers",
+                requested: property_bytes as u64,
+            })?;
         for _ in 0..property_count {
             let name = cursor.len_prefixed_string::<u32>()?;
             let type_id = cursor.u32()?;
@@ -443,6 +466,25 @@ fn parse_tdms_metadata(bytes: &[u8]) -> varve::Result<TdmsMetadata> {
     }
     cursor.finish()?;
     Ok(TdmsMetadata { objects })
+}
+
+fn container_bytes<T>(count: usize) -> varve::Result<usize> {
+    count
+        .checked_mul(std::mem::size_of::<T>().max(1))
+        .ok_or(varve::Error::LengthOverflow { value: u64::MAX })
+}
+
+fn charge_container<T>(remaining: &mut usize, count: usize) -> varve::Result<()> {
+    let bytes = container_bytes::<T>(count)?;
+    if bytes > *remaining {
+        return Err(varve::Error::LimitExceeded {
+            resource: "TDMS metadata containers",
+            actual: bytes as u64,
+            limit: *remaining as u64,
+        });
+    }
+    *remaining -= bytes;
+    Ok(())
 }
 
 fn read_raw_data_index(cursor: &mut BinaryCursor<'_>) -> varve::Result<RawDataIndex> {
@@ -673,80 +715,56 @@ impl TdmsRawValues {
     fn decode(data_type: u32, bytes: &[u8], count: usize) -> varve::Result<Self> {
         let mut cursor = BinaryCursor::new(bytes, Endian::Little);
         let values = match data_type {
-            TDMS_TYPE_I8 => Self::I8(
-                (0..count)
-                    .map(|_| cursor.i8())
-                    .collect::<varve::Result<_>>()?,
-            ),
-            TDMS_TYPE_I16 => Self::I16(
-                (0..count)
-                    .map(|_| cursor.i16())
-                    .collect::<varve::Result<_>>()?,
-            ),
-            TDMS_TYPE_I32 => Self::I32(
-                (0..count)
-                    .map(|_| cursor.i32())
-                    .collect::<varve::Result<_>>()?,
-            ),
-            TDMS_TYPE_I64 => Self::I64(
-                (0..count)
-                    .map(|_| cursor.i64())
-                    .collect::<varve::Result<_>>()?,
-            ),
-            TDMS_TYPE_U8 => Self::U8(
-                (0..count)
-                    .map(|_| cursor.u8())
-                    .collect::<varve::Result<_>>()?,
-            ),
-            TDMS_TYPE_U16 => Self::U16(
-                (0..count)
-                    .map(|_| cursor.u16())
-                    .collect::<varve::Result<_>>()?,
-            ),
-            TDMS_TYPE_U32 => Self::U32(
-                (0..count)
-                    .map(|_| cursor.u32())
-                    .collect::<varve::Result<_>>()?,
-            ),
-            TDMS_TYPE_U64 => Self::U64(
-                (0..count)
-                    .map(|_| cursor.u64())
-                    .collect::<varve::Result<_>>()?,
-            ),
-            TDMS_TYPE_SINGLE_FLOAT => Self::F32(
-                (0..count)
-                    .map(|_| cursor.f32())
-                    .collect::<varve::Result<_>>()?,
-            ),
+            TDMS_TYPE_I8 => Self::I8(decode_fixed_values(&mut cursor, count, 1, |c| c.i8())?),
+            TDMS_TYPE_I16 => Self::I16(decode_fixed_values(&mut cursor, count, 2, |c| c.i16())?),
+            TDMS_TYPE_I32 => Self::I32(decode_fixed_values(&mut cursor, count, 4, |c| c.i32())?),
+            TDMS_TYPE_I64 => Self::I64(decode_fixed_values(&mut cursor, count, 8, |c| c.i64())?),
+            TDMS_TYPE_U8 => Self::U8(decode_fixed_values(&mut cursor, count, 1, |c| c.u8())?),
+            TDMS_TYPE_U16 => Self::U16(decode_fixed_values(&mut cursor, count, 2, |c| c.u16())?),
+            TDMS_TYPE_U32 => Self::U32(decode_fixed_values(&mut cursor, count, 4, |c| c.u32())?),
+            TDMS_TYPE_U64 => Self::U64(decode_fixed_values(&mut cursor, count, 8, |c| c.u64())?),
+            TDMS_TYPE_SINGLE_FLOAT => {
+                Self::F32(decode_fixed_values(&mut cursor, count, 4, |c| c.f32())?)
+            }
             TDMS_TYPE_DOUBLE_FLOAT => Self::F64(cursor.array_f64(count)?),
-            TDMS_TYPE_SINGLE_FLOAT_WITH_UNIT => Self::F32WithUnit(
-                (0..count)
-                    .map(|_| cursor.f32())
-                    .collect::<varve::Result<_>>()?,
-            ),
+            TDMS_TYPE_SINGLE_FLOAT_WITH_UNIT => {
+                Self::F32WithUnit(decode_fixed_values(&mut cursor, count, 4, |c| c.f32())?)
+            }
             TDMS_TYPE_DOUBLE_FLOAT_WITH_UNIT => Self::F64WithUnit(cursor.array_f64(count)?),
-            TDMS_TYPE_BOOLEAN => Self::Bool(
-                (0..count)
-                    .map(|_| Ok(cursor.u8()? != 0))
-                    .collect::<varve::Result<_>>()?,
-            ),
+            TDMS_TYPE_BOOLEAN => Self::Bool(decode_fixed_values(&mut cursor, count, 1, |c| {
+                Ok(c.u8()? != 0)
+            })?),
             TDMS_TYPE_STRING => {
-                let mut offsets = Vec::with_capacity(count);
+                ensure_wire_extent(&cursor, count, 4)?;
+                let mut offsets = try_value_vec::<usize>(count, 0)?;
                 for _ in 0..count {
                     offsets.push(cursor.u32()? as usize);
                 }
                 let data = cursor.bytes(cursor.remaining())?;
                 let mut start = 0usize;
-                let mut strings = Vec::with_capacity(count);
+                let offset_bytes = count
+                    .checked_mul(std::mem::size_of::<usize>())
+                    .ok_or(varve::Error::LengthOverflow { value: u64::MAX })?;
+                let additional = offset_bytes
+                    .checked_add(data.len())
+                    .ok_or(varve::Error::LengthOverflow { value: u64::MAX })?;
+                let mut strings = try_value_vec::<String>(count, additional)?;
                 for end in offsets {
                     let bytes = data.get(start..end).ok_or(varve::Error::AdapterBounds {
                         offset: start as u64,
                         len: end.saturating_sub(start) as u64,
                         available: data.len() as u64,
                     })?;
-                    strings.push(
-                        String::from_utf8(bytes.to_vec()).map_err(|_| varve::Error::InvalidUtf8)?,
-                    );
+                    let text = std::str::from_utf8(bytes).map_err(|_| varve::Error::InvalidUtf8)?;
+                    let mut owned = String::new();
+                    owned.try_reserve_exact(text.len()).map_err(|_| {
+                        varve::Error::AllocationFailed {
+                            resource: "TDMS example value materialization",
+                            requested: text.len() as u64,
+                        }
+                    })?;
+                    owned.push_str(text);
+                    strings.push(owned);
                     start = end;
                 }
                 if start != data.len() {
@@ -757,7 +775,8 @@ impl TdmsRawValues {
                 Self::String(strings)
             }
             TDMS_TYPE_TIMESTAMP => {
-                let mut values = Vec::with_capacity(count);
+                ensure_wire_extent(&cursor, count, 16)?;
+                let mut values = try_value_vec::<TdmsTimestampValue>(count, 0)?;
                 for _ in 0..count {
                     values.push(TdmsTimestampValue {
                         second_fractions: cursor.u64()?,
@@ -767,14 +786,16 @@ impl TdmsRawValues {
                 Self::Timestamp(values)
             }
             TDMS_TYPE_COMPLEX_SINGLE_FLOAT => {
-                let mut values = Vec::with_capacity(count);
+                ensure_wire_extent(&cursor, count, 8)?;
+                let mut values = try_value_vec::<(f32, f32)>(count, 0)?;
                 for _ in 0..count {
                     values.push((cursor.f32()?, cursor.f32()?));
                 }
                 Self::ComplexF32(values)
             }
             TDMS_TYPE_COMPLEX_DOUBLE_FLOAT => {
-                let mut values = Vec::with_capacity(count);
+                ensure_wire_extent(&cursor, count, 16)?;
+                let mut values = try_value_vec::<(f64, f64)>(count, 0)?;
                 for _ in 0..count {
                     values.push((cursor.f64()?, cursor.f64()?));
                 }
@@ -817,6 +838,60 @@ impl TdmsRawValues {
         }
         Ok(())
     }
+}
+
+fn decode_fixed_values<T>(
+    cursor: &mut BinaryCursor<'_>,
+    count: usize,
+    wire_width: usize,
+    mut decode: impl FnMut(&mut BinaryCursor<'_>) -> varve::Result<T>,
+) -> varve::Result<Vec<T>> {
+    ensure_wire_extent(cursor, count, wire_width)?;
+    let mut values = try_value_vec(count, 0)?;
+    for _ in 0..count {
+        values.push(decode(cursor)?);
+    }
+    Ok(values)
+}
+
+fn ensure_wire_extent(
+    cursor: &BinaryCursor<'_>,
+    count: usize,
+    wire_width: usize,
+) -> varve::Result<()> {
+    let required = count
+        .checked_mul(wire_width)
+        .ok_or(varve::Error::LengthOverflow { value: u64::MAX })?;
+    if required > cursor.remaining() {
+        return Err(varve::Error::AdapterBounds {
+            offset: cursor.position() as u64,
+            len: required as u64,
+            available: cursor.remaining() as u64,
+        });
+    }
+    Ok(())
+}
+
+fn try_value_vec<T>(count: usize, additional_bytes: usize) -> varve::Result<Vec<T>> {
+    let resident = count
+        .checked_mul(std::mem::size_of::<T>().max(1))
+        .and_then(|bytes| bytes.checked_add(additional_bytes))
+        .ok_or(varve::Error::LengthOverflow { value: u64::MAX })?;
+    if resident > BinaryCursor::DEFAULT_MATERIALIZATION_LIMIT {
+        return Err(varve::Error::LimitExceeded {
+            resource: "TDMS example value materialization",
+            actual: resident as u64,
+            limit: BinaryCursor::DEFAULT_MATERIALIZATION_LIMIT as u64,
+        });
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| varve::Error::AllocationFailed {
+            resource: "TDMS example value materialization",
+            requested: resident as u64,
+        })?;
+    Ok(values)
 }
 
 fn is_supported_tdms_channel_type(data_type: u32) -> bool {
@@ -936,7 +1011,13 @@ impl TdmsIndexSidecar {
 }
 
 fn read_index_sidecar(path: &Path) -> varve::Result<TdmsIndexSidecar> {
-    let bytes = read(tdms_sidecar_policy().sidecar_path(path))?;
+    let mut file = File::open(tdms_sidecar_policy().sidecar_path(path))?;
+    let actual_len = file.metadata()?.len();
+    if actual_len != TDMS_INDEX_SIDECAR_LEN as u64 {
+        return Err(varve::Error::AdapterInvalidLength { value: actual_len });
+    }
+    let mut bytes = [0u8; TDMS_INDEX_SIDECAR_LEN];
+    file.read_exact(&mut bytes)?;
     let mut cursor = BinaryCursor::new(&bytes, Endian::Little);
     if cursor.bytes(4)? != &TDMS_INDEX_SIDECAR_MAGIC[..] {
         return Err(varve::Error::AdapterDiagnostic(
@@ -1064,13 +1145,19 @@ impl SegmentReducer for TdmsReducer {
                     len: byte_len,
                     available: payload.raw.len() as u64,
                 })?;
-            let raw_values = payload.raw.get(byte_offset as usize..end as usize).ok_or(
-                varve::Error::AdapterBounds {
-                    offset: byte_offset,
-                    len: byte_len,
-                    available: payload.raw.len() as u64,
-                },
-            )?;
+            let start_index = usize::try_from(byte_offset)
+                .map_err(|_| varve::Error::LengthOverflow { value: byte_offset })?;
+            let end_index =
+                usize::try_from(end).map_err(|_| varve::Error::LengthOverflow { value: end })?;
+            let raw_values =
+                payload
+                    .raw
+                    .get(start_index..end_index)
+                    .ok_or(varve::Error::AdapterBounds {
+                        offset: byte_offset,
+                        len: byte_len,
+                        available: payload.raw.len() as u64,
+                    })?;
             state.chunks.push(
                 ChunkEntry {
                     key: path.clone(),
@@ -1082,7 +1169,9 @@ impl SegmentReducer for TdmsReducer {
                 },
                 segment,
             )?;
-            let decoded = TdmsRawValues::decode(data_type, raw_values, values as usize)?;
+            let value_count = usize::try_from(values)
+                .map_err(|_| varve::Error::LengthOverflow { value: values })?;
+            let decoded = TdmsRawValues::decode(data_type, raw_values, value_count)?;
             if let Some(current) = state.raw_values.get_mut(&path) {
                 current.extend_with(decoded)?;
             } else {
@@ -1110,4 +1199,31 @@ pub fn cleanup(path: &Path) {
     let mut lock = path.as_os_str().to_os_string();
     lock.push(".lock");
     let _ = remove_file(PathBuf::from(lock));
+}
+
+#[cfg(test)]
+mod hostile_count_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_object_count_is_preflighted_before_container_allocation() {
+        let bytes = u32::MAX.to_le_bytes();
+        assert!(matches!(
+            parse_tdms_metadata(&bytes),
+            Err(varve::Error::AdapterBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn metadata_property_count_is_preflighted_before_map_allocation() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&TDMS_RAW_INDEX_NONE.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            parse_tdms_metadata(&bytes),
+            Err(varve::Error::AdapterBounds { .. })
+        ));
+    }
 }

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use varve::{
     BlockDescriptor, BlockKind, Endian, Error, FormatSpec, IndexPolicy, MatrixAuxDescriptor,
     MatrixBlockDescriptor, MatrixCommitDescriptor, MatrixCommitKind, MatrixDimensionDescriptor,
-    MatrixDimensions, ReadLimits, VarveBlock, VarveMatrixBlock,
+    MatrixDimensions, MatrixKey, ReadLimits, VarveBlock, VarveMatrixBlock,
 };
 
 const VMAT_HEADER_LEN: u64 = 160;
@@ -326,6 +326,31 @@ fn aux_reads_check_file_and_payload_limits_before_allocation() -> varve::Result<
         .write_matrix_aux("thumbnail", 0, &[1, 2, 3, 4])
         .expect_err("oversized aux write must fail");
     expect_limit(error, "record payload length", 3);
+    Ok(())
+}
+
+#[test]
+fn cell_reads_check_materialization_limit_before_allocating_slot_bytes() -> varve::Result<()> {
+    let fixture = TempMatrix::new("cell-materialization-limit");
+    let spec = matrix_spec(high_limits(), varve::IntegrityPolicy::None);
+    let dimensions = MatrixDimensions::from_pairs([("scan", 1), ("ch", 1)]);
+    let key = MatrixKey::new(0, 0);
+    let mut writer = spec.create_with_dims(fixture.path(), dimensions)?;
+    writer.write_matrix_cell(key, &LimitedCell { value: 7 })?;
+    writer.commit_matrix_cell::<LimitedCell>(key)?;
+    drop(writer);
+
+    let runtime = high_limits().with_max_materialized_bytes(3);
+    let mut reader = spec.open_reader_with_limits(fixture.path(), runtime)?;
+    let error = reader
+        .matrix_cell_payload::<LimitedCell>(key)
+        .expect_err("slot payload must be rejected before its four-byte allocation");
+    expect_limit(error, "materialized bytes", 3);
+
+    let error = reader
+        .read_matrix_cell::<LimitedCell>(key)
+        .expect_err("typed cell must be rejected before its four-byte allocation");
+    expect_limit(error, "materialized bytes", 3);
     Ok(())
 }
 

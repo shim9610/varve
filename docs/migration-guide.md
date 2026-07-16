@@ -4,23 +4,33 @@ Varve migrations are explicit. Normal typed reads reject block version
 mismatches; migration code names both the source and target block types and
 performs semantic conversion in Rust.
 
-## Migrate Declarations To Explicit Limits
+## Move Limits To Handle Creation
 
-Every `varve_format!` declaration must now choose finite hostile-input ceilings
-with `limits { ... }`. Manual `FormatSpec` construction must likewise install a
-complete `ReadLimits` policy before ordinary create/open methods are used.
-Runtime limits can only tighten declaration limits; they cannot silently widen
-them.
+`limits { ... }` is no longer mandatory and may be partial. Resource policy is
+resolved when a reader or writer is opened. Ordinary handles use
+`ReadLimits::STANDARD`, which leaves total append length, record count, segment
+count, scan length, and cumulative index bytes uncapped while bounding
+one-shot payload and materialization work.
+
+Existing `*_with_limits` calls remain tightening-only. Use the new
+`*_with_resource_limits` family when runtime policy must raise or lower an
+optional format default.
 
 Code that constructs `FormatSpec` with a public struct literal must add the new
 `read_limits` field. Prefer `FormatSpec::new(...)`, `FormatSpec::builder()`, or
 the generated `Format::spec()` method so future policy additions do not require
 editing a literal.
 
-Use `limits: trusted_unbounded;` and the visibly named
-`*_trusted_unbounded` methods only when the complete input provenance is under
-your control. Omission is intentionally a compile-time error in the macro and a
-fail-closed runtime error for manual specifications.
+Use visibly named `*_trusted_unbounded` methods only when the complete input
+provenance is under your control. Omission now selects the standard runtime
+policy rather than causing a compile error.
+
+## Migrate To Resized Replacement
+
+Generated writers now expose `replace_<block>(index, &value)`. The encoded
+payload may grow or shrink. Native replacement preserves the target sequence,
+rebuilds headers, CRCs, checkpoints, and offset-chain footers, and atomically
+publishes a new file generation. Keyed replacement must preserve the key.
 
 ## Migrate Fixed Replacement
 

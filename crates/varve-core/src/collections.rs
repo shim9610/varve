@@ -3,32 +3,57 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 
 use crate::{
-    BlockKind, FormatSpec, RecordIndexEntry, Result, SnapshotFile, VarveBlock, VarveKeyedBlock,
-    decode_from_slice, format::ReadLimitKey,
+    BlockKind, Decoder, Endian, FormatSpec, ReadLimit, RecordIndexEntry, Result, SnapshotFile,
+    VarveBlock, VarveDecode, VarveKeyedBlock, format::ReadLimitKey,
 };
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MaterializationBudget {
-    spec: FormatSpec,
-    consumed: u64,
+    limit: u64,
+    remaining: u64,
 }
 
 impl MaterializationBudget {
-    pub(crate) const fn new(spec: FormatSpec) -> Self {
-        Self { spec, consumed: 0 }
+    pub(crate) fn new(spec: FormatSpec) -> Self {
+        let limit = match spec.read_limits.resolve().max_materialized_bytes {
+            ReadLimit::Finite(limit) => limit,
+            ReadLimit::Missing | ReadLimit::TrustedUnbounded => u64::MAX,
+        };
+        Self {
+            limit,
+            remaining: limit,
+        }
     }
 
-    pub(crate) fn consume(&mut self, logical_len: u64) -> Result<()> {
-        let consumed = self.consumed.checked_add(logical_len).ok_or(
-            crate::Error::ResourceArithmeticOverflow {
-                resource: "materialized bytes",
-            },
-        )?;
-        self.spec
-            .read_limits
-            .check(ReadLimitKey::MaterializedBytes, consumed)?;
-        self.consumed = consumed;
+    pub(crate) fn consume(&mut self, bytes: u64) -> Result<()> {
+        if bytes > self.remaining {
+            let consumed = self.limit.checked_sub(self.remaining).ok_or(
+                crate::Error::ResourceArithmeticOverflow {
+                    resource: "materialized bytes",
+                },
+            )?;
+            let actual =
+                consumed
+                    .checked_add(bytes)
+                    .ok_or(crate::Error::ResourceArithmeticOverflow {
+                        resource: "materialized bytes",
+                    })?;
+            return Err(crate::Error::LimitExceeded {
+                resource: ReadLimitKey::MaterializedBytes.resource(),
+                actual,
+                limit: self.limit,
+            });
+        }
+        self.remaining -= bytes;
         Ok(())
+    }
+
+    pub(crate) fn remaining_policy(&mut self) -> &mut u64 {
+        &mut self.remaining
+    }
+
+    pub(crate) fn decode<T: VarveDecode>(&mut self, bytes: &[u8], endian: Endian) -> Result<T> {
+        Decoder::decode_from_slice_accounted(bytes, endian, self.remaining_policy())
     }
 }
 
@@ -99,10 +124,9 @@ where
         let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
         budget.consume(logical_len)?;
         let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
-        Ok(Some(decode_from_slice(
-            &payload,
-            T::ENDIAN.unwrap_or(self.spec.endian),
-        )?))
+        Ok(Some(
+            budget.decode(&payload, T::ENDIAN.unwrap_or(self.spec.endian))?,
+        ))
     }
 
     pub fn iter(&self) -> BlockIter<'_, T> {
@@ -178,7 +202,7 @@ where
             entry.logical_payload_len_snapshot(self.inner.spec, &self.inner.snapshot)?;
         budget.consume(logical_len)?;
         let payload = entry.read_logical_payload_snapshot(self.inner.spec, &self.inner.snapshot)?;
-        Ok(Some(decode_from_slice(
+        Ok(Some(budget.decode(
             &payload,
             T::ENDIAN.unwrap_or(self.inner.spec.endian),
         )?))

@@ -1050,6 +1050,41 @@ fn matrix_mmap_payload_window_is_checked_and_snapshot_based() -> varve::Result<(
     Ok(())
 }
 
+#[cfg(feature = "mmap")]
+#[test]
+fn matrix_mmap_rejects_backing_file_truncated_after_open() -> varve::Result<()> {
+    let path = temp_path("matrix_mmap_truncated_snapshot");
+    cleanup(&path);
+    let spec = matrix_spec();
+
+    let dims = MatrixDimensions::from_pairs([("scan", 1), ("ch", 1)]);
+    let mut writer = spec.create_writer_with_dims(&path, dims)?;
+    writer.push_info(&LogPoint { value: 99 })?;
+    writer.flush()?;
+    drop(writer);
+
+    let reader = spec.open_reader(&path)?;
+    let append_log_start = reader.index_entries()[0].record_offset;
+    OpenOptions::new()
+        .write(true)
+        .open(&path)?
+        .set_len(append_log_start)?;
+
+    let mapped = std::panic::catch_unwind(|| {
+        // SAFETY: Mutation is complete before this call and no mapping is returned.
+        unsafe { reader.mmap_matrix() }
+    });
+    assert!(mapped.is_ok(), "truncated matrix snapshot caused a panic");
+    assert!(matches!(
+        mapped.expect("checked above"),
+        Err(Error::MmapPayloadOutOfBounds { .. })
+    ));
+
+    drop(reader);
+    cleanup(&path);
+    Ok(())
+}
+
 #[cfg(feature = "zero-copy")]
 #[test]
 fn matrix_zero_copy_raw_cell_views_committed_slot() -> varve::Result<()> {

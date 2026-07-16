@@ -43,6 +43,7 @@ remain caller code.
 | [Self-Check Guide](docs/self-check-guide.md) | deciding whether a failure is format, caller, data, feature, environment, or library |
 | [Security Review](docs/adversarial-security-review-2026-07-10.md) | hostile-input threat model, remediated findings, and residual caller obligations |
 | [Security Validation](docs/security-remediation-validation.md) | exact verification commands, compatibility evidence, and assurance limits |
+| [Read And Allocation Safety](docs/read-allocation-safety.md) | invariant and coverage for length validation, bounded allocation, exact reads, and snapshot extents |
 | [Fuzzing And Fault Injection](docs/fuzzing-and-fault-injection.md) | ASan fuzz targets, Miri checks, Windows race tests, and reproducible commands |
 | [Performance](docs/performance.md) | repeatable regression protocol, benchmark paths, and integration gate |
 | [Durability Model](docs/durability-model.md) | flush, sync, transaction-marker, matrix, and replacement ordering |
@@ -60,15 +61,6 @@ varve_format! {
     pub format AppFormat {
         magic: b"APP";
         version: 1;
-        limits {
-            file_len: 1_073_741_824;
-            records: 1_000_000;
-            index_bytes: 134_217_728;
-            scan_bytes: 1_073_741_824;
-            record_payload: 16_777_216;
-            logical_payload: 67_108_864;
-            materialized_bytes: 268_435_456;
-        }
         schema_hash: computed;
         commit: transaction_marker(on_flush);
 
@@ -100,10 +92,12 @@ The user declares the format and block types. Varve generates the typed
 methods, block metadata, required field encoding, record headers, commit
 handling, offset-chain metadata, and diagnostics.
 
-The finite `limits` policy is required for ordinary opens and is enforced
-before claim-sized reads or allocations. Applications may tighten it at open
-time with generated `*_with_limits` methods. Trusted-unbounded operation is a
-separate, visibly named API and is not selected by ordinary open methods.
+Resource limits are runtime policy, not part of the file format. Ordinary
+opens use Varve's allocation-safe standard policy. Use generated
+`*_with_resource_limits` methods to raise or lower policy for a handle, or the
+legacy `*_with_limits` methods when only fieldwise tightening is desired. An
+optional, partial `limits { ... }` declaration can provide format defaults but
+never becomes a permanent wire-format ceiling.
 
 ## Examples
 

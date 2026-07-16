@@ -1,6 +1,6 @@
-#[cfg(feature = "mmap")]
-use std::fs::OpenOptions;
-use std::fs::remove_file;
+use std::fs::{File, OpenOptions, remove_file};
+use std::io::{Seek, SeekFrom, Write};
+use std::panic::catch_unwind;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -167,6 +167,69 @@ fn payload_reads_check_extent_limit_and_physical_end() -> varve::Result<()> {
     Ok(())
 }
 
+#[test]
+fn sparse_payload_rejects_standard_limit_before_reading() -> varve::Result<()> {
+    let path = temp_path("sparse_payload_limit");
+    cleanup(&path);
+    let payload_len = 64 * 1024 * 1024 + 1;
+    File::create(&path)?.set_len(payload_len)?;
+    let entry = varve::RecordIndexEntry {
+        block_id: StorageValue::ID,
+        block_version: StorageValue::VERSION,
+        flags: 0,
+        sequence: 0,
+        record_offset: 0,
+        payload_offset: 0,
+        payload_len,
+        checksum: 0,
+        uncompressed_len_hint: 0,
+        footer_offset: None,
+        prev_same_block_offset: None,
+        prev_same_key_offset: None,
+        committed: true,
+    };
+
+    assert!(matches!(
+        entry.read_payload(&path),
+        Err(Error::LimitExceeded {
+            resource: "record payload length",
+            ..
+        })
+    ));
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn hostile_on_disk_payload_lengths_fail_without_panicking_or_allocating() -> varve::Result<()> {
+    let path = temp_path("hostile_disk_payload_len");
+    cleanup(&path);
+    let mut writer = StorageFormat::create(&path)?;
+    writer.push(&StorageValue { value: 17 })?;
+    let entry = writer.index_entries()[0].clone();
+    drop(writer);
+
+    let payload_len_offset = entry.record_offset + 16;
+    let file_len = std::fs::metadata(&path)?.len();
+    for hostile_len in [file_len, u64::MAX] {
+        let mut file = OpenOptions::new().write(true).open(&path)?;
+        file.seek(SeekFrom::Start(payload_len_offset))?;
+        file.write_all(&hostile_len.to_le_bytes())?;
+        drop(file);
+
+        let opened = catch_unwind(|| StorageFormat::open_readonly(&path));
+        assert!(opened.is_ok(), "hostile payload length caused a panic");
+        assert!(matches!(
+            opened.expect("checked above"),
+            Err(Error::CorruptTail { .. }) | Err(Error::LimitExceeded { .. })
+        ));
+    }
+
+    cleanup(&path);
+    Ok(())
+}
+
 #[cfg(feature = "compression-zstd")]
 #[test]
 fn logical_limit_does_not_cap_compressed_storage_overhead() -> varve::Result<()> {
@@ -203,6 +266,17 @@ fn logical_limit_does_not_cap_compressed_storage_overhead() -> varve::Result<()>
         })
     ));
 
+    let runtime =
+        varve::ReadLimits::missing().with_max_logical_payload_len(logical.len() as u64 - 1);
+    let limited_spec = StorageCompressionFormat::spec().with_resource_limits(runtime);
+    assert!(matches!(
+        entry.read_logical_payload_limited(limited_spec, &path, u64::MAX, u64::MAX,),
+        Err(Error::LimitExceeded {
+            resource: "logical payload length",
+            ..
+        })
+    ));
+
     cleanup(&path);
     Ok(())
 }
@@ -226,6 +300,32 @@ fn mmap_constructor_rejects_a_stale_index_extent() -> varve::Result<()> {
     // SAFETY: Mutation is complete before this call and no mapping is returned.
     assert!(matches!(
         unsafe { reader.mmap_payloads() },
+        Err(Error::MmapPayloadOutOfBounds { .. })
+    ));
+
+    drop(reader);
+    cleanup(&path);
+    Ok(())
+}
+
+#[cfg(feature = "mmap")]
+#[test]
+fn mmap_constructor_rejects_truncated_empty_snapshot() -> varve::Result<()> {
+    let path = temp_path("mmap_truncated_empty_snapshot");
+    cleanup(&path);
+    drop(StorageFormat::create(&path)?);
+
+    let reader = StorageFormat::open_readonly(&path)?;
+    assert!(reader.index_entries().is_empty());
+    OpenOptions::new().write(true).open(&path)?.set_len(1)?;
+
+    let mapped = catch_unwind(|| {
+        // SAFETY: Mutation is complete before this call and no mapping is returned.
+        unsafe { reader.mmap_payloads() }
+    });
+    assert!(mapped.is_ok(), "truncated empty snapshot caused a panic");
+    assert!(matches!(
+        mapped.expect("checked above"),
         Err(Error::MmapPayloadOutOfBounds { .. })
     ));
 

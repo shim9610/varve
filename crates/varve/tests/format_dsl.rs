@@ -85,6 +85,27 @@ varve_format! {
 }
 
 varve_format! {
+    pub format ReplacementDslFormat {
+        magic: b"RDSL";
+        version: 1;
+        limits {
+            record_payload: 1_048_576;
+        }
+        index: [scan_on_open, block_offset_chain, keyed_offset_chain];
+        blocks {
+            fixed ReplacementPoint(id = 51) {
+                value: u32,
+            }
+
+            variable ReplacementUser(id = 52, key = [id]) {
+                id: u64,
+                name: String,
+            }
+        }
+    }
+}
+
+varve_format! {
     pub format CrcFooterFormat {
         magic: b"CRCF";
         version: 1;
@@ -321,6 +342,78 @@ fn durable_commit_marks_visible_records() -> varve::Result<()> {
     let points = reader.explicit_points()?;
     assert_eq!(points.len(), 1);
     assert_eq!(points.get(0)?.unwrap(), ExplicitPoint { value: 42 });
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn typed_replacement_translates_keyed_tails_after_resize() -> varve::Result<()> {
+    let path = temp_path("typed_replacement_tails");
+    cleanup(&path);
+
+    let mut writer = ReplacementDslFormat::create_writer(&path)?;
+    writer.push_replacement_point(&ReplacementPoint { value: 1 })?;
+    let point_replacement = ReplacementDslFormatWrite::replace_replacement_point(
+        &mut writer,
+        0,
+        &ReplacementPoint { value: 2 },
+    )?;
+    assert_eq!(
+        point_replacement.old_physical_len,
+        point_replacement.new_physical_len
+    );
+
+    writer.push_replacement_user(&ReplacementUser {
+        id: 1,
+        name: "a".to_string(),
+    })?;
+    let later = writer.push_replacement_user(&ReplacementUser {
+        id: 2,
+        name: "later".to_string(),
+    })?;
+    assert!(matches!(
+        writer.replace_replacement_user(
+            0,
+            &ReplacementUser {
+                id: 9,
+                name: "different key".to_string(),
+            },
+        ),
+        Err(varve::Error::ReplacementKeyMismatch),
+    ));
+    let replacement = writer.replace_replacement_user(
+        0,
+        &ReplacementUser {
+            id: 1,
+            name: "a much longer replacement value".to_string(),
+        },
+    )?;
+    assert!(replacement.new_physical_len > replacement.old_physical_len);
+
+    let appended = writer.push_replacement_user(&ReplacementUser {
+        id: 2,
+        name: "newest".to_string(),
+    })?;
+    assert_eq!(
+        appended.prev_same_key_offset,
+        Some(replacement.translate_record_offset(later.record_offset)?),
+    );
+    writer.flush()?;
+    drop(writer);
+
+    let reader = ReplacementDslFormat::open_reader(&path)?;
+    assert_eq!(
+        reader.replacement_points()?.get(0)?,
+        Some(ReplacementPoint { value: 2 }),
+    );
+    assert_eq!(
+        reader.replacement_users()?.get(&1)?,
+        Some(ReplacementUser {
+            id: 1,
+            name: "a much longer replacement value".to_string(),
+        }),
+    );
 
     cleanup(&path);
     Ok(())

@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use crate::format::ReadLimitKey;
 use crate::{
-    BlockKind, Error, FormatSpec, IntegrityPolicy, MatrixCommitKind, ReadLimits, Result,
-    VarveMatrixBlock, decode_from_slice, encode_to_vec,
+    BlockKind, Decoder, Error, FormatSpec, IntegrityPolicy, MatrixCommitKind, ReadLimits, Result,
+    VarveMatrixBlock, encode_to_vec,
 };
 
 const VMAT_MAGIC: &[u8; 4] = b"VMAT";
@@ -764,11 +764,27 @@ pub(crate) fn read_cell<T: VarveMatrixBlock>(
     let ordinal = layout.ordinal_for_block(block_index, key)?;
     let offset = layout.slot_offset(block_index, ordinal)?;
     let stride = layout.blocks[block_index].slot_stride;
+    layout
+        .read_limits
+        .check(ReadLimitKey::RecordPayloadLen, stride)?;
+    layout
+        .read_limits
+        .check(ReadLimitKey::MaterializedBytes, stride)?;
     file.seek(SeekFrom::Start(offset))?;
     let mut payload = filled_bytes(stride, 0)?;
     file.read_exact(&mut payload)?;
     verify_cell_crc(layout, file, block_index, ordinal, &payload)?;
-    decode_from_slice(&payload, T::ENDIAN.unwrap_or(spec.endian))
+    let materialized_limit = layout
+        .read_limits
+        .require(ReadLimitKey::MaterializedBytes)?
+        .unwrap_or(u64::MAX);
+    let decode_limit =
+        materialized_limit
+            .checked_sub(stride)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "materialized bytes",
+            })?;
+    Decoder::decode_from_slice_limited(&payload, T::ENDIAN.unwrap_or(spec.endian), decode_limit)
 }
 
 pub(crate) fn cell_status<T: VarveMatrixBlock>(
@@ -934,6 +950,12 @@ pub(crate) fn read_cell_payload<T: VarveMatrixBlock>(
     let ordinal = layout.ordinal_for_block(block_index, key)?;
     let offset = layout.slot_offset(block_index, ordinal)?;
     let stride = layout.blocks[block_index].slot_stride;
+    layout
+        .read_limits
+        .check(ReadLimitKey::RecordPayloadLen, stride)?;
+    layout
+        .read_limits
+        .check(ReadLimitKey::MaterializedBytes, stride)?;
     file.seek(SeekFrom::Start(offset))?;
     let mut payload = filled_bytes(stride, 0)?;
     file.read_exact(&mut payload)?;
@@ -959,6 +981,9 @@ pub(crate) fn read_aux_at_len(
     layout
         .read_limits
         .check(ReadLimitKey::RecordPayloadLen, len)?;
+    layout
+        .read_limits
+        .check(ReadLimitKey::MaterializedBytes, len)?;
     let absolute = aux_absolute_offset(layout.aux(name)?, offset, len)?;
     validate_range(absolute, len, logical_file_len)?;
     file.seek(SeekFrom::Start(absolute))?;
@@ -1230,13 +1255,10 @@ pub(crate) fn rebuild_commit_map_from_crc<T: VarveMatrixBlock>(
         .read_limits
         .check(ReadLimitKey::MatrixBitmapBytes, peak_bitmap_bytes)?;
     let mut rebuilt = filled_bytes(rebuilt_len, 0)?;
-    let mut payload = filled_bytes(block.slot_stride, 0)?;
     let mut committed = 0u64;
     for ordinal in 0..block.cell_count {
         let slot_offset = layout.slot_offset(block_index, ordinal)?;
-        file.seek(SeekFrom::Start(slot_offset))?;
-        file.read_exact(&mut payload)?;
-        let actual = crc32_bytes(&payload)?;
+        let actual = crc32_file_range(file, slot_offset, block.slot_stride)?;
         let stored = read_crc_at(file, indexed_crc_offset(crc_offset, ordinal)?)?;
         let valid = get_bit(&block.crc_valid_bits, ordinal)? && actual == stored;
         if valid {
@@ -1517,10 +1539,7 @@ fn update_cell_crc(
     };
     let offset = layout.slot_offset(block_index, ordinal)?;
     let stride = layout.blocks[block_index].slot_stride;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut payload = filled_bytes(stride, 0)?;
-    file.read_exact(&mut payload)?;
-    let crc = crc32_bytes(&payload)?;
+    let crc = crc32_file_range(file, offset, stride)?;
     write_crc_at(file, indexed_crc_offset(crc_offset, ordinal)?, crc)
 }
 
@@ -1614,9 +1633,39 @@ fn slot_is_all_zero(
     let offset = layout.slot_offset(block_index, ordinal)?;
     let stride = layout.blocks[block_index].slot_stride;
     file.seek(SeekFrom::Start(offset))?;
-    let mut payload = filled_bytes(stride, 0)?;
-    file.read_exact(&mut payload)?;
-    Ok(payload.iter().all(|byte| *byte == 0))
+    let mut buffer = [0u8; 64 * 1024];
+    let mut remaining = stride;
+    while remaining != 0 {
+        let chunk_len = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| Error::LengthOverflow { value: remaining })?;
+        file.read_exact(&mut buffer[..chunk_len])?;
+        if buffer[..chunk_len].iter().any(|byte| *byte != 0) {
+            return Ok(false);
+        }
+        remaining -= chunk_len as u64;
+    }
+    Ok(true)
+}
+
+#[cfg(feature = "integrity")]
+fn crc32_file_range(file: &mut File, offset: u64, len: u64) -> Result<u32> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut remaining = len;
+    while remaining != 0 {
+        let chunk_len = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| Error::LengthOverflow { value: remaining })?;
+        file.read_exact(&mut buffer[..chunk_len])?;
+        hasher.update(&buffer[..chunk_len]);
+        remaining -= chunk_len as u64;
+    }
+    Ok(hasher.finalize())
+}
+
+#[cfg(not(feature = "integrity"))]
+fn crc32_file_range(_file: &mut File, _offset: u64, _len: u64) -> Result<u32> {
+    Err(Error::IntegrityFeatureDisabled)
 }
 
 fn count_committed(commit: &MatrixCommitLayout) -> Result<u64> {
@@ -3234,5 +3283,16 @@ mod limit_tests {
                 limit: 3,
             })
         ));
+
+        let unbounded = sidecar_spec(ReadLimits::finite_all(u64::MAX));
+        for result in [
+            matrix_sidecar_read_plan(unbounded, u64::MAX, 48, u64::MAX, 4, 4, 0, 0, 0),
+            matrix_sidecar_read_plan(unbounded, u64::MAX, 48, 4, 4, u64::MAX, 0, 0, 0),
+        ] {
+            assert!(matches!(
+                result,
+                Err(Error::ResourceArithmeticOverflow { .. })
+            ));
+        }
     }
 }

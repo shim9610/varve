@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::{
     Endian, Error, FileHeaderDescriptor, FormatSpec, LayoutAnchor, LayoutFieldDescriptor,
     LayoutFieldSource, LayoutFieldType, LayoutFinalize, LayoutPartKind, LayoutPlan, LayoutPreset,
-    ReadLimits, Result, SegmentDescriptor, SegmentRepeat,
+    ReadLimits, ResourceLimits, Result, SegmentDescriptor, SegmentRepeat,
     format::ReadLimitKey,
     snapshot::{SnapshotCursor, SnapshotFile},
 };
@@ -438,6 +438,14 @@ impl FormatSpec {
         self.tighten_read_limits(limits).create_layout_writer(path)
     }
 
+    pub fn create_layout_writer_with_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<LayoutWriter> {
+        self.with_resource_limits(limits).create_layout_writer(path)
+    }
+
     pub fn create_layout_writer_trusted_unbounded<P: AsRef<Path>>(
         self,
         path: P,
@@ -467,6 +475,16 @@ impl FormatSpec {
             .create_layout_writer_with_header(path, fields)
     }
 
+    pub fn create_layout_writer_with_header_and_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        fields: &[LayoutFieldValue],
+        limits: ResourceLimits,
+    ) -> Result<LayoutWriter> {
+        self.with_resource_limits(limits)
+            .create_layout_writer_with_header(path, fields)
+    }
+
     pub fn create_layout_writer_with_header_trusted_unbounded<P: AsRef<Path>>(
         self,
         path: P,
@@ -489,6 +507,14 @@ impl FormatSpec {
         limits: ReadLimits,
     ) -> Result<LayoutWriter> {
         self.tighten_read_limits(limits).open_layout_writer(path)
+    }
+
+    pub fn open_layout_writer_with_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<LayoutWriter> {
+        self.with_resource_limits(limits).open_layout_writer(path)
     }
 
     pub fn open_layout_writer_trusted_unbounded<P: AsRef<Path>>(
@@ -514,6 +540,14 @@ impl FormatSpec {
         self.tighten_read_limits(limits).open_layout_reader(path)
     }
 
+    pub fn open_layout_reader_with_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<LayoutReader> {
+        self.with_resource_limits(limits).open_layout_reader(path)
+    }
+
     pub fn open_layout_reader_trusted_unbounded<P: AsRef<Path>>(
         self,
         path: P,
@@ -537,6 +571,14 @@ impl FormatSpec {
         self.tighten_read_limits(limits).inspect_layout_file(path)
     }
 
+    pub fn inspect_layout_file_with_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<LayoutFileInfo> {
+        self.with_resource_limits(limits).inspect_layout_file(path)
+    }
+
     pub fn inspect_layout_file_trusted_unbounded<P: AsRef<Path>>(
         self,
         path: P,
@@ -558,6 +600,15 @@ impl FormatSpec {
         limits: ReadLimits,
     ) -> Result<LayoutScanReport> {
         self.tighten_read_limits(limits)
+            .inspect_layout_file_report(path)
+    }
+
+    pub fn inspect_layout_file_report_with_resource_limits<P: AsRef<Path>>(
+        self,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<LayoutScanReport> {
+        self.with_resource_limits(limits)
             .inspect_layout_file_report(path)
     }
 
@@ -640,6 +691,7 @@ fn inspect_layout_file_report_inner<P: AsRef<Path>>(
 
 impl LayoutWriter {
     pub fn create<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        let spec = spec.resolve_entrypoint();
         spec.validate()?;
         Self::create_inner(spec, path, &[])
     }
@@ -650,6 +702,14 @@ impl LayoutWriter {
         limits: ReadLimits,
     ) -> Result<Self> {
         Self::create(spec.tighten_read_limits(limits), path)
+    }
+
+    pub fn create_with_resource_limits<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<Self> {
+        Self::create(spec.with_resource_limits(limits), path)
     }
 
     pub fn create_trusted_unbounded<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
@@ -663,6 +723,7 @@ impl LayoutWriter {
         path: P,
         fields: &[LayoutFieldValue],
     ) -> Result<Self> {
+        let spec = spec.resolve_entrypoint();
         spec.validate()?;
         Self::create_inner(spec, path, fields)
     }
@@ -674,6 +735,15 @@ impl LayoutWriter {
         limits: ReadLimits,
     ) -> Result<Self> {
         Self::create_with_header(spec.tighten_read_limits(limits), path, fields)
+    }
+
+    pub fn create_with_header_and_resource_limits<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        fields: &[LayoutFieldValue],
+        limits: ResourceLimits,
+    ) -> Result<Self> {
+        Self::create_with_header(spec.with_resource_limits(limits), path, fields)
     }
 
     pub fn create_with_header_trusted_unbounded<P: AsRef<Path>>(
@@ -732,6 +802,7 @@ impl LayoutWriter {
     }
 
     pub fn open<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        let spec = spec.resolve_entrypoint();
         spec.validate()?;
         Self::open_inner(spec, path)
     }
@@ -742,6 +813,14 @@ impl LayoutWriter {
         limits: ReadLimits,
     ) -> Result<Self> {
         Self::open(spec.tighten_read_limits(limits), path)
+    }
+
+    pub fn open_with_resource_limits<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<Self> {
+        Self::open(spec.with_resource_limits(limits), path)
     }
 
     pub fn open_trusted_unbounded<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
@@ -1093,6 +1172,7 @@ impl LayoutWriter {
 
 impl LayoutReader {
     pub fn open<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        let spec = spec.resolve_entrypoint();
         spec.validate()?;
         Self::open_inner(spec, path)
     }
@@ -1103,6 +1183,14 @@ impl LayoutReader {
         limits: ReadLimits,
     ) -> Result<Self> {
         Self::open(spec.tighten_read_limits(limits), path)
+    }
+
+    pub fn open_with_resource_limits<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        limits: ResourceLimits,
+    ) -> Result<Self> {
+        Self::open(spec.with_resource_limits(limits), path)
     }
 
     pub fn open_trusted_unbounded<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
@@ -1204,6 +1292,9 @@ impl LayoutReader {
     }
 
     fn read_snapshot_range(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::MaterializedBytes, len)?;
         let limit = self
             .spec
             .read_limits
@@ -1710,6 +1801,8 @@ fn read_file_header(spec: FormatSpec, snapshot: &SnapshotFile) -> Result<LayoutF
         .check(ReadLimitKey::ScanBytes, header_len)?;
     spec.read_limits
         .check(ReadLimitKey::IndexBytes, index_bytes)?;
+    spec.read_limits
+        .check(ReadLimitKey::MaterializedBytes, header_len)?;
     if snapshot.len() < header_len {
         return Err(Error::LayoutTruncatedHeader { offset: 0 });
     }
@@ -2223,6 +2316,10 @@ fn read_layout_segment_at(
 ) -> std::result::Result<LayoutSegmentInfo, LayoutSegmentReadError> {
     let lead_in_len = descriptor_lead_in_len(descriptor)?;
     let footer_len = descriptor_footer_len(descriptor)?;
+    spec.read_limits
+        .check(ReadLimitKey::MaterializedBytes, lead_in_len)?;
+    spec.read_limits
+        .check(ReadLimitKey::MaterializedBytes, footer_len)?;
     let after_lead_in = check_layout_scan_extent(spec, segment_start, lead_in_len)?;
     let lead_in_bytes = cursor.read_vec_at(
         segment_start,

@@ -1,5 +1,0 @@
-error: unexpected end of input, missing Varve read limit key "records"
-  --> tests/ui/fail_missing_limit_key.rs:15:5
-   |
-15 |     }
-   |     ^
