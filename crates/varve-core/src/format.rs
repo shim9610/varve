@@ -112,6 +112,21 @@ impl ReadLimits {
         max_mmap_len: ReadLimit::Finite(8 * 1024 * 1024 * 1024),
         trusted_api: false,
     };
+    /// Finite companion to [`Self::STANDARD`] for input from untrusted
+    /// sources. Every aggregate dimension that `STANDARD` leaves effectively
+    /// unbounded (total file length, record count, scan bytes, resident index
+    /// bytes, segment count) is finite here, so a hostile file cannot choose
+    /// the reader's CPU, I/O, or memory. This is the recommended default when
+    /// opening files from untrusted sources with the resident API; large
+    /// trusted files should use the scalable APIs or explicit wider limits.
+    pub const UNTRUSTED: Self = Self {
+        max_file_len: ReadLimit::Finite(16 * 1024 * 1024 * 1024),
+        max_records: ReadLimit::Finite(16_000_000),
+        max_index_bytes: ReadLimit::Finite(1024 * 1024 * 1024),
+        max_scan_bytes: ReadLimit::Finite(16 * 1024 * 1024 * 1024),
+        max_segments: ReadLimit::Finite(65_536),
+        ..Self::STANDARD
+    };
 
     const fn all(value: ReadLimit) -> Self {
         Self {
@@ -149,6 +164,10 @@ impl ReadLimits {
 
     pub const fn standard() -> Self {
         Self::STANDARD
+    }
+
+    pub const fn untrusted() -> Self {
+        Self::UNTRUSTED
     }
 
     read_limit_setters! {
@@ -947,6 +966,10 @@ pub struct FormatSpec {
     pub matrix_aux: &'static [MatrixAuxDescriptor],
     pub layout: LayoutSpec,
     pub read_limits: ReadLimits,
+    /// Explicit opt-in that keeps matrix data access available when the
+    /// matrix recovery report contains `Fatal` findings. Defaults to false:
+    /// safe accessors fail closed with [`Error::MatrixFatalCorruption`].
+    pub matrix_fatal_forensics: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1005,6 +1028,7 @@ impl FormatSpec {
             matrix_aux: &[],
             layout: LayoutSpec::varve_native(),
             read_limits: ReadLimits::MISSING,
+            matrix_fatal_forensics: false,
         }
     }
 
@@ -1070,6 +1094,16 @@ impl FormatSpec {
 
     pub const fn with_matrix_aux(mut self, aux: &'static [MatrixAuxDescriptor]) -> Self {
         self.matrix_aux = aux;
+        self
+    }
+
+    /// Explicit forensic/recovery opt-in for matrix files whose recovery
+    /// report contains `Fatal` findings (for example a matrix metadata CRC
+    /// mismatch). Without this opt-in, every safe matrix accessor on such a
+    /// file fails closed with [`Error::MatrixFatalCorruption`]; the recovery
+    /// report itself stays readable either way.
+    pub const fn with_matrix_fatal_forensics(mut self) -> Self {
+        self.matrix_fatal_forensics = true;
         self
     }
 
@@ -1332,6 +1366,16 @@ impl FormatSpec {
         let self_ = self.ordinary_read();
         self_.validate()?;
         VarveWriter::open_with_lock_policy(self_, path, policy)
+    }
+
+    /// Clears a stale writer lock without opening or scanning the data file.
+    pub fn clear_stale_writer_lock<P: AsRef<Path>>(
+        self,
+        path: P,
+        policy: WriterLockBreakPolicy,
+    ) -> Result<()> {
+        self.validate()?;
+        crate::clear_stale_writer_lock(path, policy)
     }
 
     pub fn open_readonly<P: AsRef<Path>>(self, path: P) -> Result<VarveFile> {
@@ -2850,6 +2894,33 @@ mod read_limit_tests {
             bounded.check(ReadLimitKey::FileLen, 4),
             Err(Error::LimitExceeded { limit: 3, .. })
         ));
+    }
+
+    #[test]
+    fn untrusted_preset_is_finite_in_every_aggregate_dimension() {
+        let limits = ReadLimits::untrusted();
+        for (name, limit) in [
+            ("file length", limits.max_file_len),
+            ("record count", limits.max_records),
+            ("index bytes", limits.max_index_bytes),
+            ("scan bytes", limits.max_scan_bytes),
+            ("segment count", limits.max_segments),
+        ] {
+            match limit {
+                ReadLimit::Finite(value) => {
+                    assert!(value < u64::MAX, "{name} must have a real finite bound");
+                }
+                other => panic!("{name} must be finite, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            limits.max_record_payload_len,
+            ReadLimits::STANDARD.max_record_payload_len
+        );
+        assert_eq!(
+            limits.max_materialized_bytes,
+            ReadLimits::STANDARD.max_materialized_bytes
+        );
     }
 
     #[test]

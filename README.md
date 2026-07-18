@@ -46,6 +46,8 @@ remain caller code.
 | [Read And Allocation Safety](docs/read-allocation-safety.md) | invariant and coverage for length validation, bounded allocation, exact reads, and snapshot extents |
 | [Fuzzing And Fault Injection](docs/fuzzing-and-fault-injection.md) | ASan fuzz targets, Miri checks, Windows race tests, and reproducible commands |
 | [Performance](docs/performance.md) | repeatable regression protocol, benchmark paths, and integration gate |
+| [Scalable I/O](docs/scalable-io.md) | petabyte-scale stream/indexed APIs, batching, sidecars, recovery, and exact cost model |
+| [Test Artifact Hygiene](docs/test-artifact-hygiene.md) | fresh test-file creation, success cleanup, failure retention, and build-cache policy |
 | [Durability Model](docs/durability-model.md) | flush, sync, transaction-marker, matrix, and replacement ordering |
 | [Architecture](docs/architecture.md) | current architectural outline and implementation status |
 | [Requirements Boundary](docs/requirements-boundary.md) | what Varve owns versus what callers should implement |
@@ -137,21 +139,35 @@ gate, file data, environment, or library invariant issues. See
 
 ## Status
 
-Varve 0.2.0 is usable as an alpha library for experimentation and controlled
+Varve 0.3.0 is usable as an alpha library for experimentation and controlled
 deployments. It includes append-log blocks, keyed collections,
 transaction/footer commit policies, schema manifests, diagnostics, merge and
 compact helpers, variable-block compression, matrix storage, mmap, and opt-in
-zero-copy. Valid native 0.1 wire bytes remain readable in 0.2.0, but the Rust API
+zero-copy. Valid native 0.1 wire bytes remain readable in 0.3.0, but the Rust API
 is still pre-1.0 and may evolve through semver-signaled minor releases.
+The petabyte-scale stream/disk-index API remains behind
+`high-cardinality-dev`. Progress/cancellation, process-interruption recovery,
+and sidecar robustness gates are implemented and executed; the current Windows
+NTFS host cannot execute the required real 1 PiB sparse-offset probe, so that
+platform gate remains open rather than being reported as passed.
 
 ## Local Verification
 
 ```powershell
 cargo fmt --all -- --check
-cargo test --workspace
-cargo test --workspace --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo run -p varve-test-runner -- test --workspace
+cargo run -p varve-test-runner -- test --workspace --all-features
+cargo run -p varve-test-runner -- clippy --workspace --all-targets --all-features -- -D warnings
 ```
+
+The runner gives every command a fresh temporary root, preserves that root on
+failure, and requires verified cleanup on success. Cargo build caches remain
+reusable and are not treated as test data.
+
+The same gates run in CI (`.github/workflows/ci.yml`) on Ubuntu and Windows:
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+--all-features -- -D warnings`, and `cargo test --workspace --all-features`, plus
+a non-blocking `cargo deny` / `cargo audit` supply-chain job.
 
 Optional compatibility harnesses use Python reference libraries:
 

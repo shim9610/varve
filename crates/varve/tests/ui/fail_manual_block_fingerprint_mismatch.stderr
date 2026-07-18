@@ -1,0 +1,7 @@
+error[E0046]: not all trait items implemented, missing: `SCHEMA_FINGERPRINT`
+  --> tests/ui/fail_manual_block_fingerprint_mismatch.rs:24:1
+   |
+24 | impl VarveBlock for ManualNoFingerprint {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `SCHEMA_FINGERPRINT` in implementation
+   |
+   = help: implement the missing item: `const SCHEMA_FINGERPRINT: u64 = 42;`

@@ -1,0 +1,5 @@
+error[E0599]: no method named `push_frames` found for mutable reference `&mut PetabyteChainStreamFormatStreamWriter` in the current scope
+  --> tests/ui/fail_petabyte_chain_stream_keyed_batch.rs:21:20
+   |
+21 |     let _ = writer.push_frames(frames, BatchOptions::default());
+   |                    ^^^^^^^^^^^ method not found in `&mut PetabyteChainStreamFormatStreamWriter`

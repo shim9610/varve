@@ -244,6 +244,9 @@ pub struct MatrixLayout {
     append_log_start: u64,
     read_limits: ReadLimits,
     resident_bitmap_bytes: u64,
+    // Precomputed at open time so accessors gate on a single flag instead of
+    // scanning findings per cell access.
+    fatal_access_blocked: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -294,6 +297,15 @@ struct MatrixCrcVerification {
 impl MatrixLayout {
     pub fn append_log_start(&self) -> u64 {
         self.append_log_start
+    }
+
+    // Fail-closed gate for `Fatal` recovery findings: safe accessors must not
+    // consume fatal-state data unless the spec opted into forensic access.
+    fn ensure_fatal_access_allowed(&self) -> Result<()> {
+        if self.fatal_access_blocked {
+            return Err(Error::MatrixFatalCorruption);
+        }
+        Ok(())
     }
 
     pub fn dimension(&self, name: &str) -> Option<u64> {
@@ -865,6 +877,7 @@ pub(crate) fn clear_category(
     file: &mut File,
     category: &str,
 ) -> Result<u64> {
+    layout.ensure_fatal_access_allowed()?;
     let commit_index = layout.commit_index(category)?;
     let cleared = count_committed(&layout.commits[commit_index])?;
     let commit_kind = layout.commits[commit_index].kind;
@@ -924,6 +937,7 @@ pub(crate) fn commit_event<T: VarveMatrixBlock>(
     key: MatrixKey,
 ) -> Result<MatrixCommitEvent> {
     ensure_matrix_block::<T>(spec)?;
+    layout.ensure_fatal_access_allowed()?;
     let block_index = layout.block_index(T::ID)?;
     let ordinal = layout.ordinal_for_block(block_index, key)?;
     let offset = layout.slot_offset(block_index, ordinal)?;
@@ -964,6 +978,7 @@ pub(crate) fn read_cell_payload<T: VarveMatrixBlock>(
 }
 
 pub(crate) fn aux_len(layout: &MatrixLayout, name: &str) -> Result<u64> {
+    layout.ensure_fatal_access_allowed()?;
     Ok(layout.aux(name)?.byte_len)
 }
 
@@ -975,6 +990,7 @@ pub(crate) fn read_aux_at_len(
     offset: u64,
     len: u64,
 ) -> Result<Vec<u8>> {
+    layout.ensure_fatal_access_allowed()?;
     layout
         .read_limits
         .check(ReadLimitKey::FileLen, logical_file_len)?;
@@ -1004,6 +1020,7 @@ pub(crate) fn write_aux_at_len(
         .len()
         .try_into()
         .map_err(|_| Error::InvalidMatrixLayout)?;
+    layout.ensure_fatal_access_allowed()?;
     layout
         .read_limits
         .check(ReadLimitKey::FileLen, logical_file_len)?;
@@ -1056,6 +1073,7 @@ pub(crate) fn verify_payload_crc_bytes(
 }
 
 pub(crate) fn resume_signal(layout: &MatrixLayout, category: &str) -> Result<MatrixResumeSignal> {
+    layout.ensure_fatal_access_allowed()?;
     let commit = &layout.commits[layout.commit_index(category)?];
     let committed = count_committed(commit)?;
     if committed == 0 || committed == commit.bit_count {
@@ -1073,6 +1091,7 @@ pub(crate) fn sidecar_resume_signal(
     category: &str,
     sidecar_exists: bool,
 ) -> Result<MatrixResumeSignal> {
+    layout.ensure_fatal_access_allowed()?;
     layout.read_limits.check(ReadLimitKey::SidecarLen, 0)?;
     let commit = &layout.commits[layout.commit_index(category)?];
     let committed = count_committed(commit)?;
@@ -1232,6 +1251,7 @@ pub(crate) fn rebuild_commit_map_from_crc<T: VarveMatrixBlock>(
     file: &mut File,
 ) -> Result<u64> {
     ensure_matrix_block::<T>(spec)?;
+    layout.ensure_fatal_access_allowed()?;
     let block_index = layout.block_index(T::ID)?;
     let block = &layout.blocks[block_index];
     let Some(crc_offset) = block.crc_offset else {
@@ -1382,6 +1402,7 @@ fn block_index_for_category(
 }
 
 fn ensure_commit_publishable(layout: &MatrixLayout, category: &str) -> Result<()> {
+    layout.ensure_fatal_access_allowed()?;
     let commit = &layout.commits[layout.commit_index(category)?];
     if commit.quarantined_raw_bits.is_some() {
         return Err(Error::MatrixCommitQuarantined(category.to_string()));
@@ -1483,6 +1504,7 @@ fn prepare_commit_bit(
     ordinal: u64,
     value: bool,
 ) -> Result<CommitBitUpdate> {
+    layout.ensure_fatal_access_allowed()?;
     let commit = &layout.commits[commit_index];
     if commit.quarantined_raw_bits.is_some() {
         return Err(Error::MatrixCommitQuarantined(commit.name.clone()));
@@ -1986,6 +2008,11 @@ fn layout_from_parts(
     if commit_bits.len() != commit_plans.len() {
         return Err(Error::InvalidMatrixLayout);
     }
+    let has_fatal_finding = crc_findings
+        .iter()
+        .chain(commit_findings.values())
+        .any(|finding| finding.severity == MatrixCorruptionSeverity::Fatal);
+    let fatal_access_blocked = has_fatal_finding && !spec.matrix_fatal_forensics;
     let mut commits = Vec::new();
     try_reserve_vec(&mut commits, commit_plans.len(), MATRIX_DESCRIPTOR_RESOURCE)?;
     for (commit_index, ((name, kind, bit_count), raw_bits)) in
@@ -2112,6 +2139,7 @@ fn layout_from_parts(
         append_log_start,
         read_limits: spec.read_limits,
         resident_bitmap_bytes,
+        fatal_access_blocked,
     })
 }
 

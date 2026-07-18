@@ -31,6 +31,24 @@ fn macro_compile_contracts() {
     tests.compile_fail("tests/ui/fail_generic_derive.rs");
     tests.compile_fail("tests/ui/fail_unknown_limit_key.rs");
     tests.compile_fail("tests/ui/fail_duplicate_limit_key.rs");
+    tests.compile_fail("tests/ui/fail_manual_block_fingerprint_mismatch.rs");
+    tests.compile_fail("tests/ui/fail_keyed_contradiction.rs");
+    #[cfg(not(feature = "high-cardinality-dev"))]
+    tests.compile_fail("tests/ui/fail_key_index_requires_feature.rs");
+}
+
+#[cfg(feature = "high-cardinality-dev")]
+#[test]
+fn high_cardinality_compile_contracts() {
+    let tests = trybuild::TestCases::new();
+    tests.pass("tests/ui/pass_high_cardinality_macro.rs");
+    tests.pass("tests/ui/pass_petabyte_plan_batch.rs");
+    tests.compile_fail("tests/ui/fail_key_index_matrix.rs");
+    tests.compile_fail("tests/ui/fail_key_index_value.rs");
+    tests.compile_fail("tests/ui/fail_key_index_without_key.rs");
+    tests.compile_fail("tests/ui/fail_petabyte_chain_stream_keyed_batch.rs");
+    tests.compile_fail("tests/ui/fail_petabyte_chain_unindexed_keyed_mutation.rs");
+    tests.compile_fail("tests/ui/fail_manual_block_missing_keyedness.rs");
 }
 
 #[cfg(feature = "mmap")]

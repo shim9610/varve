@@ -1,4 +1,5 @@
 use std::hash::Hash;
+use std::marker::PhantomData;
 
 use crate::{BlockKind, Endian, FieldDescriptor, Result, VarveDecode, VarveEncode};
 
@@ -7,7 +8,45 @@ pub trait VarveBlock: VarveEncode + VarveDecode {
     const VERSION: u16;
     const KIND: BlockKind;
     const ENDIAN: Option<Endian>;
+    /// Whether this block has a generated logical key.
+    ///
+    /// Generated blocks set this exactly. The scalable I/O feature makes the
+    /// fact mandatory for manual implementations so keyedness cannot silently
+    /// default to the chain-unsafe value.
+    #[cfg(feature = "high-cardinality-dev")]
+    const IS_KEYED: bool;
+    #[cfg(not(feature = "high-cardinality-dev"))]
+    const IS_KEYED: bool = false;
+    /// Process-local identity of this block's declared schema.
+    ///
+    /// `#[derive(VarveBlock)]` computes this deterministically (FNV-1a 64 over
+    /// the canonical schema: id, version, kind, endian, keyedness, and ordered
+    /// field name/type identities). Typed registration rejects two
+    /// implementations that claim the same block id with different
+    /// fingerprints, so a manual implementation cannot impersonate a
+    /// registered type by matching only id/version/kind. Manual
+    /// implementations mirroring a generated block should reuse that block's
+    /// const instead of inventing a value. This is deliberately not part of
+    /// the wire format or on-disk descriptors.
+    const SCHEMA_FINGERPRINT: u64;
     const FIELDS: &'static [FieldDescriptor] = &[];
+}
+
+/// Compile-time proof that a keyed implementation agrees with its declared
+/// [`VarveBlock::IS_KEYED`] value.
+///
+/// Keyed-only generic entry points evaluate [`KeyedBlockContract::OK`], which
+/// turns `impl VarveKeyedBlock` + `IS_KEYED = false` into a
+/// post-monomorphization compile error at every keyed use site instead of a
+/// silent index-consistency hazard.
+pub struct KeyedBlockContract<T: VarveKeyedBlock>(PhantomData<T>);
+
+impl<T: VarveKeyedBlock> KeyedBlockContract<T> {
+    pub const OK: () = assert!(
+        T::IS_KEYED,
+        "this type implements VarveKeyedBlock but declares VarveBlock::IS_KEYED = false; \
+         keyed blocks must declare IS_KEYED = true"
+    );
 }
 
 /// Opts a block into sequence-preserving copy-on-write replacement.

@@ -16,6 +16,7 @@ fn main() -> varve::Result<()> {
     generate_codec(&corpus)?;
     generate_layout(&corpus, &scratch)?;
     generate_matrix(&corpus, &scratch)?;
+    generate_sidecars(&corpus)?;
     fs::remove_dir_all(&scratch)?;
     Ok(())
 }
@@ -112,6 +113,66 @@ fn generate_matrix(corpus: &Path, scratch: &Path) -> varve::Result<()> {
     envelope.extend_from_slice(&matrix_bytes);
     envelope.extend_from_slice(&sidecar_bytes);
     fs::write(output.join("valid-matrix-envelope"), envelope)?;
+    Ok(())
+}
+
+fn generate_sidecars(corpus: &Path) -> varve::Result<()> {
+    let arbitrary = corpus.join("sidecar_arbitrary");
+    fs::create_dir_all(&arbitrary)?;
+    fs::write(arbitrary.join("empty"), [])?;
+    fs::write(arbitrary.join("redb-like-header"), b"redb\0\0\0\0")?;
+    fs::write(
+        arbitrary.join("bounded-page-pattern"),
+        (0..=255).cycle().take(16 * 1024).collect::<Vec<_>>(),
+    )?;
+
+    let mutation = corpus.join("sidecar_mutation");
+    fs::create_dir_all(&mutation)?;
+    fs::write(mutation.join("empty-synced-valid"), [0x80, 0])?;
+    fs::write(mutation.join("populated-unique-synced-valid"), [0x80, 1])?;
+    fs::write(mutation.join("repeated-delete-unsynced-valid"), [0x81, 7])?;
+    fs::write(
+        mutation.join("populated-multi-byte-mutation"),
+        [0x00, 13, 0, 0, 1, 0, 64, 0xA5, 1, 0, 0xFF],
+    )?;
+
+    let machine = corpus.join("sidecar_state_machine");
+    fs::create_dir_all(&machine)?;
+    fs::write(machine.join("empty"), [])?;
+    write_operations(
+        &machine.join("populated-unique-synced"),
+        &[
+            [0, 0, 1, 0],
+            [1, 1, 10, 4],
+            [1, 2, 20, 4],
+            [4, 3, 30, 0],
+            [5, 0, 0, 0],
+        ],
+    )?;
+    write_operations(
+        &machine.join("repeated-delete-multiple-batches-mixed"),
+        &[
+            [7, 0, 10, 7],
+            [8, 0, 20, 7],
+            [1, 3, 30, 8],
+            [1, 3, 31, 8],
+            [2, 3, 0, 0],
+            [3, 3, 0, 0],
+            [0, 0, 40, 0],
+            [4, 4, 50, 0],
+            [5, 0, 0, 0],
+        ],
+    )?;
+    write_operations(
+        &machine.join("populated-unsynced"),
+        &[[1, 1, 1, 8], [0, 0, 2, 0], [3, 0, 0, 0]],
+    )?;
+    Ok(())
+}
+
+fn write_operations(path: &Path, operations: &[[u8; 4]]) -> varve::Result<()> {
+    let bytes: Vec<_> = operations.iter().flatten().copied().collect();
+    fs::write(path, bytes)?;
     Ok(())
 }
 

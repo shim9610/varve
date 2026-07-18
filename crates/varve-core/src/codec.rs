@@ -70,6 +70,8 @@ pub trait VarveDecode: Sized {
 pub struct Encoder {
     endian: Endian,
     output: Vec<u8>,
+    max_len: Option<u64>,
+    overflow: Option<(u64, u64)>,
 }
 
 impl Encoder {
@@ -77,6 +79,17 @@ impl Encoder {
         Self {
             endian,
             output: Vec::new(),
+            max_len: None,
+            overflow: None,
+        }
+    }
+
+    pub(crate) fn new_limited(endian: Endian, max_len: u64) -> Self {
+        Self {
+            endian,
+            output: Vec::new(),
+            max_len: Some(max_len),
+            overflow: None,
         }
     }
 
@@ -88,39 +101,64 @@ impl Encoder {
         self.output
     }
 
+    pub(crate) fn try_into_inner(self, resource: &'static str) -> Result<Vec<u8>> {
+        if let Some((actual, limit)) = self.overflow {
+            return Err(Error::LimitExceeded {
+                resource,
+                actual,
+                limit,
+            });
+        }
+        Ok(self.output)
+    }
+
     pub fn write_all(&mut self, bytes: &[u8]) {
+        if self.max_len.is_none() {
+            self.output.extend_from_slice(bytes);
+            return;
+        }
+        if self.overflow.is_some() {
+            return;
+        }
+        let actual = (self.output.len() as u64).checked_add(bytes.len() as u64);
+        if let Some(limit) = self.max_len
+            && actual.is_none_or(|actual| actual > limit)
+        {
+            self.overflow = Some((actual.unwrap_or(u64::MAX), limit));
+            return;
+        }
         self.output.extend_from_slice(bytes);
     }
 
     pub fn write_u8(&mut self, value: u8) {
-        self.output.push(value);
+        self.write_all(&[value]);
     }
 
     pub fn write_u16(&mut self, value: u16) {
         match self.endian {
-            Endian::Little => self.output.extend_from_slice(&value.to_le_bytes()),
-            Endian::Big => self.output.extend_from_slice(&value.to_be_bytes()),
+            Endian::Little => self.write_all(&value.to_le_bytes()),
+            Endian::Big => self.write_all(&value.to_be_bytes()),
         }
     }
 
     pub fn write_u32(&mut self, value: u32) {
         match self.endian {
-            Endian::Little => self.output.extend_from_slice(&value.to_le_bytes()),
-            Endian::Big => self.output.extend_from_slice(&value.to_be_bytes()),
+            Endian::Little => self.write_all(&value.to_le_bytes()),
+            Endian::Big => self.write_all(&value.to_be_bytes()),
         }
     }
 
     pub fn write_u64(&mut self, value: u64) {
         match self.endian {
-            Endian::Little => self.output.extend_from_slice(&value.to_le_bytes()),
-            Endian::Big => self.output.extend_from_slice(&value.to_be_bytes()),
+            Endian::Little => self.write_all(&value.to_le_bytes()),
+            Endian::Big => self.write_all(&value.to_be_bytes()),
         }
     }
 
     pub fn write_u128(&mut self, value: u128) {
         match self.endian {
-            Endian::Little => self.output.extend_from_slice(&value.to_le_bytes()),
-            Endian::Big => self.output.extend_from_slice(&value.to_be_bytes()),
+            Endian::Little => self.write_all(&value.to_le_bytes()),
+            Endian::Big => self.write_all(&value.to_be_bytes()),
         }
     }
 }
@@ -399,6 +437,17 @@ pub fn encode_to_vec<T: VarveEncode>(value: &T, endian: Endian) -> Result<Vec<u8
     let mut encoder = Encoder::new(endian);
     value.encode_varve(&mut encoder)?;
     Ok(encoder.into_inner())
+}
+
+pub(crate) fn encode_to_vec_limited<T: VarveEncode>(
+    value: &T,
+    endian: Endian,
+    max_len: u64,
+    resource: &'static str,
+) -> Result<Vec<u8>> {
+    let mut encoder = Encoder::new_limited(endian, max_len);
+    value.encode_varve(&mut encoder)?;
+    encoder.try_into_inner(resource)
 }
 
 pub fn decode_from_slice<T: VarveDecode>(bytes: &[u8], endian: Endian) -> Result<T> {
@@ -902,3 +951,25 @@ macro_rules! tuple_codec {
 tuple_codec!(A, B);
 tuple_codec!(A, B, C);
 tuple_codec!(A, B, C, D);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limited_encoder_stops_before_the_over_limit_allocation() {
+        let mut encoder = Encoder::new_limited(Endian::Little, 8);
+        encoder.write_all(&[1; 8]);
+        encoder.write_all(&[2; 1024]);
+        encoder.write_all(&[3; 1024]);
+        assert_eq!(encoder.output.len(), 8);
+        assert!(matches!(
+            encoder.try_into_inner("test payload"),
+            Err(Error::LimitExceeded {
+                resource: "test payload",
+                actual: 1032,
+                limit: 8,
+            })
+        ));
+    }
+}

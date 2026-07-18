@@ -65,7 +65,16 @@ let report = MatrixFormat::self_test("matrix-check.varve")
     .run();
 ```
 
-Use a temporary path. Self-test creation truncates the target file.
+Use a temporary path. The self-test is non-destructive: it creates the target
+with exclusive create (`create_new` for append formats; a `create_new` claim
+before the matrix constructor, which would otherwise truncate) and never
+truncates or deletes a pre-existing file. A pre-existing path is reported as a
+failed step in the `CallerUsage` domain (message: "target path already exists;
+the self-test never truncates or deletes pre-existing files", backed by an
+`AlreadyExists` I/O error) — for append formats at the `create file` step, for
+matrix formats at the new `claim target path` step — before any modification.
+`cleanup(true)` only ever removes files the run itself created (the created
+native file and its `.lock`); it never deletes a caller file it did not create.
 
 ## Resource-Limit Failures
 

@@ -132,6 +132,8 @@ impl VarveBlock for SizeMismatchRawPoint {
     const VERSION: u16 = 1;
     const KIND: BlockKind = BlockKind::Fixed;
     const ENDIAN: Option<Endian> = None;
+    const SCHEMA_FINGERPRINT: u64 = 0xDE827495F17CC9D9;
+    const IS_KEYED: bool = false;
 }
 
 #[cfg(feature = "zero-copy")]

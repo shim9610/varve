@@ -12,6 +12,9 @@ finite fuzz campaign is evidence, not a proof that every input is safe.
 | `codec_arbitrary` | arbitrary bytes across scalar, collection, map, tuple, string, and zero-width codec paths |
 | `layout_arbitrary` | arbitrary custom-layout lead-ins, metadata/raw regions, reports, and recovery boundaries |
 | `matrix_arbitrary` | arbitrary matrix envelopes and sidecars; cell, aux, sidecar, and recovery reads |
+| `sidecar_arbitrary` | capped arbitrary `.vks` and `.vki` bytes paired with valid native files; public open, recovery, verification, and indexed lookup |
+| `sidecar_mutation` | capped mutations of native `.vks` and `.vki` companions across clean/dirty and empty/populated fixtures |
+| `sidecar_state_machine` | up to 64 modeled operations and 256 records across stream/indexed append, sync, recovery, tombstone, batch, and lookup paths |
 
 `fuzz/examples/generate_corpus.rs` creates deterministic valid seeds before a
 campaign. `fuzz/dictionaries/varve.dict` supplies native wire tokens. Generated
@@ -36,14 +39,17 @@ to `PATH`, enables fail-fast `ASAN_OPTIONS`, generates seeds, and places builds
 under the root ignored `target` directory:
 
 ```powershell
-.\scripts\run-security-fuzz.ps1 -Target all -Seconds 60 -Jobs 1
+.\scripts\run-security-fuzz.ps1 -Target all -Seconds 120 -Jobs 1
 ```
 
 Use one target while developing:
 
 ```powershell
 .\scripts\run-security-fuzz.ps1 -Target native_arbitrary -Seconds 300
+.\scripts\run-security-fuzz.ps1 -Target sidecar_state_machine -Seconds 120
 ```
+
+The runner clamps each `sidecar_*` campaign to at least 120 seconds.
 
 A nonzero exit or a file under `fuzz/artifacts` is a failed gate. Preserve and
 promote any reproducer to a deterministic regression before fixing it.
@@ -114,6 +120,21 @@ Validation date: 2026-07-11, Windows x86_64 MSVC.
 | final `matrix_arbitrary`, 16 seconds | 1,687 | pass |
 | strict Miri, three codec regressions | 3 tests | pass |
 | ASan `varve-core --all-features --lib` | 21 tests | pass |
+| `sidecar_arbitrary`, 120 seconds, 2026-07-18 | 1,723 | pass; 0 artifacts |
+| `sidecar_mutation`, 120 seconds, 2026-07-18 | 2,717 | pass; 0 artifacts |
+| `sidecar_state_machine`, 120 seconds, 2026-07-18 | 2,755 | pass; 0 artifacts |
+
+The 2026-07-18 scalable persistence matrix also reran every discovered
+before/after hook occurrence in an isolated subprocess. It covered create,
+multi-chunk append, clean publication, restore, stream bootstrap, disk-index
+rebuild, atomic replacement, and parent-directory synchronization in 67.37
+seconds with all boundary oracles passing. Environment variables are inert
+unless the child explicitly arms the test-only registry.
+
+The real sparse-offset probe passed at 1 TiB on NTFS with a 65,536-byte
+allocation and exact typed value/framing/CRC verification. The same host
+rejected the required 1 PiB positional write with Windows error 87; that gate
+is recorded as unsupported on this filesystem, not as a pass.
 
 The campaigns exposed one real compile-time macro hygiene defect: generated
 inline blocks referenced an associated constant through an unqualified trait.

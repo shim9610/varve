@@ -79,6 +79,8 @@ impl VarveBlock for MatrixCell {
     const VERSION: u16 = 1;
     const KIND: varve::BlockKind = varve::BlockKind::Matrix;
     const ENDIAN: Option<Endian> = None;
+    const SCHEMA_FINGERPRINT: u64 = 0x80696EFA53043EA2;
+    const IS_KEYED: bool = false;
 }
 
 impl varve::VarveMatrixBlock for MatrixCell {
@@ -170,6 +172,80 @@ fn matrix_self_test_roundtrips_committed_uncommitted_and_aux_paths() {
 
     assert!(report.passed(), "{report:#?}");
     cleanup(&path);
+}
+
+#[test]
+fn self_test_never_truncates_or_deletes_pre_existing_append_target() {
+    let path = temp_path("preexisting_append");
+    cleanup(&path);
+    let sentinel: &[u8] = b"caller data that must survive the self-test";
+    write(&path, sentinel).expect("write sentinel fixture");
+
+    let report = SelfCheckFormat::self_test(&path)
+        .with_block(Point { x: 1, y: 2 })
+        .cleanup(true)
+        .run();
+
+    assert!(!report.passed(), "{report:#?}");
+    let failure = report.failures().next().expect("expected a create failure");
+    assert_eq!(failure.name, "create file");
+    assert_eq!(failure.domain, Some(DiagnosticDomain::CallerUsage));
+    assert!(failure.message.contains("already exists"), "{failure:#?}");
+
+    let bytes =
+        std::fs::read(&path).expect("pre-existing file must still exist after cleanup(true)");
+    assert_eq!(bytes, sentinel, "pre-existing bytes must be untouched");
+    cleanup(&path);
+}
+
+#[test]
+fn self_test_never_truncates_or_deletes_pre_existing_matrix_target() {
+    let path = temp_path("preexisting_matrix");
+    cleanup(&path);
+    let sentinel: &[u8] = b"matrix caller data that must survive";
+    write(&path, sentinel).expect("write sentinel fixture");
+
+    let report = matrix_spec()
+        .self_test(&path)
+        .with_dims(MatrixDimensions::from_pairs([("scan", 2), ("ch", 2)]))
+        .with_matrix_cell(MatrixKey::new(0, 0), MatrixCell { value: 9 })
+        .cleanup(true)
+        .run();
+
+    assert!(!report.passed(), "{report:#?}");
+    let failure = report.failures().next().expect("expected a claim failure");
+    assert_eq!(failure.name, "claim target path");
+    assert_eq!(failure.domain, Some(DiagnosticDomain::CallerUsage));
+    assert!(failure.message.contains("already exists"), "{failure:#?}");
+
+    let bytes =
+        std::fs::read(&path).expect("pre-existing file must still exist after cleanup(true)");
+    assert_eq!(bytes, sentinel, "pre-existing bytes must be untouched");
+    cleanup(&path);
+}
+
+#[test]
+fn self_test_cleanup_removes_files_created_by_the_run() {
+    let path = temp_path("cleanup_owned");
+    cleanup(&path);
+
+    let report = SelfCheckFormat::self_test(&path)
+        .with_block(Point { x: 3, y: 4 })
+        .cleanup(true)
+        .run();
+
+    assert!(report.passed(), "{report:#?}");
+    assert!(
+        !path.exists(),
+        "cleanup(true) must remove the file this run created"
+    );
+
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".lock");
+    assert!(
+        !PathBuf::from(lock).exists(),
+        "cleanup(true) must remove the lock marker this run created"
+    );
 }
 
 #[test]

@@ -1,0 +1,5 @@
+error: expected memory or disk
+ --> tests/ui/fail_key_index_value.rs:8:59
+  |
+8 |             variable Item(id = 1, key = [id], key_index = cached) {
+  |                                                           ^^^^^^

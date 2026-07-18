@@ -1,0 +1,5 @@
+error: key_index is not supported on matrix blocks
+  --> tests/ui/fail_key_index_matrix.rs:20:17
+   |
+20 |                 key_index = disk,
+   |                 ^^^^^^^^^

@@ -3,6 +3,7 @@ members = [
     "crates/varve",
     "crates/varve-core",
     "crates/varve-macros",
+    "tools/varve-test-runner",
 ]
 resolver = "3"
 
@@ -15,7 +16,9 @@ version = "0.3.0"
 
 [workspace.dependencies]
 crc32fast = "1.5.0"
+libc = "0.2.186"
 memmap2 = "0.9.11"
+redb = "=4.1.0"
 proc-macro2 = "1.0.106"
 proptest = "1.11.0"
 quote = "1.0.46"

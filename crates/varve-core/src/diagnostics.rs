@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt::Debug;
-use std::fs::remove_file;
+use std::fs::{OpenOptions, remove_file};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::{
@@ -390,36 +391,59 @@ impl FormatSelfTest {
             return report;
         }
 
+        // API-01: the self-test must never truncate or delete a pre-existing
+        // caller file. The append path relies on the atomic exclusive-create
+        // constructor; the matrix path exclusively claims the target first
+        // because `create_with_dims` would otherwise truncate an existing
+        // file. Cleanup below only ever removes paths this run proved it
+        // created.
         let mut writer = if self.spec.has_matrix_blocks() {
-            match self.dims.clone() {
-                Some(dims) => record_result(
-                    &mut report,
+            let Some(dims) = self.dims.clone() else {
+                report.steps.push(SelfTestStepReport::failed(
                     "create matrix file",
-                    VarveFile::create_with_dims(self.spec, &self.path, dims),
-                ),
-                None => {
-                    report.steps.push(SelfTestStepReport::failed(
-                        "create matrix file",
-                        DiagnosticDomain::CallerUsage,
-                        "matrix dimensions were not supplied to the self-test",
-                        Some("call .with_dims(MatrixDimensions::from_pairs(...))".to_string()),
-                    ));
-                    return report;
-                }
+                    DiagnosticDomain::CallerUsage,
+                    "matrix dimensions were not supplied to the self-test",
+                    Some("call .with_dims(MatrixDimensions::from_pairs(...))".to_string()),
+                ));
+                return report;
+            };
+            if record_create_result(
+                &mut report,
+                "claim target path",
+                claim_fresh_path(&self.path),
+            )
+            .is_none()
+            {
+                // Nothing was created, so leave the filesystem untouched.
+                return report;
             }
+            let created = record_result(
+                &mut report,
+                "create matrix file",
+                VarveFile::create_with_dims(self.spec, &self.path, dims),
+            );
+            let Some(writer) = created else {
+                // The claim above proved this run created the (empty) target,
+                // so cleanup may remove the native path — but never the
+                // writer-lock marker, which a concurrent writer may own.
+                if self.cleanup {
+                    let _ = remove_file(&self.path);
+                }
+                return report;
+            };
+            writer
         } else {
-            record_result(
+            let created = record_create_result(
                 &mut report,
                 "create file",
-                VarveFile::create(self.spec, &self.path),
-            )
-        };
-
-        let Some(mut writer) = writer.take() else {
-            if self.cleanup {
-                cleanup_path(&self.path);
-            }
-            return report;
+                VarveFile::create_new(self.spec, &self.path),
+            );
+            let Some(writer) = created else {
+                // Creation failed without proving ownership of the path, so
+                // leave the filesystem untouched.
+                return report;
+            };
+            writer
         };
 
         let mut write_failed = false;
@@ -729,6 +753,8 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         Error::UnregisteredBlock(_)
         | Error::BlockVersionMismatch { .. }
         | Error::BlockKindMismatch { .. }
+        | Error::BlockSchemaFingerprintMismatch { .. }
+        | Error::BlockKeyednessMismatch { .. }
         | Error::SchemaHashMismatch { .. }
         | Error::FormatVersionMismatch { .. }
         | Error::EndianMismatch { .. }
@@ -764,6 +790,17 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::ZeroCopyPayloadSizeMismatch { .. }
         | Error::ZeroCopyAlignmentMismatch { .. } => DiagnosticDomain::CallerUsage,
 
+        #[cfg(feature = "high-cardinality-dev")]
+        Error::StreamingUnsupported => DiagnosticDomain::FeatureGate,
+
+        #[cfg(feature = "high-cardinality-dev")]
+        Error::InvalidBatchOptions { .. } | Error::ScanCancelled { .. } => {
+            DiagnosticDomain::CallerUsage
+        }
+
+        #[cfg(feature = "high-cardinality-dev")]
+        Error::IndexBusy => DiagnosticDomain::Environment,
+
         Error::IntegrityFeatureDisabled | Error::CompressionFeatureDisabled => {
             DiagnosticDomain::FeatureGate
         }
@@ -774,7 +811,11 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::WriterLockMalformed(_)
         | Error::WriterPoisoned(_)
         | Error::WriteRollbackFailed { .. }
-        | Error::PublishedButRebindFailed { .. } => DiagnosticDomain::Environment,
+        | Error::PublishedButRebindFailed { .. }
+        | Error::PublishedButParentSyncPending { .. } => DiagnosticDomain::Environment,
+
+        #[cfg(feature = "high-cardinality-dev")]
+        Error::PublishedButIndexStale { .. } => DiagnosticDomain::Environment,
 
         Error::InvalidMagic
         | Error::UnsupportedContainer
@@ -810,6 +851,7 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::MatrixSidecarChecksumMismatch { .. }
         | Error::MatrixChecksumMismatch { .. }
         | Error::MatrixCommitQuarantined(_)
+        | Error::MatrixFatalCorruption
         | Error::InvalidMatrixLayout
         | Error::LayoutLiteralMismatch { .. }
         | Error::LayoutAmbiguousSegment { .. }
@@ -820,6 +862,9 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::AdapterBounds { .. }
         | Error::AdapterUnsupportedType { .. }
         | Error::AdapterInvalidLength { .. } => DiagnosticDomain::FileData,
+
+        #[cfg(feature = "high-cardinality-dev")]
+        Error::DiskIndex(_) => DiagnosticDomain::FileData,
 
         Error::WriterLockBreakRefused(_) => DiagnosticDomain::CallerUsage,
         Error::MatrixLayoutMissing => DiagnosticDomain::LibraryInvariant,
@@ -862,6 +907,42 @@ fn uses_zstd_compression(spec: FormatSpec) -> bool {
         .iter()
         .any(|descriptor| descriptor.compression.algorithm == crate::CompressionAlgorithm::Zstd);
     global || block
+}
+
+/// Exclusively creates an empty file at `path` so the self-test run proves it
+/// owns the target before any truncating constructor touches it. Fails with
+/// [`Error::Io`] of kind [`ErrorKind::AlreadyExists`] without modifying a
+/// pre-existing caller file.
+fn claim_fresh_path(path: &Path) -> Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map(drop)
+        .map_err(Error::Io)
+}
+
+/// Like [`record_result`], but reports an already-existing target path as a
+/// caller-usage failure with a hint instead of a generic environment error.
+fn record_create_result<T>(
+    report: &mut FormatSelfTestReport,
+    name: impl Into<String>,
+    result: Result<T>,
+) -> Option<T> {
+    match result {
+        Err(Error::Io(error)) if error.kind() == ErrorKind::AlreadyExists => {
+            report.steps.push(SelfTestStepReport::failed(
+                name,
+                DiagnosticDomain::CallerUsage,
+                format!(
+                    "target path already exists; the self-test never truncates or deletes pre-existing files: {error}"
+                ),
+                Some("pass a fresh temporary path that does not exist yet".to_string()),
+            ));
+            None
+        }
+        other => record_result(report, name, other),
+    }
 }
 
 fn record_result<T>(

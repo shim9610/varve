@@ -3,6 +3,11 @@ use std::fs::{OpenOptions, remove_file};
 use std::io::Write;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{
+    Arc, Barrier,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use varve::{
@@ -241,6 +246,12 @@ varve_format! {
         blocks: [ContractBlock];
     }
 }
+
+/// Mirrors the private `INDEX_CHECKPOINT_MIN_RECORDS` floor in varve-core's
+/// `file.rs`. PERF-02 geometric checkpoint spacing writes the first full index
+/// checkpoint only once the live tail has grown by at least this many records,
+/// so checkpoint-mechanism tests must push at least this many blocks.
+const CHECKPOINT_MIN_RECORDS: u32 = 16;
 
 #[test]
 fn header_contract_rejects_version_endian_and_schema_mismatch() -> varve::Result<()> {
@@ -490,7 +501,11 @@ fn metadata_and_checkpoint_are_written_as_internal_blocks() -> varve::Result<()>
         let mut file = CheckpointFormat::create(&path)?;
         file.write_metadata("creator", b"varve")?;
         file.write_metadata("creator", b"varve-2")?;
-        file.push(&ContractBlock { value: 11 })?;
+        // Geometric checkpoint spacing (PERF-02) writes the first full checkpoint
+        // only once the tail grows past INDEX_CHECKPOINT_MIN_RECORDS (16) records.
+        for value in 0..CHECKPOINT_MIN_RECORDS {
+            file.push(&ContractBlock { value })?;
+        }
         file.flush()?;
     }
 
@@ -626,19 +641,32 @@ fn checkpoint_open_uses_latest_checkpoint_and_scans_tail() -> varve::Result<()> 
     let path = temp_path("checkpoint_tail");
     cleanup(&path);
 
+    // Push enough records to force a full checkpoint on flush (PERF-02 geometric
+    // spacing), then append a few more before sync so the reopen must both use
+    // the checkpoint and scan the tail that follows it.
+    let checkpointed = CHECKPOINT_MIN_RECORDS;
+    let tail = 3u32;
+    let total = checkpointed + tail;
     {
         let mut file = CheckpointFormat::create(&path)?;
-        file.push(&ContractBlock { value: 1 })?;
+        for value in 0..checkpointed {
+            file.push(&ContractBlock { value })?;
+        }
         file.flush()?;
-        file.push(&ContractBlock { value: 2 })?;
+        for value in checkpointed..total {
+            file.push(&ContractBlock { value })?;
+        }
         file.sync()?;
     }
 
     let file = CheckpointFormat::open_readonly(&path)?;
     let blocks = file.blocks::<ContractBlock>()?;
-    assert_eq!(blocks.len(), 2);
-    assert_eq!(blocks.get(0)?, Some(ContractBlock { value: 1 }));
-    assert_eq!(blocks.get(1)?, Some(ContractBlock { value: 2 }));
+    assert_eq!(blocks.len(), total as usize);
+    assert_eq!(blocks.get(0)?, Some(ContractBlock { value: 0 }));
+    assert_eq!(
+        blocks.get(total as usize - 1)?,
+        Some(ContractBlock { value: total - 1 })
+    );
     assert!(
         file.index_entries()
             .iter()
@@ -654,9 +682,15 @@ fn corrupt_checkpoint_falls_back_to_full_scan_without_hiding_data() -> varve::Re
     let path = temp_path("checkpoint_corrupt");
     cleanup(&path);
 
+    // Push enough records to force a full checkpoint on flush (PERF-02), then
+    // corrupt it: the reopen must fall back to a full native scan and still
+    // surface every record.
+    let record_count = CHECKPOINT_MIN_RECORDS;
     let checkpoint_payload_offset = {
         let mut file = CheckpointFormat::create(&path)?;
-        file.push(&ContractBlock { value: 7 })?;
+        for value in 0..record_count {
+            file.push(&ContractBlock { value })?;
+        }
         file.flush()?;
         file.index_entries()
             .iter()
@@ -667,10 +701,11 @@ fn corrupt_checkpoint_falls_back_to_full_scan_without_hiding_data() -> varve::Re
 
     tamper_byte(&path, checkpoint_payload_offset)?;
     let file = CheckpointFormat::open_readonly(&path)?;
-    assert_eq!(
-        file.blocks::<ContractBlock>()?.get(0)?,
-        Some(ContractBlock { value: 7 })
-    );
+    let blocks = file.blocks::<ContractBlock>()?;
+    assert_eq!(blocks.len(), record_count as usize);
+    for value in 0..record_count {
+        assert_eq!(blocks.get(value as usize)?, Some(ContractBlock { value }));
+    }
 
     cleanup(&path);
     Ok(())
@@ -939,6 +974,13 @@ fn writer_lock_metadata_is_inspectable_and_default_open_refuses() -> varve::Resu
         ContractFormat::spec().open_with_lock_policy(&path, WriterLockBreakPolicy::Refuse),
         Err(Error::WriterLockHeld(_))
     ));
+    assert!(matches!(
+        ContractFormat::spec().open_with_lock_policy(
+            &path,
+            WriterLockBreakPolicy::BreakIfOlderThan(Duration::ZERO)
+        ),
+        Err(Error::WriterLockBreakRefused(_))
+    ));
 
     drop(file);
     assert_eq!(ContractFormat::spec().inspect_writer_lock(&path)?, None);
@@ -982,6 +1024,93 @@ fn explicit_age_based_lock_break_is_opt_in() -> varve::Result<()> {
             .expect("replacement writer lock");
         assert_eq!(info.process_id, std::process::id());
     }
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn stale_lock_can_be_cleared_without_opening_the_data_file() -> varve::Result<()> {
+    let path = temp_path("writer_lock_clear_without_open");
+    cleanup(&path);
+
+    {
+        let mut file = ContractFormat::create(&path)?;
+        file.push(&ContractBlock { value: 144 })?;
+        file.flush()?;
+    }
+
+    write_test_lock(&path, std::process::id(), current_unix_time_ms())?;
+    assert!(matches!(
+        ContractFormat::clear_stale_writer_lock(&path, WriterLockBreakPolicy::BreakIfProcessAbsent),
+        Err(Error::WriterLockBreakRefused(_))
+    ));
+    assert!(writer_lock_path(&path).exists());
+
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--list")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let exited_process = child.id();
+    assert!(child.wait()?.success());
+    write_test_lock(&path, exited_process, current_unix_time_ms())?;
+    ContractFormat::clear_stale_writer_lock(&path, WriterLockBreakPolicy::BreakIfProcessAbsent)?;
+    drop(child);
+    assert_eq!(ContractFormat::spec().inspect_writer_lock(&path)?, None);
+    assert_eq!(
+        ContractFormat::open_readonly(&path)?
+            .blocks::<ContractBlock>()?
+            .get(0)?,
+        Some(ContractBlock { value: 144 })
+    );
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn concurrent_stale_lock_recovery_allows_exactly_one_writer() -> varve::Result<()> {
+    const WORKERS: usize = 16;
+
+    let path = temp_path("writer_lock_concurrent_recovery");
+    cleanup(&path);
+    drop(ContractFormat::create(&path)?);
+    write_test_lock(&path, 0, 0)?;
+
+    let start = Arc::new(Barrier::new(WORKERS + 1));
+    let finish = Arc::new(Barrier::new(WORKERS + 1));
+    let successes = Arc::new(AtomicUsize::new(0));
+    let mut workers = Vec::with_capacity(WORKERS);
+    for _ in 0..WORKERS {
+        let path = path.clone();
+        let start = Arc::clone(&start);
+        let finish = Arc::clone(&finish);
+        let successes = Arc::clone(&successes);
+        workers.push(std::thread::spawn(move || {
+            start.wait();
+            let writer = ContractFormat::spec().open_with_lock_policy(
+                &path,
+                WriterLockBreakPolicy::BreakIfOlderThan(Duration::ZERO),
+            );
+            match &writer {
+                Ok(_) => {
+                    successes.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(error) => assert!(matches!(error, Error::WriterLockBreakRefused(_))),
+            }
+            finish.wait();
+            drop(writer);
+        }));
+    }
+
+    start.wait();
+    finish.wait();
+    for worker in workers {
+        worker.join().expect("lock recovery worker");
+    }
+    assert_eq!(successes.load(Ordering::SeqCst), 1);
+    assert_eq!(ContractFormat::spec().inspect_writer_lock(&path)?, None);
 
     cleanup(&path);
     Ok(())

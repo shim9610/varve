@@ -34,9 +34,12 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
     }
     let mut block_id = None;
     let mut version = quote!(1u16);
+    let mut version_value: u16 = 1;
     let mut kind = quote!(::varve::__core::BlockKind::Fixed);
+    let mut kind_name = "fixed";
     let mut variable_block = false;
     let mut endian = quote!(::core::option::Option::None);
+    let mut endian_name = "default";
     let mut key_fields: Vec<Ident> = Vec::new();
 
     for attr in &input.attrs {
@@ -52,20 +55,24 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
                 let value: LitInt = meta.value()?.parse()?;
                 let parsed = value.base10_parse::<u16>()?;
                 version = quote!(#parsed);
+                version_value = parsed;
                 Ok(())
             } else if meta.path.is_ident("kind") {
                 let value: LitStr = meta.value()?.parse()?;
                 kind = match value.value().as_str() {
                     "fixed" => {
                         variable_block = false;
+                        kind_name = "fixed";
                         quote!(::varve::__core::BlockKind::Fixed)
                     }
                     "matrix" => {
                         variable_block = false;
+                        kind_name = "matrix";
                         quote!(::varve::__core::BlockKind::Matrix)
                     }
                     "variable" => {
                         variable_block = true;
+                        kind_name = "variable";
                         quote!(::varve::__core::BlockKind::Variable)
                     }
                     other => {
@@ -78,8 +85,14 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
             } else if meta.path.is_ident("endian") {
                 let value: LitStr = meta.value()?.parse()?;
                 endian = match value.value().as_str() {
-                    "little" => quote!(::core::option::Option::Some(::varve::__core::Endian::Little)),
-                    "big" => quote!(::core::option::Option::Some(::varve::__core::Endian::Big)),
+                    "little" => {
+                        endian_name = "little";
+                        quote!(::core::option::Option::Some(::varve::__core::Endian::Little))
+                    }
+                    "big" => {
+                        endian_name = "big";
+                        quote!(::core::option::Option::Some(::varve::__core::Endian::Big))
+                    }
                     other => {
                         return Err(meta.error(format!(
                             "unsupported endian {other:?}; use \"little\" or \"big\""
@@ -335,6 +348,15 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
             }
         }
     };
+    let is_keyed = !key_fields.is_empty();
+    let schema_fingerprint = schema_fingerprint(
+        block_id,
+        version_value,
+        kind_name,
+        endian_name,
+        is_keyed,
+        &descriptors,
+    );
     let replace_impl = if key_fields.is_empty() {
         quote! {
             impl ::varve::__core::VarveReplaceBlock for #ident {
@@ -388,6 +410,8 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
             const VERSION: u16 = #version;
             const KIND: ::varve::__core::BlockKind = #kind;
             const ENDIAN: ::core::option::Option<::varve::__core::Endian> = #endian;
+            const IS_KEYED: bool = #is_keyed;
+            const SCHEMA_FINGERPRINT: u64 = #schema_fingerprint;
             const FIELDS: &'static [::varve::__core::FieldDescriptor] = &[
                 #(#field_descriptors,)*
             ];
@@ -400,6 +424,51 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
 
 fn option_ident(name: &Ident) -> Ident {
     format_ident!("__varve_field_{}", name)
+}
+
+/// Deterministic fingerprint of the canonical block schema, computed at
+/// macro-expansion time.
+///
+/// FNV-1a 64 over a canonical string is implemented inline because the
+/// standard `DefaultHasher` output is not stability-guaranteed. The value is a
+/// process-local schema identity, never part of the wire format.
+fn schema_fingerprint(
+    block_id: u32,
+    version: u16,
+    kind: &str,
+    endian: &str,
+    keyed: bool,
+    fields: &[FieldDescriptor],
+) -> u64 {
+    let mut canonical = format!(
+        "varve:block-schema:v1|id={block_id}|version={version}|kind={kind}|endian={endian}|keyed={keyed}"
+    );
+    for field in fields {
+        let name = &field.name;
+        let ty = &field.ty;
+        let type_identity = quote!(#ty).to_string();
+        let field_id = field.field_id;
+        let presence = if field.default {
+            "defaulted"
+        } else {
+            "required"
+        };
+        canonical.push_str(&format!(
+            "|field:id={field_id},name={name},type={type_identity},presence={presence}"
+        ));
+    }
+    fnv1a_64(canonical.as_bytes())
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 fn parse_key_fields(value: &LitStr) -> Result<Vec<Ident>> {
@@ -656,12 +725,19 @@ enum InlineBlockKind {
     Matrix(MatrixBlockMeta),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyIndexChoice {
+    Memory,
+    Disk,
+}
+
 struct InlineBlock {
     kind: InlineBlockKind,
     name: Ident,
     id: u32,
     version: u16,
     key_fields: Vec<Ident>,
+    key_index: KeyIndexChoice,
     fields: Vec<InlineField>,
 }
 
@@ -1424,6 +1500,8 @@ fn parse_inline_block(input: ParseStream<'_>) -> Result<InlineBlock> {
     let mut id = None;
     let mut version = 1u16;
     let mut key_fields = Vec::new();
+    let mut key_index = KeyIndexChoice::Memory;
+    let mut key_index_span = None;
     while !meta.is_empty() {
         let key: Ident = meta.parse()?;
         meta.parse::<Token![=]>()?;
@@ -1445,6 +1523,20 @@ fn parse_inline_block(input: ParseStream<'_>) -> Result<InlineBlock> {
                 }
                 key_fields = parsed.into_iter().collect();
             }
+            "key_index" => {
+                if key_index_span.is_some() {
+                    return Err(syn::Error::new_spanned(key, "duplicate key_index"));
+                }
+                let value: Ident = meta.parse()?;
+                key_index = match value.to_string().as_str() {
+                    "memory" => KeyIndexChoice::Memory,
+                    "disk" => KeyIndexChoice::Disk,
+                    _ => {
+                        return Err(syn::Error::new_spanned(value, "expected memory or disk"));
+                    }
+                };
+                key_index_span = Some(key.span());
+            }
             "dims" => {
                 let inner;
                 bracketed!(inner in meta);
@@ -1460,7 +1552,7 @@ fn parse_inline_block(input: ParseStream<'_>) -> Result<InlineBlock> {
             _ => {
                 return Err(syn::Error::new_spanned(
                     key,
-                    "expected id, version, key, dims, or category",
+                    "expected id, version, key, key_index, dims, or category",
                 ));
             }
         }
@@ -1469,6 +1561,12 @@ fn parse_inline_block(input: ParseStream<'_>) -> Result<InlineBlock> {
         }
     }
     let kind = if matches!(&kind, InlineBlockKind::Matrix(_)) {
+        if let Some(span) = key_index_span {
+            return Err(syn::Error::new(
+                span,
+                "key_index is not supported on matrix blocks",
+            ));
+        }
         if !key_fields.is_empty() {
             return Err(syn::Error::new_spanned(
                 &name,
@@ -1495,6 +1593,20 @@ fn parse_inline_block(input: ParseStream<'_>) -> Result<InlineBlock> {
         }
         kind
     };
+    if let Some(span) = key_index_span {
+        if key_fields.is_empty() {
+            return Err(syn::Error::new(
+                span,
+                "key_index requires a keyed fixed or variable block",
+            ));
+        }
+        if !cfg!(feature = "high-cardinality-dev") {
+            return Err(syn::Error::new(
+                span,
+                "key_index requires the `high-cardinality-dev` feature",
+            ));
+        }
+    }
     let body;
     braced!(body in input);
     let mut fields = Vec::new();
@@ -1562,6 +1674,7 @@ fn parse_inline_block(input: ParseStream<'_>) -> Result<InlineBlock> {
         id,
         version,
         key_fields,
+        key_index,
         fields,
     })
 }
@@ -1889,6 +2002,7 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
         EndianChoice::Little => quote!(::varve::__core::Endian::Little),
         EndianChoice::Big => quote!(::varve::__core::Endian::Big),
     };
+    let keyed_offset_chain = input.index.keyed_offset_chain;
     let index = index_tokens(input.index);
     let commit = commit_tokens(input.commit);
     let integrity = match input.integrity {
@@ -1959,6 +2073,12 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     } else {
         quote!()
     };
+    let (high_cardinality_constructors, high_cardinality_api) =
+        if typed_api_enabled && cfg!(feature = "high-cardinality-dev") {
+            high_cardinality_api_tokens(&name, &inline_blocks, keyed_offset_chain)
+        } else {
+            (quote!(), quote!())
+        };
     let layout_typed_api = if typed_api_enabled && !layout_segments.is_empty() {
         layout_typed_api_tokens(&name, layout_file_header.as_ref(), &layout_segments)
     } else {
@@ -2271,6 +2391,13 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 #schema_hash_step
             }
 
+            pub fn clear_stale_writer_lock<P: AsRef<::std::path::Path>>(
+                path: P,
+                policy: ::varve::__core::WriterLockBreakPolicy,
+            ) -> ::varve::__core::Result<()> {
+                Self::spec().clear_stale_writer_lock(path, policy)
+            }
+
             pub fn create<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<::varve::__core::VarveFile> {
                 Self::spec().create(path)
             }
@@ -2495,6 +2622,8 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 #open_reader_trusted_body
             }
 
+            #high_cardinality_constructors
+
             pub fn open_layout_reader<P: AsRef<::std::path::Path>>(path: P) -> ::varve::__core::Result<#layout_reader_return> {
                 #open_layout_reader_body
             }
@@ -2686,6 +2815,7 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
 
         #(#duplicate_asserts)*
         #typed_api
+        #high_cardinality_api
         #layout_typed_api
     }
 }
@@ -3846,6 +3976,515 @@ fn layout_value_conversion_tokens(
     }
 }
 
+fn high_cardinality_api_tokens(
+    format_name: &Ident,
+    blocks: &[InlineBlock],
+    keyed_offset_chain: bool,
+) -> (TokenStream2, TokenStream2) {
+    let stream_reader_name = format_ident!("{}StreamReader", format_name);
+    let stream_writer_name = format_ident!("{}StreamWriter", format_name);
+    let indexed_reader_name = format_ident!("{}IndexedReader", format_name);
+    let indexed_writer_name = format_ident!("{}IndexedWriter", format_name);
+    let append_blocks: Vec<_> = blocks
+        .iter()
+        .filter(|block| !matches!(&block.kind, InlineBlockKind::Matrix(_)))
+        .collect();
+    let mut disk_blocks: Vec<_> = append_blocks
+        .iter()
+        .copied()
+        .filter(|block| block.key_index == KeyIndexChoice::Disk)
+        .collect();
+    disk_blocks.sort_by_key(|block| block.id);
+
+    let stream_reader_methods = append_blocks.iter().map(|block| {
+        let ty = &block.name;
+        let plural = plural_method_ident(ty);
+        quote! {
+            pub fn #plural(
+                &self,
+            ) -> ::varve::__core::Result<::varve::__core::StreamingBlocks<#ty>> {
+                self.inner.blocks::<#ty>()
+            }
+        }
+    });
+    let stream_writer_methods = append_blocks.iter().flat_map(|block| {
+        if keyed_offset_chain && !block.key_fields.is_empty() {
+            return Vec::new();
+        }
+        let ty = &block.name;
+        let push = format_ident!("push_{}", singular_method_name(ty));
+        let push_many = format_ident!("push_{}", plural_method_name(ty));
+        let mut methods = vec![
+            quote! {
+                pub fn #push(
+                    &mut self,
+                    value: &#ty,
+                ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
+                    self.inner.push_info(value)
+                }
+            },
+            quote! {
+                pub fn #push_many<I>(
+                    &mut self,
+                    values: I,
+                    options: ::varve::__core::BatchOptions,
+                ) -> ::core::result::Result<
+                    ::varve::__core::BatchAppendInfo,
+                    ::varve::__core::BatchAppendError,
+                >
+                where
+                    I: ::core::iter::IntoIterator,
+                    I::Item: ::core::borrow::Borrow<#ty>,
+                {
+                    self.inner.push_iter::<#ty, _>(values, options)
+                }
+            },
+        ];
+        if !block.key_fields.is_empty() {
+            let delete = format_ident!("delete_{}", singular_method_name(ty));
+            methods.push(quote! {
+                pub fn #delete(
+                    &mut self,
+                    key: &<#ty as ::varve::__core::VarveKeyedBlock>::Key,
+                ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
+                    self.inner.delete_with_prev_key_info::<#ty>(
+                        key,
+                        ::core::option::Option::None,
+                    )
+                }
+            });
+        }
+        methods
+    });
+
+    let stream_constructors = quote! {
+        pub fn open_stream_reader<P: AsRef<::std::path::Path>>(
+            path: P,
+            options: ::varve::__core::StreamOptions,
+        ) -> ::varve::__core::Result<#stream_reader_name> {
+            ::core::result::Result::Ok(#stream_reader_name::from_inner(
+                ::varve::__core::VarveStreamReader::open(Self::spec(), path, options)?,
+            ))
+        }
+
+        pub fn create_stream_writer<P: AsRef<::std::path::Path>>(
+            path: P,
+            options: ::varve::__core::StreamOptions,
+        ) -> ::varve::__core::Result<#stream_writer_name> {
+            ::core::result::Result::Ok(#stream_writer_name::from_inner(
+                ::varve::__core::VarveStreamWriter::create(Self::spec(), path, options)?,
+            ))
+        }
+
+        pub fn open_stream_writer<P: AsRef<::std::path::Path>>(
+            path: P,
+            options: ::varve::__core::StreamOptions,
+        ) -> ::varve::__core::Result<#stream_writer_name> {
+            ::core::result::Result::Ok(#stream_writer_name::from_inner(
+                ::varve::__core::VarveStreamWriter::open(Self::spec(), path, options)?,
+            ))
+        }
+
+        pub fn restore_stream_writer<P: AsRef<::std::path::Path>>(
+            path: P,
+            options: ::varve::__core::StreamOptions,
+        ) -> ::varve::__core::Result<#stream_writer_name> {
+            ::core::result::Result::Ok(#stream_writer_name::from_inner(
+                ::varve::__core::VarveStreamWriter::restore_checkpoint_and_open(
+                    Self::spec(),
+                    path,
+                    options,
+                )?,
+            ))
+        }
+
+        pub fn bootstrap_stream_checkpoint<P: AsRef<::std::path::Path>>(
+            path: P,
+            options: ::varve::__core::StreamOptions,
+        ) -> ::varve::__core::Result<::varve::__core::StreamBootstrapReport> {
+            ::varve::__core::bootstrap_stream_checkpoint(Self::spec(), path, options)
+        }
+
+        pub fn bootstrap_stream_checkpoint_with_progress<P, F>(
+            path: P,
+            options: ::varve::__core::StreamOptions,
+            scan: ::varve::__core::ScanOptions<'_>,
+            observer: F,
+        ) -> ::varve::__core::Result<::varve::__core::StreamBootstrapReport>
+        where
+            P: AsRef<::std::path::Path>,
+            F: ::core::ops::FnMut(::varve::__core::ScanProgress),
+        {
+            ::varve::__core::bootstrap_stream_checkpoint_with_progress(
+                Self::spec(), path, options, scan, observer,
+            )
+        }
+    };
+    let stream_api = quote! {
+        pub struct #stream_reader_name {
+            inner: ::varve::__core::VarveStreamReader,
+        }
+
+        impl #stream_reader_name {
+            pub fn from_inner(inner: ::varve::__core::VarveStreamReader) -> Self {
+                Self { inner }
+            }
+
+            pub fn into_inner(self) -> ::varve::__core::VarveStreamReader {
+                self.inner
+            }
+
+            pub fn events(&self) -> ::varve::__core::Result<::varve::__core::StreamEvents> {
+                self.inner.events()
+            }
+
+            pub fn verify_all(&self) -> ::varve::__core::Result<u64> {
+                self.inner.verify_all()
+            }
+
+            pub fn verify_all_with_progress<F>(
+                &self,
+                scan: ::varve::__core::ScanOptions<'_>,
+                observer: F,
+            ) -> ::varve::__core::Result<u64>
+            where
+                F: ::core::ops::FnMut(::varve::__core::ScanProgress),
+            {
+                self.inner.verify_all_with_progress(scan, observer)
+            }
+
+            pub fn resident_state(&self) -> ::varve::__core::StreamResidentState {
+                self.inner.resident_state()
+            }
+
+            #(#stream_reader_methods)*
+        }
+
+        pub struct #stream_writer_name {
+            inner: ::varve::__core::VarveStreamWriter,
+        }
+
+        impl #stream_writer_name {
+            pub fn from_inner(inner: ::varve::__core::VarveStreamWriter) -> Self {
+                Self { inner }
+            }
+
+            pub fn into_inner(self) -> ::varve::__core::VarveStreamWriter {
+                self.inner
+            }
+
+            pub fn flush(&mut self) -> ::varve::__core::Result<()> {
+                self.inner.flush()
+            }
+
+            pub fn sync(&mut self) -> ::varve::__core::Result<()> {
+                self.inner.sync()
+            }
+
+            pub fn resident_state(&self) -> ::varve::__core::StreamResidentState {
+                self.inner.resident_state()
+            }
+
+            #(#stream_writer_methods)*
+        }
+    };
+
+    if disk_blocks.is_empty() {
+        return (stream_constructors, stream_api);
+    }
+
+    let indexed_reader_methods = disk_blocks.iter().map(|block| {
+        let ty = &block.name;
+        let get = format_ident!("get_{}", singular_method_name(ty));
+        quote! {
+            pub fn #get(
+                &self,
+                key: &<#ty as ::varve::__core::VarveKeyedBlock>::Key,
+            ) -> ::varve::__core::Result<::core::option::Option<#ty>> {
+                self.inner.get::<#ty>(key)
+            }
+        }
+    });
+    let indexed_scan_methods = append_blocks.iter().map(|block| {
+        let ty = &block.name;
+        let plural = plural_method_ident(ty);
+        quote! {
+            pub fn #plural(
+                &self,
+            ) -> ::varve::__core::Result<::varve::__core::StreamingBlocks<#ty>> {
+                self.inner.blocks::<#ty>()
+            }
+        }
+    });
+    let indexed_writer_methods = append_blocks.iter().flat_map(|block| {
+        if keyed_offset_chain
+            && !block.key_fields.is_empty()
+            && block.key_index != KeyIndexChoice::Disk
+        {
+            return Vec::new();
+        }
+        let ty = &block.name;
+        let push = format_ident!("push_{}", singular_method_name(ty));
+        let push_many = format_ident!("push_{}", plural_method_name(ty));
+        let mut methods = if block.key_index == KeyIndexChoice::Disk {
+            vec![
+                quote! {
+                    pub fn #push(
+                        &mut self,
+                        value: &#ty,
+                    ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
+                        self.inner.push_info(value)
+                    }
+                },
+                quote! {
+                    pub fn #push_many<I>(
+                        &mut self,
+                        values: I,
+                        options: ::varve::__core::BatchOptions,
+                    ) -> ::core::result::Result<
+                        ::varve::__core::BatchAppendInfo,
+                        ::varve::__core::BatchAppendError,
+                    >
+                    where
+                        I: ::core::iter::IntoIterator,
+                        I::Item: ::core::borrow::Borrow<#ty>,
+                    {
+                        self.inner.push_iter::<#ty, _>(values, options)
+                    }
+                },
+            ]
+        } else {
+            vec![
+                quote! {
+                    pub fn #push(
+                        &mut self,
+                        value: &#ty,
+                    ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
+                        self.inner.push_unindexed_info(value)
+                    }
+                },
+                quote! {
+                    pub fn #push_many<I>(
+                        &mut self,
+                        values: I,
+                        options: ::varve::__core::BatchOptions,
+                    ) -> ::core::result::Result<
+                        ::varve::__core::BatchAppendInfo,
+                        ::varve::__core::BatchAppendError,
+                    >
+                    where
+                        I: ::core::iter::IntoIterator,
+                        I::Item: ::core::borrow::Borrow<#ty>,
+                    {
+                        self.inner
+                            .push_unindexed_iter::<#ty, _>(values, options)
+                    }
+                },
+            ]
+        };
+        if !block.key_fields.is_empty() {
+            let delete = format_ident!("delete_{}", singular_method_name(ty));
+            methods.push(if block.key_index == KeyIndexChoice::Disk {
+                quote! {
+                    pub fn #delete(
+                        &mut self,
+                        key: &<#ty as ::varve::__core::VarveKeyedBlock>::Key,
+                    ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
+                        self.inner.delete_info::<#ty>(key)
+                    }
+                }
+            } else {
+                quote! {
+                pub fn #delete(
+                    &mut self,
+                    key: &<#ty as ::varve::__core::VarveKeyedBlock>::Key,
+                ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
+                    self.inner.delete_unindexed_info::<#ty>(key)
+                }
+                }
+            });
+        }
+        methods
+    });
+    let indexed_block_descriptors = disk_blocks.iter().map(|block| {
+        let ty = &block.name;
+        quote!(::varve::__core::DiskIndexedBlock::of::<#ty>())
+    });
+    let indexed_block_descriptors: Vec<_> = indexed_block_descriptors.collect();
+    let indexed_constructors = quote! {
+        pub fn disk_index_plan() -> ::varve::__core::Result<::varve::__core::DiskIndexPlan> {
+            const BLOCKS: &[::varve::__core::DiskIndexedBlock] = &[
+                #(#indexed_block_descriptors),*
+            ];
+            ::varve::__core::DiskIndexPlan::canonical(Self::spec(), BLOCKS)
+                .map_err(|error| ::varve::__core::Error::DiskIndex(::std::boxed::Box::new(error)))
+        }
+
+        pub fn open_indexed_reader<P: AsRef<::std::path::Path>>(
+            path: P,
+            options: ::varve::__core::DiskIndexOptions,
+        ) -> ::varve::__core::Result<#indexed_reader_name> {
+            ::core::result::Result::Ok(#indexed_reader_name::from_inner(
+                ::varve::__core::VarveIndexedReader::open(
+                    Self::spec(),
+                    path,
+                    options,
+                    Self::disk_index_plan()?,
+                )?,
+            ))
+        }
+
+        pub fn create_indexed_writer<P: AsRef<::std::path::Path>>(
+            path: P,
+            options: ::varve::__core::DiskIndexOptions,
+        ) -> ::varve::__core::Result<#indexed_writer_name> {
+            ::core::result::Result::Ok(#indexed_writer_name::from_inner(
+                ::varve::__core::VarveIndexedWriter::create(
+                    Self::spec(),
+                    path,
+                    options,
+                    Self::disk_index_plan()?,
+                )?,
+            ))
+        }
+
+        pub fn open_indexed_writer<P: AsRef<::std::path::Path>>(
+            path: P,
+            options: ::varve::__core::DiskIndexOptions,
+        ) -> ::varve::__core::Result<#indexed_writer_name> {
+            ::core::result::Result::Ok(#indexed_writer_name::from_inner(
+                ::varve::__core::VarveIndexedWriter::open(
+                    Self::spec(),
+                    path,
+                    options,
+                    Self::disk_index_plan()?,
+                )?,
+            ))
+        }
+
+
+        pub fn restore_indexed_writer<P: AsRef<::std::path::Path>>(
+            path: P,
+            options: ::varve::__core::DiskIndexOptions,
+        ) -> ::varve::__core::Result<#indexed_writer_name> {
+            ::core::result::Result::Ok(#indexed_writer_name::from_inner(
+                ::varve::__core::VarveIndexedWriter::restore_checkpoint_and_open(
+                    Self::spec(),
+                    path,
+                    options,
+                    Self::disk_index_plan()?,
+                )?,
+            ))
+        }
+
+        pub fn rebuild_disk_index<P: AsRef<::std::path::Path>>(
+            path: P,
+            options: ::varve::__core::DiskIndexOptions,
+        ) -> ::varve::__core::Result<::varve::__core::DiskIndexRebuildReport> {
+            ::varve::__core::rebuild_disk_index(
+                Self::spec(),
+                path,
+                options,
+                Self::disk_index_plan()?,
+            )
+        }
+
+        pub fn rebuild_disk_index_with_progress<P, F>(
+            path: P,
+            options: ::varve::__core::DiskIndexOptions,
+            scan: ::varve::__core::ScanOptions<'_>,
+            observer: F,
+        ) -> ::varve::__core::Result<::varve::__core::DiskIndexRebuildReport>
+        where
+            P: AsRef<::std::path::Path>,
+            F: ::core::ops::FnMut(::varve::__core::ScanProgress),
+        {
+            ::varve::__core::rebuild_disk_index_with_progress(
+                Self::spec(),
+                path,
+                options,
+                Self::disk_index_plan()?,
+                scan,
+                observer,
+            )
+        }
+    };
+    let indexed_api = quote! {
+        pub struct #indexed_reader_name {
+            inner: ::varve::__core::VarveIndexedReader,
+        }
+
+        impl #indexed_reader_name {
+            pub fn from_inner(inner: ::varve::__core::VarveIndexedReader) -> Self {
+                Self { inner }
+            }
+
+            pub fn into_inner(self) -> ::varve::__core::VarveIndexedReader {
+                self.inner
+            }
+
+            pub fn resident_state(&self) -> ::varve::__core::StreamResidentState {
+                self.inner.resident_state()
+            }
+
+            pub fn events(&self) -> ::varve::__core::Result<::varve::__core::StreamEvents> {
+                self.inner.events()
+            }
+
+            pub fn verify_all(&self) -> ::varve::__core::Result<u64> {
+                self.inner.verify_all()
+            }
+
+            pub fn verify_all_with_progress<F>(
+                &self,
+                scan: ::varve::__core::ScanOptions<'_>,
+                observer: F,
+            ) -> ::varve::__core::Result<u64>
+            where
+                F: ::core::ops::FnMut(::varve::__core::ScanProgress),
+            {
+                self.inner.verify_all_with_progress(scan, observer)
+            }
+
+            #(#indexed_scan_methods)*
+            #(#indexed_reader_methods)*
+        }
+
+        pub struct #indexed_writer_name {
+            inner: ::varve::__core::VarveIndexedWriter,
+        }
+
+        impl #indexed_writer_name {
+            pub fn from_inner(inner: ::varve::__core::VarveIndexedWriter) -> Self {
+                Self { inner }
+            }
+
+            pub fn into_inner(self) -> ::varve::__core::VarveIndexedWriter {
+                self.inner
+            }
+
+            pub fn flush(&mut self) -> ::varve::__core::Result<()> {
+                self.inner.flush()
+            }
+
+            pub fn sync(&mut self) -> ::varve::__core::Result<()> {
+                self.inner.sync()
+            }
+
+            pub fn resident_state(&self) -> ::varve::__core::StreamResidentState {
+                self.inner.resident_state()
+            }
+
+            #(#indexed_writer_methods)*
+        }
+    };
+
+    (
+        quote!(#stream_constructors #indexed_constructors),
+        quote!(#stream_api #indexed_api),
+    )
+}
+
 fn typed_api_tokens(
     format_name: &Ident,
     blocks: &[InlineBlock],
@@ -4865,6 +5504,204 @@ fn pairwise<T>(items: &[T]) -> Vec<(&T, &T)> {
 mod tests {
     use super::*;
     use quote::quote;
+
+    fn parse_inline_test_block(block: TokenStream2) -> Result<InlineBlock> {
+        let parser = |input: ParseStream<'_>| parse_inline_block(input);
+        syn::parse::Parser::parse2(parser, block)
+    }
+
+    #[test]
+    fn inline_key_index_defaults_to_memory() {
+        let block = parse_inline_test_block(quote! {
+            variable Item(id = 1, key = [id]) { id: u64 }
+        })
+        .expect("keyed inline block should parse");
+
+        assert!(block.key_index == KeyIndexChoice::Memory);
+    }
+
+    #[test]
+    fn inline_key_index_rejects_unkeyed_blocks() {
+        let error = parse_inline_test_block(quote! {
+            fixed Item(id = 1, key_index = memory) { id: u64 }
+        })
+        .err()
+        .expect("unkeyed key_index should fail");
+
+        assert!(error.to_string().contains("key_index requires a keyed"));
+    }
+
+    #[test]
+    fn inline_key_index_rejects_matrix_blocks() {
+        let error = parse_inline_test_block(quote! {
+            matrix Cell(
+                id = 1,
+                dims = [row, column],
+                category = data,
+                key_index = disk,
+            ) { value: u64 }
+        })
+        .err()
+        .expect("matrix key_index should fail");
+
+        assert!(error.to_string().contains("matrix blocks"));
+    }
+
+    #[test]
+    fn inline_key_index_rejects_unknown_value() {
+        let error = parse_inline_test_block(quote! {
+            variable Item(id = 1, key = [id], key_index = cached) { id: u64 }
+        })
+        .err()
+        .expect("unknown key_index should fail");
+
+        assert_eq!(error.to_string(), "expected memory or disk");
+    }
+
+    #[cfg(not(feature = "high-cardinality-dev"))]
+    #[test]
+    fn explicit_key_index_requires_feature() {
+        let error = parse_inline_test_block(quote! {
+            variable Item(id = 1, key = [id], key_index = disk) { id: u64 }
+        })
+        .err()
+        .expect("key_index without the feature should fail");
+
+        assert!(error.to_string().contains("high-cardinality-dev"));
+    }
+
+    #[cfg(feature = "high-cardinality-dev")]
+    #[test]
+    fn disk_key_index_generates_indexed_api() {
+        let block = parse_inline_test_block(quote! {
+            variable Item(id = 1, key = [id], key_index = disk) { id: u64 }
+        })
+        .expect("disk key_index should parse with the feature");
+        let (constructors, api) =
+            high_cardinality_api_tokens(&format_ident!("Test"), &[block], false);
+        let tokens = format!("{constructors} {api}");
+
+        assert!(tokens.contains("TestStreamReader"));
+        assert!(tokens.contains("TestIndexedReader"));
+        assert!(tokens.contains("get_item"));
+        assert!(tokens.contains("push_item"));
+        assert!(tokens.contains("push_items"));
+        assert!(tokens.contains("delete_item"));
+        assert!(tokens.contains("DiskIndexPlan"));
+        assert!(tokens.contains("disk_index_plan"));
+        assert!(tokens.contains("BatchAppendInfo"));
+        assert!(tokens.contains("BatchAppendError"));
+        assert!(
+            !tokens.contains("high-cardinality-dev"),
+            "dependency features must not become downstream cfg predicates"
+        );
+    }
+
+    #[cfg(feature = "high-cardinality-dev")]
+    #[test]
+    fn disk_index_plan_is_sorted_by_block_id() {
+        let later = parse_inline_test_block(quote! {
+            variable Later(id = 9, key = [id], key_index = disk) { id: u64 }
+        })
+        .expect("later disk block should parse");
+        let earlier = parse_inline_test_block(quote! {
+            variable Earlier(id = 2, key = [id], key_index = disk) { id: u64 }
+        })
+        .expect("earlier disk block should parse");
+        let (constructors, _) =
+            high_cardinality_api_tokens(&format_ident!("Test"), &[later, earlier], false);
+        let tokens = constructors.to_string();
+        let plan_start = tokens
+            .find("pub fn disk_index_plan")
+            .expect("generated plan function");
+        let plan_end = tokens[plan_start..]
+            .find("pub fn open_indexed_reader")
+            .expect("reader constructor after plan")
+            + plan_start;
+        let plan = &tokens[plan_start..plan_end];
+
+        assert!(plan.contains("DiskIndexPlan :: canonical"));
+        assert!(
+            plan.find("Earlier").expect("earlier descriptor")
+                < plan.find("Later").expect("later descriptor")
+        );
+        assert!(tokens.contains("Self :: disk_index_plan ()"));
+    }
+
+    #[test]
+    fn generated_batch_method_uses_plural_and_borrowed_iterator() {
+        let block = parse_inline_test_block(quote! {
+            variable Frame(id = 1) { payload: Vec<u8> }
+        })
+        .expect("variable block should parse");
+        let (_, api) = high_cardinality_api_tokens(&format_ident!("Test"), &[block], false);
+        let tokens = api.to_string();
+
+        assert!(tokens.contains("push_frames"));
+        assert!(tokens.contains("BatchOptions"));
+        assert!(tokens.contains("BatchAppendInfo"));
+        assert!(tokens.contains("BatchAppendError"));
+        assert!(tokens.contains("Borrow < Frame >"));
+        assert!(tokens.contains("push_iter :: < Frame , _ >"));
+    }
+
+    #[cfg(feature = "high-cardinality-dev")]
+    #[test]
+    fn keyed_chain_exposes_only_plan_backed_keyed_mutations() {
+        let account = parse_inline_test_block(quote! {
+            variable Account(id = 1, key = [id]) { id: u64 }
+        })
+        .expect("memory-keyed block should parse");
+        let frame = parse_inline_test_block(quote! {
+            variable Frame(id = 2, key = [id], key_index = disk) { id: u64 }
+        })
+        .expect("disk-keyed block should parse");
+        let metadata = parse_inline_test_block(quote! {
+            fixed Metadata(id = 3) { value: u64 }
+        })
+        .expect("unkeyed block should parse");
+        let (_, api) =
+            high_cardinality_api_tokens(&format_ident!("Test"), &[account, frame, metadata], true);
+        let tokens = api.to_string();
+        let stream_start = tokens
+            .find("impl TestStreamWriter")
+            .expect("stream writer impl");
+        let stream_end = tokens[stream_start..]
+            .find("pub struct TestIndexedReader")
+            .expect("indexed reader after stream writer")
+            + stream_start;
+        let stream_writer = &tokens[stream_start..stream_end];
+        let indexed_start = tokens
+            .find("impl TestIndexedWriter")
+            .expect("indexed writer impl");
+        let indexed_writer = &tokens[indexed_start..];
+
+        assert!(!stream_writer.contains("push_account"));
+        assert!(!stream_writer.contains("delete_account"));
+        assert!(!stream_writer.contains("push_frame"));
+        assert!(!stream_writer.contains("delete_frame"));
+        assert!(stream_writer.contains("push_metadata"));
+        assert!(indexed_writer.contains("push_frame"));
+        assert!(indexed_writer.contains("push_frames"));
+        assert!(indexed_writer.contains("delete_frame"));
+        assert!(!indexed_writer.contains("push_account"));
+        assert!(!indexed_writer.contains("delete_account"));
+        assert!(indexed_writer.contains("push_metadata"));
+    }
+
+    #[test]
+    fn memory_key_index_generates_only_stream_api() {
+        let block = parse_inline_test_block(quote! {
+            variable Item(id = 1, key = [id]) { id: u64 }
+        })
+        .expect("default key index should parse");
+        let (constructors, api) =
+            high_cardinality_api_tokens(&format_ident!("Test"), &[block], false);
+        let tokens = format!("{constructors} {api}");
+
+        assert!(tokens.contains("TestStreamReader"));
+        assert!(!tokens.contains("TestIndexedReader"));
+    }
 
     #[test]
     fn parses_matrix_format_syntax() {

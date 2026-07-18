@@ -7,11 +7,11 @@ Performance checks are regression guards, not product benchmarks. Run them whene
 ## Smoke Commands
 
 ```powershell
-cargo test -p varve --test perf_smoke -- --ignored --nocapture
-cargo test -p varve --features compression-zstd --test compression -- --nocapture
-cargo test -p varve --features mmap --test perf_smoke -- --ignored --nocapture
-cargo test -p varve --features mmap,zero-copy --test perf_smoke -- --ignored --nocapture
-cargo test -p varve --all-features --test perf_smoke -- --ignored --nocapture
+cargo run -p varve-test-runner -- test -p varve --test perf_smoke -- --ignored --nocapture
+cargo run -p varve-test-runner -- test -p varve --features compression-zstd --test compression -- --nocapture
+cargo run -p varve-test-runner -- test -p varve --features mmap --test perf_smoke -- --ignored --nocapture
+cargo run -p varve-test-runner -- test -p varve --features mmap,zero-copy --test perf_smoke -- --ignored --nocapture
+cargo run -p varve-test-runner -- test -p varve --all-features --test perf_smoke -- --ignored --nocapture
 ```
 
 ## Benchmark Example
@@ -19,7 +19,7 @@ cargo test -p varve --all-features --test perf_smoke -- --ignored --nocapture
 For a local release-mode timing pass without adding benchmark dependencies:
 
 ```powershell
-cargo run -p varve --example perf_bench --release -- 10000
+cargo run -p varve-test-runner -- run -p varve --example perf_bench --release -- 10000
 ```
 
 The optional numeric argument is the record count. This example reports
@@ -31,7 +31,9 @@ paths.
 For security or storage changes, build once, run one unrecorded warmup, then
 record five executions of `target/release/examples/perf_bench.exe 10000`.
 Compare medians and retain the five-run range. Run on the same machine, power
-profile, feature set, and storage volume. The pre-remediation baseline is:
+profile, feature set, and storage volume. Record `powercfg /getactivescheme`
+with Windows results; a different active scheme invalidates a direct timing
+comparison. The pre-remediation baseline is:
 
 | Metric | Median ms | Five-run range ms |
 | --- | ---: | ---: |
@@ -190,3 +192,83 @@ The smoke suite reports wall time, records/sec, and file size. Compare small, me
   materializing the resource it is supposed to bound.
 - Snapshot-bound reads should use positional I/O on the retained handle and
   must not add one path open per lazy record.
+- `CheckpointOnFlush` must space full index checkpoints geometrically. A fresh
+  full checkpoint is written only once the live tail grows by
+  `max(INDEX_CHECKPOINT_MIN_RECORDS, records_at_last_checkpoint / 2)`, keeping
+  cumulative checkpoint bytes `O(N)` across `O(log N)` checkpoints. Per-flush /
+  per-record full-index checkpoints are a blocking regression.
+- CRC typed reads must decode the already-read, checksum-validated payload
+  buffer once. A CRC point lookup or streaming typed scan must not read the
+  covered payload twice, and a typed scan must not checksum or read the payloads
+  of skipped foreign-block records.
+- Tombstone rebuild must resolve the descriptor once per record by block id and
+  decode each tombstone key once. Rebuild cost must be independent of the plan
+  descriptor count, not `O(records × descriptors)`.
+
+### Checkpoint, CRC, And Rebuild Cost Fixes
+
+These paths were measured in the 2026-07-19 review as regressions and are now
+bounded; the review numbers are before-context:
+
+- resident `checkpoint_on_flush` grew cumulative checkpoint bytes as
+  `22 + 94N + 73N²` (per-flush full serialization). Geometric spacing removes
+  the quadratic term. Open/recovery is unaffected because the scan reads every
+  native record and merely validates whatever checkpoints it encounters, so a
+  sparse or checkpoint-less tail still recovers.
+- CRC typed point lookup and streaming scan read each covered payload twice
+  (integrity-none `4,194,416 B` vs CRC `8,388,832 B` on a 4 MiB point lookup).
+  The validated payload buffer is now handed straight to typed decode, so the
+  covered payload is read once; `verify_all()` remains the full whole-file
+  integrity pass.
+- Tombstone rebuild decoded each tombstone key once per descriptor
+  (`1` descriptor `2,061,267` read-transfer bytes vs `8` descriptors
+  `5,732,403`). A single descriptor lookup by block id makes rebuild cost
+  independent of descriptor count.
+
+## High-Cardinality Development Profile
+
+The unstable `high-cardinality-dev` profile has a generated integration probe:
+
+```powershell
+cargo test -p varve --features high-cardinality-dev --test high_cardinality
+```
+
+It compares allocator peaks for repeated and unique keys, then appends 10,000
+unique composite keys through the generated indexed writer,
+checks representative equality lookups, and asserts that both streaming and
+indexed handles report zero retained record and key-map entries. The redb
+cache is fixed at 1 MiB in this probe, so increasing unique-key cardinality
+must grow the `.vki` sidecar rather than a Varve `HashMap`.
+
+Derived-index updates share bounded redb write batches after a durable dirty
+marker. Previous-key lookup reads the transaction's current B-tree state, so
+the batch does not require an O(K) pending map. Native framing and sidecar
+updates are derived from the same checked in-memory prepared record. The native
+chunk is written once and is never reread during append or `sync()`. `sync()`
+syncs the authoritative native file and then durably publishes clean sidecar
+metadata. Reintroducing per-record native writes, rereading appended chunks, or
+scanning during ordinary open is a blocking performance regression.
+
+The ignored million-key probe was executed on Windows in the debug profile on
+2026-07-17. It completed in 61.85 seconds with a measured allocator peak delta
+of 9,513,224 bytes while using an 8 MiB redb cache. Treat this as a regression
+baseline for this machine, not a cross-platform throughput guarantee.
+
+The same probe in the optimized release profile produced the following more
+useful baseline:
+
+| Operation | Result |
+| --- | ---: |
+| append 1,000,000 unique composite keys | 4.072 s (about 245,600 records/s) |
+| native sync plus clean sidecar publication | 116.2 ms |
+| clean reopen with no native record scan | 9.35 ms |
+| 10,000 warm equality lookups | 141.5 ms (about 14.2 us/lookup) |
+| native file | 128,000,026 bytes |
+| redb sidecar | 134,746,112 bytes |
+| measured allocator peak delta | 12,346,781 bytes |
+
+The previous implementation of this same indexed probe took 14.369 seconds to
+append and 3.334 seconds to reopen because it reread appended native ranges and
+scanned the native file at open. Those operations are now forbidden by tests.
+The current numbers are local regression measurements, not claims against
+other storage engines or hardware.

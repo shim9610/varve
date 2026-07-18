@@ -112,6 +112,24 @@ pub enum Error {
         actual: crate::BlockKind,
     },
 
+    #[error(
+        "block {block_id} schema fingerprint mismatch: registered {registered:#018x}, declared {declared:#018x}"
+    )]
+    BlockSchemaFingerprintMismatch {
+        block_id: u32,
+        registered: u64,
+        declared: u64,
+    },
+
+    #[error(
+        "block {block_id} keyedness mismatch: registered keyed={registered}, declared keyed={declared}"
+    )]
+    BlockKeyednessMismatch {
+        block_id: u32,
+        registered: bool,
+        declared: bool,
+    },
+
     #[error("replace payload length changed from {old} to {new}")]
     ReplaceSizeMismatch { old: u64, new: u64 },
 
@@ -181,6 +199,38 @@ pub enum Error {
     #[error("{0} writer is poisoned after an uncertain write failure")]
     WriterPoisoned(&'static str),
 
+    #[cfg(feature = "high-cardinality-dev")]
+    #[error("the requested operation is unsupported by bounded streaming handles")]
+    StreamingUnsupported,
+
+    #[cfg(feature = "high-cardinality-dev")]
+    #[error("batch option {field} must be greater than zero")]
+    InvalidBatchOptions { field: &'static str },
+
+    #[cfg(feature = "high-cardinality-dev")]
+    #[error(
+        "explicit scan cancelled after {records} records and {bytes} record-region bytes",
+        records = .progress.records,
+        bytes = .progress.scanned_bytes,
+    )]
+    ScanCancelled { progress: crate::ScanProgress },
+
+    #[cfg(feature = "high-cardinality-dev")]
+    #[error("the derived disk index is busy")]
+    IndexBusy,
+
+    #[cfg(feature = "high-cardinality-dev")]
+    #[error("disk index error: {0}")]
+    DiskIndex(#[source] Box<crate::disk_index::DiskIndexError>),
+
+    #[cfg(feature = "high-cardinality-dev")]
+    #[error("record sequence {sequence} was published, but the disk index is stale: {source}")]
+    PublishedButIndexStale {
+        sequence: u64,
+        #[source]
+        source: Box<Error>,
+    },
+
     #[error("failed to roll back {operation}: {source}")]
     WriteRollbackFailed {
         operation: &'static str,
@@ -193,6 +243,15 @@ pub enum Error {
     )]
     PublishedButRebindFailed {
         sequence: u64,
+        #[source]
+        source: Box<Error>,
+    },
+
+    #[error(
+        "replacement was published at {path}, but parent-directory durability is not yet confirmed: {source}"
+    )]
+    PublishedButParentSyncPending {
+        path: String,
         #[source]
         source: Box<Error>,
     },
@@ -251,6 +310,11 @@ pub enum Error {
 
     #[error("matrix commit category {0} is quarantined after integrity failure")]
     MatrixCommitQuarantined(String),
+
+    #[error(
+        "matrix recovery report contains fatal findings; default access is fail-closed, use FormatSpec::with_matrix_fatal_forensics for forensic access"
+    )]
+    MatrixFatalCorruption,
 
     #[error("matrix key is out of bounds: scan {scan}, ch {ch}")]
     MatrixKeyOutOfBounds { scan: u64, ch: u64 },

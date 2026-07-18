@@ -15,6 +15,7 @@ use crate::{
     MatrixCommitEvent, MatrixDimensions, MatrixKey, MatrixRecoveryAction, MatrixRecoveryReport,
     MatrixResumeSignal, RecoveryPolicy, Result, SnapshotFile, VariableCompression, VarveBlock,
     VarveKeyedBlock, VarveMatrixBlock, VarveMerge, VarveMigration, VarveReplaceBlock, WireType,
+    codec::encode_to_vec_limited,
     collections::MaterializationBudget,
     encode_to_vec,
     format::ReadLimitKey,
@@ -48,6 +49,13 @@ pub(crate) const RECORD_FOOTER_KNOWN_FLAGS: u16 =
 const COMMIT_PAYLOAD_MAGIC: &[u8; 4] = b"VCMT";
 const INDEX_CHECKPOINT_MAGIC: &[u8; 4] = b"VIDX";
 const INDEX_CHECKPOINT_VERSION: u16 = 3;
+/// Smallest live-tail growth that forces a fresh full index checkpoint.
+///
+/// Below this floor the geometric-spacing rule in [`VarveFile::needs_index_checkpoint`]
+/// would fire on nearly every flush, reintroducing the cumulative O(N^2)
+/// checkpoint bytes that PERF-02 removes. The floor keeps small files cheap to
+/// recover while capping the per-flush overhead of a rapidly growing append log.
+const INDEX_CHECKPOINT_MIN_RECORDS: usize = 16;
 const MANIFEST_PAYLOAD_VERSION: u16 = 5;
 const WRITER_LOCK_MAGIC: &str = "varve-lock-v1";
 const COMPRESSION_ENVELOPE_MAGIC: &[u8; 4] = b"VCMP";
@@ -55,8 +63,14 @@ const COMPRESSION_ENVELOPE_VERSION: u8 = 1;
 const FILE_COMPRESSION_MAGIC: &[u8; 4] = b"VCHD";
 const FILE_COMPRESSION_VERSION: u8 = 1;
 const MATRIX_SIDECAR_MAGIC: &[u8; 4] = b"VSID";
-const MATRIX_SIDECAR_VERSION: u16 = 1;
-const MATRIX_SIDECAR_FIXED_LEN: usize = 48;
+// v2 binds the sidecar to the native file's OS-object identity and matrix
+// layout generation (DUR-04/05). v1 envelopes are refused as stale/regenerable.
+const MATRIX_SIDECAR_VERSION: u16 = 2;
+// Fixed header: 48-byte v1 prefix + 32-byte native fingerprint + 8-byte matrix
+// layout generation.
+const MATRIX_SIDECAR_FIXED_LEN: usize = 88;
+const MATRIX_SIDECAR_FINGERPRINT_OFFSET: usize = 48;
+const MATRIX_SIDECAR_LAYOUT_GENERATION_OFFSET: usize = 80;
 #[cfg(feature = "integrity")]
 const STREAM_BUFFER_LEN: usize = 64 * 1024;
 const WRITER_LOCK_MAX_LEN: u64 = 16 * 1024;
@@ -106,6 +120,24 @@ pub struct MatrixSidecarManifest {
     pub generation: u64,
     pub payload_len: u64,
     pub payload_crc32: u32,
+    /// Fingerprint of the native matrix file's OS object (volume + file ID on
+    /// Windows, device + inode on Unix) folded with the schema hash. Binds the
+    /// sidecar to one specific native file so a same-spec sibling cannot adopt
+    /// it (DUR-04).
+    pub native_fingerprint: [u8; 32],
+    /// The matrix layout generation the sidecar was published against, so a
+    /// reader whose native layout has changed rejects the stale sidecar.
+    pub matrix_layout_generation: u64,
+}
+
+/// Identity of the native matrix file a sidecar is bound to.
+///
+/// Recomputed by every reader from its own open native file and matrix layout,
+/// then compared against the values recorded in the sidecar envelope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MatrixNativeIdentity {
+    fingerprint: [u8; 32],
+    layout_generation: u64,
 }
 
 pub trait MatrixNumeric: Copy {
@@ -1163,6 +1195,15 @@ impl VarveWriter {
         })
     }
 
+    /// Creates a new native file, failing if `path` already exists.
+    ///
+    /// See [`VarveFile::create_new`].
+    pub fn create_new<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        Ok(Self {
+            file: VarveFile::create_new(spec, path)?,
+        })
+    }
+
     pub fn create_with_dims<P: AsRef<Path>>(
         spec: FormatSpec,
         path: P,
@@ -1282,6 +1323,12 @@ impl VarveWriter {
     ///
     /// [`Error::PublishedButRebindFailed`] means publication already succeeded.
     /// Do not retry blindly; discard this poisoned writer and reopen the path.
+    ///
+    /// [`Error::PublishedButParentSyncPending`] also means publication already
+    /// succeeded; the writer was rebound to the published generation and stays
+    /// usable, but the rename is not yet guaranteed durable against power loss
+    /// until the parent directory is synced (for example by a later successful
+    /// publication or an explicit directory sync).
     pub fn replace_block<T: VarveReplaceBlock>(
         &mut self,
         index: usize,
@@ -1295,6 +1342,12 @@ impl VarveWriter {
     ///
     /// [`Error::PublishedButRebindFailed`] means publication already succeeded.
     /// Do not retry blindly; discard this poisoned writer and reopen the path.
+    ///
+    /// [`Error::PublishedButParentSyncPending`] also means publication already
+    /// succeeded; the writer was rebound to the published generation and stays
+    /// usable, but the rename is not yet guaranteed durable against power loss
+    /// until the parent directory is synced (for example by a later successful
+    /// publication or an explicit directory sync).
     pub fn replace_fixed<T: VarveBlock>(&mut self, index: usize, block: &T) -> Result<u64> {
         self.file.replace_fixed(index, block)
     }
@@ -1319,6 +1372,12 @@ impl VarveWriter {
     ///
     /// [`Error::PublishedButRebindFailed`] means publication already succeeded.
     /// Do not retry blindly; discard this poisoned writer and reopen the path.
+    ///
+    /// [`Error::PublishedButParentSyncPending`] also means publication already
+    /// succeeded; the writer was rebound to the published generation and stays
+    /// usable, but the rename is not yet guaranteed durable against power loss
+    /// until the parent directory is synced (for example by a later successful
+    /// publication or an explicit directory sync).
     pub fn replace_rewrite<T: VarveBlock>(&mut self, index: usize, block: &T) -> Result<u64> {
         self.file.replace_rewrite(index, block)
     }
@@ -1544,6 +1603,19 @@ impl VarveWriter {
 
 impl VarveFile {
     pub fn create<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        Self::create_impl(spec, path.as_ref(), false)
+    }
+
+    /// Creates a new native file, failing if `path` already exists.
+    ///
+    /// Unlike [`VarveFile::create`], this never truncates or reuses an
+    /// existing file, so callers that must prove they created and own the
+    /// file (for example diagnostic scaffolding) cannot destroy caller data.
+    pub fn create_new<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        Self::create_impl(spec, path.as_ref(), true)
+    }
+
+    fn create_impl(spec: FormatSpec, path: &Path, exclusive: bool) -> Result<Self> {
         let spec = spec.resolve_entrypoint();
         spec.validate()?;
         ensure_native_write_limits(spec)?;
@@ -1551,14 +1623,17 @@ impl VarveFile {
         if spec.has_matrix_blocks() {
             return Err(Error::MatrixDimensionsRequired);
         }
-        let path = path.as_ref().to_path_buf();
-        let lock = WriterLock::acquire(&path)?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
+        let path = path.to_path_buf();
+        let mut lock = WriterLock::acquire(&path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        if exclusive {
+            options.create_new(true);
+        } else {
+            options.create(true).truncate(true);
+        }
+        let mut file = options.open(&path)?;
+        lock.bind_native(&file, &path)?;
         write_file_header(spec, &mut file)?;
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         let mut file = Self {
@@ -1590,13 +1665,14 @@ impl VarveFile {
             return Self::create(spec, path);
         }
         let path = path.as_ref().to_path_buf();
-        let lock = WriterLock::acquire(&path)?;
+        let mut lock = WriterLock::acquire(&path)?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(&path)?;
+        lock.bind_native(&file, &path)?;
         write_file_header(spec, &mut file)?;
         let header_len = file.stream_position()?;
         let matrix = crate::matrix::create_layout(spec, &mut file, header_len, &dims)?;
@@ -1622,8 +1698,9 @@ impl VarveFile {
         spec.validate()?;
         ensure_native_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
-        let lock = WriterLock::acquire(&path)?;
+        let mut lock = WriterLock::acquire(&path)?;
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        lock.bind_native(&file, &path)?;
         let captured_len = check_open_file_len(spec, &file)?;
         let header_len = read_file_header(spec, &mut file)?;
         let matrix = read_matrix_layout_if_needed(spec, &mut file, header_len, captured_len)?;
@@ -1655,8 +1732,9 @@ impl VarveFile {
         spec.validate()?;
         ensure_native_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
-        let lock = WriterLock::acquire_with_policy(&path, policy)?;
+        let mut lock = WriterLock::acquire_with_policy(&path, policy)?;
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        lock.bind_native(&file, &path)?;
         let captured_len = check_open_file_len(spec, &file)?;
         let header_len = read_file_header(spec, &mut file)?;
         let matrix = read_matrix_layout_if_needed(spec, &mut file, header_len, captured_len)?;
@@ -1719,8 +1797,9 @@ impl VarveFile {
         spec.validate()?;
         ensure_native_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
-        let lock = WriterLock::acquire(&path)?;
+        let mut lock = WriterLock::acquire(&path)?;
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        lock.bind_native(&file, &path)?;
         let original_len = file.metadata()?.len();
         spec.read_limits
             .check(ReadLimitKey::FileLen, original_len)?;
@@ -1815,7 +1894,7 @@ impl VarveFile {
         self.ensure_write()?;
         self.ensure_user_block::<T>()?;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
-        let payload = encode_internal_key_payload::<T>(self.spec.endian, key)?;
+        let payload = encode_internal_key_payload::<T>(self.spec, key)?;
         self.write_record_with_prev_key(
             TOMBSTONE_BLOCK_ID,
             1,
@@ -2049,11 +2128,22 @@ impl VarveFile {
         }
         drop(temp_file);
 
-        if let Err(error) = replace_path_atomically(&temp_path, &self.path) {
-            let _ = remove_file(&temp_path);
-            return Err(error);
+        match replace_path_atomically(&temp_path, &self.path) {
+            Ok(ReplaceDurability::Durable) => self.rebind_replacement_generation(info, new_index),
+            Ok(ReplaceDurability::ParentSyncPending(sync_error)) => {
+                // Publication already happened: the pathname resolves to the
+                // new generation, so the writer must move there regardless.
+                self.rebind_replacement_generation(info, new_index)?;
+                Err(Error::PublishedButParentSyncPending {
+                    path: self.path.display().to_string(),
+                    source: Box::new(sync_error),
+                })
+            }
+            Err(error) => {
+                let _ = remove_file(&temp_path);
+                Err(error)
+            }
         }
-        self.rebind_replacement_generation(info, new_index)
     }
 
     /// Publishes a same-size fixed replacement through a copy-on-write file
@@ -2061,6 +2151,12 @@ impl VarveFile {
     ///
     /// [`Error::PublishedButRebindFailed`] means publication already succeeded.
     /// Do not retry blindly; discard this poisoned writer and reopen the path.
+    ///
+    /// [`Error::PublishedButParentSyncPending`] also means publication already
+    /// succeeded; the writer was rebound to the published generation and stays
+    /// usable, but the rename is not yet guaranteed durable against power loss
+    /// until the parent directory is synced (for example by a later successful
+    /// publication or an explicit directory sync).
     pub fn replace_fixed<T: VarveBlock>(&mut self, index: usize, block: &T) -> Result<u64> {
         self.ensure_write()?;
         self.ensure_user_block::<T>()?;
@@ -2173,12 +2269,22 @@ impl VarveFile {
         }
         drop(temp_file);
 
-        if let Err(error) = replace_path_atomically(&temp_path, &self.path) {
-            let _ = remove_file(&temp_path);
-            return Err(error);
+        match replace_path_atomically(&temp_path, &self.path) {
+            Ok(ReplaceDurability::Durable) => self.rebind_published_generation(sequence, new_index),
+            Ok(ReplaceDurability::ParentSyncPending(sync_error)) => {
+                // Publication already happened: the pathname resolves to the
+                // new generation, so the writer must move there regardless.
+                self.rebind_published_generation(sequence, new_index)?;
+                Err(Error::PublishedButParentSyncPending {
+                    path: self.path.display().to_string(),
+                    source: Box::new(sync_error),
+                })
+            }
+            Err(error) => {
+                let _ = remove_file(&temp_path);
+                Err(error)
+            }
         }
-
-        self.rebind_published_generation(sequence, new_index)
     }
 
     /// Replaces a fixed record by mutating this file object directly.
@@ -2277,6 +2383,12 @@ impl VarveFile {
     ///
     /// [`Error::PublishedButRebindFailed`] means publication already succeeded.
     /// Do not retry blindly; discard this poisoned writer and reopen the path.
+    ///
+    /// [`Error::PublishedButParentSyncPending`] also means publication already
+    /// succeeded; the writer was rebound to the published generation and stays
+    /// usable, but the rename is not yet guaranteed durable against power loss
+    /// until the parent directory is synced (for example by a later successful
+    /// publication or an explicit directory sync).
     pub fn replace_rewrite<T: VarveBlock>(&mut self, index: usize, block: &T) -> Result<u64> {
         self.ensure_write()?;
         if self.spec.spec_needs_record_footer() {
@@ -2385,12 +2497,22 @@ impl VarveFile {
         }
         drop(temp_file);
 
-        if let Err(error) = replace_path_atomically(&temp_path, &self.path) {
-            let _ = remove_file(&temp_path);
-            return Err(error);
+        match replace_path_atomically(&temp_path, &self.path) {
+            Ok(ReplaceDurability::Durable) => self.rebind_published_generation(sequence, new_index),
+            Ok(ReplaceDurability::ParentSyncPending(sync_error)) => {
+                // Publication already happened: the pathname resolves to the
+                // new generation, so the writer must move there regardless.
+                self.rebind_published_generation(sequence, new_index)?;
+                Err(Error::PublishedButParentSyncPending {
+                    path: self.path.display().to_string(),
+                    source: Box::new(sync_error),
+                })
+            }
+            Err(error) => {
+                let _ = remove_file(&temp_path);
+                Err(error)
+            }
         }
-
-        self.rebind_published_generation(sequence, new_index)
     }
 
     pub fn replace<T: VarveBlock>(
@@ -2980,7 +3102,8 @@ impl VarveFile {
         if !path.exists() {
             return crate::matrix::sidecar_resume_signal(matrix, category, false);
         }
-        match read_matrix_sidecar_file(self.spec, category, path, expected_generation) {
+        let identity = self.matrix_native_identity()?;
+        match read_matrix_sidecar_file(self.spec, category, path, expected_generation, identity) {
             Ok(_) => crate::matrix::sidecar_resume_signal(matrix, category, true),
             Err(Error::IntegrityFeatureDisabled) => Err(Error::IntegrityFeatureDisabled),
             Err(error @ Error::LimitExceeded { .. })
@@ -2993,6 +3116,14 @@ impl VarveFile {
         }
     }
 
+    /// Publishes a matrix resume sidecar bound to this native file.
+    ///
+    /// Ordering contract: the native matrix data this sidecar summarizes must
+    /// already be durable (native -> sidecar). Callers write and sync native
+    /// cells/commits first, then call this, so a sidecar can never advertise
+    /// progress that is not yet present in the native file. Publication itself
+    /// is a same-directory temp write + fsync + atomic replace + parent sync,
+    /// so a crash mid-publish leaves the previous sidecar intact.
     pub fn write_matrix_sidecar<P: AsRef<Path>>(
         &mut self,
         category: &str,
@@ -3003,7 +3134,15 @@ impl VarveFile {
         self.ensure_write()?;
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
         crate::matrix::resume_signal(matrix, category)?;
-        write_matrix_sidecar_file(self.spec, category, sidecar_path, generation, payload)
+        let identity = self.matrix_native_identity()?;
+        write_matrix_sidecar_file(
+            self.spec,
+            category,
+            sidecar_path,
+            generation,
+            payload,
+            identity,
+        )
     }
 
     pub fn read_matrix_sidecar<P: AsRef<Path>>(
@@ -3013,7 +3152,8 @@ impl VarveFile {
     ) -> Result<(MatrixSidecarManifest, Vec<u8>)> {
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
         crate::matrix::resume_signal(matrix, category)?;
-        read_matrix_sidecar_file(self.spec, category, sidecar_path, None)
+        let identity = self.matrix_native_identity()?;
+        read_matrix_sidecar_file(self.spec, category, sidecar_path, None, identity)
     }
 
     pub fn read_matrix_sidecar_with_generation<P: AsRef<Path>>(
@@ -3024,7 +3164,29 @@ impl VarveFile {
     ) -> Result<(MatrixSidecarManifest, Vec<u8>)> {
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
         crate::matrix::resume_signal(matrix, category)?;
-        read_matrix_sidecar_file(self.spec, category, sidecar_path, Some(expected_generation))
+        let identity = self.matrix_native_identity()?;
+        read_matrix_sidecar_file(
+            self.spec,
+            category,
+            sidecar_path,
+            Some(expected_generation),
+            identity,
+        )
+    }
+
+    /// Computes the native-file identity a matrix sidecar is bound to.
+    ///
+    /// Reuses the same OS-object identity bytes as the scalable sidecar identity
+    /// machinery (volume + file ID on Windows, device + inode on Unix) and folds
+    /// in the schema hash, then pairs it with the matrix layout generation.
+    fn matrix_native_identity(&self) -> Result<MatrixNativeIdentity> {
+        let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
+        let file = self.snapshot.try_clone_file()?;
+        let fingerprint = native_object_fingerprint(self.spec, &file)?;
+        Ok(MatrixNativeIdentity {
+            fingerprint,
+            layout_generation: matrix.append_log_start(),
+        })
     }
 
     pub fn matrix_recovery_report(&self) -> MatrixRecoveryReport {
@@ -3039,6 +3201,17 @@ impl VarveFile {
 
     pub fn inspect_writer_lock<P: AsRef<Path>>(path: P) -> Result<Option<WriterLockInfo>> {
         read_writer_lock_info(path.as_ref())
+    }
+
+    /// Arms `count` injected post-publication parent-directory sync failures.
+    ///
+    /// Fault-testing hook only: each armed failure makes the next
+    /// `replace.parent_sync` boundary return an error after a publication has
+    /// already succeeded, which is otherwise hard to reproduce on demand.
+    #[cfg(feature = "scalable-fault-injection")]
+    #[doc(hidden)]
+    pub fn inject_parent_sync_failures(count: u64) {
+        INJECTED_PARENT_SYNC_FAILURES.store(count, std::sync::atomic::Ordering::Release);
     }
 
     #[cfg(feature = "mmap")]
@@ -3224,6 +3397,11 @@ impl VarveFile {
             #[cfg(test)]
             fail_rebind_after_publish_if_requested()?;
             let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+            // The published generation is a new file object; the single-writer
+            // object lock must move with the writer.
+            if let Some(lock) = self._lock.as_mut() {
+                lock.bind_native(&file, &self.path)?;
+            }
             let snapshot = SnapshotFile::new(file.try_clone()?)?;
             Ok((file, snapshot))
         })();
@@ -3255,6 +3433,11 @@ impl VarveFile {
             #[cfg(test)]
             fail_rebind_after_publish_if_requested()?;
             let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+            // The published generation is a new file object; the single-writer
+            // object lock must move with the writer.
+            if let Some(lock) = self._lock.as_mut() {
+                lock.bind_native(&file, &self.path)?;
+            }
             let snapshot = SnapshotFile::new(file.try_clone()?)?;
             Ok((file, snapshot))
         })();
@@ -3496,7 +3679,10 @@ impl VarveFile {
             return Err(self.rollback_append(snapshot, error));
         }
 
-        let new_snapshot = self.snapshot.with_len(prospective_len);
+        let new_snapshot = match self.snapshot.with_len(prospective_len) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Err(self.rollback_append(snapshot, error)),
+        };
 
         let committed =
             !self.spec.commit_policy.is_transaction_marker() || block_id == COMMIT_BLOCK_ID;
@@ -3638,18 +3824,53 @@ impl VarveFile {
             .any(|entry| entry.block_id != COMMIT_BLOCK_ID)
     }
 
+    /// Decides whether `flush`/`commit` should serialize a fresh full index
+    /// checkpoint.
+    ///
+    /// This throttles only the *checkpoint* serialization; native-record
+    /// durability in `flush` is untouched. Two rules apply (PERF-02):
+    ///
+    /// (a) *Skip when unchanged.* If nothing but commit markers has been
+    ///     appended since the last checkpoint, the checkpoint would be
+    ///     byte-identical, so it is suppressed.
+    ///
+    /// (b) *Geometric spacing.* A new full checkpoint is written only once the
+    ///     live tail has grown by at least
+    ///     `max(INDEX_CHECKPOINT_MIN_RECORDS, records_at_last_checkpoint / 2)`
+    ///     records. Because each checkpoint serializes the whole index, spacing
+    ///     the checkpoints geometrically bounds the total checkpoint bytes to
+    ///     O(N) with O(log N) checkpoints, instead of the O(N^2) bytes produced
+    ///     by a full checkpoint on every flush.
+    ///
+    /// Open/recovery does not depend on this cadence: the scan reads every
+    /// native record and merely validates whatever checkpoints it encounters,
+    /// so sparse checkpoints and a checkpoint-less tail both recover correctly.
     fn needs_index_checkpoint(&self) -> bool {
         if self.index.is_empty() {
             return false;
         }
-        let start = self
+        let last_checkpoint_position = self
             .index
             .iter()
-            .rposition(|entry| entry.block_id == INDEX_BLOCK_ID)
-            .map_or(0, |position| position + 1);
-        self.index[start..]
+            .rposition(|entry| entry.block_id == INDEX_BLOCK_ID);
+        let start = last_checkpoint_position.map_or(0, |position| position + 1);
+        // Records that would change the serialized checkpoint. Commit markers
+        // do not alter index identity, so on their own they never force a new
+        // checkpoint (rule a).
+        let new_records = self.index[start..]
             .iter()
-            .any(|entry| entry.block_id != COMMIT_BLOCK_ID)
+            .filter(|entry| entry.block_id != COMMIT_BLOCK_ID)
+            .count();
+        if new_records == 0 {
+            return false;
+        }
+        // The checkpoint record sits at `last_checkpoint_position` and serialized
+        // exactly that many prior entries, so its position is a faithful proxy
+        // for the byte cost of the last checkpoint (rule b).
+        let records_at_last_checkpoint = last_checkpoint_position.unwrap_or(0);
+        let threshold =
+            core::cmp::max(INDEX_CHECKPOINT_MIN_RECORDS, records_at_last_checkpoint / 2);
+        new_records >= threshold
     }
 }
 
@@ -5000,11 +5221,22 @@ where
         return Err(error);
     }
 
-    if let Err(error) = replace_path_atomically(&temp_path, output) {
-        let _ = remove_file(&temp_path);
-        return Err(error);
+    match replace_path_atomically(&temp_path, output) {
+        Ok(ReplaceDurability::Durable) => Ok(()),
+        // Publication already happened; the temp file no longer exists and the
+        // target pathname resolves to the merged generation, so the caller
+        // must not treat this as "target unchanged".
+        Ok(ReplaceDurability::ParentSyncPending(sync_error)) => {
+            Err(Error::PublishedButParentSyncPending {
+                path: output.display().to_string(),
+                source: Box::new(sync_error),
+            })
+        }
+        Err(error) => {
+            let _ = remove_file(&temp_path);
+            Err(error)
+        }
     }
-    Ok(())
 }
 
 fn apply_merge_file<T, P>(
@@ -5131,12 +5363,44 @@ fn should_apply<T>(current: Option<&(MergeOrder, Option<T>)>, order: MergeOrder)
     current.is_none_or(|(old_order, _)| order >= *old_order)
 }
 
-fn encode_internal_key_payload<T>(endian: Endian, key: &T::Key) -> Result<Vec<u8>>
+fn encode_internal_key_payload<T>(spec: FormatSpec, key: &T::Key) -> Result<Vec<u8>>
 where
     T: VarveKeyedBlock,
 {
-    let key_payload = encode_to_vec(key, endian)?;
+    const ENVELOPE_LEN: u64 = 12;
+    let logical_limit = spec
+        .read_limits
+        .require(ReadLimitKey::LogicalPayloadLen)?
+        .unwrap_or(u64::MAX);
+    let key_limit = logical_limit
+        .checked_sub(ENVELOPE_LEN)
+        .ok_or(Error::LimitExceeded {
+            resource: ReadLimitKey::LogicalPayloadLen.resource(),
+            actual: ENVELOPE_LEN,
+            limit: logical_limit,
+        })?;
+    let key_payload = encode_to_vec_limited(
+        key,
+        spec.endian,
+        key_limit,
+        ReadLimitKey::LogicalPayloadLen.resource(),
+    )?;
+    let total_len = ENVELOPE_LEN.checked_add(key_payload.len() as u64).ok_or(
+        Error::ResourceArithmeticOverflow {
+            resource: "internal key payload length",
+        },
+    )?;
+    spec.read_limits
+        .check(ReadLimitKey::LogicalPayloadLen, total_len)?;
+    let total_len_usize =
+        usize::try_from(total_len).map_err(|_| Error::LengthOverflow { value: total_len })?;
     let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(total_len_usize)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "internal key payload",
+            requested: total_len,
+        })?;
     payload.extend_from_slice(&T::ID.to_le_bytes());
     payload.extend_from_slice(&(key_payload.len() as u64).to_le_bytes());
     payload.extend_from_slice(&key_payload);
@@ -5155,6 +5419,27 @@ where
         return Ok(None);
     };
     Ok(Some(budget.decode(key, endian)?))
+}
+
+#[cfg(feature = "high-cardinality-dev")]
+pub(crate) fn decode_stream_tombstone_key<T: VarveKeyedBlock>(
+    spec: FormatSpec,
+    snapshot: &SnapshotFile,
+    entry: &RecordIndexEntry,
+) -> Result<Option<T::Key>> {
+    if entry.block_id != TOMBSTONE_BLOCK_ID {
+        return Ok(None);
+    }
+    if entry.block_version != 1 || entry.flags != RECORD_FLAG_INTERNAL {
+        return Err(Error::CorruptTail {
+            offset: entry.record_offset,
+        });
+    }
+    let logical_len = entry.logical_payload_len_snapshot(spec, snapshot)?;
+    let mut budget = MaterializationBudget::new(spec);
+    budget.consume(logical_len)?;
+    let payload = entry.read_logical_payload_snapshot(spec, snapshot)?;
+    decode_internal_key_payload::<T>(spec.endian, &payload, &mut budget)
 }
 
 fn encode_internal_op_payload<T>(endian: Endian, key: &T::Key, op: &T::Op) -> Result<Vec<u8>>
@@ -5188,7 +5473,7 @@ where
     Ok(Some((key, op)))
 }
 
-fn write_file_header(spec: FormatSpec, file: &mut File) -> Result<()> {
+pub(crate) fn write_file_header(spec: FormatSpec, file: &mut File) -> Result<()> {
     let extensions = file_header_extensions(spec)?;
     write_native_file_header(file, spec, &extensions)?;
     Ok(())
@@ -5246,7 +5531,7 @@ fn append_log_start(header_len: u64, matrix: Option<&crate::matrix::MatrixLayout
     matrix.map_or(header_len, crate::matrix::MatrixLayout::append_log_start)
 }
 
-fn ensure_native_write_limits(spec: FormatSpec) -> Result<()> {
+pub(crate) fn ensure_native_write_limits(spec: FormatSpec) -> Result<()> {
     for key in [
         ReadLimitKey::FileLen,
         ReadLimitKey::Records,
@@ -5259,13 +5544,13 @@ fn ensure_native_write_limits(spec: FormatSpec) -> Result<()> {
     Ok(())
 }
 
-fn ensure_native_open_limits(spec: FormatSpec) -> Result<()> {
+pub(crate) fn ensure_native_open_limits(spec: FormatSpec) -> Result<()> {
     ensure_native_write_limits(spec)?;
     spec.read_limits.require(ReadLimitKey::ScanBytes)?;
     Ok(())
 }
 
-fn check_initial_native_file_len(spec: FormatSpec) -> Result<()> {
+pub(crate) fn check_initial_native_file_len(spec: FormatSpec) -> Result<()> {
     let extension_len = u64::try_from(file_header_extensions(spec)?.len()).map_err(|_| {
         Error::ResourceArithmeticOverflow {
             resource: "file length",
@@ -5275,7 +5560,7 @@ fn check_initial_native_file_len(spec: FormatSpec) -> Result<()> {
     spec.read_limits.check(ReadLimitKey::FileLen, header_len)
 }
 
-fn check_open_file_len(spec: FormatSpec, file: &File) -> Result<u64> {
+pub(crate) fn check_open_file_len(spec: FormatSpec, file: &File) -> Result<u64> {
     let file_len = file.metadata()?.len();
     spec.read_limits.check(ReadLimitKey::FileLen, file_len)?;
     Ok(file_len)
@@ -5450,6 +5735,371 @@ fn read_record_entry_at(
     }
 
     Ok(RecordRead::Entry(entry))
+}
+
+#[cfg(feature = "high-cardinality-dev")]
+#[derive(Debug)]
+pub(crate) struct NativeStreamScanner {
+    spec: FormatSpec,
+    file: File,
+    snapshot: SnapshotFile,
+    offset: u64,
+    accounting: ScanAccounting,
+    records: u64,
+    previous_sequence: Option<u64>,
+}
+
+#[cfg(all(test, feature = "high-cardinality-dev"))]
+thread_local! {
+    static STREAM_SCANNER_CONSTRUCTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static STREAM_SCANNER_ENTRIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static STREAM_POINT_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, feature = "high-cardinality-dev"))]
+pub(crate) fn reset_stream_io_counters() {
+    STREAM_SCANNER_CONSTRUCTIONS.set(0);
+    STREAM_SCANNER_ENTRIES.set(0);
+    STREAM_POINT_READS.set(0);
+}
+
+#[cfg(all(test, feature = "high-cardinality-dev"))]
+pub(crate) fn stream_io_counters() -> (u64, u64, u64) {
+    (
+        STREAM_SCANNER_CONSTRUCTIONS.get(),
+        STREAM_SCANNER_ENTRIES.get(),
+        STREAM_POINT_READS.get(),
+    )
+}
+
+#[cfg(feature = "high-cardinality-dev")]
+impl NativeStreamScanner {
+    pub(crate) fn from_snapshot(spec: FormatSpec, snapshot: SnapshotFile) -> Result<Self> {
+        let mut file = snapshot.try_clone_file()?;
+        let header_len = read_file_header(spec, &mut file)?;
+        let mut accounting = ScanAccounting::default();
+        accounting.advance(spec, header_len)?;
+        #[cfg(test)]
+        STREAM_SCANNER_CONSTRUCTIONS.set(STREAM_SCANNER_CONSTRUCTIONS.get() + 1);
+        Ok(Self {
+            spec,
+            file,
+            snapshot,
+            offset: header_len,
+            accounting,
+            records: 0,
+            previous_sequence: None,
+        })
+    }
+
+    pub(crate) fn next_entry(&mut self) -> Result<Option<RecordIndexEntry>> {
+        if self.offset == self.snapshot.len() {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        STREAM_SCANNER_ENTRIES.set(STREAM_SCANNER_ENTRIES.get() + 1);
+        let partial_boundary = self.spec.spec_needs_record_footer().then_some(self.offset);
+        let entry = match read_record_entry_at(
+            self.spec,
+            &mut self.file,
+            self.snapshot.len(),
+            self.offset,
+            partial_boundary,
+            None,
+            &mut self.accounting,
+        )? {
+            RecordRead::Entry(entry) => entry,
+            RecordRead::RecoverableTail(tail) => {
+                self.offset = tail.truncate_to;
+                return Ok(None);
+            }
+        };
+        if matches!(
+            entry.block_id,
+            OP_BLOCK_ID | INDEX_BLOCK_ID | COMMIT_BLOCK_ID
+        ) {
+            return Err(Error::StreamingUnsupported);
+        }
+        if self
+            .previous_sequence
+            .is_some_and(|previous| entry.sequence <= previous)
+        {
+            return Err(Error::StreamingUnsupported);
+        }
+        self.records = self
+            .records
+            .checked_add(1)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "record count",
+            })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::Records, self.records)?;
+        self.previous_sequence = Some(entry.sequence);
+        self.offset = entry.checked_physical_end()?;
+        Ok(Some(entry))
+    }
+
+    pub(crate) const fn logical_eof(&self) -> u64 {
+        self.offset
+    }
+
+    pub(crate) fn snapshot(&self) -> &SnapshotFile {
+        &self.snapshot
+    }
+
+    pub(crate) const fn spec(&self) -> FormatSpec {
+        self.spec
+    }
+}
+
+#[cfg(feature = "high-cardinality-dev")]
+pub(crate) fn read_stream_entry_at(
+    spec: FormatSpec,
+    snapshot: &SnapshotFile,
+    offset: u64,
+    physical_len: u64,
+) -> Result<RecordIndexEntry> {
+    let validated = snapshot.validate(
+        crate::scalable_extent::UntrustedRecordPointer::new(offset, physical_len),
+        spec.spec_needs_record_footer(),
+    )?;
+    let span = validated.span();
+    #[cfg(test)]
+    STREAM_POINT_READS.set(STREAM_POINT_READS.get() + 1);
+    let mut file = snapshot.try_clone_file()?;
+    let entry = read_stream_entry_at_file(spec, &mut file, snapshot, offset)?;
+    if entry.record_offset != span.record_offset().get()
+        || entry.payload_offset != span.payload_offset().get()
+        || entry.payload_len != span.payload_len().get()
+        || entry.checked_physical_end()? != span.end().get()
+    {
+        return Err(Error::InvalidIndexCheckpoint);
+    }
+    Ok(entry)
+}
+
+#[cfg(feature = "high-cardinality-dev")]
+pub(crate) fn read_stream_entry_at_file(
+    spec: FormatSpec,
+    file: &mut File,
+    snapshot: &SnapshotFile,
+    offset: u64,
+) -> Result<RecordIndexEntry> {
+    let mut accounting = ScanAccounting::default();
+    let partial_boundary = spec.spec_needs_record_footer().then_some(offset);
+    match read_record_entry_at(
+        spec,
+        file,
+        snapshot.len(),
+        offset,
+        partial_boundary,
+        None,
+        &mut accounting,
+    )? {
+        RecordRead::Entry(entry) => Ok(entry),
+        RecordRead::RecoverableTail(_) => Err(Error::CorruptTail { offset }),
+    }
+}
+
+#[cfg(feature = "high-cardinality-dev")]
+#[derive(Debug)]
+pub(crate) struct PreparedStreamRecord {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) info: AppendInfo,
+    pub(crate) block_id: u32,
+    pub(crate) block_version: u16,
+    pub(crate) flags: u16,
+    pub(crate) checksum: u32,
+}
+
+#[cfg(feature = "high-cardinality-dev")]
+pub(crate) fn prepare_stream_user_record<T: VarveBlock>(
+    spec: FormatSpec,
+    value: &T,
+    sequence: u64,
+    record_offset: u64,
+    prev_same_block_offset: Option<u64>,
+    prev_same_key_offset: Option<u64>,
+) -> Result<PreparedStreamRecord> {
+    let endian = T::ENDIAN.unwrap_or(spec.endian);
+    let logical_limit = spec
+        .read_limits
+        .require(ReadLimitKey::LogicalPayloadLen)?
+        .unwrap_or(u64::MAX);
+    let logical = encode_to_vec_limited(
+        value,
+        endian,
+        logical_limit,
+        ReadLimitKey::LogicalPayloadLen.resource(),
+    )?;
+    let stored = prepare_user_record_payload(spec, T::ID, T::KIND, &logical)?;
+    prepare_stream_record(
+        spec,
+        T::ID,
+        T::VERSION,
+        stored.flags,
+        stored.uncompressed_len_hint,
+        &stored.bytes,
+        sequence,
+        record_offset,
+        prev_same_block_offset,
+        prev_same_key_offset,
+    )
+}
+
+#[cfg(feature = "high-cardinality-dev")]
+pub(crate) fn prepare_stream_tombstone_record<T: VarveKeyedBlock>(
+    spec: FormatSpec,
+    key: &T::Key,
+    sequence: u64,
+    record_offset: u64,
+    prev_same_block_offset: Option<u64>,
+    prev_same_key_offset: Option<u64>,
+) -> Result<PreparedStreamRecord> {
+    let payload = encode_internal_key_payload::<T>(spec, key)?;
+    prepare_stream_record(
+        spec,
+        TOMBSTONE_BLOCK_ID,
+        1,
+        RECORD_FLAG_INTERNAL,
+        0,
+        &payload,
+        sequence,
+        record_offset,
+        prev_same_block_offset,
+        prev_same_key_offset,
+    )
+}
+
+#[cfg(feature = "high-cardinality-dev")]
+pub(crate) fn prepare_stream_manifest_record(
+    spec: FormatSpec,
+    sequence: u64,
+    record_offset: u64,
+) -> Result<PreparedStreamRecord> {
+    let payload = encode_schema_manifest(spec)?;
+    prepare_stream_record(
+        spec,
+        MANIFEST_BLOCK_ID,
+        1,
+        RECORD_FLAG_INTERNAL,
+        0,
+        &payload,
+        sequence,
+        record_offset,
+        None,
+        None,
+    )
+}
+
+#[cfg(feature = "high-cardinality-dev")]
+#[allow(clippy::too_many_arguments)]
+fn prepare_stream_record(
+    spec: FormatSpec,
+    block_id: u32,
+    block_version: u16,
+    flags: u16,
+    uncompressed_len_hint: u32,
+    payload: &[u8],
+    sequence: u64,
+    record_offset: u64,
+    prev_same_block_offset: Option<u64>,
+    prev_same_key_offset: Option<u64>,
+) -> Result<PreparedStreamRecord> {
+    let prev_same_block_offset = spec
+        .index_policy
+        .block_offset_chain
+        .then_some(prev_same_block_offset)
+        .flatten();
+    let prev_same_key_offset = spec
+        .index_policy
+        .keyed_offset_chain
+        .then_some(prev_same_key_offset)
+        .flatten();
+    let payload_len =
+        u64::try_from(payload.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+    spec.read_limits
+        .check(ReadLimitKey::RecordPayloadLen, payload_len)?;
+    let logical_len =
+        record_logical_len_from_parts(spec, block_id, flags, uncompressed_len_hint, payload)?;
+    spec.read_limits
+        .check(ReadLimitKey::LogicalPayloadLen, logical_len)?;
+    let payload_offset =
+        record_offset
+            .checked_add(RECORD_HEADER_LEN)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "file length",
+            })?;
+    let payload_end =
+        payload_offset
+            .checked_add(payload_len)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "file length",
+            })?;
+    let footer = if spec.spec_needs_record_footer() {
+        encode_record_footer(RecordFooterFields {
+            prev_same_block_offset,
+            prev_same_key_offset,
+        })?
+    } else {
+        Vec::new()
+    };
+    let _record_end =
+        payload_end
+            .checked_add(footer.len() as u64)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "file length",
+            })?;
+    let header = RecordHeaderFields {
+        block_id,
+        block_version,
+        flags,
+        sequence,
+        payload_len,
+        checksum: 0,
+        uncompressed_len_hint,
+    };
+    let checksum = checksum_record_fields(spec, record_offset, header, payload, &footer)?;
+    let header = encode_native_record_header(
+        RecordHeaderFields { checksum, ..header },
+        record_offset,
+        record_footer_len(spec),
+    )?;
+    let total_len = header
+        .len()
+        .checked_add(payload.len())
+        .and_then(|len| len.checked_add(footer.len()))
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "record buffer length",
+        })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(total_len)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "record buffer",
+            requested: total_len as u64,
+        })?;
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(payload);
+    bytes.extend_from_slice(&footer);
+    Ok(PreparedStreamRecord {
+        bytes,
+        block_id,
+        block_version,
+        flags,
+        checksum,
+        info: AppendInfo {
+            sequence,
+            record_offset,
+            payload_offset,
+            payload_len,
+            footer_offset: (!footer.is_empty()).then_some(payload_end),
+            prev_same_block_offset,
+            prev_same_key_offset,
+            committed: true,
+        },
+    })
 }
 
 fn load_index(
@@ -6294,6 +6944,7 @@ fn write_matrix_sidecar_file<P: AsRef<Path>>(
     sidecar_path: P,
     generation: u64,
     payload: &[u8],
+    identity: MatrixNativeIdentity,
 ) -> Result<MatrixSidecarManifest> {
     let payload_len =
         u64::try_from(payload.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
@@ -6312,7 +6963,7 @@ fn write_matrix_sidecar_file<P: AsRef<Path>>(
         category_len_u64,
         payload_len,
     )?;
-    let manifest = matrix_sidecar_manifest_for(spec, category, generation, payload)?;
+    let manifest = matrix_sidecar_manifest_for(spec, category, generation, payload, identity)?;
     let magic_len =
         u16::try_from(manifest.format_magic.len()).map_err(|_| Error::InvalidMatrixSidecar)?;
     let category_len =
@@ -6342,15 +6993,51 @@ fn write_matrix_sidecar_file<P: AsRef<Path>>(
     bytes.extend_from_slice(&manifest.payload_len.to_le_bytes());
     bytes.extend_from_slice(&manifest.payload_crc32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&manifest.native_fingerprint);
+    bytes.extend_from_slice(&manifest.matrix_layout_generation.to_le_bytes());
     debug_assert_eq!(bytes.len(), MATRIX_SIDECAR_FIXED_LEN);
     bytes.extend_from_slice(&manifest.format_magic);
     bytes.extend_from_slice(manifest.category.as_bytes());
 
-    let mut file = File::create(sidecar_path)?;
-    file.write_all(&bytes)?;
-    file.write_all(payload)?;
-    file.sync_all()?;
-    Ok(manifest)
+    // Publish atomically via a same-directory RAII temp: write the full sidecar
+    // into a private temp, fsync it, then atomically replace the destination and
+    // sync the parent directory. A crash before the replace leaves the previous
+    // sidecar untouched; the old in-place `File::create` truncated it eagerly
+    // and could expose a partial sidecar (DUR-05).
+    let sidecar_path = sidecar_path.as_ref();
+    let (temp_path, mut temp_file) = create_rewrite_temp_file(sidecar_path)?;
+    let write_result = (|| -> Result<()> {
+        temp_file.write_all(&bytes)?;
+        temp_file.write_all(payload)?;
+        temp_file.flush()?;
+        temp_file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        drop(temp_file);
+        let _ = remove_file(&temp_path);
+        return Err(error);
+    }
+    drop(temp_file);
+
+    match replace_path_atomically(&temp_path, sidecar_path) {
+        Ok(ReplaceDurability::Durable) => Ok(manifest),
+        Ok(ReplaceDurability::ParentSyncPending(sync_error)) => {
+            // The replacement is already visible at `sidecar_path`; only the
+            // parent-directory entry's durability is pending. Do not delete the
+            // now-published file, and surface the durability gap so a caller
+            // that needs a hard guarantee can react (a regenerable sidecar may
+            // simply be rewritten).
+            Err(Error::PublishedButParentSyncPending {
+                path: sidecar_path.display().to_string(),
+                source: Box::new(sync_error),
+            })
+        }
+        Err(error) => {
+            let _ = remove_file(&temp_path);
+            Err(error)
+        }
+    }
 }
 
 fn read_matrix_sidecar_file<P: AsRef<Path>>(
@@ -6358,6 +7045,7 @@ fn read_matrix_sidecar_file<P: AsRef<Path>>(
     category: &str,
     sidecar_path: P,
     expected_generation: Option<u64>,
+    identity: MatrixNativeIdentity,
 ) -> Result<(MatrixSidecarManifest, Vec<u8>)> {
     let mut file = File::open(sidecar_path)?;
     let file_len = file.metadata()?.len();
@@ -6372,7 +7060,9 @@ fn read_matrix_sidecar_file<P: AsRef<Path>>(
     }
     let version = u16::from_le_bytes(fixed[4..6].try_into().expect("slice"));
     if version != MATRIX_SIDECAR_VERSION {
-        return Err(Error::InvalidMatrixSidecar);
+        // A different envelope version (notably legacy v1, which lacked native
+        // identity) is refused as stale and regenerable rather than trusted.
+        return Err(Error::MatrixSidecarMismatch("sidecar version"));
     }
     let format_version = u16::from_le_bytes(fixed[8..10].try_into().expect("slice"));
     let flags = u16::from_le_bytes(fixed[6..8].try_into().expect("slice"));
@@ -6384,6 +7074,15 @@ fn read_matrix_sidecar_file<P: AsRef<Path>>(
     let payload_len = u64::from_le_bytes(fixed[32..40].try_into().expect("slice"));
     let payload_crc32 = u32::from_le_bytes(fixed[40..44].try_into().expect("slice"));
     let trailing_reserved = u32::from_le_bytes(fixed[44..48].try_into().expect("slice"));
+    let mut native_fingerprint = [0u8; 32];
+    native_fingerprint.copy_from_slice(
+        &fixed[MATRIX_SIDECAR_FINGERPRINT_OFFSET..MATRIX_SIDECAR_LAYOUT_GENERATION_OFFSET],
+    );
+    let matrix_layout_generation = u64::from_le_bytes(
+        fixed[MATRIX_SIDECAR_LAYOUT_GENERATION_OFFSET..MATRIX_SIDECAR_FIXED_LEN]
+            .try_into()
+            .expect("slice"),
+    );
     let plan = crate::matrix::matrix_sidecar_read_plan(
         spec,
         file_len,
@@ -6421,8 +7120,10 @@ fn read_matrix_sidecar_file<P: AsRef<Path>>(
         generation,
         payload_len,
         payload_crc32,
+        native_fingerprint,
+        matrix_layout_generation,
     };
-    validate_matrix_sidecar_manifest(spec, category, expected_generation, &manifest)?;
+    validate_matrix_sidecar_manifest(spec, category, expected_generation, identity, &manifest)?;
     Ok((manifest, payload))
 }
 
@@ -6444,6 +7145,7 @@ fn matrix_sidecar_manifest_for(
     category: &str,
     generation: u64,
     payload: &[u8],
+    identity: MatrixNativeIdentity,
 ) -> Result<MatrixSidecarManifest> {
     if category.is_empty() {
         return Err(Error::InvalidMatrixSidecar);
@@ -6478,6 +7180,8 @@ fn matrix_sidecar_manifest_for(
             .try_into()
             .map_err(|_| Error::InvalidMatrixSidecar)?,
         payload_crc32: crc32_bytes(payload)?,
+        native_fingerprint: identity.fingerprint,
+        matrix_layout_generation: identity.layout_generation,
     })
 }
 
@@ -6485,6 +7189,7 @@ fn validate_matrix_sidecar_manifest(
     spec: FormatSpec,
     category: &str,
     expected_generation: Option<u64>,
+    identity: MatrixNativeIdentity,
     manifest: &MatrixSidecarManifest,
 ) -> Result<()> {
     if manifest.format_magic != spec.magic {
@@ -6499,12 +7204,86 @@ fn validate_matrix_sidecar_manifest(
     if manifest.category != category {
         return Err(Error::MatrixSidecarMismatch("category"));
     }
+    // Bind to a specific native file and its matrix layout: a same-spec,
+    // same-generation sibling produces a different OS-object fingerprint and is
+    // rejected (DUR-04).
+    if manifest.native_fingerprint != identity.fingerprint {
+        return Err(Error::MatrixSidecarMismatch("native identity"));
+    }
+    if manifest.matrix_layout_generation != identity.layout_generation {
+        return Err(Error::MatrixSidecarMismatch("matrix layout generation"));
+    }
     if let Some(expected_generation) = expected_generation
         && manifest.generation != expected_generation
     {
         return Err(Error::MatrixSidecarMismatch("generation"));
     }
     Ok(())
+}
+
+/// Folds the native matrix file's OS-object identity and schema hash into a
+/// 32-byte fingerprint.
+///
+/// Mirrors the scalable sidecar identity machinery
+/// (`stream::primary_identity` / `opened_file_identity`), which is compiled
+/// only under `high-cardinality-dev`; the matrix module is always built, so the
+/// OS-object identity is recomputed here rather than reused across the feature
+/// boundary. Uses the CRC helper so the fingerprint honors the same
+/// `integrity` gate the rest of the sidecar envelope requires.
+fn native_object_fingerprint(spec: FormatSpec, file: &File) -> Result<[u8; 32]> {
+    let object_identity = opened_file_identity(file)?;
+    let schema_hash = if spec.schema_hash == 0 {
+        spec.computed_schema_hash()
+    } else {
+        spec.schema_hash
+    };
+    let mut fingerprint = [0u8; 32];
+    for lane in 0..8u32 {
+        let mut buffer = Vec::with_capacity(4 + 8 + object_identity.len());
+        buffer.extend_from_slice(&lane.to_le_bytes());
+        buffer.extend_from_slice(&schema_hash.to_le_bytes());
+        buffer.extend_from_slice(&object_identity);
+        let value = crc32_bytes(&buffer)?;
+        fingerprint[(lane as usize) * 4..(lane as usize + 1) * 4]
+            .copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(fingerprint)
+}
+
+#[cfg(unix)]
+fn opened_file_identity(file: &File) -> Result<Vec<u8>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(&metadata.dev().to_le_bytes());
+    bytes.extend_from_slice(&metadata.ino().to_le_bytes());
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn opened_file_identity(file: &File) -> Result<Vec<u8>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // The handle belongs to `file`, the output points to initialized writable
+    // storage, and the OS call does not outlive either value.
+    let ok =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, information.as_mut_ptr()) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // A successful call initializes every field of BY_HANDLE_FILE_INFORMATION.
+    let information = unsafe { information.assume_init() };
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    let mut bytes = Vec::with_capacity(12);
+    bytes.extend_from_slice(&information.dwVolumeSerialNumber.to_le_bytes());
+    bytes.extend_from_slice(&file_index.to_le_bytes());
+    Ok(bytes)
 }
 
 pub(crate) fn create_rewrite_temp_file(path: &Path) -> Result<(PathBuf, File)> {
@@ -6538,20 +7317,56 @@ pub(crate) fn create_rewrite_temp_file(path: &Path) -> Result<(PathBuf, File)> {
     .into())
 }
 
+/// Outcome of a pathname publication whose rename step succeeded.
+///
+/// `Err` from [`replace_path_atomically`] always means the publication itself
+/// failed and the target pathname still resolves to the previous generation.
+/// Once the rename has happened the target is already the new generation, so a
+/// later durability failure must not be reported as a plain error: callers
+/// must keep operating on the published generation (rebind or poison the
+/// writer) and surface [`Error::PublishedButParentSyncPending`] instead.
+#[derive(Debug)]
+pub(crate) enum ReplaceDurability {
+    /// The replacement is visible at the target path and the parent-directory
+    /// entry was synced.
+    Durable,
+    /// The replacement is visible at the target path, but the parent-directory
+    /// sync failed, so the rename is not yet guaranteed to survive power loss.
+    ParentSyncPending(Error),
+}
+
 #[cfg(not(windows))]
-pub(crate) fn replace_path_atomically(replacement: &Path, target: &Path) -> Result<()> {
-    std::fs::rename(replacement, target)?;
-    Ok(())
+pub(crate) fn replace_path_atomically(
+    replacement: &Path,
+    target: &Path,
+) -> Result<ReplaceDurability> {
+    crate::scalable_fault_point("replace.atomic");
+    let replace = std::fs::rename(replacement, target);
+    crate::scalable_fault_point("replace.atomic");
+    replace?;
+    match sync_parent_directory(target) {
+        Ok(()) => Ok(ReplaceDurability::Durable),
+        Err(error) => Ok(ReplaceDurability::ParentSyncPending(error)),
+    }
 }
 
 #[cfg(windows)]
-pub(crate) fn replace_path_atomically(replacement: &Path, target: &Path) -> Result<()> {
+pub(crate) fn replace_path_atomically(
+    replacement: &Path,
+    target: &Path,
+) -> Result<ReplaceDurability> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 
     if !target.exists() {
-        std::fs::rename(replacement, target)?;
-        return Ok(());
+        crate::scalable_fault_point("replace.atomic");
+        let replace = std::fs::rename(replacement, target);
+        crate::scalable_fault_point("replace.atomic");
+        replace?;
+        return match sync_parent_directory(target) {
+            Ok(()) => Ok(ReplaceDurability::Durable),
+            Err(error) => Ok(ReplaceDurability::ParentSyncPending(error)),
+        };
     }
 
     let replacement_wide: Vec<u16> = replacement
@@ -6564,6 +7379,7 @@ pub(crate) fn replace_path_atomically(replacement: &Path, target: &Path) -> Resu
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    crate::scalable_fault_point("replace.atomic");
     let ok = unsafe {
         ReplaceFileW(
             target_wide.as_ptr(),
@@ -6574,10 +7390,114 @@ pub(crate) fn replace_path_atomically(replacement: &Path, target: &Path) -> Resu
             std::ptr::null_mut(),
         )
     };
+    crate::scalable_fault_point("replace.atomic");
     if ok == 0 {
         return Err(std::io::Error::last_os_error().into());
     }
+    match sync_parent_directory(target) {
+        Ok(()) => Ok(ReplaceDurability::Durable),
+        Err(error) => Ok(ReplaceDurability::ParentSyncPending(error)),
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    record_parent_directory_sync();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    crate::scalable_fault_point("replace.parent_sync");
+    #[cfg(feature = "scalable-fault-injection")]
+    take_injected_parent_sync_failure()?;
+    let sync = File::open(parent).and_then(|directory| directory.sync_all());
+    crate::scalable_fault_point("replace.parent_sync");
+    sync?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    #[cfg(test)]
+    record_parent_directory_sync();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let directory = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(parent)?;
+    crate::scalable_fault_point("replace.parent_sync");
+    #[cfg(feature = "scalable-fault-injection")]
+    take_injected_parent_sync_failure()?;
+    let sync = match directory.sync_all() {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            // Windows filesystems commonly reject FlushFileBuffers on a
+            // directory handle. ReplaceFileW/rename has already completed;
+            // do not turn that platform limitation into a false write failure.
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    };
+    crate::scalable_fault_point("replace.parent_sync");
+    sync
+}
+
+#[cfg(feature = "scalable-fault-injection")]
+static INJECTED_PARENT_SYNC_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "scalable-fault-injection")]
+fn take_injected_parent_sync_failure() -> Result<()> {
+    use std::sync::atomic::Ordering;
+
+    let mut current = INJECTED_PARENT_SYNC_FAILURES.load(Ordering::Acquire);
+    while current != 0 {
+        match INJECTED_PARENT_SYNC_FAILURES.compare_exchange(
+            current,
+            current - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Err(std::io::Error::other("injected parent-directory sync failure").into());
+            }
+            Err(observed) => current = observed,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static PARENT_DIRECTORY_SYNC_CALLS: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn record_parent_directory_sync() {
+    PARENT_DIRECTORY_SYNC_CALLS.set(PARENT_DIRECTORY_SYNC_CALLS.get() + 1);
+}
+
+#[cfg(test)]
+fn reset_parent_directory_sync_calls() {
+    PARENT_DIRECTORY_SYNC_CALLS.set(0);
+}
+
+#[cfg(test)]
+fn parent_directory_sync_calls() -> u64 {
+    PARENT_DIRECTORY_SYNC_CALLS.get()
 }
 
 #[cfg(feature = "integrity")]
@@ -6606,8 +7526,13 @@ fn crc32_record_bytes(_header: &[u8], _payload: &[u8], _footer: &[u8]) -> Result
 
 #[derive(Debug)]
 pub(crate) struct WriterLock {
-    path: PathBuf,
-    _file: File,
+    file: File,
+    // Authoritative single-writer lock, held on the native file object itself.
+    // Hard links and other path aliases all resolve to the same object, so an
+    // object lock cannot be bypassed the way the path-derived ".lock" marker
+    // can. The marker file above remains diagnostic metadata (pid, timestamps,
+    // break-policy machinery) plus a fast same-path exclusion.
+    native_guard: Option<File>,
 }
 
 impl WriterLock {
@@ -6615,50 +7540,201 @@ impl WriterLock {
         Self::acquire_with_policy(path, WriterLockBreakPolicy::Refuse)
     }
 
-    fn acquire_with_policy(target_path: &Path, policy: WriterLockBreakPolicy) -> Result<Self> {
+    pub(crate) fn acquire_with_policy(
+        target_path: &Path,
+        policy: WriterLockBreakPolicy,
+    ) -> Result<Self> {
         let path = lock_path(target_path);
-        for _ in 0..2 {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => {
-                    let info = WriterLockInfo {
-                        path: path.clone(),
-                        target_path: absolute_target_path(target_path)?,
-                        process_id: std::process::id(),
-                        created_unix_ms: unix_time_ms(),
-                    };
-                    if let Err(error) = write_writer_lock_info(&mut file, &info) {
-                        let _ = remove_file(&path);
-                        return Err(error);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        match try_lock_writer_guard(&file) {
+            Ok(()) => {}
+            Err(WriterGuardLockError::WouldBlock) => {
+                return match policy {
+                    WriterLockBreakPolicy::Refuse => {
+                        Err(Error::WriterLockHeld(path.display().to_string()))
                     }
-                    return Ok(Self { path, _file: file });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if policy == WriterLockBreakPolicy::Refuse {
-                        return Err(Error::WriterLockHeld(path.display().to_string()));
-                    }
-                    let Some(info) = read_writer_lock_info(target_path)? else {
-                        continue;
-                    };
-                    if should_break_writer_lock(&info, policy) {
-                        remove_file(&info.path)?;
-                        continue;
-                    }
-                    return match policy {
-                        WriterLockBreakPolicy::Refuse => {
-                            Err(Error::WriterLockHeld(path.display().to_string()))
-                        }
-                        _ => Err(Error::WriterLockBreakRefused(path.display().to_string())),
-                    };
-                }
-                Err(error) => return Err(error.into()),
+                    _ => Err(Error::WriterLockBreakRefused(path.display().to_string())),
+                };
+            }
+            Err(WriterGuardLockError::Io(error)) => return Err(error.into()),
+        }
+
+        let marker_present = file.metadata()?.len() != 0;
+        if marker_present && policy == WriterLockBreakPolicy::Refuse {
+            return Err(Error::WriterLockHeld(path.display().to_string()));
+        }
+        if marker_present {
+            let info = read_writer_lock_info_file(&path, &mut file)?
+                .ok_or_else(|| Error::WriterLockMalformed(path.display().to_string()))?;
+            if !should_break_writer_lock(&info, policy) {
+                return Err(Error::WriterLockBreakRefused(path.display().to_string()));
             }
         }
-        Err(Error::WriterLockHeld(path.display().to_string()))
+
+        // An object lock held by a live writer can never be broken: the OS
+        // releases it only when that writer's handles close, so a conflict here
+        // always means an active writer, regardless of the marker break policy.
+        let native_guard = probe_native_target_lock(target_path)?;
+
+        let info = WriterLockInfo {
+            path: path.clone(),
+            target_path: absolute_target_path(target_path)?,
+            process_id: std::process::id(),
+            created_unix_ms: unix_time_ms(),
+        };
+        if let Err(error) = write_writer_lock_info(&mut file, &info) {
+            let _ = clear_writer_lock_info(&mut file);
+            return Err(error);
+        }
+        Ok(Self { file, native_guard })
     }
+
+    /// Moves the authoritative object lock onto the writer's own native handle.
+    ///
+    /// Writers must call this on the handle they keep open for their lifetime:
+    /// once for a freshly created file (the acquire-time probe cannot lock a
+    /// file that does not exist yet) and again whenever a publication rebinds
+    /// the writer to a new file generation. Dropping the previous guard first
+    /// is required because two exclusive range locks on the same file object
+    /// conflict even within one process; a competing writer that wins the
+    /// resulting microscopic window makes this call fail, which aborts the
+    /// caller instead of ever admitting two writers.
+    pub(crate) fn bind_native(&mut self, native: &File, target_path: &Path) -> Result<()> {
+        self.native_guard = None;
+        let guard = native.try_clone()?;
+        match try_lock_native_guard(&guard) {
+            Ok(()) => {
+                self.native_guard = Some(guard);
+                Ok(())
+            }
+            Err(WriterGuardLockError::WouldBlock) => {
+                Err(Error::WriterLockHeld(target_path.display().to_string()))
+            }
+            Err(WriterGuardLockError::Io(error)) => Err(error.into()),
+        }
+    }
+}
+
+/// Locks the native file object behind `target_path` if the file exists.
+///
+/// A missing file has no aliases, so there is nothing to lock yet; creators
+/// call [`WriterLock::bind_native`] on the handle they create instead.
+fn probe_native_target_lock(target_path: &Path) -> Result<Option<File>> {
+    let native = match OpenOptions::new().read(true).open(target_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    match try_lock_native_guard(&native) {
+        Ok(()) => Ok(Some(native)),
+        Err(WriterGuardLockError::WouldBlock) => {
+            Err(Error::WriterLockHeld(target_path.display().to_string()))
+        }
+        Err(WriterGuardLockError::Io(error)) => Err(error.into()),
+    }
+}
+
+enum WriterGuardLockError {
+    WouldBlock,
+    Io(std::io::Error),
+}
+
+#[cfg(not(windows))]
+fn try_lock_writer_guard(file: &File) -> std::result::Result<(), WriterGuardLockError> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(WriterGuardLockError::WouldBlock),
+        Err(std::fs::TryLockError::Error(error)) => Err(WriterGuardLockError::Io(error)),
+    }
+}
+
+#[cfg(windows)]
+fn try_lock_writer_guard(file: &File) -> std::result::Result<(), WriterGuardLockError> {
+    try_lock_exclusive_range(file, WRITER_LOCK_MAX_LEN)
+}
+
+// Advisory whole-file lock on Unix; both native and marker guards share it.
+#[cfg(not(windows))]
+fn try_lock_native_guard(file: &File) -> std::result::Result<(), WriterGuardLockError> {
+    try_lock_writer_guard(file)
+}
+
+// Windows range locks are mandatory, so the native guard must live at an
+// offset no real data access can ever overlap. Record extents are bounded by
+// the file length, which can never reach this reserved offset, so ordinary
+// readers and the writer's own data I/O are unaffected.
+#[cfg(windows)]
+fn try_lock_native_guard(file: &File) -> std::result::Result<(), WriterGuardLockError> {
+    const NATIVE_WRITER_GUARD_OFFSET: u64 = u64::MAX - 1;
+    try_lock_exclusive_range(file, NATIVE_WRITER_GUARD_OFFSET)
+}
+
+#[cfg(windows)]
+fn try_lock_exclusive_range(
+    file: &File,
+    offset: u64,
+) -> std::result::Result<(), WriterGuardLockError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0_0};
+
+    let mut overlapped = OVERLAPPED::default();
+    overlapped.Anonymous.Anonymous = OVERLAPPED_0_0 {
+        Offset: offset as u32,
+        OffsetHigh: (offset >> 32) as u32,
+    };
+    // SAFETY: `file` remains open for the lifetime of the acquired lock, the
+    // OVERLAPPED value is initialized for a synchronous one-byte range lock,
+    // and the pointer is valid for the duration of this call.
+    let locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as HANDLE,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if locked != 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Err(WriterGuardLockError::WouldBlock)
+    } else {
+        Err(WriterGuardLockError::Io(error))
+    }
+}
+
+/// Clears stale writer-lock metadata without opening or scanning the target file.
+///
+/// The policy is always explicit. `Refuse` preserves the default single-writer
+/// behavior, while process-aware policies only break a lock after their
+/// predicate succeeds. An OS-level exclusive lock is acquired before metadata
+/// is inspected or changed, so an active or concurrently recovering writer
+/// cannot be displaced.
+pub fn clear_stale_writer_lock(
+    target_path: impl AsRef<Path>,
+    policy: WriterLockBreakPolicy,
+) -> Result<()> {
+    let mut lock = WriterLock::acquire_with_policy(target_path.as_ref(), policy)?;
+    clear_writer_lock_info(&mut lock.file)?;
+    Ok(())
 }
 
 fn write_writer_lock_info(file: &mut File, info: &WriterLockInfo) -> Result<()> {
     let target = info.target_path.to_string_lossy();
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
     file.write_all(
         format!(
             "{WRITER_LOCK_MAGIC}\npid={}\ncreated_unix_ms={}\ntarget={target}\n",
@@ -6670,17 +7746,31 @@ fn write_writer_lock_info(file: &mut File, info: &WriterLockInfo) -> Result<()> 
     Ok(())
 }
 
+fn clear_writer_lock_info(file: &mut File) -> Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.flush()?;
+    Ok(())
+}
+
 fn read_writer_lock_info(target_path: &Path) -> Result<Option<WriterLockInfo>> {
     let path = lock_path(target_path);
-    let file = match File::open(&path) {
+    let mut file = match File::open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(Error::WriterLockMalformed(path.display().to_string())),
     };
+    read_writer_lock_info_file(&path, &mut file)
+}
+
+fn read_writer_lock_info_file(path: &Path, file: &mut File) -> Result<Option<WriterLockInfo>> {
     let len = file
         .metadata()
         .map_err(|_| Error::WriterLockMalformed(path.display().to_string()))?
         .len();
+    if len == 0 {
+        return Ok(None);
+    }
     if len > WRITER_LOCK_MAX_LEN {
         return Err(Error::WriterLockMalformed(path.display().to_string()));
     }
@@ -6693,13 +7783,15 @@ fn read_writer_lock_info(target_path: &Path) -> Result<Option<WriterLockInfo>> {
             resource: "writer lock metadata",
             requested: len,
         })?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| Error::WriterLockMalformed(path.display().to_string()))?;
     file.take(WRITER_LOCK_MAX_LEN.saturating_add(1))
         .read_to_string(&mut contents)
         .map_err(|_| Error::WriterLockMalformed(path.display().to_string()))?;
     if contents.len() as u64 > WRITER_LOCK_MAX_LEN {
         return Err(Error::WriterLockMalformed(path.display().to_string()));
     }
-    parse_writer_lock_info(&path, &contents).map(Some)
+    parse_writer_lock_info(path, &contents).map(Some)
 }
 
 fn parse_writer_lock_info(path: &Path, contents: &str) -> Result<WriterLockInfo> {
@@ -6783,24 +7875,63 @@ fn absolute_target_path(path: &Path) -> Result<PathBuf> {
 
 #[cfg(windows)]
 fn process_is_absent(process_id: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+    };
 
     if process_id == std::process::id() {
         return false;
     }
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+            0,
+            process_id,
+        )
+    };
     if handle.is_null() {
         return std::io::Error::last_os_error().raw_os_error()
             == Some(ERROR_INVALID_PARAMETER as i32);
     }
+    // A terminated Windows process remains openable while any process still
+    // holds a handle to its signaled kernel object. Query the wait state instead
+    // of treating every successful OpenProcess call as a live writer.
+    let wait = unsafe { WaitForSingleObject(handle, 0) };
     unsafe {
         CloseHandle(handle);
     }
-    false
+    match wait {
+        WAIT_OBJECT_0 => true,
+        WAIT_TIMEOUT => false,
+        _ => false,
+    }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn process_is_absent(process_id: u32) -> bool {
+    if process_id == std::process::id() {
+        return false;
+    }
+    let Ok(process_id) = libc::pid_t::try_from(process_id) else {
+        return false;
+    };
+    if process_id <= 0 {
+        return false;
+    }
+
+    // SAFETY: signal 0 performs an existence/permission check only. Positive
+    // PIDs avoid process-group semantics, and no pointer crosses the FFI.
+    if unsafe { libc::kill(process_id, 0) } == 0 {
+        return false;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn process_is_absent(process_id: u32) -> bool {
     let _ = process_id;
     false
@@ -6808,7 +7939,7 @@ fn process_is_absent(process_id: u32) -> bool {
 
 impl Drop for WriterLock {
     fn drop(&mut self) {
-        let _ = remove_file(&self.path);
+        let _ = clear_writer_lock_info(&mut self.file);
     }
 }
 
@@ -6865,6 +7996,8 @@ mod tests {
         const VERSION: u16 = 1;
         const KIND: BlockKind = BlockKind::Matrix;
         const ENDIAN: Option<Endian> = None;
+        const IS_KEYED: bool = false;
+        const SCHEMA_FINGERPRINT: u64 = 0x4649_4C45_0000_0029;
     }
 
     impl VarveMatrixBlock for MatrixTestCell {
@@ -6901,6 +8034,8 @@ mod tests {
         const VERSION: u16 = 1;
         const KIND: BlockKind = BlockKind::Fixed;
         const ENDIAN: Option<Endian> = None;
+        const IS_KEYED: bool = false;
+        const SCHEMA_FINGERPRINT: u64 = 0x4649_4C45_0000_002A;
     }
 
     impl VarveReplaceBlock for ReplaceTestBlock {
@@ -6933,6 +8068,8 @@ mod tests {
         const VERSION: u16 = 1;
         const KIND: BlockKind = BlockKind::Variable;
         const ENDIAN: Option<Endian> = None;
+        const IS_KEYED: bool = false;
+        const SCHEMA_FINGERPRINT: u64 = 0x4649_4C45_0000_002B;
     }
 
     impl VarveReplaceBlock for ReplaceString {
@@ -6969,6 +8106,8 @@ mod tests {
         const VERSION: u16 = 1;
         const KIND: BlockKind = BlockKind::Variable;
         const ENDIAN: Option<Endian> = None;
+        const IS_KEYED: bool = true;
+        const SCHEMA_FINGERPRINT: u64 = 0x4649_4C45_0000_002C;
     }
 
     impl VarveKeyedBlock for ReplaceKeyed {
@@ -7765,6 +8904,39 @@ mod tests {
             decoded.expect("checked above"),
             Err(Error::LengthOverflow { .. }) | Err(Error::InvalidIndexCheckpoint)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_replace_invokes_parent_directory_sync() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("parent-sync-target.bin");
+        let replacement = directory.path().join("parent-sync-replacement.bin");
+        std::fs::write(&target, b"old")?;
+        std::fs::write(&replacement, b"new")?;
+        OpenOptions::new()
+            .write(true)
+            .open(&replacement)?
+            .sync_all()?;
+
+        reset_parent_directory_sync_calls();
+        replace_path_atomically(&replacement, &target)?;
+
+        assert_eq!(parent_directory_sync_calls(), 1);
+        assert_eq!(std::fs::read(target)?, b"new");
+
+        let new_target = directory.path().join("parent-sync-new-target.bin");
+        let new_replacement = directory.path().join("parent-sync-new-replacement.bin");
+        std::fs::write(&new_replacement, b"first")?;
+        OpenOptions::new()
+            .write(true)
+            .open(&new_replacement)?
+            .sync_all()?;
+        reset_parent_directory_sync_calls();
+        replace_path_atomically(&new_replacement, &new_target)?;
+
+        assert_eq!(parent_directory_sync_calls(), 1);
+        assert_eq!(std::fs::read(new_target)?, b"first");
         Ok(())
     }
 }

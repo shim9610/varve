@@ -780,13 +780,14 @@ impl LayoutWriter {
         spec.read_limits
             .check(ReadLimitKey::IndexBytes, index_bytes)?;
         let path = path.as_ref().to_path_buf();
-        let lock = crate::file::WriterLock::acquire(&path)?;
+        let mut lock = crate::file::WriterLock::acquire(&path)?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(&path)?;
+        lock.bind_native(&file, &path)?;
         if let Some(header) = spec.layout.file_header() {
             write_static_layout_fields(&mut file, header.fields, fields, spec.endian)?;
         }
@@ -833,8 +834,9 @@ impl LayoutWriter {
         ensure_custom_layout_spec(spec)?;
         ensure_layout_writer_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
-        let lock = crate::file::WriterLock::acquire(&path)?;
+        let mut lock = crate::file::WriterLock::acquire(&path)?;
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        lock.bind_native(&file, &path)?;
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         spec.read_limits
             .check(ReadLimitKey::FileLen, snapshot.len())?;

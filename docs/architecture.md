@@ -205,11 +205,41 @@
 - The purpose is regression detection, especially accidental O(n^2) scans, excessive allocation, or unexpected slow open/merge/compact paths.
 - Performance smoke output is not a product guarantee before stabilization, but a large unexplained slowdown blocks integration.
 
+## Petabyte-Scale I/O Path
+
+- The feature-gated stream/indexed handle family is the only path that claims
+  open and append costs independent of total native bytes, record count, and
+  key cardinality. Resident handles retain their documented scan and
+  materialization behavior.
+- Stream files use a required state-only `.vks`; disk-indexed files use a
+  required `.vki` containing the same checkpoint state plus generated-plan
+  B-tree rows. Ordinary open never falls back to scan, rebuild, verification,
+  repair, or truncation.
+- Clean writer open restores EOF, record count, next sequence, and bounded
+  declared block tails from fixed sidecar metadata. Readers pin the committed
+  EOF. Missing, dirty, stale, or identity-mismatched state is a typed error.
+- Append derives native framing and sidecar updates once from the same checked
+  in-memory record. Bounded chunks are each written once; append and `sync()`
+  do not reread newly written native bytes.
+- Sidecar offsets and lengths cross checked `u64` extent types before
+  positional I/O or allocation. Point lookup validates physical span,
+  block/version/sequence/flags/checksum, then validates the decoded key.
+- Batch/cache/key/payload values bound transient work only. They never become
+  total file, total record, or lifetime append ceilings.
+- Explicit `events`, typed plural iteration, `verify_all`, checkpoint
+  bootstrap, and disk-index rebuild are the only scalable APIs that scan
+  native records. See `docs/scalable-io.md` for the exact API and cost model.
+- Explicit scans provide synchronous monotonic progress and cooperative
+  cancellation. Cancelled bootstrap/rebuild operations publish no partial
+  sidecar target.
+- A stale writer lock can be cleared with an explicit process/age policy in
+  O(1), without falling back to the resident full-file open path.
+
 ## Dependencies And License
 
 - Direct dependencies are permissive OSS candidates: `syn`, `quote`,
   `proc-macro2`, `thiserror`, `tempfile`, optional `crc32fast`, `memmap2`,
-  `zerocopy`, and `zstd`.
+  `zerocopy`, `zstd`, and experimental `redb`.
 - Test dependencies include `trybuild` and `proptest`.
 - The optional compatibility harnesses use Python `npTDMS` and Pillow only
   outside the Rust crate dependency graph. `pip show nptdms` reports LGPL, and
@@ -221,6 +251,11 @@
 ## Current Status
 
 - Core runtime, macros, manifest, migration scaffold, checkpoint index, recovery, writer lock metadata, merge/compact, global and block-specific variable-block compression, mmap, zero-copy, read/write handles, property tests, compile tests, performance smoke tests, benchmark example, and practical guides are implemented.
+- The experimental scalable path now has zero-scan clean open, bounded batch
+  append, state/disk sidecars, generated disk plans, explicit restore/rebuild,
+  lazy scan plus point lookup on one indexed reader, controlled long scans,
+  process-interruption recovery tests, and hostile extent tests. The real 1 PiB
+  sparse-offset gate still requires a filesystem that accepts that file size.
 - User-facing docs now include quickstart, API reference, implementation model,
   format-author, self-check, durability, recovery, migration, performance, and
   requirements-boundary guides.

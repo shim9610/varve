@@ -87,6 +87,8 @@ impl VarveBlock for MatrixCell {
     const VERSION: u16 = 1;
     const KIND: BlockKind = BlockKind::Matrix;
     const ENDIAN: Option<Endian> = None;
+    const SCHEMA_FINGERPRINT: u64 = 0x6295E4AA349AD0C2;
+    const IS_KEYED: bool = false;
 }
 
 impl VarveMatrixBlock for MatrixCell {
@@ -123,6 +125,8 @@ impl VarveBlock for BadSizedCell {
     const VERSION: u16 = MatrixCell::VERSION;
     const KIND: BlockKind = BlockKind::Matrix;
     const ENDIAN: Option<Endian> = None;
+    const SCHEMA_FINGERPRINT: u64 = 0x6BED1E9E5DD7FAFD;
+    const IS_KEYED: bool = false;
 }
 
 impl VarveMatrixBlock for BadSizedCell {
@@ -159,6 +163,8 @@ impl VarveBlock for OtherMatrixCell {
     const VERSION: u16 = 1;
     const KIND: BlockKind = BlockKind::Matrix;
     const ENDIAN: Option<Endian> = None;
+    const SCHEMA_FINGERPRINT: u64 = 0xD1E2147D120E3576;
+    const IS_KEYED: bool = false;
 }
 
 impl VarveMatrixBlock for OtherMatrixCell {

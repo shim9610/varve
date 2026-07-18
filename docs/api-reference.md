@@ -44,6 +44,13 @@ the macro generates:
 | `AppFormat::diagnose_file(path)` | read-only file diagnostics |
 | `AppFormat::self_test(path)` | build an end-to-end self-test |
 
+`AppFormat::create` and `create_writer` create-or-truncate the path. For callers
+that must prove they created and own the file (diagnostic scaffolding, self-test
+scaffolding) and must never destroy caller data, `VarveFile::create_new(spec, path)`
+and `VarveWriter::create_new(spec, path)` open with `create_new`: they never
+truncate or reuse an existing path and fail with an `AlreadyExists` I/O error if
+one exists.
+
 Generated typed methods depend on block names:
 
 | Declaration | Writer method | Reader method |
@@ -102,6 +109,23 @@ and materialization. Compatibility `*_with_limits` methods perform a meet, so
 `Finite(64 MiB)` tightened by `Finite(16 MiB)` is `Finite(16 MiB)`.
 `*_with_resource_limits` overlays fields and may raise or lower defaults.
 
+`ReadLimits::UNTRUSTED` (`ReadLimits::untrusted()`) is the finite companion to
+`STANDARD` for input from untrusted sources. Every aggregate dimension that
+`STANDARD` leaves effectively unbounded is finite: `max_file_len` 16 GiB,
+`max_records` 16,000,000, `max_scan_bytes` 16 GiB, `max_index_bytes` 1 GiB, and
+`max_segments` 65,536, inheriting the `STANDARD` per-item caps for everything
+else. Use it when a resident open must not let a hostile file choose the reader's
+CPU, I/O, or memory; large trusted files should use the scalable APIs or explicit
+wider limits instead.
+
+The allocation budget these limits drive is nominal accounting, not a hard peak
+RSS guarantee. It counts logical/nominal bytes and does not fully account for
+container bucket/node overhead, the extra `8 × N` for sequence-uniqueness
+tracking, mmap index/map duplication, or auxiliary maps built during keyed
+materialization. Checked arithmetic and fallible reservation still bound each
+individual claim; a true peak-RSS ceiling belongs to an external
+process/cgroup/job policy.
+
 For omitted or explicit `preset: varve_native`, `effective_layout()` returns a
 synthetic plan containing the native `VarveFileHeader` and repeated
 `VarveRecord` segment. `VARVE3` formats expose the native `VarveRecordFooter`
@@ -144,6 +168,67 @@ Common `VarveReader` APIs:
 | `metadata(key)` | latest metadata value |
 | `schema_manifest()` | latest embedded manifest if present |
 | `scan()` | physical record event iterator |
+
+## Scalable Stream And Indexed Handles
+
+The experimental `high-cardinality-dev` feature generates a second handle
+family for files whose open/append memory and I/O cost must be independent of
+total file bytes, record count, and key cardinality.
+
+| Generated API | Meaning |
+| --- | --- |
+| `create_stream_writer(path, options)` | create native file plus state-only `.vks` |
+| `open_stream_writer(path, options)` | O(1) clean resume from `.vks`; no fallback scan |
+| `open_stream_reader(path, options)` | O(1) pinned open from `.vks` |
+| `restore_stream_writer(path, options)` | explicit savepoint rollback; no scan |
+| `bootstrap_stream_checkpoint(path, options)` | explicit native scan to create `.vks` |
+| `bootstrap_stream_checkpoint_with_progress(path, options, scan, observer)` | controlled bootstrap scan with progress/cancellation |
+| `create_indexed_writer(path, options)` | create native file plus disk-key `.vki` |
+| `open_indexed_writer(path, options)` | O(1) clean resume from `.vki`; no fallback scan |
+| `open_indexed_reader(path, options)` | O(1) pinned open with lazy B-tree pages |
+| `restore_indexed_writer(path, options)` | explicit savepoint rollback; no scan |
+| `rebuild_disk_index(path, options)` | explicit native scan to rebuild `.vki` |
+| `rebuild_disk_index_with_progress(path, options, scan, observer)` | controlled rebuild scan; cancelled publication preserves the old `.vki` |
+| `clear_stale_writer_lock(path, policy)` | O(1) explicit lock recovery without opening/scanning native data |
+
+Generated `push_<blocks>(iterator, BatchOptions)` methods coalesce native
+records into bounded writes and return one compact `BatchAppendInfo` rather
+than a per-record vector. Indexed readers expose `get_<block>(&key)` for
+`key_index = disk`, plus `events()`, `verify_all()`, and lazy typed plural
+methods for explicit sequential scans.
+
+Stream and indexed readers also expose
+`verify_all_with_progress(ScanOptions, observer)`. Scan control uses:
+
+| Type | Meaning |
+| --- | --- |
+| `ScanCancellationToken` | cloneable cooperative cancellation flag |
+| `ScanProgressOptions` | callback cadence by records and/or bytes |
+| `ScanOptions` | cadence plus an optional borrowed cancellation token |
+| `ScanProgress` | phase, completed records, scanned bytes, absolute current offset, snapshot length |
+| `ScanProgressPhase` | `Started`, `Running`, or final pre-publication `Complete` |
+
+Defaults notify every 16,384 records or 16 MiB. Cancellation returns
+`Error::ScanCancelled { progress }`; cancellation observed through the final
+callback/check publishes no new sidecar target. Progress bookkeeping does not
+allocate per record.
+
+Normal scalable open never bootstraps, repairs, rebuilds, verifies, truncates,
+or scans. Missing, dirty, stale, and identity-mismatched sidecars are errors
+with explicit recovery operations. `sync()`, not `flush()`, publishes a clean
+generation that can be reopened normally.
+
+`Error::DiskIndex` contains the original boxed `DiskIndexError`; callers should
+match that source rather than parse display text. redb database lock contention
+maps to `Error::IndexBusy`. Bootstrap refuses an existing `.vks`, and rebuild
+refuses a dirty `.vki`, so neither operation can bless an unsynced tail.
+
+With `high-cardinality-dev`, manual `VarveBlock` implementations must state
+`IS_KEYED` explicitly. This is a compile-time chain-safety requirement; macro
+generated blocks already provide the exact value.
+
+See [Scalable Stream And Disk-Index I/O](scalable-io.md) for declarations,
+mode selection, durability ordering, checked extent types, and measured costs.
 
 `scan()` yields entries whose physical payload can be read through
 `RecordIndexEntry`. Use `read_payload_limited(path, physical_limit)` for a
@@ -211,6 +296,25 @@ Decoded `BTreeMap` and `HashMap` values reject duplicate keys instead of silentl
 keeping one value. `HashMap` encoding requires `Ord` for deterministic key order
 but no longer requires `Clone`.
 
+`VarveBlock` requires a `const SCHEMA_FINGERPRINT: u64` with no default.
+`#[derive(VarveBlock)]` computes it deterministically (FNV-1a 64 over the
+canonical schema: id, version, kind, endian, keyedness, and ordered field
+name/type identities). Typed registration is first-seen per process and rejects
+two implementations that claim the same block id with different fingerprints
+(`Error::BlockSchemaFingerprintMismatch`), so a manual `VarveBlock` cannot
+impersonate a registered type by matching only id/version/kind. A manual block
+mirroring a generated one must reuse that block's fingerprint constant. The
+fingerprint is process-local and is deliberately not part of the wire format or
+on-disk descriptors.
+
+Keyedness is an invariant, not a free-form flag. A type that implements
+`VarveKeyedBlock` must declare `VarveBlock::IS_KEYED = true`; keyed-only generic
+entry points evaluate `KeyedBlockContract::<T>::OK`, turning an
+`impl VarveKeyedBlock` with `IS_KEYED = false` into a post-monomorphization
+compile error. Registration also rejects a keyedness disagreement for the same
+block id (`Error::BlockKeyednessMismatch`). Under `high-cardinality-dev` manual
+implementations must state `IS_KEYED` explicitly (no chain-unsafe default).
+
 ## Matrix API
 
 Matrix API exists on `VarveFile`, `VarveReader`, `VarveWriter`, and generated
@@ -251,6 +355,14 @@ commit. Matrix layout and commit maps are snapshotted on open, but slot bytes ar
 in-place storage. Do not overlap a reader with writes to slots it may read.
 Immutable concurrent matrix snapshots require a future generation/version or
 read-lease design and are not promised by VMAT v1.
+
+When recovery finds a `Fatal` matrix finding (for example a metadata CRC
+mismatch), default matrix access is fail-closed: every default read, write, aux,
+resume, and rebuild accessor returns `Error::MatrixFatalCorruption` through an
+`O(1)` flag precomputed once at open. `matrix_recovery_report()` stays readable
+so the fatal state can be inspected. Forensic read-through of a fatal-state file
+is an explicit opt-in via `FormatSpec::with_matrix_fatal_forensics()`, which
+sets `FormatSpec::matrix_fatal_forensics`; it does not repair or mutate the file.
 
 ## Physical Layout API
 
@@ -549,7 +661,7 @@ Normal typed reads reject block-version mismatch. Migration is explicit.
 | `with_matrix_cell(key, value)` | write/commit/read matrix sample |
 | `with_uncommitted_matrix_cell(key, value)` | verify uncommitted read rejection |
 | `with_matrix_aux(name, offset, bytes)` | write/read aux sample |
-| `cleanup(true)` | remove self-test file and lock after run |
+| `cleanup(true)` | after the run, remove only files the run itself created (its native file and `.lock`) |
 
 Report domains:
 
@@ -561,6 +673,10 @@ Report domains:
 | `FileData` | actual bytes, corruption, wrong spec for file |
 | `Environment` | filesystem, locks, concurrent processes |
 | `LibraryInvariant` | possible Varve bug after simple codecs are ruled out |
+
+The self-test is non-destructive: it claims the target with exclusive create and
+refuses a pre-existing path as a `CallerUsage` failed step instead of truncating
+it; `cleanup(true)` deletes only files the run created.
 
 ## Feature Flags
 
@@ -582,5 +698,13 @@ Report domains:
 | `IntegrityFeatureDisabled` | enable `integrity` or disable CRC policy |
 | `MatrixDimensionsRequired` | matrix file creation needs runtime dimensions |
 | `MatrixNotCommitted` | slot bytes exist but commit bit is clear |
+| `MatrixFatalCorruption` | recovery found a fatal matrix finding; default access is fail-closed. Use `FormatSpec::with_matrix_fatal_forensics()` for forensic read-through |
+| `MatrixSidecarMismatch(reason)` | matrix sidecar rejected: wrong native identity, layout generation, or sidecar version; regenerate the sidecar |
 | `MatrixSizeMismatch` | encoded matrix payload does not match slot stride |
+| `BlockSchemaFingerprintMismatch` | two block impls share an id but declare different `SCHEMA_FINGERPRINT` |
+| `BlockKeyednessMismatch` | two block impls share an id but disagree on keyedness |
+| `PublishedButParentSyncPending` | atomic replacement published, but parent-directory durability is unconfirmed; not a rollback |
+| `PublishedButRebindFailed` | replacement published but the writer could not rebind and was poisoned |
 | `WriterLockHeld` | another writer or stale lock exists |
+| `WriterLockBreakRefused` | the explicit lock policy did not prove removal was allowed |
+| `ScanCancelled { progress }` | an explicit scalable scan stopped cooperatively at the reported boundary |

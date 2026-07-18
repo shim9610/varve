@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("all", "native_arbitrary", "codec_arbitrary", "layout_arbitrary", "matrix_arbitrary")]
+    [ValidateSet("all", "native_arbitrary", "codec_arbitrary", "layout_arbitrary", "matrix_arbitrary", "sidecar_arbitrary", "sidecar_mutation", "sidecar_state_machine")]
     [string]$Target = "all",
     [ValidateRange(1, 86400)]
     [int]$Seconds = 60,
@@ -36,16 +36,18 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $targets = if ($Target -eq "all") {
-    @("native_arbitrary", "codec_arbitrary", "layout_arbitrary", "matrix_arbitrary")
+    @("native_arbitrary", "codec_arbitrary", "layout_arbitrary", "matrix_arbitrary", "sidecar_arbitrary", "sidecar_mutation", "sidecar_state_machine")
 } else {
     @($Target)
 }
 
 foreach ($name in $targets) {
+    $targetSeconds = if ($name -like "sidecar_*") { [Math]::Max($Seconds, 120) } else { $Seconds }
     $fuzzerArgs = @(
-        "-max_total_time=$Seconds",
+        "-max_total_time=$targetSeconds",
         "-timeout=10",
         "-max_len=1048576",
+        "-rss_limit_mb=1024",
         "-dict=fuzz\dictionaries\varve.dict"
     )
     cargo +nightly fuzz run $name --fuzz-dir fuzz --target-dir target\fuzz-asan --jobs $Jobs -- `

@@ -1,0 +1,5 @@
+error: key_index requires a keyed fixed or variable block
+ --> tests/ui/fail_key_index_without_key.rs:8:32
+  |
+8 |             fixed Item(id = 1, key_index = memory) {
+  |                                ^^^^^^^^^

@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::sync::{PoisonError, RwLock};
 
+use crate::traits::KeyedBlockContract;
 use crate::{
     BlockKind, Decoder, Endian, FormatSpec, ReadLimit, RecordIndexEntry, Result, SnapshotFile,
     VarveBlock, VarveDecode, VarveKeyedBlock, format::ReadLimitKey,
@@ -175,6 +177,10 @@ where
     T: VarveKeyedBlock<Key = K>,
 {
     pub(crate) fn from_parts(inner: BlockVec<T>, by_key: HashMap<K, RecordIndexEntry>) -> Self {
+        // Post-monomorphization keyedness contract: constructing a keyed
+        // collection for a type whose VarveBlock impl denies being keyed is a
+        // compile error, not a runtime index-consistency hazard.
+        let () = KeyedBlockContract::<T>::OK;
         Self { inner, by_key }
     }
 
@@ -187,6 +193,7 @@ where
     }
 
     pub fn get(&self, key: &K) -> Result<Option<T>> {
+        let () = KeyedBlockContract::<T>::OK;
         let mut budget = MaterializationBudget::new(self.inner.spec);
         let Some(entry) = self.by_key.get(key) else {
             return Ok(None);
@@ -234,5 +241,72 @@ pub(crate) fn ensure_registered_block<T: VarveBlock>(spec: FormatSpec) -> Result
             actual: T::VERSION,
         });
     }
+    ensure_block_contract::<T>(spec)
+}
+
+/// First-seen keyedness and schema fingerprint per registered block identity.
+#[derive(Clone, Copy)]
+struct BlockContract {
+    fingerprint: u64,
+    keyed: bool,
+}
+
+/// Registered block identity: the format's static descriptor table address
+/// scopes block ids so unrelated formats that reuse an id never collide.
+type BlockContractKey = (usize, u32);
+
+/// Process-local registry of first-seen block contracts. This deliberately
+/// never touches the wire format or on-disk descriptors. The sorted vector is
+/// only appended to on the first registration of a (format, block) pair, so
+/// the append hot path pays one uncontended shared-lock acquire and a binary
+/// search: no allocation, no syscall, no O(records) work.
+static BLOCK_CONTRACTS: RwLock<Vec<(BlockContractKey, BlockContract)>> = RwLock::new(Vec::new());
+
+fn check_block_contract<T: VarveBlock>(recorded: BlockContract) -> Result<()> {
+    if recorded.keyed != T::IS_KEYED {
+        return Err(crate::Error::BlockKeyednessMismatch {
+            block_id: T::ID,
+            registered: recorded.keyed,
+            declared: T::IS_KEYED,
+        });
+    }
+    if recorded.fingerprint != T::SCHEMA_FINGERPRINT {
+        return Err(crate::Error::BlockSchemaFingerprintMismatch {
+            block_id: T::ID,
+            registered: recorded.fingerprint,
+            declared: T::SCHEMA_FINGERPRINT,
+        });
+    }
     Ok(())
+}
+
+fn ensure_block_contract<T: VarveBlock>(spec: FormatSpec) -> Result<()> {
+    let key: BlockContractKey = (spec.blocks.as_ptr() as usize, T::ID);
+    {
+        let contracts = BLOCK_CONTRACTS
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Ok(index) = contracts.binary_search_by_key(&key, |entry| entry.0) {
+            return check_block_contract::<T>(contracts[index].1);
+        }
+    }
+    let mut contracts = BLOCK_CONTRACTS
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
+    match contracts.binary_search_by_key(&key, |entry| entry.0) {
+        Ok(index) => check_block_contract::<T>(contracts[index].1),
+        Err(index) => {
+            contracts.insert(
+                index,
+                (
+                    key,
+                    BlockContract {
+                        fingerprint: T::SCHEMA_FINGERPRINT,
+                        keyed: T::IS_KEYED,
+                    },
+                ),
+            );
+            Ok(())
+        }
+    }
 }

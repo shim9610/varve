@@ -1,0 +1,5 @@
+error: key_index requires the `high-cardinality-dev` feature
+ --> tests/ui/fail_key_index_requires_feature.rs:8:47
+  |
+8 |             variable Item(id = 1, key = [id], key_index = disk) {
+  |                                               ^^^^^^^^^

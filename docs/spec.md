@@ -245,7 +245,7 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Header/version/endian/schema mismatch is rejected.
 - Block version mismatch is rejected on typed read.
 - Strict recovery rejects corrupt tails; recover mode truncates incomplete tails.
-- CRC integrity detects payload/footer tampering when feature-enabled.
+- CRC integrity detects payload/footer covered-byte modification when feature-enabled.
 - `crc32_with_header` detects native record header tampering as well.
 - Variable-block compression roundtrips under record-explicit, file-explicit, and format-contract metadata modes.
 - Explicit `preset: varve_native` produces byte-identical output to the omitted

@@ -1,0 +1,7 @@
+error[E0046]: not all trait items implemented, missing: `IS_KEYED`
+  --> tests/ui/fail_manual_block_missing_keyedness.rs:24:1
+   |
+24 | impl VarveBlock for ManualKeyed {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `IS_KEYED` in implementation
+   |
+   = help: implement the missing item: `const IS_KEYED: bool = false;`

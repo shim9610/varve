@@ -25,6 +25,51 @@ Varve returns `PublishedButRebindFailed` and poisons that writer. This is not a
 publication rollback: callers must reopen and reconcile instead of blindly
 retrying the operation.
 
+## Single-Writer Lock On The Native File Object
+
+The authoritative single-writer guard is an OS lock held on the open native
+file *object*, not on a path-derived marker. On Windows Varve takes an exclusive
+`LockFileEx` (`LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY`) over a
+one-byte range at a reserved offset that never overlaps real data, so ordinary
+readers are unaffected. On Unix it takes an advisory exclusive lock on the same
+handle. The guard is bound to freshly created files at create time and probed
+for existing files at open time, and it is re-bound to each newly published
+copy-on-write generation. Because the lock lives on the file object that every
+name for the file shares, a second writer opening the file through a hard link
+or reparse alias cannot acquire it — closing the path-alias bypass that the
+former path-derived `.lock` scheme allowed.
+
+The `<file>.lock` marker is retained only as diagnostic and break-policy
+metadata (content is written below the reserved lock range). It is never the
+authority for exclusion. `clear_stale_writer_lock` acquires the native-object
+lock before it inspects or clears marker metadata regardless of the break
+policy, so an active object lock can never be displaced by recovery. A
+zero-length `.lock` file may persist as a stable filesystem identity for future
+guard acquisition; `inspect_writer_lock()` reports it as neither active nor
+stale.
+
+## Typed Post-Publication Replace Outcome
+
+Atomic replacement renames or `ReplaceFileW`s the validated generation into
+place and then syncs the parent directory. The rename is the publication point:
+once it returns, the pathname already names the new generation. A parent-sync
+error afterward therefore cannot mean "original unchanged". Varve models the two
+outcomes explicitly rather than letting a late error escape before rebinding:
+
+- On a parent-sync failure after a successful rename, the writer is first
+  re-bound to the published generation and then `PublishedButParentSyncPending`
+  is returned. Publication happened; only power-loss durability of the new
+  directory entry is unconfirmed. Callers may proceed or re-sync, but must not
+  treat this as a rollback.
+- If the post-publication re-bind itself fails, the writer is poisoned and
+  `PublishedButRebindFailed` is returned.
+
+Any error from replacement other than these two typed post-publication states
+means publication did not happen and the original generation still stands.
+Exclusive-create constructors (`VarveFile::create_new`, `VarveWriter::create_new`)
+open with `create_new`, never truncating or reusing an existing path; they fail
+with an `AlreadyExists` I/O error instead.
+
 The unsafe exclusive in-place replacement method does not provide that snapshot
 guarantee. Its safety contract requires process-wide and cross-process
 exclusion, including mmap and raw references.
@@ -132,6 +177,34 @@ The current implementation provides an optional sidecar envelope and verified
 resume signal. A separate durable parent sidecar-active flag remains future
 policy work; callers that need that stronger contract should encode the active
 state in their own payload or metadata until the policy is promoted.
+
+## Matrix Sidecar Identity And Atomic Publication
+
+The matrix sidecar manifest is version 2 (88-byte fixed header). Beyond the
+existing format/schema/category/caller-generation/length/CRC fields it binds the
+sidecar to a specific native file with two additions:
+
+- a native object fingerprint that folds the OS file identity (Windows
+  volume + file id, Unix device + inode) with the schema hash, and
+- a matrix layout generation.
+
+A reader recomputes the fingerprint from its own native file and rejects a
+mismatch as `MatrixSidecarMismatch("native identity")` or
+`MatrixSidecarMismatch("matrix layout generation")`. A version-1 or otherwise
+unrecognized envelope is refused as `MatrixSidecarMismatch("sidecar version")`.
+Because sidecars are regenerable resume state, a refused sidecar is a
+regenerate-and-retry signal, not data loss — so a same-spec sibling file can no
+longer silently adopt another file's sidecar.
+
+Publication is atomic and ordered. `write_matrix_sidecar` writes the new
+manifest to a same-directory RAII temp file, `sync`s it, atomically replaces the
+existing sidecar, and syncs the parent directory. The native file is the
+authority and is written and synced before the sidecar is published
+(native then sidecar ordering). A parent-sync failure after the replace returns
+`PublishedButParentSyncPending` without deleting the now-published sidecar; the
+temp is removed only when the replace itself failed. This replaces the former
+in-place `File::create` truncate-and-`sync_all` publication, which exposed a
+partially written sidecar during a crash.
 
 ## Acceptance Tests
 

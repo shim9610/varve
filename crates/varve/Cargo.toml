@@ -16,6 +16,14 @@ integrity = ["varve-core/integrity"]
 mmap = ["varve-core/mmap"]
 zero-copy = ["mmap", "varve-core/zero-copy"]
 compression-zstd = ["varve-core/compression-zstd"]
+high-cardinality-dev = [
+    "varve-core/high-cardinality-dev",
+    "varve-macros/high-cardinality-dev",
+]
+scalable-fault-injection = [
+    "high-cardinality-dev",
+    "varve-core/scalable-fault-injection",
+]
 
 [dependencies]
 varve-core = { path = "../varve-core", version = "0.3.0" }
@@ -23,5 +31,6 @@ varve-macros = { path = "../varve-macros", version = "0.3.0" }
 
 [dev-dependencies]
 proptest.workspace = true
+tempfile.workspace = true
 trybuild.workspace = true
 zerocopy = { workspace = true, features = ["derive"] }

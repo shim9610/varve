@@ -67,6 +67,8 @@ impl VarveBlock for PerfMatrixCell {
     const VERSION: u16 = 1;
     const KIND: BlockKind = BlockKind::Matrix;
     const ENDIAN: Option<Endian> = None;
+    const SCHEMA_FINGERPRINT: u64 = 0x3B30E83949F3C27D;
+    const IS_KEYED: bool = false;
 }
 
 impl VarveMatrixBlock for PerfMatrixCell {

@@ -1,7 +1,10 @@
 use std::fs;
-use std::path::PathBuf;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 
 use varve::varve_format;
+
+pub mod sidecar;
 
 varve_format! {
     pub format FuzzNativeFormat {
@@ -51,6 +54,53 @@ varve_format! {
                 name: String,
                 payload: Vec<u8>,
                 values: Vec<i64> = default,
+            }
+        }
+    }
+}
+
+varve_format! {
+    pub format FuzzSidecarFormat {
+        magic: b"FZSC";
+        version: 1;
+        limits {
+            file_len: 2_097_152;
+            records: 256;
+            index_bytes: 1_048_576;
+            scan_bytes: 2_097_152;
+            record_payload: 65_536;
+            logical_payload: 65_536;
+            materialized_bytes: 1_048_576;
+            segments: 256;
+            matrix_dimension: 16;
+            matrix_cells: 256;
+            matrix_bitmap: 65_536;
+            matrix_crc: 65_536;
+            matrix_metadata: 65_536;
+            matrix_slot_region: 1_048_576;
+            sidecar: 1_048_576;
+            mmap: 2_097_152;
+        }
+        endian: little;
+        schema_hash: computed;
+        integrity: crc32_with_header;
+        recovery: truncate_tail;
+
+        blocks {
+            fixed SidecarEvent(id = 20) {
+                value: u64,
+            }
+
+            variable StreamItem(id = 21, key = [key], key_index = memory) {
+                key: u64,
+                value: u64,
+                payload: Vec<u8>,
+            }
+
+            variable DiskItem(id = 22, key = [key], key_index = disk) {
+                key: u64,
+                value: u64,
+                payload: Vec<u8>,
             }
         }
     }
@@ -147,11 +197,58 @@ varve_format! {
     }
 }
 
-pub fn write_fuzz_file(kind: &str, bytes: &[u8]) -> Option<PathBuf> {
+pub struct FuzzFile {
+    path: PathBuf,
+}
+
+impl Deref for FuzzFile {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for FuzzFile {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for FuzzFile {
+    fn drop(&mut self) {
+        let mut lock_name = self.path.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        let _ = fs::remove_file(PathBuf::from(lock_name));
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+pub fn write_fuzz_file(kind: &str, bytes: &[u8]) -> Option<FuzzFile> {
     let path = std::env::temp_dir().join(format!("varve-{kind}-fuzz-{}.bin", std::process::id()));
     let mut lock_name = path.as_os_str().to_os_string();
     lock_name.push(".lock");
     let _ = fs::remove_file(PathBuf::from(lock_name));
     fs::write(&path, bytes).ok()?;
-    Some(path)
+    Some(FuzzFile { path })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuzz_file_removes_input_and_lock_marker_on_drop() {
+        let file = write_fuzz_file("scratch-cleanup", b"input").expect("scratch file");
+        let path = file.path.clone();
+        let mut lock_name = path.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        let lock = PathBuf::from(lock_name);
+        fs::write(&lock, b"lock").unwrap();
+
+        drop(file);
+
+        assert!(!path.exists());
+        assert!(!lock.exists());
+    }
 }

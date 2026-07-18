@@ -1,0 +1,26 @@
+error[E0080]: evaluation panicked: this type implements VarveKeyedBlock but declares VarveBlock::IS_KEYED = false; keyed blocks must declare IS_KEYED = true
+ --> $RUST/core/src/panic.rs
+  |
+  = note: evaluation of `varve_core::traits::KeyedBlockContract::<ContradictoryKeyed>::OK` failed here
+  |
+ ::: $WORKSPACE/crates/varve-core/src/traits.rs
+  |
+  |       pub const OK: () = assert!(
+  |  ________________________-
+  | |         T::IS_KEYED,
+  | |         "this type implements VarveKeyedBlock but declares VarveBlock::IS_KEYED = false; \
+  | |          keyed blocks must declare IS_KEYED = true"
+  | |     );
+  | |_____- in this macro invocation
+
+note: erroneous constant encountered
+ --> $WORKSPACE/crates/varve-core/src/collections.rs
+  |
+  |         let () = KeyedBlockContract::<T>::OK;
+  |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn KeyedBlockVec::<u64, ContradictoryKeyed>::from_parts`
+ --> $WORKSPACE/crates/varve-core/src/file.rs
+  |
+  |         Ok(KeyedBlockVec::from_parts(blocks, by_key))
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

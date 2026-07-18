@@ -8,6 +8,10 @@ version.workspace = true
 description = "Procedural macros for declaring Varve binary formats and blocks"
 documentation = "https://docs.rs/varve-macros"
 
+[features]
+default = []
+high-cardinality-dev = []
+
 [lib]
 proc-macro = true
 

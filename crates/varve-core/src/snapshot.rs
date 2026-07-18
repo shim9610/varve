@@ -4,12 +4,17 @@ use std::{
     sync::Arc,
 };
 
-use crate::{Error, Result};
+#[cfg(any(feature = "high-cardinality-dev", test))]
+use crate::scalable_extent::{UntrustedRecordPointer, ValidatedRecordPointer};
+use crate::{
+    Error, Result,
+    scalable_extent::{ByteLength, FileOffset, SnapshotBounds},
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct SnapshotFile {
     file: Arc<File>,
-    len: u64,
+    bounds: SnapshotBounds,
 }
 
 impl SnapshotFile {
@@ -23,44 +28,41 @@ impl SnapshotFile {
     }
 
     pub(crate) fn from_file_with_len(file: File, len: u64) -> Result<Self> {
-        let physical_len = file.metadata()?.len();
-        if len > physical_len {
-            return Err(Error::SnapshotRangeOutOfBounds {
-                offset: 0,
-                len,
-                snapshot_len: physical_len,
-            });
-        }
+        let bounds = checked_snapshot_bounds(&file, len)?;
         Ok(Self {
             file: Arc::new(file),
-            len,
+            bounds,
         })
     }
 
     pub(crate) const fn len(&self) -> u64 {
-        self.len
+        self.bounds.logical_len().get()
     }
 
-    pub(crate) fn with_len(&self, len: u64) -> Self {
-        Self {
+    pub(crate) fn with_len(&self, len: u64) -> Result<Self> {
+        let bounds = checked_snapshot_bounds(&self.file, len)?;
+        Ok(Self {
             file: Arc::clone(&self.file),
-            len,
-        }
+            bounds,
+        })
+    }
+
+    #[cfg(any(feature = "high-cardinality-dev", test))]
+    pub(crate) fn validate(
+        &self,
+        pointer: UntrustedRecordPointer,
+        has_footer: bool,
+    ) -> Result<ValidatedRecordPointer> {
+        self.bounds.validate_native_record(pointer, has_footer)
     }
 
     pub(crate) fn cursor_at(&self, offset: u64) -> Result<SnapshotCursor> {
-        if offset > self.len {
-            return Err(Error::SnapshotRangeOutOfBounds {
-                offset,
-                len: 0,
-                snapshot_len: self.len,
-            });
-        }
+        self.check_range(offset, 0)?;
         let mut reader = BufReader::with_capacity(64 * 1024, self.file.try_clone()?);
         reader.seek(SeekFrom::Start(offset))?;
         Ok(SnapshotCursor {
             reader,
-            len: self.len,
+            bounds: self.bounds,
             position: offset,
         })
     }
@@ -109,7 +111,7 @@ impl SnapshotFile {
             });
         }
         self.check_range(offset, len)?;
-        let len = usize::try_from(len).map_err(|_| Error::LengthOverflow { value: len })?;
+        let len = ByteLength::new(len).try_usize()?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(len)
@@ -135,7 +137,10 @@ impl SnapshotFile {
             let remaining = len - copied;
             let chunk_len = usize::try_from(remaining.min(buffer.len() as u64))
                 .map_err(|_| Error::LengthOverflow { value: remaining })?;
-            self.read_exact_at(offset + copied, &mut buffer[..chunk_len])?;
+            let current_offset = FileOffset::new(offset)
+                .checked_add(ByteLength::new(copied))?
+                .get();
+            self.read_exact_at(current_offset, &mut buffer[..chunk_len])?;
             output.write_all(&buffer[..chunk_len])?;
             copied =
                 copied
@@ -148,25 +153,15 @@ impl SnapshotFile {
     }
 
     fn check_range(&self, offset: u64, len: u64) -> Result<()> {
-        let end = offset
-            .checked_add(len)
-            .ok_or(Error::ResourceArithmeticOverflow {
-                resource: "snapshot range",
-            })?;
-        if end > self.len {
-            return Err(Error::SnapshotRangeOutOfBounds {
-                offset,
-                len,
-                snapshot_len: self.len,
-            });
-        }
+        self.bounds
+            .validate_range(FileOffset::new(offset), ByteLength::new(len))?;
         Ok(())
     }
 }
 
 pub(crate) struct SnapshotCursor {
     reader: BufReader<File>,
-    len: u64,
+    bounds: SnapshotBounds,
     position: u64,
 }
 
@@ -212,7 +207,7 @@ impl SnapshotCursor {
             });
         }
         self.check_range(offset, len)?;
-        let len = usize::try_from(len).map_err(|_| Error::LengthOverflow { value: len })?;
+        let len = ByteLength::new(len).try_usize()?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(len)
@@ -240,20 +235,17 @@ impl SnapshotCursor {
     }
 
     fn check_range(&self, offset: u64, len: u64) -> Result<()> {
-        let end = offset
-            .checked_add(len)
-            .ok_or(Error::ResourceArithmeticOverflow {
-                resource: "snapshot cursor range",
-            })?;
-        if end > self.len {
-            return Err(Error::SnapshotRangeOutOfBounds {
-                offset,
-                len,
-                snapshot_len: self.len,
-            });
-        }
+        self.bounds
+            .validate_range(FileOffset::new(offset), ByteLength::new(len))?;
         Ok(())
     }
+}
+
+fn checked_snapshot_bounds(file: &File, len: u64) -> Result<SnapshotBounds> {
+    let physical_len = file.metadata()?.len();
+    SnapshotBounds::new(ByteLength::new(physical_len))
+        .validate_range(FileOffset::ZERO, ByteLength::new(len))?;
+    Ok(SnapshotBounds::new(ByteLength::new(len)))
 }
 
 #[cfg(unix)]
@@ -335,6 +327,77 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_length_rebinding_and_growth_are_fallible() {
+        let path = temp_path();
+        std::fs::write(&path, b"old").unwrap();
+        let snapshot = SnapshotFile::new(File::open(&path).unwrap()).unwrap();
+
+        assert!(matches!(
+            snapshot.with_len(4),
+            Err(Error::SnapshotRangeOutOfBounds {
+                offset: 0,
+                len: 4,
+                snapshot_len: 3
+            })
+        ));
+
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"!")
+            .unwrap();
+        let grown = snapshot.with_len(4).unwrap();
+        let shortened = grown.with_len(2).unwrap();
+
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(grown.len(), 4);
+        assert_eq!(grown.read_vec_at(0, 4, 4, "test").unwrap(), b"old!");
+        assert_eq!(shortened.len(), 2);
+        assert!(matches!(
+            shortened.read_vec_at(2, 1, 1, "test"),
+            Err(Error::SnapshotRangeOutOfBounds {
+                offset: 2,
+                len: 1,
+                snapshot_len: 2
+            })
+        ));
+        remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn record_pointer_validation_uses_native_minimum_framing() {
+        let path = temp_path();
+        let header_len = crate::native_layout::native_record_header_len();
+        let footer_len = crate::native_layout::native_record_footer_len();
+        let physical_len = header_len + footer_len;
+        std::fs::write(&path, vec![0; physical_len as usize]).unwrap();
+        let snapshot = SnapshotFile::new(File::open(&path).unwrap()).unwrap();
+
+        assert!(matches!(
+            snapshot.validate(UntrustedRecordPointer::new(0, header_len - 1), false),
+            Err(Error::InvalidIndexCheckpoint)
+        ));
+
+        let no_footer = snapshot
+            .validate(UntrustedRecordPointer::new(0, header_len), false)
+            .unwrap()
+            .span();
+        assert_eq!(no_footer.header_len().get(), header_len);
+        assert_eq!(no_footer.payload_len(), ByteLength::ZERO);
+        assert_eq!(no_footer.footer_len(), ByteLength::ZERO);
+
+        let with_footer = snapshot
+            .validate(UntrustedRecordPointer::new(0, physical_len), true)
+            .unwrap()
+            .span();
+        assert_eq!(with_footer.header_len().get(), header_len);
+        assert_eq!(with_footer.payload_len(), ByteLength::ZERO);
+        assert_eq!(with_footer.footer_len().get(), footer_len);
+        remove_file(path).unwrap();
+    }
+
+    #[test]
     fn validated_logical_eof_can_be_shorter_than_physical_eof() {
         let path = temp_path();
         std::fs::write(&path, b"valid-torn").unwrap();
@@ -363,6 +426,29 @@ mod tests {
             Err(Error::LimitExceeded { .. })
         ));
         assert!(snapshot.try_clone_file().is_ok());
+        remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn hostile_overflow_ranges_fail_before_read_or_allocation() {
+        let path = temp_path();
+        std::fs::write(&path, b"x").unwrap();
+        let snapshot = SnapshotFile::new(File::open(&path).unwrap()).unwrap();
+
+        assert!(matches!(
+            snapshot.read_vec_at(u64::MAX, 1, 1, "test"),
+            Err(Error::ResourceArithmeticOverflow {
+                resource: "snapshot range"
+            })
+        ));
+
+        let mut cursor = snapshot.cursor_at(0).unwrap();
+        assert!(matches!(
+            cursor.read_vec_at(u64::MAX, 1, 1, "test"),
+            Err(Error::ResourceArithmeticOverflow {
+                resource: "snapshot range"
+            })
+        ));
         remove_file(path).unwrap();
     }
 
