@@ -1028,7 +1028,14 @@ impl FormatSpec {
     /// keyedness, and generated codec identity from
     /// [`FormatSpec::block_identities`]. Values computed by v1 do not match
     /// v2 for any spec.
-    pub const SCHEMA_HASH_ALGORITHM_VERSION: u16 = 2;
+    ///
+    /// v3 (API-04, pre-1.0 breaking change): the generated block fingerprints
+    /// folded in from [`FormatSpec::block_identities`] now resolve every
+    /// field's codec through [`crate::VarveEncode::SCHEMA_ID`] instead of the
+    /// field type's source spelling, so two custom nested codecs that spell
+    /// their field type identically but emit different bytes no longer share
+    /// a hash. Values computed by v1 or v2 do not match v3 for any spec.
+    pub const SCHEMA_HASH_ALGORITHM_VERSION: u16 = 3;
 
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
@@ -1742,12 +1749,18 @@ impl FormatSpec {
     /// [`FormatSpec::block_identities`] is populated — the block's endian
     /// override, keyedness, and generated codec fingerprint.
     ///
+    /// Version 3 (API-04) inherits transitive custom-codec identity: the
+    /// generated fingerprints in [`FormatSpec::block_identities`] resolve each
+    /// field through [`crate::VarveEncode::SCHEMA_ID`], so a nested codec that
+    /// changes its emitted bytes changes this hash even when every declared
+    /// type name stays the same.
+    ///
     /// The computed value is stored in newly created files. Whether it is
     /// *compared* at open is a separate opt-in; see
     /// [`FormatSpec::schema_hash`].
     pub fn computed_schema_hash(&self) -> u64 {
         let mut hash = Fnv1a64::new();
-        hash.write_bytes(b"varve-schema-v2");
+        hash.write_bytes(b"varve-schema-v3");
         hash.write_u16(self.version);
         hash.write_u8(self.endian.to_byte());
         match self.extension {

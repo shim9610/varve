@@ -7,7 +7,8 @@ use crate::disk_index::{
     DiskIndexDescriptor as DiskIndexedBlock, DiskIndexEntry, DiskIndexError, DiskIndexFrontier,
     DiskIndexMetadata, DiskIndexOptions, DiskIndexPhysicalRecord, DiskIndexPlan,
     DiskIndexRecordPointer, DiskIndexState, DiskIndexStore, DiskIndexTail, DiskIndexUpdate,
-    DiskIndexWriteBatch, VarveDiskKey, read_metadata_read_only, sidecar_path, tail_limit_for_spec,
+    DiskIndexWriteBatch, PRIMARY_GENERATION_WINDOW, VarveDiskKey, read_metadata_read_only,
+    sidecar_path, tail_limit_for_spec,
 };
 use crate::file::{
     NativeStreamScanner, RECORD_FOOTER_LEN, RECORD_HEADER_LEN, ReplaceDurability, WriterLock,
@@ -16,7 +17,9 @@ use crate::file::{
 };
 use crate::native_layout::{decode_native_record_footer, read_native_record_header};
 use crate::scalable_extent::UntrustedRecordPointer;
-use crate::stream::{StreamCheckpoint, StreamTail, primary_identity};
+use crate::stream::{
+    StreamCheckpoint, StreamTail, primary_generation, primary_identity, verify_primary_generation,
+};
 use crate::traits::KeyedBlockContract;
 use crate::{
     AppendInfo, BatchAppendError, BatchAppendInfo, BatchOptions, Error, FormatSpec,
@@ -30,6 +33,34 @@ const INDEX_BATCH_RECORDS: usize = 16_384;
 pub struct DiskIndexRebuildReport {
     pub records: u64,
     pub scanned_bytes: u64,
+}
+
+/// Scaling observability for the disk-index release gates.
+///
+/// These are thread-local test counters, not runtime metrics: they exist so
+/// the suite can pin PERF-04 (registry cost per open must not scale with the
+/// number of live sidecar identities) and API-03 (no captured codec runs
+/// before schema identity is validated) as executable contracts. They are
+/// hosted here because `varve-core`'s re-export list is outside this module's
+/// ownership; see the openIssues note about moving them to a dedicated
+/// exported handle.
+#[cfg(feature = "scalable-fault-injection")]
+impl DiskIndexRebuildReport {
+    pub fn registry_slots_inspected() -> u64 {
+        crate::disk_index::scaling_counters::registry_slots_inspected()
+    }
+
+    pub fn primary_generation_scans() -> u64 {
+        crate::disk_index::scaling_counters::primary_generation_scans()
+    }
+
+    pub fn descriptor_decoder_calls() -> u64 {
+        crate::disk_index::scaling_counters::descriptor_decoder_calls()
+    }
+
+    pub fn reset_scaling_counters() {
+        crate::disk_index::scaling_counters::reset();
+    }
 }
 
 /// Rebuilds the disk-index sidecar from the native log.
@@ -122,6 +153,7 @@ impl VarveIndexedReader {
         let index = store
             .begin_snapshot_with_plan(identity, plan, stream.snapshot().len())
             .map_err(index_error)?;
+        verify_primary_generation(stream.spec(), index.primary_generation(), stream.snapshot())?;
         let stream = stream.pin_logical_len(index.committed_eof())?;
         Ok(Self {
             stream,
@@ -379,7 +411,12 @@ impl VarveIndexedWriter {
             plan.digest(),
             checkpoint_frontier(&checkpoint),
             tail_limit_for_spec(stream.spec()).map_err(index_error)?,
-        );
+        )
+        .with_primary_generation(primary_generation(
+            stream.spec(),
+            stream.snapshot(),
+            stream.snapshot().len(),
+        )?);
         let index = create_index_store(
             &path,
             options,
@@ -439,7 +476,11 @@ impl VarveIndexedWriter {
                         tail_limit_for_spec(spec).map_err(index_error)?,
                     )
                     .map_err(index_error)?;
-                Ok((stream_checkpoint_from_state(&state), store))
+                Ok((
+                    stream_checkpoint_from_state(&state),
+                    state.metadata.primary_generation,
+                    store,
+                ))
             },
         )?;
         Ok(Self::new(stream, index, blocks))
@@ -920,6 +961,22 @@ impl VarveIndexedWriter {
     }
 
     fn commit_pending_batch(&mut self) -> Result<()> {
+        // STO-01: see VarveStreamWriter::commit_state_chunk. The witness stops
+        // being recomputed once its bounded window is full.
+        if let Some(batch) = self.batch.as_ref()
+            && batch.primary_generation().len < PRIMARY_GENERATION_WINDOW
+        {
+            let generation = primary_generation(
+                self.stream.spec(),
+                self.stream.snapshot(),
+                self.stream.snapshot().len(),
+            )?;
+            self.batch
+                .as_mut()
+                .expect("batch present")
+                .set_primary_generation(generation)
+                .map_err(index_error)?;
+        }
         let Some(batch) = self.batch.take() else {
             return Ok(());
         };
@@ -1177,6 +1234,9 @@ where
             batch.can_accept_coverage(has_tail).map_err(index_error)?
         };
         if !fits && batch_records != 0 {
+            batch
+                .set_primary_generation(primary_generation(spec, snapshot, covered)?)
+                .map_err(index_error)?;
             batch.commit().map_err(index_error)?;
             batch = store.begin_write_batch().map_err(index_error)?;
             batch_records = 0;
@@ -1213,6 +1273,9 @@ where
             .record_completed(scanner.logical_eof(), &mut observer)
             .map_err(crate::stream::scan_cancelled)?;
     }
+    batch
+        .set_primary_generation(primary_generation(spec, snapshot, covered)?)
+        .map_err(index_error)?;
     batch.commit().map_err(index_error)?;
     let working = store.read_metadata().map_err(index_error)?.working;
     if working.eof != covered || working.record_count != records {
@@ -1713,7 +1776,8 @@ mod tests {
             Err(Error::DiskIndex(_))
         ));
         let report = rebuild_disk_index(spec(), &path, options, index_plan())?;
-        assert_eq!(report.records, 3);
+        // Three user records plus the internal creation-nonce record (STO-01).
+        assert_eq!(report.records, 4);
         assert!(report.scanned_bytes > 0);
         let mut writer = VarveIndexedWriter::open(spec(), &path, options, index_plan())?;
         writer.sync()?;
@@ -1927,7 +1991,8 @@ mod tests {
             ..DiskIndexOptions::default()
         };
         let report = rebuild_disk_index(spec(), &path, options, index_plan())?;
-        assert_eq!(report.records, 5);
+        // Five user records plus the internal creation-nonce record (STO-01).
+        assert_eq!(report.records, 6);
         let reader = VarveIndexedReader::open(spec(), &path, options, index_plan())?;
         assert_eq!(reader.get::<Item>(&4)?.unwrap().value, "value-4");
         Ok(())
@@ -2012,7 +2077,8 @@ mod tests {
         fs::remove_file(sidecar_path(&path))?;
         crate::disk_index::reset_tombstone_key_decode_calls();
         let report = rebuild_disk_index(spec_multi(), &path, options, plan_multi())?;
-        assert_eq!(report.records, 4);
+        // Four user records plus the internal creation-nonce record (STO-01).
+        assert_eq!(report.records, 5);
         // One decode per tombstone record, not one per plan descriptor.
         assert_eq!(crate::disk_index::tombstone_key_decode_calls(), 2);
         let reader = VarveIndexedReader::open(spec_multi(), &path, options, plan_multi())?;
@@ -2118,7 +2184,8 @@ mod tests {
 
         crate::disk_index::reset_plan_payload_reads();
         let report = rebuild_disk_index(spec_crc(), &path, options, plan_crc())?;
-        assert_eq!(report.records, 4);
+        // Four user records plus the internal creation-nonce record (STO-01).
+        assert_eq!(report.records, 5);
         // Two indexed puts and one tombstone: three payload materializations,
         // never a scanner checksum pre-pass on top and never the unindexed
         // record's payload.

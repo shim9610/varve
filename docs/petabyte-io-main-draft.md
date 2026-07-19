@@ -32,6 +32,21 @@ file size or total record count.
    verification, recovery, migration, merge, compact, or rebuild operation.
    No `open` operation silently falls back to a full scan.
 
+Carve-out for the keyed merge/compact family. Invariant 7 permits those
+operations to iterate; it does not claim they are PB-scale. `merge_keyed_files`,
+`compact_keyed_files`, and `compact_keyed_file` are **resident-only** and are
+explicitly outside the petabyte surface. Each opens its inputs as whole
+`VarveFile` values and holds one map entry per distinct key ever seen
+(tombstoned keys included), so memory is
+`O(K-ever + largest resident input index + retained live values)` and nothing
+spills to disk. Varve exports no bounded-memory external merge or compact; the
+scalable stream and indexed writers cover bounded *ingest*, not bounded
+merge/compact. Callers must size the operation with `estimate_keyed_merge`
+first, or bound it with `merge_keyed_files_with_key_limit`,
+`compact_keyed_files_with_key_limit`, or `compact_keyed_file_with_key_limit`,
+which fail with `Error::LimitExceeded { resource: "merge distinct keys", .. }`
+at the key boundary and publish no output.
+
 ## API Surface
 
 The unstable `high-cardinality-dev` feature receives these runtime policies:

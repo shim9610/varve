@@ -127,6 +127,23 @@ publication. A future implementation may add an append-only replacement event
 strategy, but it must preserve sequence, keyed-event ordering, snapshot, CRC,
 footer-chain, checkpoint, and transaction visibility semantics.
 
+## Capability Boundary
+
+Performance claims are not uniform across the API. Two families exist and they
+have different bounds:
+
+| Family | Entry points | Bound |
+| --- | --- | --- |
+| Resident | `VarveFile`, `VarveReader`, `VarveWriter`, keyed collections, `merge_keyed_files`, `compact_keyed_file(s)` | index and working state live in memory; sized by the file's record and key counts |
+| Scalable | `high-cardinality-dev` `VarveStreamWriter`/`VarveIndexedWriter`/readers with their `.vks`/`.vki` sidecars | bounded resident state; sized by declared blocks and bounded buffers, not by record or key count |
+
+The scalable family covers bounded *ingest and lookup*. It does not cover
+merge/compact: the keyed merge/compact family is resident-only and explicitly
+not PB-scale (see the entries below and `docs/api-reference.md`). Matrix storage
+is a third, separate mode: its integrity metadata is paged and sparse rather
+than resident-per-cell, and create, open, and whole-category clear are all
+bounded by the bytes actually written rather than by cell count.
+
 ## Covered Paths
 
 - fixed append, open, scan, and lazy typed lookup
@@ -138,9 +155,13 @@ footer-chain, checkpoint, and transaction visibility semantics.
 - checkpoint open with `IndexPolicy::CheckpointOnFlush`
 - VARVE3 footer scan, transaction-marker visibility, and block/keyed offset-chain append paths
 - keyed put/op/tombstone materialization
-- `merge_keyed_files`
-- `compact_keyed_file`
-- direct base+delta `compact_keyed_files`
+- `merge_keyed_files` (resident: `O(K-ever + largest resident input index +
+  retained live values)` memory, not PB-scale)
+- `compact_keyed_file` (same resident bound over its single input)
+- direct base+delta `compact_keyed_files` (same resident bound)
+- `estimate_keyed_merge` pre-flight sizing and the `*_with_key_limit` guarded
+  variants, which fail typed at a caller-chosen `K-ever` ceiling rather than in
+  the allocator
 - explicit tail recovery
 - streaming CRC validation without allocating a whole claimed payload
 - snapshot-bound lazy reads after pathname replacement
@@ -212,6 +233,36 @@ The smoke suite reports wall time, records/sec, and file size. Compare small, me
 - Tombstone rebuild must resolve the descriptor once per record by block id and
   decode each tombstone key once. Rebuild cost must be independent of the plan
   descriptor count, not `O(records × descriptors)`.
+- Matrix commit-bit maintenance under `integrity: crc32` must hash a bounded
+  amount of bitmap per mutation. Each mutation rehashes exactly the 4 KiB page
+  holding the mutated byte (less for a map shorter than one page), so write +
+  commit of `M` cells hashes `Theta(M)` bitmap bytes. Any structure that
+  rehashes a whole category bitmap, or recomputes a composition over all page
+  digests, per mutation is a blocking regression: both make the per-mutation
+  cost depend on matrix size.
+- Matrix create-time metadata writes and post-open bitmap residency must not
+  scale with cell count. Creation writes only descriptor tables plus the `MCRC`
+  header; commit, CRC-valid, and current-write bitmaps are sparse and
+  materialize a page only when it carries a set bit. Committed-cell counting
+  must stay `O(1)` off the maintained set-bit totals rather than scanning.
+  Matrix open must cost `O(bytes actually written)`, not `O(cells/8)`: it proves
+  never-written pages read as zero from the filesystem's allocated-range map
+  rather than by reading them, falling back to reading every page only when the
+  platform or filesystem cannot answer. Clearing a whole commit category must
+  punch a hole rather than write zeros.
+- Resident block-offset chaining must resolve the previous record of a block id
+  from maintained sorted block tails in `O(log B)` with no resident-index reads,
+  never by reverse-scanning the index (`O(N*B)`, quadratic when block ids are
+  as numerous as records). The tail table is rebuilt with one forward pass
+  wherever the resident index is loaded or replaced wholesale.
+- Opening or invalidating a shared sidecar identity must not sweep the whole
+  process-global registry every time. The registry sweeps only after it grows
+  past a doubling threshold, so `S` sequential opens cost `O(S)` slot checks in
+  total instead of `Theta(S^2)`.
+- The stream/indexed primary-generation witness must stop recomputing once its
+  bounded leading window is full: steady-state appends do zero witness work, and
+  the per-create nonce costs exactly one record at create and nothing per
+  append.
 
 ### Checkpoint, CRC, And Rebuild Cost Fixes
 

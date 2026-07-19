@@ -273,7 +273,8 @@ fn explicit_scan_progress_and_cancellation_are_exact() -> varve::Result<()> {
         reader.verify_all_with_progress(every_record_scan(None), |progress| {
             phases.push(progress.phase);
         })?,
-        4
+        // Three user records plus the internal creation-nonce record (STO-01).
+        5
     );
     assert_eq!(phases.first(), Some(&ScanProgressPhase::Started));
     assert_eq!(phases.last(), Some(&ScanProgressPhase::Complete));
@@ -400,5 +401,252 @@ fn million_unique_keys_keep_varve_resident_maps_empty() -> varve::Result<()> {
         report.write_calls,
         peak_delta(baseline),
     );
+    Ok(())
+}
+
+// PERF2-03 (report finding PERF-03): the resident keyed merge/compact family
+// retains one map entry per distinct key ever seen, including tombstoned keys,
+// so its memory is O(K-ever) and it is deliberately not a PB-scale operation.
+// These tests pin the published contract: the cost is predictable up front via
+// `estimate_keyed_merge`, and the `*_with_key_limit` entry points fail typed at
+// the cardinality boundary instead of exhausting memory.
+
+#[derive(Clone, Debug, PartialEq, varve::VarveBlock)]
+#[varve(id = 40, version = 1, kind = "variable", key = "user_id")]
+struct MergeUser {
+    #[varve(field_id = 1)]
+    user_id: u64,
+    #[varve(field_id = 2)]
+    name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, varve::VarveBlock)]
+#[varve(id = 41, version = 1, kind = "variable")]
+struct MergeUserOp {
+    #[varve(field_id = 1)]
+    rename_to: String,
+}
+
+impl varve::VarveMerge for MergeUser {
+    type Op = MergeUserOp;
+
+    fn apply_op(&mut self, op: Self::Op) -> varve::Result<()> {
+        self.name = op.rename_to;
+        Ok(())
+    }
+}
+
+varve_format! {
+    pub struct ResidentMergeFormat {
+        magic: b"HCMRG";
+        version: 1;
+        endian: little;
+        blocks: [MergeUser, MergeUserOp];
+    }
+}
+
+/// Writes `keys` distinct users and then tombstones the first `deleted` of
+/// them, so `K-ever` is `keys` while `K-live` is `keys - deleted`.
+fn write_merge_input(path: &Path, keys: u64, deleted: u64) -> varve::Result<()> {
+    let mut file = ResidentMergeFormat::create(path)?;
+    for key in 0..keys {
+        file.push(&MergeUser {
+            user_id: key,
+            name: format!("user-{key}"),
+        })?;
+    }
+    for key in 0..deleted {
+        file.delete::<MergeUser>(&key)?;
+    }
+    file.flush()?;
+    Ok(())
+}
+
+#[test]
+fn resident_merge_estimate_reports_the_k_ever_bound() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let base = directory.path().join("merge-estimate-base.varve");
+    let delta = directory.path().join("merge-estimate-delta.varve");
+    write_merge_input(&base, 200, 50)?;
+    write_merge_input(&delta, 40, 0)?;
+
+    let estimate = varve::estimate_keyed_merge::<MergeUser, _>(
+        ResidentMergeFormat::spec(),
+        base.as_path(),
+        &[delta.as_path()],
+    )?;
+
+    assert_eq!(estimate.input_records, 200 + 50 + 40);
+    assert_eq!(estimate.key_bearing_records, 200 + 50 + 40);
+    assert!(
+        estimate.max_distinct_keys >= 200,
+        "the estimate must bound K-ever from above, got {}",
+        estimate.max_distinct_keys
+    );
+    assert!(estimate.largest_input_index_bytes > 0);
+    assert!(estimate.max_state_bytes > 0);
+
+    // The bound is proportional to key cardinality, which is exactly why this
+    // family is resident-only: a ten-fold key count costs ten-fold state.
+    let bigger = directory.path().join("merge-estimate-big.varve");
+    write_merge_input(&bigger, 2_000, 0)?;
+    let bigger_estimate = varve::estimate_keyed_merge::<MergeUser, _>(
+        ResidentMergeFormat::spec(),
+        bigger.as_path(),
+        &[],
+    )?;
+    assert!(
+        bigger_estimate.max_state_bytes > estimate.max_state_bytes * 5,
+        "state bound must scale with K-ever: {} vs {}",
+        bigger_estimate.max_state_bytes,
+        estimate.max_state_bytes
+    );
+    Ok(())
+}
+
+#[test]
+fn resident_merge_and_compact_fail_typed_at_the_key_ceiling() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let base = directory.path().join("merge-guard-base.varve");
+    write_merge_input(&base, 200, 50)?;
+
+    // Tombstoned keys stay in the state, so K-ever is 200, not 150.
+    for output_name in ["merge-guard-out.varve", "compact-guard-out.varve"] {
+        let output = directory.path().join(output_name);
+        let compacting = output_name.starts_with("compact");
+        let refused = if compacting {
+            varve::compact_keyed_files_with_key_limit::<MergeUser, _>(
+                ResidentMergeFormat::spec(),
+                base.as_path(),
+                &[],
+                output.as_path(),
+                199,
+            )
+        } else {
+            varve::merge_keyed_files_with_key_limit::<MergeUser, _>(
+                ResidentMergeFormat::spec(),
+                base.as_path(),
+                &[],
+                output.as_path(),
+                199,
+            )
+        }
+        .expect_err("a K-ever ceiling below the input cardinality must be refused");
+        assert!(
+            matches!(
+                refused,
+                varve::Error::LimitExceeded {
+                    resource: "merge distinct keys",
+                    actual: 200,
+                    limit: 199,
+                }
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            !output.exists(),
+            "a refused merge must not publish {output_name}"
+        );
+
+        let accepted = if compacting {
+            varve::compact_keyed_files_with_key_limit::<MergeUser, _>(
+                ResidentMergeFormat::spec(),
+                base.as_path(),
+                &[],
+                output.as_path(),
+                200,
+            )
+        } else {
+            varve::merge_keyed_files_with_key_limit::<MergeUser, _>(
+                ResidentMergeFormat::spec(),
+                base.as_path(),
+                &[],
+                output.as_path(),
+                200,
+            )
+        };
+        accepted?;
+
+        let merged = ResidentMergeFormat::open_readonly(&output)?;
+        let users = merged.keyed_blocks::<MergeUser>()?;
+        assert_eq!(users.len(), 150, "50 of the 200 keys were tombstoned");
+    }
+    Ok(())
+}
+
+/// `compact_keyed_file` is the third public entry point named by the resident
+/// scale contract, and it lives in `merge.rs` rather than `file.rs`. It must
+/// carry the same caller-usable guards as its base+delta siblings: a pre-flight
+/// estimate that predicts the ceiling, a typed refusal at that ceiling that
+/// publishes nothing, and an unbounded form that still behaves.
+#[test]
+fn resident_single_input_compact_fails_typed_at_the_key_ceiling() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("compact-one-input.varve");
+    write_merge_input(&input, 200, 50)?;
+
+    // Pre-flight sizing for the single-input path goes through the same
+    // estimator with an empty delta slice.
+    let estimate = varve::estimate_keyed_merge::<MergeUser, _>(
+        ResidentMergeFormat::spec(),
+        input.as_path(),
+        &[],
+    )?;
+    assert_eq!(estimate.input_records, 250);
+    assert!(
+        estimate.max_distinct_keys >= 200,
+        "the estimate must bound K-ever from above, got {}",
+        estimate.max_distinct_keys
+    );
+
+    let refused_output = directory.path().join("compact-one-refused.varve");
+    let refused = varve::compact_keyed_file_with_key_limit::<MergeUser, _>(
+        ResidentMergeFormat::spec(),
+        input.as_path(),
+        refused_output.as_path(),
+        199,
+    )
+    .expect_err("a K-ever ceiling below the input cardinality must be refused");
+    assert!(
+        matches!(
+            refused,
+            varve::Error::LimitExceeded {
+                resource: "merge distinct keys",
+                actual: 200,
+                limit: 199,
+            }
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        !refused_output.exists(),
+        "a refused compact must not publish an output file"
+    );
+
+    // The tombstoned keys are counted by the ceiling, so the exact K-ever
+    // bound - not the live-key count - is what admits the run.
+    let bounded_output = directory.path().join("compact-one-bounded.varve");
+    varve::compact_keyed_file_with_key_limit::<MergeUser, _>(
+        ResidentMergeFormat::spec(),
+        input.as_path(),
+        bounded_output.as_path(),
+        200,
+    )?;
+    let bounded = ResidentMergeFormat::open_readonly(&bounded_output)?;
+    assert_eq!(
+        bounded.keyed_blocks::<MergeUser>()?.len(),
+        150,
+        "50 of the 200 keys were tombstoned"
+    );
+
+    // The unbounded entry point delegates with no ceiling and is unchanged.
+    let unbounded_output = directory.path().join("compact-one-unbounded.varve");
+    varve::compact_keyed_file::<MergeUser, _>(
+        ResidentMergeFormat::spec(),
+        input.as_path(),
+        unbounded_output.as_path(),
+    )?;
+    let unbounded = ResidentMergeFormat::open_readonly(&unbounded_output)?;
+    assert_eq!(unbounded.keyed_blocks::<MergeUser>()?.len(), 150);
     Ok(())
 }

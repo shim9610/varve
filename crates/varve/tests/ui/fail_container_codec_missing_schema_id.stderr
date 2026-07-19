@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: varve field `packed` uses a custom codec that declares no SCHEMA_ID; a hand-written codec must declare a schema identity that changes whenever its encoded bytes change (wrapping it in Option/Vec/array/map/tuple does not supply one)
+  --> tests/ui/fail_container_codec_missing_schema_id.rs:25:35
+   |
+25 | #[derive(Clone, Debug, PartialEq, VarveBlock)]
+   |                                   ^^^^^^^^^^ evaluation of `_` failed here

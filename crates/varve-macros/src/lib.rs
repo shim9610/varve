@@ -1,5 +1,5 @@
 use proc_macro::TokenStream;
-use proc_macro2::{Group, TokenStream as TokenStream2, TokenTree};
+use proc_macro2::{Group, Span, TokenStream as TokenStream2, TokenTree};
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
@@ -508,6 +508,7 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
         }
     };
     let is_keyed = !key_fields.is_empty();
+    let codec_identity_asserts = field_codec_identity_asserts(&descriptors);
     let schema_fingerprint = schema_fingerprint(
         block_id,
         version_value,
@@ -548,8 +549,11 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
     };
 
     Ok(quote! {
+        #(#codec_identity_asserts)*
+
         impl ::varve::__core::VarveEncode for #ident {
             const WIRE_TYPE: ::varve::__core::WireType = ::varve::__core::WireType::Nested;
+            const SCHEMA_ID: u64 = <Self as ::varve::__core::VarveBlock>::SCHEMA_FINGERPRINT;
 
             fn encode_varve(&self, encoder: &mut ::varve::__core::Encoder) -> ::varve::__core::Result<()> {
                 #encode_body
@@ -558,6 +562,7 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
 
         impl ::varve::__core::VarveDecode for #ident {
             const WIRE_TYPE: ::varve::__core::WireType = ::varve::__core::WireType::Nested;
+            const SCHEMA_ID: u64 = <Self as ::varve::__core::VarveBlock>::SCHEMA_FINGERPRINT;
 
             fn decode_varve(decoder: &mut ::varve::__core::Decoder<'_>) -> ::varve::__core::Result<Self> {
                 #decode_body
@@ -585,12 +590,19 @@ fn option_ident(name: &Ident) -> Ident {
     format_ident!("__varve_field_{}", name)
 }
 
-/// Deterministic fingerprint of the canonical block schema, computed at
-/// macro-expansion time.
+/// Deterministic fingerprint of the canonical block schema, emitted as a const
+/// expression the compiler folds in the caller's crate.
 ///
-/// FNV-1a 64 over a canonical string is implemented inline because the
+/// FNV-1a 64 over a canonical byte string is expanded inline because the
 /// standard `DefaultHasher` output is not stability-guaranteed. The value is a
 /// process-local schema identity, never part of the wire format.
+///
+/// API-04: each field contributes `<FieldTy as VarveEncode>::SCHEMA_ID` and
+/// its decode counterpart — resolved codec identities — alongside the source
+/// spelling, so two custom nested codecs that spell the field type identically
+/// but emit different bytes cannot share a fingerprint. That is why the
+/// fingerprint can no longer be a literal: the field identities are known only
+/// after type resolution.
 fn schema_fingerprint(
     block_id: u32,
     version: u16,
@@ -598,11 +610,15 @@ fn schema_fingerprint(
     endian: &str,
     keyed: bool,
     fields: &[FieldDescriptor],
-) -> u64 {
-    let mut canonical = format!(
-        "varve:block-schema:v1|id={block_id}|version={version}|kind={kind}|endian={endian}|keyed={keyed}"
+) -> TokenStream2 {
+    let header = LitByteStr::new(
+        format!(
+            "varve:block-schema:v2|id={block_id}|version={version}|kind={kind}|endian={endian}|keyed={keyed}"
+        )
+        .as_bytes(),
+        Span::call_site(),
     );
-    for field in fields {
+    let field_steps = fields.iter().map(|field| {
         let name = &field.name;
         let ty = &field.ty;
         let type_identity = quote!(#ty).to_string();
@@ -612,22 +628,84 @@ fn schema_fingerprint(
         } else {
             "required"
         };
-        canonical.push_str(&format!(
-            "|field:id={field_id},name={name},type={type_identity},presence={presence}"
-        ));
+        let literal = LitByteStr::new(
+            format!(
+                "|field:id={field_id},name={name},type={type_identity},presence={presence},codec="
+            )
+            .as_bytes(),
+            Span::call_site(),
+        );
+        quote! {
+            __varve_acc = __varve_schema_bytes(__varve_acc, #literal);
+            __varve_acc = __varve_schema_u64(
+                __varve_acc,
+                <#ty as ::varve::__core::VarveEncode>::SCHEMA_ID,
+            );
+            __varve_acc = __varve_schema_u64(
+                __varve_acc,
+                <#ty as ::varve::__core::VarveDecode>::SCHEMA_ID,
+            );
+            __varve_acc = __varve_schema_u64(
+                __varve_acc,
+                <#ty as ::varve::__core::VarveEncode>::WIRE_TYPE as u16 as u64,
+            );
+        }
+    });
+    quote! {
+        {
+            const fn __varve_schema_bytes(acc: u64, bytes: &[u8]) -> u64 {
+                let mut acc = acc;
+                let mut index = 0;
+                while index < bytes.len() {
+                    acc ^= bytes[index] as u64;
+                    acc = acc.wrapping_mul(0x0000_0100_0000_01b3u64);
+                    index += 1;
+                }
+                acc
+            }
+            const fn __varve_schema_u64(acc: u64, value: u64) -> u64 {
+                __varve_schema_bytes(acc, &value.to_le_bytes())
+            }
+            let mut __varve_acc = __varve_schema_bytes(0xcbf2_9ce4_8422_2325u64, #header);
+            #(#field_steps)*
+            __varve_acc
+        }
     }
-    fnv1a_64(canonical.as_bytes())
 }
 
-fn fnv1a_64(bytes: &[u8]) -> u64 {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET_BASIS;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
+/// Compile-time enforcement of the `VarveEncode::SCHEMA_ID` trust boundary for
+/// every field codec: a field type whose codec declares no identity would
+/// fingerprint by source spelling alone, which is exactly the API-04 collision.
+///
+/// The rule is deliberately wire-type agnostic. Restricting it to
+/// `WireType::Nested` left the same collision reachable through any other wire
+/// type - two `Packed` codecs spelled identically, both `WireType::U64`, both
+/// identity-less, emitting different bytes - so the assertion demands an
+/// identity from every field type. Built-in scalars, built-in containers and
+/// derived blocks all declare one, so this only fires on hand-written codecs,
+/// including ones reached through a container (`container_schema_id`
+/// propagates the missing identity outward as zero).
+fn field_codec_identity_asserts(fields: &[FieldDescriptor]) -> Vec<TokenStream2> {
+    fields
+        .iter()
+        .map(|field| {
+            let ty = &field.ty;
+            let name = field.name.to_string();
+            let message = format!(
+                "varve field `{name}` uses a custom codec that declares no SCHEMA_ID; a hand-written codec must declare a schema identity that changes whenever its encoded bytes change (wrapping it in Option/Vec/array/map/tuple does not supply one)"
+            );
+            quote! {
+                const _: () = ::core::assert!(
+                    <#ty as ::varve::__core::VarveEncode>::SCHEMA_ID != 0,
+                    #message
+                );
+                const _: () = ::core::assert!(
+                    <#ty as ::varve::__core::VarveDecode>::SCHEMA_ID != 0,
+                    #message
+                );
+            }
+        })
+        .collect()
 }
 
 fn parse_key_fields(value: &LitStr) -> Result<Vec<Ident>> {

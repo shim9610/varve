@@ -273,7 +273,10 @@ impl FormatSelfTest {
         self.cases.push(SelfTestCase {
             name: format!("keyed block {} key {:?}", T::ID, key),
             write: Some(Box::new(move |file| {
-                file.push(&write_value)?;
+                // API2-05: keyed self-test writes go through the maintaining
+                // keyed path, so a keyed-chaining format is exercised with a
+                // real predecessor chain rather than a truncated one.
+                file.push_keyed(&write_value)?;
                 Ok(())
             })),
             read: Some(Box::new(move |file| {
@@ -789,7 +792,8 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::ZeroCopyBlockKindMismatch { .. }
         | Error::ZeroCopyEndianMismatch { .. }
         | Error::ZeroCopyPayloadSizeMismatch { .. }
-        | Error::ZeroCopyAlignmentMismatch { .. } => DiagnosticDomain::CallerUsage,
+        | Error::ZeroCopyAlignmentMismatch { .. }
+        | Error::KeyedChainRequiresKeyedApi { .. } => DiagnosticDomain::CallerUsage,
 
         #[cfg(feature = "high-cardinality-dev")]
         Error::StreamingUnsupported => DiagnosticDomain::FeatureGate,
@@ -874,6 +878,19 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
 }
 
 pub fn error_hint(error: &Error) -> &'static str {
+    // A stale or foreign sidecar has one documented recovery, so it earns a
+    // variant-specific hint instead of the generic file-data one (STO-01).
+    #[cfg(feature = "high-cardinality-dev")]
+    if let Error::DiskIndex(disk_index) = error
+        && matches!(
+            **disk_index,
+            crate::disk_index::DiskIndexError::PrimaryGenerationMismatch
+                | crate::disk_index::DiskIndexError::IdentityMismatch
+        )
+    {
+        return "the sidecar does not describe this generation of the primary file; \
+                republish it with rebuild_disk_index (never trust it)";
+    }
     match classify_error(error) {
         DiagnosticDomain::FormatDefinition => "inspect the format declaration and generated schema",
         DiagnosticDomain::CallerUsage => {

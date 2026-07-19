@@ -54,14 +54,102 @@ impl WireType {
     }
 }
 
+/// FNV-1a 64 state for structural codec identities (API-04).
+///
+/// The derive expands the same folding inline so a generated
+/// `SCHEMA_FINGERPRINT` is a const expression over its fields' real
+/// `SCHEMA_ID` values rather than over their source spelling.
+const SCHEMA_ID_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+const SCHEMA_ID_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+const fn schema_id_bytes(acc: u64, bytes: &[u8]) -> u64 {
+    let mut acc = acc;
+    let mut index = 0;
+    while index < bytes.len() {
+        acc ^= bytes[index] as u64;
+        acc = acc.wrapping_mul(SCHEMA_ID_PRIME);
+        index += 1;
+    }
+    acc
+}
+
+const fn schema_id_u64(acc: u64, value: u64) -> u64 {
+    schema_id_bytes(acc, &value.to_le_bytes())
+}
+
+/// Identity of a leaf codec whose byte layout is fully described by `tag`.
+const fn leaf_schema_id(tag: &[u8]) -> u64 {
+    schema_id_bytes(SCHEMA_ID_SEED, tag)
+}
+
+/// Identity of a container codec, folded transitively over its elements.
+///
+/// **Absence is contagious.** An element whose `SCHEMA_ID` is `0` declares no
+/// identity, so the container built over it cannot claim one either: the
+/// result is `0`, not a hash of `0`. Without this rule `Option<Packed>` or
+/// `Vec<Packed>` would manufacture a non-zero identity out of two *different*
+/// identity-less `Packed` codecs and hand them the same value — exactly the
+/// collision `SCHEMA_ID` exists to prevent, merely one container deep. It also
+/// keeps the derive's per-field assertion transitively complete: rejecting
+/// zero at the field type rejects an identity-less codec at any nesting depth.
+const fn container_schema_id(tag: &[u8], elements: &[u64]) -> u64 {
+    container_schema_id_with_arity(tag, elements.len() as u64, elements)
+}
+
+/// [`container_schema_id`] for containers whose arity is part of the layout
+/// rather than an element identity (arrays), so `[T; 0]` is not mistaken for
+/// an identity-less element.
+const fn container_schema_id_with_arity(tag: &[u8], arity: u64, elements: &[u64]) -> u64 {
+    let mut acc = schema_id_u64(leaf_schema_id(tag), arity);
+    let mut index = 0;
+    while index < elements.len() {
+        if elements[index] == 0 {
+            return 0;
+        }
+        acc = schema_id_u64(acc, elements[index]);
+        index += 1;
+    }
+    acc
+}
+
 pub trait VarveEncode {
     const WIRE_TYPE: WireType;
+
+    /// Structural identity of the bytes this codec emits (API-04).
+    ///
+    /// [`WireType`] is far too coarse to separate two custom codecs that both
+    /// encode as [`WireType::Nested`] but disagree on layout, and a derived
+    /// block's fingerprint cannot see through a field type's source spelling.
+    /// `SCHEMA_ID` is the value that does distinguish them: built-in scalars
+    /// and containers define it structurally (containers fold their element
+    /// ids transitively), and `#[derive(VarveBlock)]` computes it from the
+    /// block identity plus every field's own `SCHEMA_ID`. Blocks therefore
+    /// fingerprint their fields by resolved codec identity, and
+    /// [`crate::FormatSpec::computed_schema_hash`] inherits that transitively.
+    ///
+    /// **Trust boundary.** The default `0` means "this codec declares no
+    /// identity". A manual codec that leaves it at `0` is indistinguishable
+    /// from any other identity-less codec with the same field type spelling,
+    /// so every hand-written codec must declare a value that changes whenever
+    /// its emitted bytes change. That requirement is enforced, not merely
+    /// documented, wherever it can collide: `#[derive(VarveBlock)]` rejects at
+    /// compile time *any* field whose codec resolves to `SCHEMA_ID == 0`,
+    /// regardless of [`WireType`], and [`container_schema_id`] propagates the
+    /// zero outward so wrapping an identity-less codec in `Option`, `Vec`, an
+    /// array, a map or a tuple cannot launder it into an identity.
+    const SCHEMA_ID: u64 = 0;
 
     fn encode_varve(&self, encoder: &mut Encoder) -> Result<()>;
 }
 
 pub trait VarveDecode: Sized {
     const WIRE_TYPE: WireType;
+
+    /// Structural identity of the bytes this codec accepts; see
+    /// [`VarveEncode::SCHEMA_ID`]. Derived block fingerprints fold both the
+    /// encode and the decode identity of every field, so an asymmetric manual
+    /// codec cannot pass itself off as its own mirror image.
+    const SCHEMA_ID: u64 = 0;
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self>;
 }
@@ -192,6 +280,12 @@ pub struct Decoder<'a> {
     materialization_limit: u64,
     materialization_remaining: u64,
 }
+
+/// Materialization charged per distinct variable field id above the small-id
+/// mask (RES-01). A `HashSet<u32>` bucket costs four payload bytes plus one
+/// control byte at a 7/8 load factor; eight bytes over-approximates that so
+/// the charge can never undercount the reservation it guards.
+const FIELD_ID_SET_ENTRY_BYTES: u64 = 2 * size_of::<u32>() as u64;
 
 impl<'a> Decoder<'a> {
     pub const STANDARD_MATERIALIZATION_LIMIT: u64 = 1024 * 1024 * 1024;
@@ -388,10 +482,20 @@ impl<'a> Decoder<'a> {
             return Ok(());
         }
 
-        let field_ids = self.large_field_ids.get_or_insert_with(HashSet::new);
-        if field_ids.contains(&field_id) {
+        if self
+            .large_field_ids
+            .as_ref()
+            .is_some_and(|field_ids| field_ids.contains(&field_id))
+        {
             return Err(Error::InvalidCanonicalEncoding("duplicate variable field"));
         }
+        // RES-01: every other decoder-owned container charges the
+        // materialization budget before it reserves. Duplicate detection for
+        // ids above the small-id mask is the one decoder-owned set whose
+        // growth is driven purely by attacker-chosen field ids, so charge
+        // before reserving rather than after.
+        self.charge_materialization(FIELD_ID_SET_ENTRY_BYTES, "variable field ids")?;
+        let field_ids = self.large_field_ids.get_or_insert_with(HashSet::new);
         let requested = u64::try_from(field_ids.len())
             .unwrap_or(u64::MAX)
             .saturating_add(1)
@@ -475,6 +579,7 @@ pub fn decode_from_slice<T: VarveDecode>(bytes: &[u8], endian: Endian) -> Result
 
 impl VarveEncode for () {
     const WIRE_TYPE: WireType = WireType::Unit;
+    const SCHEMA_ID: u64 = leaf_schema_id(b"unit");
 
     fn encode_varve(&self, _encoder: &mut Encoder) -> Result<()> {
         Ok(())
@@ -483,6 +588,7 @@ impl VarveEncode for () {
 
 impl VarveDecode for () {
     const WIRE_TYPE: WireType = WireType::Unit;
+    const SCHEMA_ID: u64 = leaf_schema_id(b"unit");
 
     fn decode_varve(_decoder: &mut Decoder<'_>) -> Result<Self> {
         Ok(())
@@ -493,6 +599,7 @@ macro_rules! unsigned {
     ($ty:ty, $wire:ident, $write:ident, $read:ident) => {
         impl VarveEncode for $ty {
             const WIRE_TYPE: WireType = WireType::$wire;
+            const SCHEMA_ID: u64 = leaf_schema_id(stringify!($ty).as_bytes());
 
             fn encode_varve(&self, encoder: &mut Encoder) -> Result<()> {
                 encoder.$write(*self);
@@ -502,6 +609,7 @@ macro_rules! unsigned {
 
         impl VarveDecode for $ty {
             const WIRE_TYPE: WireType = WireType::$wire;
+            const SCHEMA_ID: u64 = leaf_schema_id(stringify!($ty).as_bytes());
 
             fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
                 decoder.$read()
@@ -514,6 +622,7 @@ macro_rules! signed {
     ($ty:ty, $wire:ident, $uty:ty, $write:ident, $read:ident) => {
         impl VarveEncode for $ty {
             const WIRE_TYPE: WireType = WireType::$wire;
+            const SCHEMA_ID: u64 = leaf_schema_id(stringify!($ty).as_bytes());
 
             fn encode_varve(&self, encoder: &mut Encoder) -> Result<()> {
                 encoder.$write(*self as $uty);
@@ -523,6 +632,7 @@ macro_rules! signed {
 
         impl VarveDecode for $ty {
             const WIRE_TYPE: WireType = WireType::$wire;
+            const SCHEMA_ID: u64 = leaf_schema_id(stringify!($ty).as_bytes());
 
             fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
                 Ok(decoder.$read()? as Self)
@@ -544,6 +654,7 @@ signed!(i128, I128, u128, write_u128, read_u128);
 
 impl VarveEncode for bool {
     const WIRE_TYPE: WireType = WireType::Bool;
+    const SCHEMA_ID: u64 = leaf_schema_id(b"bool");
 
     fn encode_varve(&self, encoder: &mut Encoder) -> Result<()> {
         encoder.write_u8(u8::from(*self));
@@ -553,6 +664,7 @@ impl VarveEncode for bool {
 
 impl VarveDecode for bool {
     const WIRE_TYPE: WireType = WireType::Bool;
+    const SCHEMA_ID: u64 = leaf_schema_id(b"bool");
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         match decoder.read_u8()? {
@@ -567,6 +679,7 @@ impl VarveDecode for bool {
 
 impl VarveEncode for f32 {
     const WIRE_TYPE: WireType = WireType::F32;
+    const SCHEMA_ID: u64 = leaf_schema_id(b"f32");
 
     fn encode_varve(&self, encoder: &mut Encoder) -> Result<()> {
         encoder.write_u32(self.to_bits());
@@ -576,6 +689,7 @@ impl VarveEncode for f32 {
 
 impl VarveDecode for f32 {
     const WIRE_TYPE: WireType = WireType::F32;
+    const SCHEMA_ID: u64 = leaf_schema_id(b"f32");
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         Ok(Self::from_bits(decoder.read_u32()?))
@@ -584,6 +698,7 @@ impl VarveDecode for f32 {
 
 impl VarveEncode for f64 {
     const WIRE_TYPE: WireType = WireType::F64;
+    const SCHEMA_ID: u64 = leaf_schema_id(b"f64");
 
     fn encode_varve(&self, encoder: &mut Encoder) -> Result<()> {
         encoder.write_u64(self.to_bits());
@@ -593,6 +708,7 @@ impl VarveEncode for f64 {
 
 impl VarveDecode for f64 {
     const WIRE_TYPE: WireType = WireType::F64;
+    const SCHEMA_ID: u64 = leaf_schema_id(b"f64");
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         Ok(Self::from_bits(decoder.read_u64()?))
@@ -601,6 +717,7 @@ impl VarveDecode for f64 {
 
 impl VarveEncode for Vec<u8> {
     const WIRE_TYPE: WireType = WireType::Bytes;
+    const SCHEMA_ID: u64 = leaf_schema_id(b"bytes");
 
     fn encode_varve(&self, encoder: &mut Encoder) -> Result<()> {
         encoder.write_u64(self.len() as u64);
@@ -611,6 +728,7 @@ impl VarveEncode for Vec<u8> {
 
 impl VarveDecode for Vec<u8> {
     const WIRE_TYPE: WireType = WireType::Bytes;
+    const SCHEMA_ID: u64 = leaf_schema_id(b"bytes");
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         let len = decoder.read_len()?;
@@ -633,6 +751,7 @@ impl VarveDecode for Vec<u8> {
 
 impl VarveEncode for String {
     const WIRE_TYPE: WireType = WireType::String;
+    const SCHEMA_ID: u64 = leaf_schema_id(b"string");
 
     fn encode_varve(&self, encoder: &mut Encoder) -> Result<()> {
         encoder.write_u64(self.len() as u64);
@@ -643,6 +762,7 @@ impl VarveEncode for String {
 
 impl VarveDecode for String {
     const WIRE_TYPE: WireType = WireType::String;
+    const SCHEMA_ID: u64 = leaf_schema_id(b"string");
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         let len = decoder.read_len()?;
@@ -668,6 +788,7 @@ where
     T: VarveEncode,
 {
     const WIRE_TYPE: WireType = WireType::Nested;
+    const SCHEMA_ID: u64 = container_schema_id(b"option", &[T::SCHEMA_ID]);
 
     fn encode_varve(&self, encoder: &mut Encoder) -> Result<()> {
         match self {
@@ -688,6 +809,7 @@ where
     T: VarveDecode,
 {
     const WIRE_TYPE: WireType = WireType::Nested;
+    const SCHEMA_ID: u64 = container_schema_id(b"option", &[T::SCHEMA_ID]);
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         if bool::decode_varve(decoder)? {
@@ -703,6 +825,7 @@ where
     T: VarveEncode,
 {
     const WIRE_TYPE: WireType = WireType::Seq;
+    const SCHEMA_ID: u64 = container_schema_id_with_arity(b"array", N as u64, &[T::SCHEMA_ID]);
 
     fn encode_varve(&self, encoder: &mut Encoder) -> Result<()> {
         for value in self {
@@ -717,6 +840,7 @@ where
     T: VarveDecode,
 {
     const WIRE_TYPE: WireType = WireType::Seq;
+    const SCHEMA_ID: u64 = container_schema_id_with_arity(b"array", N as u64, &[T::SCHEMA_ID]);
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         decoder.preflight_count(N, minimum_wire_size(T::WIRE_TYPE), size_of::<T>(), "array")?;
@@ -740,6 +864,7 @@ where
     V: VarveEncode,
 {
     const WIRE_TYPE: WireType = WireType::Nested;
+    const SCHEMA_ID: u64 = container_schema_id(b"btreemap", &[K::SCHEMA_ID, V::SCHEMA_ID]);
 
     fn encode_varve(&self, encoder: &mut Encoder) -> Result<()> {
         encoder.write_u64(self.len() as u64);
@@ -757,6 +882,7 @@ where
     V: VarveDecode,
 {
     const WIRE_TYPE: WireType = WireType::Nested;
+    const SCHEMA_ID: u64 = container_schema_id(b"btreemap", &[K::SCHEMA_ID, V::SCHEMA_ID]);
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         let len = decoder.read_len()?;
@@ -801,6 +927,7 @@ where
     V: VarveEncode,
 {
     const WIRE_TYPE: WireType = WireType::Nested;
+    const SCHEMA_ID: u64 = container_schema_id(b"hashmap", &[K::SCHEMA_ID, V::SCHEMA_ID]);
 
     fn encode_varve(&self, encoder: &mut Encoder) -> Result<()> {
         let mut entries: Vec<(&K, &V)> = self.iter().collect();
@@ -820,6 +947,7 @@ where
     V: VarveDecode,
 {
     const WIRE_TYPE: WireType = WireType::Nested;
+    const SCHEMA_ID: u64 = container_schema_id(b"hashmap", &[K::SCHEMA_ID, V::SCHEMA_ID]);
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         let len = decoder.read_len()?;
@@ -869,6 +997,8 @@ macro_rules! vec_seq_codec {
         $(
             impl VarveEncode for Vec<$ty> {
                 const WIRE_TYPE: WireType = WireType::Seq;
+                const SCHEMA_ID: u64 =
+                    container_schema_id(b"seq", &[<$ty as VarveEncode>::SCHEMA_ID]);
 
                 fn encode_varve(&self, encoder: &mut Encoder) -> Result<()> {
                     encoder.write_u64(self.len() as u64);
@@ -881,6 +1011,8 @@ macro_rules! vec_seq_codec {
 
             impl VarveDecode for Vec<$ty> {
                 const WIRE_TYPE: WireType = WireType::Seq;
+                const SCHEMA_ID: u64 =
+                    container_schema_id(b"seq", &[<$ty as VarveDecode>::SCHEMA_ID]);
 
                 fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
                     let len = decoder.read_len()?;
@@ -945,6 +1077,8 @@ macro_rules! tuple_codec {
             $($name: VarveEncode),+
         {
             const WIRE_TYPE: WireType = WireType::Nested;
+            const SCHEMA_ID: u64 =
+                container_schema_id(b"tuple", &[$(<$name as VarveEncode>::SCHEMA_ID),+]);
 
             #[allow(non_snake_case)]
             fn encode_varve(&self, encoder: &mut Encoder) -> Result<()> {
@@ -959,6 +1093,8 @@ macro_rules! tuple_codec {
             $($name: VarveDecode),+
         {
             const WIRE_TYPE: WireType = WireType::Nested;
+            const SCHEMA_ID: u64 =
+                container_schema_id(b"tuple", &[$(<$name as VarveDecode>::SCHEMA_ID),+]);
 
             fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
                 Ok(($($name::decode_varve(decoder)?,)+))

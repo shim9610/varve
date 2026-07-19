@@ -56,13 +56,15 @@ pub use disk_index::{
 };
 pub use error::{Error, Result};
 pub use file::{
-    AppendInfo, BlockEvent, COMMIT_BLOCK_ID, FileMatrixDurabilityBarrier, INDEX_BLOCK_ID,
-    MANIFEST_BLOCK_ID, METADATA_BLOCK_ID, MatrixDurabilityBarrier, MatrixNumeric,
-    MatrixSidecarManifest, OP_BLOCK_ID, OpenMode, RecordIndexEntry, RecoveryReport,
-    ReplacePublicationFailure, ReplaceStrategy, ReplacementInfo, SchemaBlockDescriptor,
-    SchemaFieldDescriptor, SchemaManifest, TOMBSTONE_BLOCK_ID, VarveFile, VarveReader, VarveWriter,
-    WriterLockBreakPolicy, WriterLockInfo, classify_replace_publication_error,
-    clear_stale_writer_lock, compact_keyed_files, merge_keyed_files,
+    AppendInfo, BlockEvent, COMMIT_BLOCK_ID, CREATION_NONCE_BLOCK_ID, FileMatrixDurabilityBarrier,
+    INDEX_BLOCK_ID, KeyedMergeEstimate, MANIFEST_BLOCK_ID, METADATA_BLOCK_ID,
+    MatrixDurabilityBarrier, MatrixNumeric, MatrixSidecarManifest, OP_BLOCK_ID, OpenMode,
+    RecordIndexEntry, RecoveryReport, ReplacePublicationFailure, ReplaceStrategy, ReplacementInfo,
+    SchemaBlockDescriptor, SchemaFieldDescriptor, SchemaManifest, TOMBSTONE_BLOCK_ID, VarveFile,
+    VarveReader, VarveWriter, WriterLockBreakPolicy, WriterLockInfo,
+    classify_replace_publication_error, clear_stale_writer_lock, compact_keyed_files,
+    compact_keyed_files_with_key_limit, estimate_keyed_merge, merge_keyed_files,
+    merge_keyed_files_with_key_limit,
 };
 #[cfg(feature = "mmap")]
 pub use file::{MmapMatrix, MmapPayloads};
@@ -94,7 +96,10 @@ pub use matrix::{
     MatrixDimensionValue, MatrixDimensions, MatrixKey, MatrixRecoveryAction, MatrixRecoveryFinding,
     MatrixRecoveryReport, MatrixResumeSignal, PackedBitmap,
 };
-pub use merge::{MergeAction, SequencedMergeAction, VarveMerge, compact_keyed_file};
+pub use merge::{
+    MergeAction, SequencedMergeAction, VarveMerge, compact_keyed_file,
+    compact_keyed_file_with_key_limit,
+};
 #[cfg(feature = "high-cardinality-dev")]
 pub use scan_control::{
     ScanCancellationToken, ScanOptions, ScanProgress, ScanProgressOptions, ScanProgressPhase,

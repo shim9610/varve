@@ -194,7 +194,8 @@ fn rebuild_replaces_the_sidecar_for_fresh_handles() -> Result<()> {
     // open the replacement database, not a stale shared entry for the
     // replaced file object.
     let report = rebuild_disk_index(spec, &path, options, plan)?;
-    assert_eq!(report.records, 3);
+    // Three user records plus the internal creation-nonce record (STO-01).
+    assert_eq!(report.records, 4);
     let first = VarveIndexedReader::open(spec, &path, options, plan)?;
     let second = VarveIndexedReader::open(spec, &path, options, plan)?;
     for reader in [&first, &second] {
@@ -279,6 +280,13 @@ fn crc_point_lookups_verify_payloads_and_detect_corruption() -> Result<()> {
 
     let marker = "crc-corruption-target-payload-0123456789abcdef";
     let mut writer = VarveIndexedWriter::create(spec, &path, options, plan)?;
+    // Push the corruption target past the primary generation witness window
+    // (STO-01): a byte flipped inside that window is a generation change and
+    // is refused at open, which is a different contract from the per-record
+    // checksum this test pins. Everything asserted below is unchanged.
+    for key in 100..200u64 {
+        writer.push_info(&item(key, "generation-window-filler"))?;
+    }
     writer.push_info(&item(1, marker))?;
     writer.push_info(&item(2, "intact"))?;
     writer.delete_info::<Item>(&3)?;
@@ -319,5 +327,53 @@ fn crc_point_lookups_verify_payloads_and_detect_corruption() -> Result<()> {
     ));
     // The untouched record still verifies and decodes.
     assert_eq!(reader.get::<Item>(&2)?, Some(item(2, "intact")));
+    Ok(())
+}
+
+/// PERF-04: the process-global sidecar registry used to sweep every slot on
+/// every create/open/invalidate while holding the global mutex, so opening `S`
+/// identities accumulated `Theta(S^2)` slot checks. Reclamation is now
+/// amortized: the total slot inspections for `S` sequential opens must stay
+/// linear in `S`.
+#[cfg(feature = "scalable-fault-injection")]
+#[test]
+fn registry_cost_per_open_does_not_scale_with_live_identities() -> Result<()> {
+    use varve::DiskIndexRebuildReport;
+
+    fn open_identities(count: u64) -> Result<u64> {
+        let directory = tempfile::tempdir()?;
+        let options = DiskIndexOptions::default();
+        let spec = spec(IntegrityPolicy::None);
+        let plan = plan(IntegrityPolicy::None);
+        let mut readers = Vec::new();
+        for index in 0..count {
+            let path = directory.path().join(format!("identity-{index}.varve"));
+            let mut writer = VarveIndexedWriter::create(spec, &path, options, plan)?;
+            writer.push_info(&item(index, "value"))?;
+            writer.sync()?;
+            drop(writer);
+            readers.push(VarveIndexedReader::open(spec, &path, options, plan)?);
+        }
+        DiskIndexRebuildReport::reset_scaling_counters();
+        // Reopen every identity while all of them are still live.
+        let mut extra = Vec::new();
+        for index in 0..count {
+            let path = directory.path().join(format!("identity-{index}.varve"));
+            extra.push(VarveIndexedReader::open(spec, &path, options, plan)?);
+        }
+        let inspected = DiskIndexRebuildReport::registry_slots_inspected();
+        drop(extra);
+        drop(readers);
+        Ok(inspected)
+    }
+
+    let small = open_identities(8)?;
+    let large = open_identities(64)?;
+    // Quadratic sweeping would make `large` roughly 64 times `small`; the
+    // amortized bound keeps the ratio close to the identity-count ratio.
+    assert!(
+        large <= small.saturating_mul(16).max(64 * 4),
+        "registry inspections scale super-linearly: {small} for 8 identities, {large} for 64"
+    );
     Ok(())
 }

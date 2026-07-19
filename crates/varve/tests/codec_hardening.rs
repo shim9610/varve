@@ -381,3 +381,78 @@ fn field_headers_decode_checked_lengths_while_writers_emit_zero_flags() -> varve
 
     Ok(())
 }
+
+/// RES-01: distinct variable field ids above the small-id mask are the one
+/// decoder-owned set an attacker sizes directly from the header stream, so
+/// each one must be charged to the materialization budget before the set
+/// reserves for it — like every other decoder-owned container.
+#[test]
+fn large_field_id_bookkeeping_is_charged_to_the_materialization_budget() {
+    const HIGH_FIELD_IDS: u32 = 8;
+    const CHARGE_PER_ID: u64 = 8;
+
+    let mut encoded = Vec::new();
+    append_field(&mut encoded, 1, WireType::U8, 0, 1, &[7]);
+    for offset in 0..HIGH_FIELD_IDS {
+        append_field(&mut encoded, 64 + offset, WireType::U8, 0, 1, &[0]);
+    }
+
+    // A zero budget cannot admit even the first high field id.
+    assert!(matches!(
+        Decoder::decode_from_slice_limited::<HardenedVariable>(&encoded, Endian::Little, 0),
+        Err(Error::LimitExceeded {
+            resource: "variable field ids",
+            actual: CHARGE_PER_ID,
+            limit: 0,
+        })
+    ));
+
+    // One byte short of the full set still fails, and it fails on the last
+    // id rather than silently over-allocating.
+    let exact = CHARGE_PER_ID * u64::from(HIGH_FIELD_IDS);
+    assert!(matches!(
+        Decoder::decode_from_slice_limited::<HardenedVariable>(
+            &encoded,
+            Endian::Little,
+            exact - 1
+        ),
+        Err(Error::LimitExceeded {
+            resource: "variable field ids",
+            limit,
+            ..
+        }) if limit == exact - 1
+    ));
+
+    // The exact budget admits the record, and small ids stay free: they are
+    // tracked by the fixed 64-bit mask and own no allocation.
+    assert_eq!(
+        Decoder::decode_from_slice_limited::<HardenedVariable>(&encoded, Endian::Little, exact)
+            .expect("exact large-field-id budget"),
+        HardenedVariable { value: 7 }
+    );
+
+    let mut small_only = Vec::new();
+    append_field(&mut small_only, 1, WireType::U8, 0, 1, &[7]);
+    append_field(&mut small_only, 63, WireType::U8, 0, 1, &[0]);
+    assert_eq!(
+        Decoder::decode_from_slice_limited::<HardenedVariable>(&small_only, Endian::Little, 0)
+            .expect("small field ids need no budget"),
+        HardenedVariable { value: 7 }
+    );
+}
+
+/// Duplicate detection still precedes the charge, so a hostile duplicate
+/// cannot drain the budget on an id the set already holds.
+#[test]
+fn duplicate_large_field_ids_are_rejected_without_extra_charge() {
+    let mut encoded = Vec::new();
+    append_field(&mut encoded, 1, WireType::U8, 0, 1, &[7]);
+    append_field(&mut encoded, 4096, WireType::U8, 0, 1, &[0]);
+    append_field(&mut encoded, 4096, WireType::U8, 0, 1, &[0]);
+
+    assert_invalid_canonical(Decoder::decode_from_slice_limited::<HardenedVariable>(
+        &encoded,
+        Endian::Little,
+        8,
+    ));
+}

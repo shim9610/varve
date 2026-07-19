@@ -32,6 +32,8 @@ fn macro_compile_contracts() {
     tests.compile_fail("tests/ui/fail_unknown_limit_key.rs");
     tests.compile_fail("tests/ui/fail_duplicate_limit_key.rs");
     tests.compile_fail("tests/ui/fail_manual_block_fingerprint_mismatch.rs");
+    tests.compile_fail("tests/ui/fail_custom_codec_missing_schema_id.rs");
+    tests.compile_fail("tests/ui/fail_container_codec_missing_schema_id.rs");
     tests.compile_fail("tests/ui/fail_keyed_contradiction.rs");
     tests.compile_fail("tests/ui/fail_keyed_contradiction_merge.rs");
     #[cfg(not(feature = "high-cardinality-dev"))]

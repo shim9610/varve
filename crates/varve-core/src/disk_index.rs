@@ -29,8 +29,10 @@ const DEFAULT_BATCH_RECORDS: usize = 16_384;
 const DEFAULT_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
 const META_MAGIC: [u8; 8] = *b"VARVEVKI";
-const META_VERSION: u16 = 2;
-const META_LEN: usize = 260;
+// v3 adds the primary generation witness (STO-01). A v2 sidecar is refused
+// with the typed `MetadataVersion` error and is stale-regenerable by rebuild.
+const META_VERSION: u16 = 3;
+const META_LEN: usize = 300;
 const LATEST_LEN: usize = 52;
 const TAIL_LEN: usize = 32;
 const BATCH_UPDATE_FIXED_BYTES: usize = 32 + 8 + LATEST_LEN;
@@ -131,6 +133,71 @@ impl DiskIndexOptions {
 
 pub type DiskIndexResult<T> = std::result::Result<T, DiskIndexError>;
 
+/// Observability counters for the scaling contracts the release gates pin
+/// (PERF-04 registry cost, API-03 codec invocation). Thread-local and only
+/// compiled under `scalable-fault-injection`; the release build keeps the
+/// call sites as empty inline functions.
+#[cfg(feature = "scalable-fault-injection")]
+pub(crate) mod scaling_counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        static REGISTRY_SLOTS_INSPECTED: Cell<u64> = const { Cell::new(0) };
+        static DESCRIPTOR_DECODER_CALLS: Cell<u64> = const { Cell::new(0) };
+        static PRIMARY_GENERATION_SCANS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn add_registry_slots_inspected(slots: u64) {
+        REGISTRY_SLOTS_INSPECTED.with(|value| value.set(value.get().saturating_add(slots)));
+    }
+
+    pub(crate) fn add_descriptor_decoder_call() {
+        DESCRIPTOR_DECODER_CALLS.with(|value| value.set(value.get().saturating_add(1)));
+    }
+
+    pub(crate) fn add_primary_generation_scan() {
+        PRIMARY_GENERATION_SCANS.with(|value| value.set(value.get().saturating_add(1)));
+    }
+
+    pub fn primary_generation_scans() -> u64 {
+        PRIMARY_GENERATION_SCANS.with(Cell::get)
+    }
+
+    pub fn registry_slots_inspected() -> u64 {
+        REGISTRY_SLOTS_INSPECTED.with(Cell::get)
+    }
+
+    pub fn descriptor_decoder_calls() -> u64 {
+        DESCRIPTOR_DECODER_CALLS.with(Cell::get)
+    }
+
+    pub fn reset() {
+        REGISTRY_SLOTS_INSPECTED.with(|value| value.set(0));
+        DESCRIPTOR_DECODER_CALLS.with(|value| value.set(0));
+        PRIMARY_GENERATION_SCANS.with(|value| value.set(0));
+    }
+}
+
+#[inline(always)]
+fn registry_slots_inspected(slots: u64) {
+    #[cfg(feature = "scalable-fault-injection")]
+    scaling_counters::add_registry_slots_inspected(slots);
+    #[cfg(not(feature = "scalable-fault-injection"))]
+    let _ = slots;
+}
+
+#[inline(always)]
+pub(crate) fn primary_generation_scan() {
+    #[cfg(feature = "scalable-fault-injection")]
+    scaling_counters::add_primary_generation_scan();
+}
+
+#[inline(always)]
+fn descriptor_decoder_call() {
+    #[cfg(feature = "scalable-fault-injection")]
+    scaling_counters::add_descriptor_decoder_call();
+}
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DiskIndexError {
@@ -196,6 +263,9 @@ pub enum DiskIndexError {
     TailDigestMismatch,
     InvalidTail(&'static str),
     IdentityMismatch,
+    /// The primary no longer matches the generation the sidecar was published
+    /// against: the leading bytes of the file changed underneath it (STO-01).
+    PrimaryGenerationMismatch,
     ModeMismatch {
         expected: DiskIndexMode,
         actual: DiskIndexMode,
@@ -337,6 +407,10 @@ impl fmt::Display for DiskIndexError {
             Self::TailDigestMismatch => write!(f, "disk index tail digest mismatch"),
             Self::InvalidTail(reason) => write!(f, "invalid disk index tail: {reason}"),
             Self::IdentityMismatch => write!(f, "disk index does not match the primary file"),
+            Self::PrimaryGenerationMismatch => write!(
+                f,
+                "disk index was published against a different generation of the primary file"
+            ),
             Self::ModeMismatch { expected, actual } => write!(
                 f,
                 "disk index mode mismatch: expected {expected:?}, got {actual:?}"
@@ -526,6 +600,36 @@ pub struct DiskIndexIdentity {
     pub primary_fingerprint: [u8; 32],
 }
 
+/// Bytes of the primary covered by the generation witness (STO-01).
+///
+/// The window is a small constant: the witness must catch a rewrite of the
+/// primary's leading records, and verifying it costs one bounded read at open
+/// regardless of file size. Growing it would not change the class of rewrite
+/// it detects, only how far into the file the check reaches.
+pub(crate) const PRIMARY_GENERATION_WINDOW: u64 = 4096;
+
+/// Witness that the sidecar still belongs to the primary generation it was
+/// published against.
+///
+/// Schema hash, OS object identity and the deterministic file header are all
+/// stable across an in-place rewrite of a primary by an equal-length primary
+/// of the same format, so they cannot distinguish two logical generations of
+/// one file object. `digest` covers the first `len` bytes of the primary as of
+/// the recorded commit, which no such rewrite preserves unless it reproduces
+/// those bytes exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiskIndexPrimaryGeneration {
+    pub len: u64,
+    pub digest: DiskIndexDigest,
+}
+
+impl DiskIndexPrimaryGeneration {
+    pub const EMPTY: Self = Self {
+        len: 0,
+        digest: DiskIndexDigest([0u8; 32]),
+    };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiskIndexState {
     Dirty,
@@ -562,6 +666,7 @@ pub struct DiskIndexCheckpoint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DiskIndexMetadata {
     pub identity: DiskIndexIdentity,
+    pub primary_generation: DiskIndexPrimaryGeneration,
     pub mode: DiskIndexMode,
     pub state: DiskIndexState,
     pub generation: u64,
@@ -607,6 +712,7 @@ impl DiskIndexMetadata {
         let empty_digest = tail_digest(std::iter::empty());
         Self {
             identity,
+            primary_generation: DiskIndexPrimaryGeneration::EMPTY,
             mode,
             state: DiskIndexState::Clean,
             generation: 0,
@@ -619,6 +725,12 @@ impl DiskIndexMetadata {
             committed_tail_digest: empty_digest,
             working_tail_digest: empty_digest,
         }
+    }
+
+    #[must_use]
+    pub fn with_primary_generation(mut self, generation: DiskIndexPrimaryGeneration) -> Self {
+        self.primary_generation = generation;
+        self
     }
 }
 
@@ -633,12 +745,23 @@ type ExtractTombstoneUpdate = fn(
     usize,
 ) -> crate::Result<DiskIndexUpdate>;
 
+type RegisterDescriptorBlock = fn(FormatSpec) -> crate::Result<()>;
+
+type BlockIdentityTable = &'static [(u32, Option<crate::Endian>, bool, u64)];
+
 #[derive(Clone, Copy)]
 pub struct DiskIndexDescriptor {
     pub block_id: u32,
     pub block_version: u16,
     pub key_wire_type: u16,
+    /// API-03: the block schema fingerprint of the concrete `T` whose decode
+    /// and key-extraction function pointers this descriptor captured. Without
+    /// it a descriptor built for one block type validated — and then decoded
+    /// primary bytes — against a format that declares a different schema for
+    /// the same block id.
+    pub schema_fingerprint: u64,
     key_codec_identity: fn() -> String,
+    register: RegisterDescriptorBlock,
     extract_put: ExtractPutUpdate,
     extract_tombstone: ExtractTombstoneUpdate,
 }
@@ -656,7 +779,9 @@ impl DiskIndexDescriptor {
             block_id: T::ID,
             block_version: T::VERSION,
             key_wire_type: <T::Key as VarveEncode>::WIRE_TYPE as u16,
+            schema_fingerprint: T::SCHEMA_FINGERPRINT,
             key_codec_identity: disk_key_codec_identity::<T::Key>,
+            register: register_descriptor_block::<T>,
             extract_put: extract_descriptor_put::<T>,
             extract_tombstone: extract_descriptor_tombstone::<T>,
         }
@@ -665,6 +790,23 @@ impl DiskIndexDescriptor {
     pub fn key_codec_identity(self) -> String {
         (self.key_codec_identity)()
     }
+
+    /// Runs the format's authoritative block-identity gate for the concrete
+    /// type this descriptor captured. Plan construction calls it once per
+    /// descriptor, before any captured codec can reach file bytes; the gate is
+    /// itself cached per (format, block), so it is allocation- and syscall-free
+    /// after the first call.
+    fn check_registered(self, spec: FormatSpec) -> crate::Result<()> {
+        (self.register)(spec)
+    }
+}
+
+fn register_descriptor_block<T>(spec: FormatSpec) -> crate::Result<()>
+where
+    T: VarveKeyedBlock,
+    T::Key: VarveDiskKey,
+{
+    crate::collections::ensure_registered_block::<T>(spec)
 }
 
 impl fmt::Debug for DiskIndexDescriptor {
@@ -674,6 +816,7 @@ impl fmt::Debug for DiskIndexDescriptor {
             .field("block_id", &self.block_id)
             .field("block_version", &self.block_version)
             .field("key_wire_type", &self.key_wire_type)
+            .field("schema_fingerprint", &self.schema_fingerprint)
             .field("key_codec_identity", &key_codec_identity)
             .finish_non_exhaustive()
     }
@@ -684,12 +827,15 @@ pub struct DiskIndexPlan {
     descriptors: &'static [DiskIndexDescriptor],
     digest: DiskIndexDigest,
     /// Witness that this exact plan value already passed [`Self::validate`]
-    /// against the referenced format blocks. Block existence and version
-    /// checks depend only on `FormatSpec::blocks`, so a matching slice
-    /// (compared as a fat pointer) proves the earlier validation still holds
-    /// and open paths do not repeat the per-descriptor walk or the digest
-    /// recomputation that canonicalization already performed.
-    validated_blocks: Option<&'static [crate::BlockDescriptor]>,
+    /// against the referenced format tables. Block existence, version and
+    /// block-identity checks depend only on `FormatSpec::blocks` and
+    /// `FormatSpec::block_identities`, so matching slices (compared as fat
+    /// pointers) prove the earlier validation still holds and open paths do
+    /// not repeat the per-descriptor walk, the registration gate, or the
+    /// digest recomputation that canonicalization already performed. Both
+    /// tables are part of the witness: two specs that share a descriptor
+    /// table but declare different identities must not share it.
+    validated_blocks: Option<(&'static [crate::BlockDescriptor], BlockIdentityTable)>,
 }
 
 impl DiskIndexPlan {
@@ -702,7 +848,7 @@ impl DiskIndexPlan {
         Ok(Self {
             descriptors,
             digest,
-            validated_blocks: Some(spec.blocks),
+            validated_blocks: Some((spec.blocks, spec.block_identities)),
         })
     }
 
@@ -721,10 +867,9 @@ impl DiskIndexPlan {
         if self.digest.is_zero() {
             return Err(DiskIndexError::PlanDigestIsZero);
         }
-        if self
-            .validated_blocks
-            .is_some_and(|blocks| std::ptr::eq(blocks, spec.blocks))
-        {
+        if self.validated_blocks.is_some_and(|(blocks, identities)| {
+            std::ptr::eq(blocks, spec.blocks) && std::ptr::eq(identities, spec.block_identities)
+        }) {
             return Ok(self);
         }
         validate_descriptors(spec, self.descriptors)?;
@@ -732,7 +877,7 @@ impl DiskIndexPlan {
             return Err(DiskIndexError::PlanDigestMismatch);
         }
         Ok(Self {
-            validated_blocks: Some(spec.blocks),
+            validated_blocks: Some((spec.blocks, spec.block_identities)),
             ..self
         })
     }
@@ -797,6 +942,14 @@ fn validate_descriptors(
                 actual: block.1,
             });
         }
+        // API-03: the format's immutable block identity — keyedness and schema
+        // fingerprint included — is the authority for the concrete type whose
+        // decode and key-extraction pointers this descriptor captured. It runs
+        // here, at plan construction, so no captured codec can reach primary
+        // bytes through a plan the format never declared.
+        descriptor
+            .check_registered(spec)
+            .map_err(DiskIndexError::Primary)?;
     }
     Ok(())
 }
@@ -817,7 +970,10 @@ fn compute_plan_digest(descriptors: &[DiskIndexDescriptor]) -> DiskIndexResult<D
     let mut digest = [0u8; 32];
     for lane in 0..8u32 {
         let mut hasher = crc32fast::Hasher::new();
-        hasher.update(b"varve-disk-index-plan-v1");
+        // v2 folds the block schema fingerprint into the plan digest (API-03),
+        // so a sidecar published for one block schema is refused as stale for
+        // a plan whose descriptors decode a different one.
+        hasher.update(b"varve-disk-index-plan-v2");
         hasher.update(&lane.to_le_bytes());
         hasher.update(&descriptor_count.to_le_bytes());
         for (descriptor, codec) in descriptors.iter().zip(&codecs) {
@@ -826,6 +982,7 @@ fn compute_plan_digest(descriptors: &[DiskIndexDescriptor]) -> DiskIndexResult<D
             hasher.update(&descriptor.block_id.to_le_bytes());
             hasher.update(&descriptor.block_version.to_le_bytes());
             hasher.update(&descriptor.key_wire_type.to_le_bytes());
+            hasher.update(&descriptor.schema_fingerprint.to_le_bytes());
             hasher.update(&codec_len.to_le_bytes());
             hasher.update(codec);
         }
@@ -1150,6 +1307,7 @@ where
     T::Key: VarveDiskKey,
 {
     debug_assert_eq!(entry.block_id, T::ID);
+    descriptor_decoder_call();
     if entry.block_version != T::VERSION {
         return Err(Error::BlockVersionMismatch {
             block_id: T::ID,
@@ -1186,6 +1344,7 @@ where
 {
     #[cfg(test)]
     TOMBSTONE_KEY_DECODE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    descriptor_decoder_call();
     // Tombstone keys are decoded with the file endianness, matching
     // `file::decode_stream_tombstone_key`.
     let key: T::Key = budget.decode(key_payload, spec.endian)?;
@@ -1257,60 +1416,97 @@ impl SharedSidecar {
 /// cannot both reach redb.
 type SharedSidecarSlot = Arc<Mutex<SharedSidecar>>;
 
-fn shared_sidecar_registry() -> &'static Mutex<HashMap<Vec<u8>, SharedSidecarSlot>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<Vec<u8>, SharedSidecarSlot>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+/// Smallest map size that is ever swept. Below it a sweep is cheaper than the
+/// bookkeeping that would avoid it.
+const MIN_REGISTRY_PRUNE_SLOTS: usize = 16;
+
+/// Process-global identity -> slot map with amortized reclamation (PERF-04).
+///
+/// The map is only swept once it has grown past `prune_at`, and the next
+/// threshold is set to twice the surviving size. Each sweep is `Theta(S)` but
+/// is preceded by at least `S/2` insertions, so the global mutex is held for
+/// `O(1)` on the common path and `S` sequential opens cost `O(S)` slot checks
+/// in total instead of the previous `Theta(S^2)`.
+struct SharedSidecarRegistry {
+    slots: HashMap<Vec<u8>, SharedSidecarSlot>,
+    prune_at: usize,
 }
 
-fn lock_shared_registry() -> std::sync::MutexGuard<'static, HashMap<Vec<u8>, SharedSidecarSlot>> {
+impl SharedSidecarRegistry {
+    fn new() -> Self {
+        Self {
+            slots: HashMap::new(),
+            prune_at: MIN_REGISTRY_PRUNE_SLOTS,
+        }
+    }
+
+    /// Drops slots whose database is gone and that no in-flight open still
+    /// holds. A slot mutex is only probed with `try_lock`: a held lock means an
+    /// open is in progress, so the slot is live and must be kept — and the
+    /// global lock is therefore never blocked on a slow slot initialization.
+    fn prune(&mut self) {
+        registry_slots_inspected(self.slots.len() as u64);
+        self.slots.retain(|_, slot| {
+            if Arc::strong_count(slot) > 1 {
+                return true;
+            }
+            match slot.try_lock() {
+                Ok(shared) => shared.database.strong_count() != 0,
+                Err(std::sync::TryLockError::WouldBlock) => true,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    poisoned.into_inner().database.strong_count() != 0
+                }
+            }
+        });
+        self.prune_at = self
+            .slots
+            .len()
+            .saturating_mul(2)
+            .max(MIN_REGISTRY_PRUNE_SLOTS);
+    }
+
+    fn prune_if_grown(&mut self) {
+        if self.slots.len() > self.prune_at {
+            self.prune();
+        }
+    }
+}
+
+fn shared_sidecar_registry() -> &'static Mutex<SharedSidecarRegistry> {
+    static REGISTRY: OnceLock<Mutex<SharedSidecarRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(SharedSidecarRegistry::new()))
+}
+
+fn lock_shared_registry() -> std::sync::MutexGuard<'static, SharedSidecarRegistry> {
     shared_sidecar_registry()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Drops slots whose database is gone and that no in-flight open still holds.
-/// A slot mutex is only probed with `try_lock`: a held lock means an open is
-/// in progress, so the slot is live and must be kept — and the global lock is
-/// therefore never blocked on a slow slot initialization.
-fn prune_shared_registry(registry: &mut HashMap<Vec<u8>, SharedSidecarSlot>) {
-    registry.retain(|_, slot| {
-        if Arc::strong_count(slot) > 1 {
-            return true;
-        }
-        match slot.try_lock() {
-            Ok(shared) => shared.database.strong_count() != 0,
-            Err(std::sync::TryLockError::WouldBlock) => true,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                poisoned.into_inner().database.strong_count() != 0
-            }
-        }
-    });
-}
-
 /// Removes the process-local shared-database entry for the sidecar currently
 /// named by `path`. Best-effort: a missing or unreadable path can only leave
 /// entries whose `Weak` is dead or whose identity no longer resolves from any
-/// pathname; every open prunes dead entries opportunistically.
+/// pathname; growth past the prune threshold reclaims those.
 pub(crate) fn invalidate_shared_database(path: &Path) {
     let identity = sidecar_path_identity(path).ok();
     let mut registry = lock_shared_registry();
     if let Some(identity) = identity {
-        registry.remove(&identity);
+        registry_slots_inspected(1);
+        registry.slots.remove(&identity);
     }
-    prune_shared_registry(&mut registry);
+    registry.prune_if_grown();
 }
 
 fn shared_sidecar_slot(identity: &[u8]) -> SharedSidecarSlot {
     let mut registry = lock_shared_registry();
-    prune_shared_registry(&mut registry);
-    match registry.get(identity) {
-        Some(slot) => Arc::clone(slot),
-        None => {
-            let slot = Arc::new(Mutex::new(SharedSidecar::empty()));
-            registry.insert(identity.to_vec(), Arc::clone(&slot));
-            slot
-        }
+    registry_slots_inspected(1);
+    if let Some(slot) = registry.slots.get(identity) {
+        return Arc::clone(slot);
     }
+    let slot = Arc::new(Mutex::new(SharedSidecar::empty()));
+    registry.slots.insert(identity.to_vec(), Arc::clone(&slot));
+    registry.prune_if_grown();
+    slot
 }
 
 fn open_shared_database(
@@ -2106,6 +2302,24 @@ impl DiskIndexWriteBatch {
         Ok(self.metadata)
     }
 
+    /// Re-stamps the primary generation witness for this batch (STO-01).
+    ///
+    /// Only called while the witness window is still growing — once it covers
+    /// [`PRIMARY_GENERATION_WINDOW`] bytes it is frozen for the file's life, so
+    /// steady-state appends do no witness work at all.
+    pub(crate) fn set_primary_generation(
+        &mut self,
+        generation: DiskIndexPrimaryGeneration,
+    ) -> DiskIndexResult<()> {
+        self.ensure_usable()?;
+        self.metadata.primary_generation = generation;
+        Ok(())
+    }
+
+    pub(crate) const fn primary_generation(&self) -> DiskIndexPrimaryGeneration {
+        self.metadata.primary_generation
+    }
+
     #[cfg(test)]
     pub(crate) const fn working_frontier(&self) -> DiskIndexFrontier {
         self.metadata.working
@@ -2290,6 +2504,10 @@ impl DiskIndexRestoreGuard {
         &self.staged.tails
     }
 
+    pub const fn primary_generation(&self) -> DiskIndexPrimaryGeneration {
+        self.staged.metadata.primary_generation
+    }
+
     /// Commits only after the caller has truncated and synced the native file
     /// and has re-observed exactly the checkpoint EOF.
     pub(crate) fn commit_after_native_sync(
@@ -2349,6 +2567,10 @@ pub struct DiskIndexSnapshot {
 impl DiskIndexSnapshot {
     pub const fn committed_eof(&self) -> u64 {
         self.metadata.committed.eof
+    }
+
+    pub const fn primary_generation(&self) -> DiskIndexPrimaryGeneration {
+        self.metadata.primary_generation
     }
 
     /// Historical distinct key cardinality of this snapshot's latest-key
@@ -2831,6 +3053,13 @@ fn validate_tail(tail: DiskIndexTail, frontier: DiskIndexFrontier) -> DiskIndexR
 }
 
 fn validate_metadata(metadata: DiskIndexMetadata) -> DiskIndexResult<()> {
+    if metadata.primary_generation.len > PRIMARY_GENERATION_WINDOW
+        || metadata.primary_generation.len > metadata.working.eof
+    {
+        return Err(DiskIndexError::MetadataInvariant(
+            "primary generation window exceeds its bound",
+        ));
+    }
     match metadata.mode {
         DiskIndexMode::StateOnly => {}
         DiskIndexMode::DiskPlan(digest) if digest.is_zero() => {
@@ -3054,8 +3283,10 @@ fn encode_metadata(metadata: DiskIndexMetadata) -> [u8; META_LEN] {
     bytes[184..188].copy_from_slice(&metadata.working_tail_count.to_le_bytes());
     bytes[192..224].copy_from_slice(metadata.committed_tail_digest.as_bytes());
     bytes[224..256].copy_from_slice(metadata.working_tail_digest.as_bytes());
-    let crc = crc32fast::hash(&bytes[..256]);
-    bytes[256..260].copy_from_slice(&crc.to_le_bytes());
+    bytes[256..264].copy_from_slice(&metadata.primary_generation.len.to_le_bytes());
+    bytes[264..296].copy_from_slice(metadata.primary_generation.digest.as_bytes());
+    let crc = crc32fast::hash(&bytes[..296]);
+    bytes[296..300].copy_from_slice(&crc.to_le_bytes());
     bytes
 }
 
@@ -3073,8 +3304,8 @@ fn decode_metadata(bytes: &[u8]) -> DiskIndexResult<DiskIndexMetadata> {
     if version != META_VERSION {
         return Err(DiskIndexError::MetadataVersion { actual: version });
     }
-    let stored_crc = read_u32(bytes, 256);
-    if crc32fast::hash(&bytes[..256]) != stored_crc {
+    let stored_crc = read_u32(bytes, 296);
+    if crc32fast::hash(&bytes[..296]) != stored_crc {
         return Err(DiskIndexError::MetadataChecksum);
     }
     if bytes[13..16] != [0; 3] || bytes[188..192] != [0; 4] {
@@ -3132,6 +3363,10 @@ fn decode_metadata(bytes: &[u8]) -> DiskIndexResult<DiskIndexMetadata> {
         identity: DiskIndexIdentity {
             schema_hash: read_u64(bytes, 16),
             primary_fingerprint: bytes[24..56].try_into().expect("fixed metadata slice"),
+        },
+        primary_generation: DiskIndexPrimaryGeneration {
+            len: read_u64(bytes, 256),
+            digest: DiskIndexDigest(bytes[264..296].try_into().expect("fixed metadata slice")),
         },
         mode,
         state,
@@ -3504,8 +3739,8 @@ mod tests {
     }
 
     fn rewrite_crc(bytes: &mut [u8; META_LEN]) {
-        let crc = crc32fast::hash(&bytes[..256]);
-        bytes[256..260].copy_from_slice(&crc.to_le_bytes());
+        let crc = crc32fast::hash(&bytes[..296]);
+        bytes[296..300].copy_from_slice(&crc.to_le_bytes());
     }
 
     #[test]

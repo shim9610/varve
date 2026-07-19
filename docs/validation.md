@@ -95,6 +95,112 @@ The actual dependency graph from `cargo metadata --all-features` was reviewed. D
 
 `zstd` is optional under `compression-zstd` and is included in the same all-features license audit.
 
+## Resident Merge/Compact Scale Contract
+
+- Adversarial review found `merge_keyed_files`, `compact_keyed_files`, and
+  `compact_keyed_file` documented without a memory bound while
+  `docs/petabyte-io-main-draft.md` listed merge/compact inside the
+  petabyte-permitted operation set.
+  - Resolution: the family is documented as resident-only and explicitly not
+    PB-scale (`Theta(records + decoded bytes) + O(K-live log K-live)` time,
+    `O(K-ever + largest resident input index + retained live values)` memory,
+    tombstoned keys retained, nothing spilled to disk, no bounded-memory
+    external merge/compact exported). `estimate_keyed_merge` gives a decode-free
+    pre-flight bound and `merge_keyed_files_with_key_limit`,
+    `compact_keyed_files_with_key_limit`, and `compact_keyed_file_with_key_limit`
+    fail with `Error::LimitExceeded { resource: "merge distinct keys", .. }` at
+    the key boundary and publish no output. Covered by
+    `crates/varve/tests/high_cardinality.rs::resident_merge_estimate_reports_the_k_ever_bound`,
+    `::resident_merge_and_compact_fail_typed_at_the_key_ceiling`, and
+    `::resident_single_input_compact_fails_typed_at_the_key_ceiling`.
+- Adversarial review found the generic `push`/`push_info` writing a truncated
+  keyed offset chain for keyed blocks.
+  - Resolution: those entry points refuse a keyed block on a `keyed_offset_chain`
+    format with `Error::KeyedChainRequiresKeyedApi`, and the maintaining
+    `push_keyed`/`push_keyed_info` (plus a chain-maintaining `delete`) are the
+    documented replacement. Covered by
+    `crates/varve/tests/resident_contracts.rs`.
+
+## 2026-07-19 Performance And Defensive-Engineering Review Remediation
+
+Findings from
+[`adversarial-performance-security-review-2026-07-19-4e07a3f-final.md`](adversarial-performance-security-review-2026-07-19-4e07a3f-final.md)
+and where each is now pinned by a test:
+
+- PERF-01, matrix commit-bit mutation hashed the whole category bitmap.
+  - Resolution: per-4-KiB-page commit digests; a mutation rehashes one page.
+    `crates/varve/tests/matrix_integrity_scaling.rs::commit_bit_mutation_hashing_cost_is_independent_of_cell_count`
+    and `::a_single_mutation_hashes_exactly_one_page_anywhere_in_the_map`.
+- PERF-02, matrix create/open metadata scaled per cell in I/O and RAM.
+  - Resolution: no per-cell metadata written at create, sparse in-memory
+    bitmaps, and open bounded by the filesystem allocated-range map.
+    `::create_metadata_bytes_do_not_scale_with_cell_count`,
+    `::resident_bitmap_bytes_after_open_do_not_scale_with_cell_count`,
+    `::untouched_matrix_holds_no_resident_bitmap_pages`,
+    `::open_bitmap_bytes_read_do_not_scale_with_cell_count`,
+    `::whole_category_clear_cost_does_not_scale_with_cell_count`. Detection
+    strength is separately pinned by
+    `::stray_bytes_in_a_skipped_region_are_still_detected`,
+    `::published_page_corruption_is_detected_and_rebuild_recovers`, and
+    `::never_written_and_zero_written_pages_are_distinguishable`; the layout
+    break by `::previous_layout_version_artifact_is_rejected_typed`.
+- PERF-03, resident merge/compact retained `K-ever` while docs implied PB scale.
+  - Resolution: see the previous section (contract plus caller-side guards).
+- PERF-04, registry pruning was linear on every open/invalidate.
+  - Resolution: amortized sweep after a doubling threshold.
+    `crates/varve/tests/index_shared_readers.rs::registry_cost_per_open_does_not_scale_with_live_identities`.
+- PERF-05, resident predecessor lookup reverse-scanned the index per append.
+  - Resolution: maintained sorted block tails, `O(log B)` and no index reads.
+    `crates/varve/tests/resident_contracts.rs::append_time_predecessor_lookup_never_reads_the_resident_index`.
+- RES-01, variable field-id bookkeeping bypassed materialization accounting.
+  - Resolution: 8 bytes charged per distinct id above 63 before reserving.
+    `crates/varve/tests/codec_hardening.rs::large_field_id_bookkeeping_is_charged_to_the_materialization_budget`
+    and `::duplicate_large_field_ids_are_rejected_without_extra_charge`.
+- API-01, first-use registration could seed a wrong schema identity.
+  - Resolution: the `FormatSpec` identity is the authority; the registry is a
+    cache of an already-validated result.
+    `crates/varve/tests/manual_trait_invariants.rs::impostor_registered_first_is_rejected_against_the_format_identity`.
+- API-02, generic keyed push omitted the predecessor chain.
+  - Resolution: see the previous section.
+- API-03, disk-index descriptors could invoke a mismatched decoder.
+  - Resolution: descriptors carry the block schema fingerprint, the registration
+    gate runs per descriptor before any decode, and the fingerprint is folded
+    into the plan digest.
+    `crates/varve/tests/scalable_identity.rs::mismatched_descriptor_plan_is_rejected_before_any_decode`
+    (asserts zero decoder calls) and `::matching_descriptor_plan_still_builds_and_indexes`.
+- API-04, custom nested codecs collided in computed schema identity.
+  - Resolution: `SCHEMA_ID` on both codec traits, folded transitively into block
+    fingerprints, with a compile-time rejection of identity-less field codecs.
+    `crates/varve/tests/schema_hash_contract.rs::custom_nested_codecs_with_equal_spelling_cannot_share_an_identity`,
+    `::nested_block_codec_identity_is_transitive`,
+    `::built_in_codec_identities_are_structural`, and the `tests/ui`
+    compile-fail fixtures.
+- STO-01, a same-object equal-length primary rewrite was accepted with a stale
+  sidecar.
+  - Resolution: a per-create nonce inside the primary plus a bounded
+    primary-generation witness in the sidecar; both reader and writer open
+    refuse a mismatch with `DiskIndexError::PrimaryGenerationMismatch` and
+    rebuild recovers.
+    `crates/varve/tests/scalable_identity.rs::same_object_equal_length_rewrite_is_refused_and_rebuild_recovers`,
+    `::stream_state_sidecar_refuses_a_rewritten_primary`, and
+    `crates/varve/tests/stream_append_perf_contract.rs::primary_generation_witness_stops_scanning_once_its_window_is_full`.
+- REL-01, the committed fuzz lockfile was stale and CI could not see it.
+  - Resolution: the lockfile was regenerated and CI gained a blocking locked
+    fuzz job whose step order prevents any tool from regenerating a stale
+    lockfile, with a trailing `git diff --exit-code`. The clean-archive job also
+    builds the archived fuzz workspace. Not executable locally; verified by
+    running each underlying command against the committed lockfile.
+- TEST-01, Windows crash tests could raise interactive error reporting.
+  - Resolution: the crash child suppresses WER before inducing a fault.
+    `crates/varve/tests/scalable_crash_faults.rs`. On the measured host WER UI
+    was already disabled system-wide, so suite wall time was unchanged within
+    noise; the change makes the gate unattended on a default machine.
+- Coverage gap named by the review: direct public stream/indexed
+  publication-failure result tests.
+  - Resolution: `crates/varve/tests/publication_failure_results.rs`, covering
+    parent-sync-pending on stream and indexed create, batch-failure poisoning
+    on both writers, the retryable zero-record batch, and an unfaulted control.
+
 ## Deferred Work
 
 - Add richer zero-copy policies for aligned multi-record layouts if a later use case needs them.

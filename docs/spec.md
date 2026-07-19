@@ -1,4 +1,4 @@
-# Varve 0.2 Implementation Spec
+# Varve 0.3 Implementation Spec
 
 ## Goal
 
@@ -59,9 +59,10 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 ## Preallocated Matrix Wire Contract
 
 - Matrix support is a separate storage mode from the append-log record region.
-- Files whose static spec contains matrix blocks store a `VMAT` layout region
-  immediately after the normal Varve file header.
-- `VMAT` layout version 1 stores runtime dimensions, matrix block layout,
+- Files whose static spec contains matrix blocks store a 24-byte `VMNC`
+  creation-nonce region and then a `VMAT` layout region immediately after the
+  normal Varve file header.
+- `VMAT` layout version 2 stores runtime dimensions, matrix block layout,
   commit bitmap offsets, slot region offsets, derived static aux region
   placement, optional offset-table metadata, region CRC metadata, and
   `append_log_start`.
@@ -74,9 +75,21 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Static matrix aux regions are declared in the format spec, preallocated after
   slot payloads, excluded from commit bitmap validity, and exposed through
   `matrix_aux_len`, `read_matrix_aux`, and writer-only `write_matrix_aux`.
-- With `integrity: crc32`, `VMAT` v1 includes an `MCRC` table after the slot
-  region and any static aux regions. It stores CRC32 values for metadata
-  tables, each commit map, and each dense cell slot.
+- With `integrity: crc32`, `VMAT` v2 includes an `MCRC` v2 table after the slot
+  region and any static aux regions. It stores a CRC32 over the metadata tables,
+  an 8-byte digest (`crc32` plus a state word) per 4 KiB page of every commit
+  map, and a CRC32 plus a validity bit per dense cell slot. A commit-bit
+  mutation rehashes only the affected page, and a page whose state word says
+  "uninitialized" must still read as all zeros, which is what distinguishes a
+  never-written page from one deliberately written with zeros.
+- Matrix creation writes only the descriptor tables and the `MCRC` header; the
+  commit maps, per-cell checksums, and validity bitmaps are a sparse zero
+  extent, and those bitmaps are held sparsely in memory after open, so neither
+  create-time metadata I/O nor post-open bitmap residency scales with cell
+  count.
+- A `VMAT`/`MCRC` layout version 1 artifact is refused at open with
+  `Error::FormatVersionMismatch { expected: 2, actual: 1 }`; it is stale and
+  regenerable, not migratable.
 - P0 commit operations are logical visibility operations under the explicit
   `flush`/`sync` durability model, not implicit per-cell fsync operations.
 - Same-size matrix overwrites update the existing slot range and must not change
@@ -144,7 +157,16 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   of insertion or hash iteration order.
 - Decoding `HashMap<K, V>` preserves values but not insertion order.
 - Custom field codecs are supported by implementing `VarveEncode` and `VarveDecode` for the field type. The derive macro uses the type's `WIRE_TYPE` in field descriptors and manifests.
-- Enum-like values should use explicit custom codecs in 0.2; automatic enum representation inference is out of scope.
+- Every codec declares `SCHEMA_ID`, the structural identity of its bytes.
+  Built-in scalars declare leaf identities and built-in containers fold their
+  elements, so an element that declares none propagates outward as "no
+  identity". `#[derive(VarveBlock)]` folds every field's encode and decode
+  `SCHEMA_ID` into the block fingerprint and rejects at compile time any field
+  whose codec left `SCHEMA_ID` at the default `0`. A hand-written codec used as
+  a block field must therefore declare a value that changes whenever its emitted
+  bytes change; identical source spelling is no longer enough to make two custom
+  codecs share a schema identity.
+- Enum-like values should use explicit custom codecs; automatic enum representation inference is out of scope.
 - Length and count limits are format-author policy. Varve's built-in decoders
   avoid large allocation-before-validation patterns where the remaining bytes
   can be checked generically, but domain-specific maximum string, sequence,
@@ -159,6 +181,11 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   stored payload or decompressed logical payload.
 - Boolean decoders accept only canonical bytes `0` and `1`. Map decoders reject
   duplicate destination keys before decoding a duplicate value.
+- Every decoder-owned container charges the materialization budget before it
+  reserves, including the set that tracks seen variable field ids above 63: each
+  distinct such id charges 8 bytes and an exhausted budget fails with
+  `Error::LimitExceeded { resource: "variable field ids" }`. Duplicate detection
+  runs before the charge, so a repeated id cannot drain the budget.
 
 ## Macro Contract
 
@@ -411,6 +438,19 @@ CRC integrity is a corruption-detection aid, not an authenticity or tamper-proof
 - Base+delta compact API: `compact_keyed_files::<T, P>(spec, base, deltas, output)`.
 - Base+delta compact reads the base and ordered delta shards, applies the same shard-order conflict semantics as merge, and atomically publishes only final values.
 - Compact is single keyed block type per call. Non-keyed blocks and unrelated block ids are not copied in this first API.
+- Scale contract: `merge_keyed_files`, `compact_keyed_file`, and
+  `compact_keyed_files` are resident operations and are explicitly not PB-scale.
+  Time is `Theta(records + decoded bytes) + O(K-live log K-live)`; memory is
+  `O(K-ever + largest resident input index + retained live values)`, where
+  `K-ever` counts every distinct key ever seen including tombstoned keys.
+  Nothing spills to disk and no bounded-memory external merge/compact is
+  exported.
+- Guarded APIs: `estimate_keyed_merge::<T, P>(spec, base, deltas)` returns a
+  decode-free `KeyedMergeEstimate`, and
+  `merge_keyed_files_with_key_limit`, `compact_keyed_files_with_key_limit`,
+  `compact_keyed_file_with_key_limit` refuse a run that would exceed
+  `max_distinct_keys` with `Error::LimitExceeded { resource: "merge distinct
+  keys", .. }` before publishing any output.
 
 ### Writer Safety
 

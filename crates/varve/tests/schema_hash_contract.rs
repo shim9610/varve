@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use varve::{
     BlockDescriptor, BlockKind, Endian, Error, FieldDescriptor, FieldPresence, FormatSpec,
     IndexPolicy, IntegrityPolicy, ManifestPolicy, ReadLimits, RecoveryPolicy, VarveBlock, WireType,
-    varve_format,
+    encode_to_vec, varve_format,
 };
 
 const FIELD_ALPHA: FieldDescriptor = FieldDescriptor {
@@ -305,4 +305,358 @@ fn file_created_with_omitted_hash_rejects_pinned_open() -> varve::Result<()> {
 
     cleanup(&path);
     Ok(())
+}
+
+/// API-04 reproducer: two crates can spell a nested field type identically
+/// while their custom codecs emit different bytes. Before transitive codec
+/// identity the outer fingerprint and the computed format hash both matched.
+macro_rules! nested_codec_module {
+    ($module:ident, $schema_id:expr, $first:ident, $second:ident) => {
+        mod $module {
+            use varve::{
+                Decoder, Encoder, VarveBlock, VarveDecode, VarveEncode, WireType, varve_format,
+            };
+
+            /// Hand-written nested codec. Both modules spell it `Payload`.
+            #[derive(Clone, Debug, PartialEq)]
+            pub struct Payload {
+                pub left: u32,
+                pub right: u32,
+            }
+
+            impl VarveEncode for Payload {
+                const WIRE_TYPE: WireType = WireType::Nested;
+                const SCHEMA_ID: u64 = $schema_id;
+
+                fn encode_varve(&self, encoder: &mut Encoder) -> varve::Result<()> {
+                    self.$first.encode_varve(encoder)?;
+                    self.$second.encode_varve(encoder)
+                }
+            }
+
+            impl VarveDecode for Payload {
+                const WIRE_TYPE: WireType = WireType::Nested;
+                const SCHEMA_ID: u64 = $schema_id;
+
+                fn decode_varve(decoder: &mut Decoder<'_>) -> varve::Result<Self> {
+                    let $first = u32::decode_varve(decoder)?;
+                    let $second = u32::decode_varve(decoder)?;
+                    Ok(Self { $first, $second })
+                }
+            }
+
+            #[derive(Clone, Debug, PartialEq, VarveBlock)]
+            #[varve(id = 8, version = 1, kind = "fixed")]
+            pub struct Wrapper {
+                pub payload: Payload,
+            }
+
+            varve_format! {
+                pub struct NestedCodecFormat {
+                    magic: b"SHCN";
+                    version: 1;
+                    limits {
+                        file_len: 8_589_934_592;
+                        records: 4_000_000;
+                        index_bytes: 536_870_912;
+                        scan_bytes: 8_589_934_592;
+                        record_payload: 67_108_864;
+                        logical_payload: 268_435_456;
+                        materialized_bytes: 1_073_741_824;
+                        segments: 4_000_000;
+                        matrix_dimension: 16_000_000;
+                        matrix_cells: 16_000_000;
+                        matrix_bitmap: 64_000_000;
+                        matrix_crc: 128_000_000;
+                        matrix_metadata: 268_435_456;
+                        matrix_slot_region: 8_589_934_592;
+                        sidecar: 268_435_456;
+                        mmap: 8_589_934_592;
+                    }
+                    endian: little;
+                    schema_hash: computed;
+                    manifest: none;
+                    blocks: [Wrapper];
+                }
+            }
+        }
+    };
+}
+
+nested_codec_module!(nested_codec_alpha, 0xA1A1_0000_0000_0001, left, right);
+nested_codec_module!(nested_codec_beta, 0xB2B2_0000_0000_0002, right, left);
+
+#[test]
+fn custom_nested_codecs_with_equal_spelling_cannot_share_an_identity() {
+    let alpha = nested_codec_alpha::NestedCodecFormat::spec();
+    let beta = nested_codec_beta::NestedCodecFormat::spec();
+
+    // The declared schema really is spelled identically: same block, same
+    // field, same coarse wire type. Only the codec differs.
+    let alpha_block = alpha.block(8).expect("alpha block descriptor");
+    let beta_block = beta.block(8).expect("beta block descriptor");
+    assert_eq!(alpha_block.name, beta_block.name);
+    assert_eq!(alpha_block.version, beta_block.version);
+    assert_eq!(alpha_block.kind, beta_block.kind);
+    assert_eq!(alpha_block.fields.len(), beta_block.fields.len());
+    assert_eq!(alpha_block.fields[0].id, beta_block.fields[0].id);
+    assert_eq!(alpha_block.fields[0].name, beta_block.fields[0].name);
+    assert_eq!(
+        alpha_block.fields[0].wire_type,
+        beta_block.fields[0].wire_type
+    );
+
+    // The codecs genuinely disagree on the bytes.
+    let alpha_bytes = encode_to_vec(
+        &nested_codec_alpha::Wrapper {
+            payload: nested_codec_alpha::Payload { left: 1, right: 2 },
+        },
+        Endian::Little,
+    )
+    .expect("encode alpha");
+    let beta_bytes = encode_to_vec(
+        &nested_codec_beta::Wrapper {
+            payload: nested_codec_beta::Payload { left: 1, right: 2 },
+        },
+        Endian::Little,
+    )
+    .expect("encode beta");
+    assert_ne!(alpha_bytes, beta_bytes);
+
+    // ... so neither the block fingerprint nor the format hash may match.
+    assert_ne!(
+        <nested_codec_alpha::Wrapper as VarveBlock>::SCHEMA_FINGERPRINT,
+        <nested_codec_beta::Wrapper as VarveBlock>::SCHEMA_FINGERPRINT
+    );
+    assert_ne!(alpha.computed_schema_hash(), beta.computed_schema_hash());
+    assert_ne!(alpha.schema_hash, beta.schema_hash);
+}
+
+/// The identity is transitive, not just per-field: a block whose only nested
+/// field is another derived block inherits that block's codec identity.
+#[test]
+fn nested_block_codec_identity_is_transitive() {
+    assert_eq!(
+        <nested_codec_alpha::Payload as varve::VarveEncode>::SCHEMA_ID,
+        0xA1A1_0000_0000_0001
+    );
+    assert_eq!(
+        <nested_codec_alpha::Wrapper as varve::VarveEncode>::SCHEMA_ID,
+        <nested_codec_alpha::Wrapper as VarveBlock>::SCHEMA_FINGERPRINT
+    );
+    assert_ne!(
+        <nested_codec_alpha::Wrapper as varve::VarveEncode>::SCHEMA_ID,
+        <nested_codec_beta::Wrapper as varve::VarveEncode>::SCHEMA_ID
+    );
+}
+
+/// Built-in codecs declare structural identities that separate types the
+/// coarse wire type cannot.
+#[test]
+fn built_in_codec_identities_are_structural() {
+    use varve::VarveEncode;
+
+    assert_ne!(<u32 as VarveEncode>::SCHEMA_ID, 0);
+    assert_ne!(
+        <u32 as VarveEncode>::SCHEMA_ID,
+        <i32 as VarveEncode>::SCHEMA_ID
+    );
+    assert_ne!(
+        <Vec<u8> as VarveEncode>::SCHEMA_ID,
+        <String as VarveEncode>::SCHEMA_ID
+    );
+    // Containers fold their elements, so same-shape containers over different
+    // elements never share an identity.
+    assert_ne!(
+        <Option<u32> as VarveEncode>::SCHEMA_ID,
+        <Option<i32> as VarveEncode>::SCHEMA_ID
+    );
+    assert_ne!(
+        <Vec<u32> as VarveEncode>::SCHEMA_ID,
+        <Vec<u64> as VarveEncode>::SCHEMA_ID
+    );
+    assert_ne!(
+        <(u32, u64) as VarveEncode>::SCHEMA_ID,
+        <(u64, u32) as VarveEncode>::SCHEMA_ID
+    );
+}
+
+/// The same API-04 defect one wire type over: a hand-written codec does not
+/// have to be `WireType::Nested` to collide. These two modules spell the field
+/// type `Packed` identically, both declare `WireType::U64`, and both are the
+/// single field of a derived `Outer` block - only the packing (and therefore
+/// the emitted bytes) differs. Without a declared `SCHEMA_ID` the fingerprints
+/// matched while the bytes did not, which is the exact shape of the report's
+/// finding.
+macro_rules! packed_codec_module {
+    ($module:ident, $schema_id:expr, $high:ident, $low:ident) => {
+        mod $module {
+            use varve::{
+                Decoder, Encoder, VarveBlock, VarveDecode, VarveEncode, WireType, varve_format,
+            };
+
+            /// Hand-written NON-nested codec. Both modules spell it `Packed`.
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            pub struct Packed {
+                pub left: u32,
+                pub right: u32,
+            }
+
+            impl VarveEncode for Packed {
+                const WIRE_TYPE: WireType = WireType::U64;
+                const SCHEMA_ID: u64 = $schema_id;
+
+                fn encode_varve(&self, encoder: &mut Encoder) -> varve::Result<()> {
+                    let packed = (u64::from(self.$high) << 32) | u64::from(self.$low);
+                    packed.encode_varve(encoder)
+                }
+            }
+
+            impl VarveDecode for Packed {
+                const WIRE_TYPE: WireType = WireType::U64;
+                const SCHEMA_ID: u64 = $schema_id;
+
+                fn decode_varve(decoder: &mut Decoder<'_>) -> varve::Result<Self> {
+                    let packed = u64::decode_varve(decoder)?;
+                    let $high = (packed >> 32) as u32;
+                    let $low = packed as u32;
+                    Ok(Self { $high, $low })
+                }
+            }
+
+            #[derive(Clone, Debug, PartialEq, VarveBlock)]
+            #[varve(id = 9, version = 1, kind = "fixed")]
+            pub struct Outer {
+                pub packed: Packed,
+            }
+
+            varve_format! {
+                pub struct PackedCodecFormat {
+                    magic: b"SHCP";
+                    version: 1;
+                    limits {
+                        file_len: 8_589_934_592;
+                        records: 4_000_000;
+                        index_bytes: 536_870_912;
+                        scan_bytes: 8_589_934_592;
+                        record_payload: 67_108_864;
+                        logical_payload: 268_435_456;
+                        materialized_bytes: 1_073_741_824;
+                        segments: 4_000_000;
+                        matrix_dimension: 16_000_000;
+                        matrix_cells: 16_000_000;
+                        matrix_bitmap: 64_000_000;
+                        matrix_crc: 128_000_000;
+                        matrix_metadata: 268_435_456;
+                        matrix_slot_region: 8_589_934_592;
+                        sidecar: 268_435_456;
+                        mmap: 8_589_934_592;
+                    }
+                    endian: little;
+                    schema_hash: computed;
+                    manifest: none;
+                    blocks: [Outer];
+                }
+            }
+        }
+    };
+}
+
+packed_codec_module!(packed_codec_alpha, 0xC3C3_0000_0000_0001, left, right);
+packed_codec_module!(packed_codec_beta, 0xD4D4_0000_0000_0002, right, left);
+
+#[test]
+fn custom_non_nested_codecs_with_equal_spelling_cannot_share_an_identity() {
+    let alpha = packed_codec_alpha::PackedCodecFormat::spec();
+    let beta = packed_codec_beta::PackedCodecFormat::spec();
+
+    // Everything the declared schema can see is identical, including the
+    // coarse wire type, which here is not Nested.
+    let alpha_block = alpha.block(9).expect("alpha block descriptor");
+    let beta_block = beta.block(9).expect("beta block descriptor");
+    assert_eq!(alpha_block.name, beta_block.name);
+    assert_eq!(alpha_block.version, beta_block.version);
+    assert_eq!(alpha_block.kind, beta_block.kind);
+    assert_eq!(alpha_block.fields.len(), beta_block.fields.len());
+    assert_eq!(alpha_block.fields[0].id, beta_block.fields[0].id);
+    assert_eq!(alpha_block.fields[0].name, beta_block.fields[0].name);
+    assert_eq!(
+        alpha_block.fields[0].wire_type,
+        beta_block.fields[0].wire_type
+    );
+    assert_eq!(alpha_block.fields[0].wire_type, WireType::U64);
+
+    // The codecs genuinely disagree on the bytes.
+    let alpha_bytes = encode_to_vec(
+        &packed_codec_alpha::Outer {
+            packed: packed_codec_alpha::Packed { left: 1, right: 2 },
+        },
+        Endian::Little,
+    )
+    .expect("encode alpha");
+    let beta_bytes = encode_to_vec(
+        &packed_codec_beta::Outer {
+            packed: packed_codec_beta::Packed { left: 1, right: 2 },
+        },
+        Endian::Little,
+    )
+    .expect("encode beta");
+    assert_ne!(alpha_bytes, beta_bytes);
+
+    // ... so neither the block fingerprint nor the format hash may match.
+    assert_ne!(
+        <packed_codec_alpha::Outer as VarveBlock>::SCHEMA_FINGERPRINT,
+        <packed_codec_beta::Outer as VarveBlock>::SCHEMA_FINGERPRINT
+    );
+    assert_ne!(alpha.computed_schema_hash(), beta.computed_schema_hash());
+    assert_ne!(alpha.schema_hash, beta.schema_hash);
+}
+
+/// A codec that declares no identity cannot acquire one by being wrapped: the
+/// container fold propagates the absence outward as `0`. Otherwise
+/// `Option<Packed>` would hash two *different* identity-less `Packed` codecs to
+/// the same value and reopen the collision one container deep, while also
+/// slipping past the derive's per-field assertion.
+#[test]
+fn containers_do_not_launder_a_missing_codec_identity() {
+    use varve::{Decoder, Encoder, VarveDecode, VarveEncode};
+
+    /// Deliberately identity-less: it declares no `SCHEMA_ID`. It is never a
+    /// field of a derived block, because that no longer compiles.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Anonymous(u64);
+
+    impl VarveEncode for Anonymous {
+        const WIRE_TYPE: WireType = WireType::U64;
+
+        fn encode_varve(&self, encoder: &mut Encoder) -> varve::Result<()> {
+            self.0.encode_varve(encoder)
+        }
+    }
+
+    impl VarveDecode for Anonymous {
+        const WIRE_TYPE: WireType = WireType::U64;
+
+        fn decode_varve(decoder: &mut Decoder<'_>) -> varve::Result<Self> {
+            Ok(Self(u64::decode_varve(decoder)?))
+        }
+    }
+
+    assert_eq!(<Anonymous as VarveEncode>::SCHEMA_ID, 0);
+    assert_eq!(<Anonymous as VarveDecode>::SCHEMA_ID, 0);
+    assert_eq!(<Option<Anonymous> as VarveEncode>::SCHEMA_ID, 0);
+    assert_eq!(<Option<Anonymous> as VarveDecode>::SCHEMA_ID, 0);
+    assert_eq!(<[Anonymous; 4] as VarveEncode>::SCHEMA_ID, 0);
+    assert_eq!(<[Anonymous; 4] as VarveDecode>::SCHEMA_ID, 0);
+    assert_eq!(<(u32, Anonymous) as VarveEncode>::SCHEMA_ID, 0);
+    assert_eq!(<(u32, Anonymous) as VarveDecode>::SCHEMA_ID, 0);
+    assert_eq!(<Option<Option<Anonymous>> as VarveEncode>::SCHEMA_ID, 0);
+
+    // The same containers over an identified element still carry an identity,
+    // so the rule above is absence propagation, not a blanket zero.
+    assert_ne!(<Option<u64> as VarveEncode>::SCHEMA_ID, 0);
+    assert_ne!(<[u64; 4] as VarveEncode>::SCHEMA_ID, 0);
+    assert_ne!(<(u32, u64) as VarveEncode>::SCHEMA_ID, 0);
+    // A zero-length array is a layout, not a missing element identity.
+    assert_ne!(<[u64; 0] as VarveEncode>::SCHEMA_ID, 0);
 }

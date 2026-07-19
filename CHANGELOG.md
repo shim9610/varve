@@ -8,6 +8,63 @@ increment the minor version.
 
 ### Added
 
+- Documented resident scale contract and caller-side guards for the keyed
+  merge/compact family (PERF-03). `merge_keyed_files`, `compact_keyed_files`,
+  and `compact_keyed_file` are resident operations and are explicitly **not**
+  PB-scale: time is `Theta(records + decoded bytes) + O(K-live log K-live)` and
+  memory is `O(K-ever + largest resident input index + retained live values)`,
+  where `K-ever` counts every distinct key ever seen including tombstoned keys.
+  Nothing spills to disk and Varve exports no bounded-memory external
+  merge/compact. New entry points let a caller predict or fail typed instead of
+  exhausting memory: `estimate_keyed_merge::<T, P>(spec, base, deltas) ->
+  KeyedMergeEstimate` (decode-free pre-flight; pass an empty delta slice to size
+  a single-input compact) and `merge_keyed_files_with_key_limit`,
+  `compact_keyed_files_with_key_limit`, `compact_keyed_file_with_key_limit`,
+  which refuse a run exceeding `max_distinct_keys` with
+  `Error::LimitExceeded { resource: "merge distinct keys", .. }` at the key
+  boundary and publish no output. The unbounded entry points delegate with
+  `u64::MAX`, so their behaviour is unchanged. `estimate_keyed_merge` itself
+  opens each input as a resident file, so it costs `O(largest input index)`.
+- `VarveFile::push_keyed` / `push_keyed_info` and `VarveWriter::push_keyed` /
+  `push_keyed_info`: maintaining generic keyed append paths that resolve and
+  link the keyed offset-chain predecessor. See the corresponding Breaking entry
+  for `push` / `push_info`.
+
+- Per-create nonce for stream and disk-indexed primaries (STO-01). Every
+  `VarveStreamWriter::create` / `VarveIndexedWriter::create` stamps a 128-bit
+  nonce as the primary's first record, under the new reserved
+  `CREATION_NONCE_BLOCK_ID`, and folds it into the sidecar's primary-generation
+  witness. A sidecar is therefore refused with
+  `DiskIndexError::PrimaryGenerationMismatch` when its primary is replaced in
+  place by another equal-length primary of the same format, regardless of how
+  much leading content the two generations share; `rebuild_disk_index` is the
+  recovery. The nonce costs one record at create and nothing per append.
+  **Breaking, stale-regenerable:** stream/indexed primaries now carry one extra
+  internal leading record, so record counts and sequence numbers shift by one
+  relative to 0.3.0, and every existing sidecar's recorded generation witness is
+  refused at open until rebuilt. Primaries bootstrapped from a resident
+  `VarveFile` carry no nonce and keep the weaker content-window witness only.
+
+- `DiskIndexDescriptor` (exported as `DiskIndexedBlock`) carries
+  `schema_fingerprint`, the block schema fingerprint of the concrete type whose
+  decode and key-extraction pointers it holds (API-03).
+- CI runs a blocking locked fuzz-workspace job: `cargo metadata --locked` before
+  any caching or tooling step, then `cargo check --locked --all-targets`,
+  `cargo audit --file fuzz/Cargo.lock`, `cargo deny`, and a final
+  `git diff --exit-code -- fuzz/Cargo.lock`. The ordering is deliberate — both
+  rust-cache and cargo-deny run an unlocked `cargo metadata` that would
+  regenerate a stale lockfile and hide the defect the job exists to catch — and
+  the trailing diff makes the job fail closed. The clean-archive job now also
+  runs `cargo metadata --locked` and `cargo check --locked --all-targets`
+  against the archived `fuzz/` workspace (REL-01).
+- Windows crash-fault test children suppress interactive error reporting
+  (`SetErrorMode`, `SetThreadErrorMode`, and process-level `WerSetFlags`) before
+  inducing a fault, so the release gate cannot raise a WerFault dialog on a
+  developer machine with default WER settings (TEST-01). On the measured host,
+  where interactive WER was already disabled system-wide, suite wall time was
+  unchanged within noise; the durable benefit is unattended behaviour, not
+  speed.
+
 - Experimental `high-cardinality-dev` stream and disk-index handle family with
   required `.vks`/`.vki` checkpoints, generated typed batch APIs, explicit
   restore/bootstrap/rebuild operations, and indexed point lookup plus lazy
@@ -52,7 +109,18 @@ increment the minor version.
   generated codec fingerprint)` that `varve_format!` emits and
   `computed_schema_hash()` folds into the hash.
   `FormatSpec::SCHEMA_HASH_ALGORITHM_VERSION` names the hash algorithm
-  revision (now 2). `validate()` rejects duplicate or unregistered identities.
+  revision (now 3). `validate()` rejects duplicate or unregistered identities.
+- `VarveEncode::SCHEMA_ID` / `VarveDecode::SCHEMA_ID`: the structural identity
+  of a codec's bytes. Built-in scalars declare leaf identities and built-in
+  containers fold their elements transitively (an element that declares no
+  identity propagates outward as "no identity", so a container cannot launder
+  one). Derived blocks set it to their `SCHEMA_FINGERPRINT`, which now folds
+  every field's encode and decode identity, so nesting propagates identity.
+  Hash algorithm version 2 -> 3 (domain tag `varve-schema-v3`): every computed
+  value changes and pre-v3 pinned files fail closed with `SchemaHashMismatch`.
+  **Breaking for hand-written codecs:** the derive rejects at compile time any
+  field whose codec leaves `SCHEMA_ID` at the default `0`, regardless of wire
+  type.
 - `MatrixSidecarManifest::matrix_creation_nonce`: the 16-byte per-create nonce
   that binds a sidecar to one logical matrix creation, not just one OS file
   object.
@@ -72,6 +140,77 @@ increment the minor version.
 
 ### Changed
 
+- Matrix commit-map integrity is paged (PERF-01). The single per-category commit
+  CRC is replaced by an array of 8-byte per-page digests (`crc32` plus a state
+  word, one per 4 KiB of bitmap). A commit-bit mutation rehashes only the page
+  holding the mutated byte, so writing and committing `M` cells hashes
+  `Theta(M)` bitmap bytes instead of `Theta(M^2)`. There is deliberately no
+  composition checksum over the digest array: maintaining one per mutation would
+  reintroduce a size-dependent hot-path cost. Whole-map verification remains
+  "verify every page against its digest", which is what open does.
+- Matrix creation and open no longer scale with cell count (PERF-02). Creation
+  writes only the descriptor tables plus a 16-byte `MCRC` header; the per-cell
+  checksum array, the per-cell validity bitmaps, and the commit bitmaps are
+  established as a sparse zero extent. Uninitialized pages are encoded
+  explicitly (`state = 0` asserts "never published, must still read as zero"),
+  so a page written with zeros is distinguishable from a page never written, and
+  a per-cell checksum is trusted only when its persistent validity bit is set.
+  Commit, CRC-valid, and current-write bitmaps are held sparsely after open: a
+  page is materialized only when it carries a set bit, an absent page is
+  provably zero, and the maintained set-bit totals make committed-cell counting
+  `O(1)` instead of a full scan. The provably-constant `written` bitmap was
+  removed outright. Open is bounded the same way: instead of reading every page
+  to prove never-published pages still read as zero, it takes that proof from
+  the filesystem's allocated-range map
+  (`FSCTL_QUERY_ALLOCATED_RANGES` on Windows, `SEEK_DATA`/`SEEK_HOLE`
+  elsewhere) and skips reported holes, so open costs `O(bytes actually
+  written)`. Detection strength is unchanged, because writing a stray byte into
+  an untouched page allocates that page and brings it back into the read set,
+  and a skipped page's digest is still read when the digest slot itself is
+  allocated. Where the platform or filesystem cannot answer, or the file is
+  fragmented past the tracked extent ceiling, every page is read exactly as
+  before. Clearing a whole commit category punches a hole over the map and its
+  digests instead of writing zeros, restoring the uninitialized encoding in
+  `O(1)` writes.
+- The `matrix_bitmap` resource limit now charges the bitmap pages actually
+  materialized, checked before each growth, instead of a dense cell-count-scaled
+  worst case. It still fails closed, but a large matrix with few committed cells
+  is no longer refused on a figure describing a representation that no longer
+  exists.
+- Generic block registration validates against the format, not against whichever
+  type arrived first (API-01). When the `FormatSpec` declares an identity for a
+  block id, that immutable `(keyedness, fingerprint)` pair is the authority and
+  a disagreeing `T` is rejected with `BlockSchemaFingerprintMismatch` /
+  `BlockKeyednessMismatch` before anything is cached or written, so call order
+  can no longer decide which wire type a process accepts. The process registry
+  is now only a cache of an already-validated result, and its key includes the
+  spec's identity table so two specs sharing a descriptor table but declaring
+  different identities cannot alias one cached contract. Block ids that a
+  hand-built spec declares no identity for keep the documented first-use
+  behaviour.
+- Disk-index plans validate descriptor schema identity before any decode
+  (API-03). Plan construction and plan validation run the registration gate once
+  per descriptor, so a descriptor that matches a declared block's id and version
+  while being a different type is refused with
+  `Error::BlockSchemaFingerprintMismatch` with zero decoder calls. The
+  fingerprint is folded into the plan digest, so a sidecar published for one
+  block schema is refused as stale for a plan that decodes another.
+- Shared sidecar registry access is amortized `O(1)` (PERF-04). A lookup or
+  invalidation is one map probe; dead slots are swept only after the map grows
+  past a doubling threshold, so opening `S` live identities in sequence costs
+  `O(S)` slot checks instead of `Theta(S^2)`. The liveness rule is unchanged.
+- Resident block-offset chaining uses maintained sorted block tails (PERF-05).
+  Per-append predecessor lookup is `O(log B)` in the number of distinct block
+  ids, with no resident-index reads and no allocation once a block id has
+  appeared, replacing a reverse scan of the resident index that cost
+  `Theta(distance to the previous record of that block)`. The table is rebuilt
+  with one forward pass wherever the resident index is loaded or replaced
+  wholesale.
+- Decoding charges the materialization budget for variable field-id bookkeeping
+  (RES-01). Each distinct field id above 63 charges 8 bytes before the tracking
+  set reserves, surfacing as
+  `Error::LimitExceeded { resource: "variable field ids" }`. Duplicate detection
+  still runs first, so a repeated id cannot drain the budget.
 - The authoritative single-writer guard is now an OS lock on the open native file
   object (Windows `LockFileEx` on a reserved non-data byte, Unix advisory lock),
   bound at create and re-bound to each published generation. A hard-link or
@@ -204,6 +343,36 @@ increment the minor version.
 
 ### Breaking
 
+- Wire-breaking, stale-regenerable: the matrix layout is `VMAT` version 2 with
+  an `MCRC` version 2 integrity region. Region lengths, `append_log_start`, and
+  total matrix file length all change. A version 1 artifact is refused at open
+  with the typed `Error::FormatVersionMismatch { expected: 2, actual: 1 }`
+  (previously the generic `InvalidMatrixLayout`); recreate it.
+- Wire-breaking, stale-regenerable: the disk-index sidecar metadata record is
+  version 3 (length 260 -> 300, carrying the primary-generation witness) and the
+  plan-digest domain was bumped. A version 2 sidecar is refused with
+  `DiskIndexError::MetadataVersion`, and a sidecar published against an older
+  plan digest is refused as stale. `rebuild_disk_index` is the recovery for
+  both; neither is migrated in place.
+- New public error variant `DiskIndexError::PrimaryGenerationMismatch` (the enum
+  is `#[non_exhaustive]`, so this is additive) and new public
+  `Error::KeyedChainRequiresKeyedApi { block_id }`.
+- Callers that size a materialization budget to the exact payload byte count and
+  use variable field ids above 63 must add 8 bytes per such distinct id.
+- Source-breaking (no wire change): on a format whose `index_policy` enables
+  `keyed_offset_chain`, the generic `VarveFile::push` / `push_info` and
+  `VarveWriter::push` / `push_info` now refuse a keyed block with the new
+  `Error::KeyedChainRequiresKeyedApi { block_id }` instead of silently writing
+  `prev_same_key_offset = None` and truncating the keyed chain (API-02). The
+  rejection is unconditional — it fires on the first push, not only on a push
+  that would have had a predecessor — so the contract does not depend on call
+  order. **Migration:** call the new maintaining `push_keyed` / `push_keyed_info`
+  instead; they resolve the predecessor from the persisted keyed tail offsets
+  and rebuild that cache after reopen. Unkeyed blocks and formats without
+  `keyed_offset_chain` are unaffected, and the generated typed writers already
+  take the maintaining path. `VarveFile::delete` / `VarveWriter::delete` had the
+  same truncation defect and now maintain the chain; they gained a
+  `T::Key: Eq + Hash` bound, already implied by `VarveKey`.
 - Manual `VarveBlock` implementations must now provide
   `const SCHEMA_FINGERPRINT: u64` (no default). Derive-generated blocks are
   unaffected; a manual block mirroring a generated one must reuse its fingerprint

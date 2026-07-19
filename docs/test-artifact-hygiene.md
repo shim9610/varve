@@ -45,6 +45,18 @@ later run never reuses that path.
 Process-interruption tests place child artifacts under the inherited session;
 the parent test owns their lifecycle.
 
+## Unattended Process-Boundary Tests
+
+A test that deliberately crashes a child process must also leave no operating
+system dialog behind, or the suite stops being unattended. On Windows an
+aborted child is handed to Windows Error Reporting, which starts `WerFault.exe`
+and may show an error box. The crash child in
+`crates/varve/tests/scalable_crash_faults.rs` suppresses that at its own entry
+point, before it induces the fault (see
+[`fuzzing-and-fault-injection.md`](fuzzing-and-fault-injection.md)). Any new
+test that crashes a child must do the same; suppression in the parent process
+does not propagate.
+
 ## Per-Test Owned Directories
 
 The runner is the outer safety net, not the only one. Each integration test

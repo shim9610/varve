@@ -102,6 +102,71 @@ records and unrelated block ids are not copied.
 Merge and compact outputs are published through same-directory temp files,
 flush/sync, and atomic replacement.
 
+## Merge And Compact Are Resident, Not PB-Scale
+
+`merge_keyed_files`, `compact_keyed_file`, and `compact_keyed_files` open their
+inputs as whole `VarveFile` values and hold one map entry per distinct key ever
+seen - including keys whose latest record is a tombstone - plus the live values
+that reach the output:
+
+- time: `Theta(records + decoded bytes) + O(K-live log K-live)`
+- memory: `O(K-ever + largest resident input index + retained live values)`
+
+Nothing spills to disk, so `K-ever` must fit in memory. Varve exports no
+bounded-memory external merge or compact; the scalable stream and indexed
+writers bound *ingest*, not merge/compact. Do not call this family on a file
+whose key cardinality you cannot afford to hold resident.
+
+Size the run first:
+
+```rust
+use varve::estimate_keyed_merge;
+
+let estimate = estimate_keyed_merge::<User, _>(
+    AppFormat::spec(),
+    "base.varve",
+    &["delta-1.varve"],
+)?;
+// estimate.max_distinct_keys is an upper bound on K-ever;
+// estimate.max_state_bytes is the resident state that bound implies.
+```
+
+`estimate_keyed_merge` decodes no values, but it does open each input as a
+resident file, so it costs `O(largest input index)` itself. It reports that
+number as `largest_input_index_bytes`; it is not a way to size an input you
+cannot already afford to open. Pass an empty delta slice to size a single-input
+`compact_keyed_file`.
+
+Or bound the run and fail typed instead of exhausting memory:
+
+```rust
+use varve::{
+    compact_keyed_file_with_key_limit, compact_keyed_files_with_key_limit,
+    merge_keyed_files_with_key_limit,
+};
+
+merge_keyed_files_with_key_limit::<User, _>(
+    AppFormat::spec(),
+    "base.varve",
+    &["delta-1.varve"],
+    "merged.varve",
+    1_000_000,
+)?;
+
+compact_keyed_file_with_key_limit::<User, _>(
+    AppFormat::spec(),
+    "users.varve",
+    "users.compact.varve",
+    1_000_000,
+)?;
+```
+
+The ceiling is checked before each new key is admitted, so exceeding it yields
+`Error::LimitExceeded { resource: "merge distinct keys", .. }` at the key
+boundary. A refused run publishes no output file. The ceiling counts tombstoned
+keys, matching what the state actually retains. The unbounded entry points
+delegate with `u64::MAX`, so their behaviour is unchanged.
+
 ## Direct Replacement
 
 `replace_fixed` and

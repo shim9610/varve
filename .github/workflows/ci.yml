@@ -129,6 +129,47 @@ jobs:
           cargo install cargo-audit --locked
           cargo audit
 
+  # REL-01 release gate: `fuzz/` is an independent workspace with its own
+  # lockfile and its own license policy, so nothing in the root workspace jobs
+  # resolves it. A stale `fuzz/Cargo.lock` was therefore invisible to CI.
+  # Locked resolution fails the build instead of silently updating the
+  # lockfile, and the final diff proves that no gate in this job rewrote it
+  # (an unlocked cargo-deny metadata resolution is exactly how the staleness
+  # was masked locally).
+  fuzz-supply-chain:
+    name: fuzz workspace (locked)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Before any caching or tooling step: `Swatinem/rust-cache` and
+      # cargo-deny both run an unlocked `cargo metadata`, which would rewrite a
+      # stale lockfile and mask the very defect this job exists to catch.
+      - name: Locked resolution
+        working-directory: fuzz
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz
+          workspaces: fuzz
+      - name: cargo check
+        working-directory: fuzz
+        run: cargo check --locked --all-targets
+      - name: cargo-audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --file fuzz/Cargo.lock
+      # cargo-deny resolves `fuzz/deny.toml` from the fuzz workspace root; that
+      # policy allows NCSA for `libfuzzer-sys`, which the publishable
+      # workspace's policy deliberately does not.
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          manifest-path: fuzz/Cargo.toml
+      - name: Fuzz lockfile was not rewritten
+        run: git diff --exit-code -- fuzz/Cargo.lock
+
   # Build the committed tree exactly as a source package consumer sees it:
   # `git archive` contains only tracked files, so a workspace member or
   # fixture that exists locally but was never committed fails here
@@ -147,3 +188,12 @@ jobs:
       - name: cargo check
         working-directory: ${{ runner.temp }}/varve-archive
         run: cargo check --workspace --all-targets --all-features --locked
+      # The fuzz workspace is not a root workspace member, so the two steps
+      # above never touch it. Its tracked-file completeness and lockfile
+      # freshness need the same clean-archive treatment (REL-01).
+      - name: cargo metadata (fuzz workspace)
+        working-directory: ${{ runner.temp }}/varve-archive/fuzz
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      - name: cargo check (fuzz workspace)
+        working-directory: ${{ runner.temp }}/varve-archive/fuzz
+        run: cargo check --locked --all-targets

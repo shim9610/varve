@@ -275,12 +275,15 @@ fn rebuild_cost_is_independent_of_plan_descriptor_count() -> Result<()> {
         writer.sync()?;
     }
     let records = u64::from(PUTS + TOMBSTONES);
+    // A rebuild also scans the internal creation-nonce record every
+    // stream/indexed primary carries as its first record (STO-01).
+    let scanned_records = records + 1;
 
     fs::remove_file(disk_index_sidecar_path(&path))?;
     let small_started = Instant::now();
     let small_report = rebuild_disk_index(spec(), &path, options, small_plan())?;
     let small_elapsed = small_started.elapsed();
-    assert_eq!(small_report.records, records);
+    assert_eq!(small_report.records, scanned_records);
     {
         let reader = VarveIndexedReader::open(spec(), &path, options, small_plan())?;
         assert_eq!(reader.get::<Target>(&big_key(0))?, None);
@@ -295,7 +298,7 @@ fn rebuild_cost_is_independent_of_plan_descriptor_count() -> Result<()> {
     let full_started = Instant::now();
     let full_report = rebuild_disk_index(spec(), &path, options, full_plan())?;
     let full_elapsed = full_started.elapsed();
-    assert_eq!(full_report.records, records);
+    assert_eq!(full_report.records, scanned_records);
     assert_eq!(full_report.scanned_bytes, small_report.scanned_bytes);
     {
         let reader = VarveIndexedReader::open(spec(), &path, options, full_plan())?;
@@ -355,7 +358,8 @@ fn historical_distinct_keys_follows_k_ever_across_rebuild() -> Result<()> {
     // does not shrink without a native compaction.
     fs::remove_file(disk_index_sidecar_path(&path))?;
     let report = rebuild_disk_index(spec(), &path, options, small_plan())?;
-    assert_eq!(report.records, 64);
+    // 64 user records plus the internal creation-nonce record (STO-01).
+    assert_eq!(report.records, 65);
     let reader = VarveIndexedReader::open(spec(), &path, options, small_plan())?;
     assert_eq!(reader.historical_distinct_keys()?, 32);
     Ok(())
@@ -469,7 +473,8 @@ mod crc_single_traversal {
         // Baseline: the clean CRC file rebuilds.
         fs::remove_file(disk_index_sidecar_path(&path))?;
         let report = rebuild_disk_index(crc_spec(), &path, options, crc_plan())?;
-        assert_eq!(report.records, 3);
+        // Three user records plus the internal creation-nonce record (STO-01).
+        assert_eq!(report.records, 4);
 
         // Corrupt the payload of the record outside the plan. A rebuild that
         // still ran the scanner's whole-payload checksum pre-pass would fail
@@ -477,7 +482,8 @@ mod crc_single_traversal {
         let corrupted = flip_marker_byte(&path, blob_marker)?;
         fs::remove_file(disk_index_sidecar_path(&path))?;
         let report = rebuild_disk_index(crc_spec(), &path, options, crc_plan())?;
-        assert_eq!(report.records, 3);
+        // Three user records plus the internal creation-nonce record (STO-01).
+        assert_eq!(report.records, 4);
         let reader = VarveIndexedReader::open(crc_spec(), &path, options, crc_plan())?;
         assert_eq!(
             reader.get::<Target>(&indexed_marker.to_string())?,
@@ -722,7 +728,8 @@ mod publication_state {
         // ...and the native file remains recoverable: an unarmed rebuild
         // publishes a fresh sidecar generation alongside the preserved temp.
         let report = rebuild_disk_index(spec(), &path, options, small_plan())?;
-        assert_eq!(report.records, 0);
+        // No user records, but the internal creation-nonce record is there.
+        assert_eq!(report.records, 1);
         assert!(disk_index_sidecar_path(&path).exists());
         assert!(
             temp.exists(),

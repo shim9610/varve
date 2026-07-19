@@ -232,11 +232,12 @@ whose dimensions are known when the file is created.
 ```mermaid
 flowchart TD
     A["create_writer_with_dims"] --> B["write normal Varve header"]
-    B --> C["write VMAT matrix layout"]
-    C --> D["preallocate commit maps"]
+    B --> B2["write VMNC creation nonce"]
+    B2 --> C["write VMAT matrix layout"]
+    C --> D["reserve commit maps as a sparse zero extent"]
     D --> E["preallocate slot regions"]
     E --> F["optional aux regions"]
-    F --> G["optional matrix CRC table"]
+    F --> G["optional matrix CRC header"]
     G --> H["append-log region starts"]
 ```
 
@@ -290,7 +291,11 @@ With `integrity: crc32`, Varve validates record payload CRCs. In `VARVE3`, the
 CRC covers payload plus footer. With `integrity: crc32_with_header`, the native
 record header is included too, with the checksum field normalized to zero.
 Matrix CRC additionally covers metadata tables, commit maps, and committed
-slots.
+slots. Commit maps are covered per 4 KiB page rather than per category, so
+mutating one commit bit rehashes one page, and a page marked uninitialized must
+still read as all zeros. Creation writes no per-cell integrity metadata at all:
+those regions start as a sparse zero extent and are filled in as cells are
+actually used.
 
 CRC is corruption detection, not authentication. It does not protect against a
 malicious writer that can recompute checksums.

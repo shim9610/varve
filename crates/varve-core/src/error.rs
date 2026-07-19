@@ -199,6 +199,13 @@ pub enum Error {
     #[error("{0} writer is poisoned after an uncertain write failure")]
     WriterPoisoned(&'static str),
 
+    #[error(
+        "block {block_id} is keyed and this format chains keyed offsets, but the generic append \
+         cannot maintain the predecessor chain; use the generated keyed writer method or \
+         VarveFile::push_keyed_info"
+    )]
+    KeyedChainRequiresKeyedApi { block_id: u32 },
+
     #[cfg(feature = "high-cardinality-dev")]
     #[error("the requested operation is unsupported by bounded streaming handles")]
     StreamingUnsupported,

@@ -93,6 +93,10 @@ struct PackedPair {
 
 impl VarveEncode for PackedPair {
     const WIRE_TYPE: WireType = WireType::U64;
+    // A hand-written codec must declare an identity that changes whenever its
+    // emitted bytes change: WireType::U64 alone cannot separate this packing
+    // from any other u64 packing. Changing the shift below must change this.
+    const SCHEMA_ID: u64 = 0x5041_434b_5041_4952;
 
     fn encode_varve(&self, encoder: &mut Encoder) -> varve::Result<()> {
         let packed = (u64::from(self.left) << 32) | u64::from(self.right);
@@ -102,6 +106,7 @@ impl VarveEncode for PackedPair {
 
 impl VarveDecode for PackedPair {
     const WIRE_TYPE: WireType = WireType::U64;
+    const SCHEMA_ID: u64 = 0x5041_434b_5041_4952;
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> varve::Result<Self> {
         let packed = u64::decode_varve(decoder)?;

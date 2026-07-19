@@ -14,7 +14,21 @@ const VMAT_HEADER_LEN: u64 = 160;
 const HEADER_U64_OFFSET: u64 = 24;
 #[cfg(feature = "integrity")]
 const COMMIT_MAP_OFFSET_INDEX: u64 = 6;
+/// Resident bitmap bytes held by the 4x4 fixture once a single cell has been
+/// written and committed: the commit-map, checksum-validity, and current-write
+/// pages, each a 2-byte short page for a 16-cell block. The budget now charges
+/// the pages actually materialised rather than the dense worst case of every
+/// map, so this constant tracks residency, not the reserved on-disk extents.
+#[cfg(feature = "integrity")]
 const TEST_BITMAP_BYTES: u64 = 6;
+/// Residency of the same fixture after a reopen: the persisted commit-map and
+/// checksum-validity pages only. The current-write map is session state and
+/// starts empty at every open.
+#[cfg(feature = "integrity")]
+const TEST_REOPEN_BITMAP_BYTES: u64 = 4;
+/// Residency of a single materialised commit-map page of the same fixture.
+#[cfg(feature = "integrity")]
+const TEST_COMMIT_PAGE_BYTES: u64 = 2;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -211,11 +225,6 @@ fn create_checks_all_non_crc_matrix_limits_before_preallocation() {
             0,
         ),
         (
-            high_limits().with_max_matrix_bitmap_bytes(TEST_BITMAP_BYTES - 1),
-            "matrix bitmap bytes",
-            TEST_BITMAP_BYTES - 1,
-        ),
-        (
             high_limits().with_max_matrix_slot_region_len(63),
             "matrix slot region length",
             63,
@@ -376,7 +385,7 @@ fn nonzero_vmat_flags_are_rejected_as_noncanonical() -> varve::Result<()> {
 
 #[cfg(feature = "integrity")]
 #[test]
-fn quarantined_commit_map_copy_is_counted_before_allocation() -> varve::Result<()> {
+fn quarantined_commit_map_is_charged_to_the_resident_budget_as_it_is_read() -> varve::Result<()> {
     let fixture = TempMatrix::new("quarantine-bitmap-limit");
     let spec = matrix_spec(high_limits(), varve::IntegrityPolicy::Crc32);
     let dimensions = MatrixDimensions::from_pairs([("scan", 4), ("ch", 4)]);
@@ -397,15 +406,80 @@ fn quarantined_commit_map_copy_is_counted_before_allocation() -> varve::Result<(
     file.write_all(&[1])?;
     drop(file);
 
+    // The corrupted byte makes the first commit-map page carry state, so the
+    // page is materialised and charged as it is read, before the quarantined
+    // map is retained. A budget below one page must refuse the open.
     let error = match matrix_spec(
-        high_limits().with_max_matrix_bitmap_bytes(TEST_BITMAP_BYTES),
+        high_limits().with_max_matrix_bitmap_bytes(TEST_COMMIT_PAGE_BYTES - 1),
         varve::IntegrityPolicy::Crc32,
     )
     .open_readonly(fixture.path())
     {
-        Ok(_) => panic!("quarantined bitmap unexpectedly fit the steady-state budget"),
+        Ok(_) => panic!("quarantined bitmap unexpectedly fit the resident budget"),
         Err(error) => error,
     };
-    expect_limit(error, "matrix bitmap bytes", TEST_BITMAP_BYTES);
+    expect_limit(error, "matrix bitmap bytes", TEST_COMMIT_PAGE_BYTES - 1);
+
+    // A budget that does cover the page admits the same file, so the refusal
+    // above is the budget and not the corruption.
+    drop(
+        matrix_spec(
+            high_limits().with_max_matrix_bitmap_bytes(TEST_COMMIT_PAGE_BYTES),
+            varve::IntegrityPolicy::Crc32,
+        )
+        .open_readonly(fixture.path())?,
+    );
+    Ok(())
+}
+
+/// The resident bitmap budget is charged where residency is actually taken: as
+/// commit-map and checksum-validity pages are materialised by writes. Creation
+/// itself makes nothing resident, whatever the cell count.
+#[cfg(feature = "integrity")]
+#[test]
+fn resident_bitmap_budget_is_charged_as_pages_are_materialized() -> varve::Result<()> {
+    let dimensions = MatrixDimensions::from_pairs([("scan", 4), ("ch", 4)]);
+
+    // A budget of zero still admits creation, because creation is free.
+    let tight = TempMatrix::new("resident-bitmap-tight");
+    let mut writer = matrix_spec(
+        high_limits().with_max_matrix_bitmap_bytes(0),
+        varve::IntegrityPolicy::Crc32,
+    )
+    .create_writer_with_dims(tight.path(), dimensions.clone())?;
+    // ...but the first write, which materialises the current-write page, must
+    // be refused by that budget.
+    let error = match writer.write_matrix_cell(MatrixKey::new(0, 0), &LimitedCell { value: 1 }) {
+        Ok(()) => panic!("write unexpectedly fit a zero resident bitmap budget"),
+        Err(error) => error,
+    };
+    expect_limit(error, "matrix bitmap bytes", 0);
+    drop(writer);
+
+    // A budget that covers both pages admits the same write and commit, and the
+    // reopen is charged the same residency.
+    let roomy = TempMatrix::new("resident-bitmap-roomy");
+    let spec = matrix_spec(
+        high_limits().with_max_matrix_bitmap_bytes(TEST_BITMAP_BYTES),
+        varve::IntegrityPolicy::Crc32,
+    );
+    let mut writer = spec.create_writer_with_dims(roomy.path(), dimensions)?;
+    writer.write_matrix_cell(MatrixKey::new(0, 0), &LimitedCell { value: 1 })?;
+    writer.commit_matrix_cell::<LimitedCell>(MatrixKey::new(0, 0))?;
+    writer.flush()?;
+    drop(writer);
+    drop(spec.open_readonly(roomy.path())?);
+
+    // One byte less than the persisted pages actually hold refuses the reopen.
+    let error = match matrix_spec(
+        high_limits().with_max_matrix_bitmap_bytes(TEST_REOPEN_BITMAP_BYTES - 1),
+        varve::IntegrityPolicy::Crc32,
+    )
+    .open_readonly(roomy.path())
+    {
+        Ok(_) => panic!("reopen unexpectedly fit an under-sized resident budget"),
+        Err(error) => error,
+    };
+    expect_limit(error, "matrix bitmap bytes", TEST_REOPEN_BITMAP_BYTES - 1);
     Ok(())
 }

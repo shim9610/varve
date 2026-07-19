@@ -26,6 +26,27 @@ The workspace contains:
   contents masks, raw data offsets, next-segment offsets, or externally defined
   record framing.
 
+## Capability Boundary
+
+Varve has two API families with different scale contracts. Pick deliberately.
+
+| Family | Entry points | State | Suited to |
+| --- | --- | --- | --- |
+| Resident | `VarveFile`, generated typed readers/writers, keyed collections, `merge_keyed_files`, `compact_keyed_file(s)` | index and merge state live in memory, sized by record and key counts | files that fit comfortably in RAM alongside the application |
+| Scalable (`high-cardinality-dev`) | `VarveStreamWriter`, `VarveIndexedWriter`, their readers, and `.vks`/`.vki` sidecars | bounded resident state, sized by declared blocks and bounded buffers | high-rate append and point lookup over data far larger than RAM |
+
+The scalable family covers bounded ingest and lookup only. **Keyed merge and
+compact are resident-only and explicitly not petabyte-scale**: they retain one
+map entry per distinct key ever seen, tombstoned keys included, and nothing
+spills to disk. Use `estimate_keyed_merge` to size a run in advance, or the
+`*_with_key_limit` variants to fail with a typed limit error at a chosen key
+ceiling instead of exhausting memory.
+
+Matrix (preallocated) storage is a third mode. Its integrity metadata is paged
+and sparse, so create-time metadata I/O, per-mutation integrity cost, post-open
+bitmap residency, and open-time reads are all bounded by the cells actually
+used rather than by the declared cell count.
+
 Varve should own the reusable binary-format mechanics. Application-specific
 meaning, domain transforms, and compatibility with an external specification
 remain caller code.
@@ -140,7 +161,7 @@ gate, file data, environment, or library invariant issues. See
 ## Status
 
 Varve 0.3.0 is usable as an alpha library for experimentation and controlled
-deployments. It includes append-log blocks, keyed collections,
+deployments, at moderate scale through the generated APIs. It includes append-log blocks, keyed collections,
 transaction/footer commit policies, schema manifests, diagnostics, merge and
 compact helpers, variable-block compression, matrix storage, mmap, and opt-in
 zero-copy. Valid native 0.1 wire bytes remain readable in 0.3.0, but the Rust API
@@ -171,9 +192,16 @@ covering no-default-features, default, each optional feature alone
 `scalable-fault-injection`), and the all-feature workspace union; default and
 all-feature test runs through `varve-test-runner` so a leaked test artifact
 fails the build; a blocking `cargo deny` / `cargo audit` supply-chain job; a
-renamed-dependency macro fixture; and a clean-archive job that builds only the
-committed tree (`git archive` + `cargo metadata`/`cargo check --locked`) so an
+blocking locked fuzz-workspace job (`cargo metadata --locked`, `cargo check
+--locked --all-targets`, `cargo audit`, `cargo deny`, and a final
+`git diff --exit-code -- fuzz/Cargo.lock`, in that order, so no step can hide a
+stale lockfile by regenerating it); a renamed-dependency macro fixture; and a
+clean-archive job that builds only the committed tree (`git archive` +
+`cargo metadata`/`cargo check --locked`, including the fuzz workspace) so an
 uncommitted workspace member cannot pass CI.
+
+Job results block merges only where branch protection lists them as required
+status checks; adding a job to the workflow does not by itself make it a gate.
 
 Optional compatibility harnesses use Python reference libraries:
 

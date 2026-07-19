@@ -264,6 +264,7 @@ mod enabled {
         if env::var_os(CHILD_ENV).is_none() {
             return;
         }
+        suppress_interactive_fault_reporting();
         let scenario = Scenario::parse(&env::var(SCENARIO_ENV).expect("child scenario"));
         let root = PathBuf::from(env::var_os(ROOT_ENV).expect("child root"));
         run_scenario(scenario, &root);
@@ -275,8 +276,53 @@ mod enabled {
         if env::var_os(CHILD_ENV).is_none() {
             return;
         }
+        suppress_interactive_fault_reporting();
         fault_point("generation.commit");
     }
+
+    /// Keeps a deliberately aborting child process non-interactive.
+    ///
+    /// The crash matrix aborts one child per traced fault boundary. Without
+    /// this, Windows starts `WerFault.exe` for every one of them, which
+    /// dominates the suite wall time and can raise error dialogs on a
+    /// developer machine. Suppression must happen inside the child, before it
+    /// induces the fault, because the abort is `std::process::abort` in the
+    /// injected fault point itself.
+    #[cfg(windows)]
+    fn suppress_interactive_fault_reporting() {
+        const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+        const SEM_NOGPFAULTERRORBOX: u32 = 0x0002;
+        const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
+        const WER_FAULT_REPORTING_FLAG_NOHEAP: u32 = 0x0001;
+        const WER_FAULT_REPORTING_NO_UI: u32 = 0x0020;
+        const WER_FAULT_REPORTING_FLAG_DISABLE_SNAPSHOT_CRASH: u32 = 0x0040;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn SetErrorMode(mode: u32) -> u32;
+            fn SetThreadErrorMode(mode: u32, old_mode: *mut u32) -> i32;
+            fn WerSetFlags(flags: u32) -> i32;
+        }
+
+        let mode = SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX;
+        let mut previous_thread_mode = 0_u32;
+        // SAFETY: both error-mode setters take documented flag bit sets, and
+        // the out parameter points at a live local. `WerSetFlags` only takes a
+        // documented flag bit set. All three are process/thread-local settings
+        // with no memory effects.
+        unsafe {
+            SetErrorMode(mode);
+            SetThreadErrorMode(mode, &raw mut previous_thread_mode);
+            WerSetFlags(
+                WER_FAULT_REPORTING_NO_UI
+                    | WER_FAULT_REPORTING_FLAG_NOHEAP
+                    | WER_FAULT_REPORTING_FLAG_DISABLE_SNAPSHOT_CRASH,
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn suppress_interactive_fault_reporting() {}
 
     fn run_child(scenario: Scenario, root: &Path, selection: &str, trace: &Path) -> ExitStatus {
         Command::new(env::current_exe().expect("locate integration test executable"))

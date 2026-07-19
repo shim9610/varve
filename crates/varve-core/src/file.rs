@@ -34,11 +34,13 @@ pub const METADATA_BLOCK_ID: u32 = 0xFFFF_FFFC;
 pub const INDEX_BLOCK_ID: u32 = 0xFFFF_FFFB;
 pub const MANIFEST_BLOCK_ID: u32 = 0xFFFF_FFFA;
 pub const COMMIT_BLOCK_ID: u32 = 0xFFFF_FFF9;
+/// Carries the per-create nonce of a stream/indexed primary (STO-01).
+pub const CREATION_NONCE_BLOCK_ID: u32 = 0xFFFF_FFF8;
 const RESERVED_BLOCK_ID_START: u32 = 0xFFFF_FF00;
 pub(crate) const RECORD_HEADER_LEN: u64 = 32;
 pub(crate) const RECORD_FOOTER_LEN: u64 = 32;
 const RECORD_FLAG_COMPRESSED: u16 = 0x0001;
-const RECORD_FLAG_INTERNAL: u16 = 0x8000;
+pub(crate) const RECORD_FLAG_INTERNAL: u16 = 0x8000;
 const RECORD_KNOWN_FLAGS: u16 = RECORD_FLAG_COMPRESSED | RECORD_FLAG_INTERNAL;
 pub(crate) const RECORD_FOOTER_MAGIC: &[u8; 4] = b"VRF1";
 pub(crate) const RECORD_FOOTER_VERSION: u16 = 1;
@@ -651,6 +653,120 @@ fn note_checkpoint_cadence_index_touches(count: u64) {
     let _ = count;
 }
 
+/// O(1)-append / O(log B) resident block-offset tails (PERF2-05).
+///
+/// The append path used to reverse-scan the resident index for the newest
+/// record of the same block, costing `Theta(g)` per append (`g` = distance
+/// back to that record) and `O(N*B)` overall, degenerating to `Theta(N^2)`
+/// when every record carries a distinct block id. This mirrors exactly what
+/// that scan recomputed - the record offset of the newest entry per block id -
+/// and never reads the resident index on the append path.
+///
+/// `B` is the number of distinct block ids present, which is bounded by the
+/// format's declared block set plus varve's internal ids, so the sorted vector
+/// stays tiny and stops allocating once every block id has appeared.
+///
+/// Invariant: at all times this equals `BlockTails::from_index(&index)` for
+/// the current resident index. It is maintained at the single index append
+/// site and rebuilt wherever the resident index is replaced or truncated
+/// wholesale (open, recovery, generation rebinds, append rollback).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BlockTails {
+    /// Sorted by block id.
+    tails: Vec<(u32, u64)>,
+}
+
+impl BlockTails {
+    fn new_empty() -> Self {
+        Self { tails: Vec::new() }
+    }
+
+    /// Recovers the tails with one forward pass over the resident index, so a
+    /// reopen pays `O(N log B)` exactly once instead of every append paying
+    /// its own reverse scan.
+    fn from_index(index: &[RecordIndexEntry]) -> Self {
+        note_block_tail_index_touches(index.len() as u64);
+        let mut tails = Self::new_empty();
+        for entry in index {
+            tails.note_appended(entry.block_id, entry.record_offset);
+        }
+        tails
+    }
+
+    fn tail(&self, block_id: u32) -> Option<u64> {
+        self.position(block_id)
+            .map(|position| self.tails[position].1)
+    }
+
+    fn position(&self, block_id: u32) -> Option<usize> {
+        self.tails
+            .binary_search_by_key(&block_id, |(id, _)| *id)
+            .ok()
+    }
+
+    /// Advances the tail for the entry just pushed. Updating a block id the
+    /// table already holds writes one `u64` and allocates nothing; a block id
+    /// is inserted at most once per distinct id in the file.
+    fn note_appended(&mut self, block_id: u32, record_offset: u64) {
+        match self.tails.binary_search_by_key(&block_id, |(id, _)| *id) {
+            Ok(position) => self.tails[position].1 = record_offset,
+            Err(position) => self.tails.insert(position, (block_id, record_offset)),
+        }
+    }
+}
+
+#[cfg(feature = "scalable-fault-injection")]
+std::thread_local! {
+    static BLOCK_TAIL_INDEX_TOUCHES: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+/// Counts resident index entries examined by the block-offset-chain
+/// predecessor machinery on this thread (PERF2-05 regression evidence). The
+/// append path must never advance this counter. Inert without the
+/// `scalable-fault-injection` feature.
+#[inline]
+fn note_block_tail_index_touches(count: u64) {
+    #[cfg(feature = "scalable-fault-injection")]
+    BLOCK_TAIL_INDEX_TOUCHES.with(|touches| touches.set(touches.get().saturating_add(count)));
+    #[cfg(not(feature = "scalable-fault-injection"))]
+    let _ = count;
+}
+
+/// Lazily built resident keyed tails for the generic keyed append path
+/// (API2-05).
+///
+/// One tail map per keyed block id. The resident file is not generic over its
+/// block types, so keys are held as their canonical internal key payload -
+/// the same encoding tombstone records carry - rather than as `T::Key`. A map
+/// is built on first use from [`VarveFile::key_tail_offsets`] and then
+/// maintained in O(1) per append, so the generic keyed entry points link
+/// predecessors exactly like the generated keyed writer does. Any
+/// caller-supplied predecessor (the generated writer's own path) invalidates
+/// the cached map for that block id, because the file cannot learn which key
+/// that record carried.
+#[derive(Debug, Default)]
+struct KeyedTails {
+    tails: HashMap<u32, HashMap<Vec<u8>, u64>>,
+}
+
+impl KeyedTails {
+    fn new_empty() -> Self {
+        Self {
+            tails: HashMap::new(),
+        }
+    }
+
+    fn invalidate(&mut self, block_id: u32) {
+        self.tails.remove(&block_id);
+    }
+
+    fn invalidate_all(&mut self) {
+        self.tails.clear();
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct AppendSnapshot {
     eof: u64,
@@ -1099,6 +1215,12 @@ pub struct VarveFile {
     // O(1) flush-cadence state for `needs_index_checkpoint`; must equal
     // `CheckpointCadence::from_index(&index)` at all times (PERF2-02).
     checkpoint_cadence: CheckpointCadence,
+    // O(1) append-side block-offset-chain predecessors; must equal
+    // `BlockTails::from_index(&index)` at all times (PERF2-05).
+    block_tails: BlockTails,
+    // Lazily built keyed-offset-chain predecessors for the generic keyed
+    // append path; a cached map is either absent or exact (API2-05).
+    keyed_tails: KeyedTails,
     poisoned: bool,
     _lock: Option<WriterLock>,
 }
@@ -1425,6 +1547,26 @@ impl VarveWriter {
         self.file.push_info(block)
     }
 
+    /// Appends a keyed block through the generic API while maintaining the
+    /// keyed predecessor chain. See [`VarveFile::push_keyed`].
+    pub fn push_keyed<T>(&mut self, block: &T) -> Result<u64>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
+    {
+        self.file.push_keyed(block)
+    }
+
+    /// Appends a keyed block through the generic API while maintaining the
+    /// keyed predecessor chain. See [`VarveFile::push_keyed_info`].
+    pub fn push_keyed_info<T>(&mut self, block: &T) -> Result<AppendInfo>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
+    {
+        self.file.push_keyed_info(block)
+    }
+
     pub fn push_with_prev_key_info<T: VarveBlock>(
         &mut self,
         block: &T,
@@ -1437,6 +1579,7 @@ impl VarveWriter {
     pub fn delete<T>(&mut self, key: &T::Key) -> Result<u64>
     where
         T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
     {
         self.file.delete::<T>(key)
     }
@@ -1798,6 +1941,8 @@ impl VarveFile {
             matrix_creation_nonce: None,
             sequence_state: SequenceState::Available(0),
             checkpoint_cadence: CheckpointCadence::new_empty(),
+            block_tails: BlockTails::new_empty(),
+            keyed_tails: KeyedTails::new_empty(),
             poisoned: false,
             _lock: Some(lock),
         };
@@ -1877,6 +2022,8 @@ impl VarveFile {
             matrix_creation_nonce: Some(creation_nonce),
             sequence_state: SequenceState::Available(0),
             checkpoint_cadence: CheckpointCadence::new_empty(),
+            block_tails: BlockTails::new_empty(),
+            keyed_tails: KeyedTails::new_empty(),
             poisoned: false,
             _lock: Some(lock),
         };
@@ -1905,6 +2052,7 @@ impl VarveFile {
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
         let sequence_state = SequenceState::from_index(&index);
         let checkpoint_cadence = CheckpointCadence::from_index(&index);
+        let block_tails = BlockTails::from_index(&index);
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         Ok(Self {
             spec,
@@ -1917,6 +2065,8 @@ impl VarveFile {
             matrix_creation_nonce,
             sequence_state,
             checkpoint_cadence,
+            block_tails,
+            keyed_tails: KeyedTails::new_empty(),
             poisoned: false,
             _lock: Some(lock),
         })
@@ -1947,6 +2097,7 @@ impl VarveFile {
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
         let sequence_state = SequenceState::from_index(&index);
         let checkpoint_cadence = CheckpointCadence::from_index(&index);
+        let block_tails = BlockTails::from_index(&index);
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         Ok(Self {
             spec,
@@ -1959,6 +2110,8 @@ impl VarveFile {
             matrix_creation_nonce,
             sequence_state,
             checkpoint_cadence,
+            block_tails,
+            keyed_tails: KeyedTails::new_empty(),
             poisoned: false,
             _lock: Some(lock),
         })
@@ -1982,6 +2135,7 @@ impl VarveFile {
         let index = load_index(spec, &mut file, append_start, ScanIntent::ReadOnly)?;
         let sequence_state = SequenceState::from_index(&index);
         let checkpoint_cadence = CheckpointCadence::from_index(&index);
+        let block_tails = BlockTails::from_index(&index);
         let logical_len = validated_snapshot_len(append_start, &index)?;
         let snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, logical_len)?;
         Ok(Self {
@@ -1995,6 +2149,8 @@ impl VarveFile {
             matrix_creation_nonce,
             sequence_state,
             checkpoint_cadence,
+            block_tails,
+            keyed_tails: KeyedTails::new_empty(),
             poisoned: false,
             _lock: None,
         })
@@ -2031,6 +2187,7 @@ impl VarveFile {
         let recovered_len = file.metadata()?.len();
         let sequence_state = SequenceState::from_index(&index);
         let checkpoint_cadence = CheckpointCadence::from_index(&index);
+        let block_tails = BlockTails::from_index(&index);
         let records_preserved = index.len();
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         Ok((
@@ -2045,6 +2202,8 @@ impl VarveFile {
                 matrix_creation_nonce,
                 sequence_state,
                 checkpoint_cadence,
+                block_tails,
+                keyed_tails: KeyedTails::new_empty(),
                 poisoned: false,
                 _lock: Some(lock),
             },
@@ -2076,11 +2235,139 @@ impl VarveFile {
         Ok(self.push_info(block)?.sequence)
     }
 
+    /// Appends a block without a keyed predecessor link.
+    ///
+    /// API2-05: a keyed block cannot go through this entry point when the
+    /// format enables `keyed_offset_chain`. `T: VarveBlock` exposes no key, so
+    /// this path can only write `prev_same_key_offset = None`, which silently
+    /// truncates the physical keyed chain as soon as a second record shares a
+    /// key. Such calls are rejected with
+    /// [`Error::KeyedChainRequiresKeyedApi`]; use the generated keyed writer
+    /// method or [`VarveFile::push_keyed_info`], both of which maintain the
+    /// chain. The bounded streaming and indexed writers already reject the
+    /// same combination.
     pub fn push_info<T: VarveBlock>(&mut self, block: &T) -> Result<AppendInfo> {
+        if self.spec.index_policy.keyed_offset_chain && T::IS_KEYED {
+            return Err(Error::KeyedChainRequiresKeyedApi { block_id: T::ID });
+        }
         self.push_with_prev_key_info(block, None)
     }
 
+    /// Appends a keyed block through the generic API, linking it to the
+    /// previous record with the same key.
+    ///
+    /// This is the generic equivalent of the generated `push_<block>` writer
+    /// method. The predecessor comes from a per-block-id tail map that is
+    /// built once from the resident index on first use for a given block type
+    /// (`O(N)` decode of that block's records, exactly what the generated
+    /// writer pays at open) and then maintained in O(1) per append. Formats
+    /// without `keyed_offset_chain` skip the map entirely.
+    ///
+    /// Interleaving this with [`VarveFile::push_with_prev_key_info`] for the
+    /// same block id is supported but drops the cached map: a caller-supplied
+    /// link carries no key the file can observe, so the next call here rebuilds.
+    pub fn push_keyed<T>(&mut self, block: &T) -> Result<u64>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
+    {
+        Ok(self.push_keyed_info(block)?.sequence)
+    }
+
+    /// Appends a keyed block through the generic API, linking it to the
+    /// previous record with the same key. See [`VarveFile::push_keyed`].
+    pub fn push_keyed_info<T>(&mut self, block: &T) -> Result<AppendInfo>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
+    {
+        // API2-03: keyed generic entry points evaluate the compile-time
+        // keyedness contract post-monomorphization.
+        let () = crate::traits::KeyedBlockContract::<T>::OK;
+        if !self.spec.index_policy.keyed_offset_chain {
+            return self.push_with_prev_key_info_unlinked(block, None);
+        }
+        self.ensure_write()?;
+        let key = encode_internal_key_payload::<T>(self.spec, &block.key())?;
+        let previous = self.keyed_tail_map::<T>()?.get(&key).copied();
+        let info = self.push_with_prev_key_info_unlinked(block, previous)?;
+        let offset = info.record_offset;
+        self.insert_keyed_tail::<T>(key, offset)?;
+        Ok(info)
+    }
+
+    /// Returns the maintained keyed tails for `T`, building them from the
+    /// resident index the first time this block type is used.
+    fn keyed_tail_map<T>(&mut self) -> Result<&mut HashMap<Vec<u8>, u64>>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
+    {
+        if !self.keyed_tails.tails.contains_key(&T::ID) {
+            let spec = self.spec;
+            let typed = self.key_tail_offsets::<T>()?;
+            let requested = allocation_bytes::<(Vec<u8>, u64)>(typed.len(), "keyed tail offsets")?;
+            let mut built: HashMap<Vec<u8>, u64> = HashMap::new();
+            built
+                .try_reserve(typed.len())
+                .map_err(|_| Error::AllocationFailed {
+                    resource: "keyed tail offsets",
+                    requested,
+                })?;
+            for (key, offset) in &typed {
+                built.insert(encode_internal_key_payload::<T>(spec, key)?, *offset);
+            }
+            let requested = allocation_bytes::<(u32, HashMap<Vec<u8>, u64>)>(
+                self.keyed_tails.tails.len().saturating_add(1),
+                "keyed tail cache",
+            )?;
+            self.keyed_tails
+                .tails
+                .try_reserve(1)
+                .map_err(|_| Error::AllocationFailed {
+                    resource: "keyed tail cache",
+                    requested,
+                })?;
+            self.keyed_tails.tails.insert(T::ID, built);
+        }
+        Ok(self
+            .keyed_tails
+            .tails
+            .get_mut(&T::ID)
+            .expect("keyed tail map for this block id was just installed"))
+    }
+
+    fn insert_keyed_tail<T>(&mut self, key: Vec<u8>, record_offset: u64) -> Result<()>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
+    {
+        let tails = self.keyed_tail_map::<T>()?;
+        let requested = allocation_bytes::<(Vec<u8>, u64)>(
+            tails.len().saturating_add(1),
+            "keyed tail offsets",
+        )?;
+        tails.try_reserve(1).map_err(|_| Error::AllocationFailed {
+            resource: "keyed tail offsets",
+            requested,
+        })?;
+        tails.insert(key, record_offset);
+        Ok(())
+    }
+
     pub fn push_with_prev_key_info<T: VarveBlock>(
+        &mut self,
+        block: &T,
+        prev_same_key_offset: Option<u64>,
+    ) -> Result<AppendInfo> {
+        // API2-05: the caller owns this block's keyed chain, so any tail map
+        // this file cached for the block id can no longer be trusted - the
+        // record's key is not observable here.
+        self.keyed_tails.invalidate(T::ID);
+        self.push_with_prev_key_info_unlinked(block, prev_same_key_offset)
+    }
+
+    fn push_with_prev_key_info_unlinked<T: VarveBlock>(
         &mut self,
         block: &T,
         prev_same_key_offset: Option<u64>,
@@ -2099,14 +2386,47 @@ impl VarveFile {
         self.write_user_record(T::ID, T::VERSION, T::KIND, &payload, prev_same_key_offset)
     }
 
+    /// Appends a tombstone for `key`, linking it to the previous record with
+    /// the same key.
+    ///
+    /// API2-05: this used to write `prev_same_key_offset = None` and truncate
+    /// the physical keyed chain. It now resolves and maintains the predecessor
+    /// through the same tail map as [`VarveFile::push_keyed_info`].
     pub fn delete<T>(&mut self, key: &T::Key) -> Result<u64>
     where
         T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
     {
-        Ok(self.delete_with_prev_key_info::<T>(key, None)?.sequence)
+        let () = crate::traits::KeyedBlockContract::<T>::OK;
+        if !self.spec.index_policy.keyed_offset_chain {
+            return Ok(self
+                .delete_with_prev_key_info_unlinked::<T>(key, None)?
+                .sequence);
+        }
+        self.ensure_write()?;
+        let key_payload = encode_internal_key_payload::<T>(self.spec, key)?;
+        let previous = self.keyed_tail_map::<T>()?.get(&key_payload).copied();
+        let info = self.delete_with_prev_key_info_unlinked::<T>(key, previous)?;
+        let offset = info.record_offset;
+        self.insert_keyed_tail::<T>(key_payload, offset)?;
+        Ok(info.sequence)
     }
 
     pub fn delete_with_prev_key_info<T>(
+        &mut self,
+        key: &T::Key,
+        prev_same_key_offset: Option<u64>,
+    ) -> Result<AppendInfo>
+    where
+        T: VarveKeyedBlock,
+    {
+        // API2-05: the caller owns this block's keyed chain; drop the cached
+        // tail map so a later maintained append rebuilds it.
+        self.keyed_tails.invalidate(T::ID);
+        self.delete_with_prev_key_info_unlinked::<T>(key, prev_same_key_offset)
+    }
+
+    fn delete_with_prev_key_info_unlinked<T>(
         &mut self,
         key: &T::Key,
         prev_same_key_offset: Option<u64>,
@@ -2990,6 +3310,7 @@ impl VarveFile {
             MergeShard::single_file(),
             &mut state,
             &mut budget,
+            u64::MAX,
         )?;
         let requested = allocation_bytes::<(T::Key, T)>(state.len(), "materialized keyed map")?;
         let mut values = HashMap::new();
@@ -3506,6 +3827,20 @@ impl VarveFile {
         CHECKPOINT_CADENCE_INDEX_TOUCHES.with(|touches| touches.get())
     }
 
+    /// Returns the cumulative number of resident index entries this thread's
+    /// block-offset-chain predecessor machinery has examined (PERF2-05).
+    ///
+    /// Fault-testing hook only. The append path resolves predecessors from the
+    /// maintained tail table and must never advance this counter, so a
+    /// regression test can delta-measure an append window and assert zero for
+    /// any record count; only wholesale index loads (open, recovery, rebind,
+    /// rollback) pay one pass.
+    #[cfg(feature = "scalable-fault-injection")]
+    #[doc(hidden)]
+    pub fn block_tail_index_touches() -> u64 {
+        BLOCK_TAIL_INDEX_TOUCHES.with(|touches| touches.get())
+    }
+
     #[cfg(feature = "mmap")]
     /// Maps the file's indexed record payloads as a read-only snapshot.
     ///
@@ -3704,8 +4039,12 @@ impl VarveFile {
                 self.snapshot = snapshot;
                 self.index = new_index;
                 // The resident index was replaced wholesale; recover the O(1)
-                // flush-cadence state once for the new generation (PERF2-02).
+                // flush-cadence state once for the new generation (PERF2-02)
+                // and the O(1) block tails with it (PERF2-05). Record offsets
+                // moved, so every cached generic keyed tail is stale (API2-05).
                 self.checkpoint_cadence = CheckpointCadence::from_index(&self.index);
+                self.block_tails = BlockTails::from_index(&self.index);
+                self.keyed_tails.invalidate_all();
                 self.publish_sequence(sequence);
                 Ok(sequence)
             }
@@ -3743,8 +4082,12 @@ impl VarveFile {
                 self.snapshot = snapshot;
                 self.index = new_index;
                 // The resident index was replaced wholesale; recover the O(1)
-                // flush-cadence state once for the new generation (PERF2-02).
+                // flush-cadence state once for the new generation (PERF2-02)
+                // and the O(1) block tails with it (PERF2-05). Record offsets
+                // moved, so every cached generic keyed tail is stale (API2-05).
                 self.checkpoint_cadence = CheckpointCadence::from_index(&self.index);
+                self.block_tails = BlockTails::from_index(&self.index);
+                self.keyed_tails.invalidate_all();
                 Ok(info)
             }
             Err(source) => {
@@ -3824,7 +4167,7 @@ impl VarveFile {
         self.sequence_state = SequenceState::after_publishing(sequence);
     }
 
-    fn write_record(
+    pub(crate) fn write_record(
         &mut self,
         block_id: u32,
         block_version: u16,
@@ -3933,12 +4276,10 @@ impl VarveFile {
         self.spec
             .read_limits
             .check(ReadLimitKey::FileLen, prospective_len)?;
+        // PERF2-05: the predecessor comes from the maintained tail table, not
+        // from a reverse scan of the resident index.
         let prev_same_block_offset = if self.spec.index_policy.block_offset_chain {
-            self.index
-                .iter()
-                .rev()
-                .find(|entry| entry.block_id == block_id)
-                .map(|entry| entry.record_offset)
+            self.block_tails.tail(block_id)
         } else {
             None
         };
@@ -4020,16 +4361,27 @@ impl VarveFile {
         let info = AppendInfo::from(&entry);
         self.index.push(entry);
         // Single index append site: keep the O(1) flush-cadence state in
-        // lockstep with the resident index (PERF2-02).
+        // lockstep with the resident index (PERF2-02), and the block tails
+        // with it (PERF2-05). Both run only after the record is durable in the
+        // append log, so the rollback path never has to undo them.
         self.checkpoint_cadence
             .note_appended(self.index.len() - 1, block_id);
+        self.block_tails.note_appended(block_id, record_offset);
         self.snapshot = new_snapshot;
         self.publish_sequence(sequence);
         Ok(info)
     }
 
     fn rollback_append(&mut self, snapshot: AppendSnapshot, operation_error: Error) -> Error {
+        // The tail states are advanced only after the record is fully written,
+        // so this normally truncates nothing; rebuilding when it does keeps
+        // the `BlockTails::from_index` invariant unconditional (PERF2-05).
+        let truncated = self.index.len() > snapshot.index_len;
         self.index.truncate(snapshot.index_len);
+        if truncated {
+            self.block_tails = BlockTails::from_index(&self.index);
+            self.keyed_tails.invalidate_all();
+        }
         self.sequence_state = snapshot.sequence_state;
         self.checkpoint_cadence = snapshot.checkpoint_cadence;
 
@@ -5426,7 +5778,43 @@ fn decompress_with_algorithm(
     unreachable!("compression algorithm availability returned Ok without a backend")
 }
 
-pub fn merge_keyed_files<T, P>(spec: FormatSpec, base: P, deltas: &[P], output: P) -> Result<()>
+/// Pre-flight cost estimate for the resident keyed merge/compact family
+/// (PERF2-03).
+///
+/// Every field is an upper bound derived from record *counts* only: producing
+/// it decodes nothing and retains no values, so a caller can size or refuse a
+/// merge before paying for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeyedMergeEstimate {
+    /// Records across all inputs.
+    pub input_records: u64,
+    /// Records that can introduce a distinct key: values of `T`, tombstones,
+    /// and merge ops.
+    pub key_bearing_records: u64,
+    /// Upper bound on `K-ever`, the number of distinct keys the merge state
+    /// retains. Tombstoned keys count: the collector keeps their entries.
+    pub max_distinct_keys: u64,
+    /// Resident index bytes for the largest single input, which is opened
+    /// whole while its records are applied.
+    pub largest_input_index_bytes: u64,
+    /// Upper bound on the merge-state map itself, excluding the heap owned by
+    /// individual keys and decoded values.
+    pub max_state_bytes: u64,
+}
+
+/// Estimates the resident cost of merging `base` with `deltas` for block `T`.
+///
+/// Opens each input read-only in turn and counts index entries; nothing is
+/// decoded and no value is retained, so the peak cost of the estimate itself
+/// is one input's resident index. Use it to decide whether
+/// [`merge_keyed_files`] fits in available memory, or pass the result's
+/// `max_distinct_keys` to [`merge_keyed_files_with_key_limit`].
+pub fn estimate_keyed_merge<T, P>(
+    spec: FormatSpec,
+    base: P,
+    deltas: &[P],
+) -> Result<KeyedMergeEstimate>
 where
     T: VarveMerge,
     T::Key: Eq + Hash,
@@ -5434,7 +5822,107 @@ where
 {
     let spec = spec.ordinary_read();
     spec.validate()?;
-    let final_values = collect_merged_keyed_values::<T, P>(spec, base, deltas)?;
+    crate::collections::ensure_registered_block::<T>(spec)?;
+    let mut estimate = KeyedMergeEstimate::default();
+    accumulate_keyed_merge_estimate::<T, _>(spec, base, &mut estimate)?;
+    for delta in deltas {
+        accumulate_keyed_merge_estimate::<T, _>(spec, delta, &mut estimate)?;
+    }
+    estimate.max_distinct_keys = estimate.key_bearing_records;
+    estimate.max_state_bytes = allocation_bytes::<(T::Key, (MergeOrder, Option<T>))>(
+        usize::try_from(estimate.max_distinct_keys).unwrap_or(usize::MAX),
+        "merge state",
+    )?;
+    Ok(estimate)
+}
+
+fn accumulate_keyed_merge_estimate<T, P>(
+    spec: FormatSpec,
+    path: P,
+    estimate: &mut KeyedMergeEstimate,
+) -> Result<()>
+where
+    T: VarveMerge,
+    T::Key: Eq + Hash,
+    P: AsRef<Path>,
+{
+    let file = VarveFile::open_readonly(spec, path)?;
+    let records =
+        u64::try_from(file.index.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+            resource: "record count",
+        })?;
+    let key_bearing = file
+        .index
+        .iter()
+        .filter(|entry| {
+            entry.block_id == T::ID
+                || entry.block_id == TOMBSTONE_BLOCK_ID
+                || entry.block_id == OP_BLOCK_ID
+        })
+        .count();
+    let key_bearing =
+        u64::try_from(key_bearing).map_err(|_| Error::ResourceArithmeticOverflow {
+            resource: "record count",
+        })?;
+    estimate.input_records = estimate.input_records.saturating_add(records);
+    estimate.key_bearing_records = estimate.key_bearing_records.saturating_add(key_bearing);
+    estimate.largest_input_index_bytes = estimate
+        .largest_input_index_bytes
+        .max(index_bytes_for_count(file.index.len())?);
+    Ok(())
+}
+
+/// Merges `base` with `deltas` into `output`, keeping the last write per key.
+///
+/// # Scale contract
+///
+/// This is a **resident** operation and is deliberately not PB-scale. It opens
+/// each input as a whole [`VarveFile`] and accumulates one map entry per
+/// distinct key ever seen - including keys whose latest record is a tombstone -
+/// plus the live values that survive to the output:
+///
+/// - time: `Theta(records + decoded bytes) + O(K-live log K-live)`;
+/// - memory: `O(K-ever + largest resident input index + retained live values)`,
+///   where `K-ever` is the number of distinct keys across all inputs.
+///
+/// Nothing here spills to disk, so `K-ever` must fit in memory. Varve exports
+/// no bounded-memory external merge/compact; the scalable stream and indexed
+/// writers cover bounded *ingest*, not bounded merge. Callers whose key
+/// cardinality is not known to be resident-sized should size the operation
+/// first with [`estimate_keyed_merge`] or bound it with
+/// [`merge_keyed_files_with_key_limit`], which fails with a typed limit error
+/// instead of exhausting memory.
+pub fn merge_keyed_files<T, P>(spec: FormatSpec, base: P, deltas: &[P], output: P) -> Result<()>
+where
+    T: VarveMerge,
+    T::Key: Eq + Hash,
+    P: AsRef<Path>,
+{
+    merge_keyed_files_with_key_limit::<T, P>(spec, base, deltas, output, u64::MAX)
+}
+
+/// [`merge_keyed_files`] with an explicit ceiling on distinct retained keys.
+///
+/// The collector checks `max_distinct_keys` before it admits each new key, so
+/// an input whose cardinality exceeds the caller's memory budget fails with
+/// [`Error::LimitExceeded`] (`resource = "merge distinct keys"`) at the
+/// boundary instead of being discovered by the allocator. The ceiling counts
+/// tombstoned keys, matching what the state actually retains.
+pub fn merge_keyed_files_with_key_limit<T, P>(
+    spec: FormatSpec,
+    base: P,
+    deltas: &[P],
+    output: P,
+    max_distinct_keys: u64,
+) -> Result<()>
+where
+    T: VarveMerge,
+    T::Key: Eq + Hash,
+    P: AsRef<Path>,
+{
+    let spec = spec.ordinary_read();
+    spec.validate()?;
+    let final_values = collect_merged_keyed_values::<T, P>(spec, base, deltas, max_distinct_keys)?;
     write_keyed_values_atomically(
         spec,
         output.as_ref(),
@@ -5442,7 +5930,33 @@ where
     )
 }
 
+/// Compacts `base` plus `deltas` into `output`, dropping superseded records.
+///
+/// # Scale contract
+///
+/// Identical to [`merge_keyed_files`]: resident, `O(K-ever + largest resident
+/// input index + retained live values)` memory, not PB-scale. See that
+/// function for the full bound, [`estimate_keyed_merge`] for a pre-flight
+/// estimate, and [`compact_keyed_files_with_key_limit`] for a typed guard.
 pub fn compact_keyed_files<T, P>(spec: FormatSpec, base: P, deltas: &[P], output: P) -> Result<()>
+where
+    T: VarveMerge,
+    T::Key: Eq + Hash,
+    P: AsRef<Path>,
+{
+    compact_keyed_files_with_key_limit::<T, P>(spec, base, deltas, output, u64::MAX)
+}
+
+/// [`compact_keyed_files`] with an explicit ceiling on distinct retained keys.
+///
+/// See [`merge_keyed_files_with_key_limit`] for the guard semantics.
+pub fn compact_keyed_files_with_key_limit<T, P>(
+    spec: FormatSpec,
+    base: P,
+    deltas: &[P],
+    output: P,
+    max_distinct_keys: u64,
+) -> Result<()>
 where
     T: VarveMerge,
     T::Key: Eq + Hash,
@@ -5450,7 +5964,7 @@ where
 {
     let spec = spec.ordinary_read();
     spec.validate()?;
-    let final_values = collect_merged_keyed_values::<T, P>(spec, base, deltas)?;
+    let final_values = collect_merged_keyed_values::<T, P>(spec, base, deltas, max_distinct_keys)?;
     write_keyed_values_atomically(
         spec,
         output.as_ref(),
@@ -5462,6 +5976,7 @@ fn collect_merged_keyed_values<T, P>(
     spec: FormatSpec,
     base: P,
     deltas: &[P],
+    max_distinct_keys: u64,
 ) -> Result<Vec<(MergeOrder, T)>>
 where
     T: VarveMerge,
@@ -5477,6 +5992,7 @@ where
         MergeShard { ordinal: 0 },
         &mut state,
         &mut budget,
+        max_distinct_keys,
     )?;
     for (index, delta) in deltas.iter().enumerate() {
         apply_merge_file::<T, _>(
@@ -5485,6 +6001,7 @@ where
             MergeShard { ordinal: index + 1 },
             &mut state,
             &mut budget,
+            max_distinct_keys,
         )?;
     }
 
@@ -5520,7 +6037,12 @@ where
     let result = (|| {
         let mut out = VarveFile::create(spec, &temp_path)?;
         for value in values {
-            out.push(&value)?;
+            // API2-05: `values` comes from a per-key map, so the merged
+            // generation holds exactly one record per surviving key and an
+            // absent keyed predecessor is the correct link. Stating it
+            // explicitly keeps this off the generic push, which refuses keyed
+            // blocks precisely because it cannot know that.
+            out.push_with_prev_key_info(&value, None)?;
         }
         out.flush()?;
         out.sync()
@@ -5562,6 +6084,7 @@ fn apply_merge_file<T, P>(
     shard: MergeShard,
     state: &mut HashMap<T::Key, (MergeOrder, Option<T>)>,
     budget: &mut MaterializationBudget,
+    max_distinct_keys: u64,
 ) -> Result<()>
 where
     T: VarveMerge,
@@ -5569,7 +6092,43 @@ where
     P: AsRef<Path>,
 {
     let file = VarveFile::open_readonly(spec, path)?;
-    apply_merge_entries::<T>(spec, &file.snapshot, &file.index, shard, state, budget)
+    apply_merge_entries::<T>(
+        spec,
+        &file.snapshot,
+        &file.index,
+        shard,
+        state,
+        budget,
+        max_distinct_keys,
+    )
+}
+
+/// Refuses a key the merge state has not seen once the caller's `K-ever`
+/// ceiling is reached (PERF2-03), so a cardinality the caller cannot afford
+/// fails typed at the boundary instead of in the allocator.
+fn admit_merge_key<T>(
+    state: &HashMap<T::Key, (MergeOrder, Option<T>)>,
+    key: &T::Key,
+    max_distinct_keys: u64,
+) -> Result<()>
+where
+    T: VarveMerge,
+    T::Key: Eq + Hash,
+{
+    if state.contains_key(key) {
+        return Ok(());
+    }
+    let admitted = u64::try_from(state.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+        resource: "merge distinct keys",
+    })?;
+    if admitted >= max_distinct_keys {
+        return Err(Error::LimitExceeded {
+            resource: "merge distinct keys",
+            actual: admitted.saturating_add(1),
+            limit: max_distinct_keys,
+        });
+    }
+    Ok(())
 }
 
 fn apply_merge_entries<T>(
@@ -5579,6 +6138,7 @@ fn apply_merge_entries<T>(
     shard: MergeShard,
     state: &mut HashMap<T::Key, (MergeOrder, Option<T>)>,
     budget: &mut MaterializationBudget,
+    max_distinct_keys: u64,
 ) -> Result<()>
 where
     T: VarveMerge,
@@ -5601,6 +6161,7 @@ where
                 let block: T = budget.decode(&payload, T::ENDIAN.unwrap_or(spec.endian))?;
                 let key = block.key();
                 if should_apply(state.get(&key), order) {
+                    admit_merge_key::<T>(state, &key, max_distinct_keys)?;
                     state.try_reserve(1).map_err(|_| Error::AllocationFailed {
                         resource: "merge state",
                         requested: logical_len,
@@ -5617,6 +6178,7 @@ where
                     continue;
                 };
                 if should_apply(state.get(&key), order) {
+                    admit_merge_key::<T>(state, &key, max_distinct_keys)?;
                     state.try_reserve(1).map_err(|_| Error::AllocationFailed {
                         resource: "merge state",
                         requested: logical_len,
@@ -6472,6 +7034,84 @@ pub(crate) fn prepare_stream_manifest_record(
         None,
         None,
     )
+}
+
+/// Produces a fresh 128-bit creation nonce for a stream/indexed primary.
+///
+/// Same uniqueness-not-secrecy contract as the matrix creation nonce: it only
+/// has to differ between two `create` calls, including two that reuse the same
+/// OS file object.
+#[cfg(feature = "high-cardinality-dev")]
+pub(crate) fn fresh_stream_creation_nonce() -> [u8; MATRIX_CREATION_NONCE_LEN] {
+    fresh_matrix_creation_nonce()
+}
+
+/// Frames the creation-nonce record (STO-01).
+///
+/// The nonce lives *inside the primary* because that is the only place an
+/// equal-length in-place rewrite cannot preserve: a nonce in the sidecar, the
+/// writer-lock file or any companion file survives the rewrite and detects
+/// nothing. It is written exactly once, at create, as the first record of the
+/// log, so it costs nothing per append.
+///
+/// The payload is the bare 16-byte nonce under a dedicated reserved block id
+/// rather than a keyed metadata envelope. That keeps the record at the smallest
+/// possible size, so it fits inside any payload limit that admits a 16-byte
+/// user record and needs no exemption from the caller's read limits.
+#[cfg(feature = "high-cardinality-dev")]
+pub(crate) fn prepare_stream_creation_nonce_record(
+    spec: FormatSpec,
+    nonce: [u8; MATRIX_CREATION_NONCE_LEN],
+    sequence: u64,
+    record_offset: u64,
+) -> Result<PreparedStreamRecord> {
+    prepare_stream_record(
+        spec,
+        CREATION_NONCE_BLOCK_ID,
+        1,
+        RECORD_FLAG_INTERNAL,
+        0,
+        &nonce,
+        sequence,
+        record_offset,
+        None,
+        None,
+    )
+}
+
+/// Recovers the creation nonce of a stream/indexed primary, or `None` when the
+/// primary carries none (a legacy primary, or one bootstrapped from a resident
+/// `VarveFile`).
+///
+/// Cost is one bounded point read of the first record, performed only at open
+/// and at create — never on an append or lookup path.
+///
+/// Any failure to read or decode the leading record is reported as "no nonce"
+/// rather than as an error. That is fail-closed, not permissive: a primary that
+/// *was* created with a nonce recorded a fingerprint that folds it in, so
+/// answering `None` can only ever produce a *different* fingerprint and refuse
+/// the sidecar. It must never turn a damaged leading record into an open-time
+/// error on a path whose job is to compute an identity.
+#[cfg(feature = "high-cardinality-dev")]
+pub(crate) fn read_stream_creation_nonce(
+    spec: FormatSpec,
+    snapshot: &SnapshotFile,
+    header_len: u64,
+) -> Option<[u8; MATRIX_CREATION_NONCE_LEN]> {
+    if header_len >= snapshot.len() {
+        return None;
+    }
+    let mut file = snapshot.try_clone_file().ok()?;
+    let entry = read_stream_entry_at_file(spec, &mut file, snapshot, header_len).ok()?;
+    if entry.block_id != CREATION_NONCE_BLOCK_ID
+        || entry.flags & RECORD_FLAG_INTERNAL == 0
+        || entry.block_version != 1
+        || entry.payload_len != MATRIX_CREATION_NONCE_LEN as u64
+    {
+        return None;
+    }
+    let payload = entry.read_payload_snapshot(spec, snapshot).ok()?;
+    <[u8; MATRIX_CREATION_NONCE_LEN]>::try_from(payload.as_slice()).ok()
 }
 
 #[cfg(feature = "high-cardinality-dev")]
@@ -9020,7 +9660,9 @@ mod tests {
         let spec =
             replacement_policy_spec().with_index_policy(IndexPolicy::new(true, true, true, true));
         let mut writer = VarveFile::create(spec, &path)?;
-        let first = writer.push_info(&ReplaceKeyed {
+        // API2-05: the generic push refuses keyed blocks on a keyed-chaining
+        // format; the maintaining path is the equivalent entry point.
+        let first = writer.push_keyed_info(&ReplaceKeyed {
             key: 1,
             value: "a".into(),
         })?;

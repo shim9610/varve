@@ -84,7 +84,7 @@ Generated typed methods depend on block names:
 | `with_matrix_aux(aux)` | manual matrix aux registry |
 | `with_block_identities(identities)` | attach the per-block identity table (endian override, keyedness, generated codec fingerprint) hashed by `computed_schema_hash()`; generated `spec()` does this automatically |
 | `validate()` | check static spec consistency, including duplicate/unregistered block identities |
-| `computed_schema_hash()` | deterministic schema fingerprint (algorithm version `FormatSpec::SCHEMA_HASH_ALGORITHM_VERSION`, currently 2) |
+| `computed_schema_hash()` | deterministic schema fingerprint (algorithm version `FormatSpec::SCHEMA_HASH_ALGORITHM_VERSION`, currently 3) |
 | `effective_layout()` | physical layout plan using header/segment/lead-in/raw/footer vocabulary |
 | `inspect_layout_file(path)` | validate a native or custom file and return physical layout ranges |
 | `schema_debug_dump()` | human-readable schema dump |
@@ -160,8 +160,9 @@ Common `VarveWriter` APIs:
 
 | API | Meaning |
 | --- | --- |
-| `push(&block)` | append fixed/variable user block |
-| `delete::<T>(&key)` | append keyed tombstone |
+| `push(&block)` | append fixed/variable user block; refuses a keyed block on a `keyed_offset_chain` format |
+| `push_keyed(&block)` | append a keyed user block and maintain the keyed offset chain |
+| `delete::<T>(&key)` | append keyed tombstone; maintains the keyed offset chain |
 | `push_op::<T>(&key, &op)` | append user-defined merge op |
 | `write_metadata(key, bytes)` | append internal metadata record |
 | `replace_block(index, &block)` | sequence-preserving copy-on-write replacement; encoded size may grow or shrink |
@@ -172,6 +173,19 @@ Common `VarveWriter` APIs:
 | `commit_durable()` | write an explicit transaction marker with ordered flush/sync barriers |
 | `flush()` | write buffered records/checkpoints/manifests/marker |
 | `sync()` | request durable persistence |
+
+Keyed appends on a `keyed_offset_chain` format must go through a maintaining
+path. The generic `push` / `push_info` (on both `VarveWriter` and `VarveFile`)
+cannot see `T::Key`, so it would write `prev_same_key_offset = None` and
+truncate the chain; it therefore refuses a keyed block on such a format with
+`Error::KeyedChainRequiresKeyedApi { block_id }`. The refusal is unconditional —
+it fires on the first push, not only where a predecessor exists — so the
+contract never depends on call order, and nothing is written. Use `push_keyed` /
+`push_keyed_info` instead, which resolve the predecessor from the persisted
+keyed tail offsets and rebuild that cache after reopen. `delete` maintains the
+chain on its own. Unkeyed blocks and formats without `keyed_offset_chain` are
+unaffected, and the generated typed keyed writers already take the maintaining
+path.
 
 Writer encoding is limit-bounded end to end: push, metadata, replacement, and
 keyed-op entry points encode through a budgeted encoder, so an oversized value
@@ -257,6 +271,29 @@ was published". Under CRC policies, `rebuild_disk_index` reads and verifies
 only the payloads the index plan needs; `verify_all()` is the whole-file
 integrity scan.
 
+Disk-index descriptors carry the block schema fingerprint of the exact concrete
+type whose decode and key-extraction function pointers they hold.
+`DiskIndexDescriptor::of::<T>()` records `T::SCHEMA_FINGERPRINT`, plan
+construction and plan validation run the format's registration gate for every
+descriptor before any primary bytes reach a captured codec, and the fingerprint
+is folded into the plan digest. A descriptor that claims a declared block's
+id and version but is a different type is therefore refused with
+`Error::BlockSchemaFingerprintMismatch` with zero decoder calls, and a sidecar
+published for one block schema is refused as stale for a plan that decodes
+another. The strength of that gate follows the spec: for a block id whose
+`FormatSpec` declares no identity, registration falls back to first use and the
+check degrades to id/version/keyedness.
+
+Stream and indexed primaries carry a per-create 128-bit nonce as their first
+record (reserved block id `CREATION_NONCE_BLOCK_ID`, one record at create and
+nothing per append), and the sidecar binds to it through its recorded
+primary-generation witness. Replacing a primary in place with another
+equal-length primary of the same format is refused at open with
+`DiskIndexError::PrimaryGenerationMismatch` on both the reader and the writer;
+`rebuild_disk_index` is the recovery. A primary bootstrapped from a resident
+`VarveFile` carries no nonce and is protected only by the weaker
+content-window witness over its leading bytes.
+
 With `high-cardinality-dev`, manual `VarveBlock` implementations must state
 `IS_KEYED` explicitly. This is a compile-time chain-safety requirement; macro
 generated blocks already provide the exact value.
@@ -338,14 +375,25 @@ but no longer requires `Clone`.
 
 `VarveBlock` requires a `const SCHEMA_FINGERPRINT: u64` with no default.
 `#[derive(VarveBlock)]` computes it deterministically (FNV-1a 64 over the
-canonical schema: id, version, kind, endian, keyedness, and ordered field
-name/type identities). Typed registration is first-seen per process and rejects
-two implementations that claim the same block id with different fingerprints
-(`Error::BlockSchemaFingerprintMismatch`), so a manual `VarveBlock` cannot
-impersonate a registered type by matching only id/version/kind. A manual block
-mirroring a generated one must reuse that block's fingerprint constant. The
-fingerprint is process-local and is deliberately not part of the wire format or
-on-disk descriptors.
+canonical schema: id, version, kind, endian, keyedness, ordered field
+name/type identities, and each field's resolved codec `SCHEMA_ID`).
+
+Typed registration validates against the format, not against whichever type
+arrived first. When the `FormatSpec` declares an identity for the block id — as
+every `varve_format!`-generated spec does — that immutable `(keyedness,
+fingerprint)` pair is the authority, and a `T` that disagrees is rejected with
+`Error::BlockSchemaFingerprintMismatch` or `Error::BlockKeyednessMismatch`
+before anything is cached or written. Call order therefore cannot decide which
+wire type a process accepts. The process registry is only a cache of an
+already-validated result, keyed by the spec's block table *and* identity table,
+so two specs that share a descriptor table but declare different identities
+cannot alias one cached contract. A hand-built spec with an empty identity
+table keeps the older first-use behaviour for the block ids it does not cover:
+the first `T` seen defines the contract and later disagreeing types are
+rejected. A manual block mirroring a generated one must reuse that block's
+fingerprint constant. The fingerprint is process-local and is deliberately not
+part of the wire format or on-disk descriptors, except where a disk-index
+descriptor records it (see below).
 
 Keyedness is an invariant, not a free-form flag. A type that implements
 `VarveKeyedBlock` must declare `VarveBlock::IS_KEYED = true`; every public
@@ -405,7 +453,7 @@ poisons the writer; successful replacement becomes readable only after a new
 commit. Matrix layout and commit maps are snapshotted on open, but slot bytes are
 in-place storage. Do not overlap a reader with writes to slots it may read.
 Immutable concurrent matrix snapshots require a future generation/version or
-read-lease design and are not promised by VMAT v1.
+read-lease design and are not promised by VMAT v2.
 
 When recovery finds a `Fatal` matrix finding (for example a metadata CRC
 mismatch), default matrix access is fail-closed: every default read, write, aux,
@@ -685,9 +733,37 @@ per-chunk CRC creation/verification.
 | `merge_keyed_files::<T>(spec, base, deltas, output)` | materialize ordered shards |
 | `compact_keyed_file::<T, P>(spec, input, output)` | compact one file's final keyed state |
 | `compact_keyed_files::<T, P>(spec, base, deltas, output)` | compact base plus deltas directly |
+| `estimate_keyed_merge::<T, P>(spec, base, deltas)` | pre-flight `KeyedMergeEstimate`, decodes no values |
+| `merge_keyed_files_with_key_limit::<T, P>(spec, base, deltas, output, max_distinct_keys)` | merge, refused typed at the key ceiling |
+| `compact_keyed_files_with_key_limit::<T, P>(spec, base, deltas, output, max_distinct_keys)` | base+delta compact with the same ceiling |
+| `compact_keyed_file_with_key_limit::<T, P>(spec, input, output, max_distinct_keys)` | single-input compact with the same ceiling |
 
 Conflict order is shard order, then local sequence, then record ordinal. Later
 delta shards win.
+
+### Resident scale contract
+
+`merge_keyed_files`, `compact_keyed_files`, and `compact_keyed_file` are
+resident operations and are deliberately **not** PB-scale. Each opens its
+inputs as whole `VarveFile` values and retains one map entry per distinct key
+ever seen, tombstoned keys included:
+
+- time: `Theta(records + decoded bytes) + O(K-live log K-live)`
+- memory: `O(K-ever + largest resident input index + retained live values)`
+
+Nothing spills to disk, so `K-ever` must fit in memory. Varve exports no
+bounded-memory external merge or compact; the scalable stream and indexed
+writers cover bounded *ingest*, not bounded merge/compact.
+
+Callers whose key cardinality is not known to be resident-sized should either
+size the run first with `estimate_keyed_merge` - which reports
+`input_records`, `key_bearing_records`, `max_distinct_keys` (an upper bound on
+`K-ever`), `largest_input_index_bytes`, and `max_state_bytes` without decoding
+any value - or bound it with a `*_with_key_limit` entry point, which fails with
+`Error::LimitExceeded { resource: "merge distinct keys", .. }` at the key
+boundary and publishes no output. `estimate_keyed_merge` itself opens each
+input as a resident file, so it costs `O(largest input index)`; it reports that
+number but is not bounded below it.
 
 ## Migration API
 
@@ -758,7 +834,11 @@ survives.
 | `MatrixSidecarMismatch(reason)` | matrix sidecar rejected: wrong native identity, layout generation, creation nonce, or sidecar version; regenerate the sidecar |
 | `InvalidMatrixLayout` | matrix layout bytes are not valid for this build — including a matrix file created before the creation-nonce region existed; recreate the matrix file |
 | `MatrixSizeMismatch` | encoded matrix payload does not match slot stride |
-| `BlockSchemaFingerprintMismatch` | two block impls share an id but declare different `SCHEMA_FINGERPRINT` |
+| `FormatVersionMismatch { expected, actual }` | container/layout version is not the one this build writes — including a `VMAT`/`MCRC` layout version 1 matrix file; the artifact is stale and regenerable |
+| `KeyedChainRequiresKeyedApi { block_id }` | generic `push`/`push_info` cannot maintain the keyed offset chain; use `push_keyed`/`push_keyed_info` or the generated keyed writer |
+| `LimitExceeded { resource: "variable field ids" }` | decoding charged the materialization budget for distinct variable field ids above 63 and the budget ran out |
+| `LimitExceeded { resource: "merge distinct keys" }` | a `*_with_key_limit` merge/compact hit the caller's `K-ever` ceiling; nothing was published |
+| `BlockSchemaFingerprintMismatch` | a block impl disagrees with the format's declared identity for that block id, or two impls share an id with different `SCHEMA_FINGERPRINT` |
 | `BlockKeyednessMismatch` | two block impls share an id but disagree on keyedness |
 | `PublishedButParentSyncPending` | atomic replacement published, but parent-directory durability is unconfirmed; not a rollback. Also surfaced by redb sidecar create/bootstrap/rebuild |
 | `PublishedButRebindFailed` | replacement published but the writer could not rebind and was poisoned |

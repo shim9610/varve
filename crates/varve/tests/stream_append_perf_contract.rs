@@ -242,7 +242,8 @@ fn crc_typed_scan_decodes_all_values() -> Result<()> {
         writer.sync()?;
     }
     let reader = VarveStreamReader::open(spec, &path, small_chunk_options())?;
-    assert_eq!(reader.verify_all()?, 20);
+    // 20 user records plus the internal creation-nonce record (STO-01).
+    assert_eq!(reader.verify_all()?, 21);
     let values = reader.blocks::<Value>()?.collect::<Result<Vec<_>>>()?;
     assert_eq!(values, (0..20).map(Value).collect::<Vec<_>>());
     Ok(())
@@ -259,11 +260,15 @@ fn crc_typed_scan_skips_foreign_payloads_and_gates_decode() -> Result<()> {
     let spec = chain_spec(IntegrityPolicy::Crc32WithHeader);
     {
         let mut writer = VarveStreamWriter::create(spec, &path, small_chunk_options())?;
-        for value in 0..3 {
+        // The corrupted record must sit past the primary generation witness
+        // window (STO-01); a byte flipped inside that window is a generation
+        // change refused at open, which is a different contract from the
+        // per-record checksum this test pins. Assertions are unchanged.
+        for value in 0..400 {
             writer.push_info(&Value(value))?;
         }
         writer.push_info(&Extra(100))?;
-        for value in 3..6 {
+        for value in 400..406 {
             writer.push_info(&Value(value))?;
         }
         writer.sync()?;
@@ -303,7 +308,7 @@ fn crc_typed_scan_skips_foreign_payloads_and_gates_decode() -> Result<()> {
     // foreign payload; before the single-read contract this scan failed with
     // a checksum mismatch on the skipped record.
     let values = reader.blocks::<Value>()?.collect::<Result<Vec<_>>>()?;
-    assert_eq!(values, (0..6).map(Value).collect::<Vec<_>>());
+    assert_eq!(values, (0..406).map(Value).collect::<Vec<_>>());
     // Decoding the corrupt record itself must fail: the one payload read that
     // feeds typed decode is also the checksum verification.
     let extra_error = reader
@@ -470,4 +475,36 @@ mod commit_contract {
         drop(writer);
         drop(guard);
     }
+}
+
+/// STO-01 must not add per-append work to the streaming hot path. The primary
+/// generation witness covers a bounded prefix, so once that window is full the
+/// witness is frozen for the file's life and no further append recomputes it.
+#[cfg(feature = "scalable-fault-injection")]
+#[test]
+fn primary_generation_witness_stops_scanning_once_its_window_is_full() -> Result<()> {
+    use varve::DiskIndexRebuildReport;
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("generation-window.varve");
+    let spec = chain_spec(IntegrityPolicy::None);
+    let mut writer = VarveStreamWriter::create(spec, &path, StreamOptions::default())?;
+
+    // Fill well past the witness window, then measure only the steady state.
+    for index in 0..4096u64 {
+        writer.push_info(&Value(index))?;
+    }
+    writer.sync()?;
+
+    DiskIndexRebuildReport::reset_scaling_counters();
+    for index in 4096..8192u64 {
+        writer.push_info(&Value(index))?;
+    }
+    writer.sync()?;
+    assert_eq!(
+        DiskIndexRebuildReport::primary_generation_scans(),
+        0,
+        "the frozen generation witness was recomputed during steady-state appends"
+    );
+    Ok(())
 }

@@ -562,7 +562,7 @@ fn generated_variable_push_rejects_oversized_field_with_typed_limit_error() {
     // `Encoder::encode_nested_to_vec` (pinned by
     // `generated_nested_field_encode_inherits_the_entry_point_budget` below).
     let err = writer
-        .push(&User {
+        .push_keyed(&User {
             id: 7,
             name: "x".repeat(1024 * 1024),
             flags: 0,
@@ -580,7 +580,7 @@ fn generated_variable_push_rejects_oversized_field_with_typed_limit_error() {
     );
 
     writer
-        .push(&User {
+        .push_keyed(&User {
             id: 7,
             name: "small".to_string(),
             flags: 0,

@@ -545,3 +545,123 @@ fn matrix_impostor_same_stride_mmap_is_rejected() -> varve::Result<()> {
     cleanup(&path);
     Ok(())
 }
+
+#[derive(Clone, Debug, PartialEq, VarveBlock)]
+#[varve(id = 63, version = 1, kind = "fixed")]
+struct Ordered {
+    value: u32,
+}
+
+varve_format! {
+    pub struct OrderInvariantFormat {
+        magic: b"ORDIN";
+        version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
+        endian: little;
+        manifest: none;
+        blocks: [Ordered];
+    }
+}
+
+/// API-01 impostor: same id/version/kind as `Ordered`, different schema, and
+/// used before the generated type ever registers block 63.
+#[derive(Clone, Debug, PartialEq)]
+struct OrderedImpostor {
+    value: u64,
+}
+
+impl VarveEncode for OrderedImpostor {
+    const WIRE_TYPE: WireType = WireType::Nested;
+    const SCHEMA_ID: u64 = 0x0BAD_0DE0_0000_0001;
+
+    fn encode_varve(&self, encoder: &mut Encoder) -> varve::Result<()> {
+        self.value.encode_varve(encoder)
+    }
+}
+
+impl VarveDecode for OrderedImpostor {
+    const WIRE_TYPE: WireType = WireType::Nested;
+    const SCHEMA_ID: u64 = 0x0BAD_0DE0_0000_0001;
+
+    fn decode_varve(decoder: &mut Decoder<'_>) -> varve::Result<Self> {
+        Ok(Self {
+            value: u64::decode_varve(decoder)?,
+        })
+    }
+}
+
+impl VarveBlock for OrderedImpostor {
+    const ID: u32 = 63;
+    const VERSION: u16 = 1;
+    const KIND: BlockKind = BlockKind::Fixed;
+    const ENDIAN: Option<Endian> = None;
+    const IS_KEYED: bool = false;
+    const SCHEMA_FINGERPRINT: u64 = 0x0BAD_0001_0BAD_0001;
+}
+
+/// API-01: the format's immutable identity decides which type owns a block
+/// id, not whichever generic `T` happened to reach the registry first. Block
+/// 63 is touched by this test alone, so the impostor genuinely registers
+/// first — and is still rejected on both the write and the read path, after
+/// which the generated type works normally.
+#[test]
+fn impostor_registered_first_is_rejected_against_the_format_identity() -> varve::Result<()> {
+    let path = temp_path("order_impostor_first");
+    cleanup(&path);
+
+    let mut file = OrderInvariantFormat::create(&path)?;
+
+    let expected = <Ordered as VarveBlock>::SCHEMA_FINGERPRINT;
+    let assert_rejected = |result: varve::Result<()>| match result {
+        Err(Error::BlockSchemaFingerprintMismatch {
+            block_id,
+            registered,
+            declared,
+        }) => {
+            assert_eq!(block_id, 63);
+            assert_eq!(registered, expected);
+            assert_eq!(declared, 0x0BAD_0001_0BAD_0001);
+        }
+        other => panic!("expected BlockSchemaFingerprintMismatch, got {other:?}"),
+    };
+
+    assert_rejected(file.push(&OrderedImpostor { value: 1 }).map(|_| ()));
+    assert_rejected(file.blocks::<OrderedImpostor>().map(|_| ()));
+
+    // The legitimate generated type is unaffected by the failed first use.
+    file.push(&Ordered { value: 7 })?;
+    file.flush()?;
+    assert_eq!(
+        file.blocks::<Ordered>()?.get(0)?,
+        Some(Ordered { value: 7 })
+    );
+    drop(file);
+
+    // Reopening keeps the same verdict in both directions.
+    let reopened = OrderInvariantFormat::open_readonly(&path)?;
+    assert_eq!(
+        reopened.blocks::<Ordered>()?.get(0)?,
+        Some(Ordered { value: 7 })
+    );
+    assert_rejected(reopened.blocks::<OrderedImpostor>().map(|_| ()));
+
+    cleanup(&path);
+    Ok(())
+}

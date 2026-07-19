@@ -7,15 +7,17 @@ wave.
 
 - Matrix storage is a second storage mode beside the existing append log.
 - Runtime dimensions are a P0 dependency and are persisted at create time.
-- Matrix files store a `VMAT` v1 layout region immediately after the normal
-  Varve header.
+- Matrix files store a 24-byte `VMNC` creation-nonce region and then a `VMAT`
+  v2 layout region immediately after the normal Varve header. A `VMAT`/`MCRC`
+  version 1 artifact is refused at open with
+  `Error::FormatVersionMismatch { expected: 2, actual: 1 }`.
 - Dense cells use deterministic addressing:
   `ordinal = scan * n_channels + ch` and
   `offset = slot_region_start + ordinal * slot_stride`.
 - Slot payloads are fixed-stride, bounded, canonical encoded values.
 - Commit bitmaps are the only normal read-time validity source.
 - Readers snapshot layout metadata and commit maps on open. Slot bytes remain
-  live in-place storage, so VMAT v1 does not promise immutable concurrent reads
+  live in-place storage, so VMAT v2 does not promise immutable concurrent reads
   across an overwrite of the same slot.
 - Same-size overwrite writes the existing slot range and must not change file
   length.
@@ -39,7 +41,7 @@ wave.
 - P0 includes storage primitives and generated helpers for cell-category bits,
   single global bits, and per-channel bits. Matrix cell reads use cell-category
   bits; singles/per-channel are status flags until a domain block binds them.
-- In VMAT v1 each matrix block owns one unique cell commit category. Sharing a
+- In VMAT v2 each matrix block owns one unique cell commit category. Sharing a
   cell category across multiple matrix blocks is rejected until multi-block
   category rebuild semantics are explicitly defined.
 - `commit_*` before a successful slot write is rejected with
@@ -85,9 +87,12 @@ Current implementation status:
   generation equality checks use
   `matrix_verified_sidecar_resume_signal_with_generation` or
   `read_matrix_sidecar_with_generation`.
-- When `integrity: crc32` is enabled, VMAT writes a CRC table after the slot
-  region and any static aux regions. It covers matrix metadata tables, each
-  commit map, and each dense cell slot. Open classifies metadata/commit-map CRC
+- When `integrity: crc32` is enabled, VMAT writes an `MCRC` v2 CRC table after
+  the slot region and any static aux regions. It covers matrix metadata tables,
+  every 4 KiB page of each commit map (one `crc32` plus a state word per page,
+  where an uninitialized page must still read as all zeros), and each dense cell
+  slot. A commit-bit mutation rehashes exactly one page, creation writes no
+  per-cell integrity metadata, and the bitmaps are held sparsely after open. Open classifies metadata/commit-map CRC
   mismatches, committed cell reads verify slot CRCs, and writers can call
   `rebuild_matrix_commit_from_crc::<T>()` to reconstruct a damaged cell commit
   map from per-cell CRC evidence.

@@ -244,21 +244,23 @@ pub(crate) fn ensure_registered_block<T: VarveBlock>(spec: FormatSpec) -> Result
     ensure_block_contract::<T>(spec)
 }
 
-/// First-seen keyedness and schema fingerprint per registered block identity.
+/// Validated keyedness and schema fingerprint per registered block identity.
 #[derive(Clone, Copy)]
 struct BlockContract {
     fingerprint: u64,
     keyed: bool,
 }
 
-/// Registered block identity: the format's static descriptor table address
-/// scopes block ids so unrelated formats that reuse an id never collide.
-type BlockContractKey = (usize, u32);
+/// Registered block identity: the format's static descriptor and identity
+/// table addresses scope block ids so unrelated formats that reuse an id never
+/// collide, and two specs that share a descriptor table but declare different
+/// identities never share a cached contract.
+type BlockContractKey = (usize, usize, u32);
 
-/// Process-local registry of first-seen block contracts. This deliberately
-/// never touches the wire format or on-disk descriptors. The sorted vector is
-/// only appended to on the first registration of a (format, block) pair, so
-/// the append hot path pays one uncontended shared-lock acquire and a binary
+/// Process-local cache of validated block contracts. This deliberately never
+/// touches the wire format or on-disk descriptors. The sorted vector is only
+/// appended to on the first registration of a (format, block) pair, so the
+/// append hot path pays one uncontended shared-lock acquire and a binary
 /// search: no allocation, no syscall, no O(records) work.
 static BLOCK_CONTRACTS: RwLock<Vec<(BlockContractKey, BlockContract)>> = RwLock::new(Vec::new());
 
@@ -280,8 +282,29 @@ fn check_block_contract<T: VarveBlock>(recorded: BlockContract) -> Result<()> {
     Ok(())
 }
 
+/// The contract `T` must satisfy for `spec`, independent of call order.
+///
+/// API-01: where the spec declares an immutable identity for the block id,
+/// that identity — not whichever `T` happened to be used first — is the
+/// authority. Only block ids the spec declares no identity for keep the
+/// first-use escape hatch, which is the documented contract for hand-built
+/// specs that carry no generated identities at all.
+fn authoritative_block_contract<T: VarveBlock>(spec: FormatSpec) -> BlockContract {
+    match spec.block_identity(T::ID) {
+        Some((_, _, keyed, fingerprint)) => BlockContract { fingerprint, keyed },
+        None => BlockContract {
+            fingerprint: T::SCHEMA_FINGERPRINT,
+            keyed: T::IS_KEYED,
+        },
+    }
+}
+
 fn ensure_block_contract<T: VarveBlock>(spec: FormatSpec) -> Result<()> {
-    let key: BlockContractKey = (spec.blocks.as_ptr() as usize, T::ID);
+    let key: BlockContractKey = (
+        spec.blocks.as_ptr() as usize,
+        spec.block_identities.as_ptr() as usize,
+        T::ID,
+    );
     {
         let contracts = BLOCK_CONTRACTS
             .read()
@@ -290,22 +313,19 @@ fn ensure_block_contract<T: VarveBlock>(spec: FormatSpec) -> Result<()> {
             return check_block_contract::<T>(contracts[index].1);
         }
     }
+    // Cache miss: resolve the format's authoritative identity once, validate
+    // against it, and only then cache. The linear identity lookup is confined
+    // to this path; every later typed operation takes the binary-search hit
+    // above.
+    let contract = authoritative_block_contract::<T>(spec);
+    check_block_contract::<T>(contract)?;
     let mut contracts = BLOCK_CONTRACTS
         .write()
         .unwrap_or_else(PoisonError::into_inner);
     match contracts.binary_search_by_key(&key, |entry| entry.0) {
         Ok(index) => check_block_contract::<T>(contracts[index].1),
         Err(index) => {
-            contracts.insert(
-                index,
-                (
-                    key,
-                    BlockContract {
-                        fingerprint: T::SCHEMA_FINGERPRINT,
-                        keyed: T::IS_KEYED,
-                    },
-                ),
-            );
+            contracts.insert(index, (key, contract));
             Ok(())
         }
     }

@@ -25,10 +25,12 @@ empty.
 | --- | --- |
 | Native records | fixed header, checked payload/footer extent, captured snapshot, physical/logical payload limits |
 | Variable fields | enclosing payload slice, field header extent check, shared decoder materialization budget |
+| Variable field-id bookkeeping | 8 bytes charged to the materialization budget per distinct field id above 63, before the set reserves; duplicates are detected first and charged nothing |
 | Compression | declared logical size checked before decompression; default whole-value and chunk decoding are finite |
 | Custom layouts | compile-time lead-in/footer widths; derived segment ranges checked against the snapshot and scan limits |
 | Layout payload reads | declared metadata/raw ranges plus physical and materialized-byte limits |
 | Matrix metadata | fixed matrix header, exact descriptor-derived table extents, matrix metadata/bitmap/CRC limits |
+| Matrix commit/validity bitmaps | 4 KiB pages materialized only when they carry a set bit; an absent page is provably zero and is answered without I/O or allocation. The `matrix_bitmap` budget charges each page as it is materialized, before the memory is used |
 | Matrix cells and aux | schema-derived stride or caller length, validated range, payload and materialization limits |
 | Matrix CRC/zero scans | schema-derived exact range processed through a fixed 64 KiB stack buffer |
 | Sidecars | fixed header, checked exact total extent, sidecar/materialization limits, and a finite 256 MiB default identity-scan ceiling |

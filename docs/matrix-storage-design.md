@@ -125,6 +125,8 @@ without matrix blocks continue to scan from the normal Varve header length.
 +---------------------------+
 | Varve file header         |
 +---------------------------+
+| Creation nonce region     |
++---------------------------+
 | Matrix layout header      |
 +---------------------------+
 | Dimension table           |
@@ -143,6 +145,12 @@ without matrix blocks continue to scan from the normal Varve header length.
 +---------------------------+
 ```
 
+The creation nonce region is a fixed 24 bytes (`VMNC` magic, version, reserved,
+and a 16-byte random nonce) written once when a matrix file is created. It binds
+a matrix sidecar to one logical creation rather than to one OS file object, so a
+recreated file at the same path with the same layout is not accepted by the old
+sidecar.
+
 The matrix layout header stores:
 
 - magic `VMAT`
@@ -153,18 +161,18 @@ The matrix layout header stores:
 - offsets and lengths for the dimension table, block table, commit maps,
   optional offset tables, slot regions, region CRC table, and append-log start.
 
-All integers in `VMAT` metadata are little-endian in layout version 1. Matrix
+All integers in `VMAT` metadata are little-endian in layout version 2. Matrix
 slot payloads still use the block/format endian policy for canonical field
 encoding. The append-log scanner must start from `append_log_start`, never from
 the normal header length, when the static spec contains matrix blocks.
 
-## VMAT Version 1 Header
+## VMAT Version 2 Header
 
-The P0 header is deliberately simple and dense-layout oriented:
+The header is deliberately simple and dense-layout oriented:
 
 ```text
 magic                 [u8; 4] = b"VMAT"
-layout_version        u16 = 1
+layout_version        u16 = 2
 flags                 u16
 header_len            u32
 dimension_count       u32
@@ -195,31 +203,101 @@ table ranges that overlap incorrectly, point outside the file, or place
 P0 or `integrity: none` files set `region_crc_off = 0` and
 `region_crc_len = 0`. Static auxiliary regions, when declared by the format
 spec, are derived in declaration order immediately after the slot region. VMAT
-v1 does not store an auxiliary table; readers reconstruct aux offsets from the
+v2 does not store an auxiliary table; readers reconstruct aux offsets from the
 static `FormatSpec`, so changing aux names, byte lengths, or declaration order
 is a schema change.
+
+Layout version 2 replaced the version 1 integrity representation (see the next
+section). A version 1 artifact is refused at open with the typed
+`Error::FormatVersionMismatch { expected: 2, actual: 1 }`, matching the
+container-version convention: such a file is stale and regenerable, never
+migrated in place.
+
 When `integrity: crc32` is enabled, the region CRC table is placed immediately
 after the derived aux region and before `append_log_start`.
 
-Region CRC table (`MCRC` v1):
+Region CRC table (`MCRC` v2):
 
 ```text
 magic          [u8; 4] = "MCRC"
-version        u16 = 1
+version        u16 = 2
 reserved       u16
 metadata_crc32 u32  // dimension table + block table + commit category table
 reserved       u32
-commit_crc32   [u32; commit_category_count]
+commit_pages   [{ crc32: u32, state: u32 };
+                sum over commit categories of
+                ceil(bit_bytes(category_bits) / 4096)]
 slot_crc32     [u32; sum(matrix_block.cell_count)]
 slot_valid     [packed bits; sum(bit_bytes(matrix_block.cell_count))]
 ```
 
-Commit CRC entries follow the declared commit-category order. Slot CRC entries
-are dense in matrix-block declaration order, then ordinal order within that
-block. Slot valid bitmaps use the same block and ordinal order and distinguish
-a committed all-zero payload from an untouched all-zero slot during commit-map
-rebuild. The table has no per-entry offset fields because offsets are derived
-from the VMAT tables and runtime dimensions.
+Commit integrity is per page, not per category. Each commit-category bitmap is
+divided into 4 KiB pages and each page carries one 8-byte digest: a CRC32 of the
+page bytes plus a state word. `state = 0` means uninitialized — the page was
+never published and must still read as all zeros — and `state = 1` means
+initialized, in which case the stored CRC is authoritative. Any other state word
+is corruption. That distinction is what makes a page written with zeros
+unambiguously different from a page that was never written, so a never-written
+cell can no longer accidentally match a checksum computed over zeros.
+
+The page representation exists to keep integrity maintenance independent of
+matrix size. Mutating one commit bit rehashes only the 4 KiB page containing the
+mutated byte (less for a map smaller than one page), so writing and committing
+`M` cells hashes `Theta(M)` bitmap bytes in total instead of the `Theta(M^2)` a
+whole-bitmap-per-bit digest costs. There is deliberately no composition checksum
+over the page-digest array: maintaining one would reintroduce a size-dependent
+cost on every mutation. Whole-map verification is "verify every page against its
+digest", which is exactly what open performs, and the digest array is exactly as
+exposed as the single unprotected per-category CRC it replaces.
+
+Commit page-digest arrays follow the declared commit-category order. Slot CRC
+entries are dense in matrix-block declaration order, then ordinal order within
+that block. Slot valid bitmaps use the same block and ordinal order; a per-cell
+CRC is trusted only when its persistent validity bit is set, which is what
+distinguishes a committed all-zero payload from an untouched all-zero slot
+during commit-map rebuild. The table has no per-entry offset fields because
+offsets are derived from the VMAT tables and runtime dimensions.
+
+### Creation And Residency Cost
+
+Creation writes the descriptor tables and the 16-byte `MCRC` header and nothing
+else. The per-cell CRC array, the per-cell validity bitmaps, and the commit
+bitmaps are established as a sparse zero extent by the same `set_len` that
+establishes the slot region, so explicit create-time metadata I/O does not scale
+with cell count at all. The uninitialized encoding above is what makes that
+sound: a zero extent is a region of `state = 0` pages, which assert "never
+published" rather than "checksum of zeros".
+
+Commit, CRC-valid, and current-write bitmaps are held sparsely after open. A
+page is materialized in memory only when it carries a set bit; an absent page is
+provably all zero and answers every query without I/O or allocation. Resident
+bitmap bytes are therefore proportional to the pages that carry state, not to
+cell count — a freshly created matrix holds none at any size — and the running
+set-bit total each sparse map maintains makes committed-cell counting (and so
+resume signals and recovery reports) `O(1)` instead of a full scan.
+
+Open is bounded the same way. Authenticating an uninitialized page means
+proving it still reads as zero, which would otherwise mean streaming every page
+of every map. Instead open asks the filesystem which byte ranges of the file are
+allocated (`FSCTL_QUERY_ALLOCATED_RANGES` on Windows, `SEEK_DATA`/`SEEK_HOLE`
+elsewhere) and skips the ranges it reports as holes: a hole has never been
+written since creation, so it reads as zero and cannot hold stray bytes, and
+writing a stray byte into an untouched page necessarily allocates that page and
+brings it back into the read set. Detection strength is therefore unchanged
+while open costs `O(bytes actually written)`. The page digest of a skipped page
+is still read when the digest slot itself is allocated, so a digest recorded for
+a page whose bytes never reached disk stays detectable. Where the platform or
+filesystem cannot answer the query, or the file is fragmented past the tracked
+extent ceiling, every page is read exactly as before.
+
+Clearing a whole commit category punches a hole over the map and its digests
+rather than writing zeros, so it restores the uninitialized encoding in `O(1)`
+writes, again falling back to explicit zeroing where hole punching is
+unavailable.
+
+One cost is deliberately unchanged: `rebuild_matrix_commit_from_crc` remains
+`O(cells)` with two reads per cell, which is inherent to rebuilding from
+per-cell checksums.
 
 Dimension table entry:
 
@@ -256,14 +334,14 @@ map_len   u64
 ```
 
 Future versions may extend these tables with additional recovery metadata by
-increasing `layout_version`; v1 keeps CRC offsets derived from table order.
+increasing `layout_version`; v2 keeps CRC offsets derived from table order.
 
 ## P0/P1/P2 Split
 
 P0 includes dense matrix declarations, runtime dimensions, `VMAT` layout
 persistence, fixed-stride slots, direct addressing, commit maps, same-size
 overwrite, `NotCommitted`, and mixed matrix plus append-log scan behavior.
-In VMAT v1, a cell commit category belongs to exactly one matrix block.
+In VMAT v2, a cell commit category belongs to exactly one matrix block.
 
 P0 excludes recovery decisions, sidecars, compression, zero-copy, sparse or
 offset-table-backed matrices, declarative migration, and per-cell crash
@@ -399,7 +477,7 @@ Opening a matrix file creates a snapshot of layout metadata and commit maps.
 It does not copy the preallocated slot region. Applications must not overlap a
 reader with an in-place write to a slot that reader may access. True immutable
 concurrent snapshots require versioned slots/generations or a read-lease design
-outside VMAT v1.
+outside VMAT v2.
 Reading a cell:
 
 1. validates the key

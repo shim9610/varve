@@ -238,6 +238,51 @@ Sidecar protocol failures retain their public `DiskIndexError` source inside
 distinguish dirty, stale, identity, plan, metadata, and I/O failures without
 parsing error text.
 
+### Primary Generation Binding
+
+A sidecar is bound to one logical *generation* of its primary, not merely to one
+pathname or one OS file object. Every `VarveStreamWriter::create` /
+`VarveIndexedWriter::create` stamps a 128-bit random nonce as the primary's
+first record, under the reserved internal block id `CREATION_NONCE_BLOCK_ID`.
+The sidecar records a primary-generation witness that folds that nonce together
+with the primary's length and a checksum over its bounded leading window (4 KiB;
+frozen once the primary has grown past it, so appends do no witness work).
+
+Every stream/indexed writer open, reader snapshot open, and checkpoint restore
+recomputes the witness and refuses a mismatch with
+`DiskIndexError::PrimaryGenerationMismatch`. This is what makes an in-place
+rewrite of a primary by another equal-length primary of the same format — same
+path, same OS object, same header bytes, same schema hash — a refusal rather
+than an accepted stale generation. The recovery is `rebuild_disk_index`, never
+"trust the sidecar".
+
+The nonce costs one record at create and nothing per append. Reading it is one
+bounded point read of the leading record, performed only at create and open. A
+primary that carries no nonce — a legacy file, or one bootstrapped from a
+resident `VarveFile` — is reported as "no nonce" rather than as an error, which
+is fail-closed: a primary that *was* created with one recorded a witness that
+folds it in, so answering "none" can only produce a different witness and refuse
+the sidecar.
+
+Sidecar metadata is at record version 3. A version 2 sidecar is refused with the
+typed `DiskIndexError::MetadataVersion`, and the disk-index plan digest domain
+was bumped alongside it, so plan digests published before this change are
+refused as stale. Both are rebuild-and-regenerate conditions under the pre-1.0
+wire policy; neither is migrated in place.
+
+### Disk-Index Descriptor Identity
+
+A `DiskIndexDescriptor` records the block schema fingerprint of the concrete
+type whose decode and key-extraction function pointers it captured, and that
+fingerprint is folded into the plan digest. Plan construction and plan
+validation run the format's block-registration gate once per descriptor —
+before any primary bytes can reach a captured codec — so a descriptor that
+matches a declared block's id and version while being a different type is
+refused with `Error::BlockSchemaFingerprintMismatch` without a single decoder
+call. Descriptor validation stays off every per-record and per-lookup path: it
+runs at plan construction/validation only, and repeat validation short-circuits
+on the spec's block and identity table identity.
+
 Atomic sidecar publication syncs the parent directory after the
 `ReplaceFileW`/rename (the Windows directory handle is opened with the write
 access `FlushFileBuffers` requires). A parent-sync failure is never silently
@@ -334,6 +379,12 @@ opened while that gate is held observe a typed `Error::IndexBusy` rather than
 blocking inside redb. After the batch commits, fresh handles proceed. When a
 rebuild republishes the sidecar it invalidates the registry entry so later
 handles bind to the new database.
+
+Registry access is amortized `O(1)` rather than a sweep per operation. Looking
+up or invalidating a slot is one map probe; dead slots are swept only when the
+map grows past a doubling threshold, so opening `S` live identities in sequence
+costs `O(S)` slot checks in total instead of `Theta(S^2)`. The liveness rule
+itself is unchanged.
 
 This coordination is process-local. Cross-process exclusivity is unchanged: a
 `.vki` remains single-process for writing, and the native-object writer lock and

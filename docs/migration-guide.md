@@ -7,20 +7,55 @@ performs semantic conversion in Rust.
 ## Unreleased Pre-1.0 Wire Changes
 
 The current unreleased changes are wire-breaking under the pre-1.0 policy;
-there is no automatic migration path for these three surfaces:
+there is no automatic migration path for these surfaces:
 
-- The computed schema hash algorithm moved to version 2
-  (`FormatSpec::SCHEMA_HASH_ALGORITHM_VERSION`). Every computed value changes.
-  Files whose header pins a v1 computed hash fail open with
-  `SchemaHashMismatch`; recreate them (or re-derive and re-pin literal hashes
-  in the declaration). Files with `schema_hash` omitted (stored 0) are
-  unaffected because the comparison is disabled.
+- The computed schema hash algorithm moved to version 3
+  (`FormatSpec::SCHEMA_HASH_ALGORITHM_VERSION`, domain tag
+  `varve-schema-v3`). Every computed value changes. Version 3 folds each
+  field's resolved codec identity (`VarveEncode::SCHEMA_ID` /
+  `VarveDecode::SCHEMA_ID`) into the block fingerprint, so two blocks whose
+  field types are spelled identically but whose custom codecs emit different
+  bytes no longer share a hash. Files whose header pins a v1 or v2 computed
+  hash fail open with `SchemaHashMismatch`; recreate them (or re-derive and
+  re-pin literal hashes in the declaration). Files with `schema_hash` omitted
+  (stored 0) are unaffected because the comparison is disabled.
+- `#[derive(VarveBlock)]` now rejects, at compile time, any field whose codec
+  declares no `SCHEMA_ID` (the trait default `0`). Built-in scalars,
+  containers and derived blocks always declare one; a hand-written codec used
+  as a block field must add `const SCHEMA_ID: u64 = ...;` to both its
+  `VarveEncode` and `VarveDecode` impls, choosing a value that changes
+  whenever its emitted bytes change. Wrapping such a codec in
+  `Option`/`Vec`/array/map/tuple does not satisfy the requirement: the
+  container fold propagates the missing identity outward.
 - Matrix native files gained a creation-nonce region after the native file
   header. Matrix files created before this change are refused with
   `InvalidMatrixLayout`; recreate them. Non-matrix native files are unchanged.
 - The matrix sidecar envelope is version 3. Version-1/2 sidecars are refused
   as `MatrixSidecarMismatch("sidecar version")` and simply regenerate —
   sidecars are regenerable resume state, not data.
+- The matrix layout is `VMAT` version 2 with an `MCRC` version 2 integrity
+  region (per-page commit digests instead of one CRC per commit category, and
+  no explicitly initialized per-cell metadata at create). A version 1 matrix
+  file is refused with `Error::FormatVersionMismatch { expected: 2, actual: 1 }`
+  and must be recreated; region lengths and total matrix file length change, so
+  there is no in-place fixup.
+- Stream and disk-indexed primaries now begin with an internal creation-nonce
+  record. Existing primaries keep working, but record counts, sequence numbers,
+  and record offsets of newly created primaries shift by one relative to 0.3.0;
+  tests or tools that assert absolute counts on a freshly created stream or
+  indexed file must account for it.
+- The disk-index sidecar metadata record is version 3 and the plan digest
+  domain was bumped. A version 2 sidecar is refused with
+  `DiskIndexError::MetadataVersion`, and a sidecar published against an older
+  plan digest is refused as stale. Both recover with `rebuild_disk_index`.
+- Decoding now charges the materialization budget 8 bytes for each distinct
+  variable field id above 63. A caller that sized a materialization budget to
+  the exact payload byte count *and* uses field ids above 63 must add that
+  allowance or it will see
+  `Error::LimitExceeded { resource: "variable field ids" }`.
+- Generic `push`/`push_info` on a `keyed_offset_chain` format now refuses keyed
+  blocks (see the Changelog Breaking entry); switch those calls to
+  `push_keyed`/`push_keyed_info`.
 
 ## Move Limits To Handle Creation
 

@@ -7,7 +7,7 @@
   log so bounded in-place matrix datasets can be hosted without changing
   append-log semantics.
 - The workspace starts with three crates: `varve`, `varve-core`, and `varve-macros`.
-- The 0.2 release model is synchronous I/O and single-writer per file. Append-log
+- The 0.3 release model is synchronous I/O and single-writer per file. Append-log
   readers are snapshot-on-open. Matrix metadata and commit maps are snapshotted,
   but in-place slot bytes require caller coordination with readers.
 - The first stable goal is a conservative owned-decoding core, with mmap and zero-copy as explicit opt-in features.
@@ -97,12 +97,11 @@
 - Writers are append-oriented and protected by a sidecar writer lock.
 - Default open/create/recover paths refuse an existing writer lock.
 - Explicit stale-lock handling is available through `FormatSpec::inspect_writer_lock` and `FormatSpec::open_with_lock_policy`.
-- Append-log readers are snapshot-on-open. Live tailing is out of scope for
-  0.2. A snapshot retains the opened object and validated logical EOF; it does
+- Append-log readers are snapshot-on-open. Live tailing is out of scope in 0.3. A snapshot retains the opened object and validated logical EOF; it does
   not copy bytes or prevent an uncoordinated external writer from mutating that
   same object. Matrix readers must not overlap reads with writes to the same
   in-place slot; true immutable matrix snapshots require versioned slots,
-  generations, or read leases that are outside VMAT v1.
+  generations, or read leases that are outside VMAT v2.
 - Durability is explicit: `flush` pushes buffered bytes to the OS, and `sync` performs durable fsync.
 - Native append and streamed custom-layout writes snapshot EOF and in-memory
   publication state. Returned write errors roll back when possible; rollback
@@ -131,6 +130,17 @@
 - `compact_keyed_file::<T>(spec, input, output)` compacts one file into final keyed values only.
 - `compact_keyed_files::<T>(spec, base, deltas, output)` compacts base plus ordered deltas directly, avoiding an unnecessary merge-then-compact intermediate file.
 - Compact and merge output use same-directory temp files, flush/sync, and atomic publish.
+- The keyed merge/compact family is **resident-only and not PB-scale**. Each
+  call opens its inputs as whole `VarveFile` values and retains one map entry
+  per distinct key ever seen (tombstoned keys included), so memory is
+  `O(K-ever + largest resident input index + retained live values)` and nothing
+  spills to disk. Varve exports no bounded-memory external merge or compact.
+- `estimate_keyed_merge::<T>(spec, base, deltas)` gives a decode-free pre-flight
+  bound, and `merge_keyed_files_with_key_limit` /
+  `compact_keyed_files_with_key_limit` / `compact_keyed_file_with_key_limit`
+  fail with `Error::LimitExceeded { resource: "merge distinct keys", .. }` at
+  the key boundary instead of exhausting memory. A refused run publishes
+  nothing.
 
 ## Schema And Compatibility
 
@@ -142,8 +152,10 @@
 - `FormatSpec::computed_schema_hash()` computes a deterministic schema fingerprint excluding the pinned header `schema_hash`.
 - `FormatSpec::schema_debug_dump()` emits a human-readable view for inspection and support.
 - Migration is explicit with `VarveMigration<From, To>` and `blocks_migrated::<From, To, M>()`.
-- Valid native 0.1 wire contracts remain stable in 0.2. Future incompatible
-  wire changes require an explicit migration path.
+- Valid native 0.1 wire contracts remain readable in 0.3. Wire changes on the
+  unreleased branch (computed schema hash v3, matrix `VMAT`/`MCRC` v2,
+  disk-index sidecar metadata v3) are pre-1.0 breaking changes with no in-place
+  migration: affected artifacts are refused with a typed error and regenerated.
 
 ## Codec Policy
 
@@ -263,7 +275,14 @@
   addressing, commit bitmaps, same-size overwrite, generated DSL helpers, and
   performance smoke coverage. P1 matrix CRC is implemented for `integrity:
   crc32` metadata tables, commit maps, and per-cell slots, including commit-map
-  rebuild from CRC evidence, injectable ordered durability barriers, and an
+  rebuild from CRC evidence. Commit-map integrity is per 4 KiB page and per-cell
+  metadata is created as a sparse zero extent and held sparsely in memory, so
+  neither commit-bit maintenance, create-time metadata I/O, post-open bitmap
+  residency, nor open-time reads scale with cell count (open takes its
+  never-written proof from the filesystem allocated-range map, and whole-category
+  clear punches a hole). That change is `VMAT`/`MCRC` layout
+  version 2; version 1 matrix files are refused with `FormatVersionMismatch`.
+  Matrix integrity also provides injectable ordered durability barriers and an
   optional `integrity`-gated sidecar identity/CRC envelope. Safe matrix
   recovery clear actions are public. P2 now includes static noncommit aux
   regions, safe mmap numeric scalar reads, and compatible cell byte-copy

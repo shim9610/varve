@@ -293,7 +293,7 @@ fn keyed_tombstone_order_uses_sequence_before_physical_ordinal() -> varve::Resul
     cleanup(&path);
     {
         let mut writer = NativeSecurityFormat::create(&path)?;
-        writer.push(&KeyedValue { id: 7, value: 1 })?;
+        writer.push_keyed(&KeyedValue { id: 7, value: 1 })?;
         writer.delete::<KeyedValue>(&7)?;
         // SAFETY: No other handle exists during this exclusive mutation.
         unsafe {

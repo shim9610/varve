@@ -435,6 +435,13 @@ committed by a later append.
 Offset chains are a physical acceleration/debug structure. The typed API still
 returns normal block collections and keyed collections.
 
+With `keyed_offset_chain`, the generic `VarveFile::push` / `push_info` and
+`VarveWriter::push` / `push_info` refuse a keyed block with
+`Error::KeyedChainRequiresKeyedApi { block_id }` rather than writing a truncated
+chain, because a generic `T` does not expose its key to the file. Use the
+maintaining `push_keyed` / `push_keyed_info`, or the generated typed keyed
+writer, which already maintains the chain. `delete` maintains it directly.
+
 ## Compression
 
 Compression is disabled by default. This declaration enables global compression
@@ -688,7 +695,7 @@ invariant.
 
 ## Current Stability
 
-Varve 0.2 remains alpha software at the Rust API layer. Valid native 0.1 wire
+Varve 0.3 remains alpha software at the Rust API layer. Valid native 0.1 wire
 bytes remain readable, and incompatible future wire changes require an explicit
 migration path. Keep representative byte fixtures and migration tests around
 data that matters even when a release promises wire compatibility.

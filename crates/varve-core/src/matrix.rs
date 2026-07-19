@@ -11,12 +11,25 @@ use crate::{
 };
 
 const VMAT_MAGIC: &[u8; 4] = b"VMAT";
-const VMAT_VERSION: u16 = 1;
+// PERF-01/PERF-02: layout version 2 replaces the whole-bitmap commit checksum
+// with per-page digests and stops explicitly initialising the per-cell CRC and
+// validity regions at create. Version 1 artifacts describe a different physical
+// representation, so they are rejected as stale-regenerable rather than being
+// reinterpreted under the new rules.
+const VMAT_VERSION: u16 = 2;
 const VMAT_HEADER_LEN: u32 = 160;
 const MCRC_MAGIC: &[u8; 4] = b"MCRC";
-const MCRC_VERSION: u16 = 1;
+const MCRC_VERSION: u16 = 2;
 const MCRC_HEADER_LEN: u64 = 16;
 const CRC_LEN: u64 = 4;
+// Commit and validity bitmaps are hashed, stored, and made resident one page at
+// a time, so a single bit mutation costs O(page) instead of O(whole bitmap) and
+// a never-touched page costs nothing at all.
+const BITMAP_PAGE_BYTES: u64 = 4096;
+const PAGE_DIGEST_LEN: u64 = 8;
+const PAGE_STATE_UNINITIALIZED: u32 = 0;
+const PAGE_STATE_INITIALIZED: u32 = 1;
+const ZERO_PAGE: [u8; BITMAP_PAGE_BYTES as usize] = [0; BITMAP_PAGE_BYTES as usize];
 const MATRIX_BYTES_RESOURCE: &str = "matrix bytes";
 const MATRIX_SLOT_PAYLOAD_RESOURCE: &str = "matrix slot payload";
 const MATRIX_DESCRIPTOR_RESOURCE: &str = "matrix descriptors";
@@ -25,6 +38,319 @@ const MATRIX_SIDECAR_RESOURCE: &str = "matrix sidecar";
 
 type CommitPlan = (String, MatrixCommitKind, u64);
 type StoredCommitPlan = (String, MatrixCommitKind, u64, u64, u64);
+
+/// Upper bound on the number of filesystem extents tracked for one matrix file.
+///
+/// A file fragmented beyond this is dense enough that skipping holes would save
+/// nothing, so the query gives up and every byte is read exactly as before.
+const MAX_TRACKED_EXTENTS: usize = 8192;
+
+/// The byte ranges of a matrix file that the filesystem reports as allocated,
+/// i.e. the only ranges that can possibly hold non-zero bytes.
+///
+/// PERF-02: the commit maps, per-cell checksums, and validity bitmaps are
+/// established as a zero extent by `set_len` and are never written at create.
+/// Authenticating a `PAGE_STATE_UNINITIALIZED` page still requires proving that
+/// it reads as zero, which previously meant streaming every page of every map
+/// at open — `Theta(cell_count / 8)` of sequential reads even for a matrix with
+/// no committed cells.
+///
+/// A range the filesystem reports as unallocated has never been written since
+/// the file was created, so it reads as zero and cannot hold stray bytes: the
+/// proof is obtained from the filesystem instead of from the bytes. Writing a
+/// stray byte into an untouched page necessarily allocates that page, so the
+/// detection strength of open is unchanged — corruption is still read and still
+/// reported. Open therefore costs `O(bytes actually written)` rather than
+/// `O(cell_count)`.
+///
+/// `None` means "unknown": the platform or filesystem cannot prove anything, in
+/// which case every page is read exactly as it was before this change.
+#[derive(Clone, Debug, Default)]
+struct AllocatedExtents {
+    /// Half-open `[start, end)` ranges, sorted and disjoint.
+    ranges: Vec<(u64, u64)>,
+}
+
+impl AllocatedExtents {
+    /// Queries the filesystem, restoring the file cursor before returning.
+    fn query(file: &mut File) -> Option<Self> {
+        let cursor = file.stream_position().ok()?;
+        let ranges = query_allocated_extents(file);
+        let restored = file.seek(SeekFrom::Start(cursor)).is_ok();
+        let ranges = ranges?;
+        if !restored {
+            return None;
+        }
+        // The lookup binary-searches, and skipping a range because the platform
+        // answered out of order would turn into an unread page. Verify the
+        // ordering rather than trusting it; an unexpected shape means "unknown".
+        let ordered = ranges
+            .iter()
+            .try_fold(0u64, |previous_end, (start, end)| {
+                (*start >= previous_end && *end >= *start).then_some(*end)
+            })
+            .is_some();
+        if !ordered {
+            return None;
+        }
+        Some(Self { ranges })
+    }
+
+    /// True when `[offset, offset + len)` overlaps any allocated range, i.e.
+    /// when the range must be read to establish its contents.
+    fn may_hold_data(&self, offset: u64, len: u64) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let Some(end) = offset.checked_add(len) else {
+            return true;
+        };
+        let index = self
+            .ranges
+            .partition_point(|(_, range_end)| *range_end <= offset);
+        matches!(self.ranges.get(index), Some((start, _)) if *start < end)
+    }
+}
+
+/// True when the range must be read, either because the filesystem says it may
+/// hold data or because no allocation map could be obtained.
+fn range_may_hold_data(extents: Option<&AllocatedExtents>, offset: u64, len: u64) -> bool {
+    extents.is_none_or(|extents| extents.may_hold_data(offset, len))
+}
+
+#[cfg(windows)]
+fn query_allocated_extents(file: &mut File) -> Option<Vec<(u64, u64)>> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::{
+        FILE_ALLOCATED_RANGE_BUFFER, FSCTL_QUERY_ALLOCATED_RANGES,
+    };
+
+    const ENTRY_LEN: usize = std::mem::size_of::<FILE_ALLOCATED_RANGE_BUFFER>();
+
+    let file_len = i64::try_from(file.metadata().ok()?.len()).ok()?;
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    if file_len == 0 {
+        return Some(ranges);
+    }
+    let mut output = vec![FILE_ALLOCATED_RANGE_BUFFER::default(); 512];
+    let mut scan_from = 0i64;
+    loop {
+        let input = FILE_ALLOCATED_RANGE_BUFFER {
+            FileOffset: scan_from,
+            Length: file_len - scan_from,
+        };
+        let mut returned = 0u32;
+        // SAFETY: the handle is borrowed from a live `File` opened for reading,
+        // the input and output buffers are valid for the byte lengths passed,
+        // and `returned` is a writable out pointer. The FSCTL only reads
+        // allocation metadata.
+        let ok = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle() as _,
+                FSCTL_QUERY_ALLOCATED_RANGES,
+                ptr::from_ref(&input).cast(),
+                ENTRY_LEN as u32,
+                output.as_mut_ptr().cast(),
+                (output.len() * ENTRY_LEN) as u32,
+                &mut returned,
+                ptr::null_mut(),
+            )
+        };
+        let more = if ok == 0 {
+            if std::io::Error::last_os_error().raw_os_error() != Some(ERROR_MORE_DATA as i32) {
+                return None;
+            }
+            true
+        } else {
+            false
+        };
+        let count = returned as usize / ENTRY_LEN;
+        for entry in &output[..count] {
+            let start = u64::try_from(entry.FileOffset).ok()?;
+            let end = start.checked_add(u64::try_from(entry.Length).ok()?)?;
+            ranges.push((start, end));
+        }
+        if !more || count == 0 {
+            break;
+        }
+        scan_from = output[count - 1]
+            .FileOffset
+            .checked_add(output[count - 1].Length)?;
+        if scan_from >= file_len || ranges.len() > MAX_TRACKED_EXTENTS {
+            break;
+        }
+    }
+    if ranges.len() > MAX_TRACKED_EXTENTS {
+        return None;
+    }
+    Some(ranges)
+}
+
+#[cfg(target_os = "linux")]
+fn query_allocated_extents(file: &mut File) -> Option<Vec<(u64, u64)>> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    let file_len = file.metadata().ok()?.len();
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let mut cursor = 0i64;
+    while (cursor as u64) < file_len {
+        // SAFETY: `fd` is borrowed from a live `File`; `lseek` only moves the
+        // descriptor offset, which the caller restores.
+        let data = unsafe { libc::lseek(fd, cursor, libc::SEEK_DATA) };
+        if data < 0 {
+            // `ENXIO` means there is no data at or after `cursor`, which is the
+            // documented end of the scan. Anything else means the filesystem
+            // cannot answer, so nothing may be skipped.
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ENXIO) => Some(ranges),
+                _ => None,
+            };
+        }
+        // SAFETY: same invariants as the `SEEK_DATA` call above.
+        let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return None;
+        }
+        ranges.push((data as u64, hole as u64));
+        cursor = hole;
+        if ranges.len() > MAX_TRACKED_EXTENTS {
+            return None;
+        }
+    }
+    Some(ranges)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn query_allocated_extents(_file: &mut File) -> Option<Vec<(u64, u64)>> {
+    None
+}
+
+/// Best-effort request that the filesystem represent unwritten regions of a
+/// newly created matrix as holes.
+///
+/// On POSIX this is already the default. On Windows a file must carry the
+/// sparse attribute *before* it is extended, otherwise `set_len` allocates the
+/// clusters it reserves and `FSCTL_QUERY_ALLOCATED_RANGES` reports the whole
+/// file as data. Failure is ignored: the matrix is then simply dense, which
+/// costs performance and nothing else.
+#[cfg(windows)]
+fn mark_file_sparse(file: &File) {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+
+    let mut returned = 0u32;
+    // SAFETY: the handle is borrowed from a live writable `File`,
+    // `FSCTL_SET_SPARSE` accepts null input/output buffers, and `returned` is a
+    // valid out pointer.
+    unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as _,
+            FSCTL_SET_SPARSE,
+            ptr::null(),
+            0,
+            ptr::null_mut(),
+            0,
+            &mut returned,
+            ptr::null_mut(),
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn mark_file_sparse(_file: &File) {}
+
+/// Zeroes `[offset, offset + len)`, deallocating the range where the platform
+/// supports it.
+///
+/// Returns `true` when the range was zeroed by a hole punch, which is `O(1)` in
+/// `len`; `false` means the caller must fall back to writing zeros.
+fn punch_zero_range(file: &mut File, offset: u64, len: u64) -> bool {
+    if len == 0 {
+        return true;
+    }
+    punch_zero_range_native(file, offset, len)
+}
+
+#[cfg(windows)]
+fn punch_zero_range_native(file: &mut File, offset: u64, len: u64) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
+
+    let (Some(file_offset), Some(end)) = (
+        i64::try_from(offset).ok(),
+        offset
+            .checked_add(len)
+            .and_then(|end| i64::try_from(end).ok()),
+    ) else {
+        return false;
+    };
+    let input = FILE_ZERO_DATA_INFORMATION {
+        FileOffset: file_offset,
+        BeyondFinalZero: end,
+    };
+    let mut returned = 0u32;
+    // SAFETY: the handle is borrowed from a live writable `File`, the input
+    // buffer is valid for the byte length passed, and `returned` is a writable
+    // out pointer.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as _,
+            FSCTL_SET_ZERO_DATA,
+            ptr::from_ref(&input).cast(),
+            std::mem::size_of::<FILE_ZERO_DATA_INFORMATION>() as u32,
+            ptr::null_mut(),
+            0,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    ok != 0
+}
+
+#[cfg(target_os = "linux")]
+fn punch_zero_range_native(file: &mut File, offset: u64, len: u64) -> bool {
+    use std::os::unix::io::AsRawFd;
+
+    let (Ok(offset), Ok(len)) = (libc::off_t::try_from(offset), libc::off_t::try_from(len)) else {
+        return false;
+    };
+    // SAFETY: `fd` is borrowed from a live writable `File`; `fallocate` only
+    // affects the requested byte range and never changes the file length with
+    // `FALLOC_FL_KEEP_SIZE`.
+    let result = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset,
+            len,
+        )
+    };
+    result == 0
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn punch_zero_range_native(_file: &mut File, _offset: u64, _len: u64) -> bool {
+    false
+}
+
+/// Zeroes `[offset, offset + len)` with a hole punch where possible, falling
+/// back to writing zeros.
+fn zero_range(file: &mut File, offset: u64, len: u64) -> Result<()> {
+    if punch_zero_range(file, offset, len) {
+        return Ok(());
+    }
+    count_category_clear_bytes_written(len);
+    file.seek(SeekFrom::Start(offset))?;
+    write_zeros(file, len)
+}
 
 #[cfg(test)]
 std::thread_local! {
@@ -35,6 +361,106 @@ std::thread_local! {
         std::cell::Cell::new(false)
     };
 }
+
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+mod scaling_counters {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        pub(super) static BITMAP_BYTES_HASHED: Cell<u64> = const { Cell::new(0) };
+        pub(super) static CREATE_METADATA_BYTES_WRITTEN: Cell<u64> = const { Cell::new(0) };
+        pub(super) static OPEN_BITMAP_BYTES_RESIDENT: Cell<u64> = const { Cell::new(0) };
+        pub(super) static OPEN_BITMAP_BYTES_READ: Cell<u64> = const { Cell::new(0) };
+        pub(super) static CATEGORY_CLEAR_BYTES_WRITTEN: Cell<u64> = const { Cell::new(0) };
+        pub(super) static OPEN_ALLOCATION_MAP_AVAILABLE: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn add(cell: &'static std::thread::LocalKey<Cell<u64>>, value: u64) {
+        cell.with(|counter| counter.set(counter.get().saturating_add(value)));
+    }
+
+    pub(super) fn set(cell: &'static std::thread::LocalKey<Cell<u64>>, value: u64) {
+        cell.with(|counter| counter.set(value));
+    }
+
+    #[cfg(feature = "scalable-fault-injection")]
+    pub(super) fn get(cell: &'static std::thread::LocalKey<Cell<u64>>) -> u64 {
+        cell.with(Cell::get)
+    }
+}
+
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+fn count_bitmap_bytes_hashed(bytes: u64) {
+    scaling_counters::add(&scaling_counters::BITMAP_BYTES_HASHED, bytes);
+}
+
+#[cfg(not(any(test, feature = "scalable-fault-injection")))]
+fn count_bitmap_bytes_hashed(_bytes: u64) {}
+
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+fn count_create_metadata_bytes(bytes: u64) {
+    scaling_counters::add(&scaling_counters::CREATE_METADATA_BYTES_WRITTEN, bytes);
+}
+
+#[cfg(not(any(test, feature = "scalable-fault-injection")))]
+fn count_create_metadata_bytes(_bytes: u64) {}
+
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+fn count_open_bitmap_bytes_read(bytes: u64) {
+    scaling_counters::add(&scaling_counters::OPEN_BITMAP_BYTES_READ, bytes);
+}
+
+#[cfg(not(any(test, feature = "scalable-fault-injection")))]
+fn count_open_bitmap_bytes_read(_bytes: u64) {}
+
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+fn count_category_clear_bytes_written(bytes: u64) {
+    scaling_counters::add(&scaling_counters::CATEGORY_CLEAR_BYTES_WRITTEN, bytes);
+}
+
+#[cfg(not(any(test, feature = "scalable-fault-injection")))]
+fn count_category_clear_bytes_written(_bytes: u64) {}
+
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+fn record_open_allocation_map(extents: Option<&AllocatedExtents>) {
+    scaling_counters::set(
+        &scaling_counters::OPEN_ALLOCATION_MAP_AVAILABLE,
+        u64::from(extents.is_some()),
+    );
+}
+
+#[cfg(not(any(test, feature = "scalable-fault-injection")))]
+fn record_open_allocation_map(_extents: Option<&AllocatedExtents>) {}
+
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+fn record_open_resident_bitmap_bytes(layout: &MatrixLayout) {
+    let commits: u64 = layout
+        .commits
+        .iter()
+        .map(|commit| {
+            commit.bits.resident_bytes()
+                + commit
+                    .quarantined_raw_bits
+                    .as_ref()
+                    .map(SparseBitmap::resident_bytes)
+                    .unwrap_or(0)
+        })
+        .sum();
+    let blocks: u64 = layout
+        .blocks
+        .iter()
+        .map(|block| {
+            block.crc_valid_bits.resident_bytes() + block.current_write_bits.resident_bytes()
+        })
+        .sum();
+    scaling_counters::set(
+        &scaling_counters::OPEN_BITMAP_BYTES_RESIDENT,
+        commits.saturating_add(blocks),
+    );
+}
+
+#[cfg(not(any(test, feature = "scalable-fault-injection")))]
+fn record_open_resident_bitmap_bytes(_layout: &MatrixLayout) {}
 
 #[cfg(test)]
 pub(crate) fn inject_partial_slot_write_failure() {
@@ -218,6 +644,347 @@ pub struct MatrixRecoveryReport {
     pub recommended_actions: Vec<MatrixRecoveryAction>,
 }
 
+/// Thread-local observability counters for the paged matrix integrity
+/// representation (PERF-01/PERF-02 scaling contracts).
+///
+/// These hang off `MatrixRecoveryReport` because it is the matrix diagnostic
+/// type already exported from the crate root; they are not a property of any
+/// particular report value.
+#[cfg(feature = "scalable-fault-injection")]
+impl MatrixRecoveryReport {
+    /// Bitmap bytes fed to the checksum while maintaining commit-map integrity.
+    pub fn matrix_bitmap_bytes_hashed() -> u64 {
+        scaling_counters::get(&scaling_counters::BITMAP_BYTES_HASHED)
+    }
+
+    /// Metadata bytes explicitly written by matrix creation, excluding the
+    /// sparse extent established with `set_len`.
+    pub fn matrix_create_metadata_bytes_written() -> u64 {
+        scaling_counters::get(&scaling_counters::CREATE_METADATA_BYTES_WRITTEN)
+    }
+
+    /// Resident bitmap bytes held by the most recently created or opened matrix
+    /// layout on this thread.
+    pub fn matrix_open_resident_bitmap_bytes() -> u64 {
+        scaling_counters::get(&scaling_counters::OPEN_BITMAP_BYTES_RESIDENT)
+    }
+
+    /// Bitmap and page-digest bytes read from disk while opening matrix
+    /// layouts on this thread.
+    ///
+    /// Pages the filesystem proves were never written are neither read nor
+    /// counted, so this tracks the work the matrix has actually accumulated
+    /// rather than its total cell count.
+    pub fn matrix_open_bitmap_bytes_read() -> u64 {
+        scaling_counters::get(&scaling_counters::OPEN_BITMAP_BYTES_READ)
+    }
+
+    /// Zero bytes explicitly written by whole-category clears on this thread.
+    ///
+    /// A clear that could deallocate its regions instead of overwriting them
+    /// counts nothing.
+    pub fn matrix_category_clear_bytes_written() -> u64 {
+        scaling_counters::get(&scaling_counters::CATEGORY_CLEAR_BYTES_WRITTEN)
+    }
+
+    /// Whether the most recent matrix open obtained a filesystem allocation map.
+    ///
+    /// When this is false the platform or filesystem could not prove any range
+    /// unwritten, so every page was read exactly as it was before the paged
+    /// representation existed: correctness is unaffected, but open cost falls
+    /// back to `O(cell_count / 8)`.
+    pub fn matrix_open_allocation_map_available() -> bool {
+        scaling_counters::get(&scaling_counters::OPEN_ALLOCATION_MAP_AVAILABLE) != 0
+    }
+
+    /// Resets every matrix integrity counter for the calling thread.
+    pub fn reset_matrix_integrity_counters() {
+        scaling_counters::set(&scaling_counters::BITMAP_BYTES_HASHED, 0);
+        scaling_counters::set(&scaling_counters::CREATE_METADATA_BYTES_WRITTEN, 0);
+        scaling_counters::set(&scaling_counters::OPEN_BITMAP_BYTES_RESIDENT, 0);
+        scaling_counters::set(&scaling_counters::OPEN_BITMAP_BYTES_READ, 0);
+        scaling_counters::set(&scaling_counters::CATEGORY_CLEAR_BYTES_WRITTEN, 0);
+        scaling_counters::set(&scaling_counters::OPEN_ALLOCATION_MAP_AVAILABLE, 0);
+    }
+}
+
+/// A bitmap whose pages are materialised only once they hold a set bit.
+///
+/// Pages that were never written are not resident and are not read back: the
+/// on-disk page digest (or, where integrity is disabled, the streamed load)
+/// establishes that they are zero, and a zero page answers every query without
+/// occupying memory. Residency therefore tracks the work actually performed
+/// against the matrix instead of its total cell count.
+#[derive(Clone, Debug)]
+struct SparseBitmap {
+    bit_count: u64,
+    byte_len: u64,
+    page_count: u64,
+    pages: HashMap<u64, Arc<Vec<u8>>>,
+    ones: u64,
+}
+
+impl SparseBitmap {
+    fn new(bit_count: u64) -> Result<Self> {
+        let byte_len = bit_bytes(bit_count)?;
+        Ok(Self {
+            bit_count,
+            byte_len,
+            page_count: page_count_for(byte_len)?,
+            pages: HashMap::new(),
+            ones: 0,
+        })
+    }
+
+    fn page_len(&self, page: u64) -> Result<u64> {
+        let start = page
+            .checked_mul(BITMAP_PAGE_BYTES)
+            .ok_or(Error::InvalidMatrixLayout)?;
+        if start >= self.byte_len {
+            return Err(Error::InvalidMatrixLayout);
+        }
+        Ok((self.byte_len - start).min(BITMAP_PAGE_BYTES))
+    }
+
+    fn page_bytes(&self, page: u64) -> Result<&[u8]> {
+        let len = usize::try_from(self.page_len(page)?).map_err(|_| Error::InvalidMatrixLayout)?;
+        match self.pages.get(&page) {
+            Some(bytes) if bytes.len() == len => Ok(bytes.as_slice()),
+            Some(_) => Err(Error::InvalidMatrixLayout),
+            None => Ok(&ZERO_PAGE[..len]),
+        }
+    }
+
+    fn byte(&self, index: u64) -> Result<u8> {
+        if index >= self.byte_len {
+            return Err(Error::InvalidMatrixLayout);
+        }
+        let page = index / BITMAP_PAGE_BYTES;
+        let within =
+            usize::try_from(index % BITMAP_PAGE_BYTES).map_err(|_| Error::InvalidMatrixLayout)?;
+        match self.pages.get(&page) {
+            Some(bytes) => bytes.get(within).copied().ok_or(Error::InvalidMatrixLayout),
+            None => Ok(0),
+        }
+    }
+
+    fn get(&self, ordinal: u64) -> Result<bool> {
+        if ordinal >= self.bit_count {
+            return Err(Error::InvalidMatrixLayout);
+        }
+        Ok(self.byte(ordinal / 8)? & (1u8 << (ordinal % 8)) != 0)
+    }
+
+    /// Bytes that writing `value` at `index` would newly make resident, so a
+    /// caller can charge the matrix bitmap budget before the memory is taken.
+    /// A write that changes nothing materialises nothing and costs nothing.
+    fn materialisation_cost(&self, index: u64, value: u8) -> Result<u64> {
+        if index >= self.byte_len {
+            return Err(Error::InvalidMatrixLayout);
+        }
+        if self.byte(index)? == value {
+            return Ok(0);
+        }
+        let page = index / BITMAP_PAGE_BYTES;
+        if self.pages.contains_key(&page) {
+            Ok(0)
+        } else {
+            self.page_len(page)
+        }
+    }
+
+    /// Returns the number of bytes newly made resident, which is one page the
+    /// first time a page is touched and zero afterwards. Callers charge the
+    /// return value to the matrix bitmap budget.
+    fn set_byte(&mut self, index: u64, value: u8) -> Result<u64> {
+        let current = self.byte(index)?;
+        if current == value {
+            return Ok(0);
+        }
+        let page = index / BITMAP_PAGE_BYTES;
+        let within =
+            usize::try_from(index % BITMAP_PAGE_BYTES).map_err(|_| Error::InvalidMatrixLayout)?;
+        let mut materialised = 0;
+        if !self.pages.contains_key(&page) {
+            let page_len = self.page_len(page)?;
+            let bytes = filled_bytes_for(page_len, 0, ReadLimitKey::MatrixBitmapBytes.resource())?;
+            try_reserve_map(
+                &mut self.pages,
+                1,
+                ReadLimitKey::MatrixBitmapBytes.resource(),
+            )?;
+            self.pages.insert(page, Arc::new(bytes));
+            materialised = page_len;
+        }
+        let bytes = self
+            .pages
+            .get_mut(&page)
+            .ok_or(Error::InvalidMatrixLayout)?;
+        *Arc::make_mut(bytes)
+            .get_mut(within)
+            .ok_or(Error::InvalidMatrixLayout)? = value;
+        self.ones = self
+            .ones
+            .checked_add(u64::from(value.count_ones()))
+            .and_then(|ones| ones.checked_sub(u64::from(current.count_ones())))
+            .ok_or(Error::InvalidMatrixLayout)?;
+        Ok(materialised)
+    }
+
+    fn set(&mut self, ordinal: u64, value: bool) -> Result<u64> {
+        if ordinal >= self.bit_count {
+            return Err(Error::InvalidMatrixLayout);
+        }
+        let index = ordinal / 8;
+        let mask = 1u8 << (ordinal % 8);
+        let current = self.byte(index)?;
+        let next = if value {
+            current | mask
+        } else {
+            current & !mask
+        };
+        self.set_byte(index, next)
+    }
+
+    // Loading never materialises an all-zero page, so residency after open is
+    // proportional to the pages that carry state rather than to the cell count.
+    fn insert_loaded_page(&mut self, page: u64, bytes: Vec<u8>) -> Result<u64> {
+        let page_len = self.page_len(page)?;
+        if usize_to_u64(bytes.len())? != page_len {
+            return Err(Error::InvalidMatrixLayout);
+        }
+        let ones = bytes
+            .iter()
+            .try_fold(0u64, |acc, byte| {
+                acc.checked_add(u64::from(byte.count_ones()))
+            })
+            .ok_or(Error::InvalidMatrixLayout)?;
+        if ones == 0 {
+            return Ok(0);
+        }
+        try_reserve_map(
+            &mut self.pages,
+            1,
+            ReadLimitKey::MatrixBitmapBytes.resource(),
+        )?;
+        self.pages.insert(page, Arc::new(bytes));
+        self.ones = self
+            .ones
+            .checked_add(ones)
+            .ok_or(Error::InvalidMatrixLayout)?;
+        Ok(page_len)
+    }
+
+    fn clear(&mut self) {
+        self.pages.clear();
+        self.ones = 0;
+    }
+
+    fn ones(&self) -> u64 {
+        self.ones
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.pages
+            .values()
+            .map(|page| page.len() as u64)
+            .fold(0u64, u64::saturating_add)
+    }
+}
+
+/// Running total of resident matrix bitmap bytes, checked against
+/// `ReadLimitKey::MatrixBitmapBytes` every time the total grows.
+///
+/// PERF-02: the budget used to be charged once, up front, as
+/// `2 * block_bitmap_len + commit_map_len` — the dense worst case of a
+/// representation that no longer exists. That refused large matrices on a
+/// cell-count-scaled figure even though a freshly created matrix holds no
+/// resident bitmap bytes at all. The charge now tracks the pages actually
+/// materialised, so the limit means what it says and still fails closed: every
+/// growth is checked before the memory is used.
+#[derive(Clone, Copy, Debug)]
+struct ResidentBitmapBudget {
+    limits: ReadLimits,
+    used: u64,
+}
+
+impl ResidentBitmapBudget {
+    fn new(limits: ReadLimits) -> Self {
+        Self { limits, used: 0 }
+    }
+
+    fn charge(&mut self, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.used = self
+            .used
+            .checked_add(bytes)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: ReadLimitKey::MatrixBitmapBytes.resource(),
+            })?;
+        self.limits
+            .check(ReadLimitKey::MatrixBitmapBytes, self.used)
+    }
+}
+
+fn page_count_for(byte_len: u64) -> Result<u64> {
+    byte_len
+        .checked_add(BITMAP_PAGE_BYTES - 1)
+        .map(|value| value / BITMAP_PAGE_BYTES)
+        .ok_or(Error::InvalidMatrixLayout)
+}
+
+fn page_digest_len(byte_len: u64) -> Result<u64> {
+    page_count_for(byte_len)?
+        .checked_mul(PAGE_DIGEST_LEN)
+        .ok_or(Error::InvalidMatrixLayout)
+}
+
+fn page_digest_offset(base: u64, page: u64) -> Result<u64> {
+    page.checked_mul(PAGE_DIGEST_LEN)
+        .and_then(|delta| base.checked_add(delta))
+        .ok_or(Error::InvalidMatrixLayout)
+}
+
+fn read_page_digest(file: &mut File, offset: u64) -> Result<(u32, u32)> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = [0; PAGE_DIGEST_LEN as usize];
+    file.read_exact(&mut bytes)?;
+    Ok((
+        u32::from_le_bytes(bytes[0..4].try_into().expect("slice")),
+        u32::from_le_bytes(bytes[4..8].try_into().expect("slice")),
+    ))
+}
+
+/// Writes one page digest.
+///
+/// Trust boundary, recorded deliberately rather than left implicit. The digest
+/// array and the checksum-validity bitmap are *not* themselves covered by the
+/// MCRC metadata checksum, which spans only the dimension, block, and category
+/// tables. A CRC cannot authenticate metadata against anyone who can write the
+/// file, and the only construction that would detect a fabricated digest — a
+/// composition over the whole digest array — must be recomputed on every
+/// mutation and on every open, which reintroduces exactly the cell-count-scaled
+/// costs PERF-01 and PERF-02 exist to remove.
+///
+/// The consequence is bounded and unchanged from the single unprotected commit
+/// checksum this array replaced: an attacker who writes a commit bit together
+/// with a matching digest can make `cell_status` report `Committed` for a cell
+/// that was never written. Reading that cell still fails typed with
+/// `MatrixChecksumMismatch`, because `verify_cell_crc` consults the persistent
+/// validity bit and the recorded per-cell checksum, so no fabricated payload is
+/// ever returned. Detecting metadata forgery requires a keyed digest, which is
+/// a format decision outside this representation.
+fn write_page_digest(file: &mut File, offset: u64, crc: u32, state: u32) -> Result<()> {
+    let mut bytes = [0; PAGE_DIGEST_LEN as usize];
+    bytes[0..4].copy_from_slice(&crc.to_le_bytes());
+    bytes[4..8].copy_from_slice(&state.to_le_bytes());
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(&bytes)?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MatrixResumeSignal {
     Clean,
@@ -257,10 +1024,10 @@ struct MatrixCommitLayout {
     kind: MatrixCommitKind,
     bit_count: u64,
     map_offset: u64,
-    bits: Arc<Vec<u8>>,
-    quarantined_raw_bits: Option<Arc<Vec<u8>>>,
+    bits: SparseBitmap,
+    quarantined_raw_bits: Option<SparseBitmap>,
     quarantine_finding: Option<MatrixRecoveryFinding>,
-    crc_offset: Option<u64>,
+    digest_offset: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -272,9 +1039,8 @@ struct MatrixBlockLayout {
     cell_count: u64,
     crc_offset: Option<u64>,
     crc_valid_offset: Option<u64>,
-    crc_valid_bits: Arc<Vec<u8>>,
-    written_bits: Arc<Vec<u8>>,
-    current_write_bits: Arc<Vec<u8>>,
+    crc_valid_bits: SparseBitmap,
+    current_write_bits: SparseBitmap,
 }
 
 #[derive(Clone, Debug)]
@@ -287,7 +1053,9 @@ struct MatrixAuxLayout {
 #[derive(Clone, Debug)]
 struct MatrixCrcLayout {
     region_offset: u64,
-    region_len: u64,
+    commit_digest_offsets: Vec<u64>,
+    block_crc_offsets: Vec<u64>,
+    block_valid_offsets: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -299,6 +1067,23 @@ struct MatrixCrcVerification {
 impl MatrixLayout {
     pub fn append_log_start(&self) -> u64 {
         self.append_log_start
+    }
+
+    /// Charges newly resident bitmap bytes against
+    /// `ReadLimitKey::MatrixBitmapBytes` before the memory is taken.
+    fn charge_resident_bitmap(&mut self, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let next = self.resident_bitmap_bytes.checked_add(bytes).ok_or(
+            Error::ResourceArithmeticOverflow {
+                resource: ReadLimitKey::MatrixBitmapBytes.resource(),
+            },
+        )?;
+        self.read_limits
+            .check(ReadLimitKey::MatrixBitmapBytes, next)?;
+        self.resident_bitmap_bytes = next;
+        Ok(())
     }
 
     // Fail-closed gate for `Fatal` recovery findings: safe accessors must not
@@ -391,11 +1176,14 @@ pub(crate) fn create_layout(
     spec.read_limits
         .check(ReadLimitKey::MatrixSlotRegionLen, slot_region_len)?;
     let block_bitmap_len = matrix_block_bitmap_len(spec, &cell_counts)?;
-    let resident_bitmap_bytes = matrix_resident_bitmap_len(commit_map_len, block_bitmap_len)?;
-    spec.read_limits
-        .check(ReadLimitKey::MatrixBitmapBytes, resident_bitmap_bytes)?;
+    // PERF-02: creation makes no bitmap page resident, so the resident budget
+    // starts empty and is charged as pages are actually materialised. The
+    // cell-count-scaled admission gates that remain (cells, slot region length,
+    // metadata bytes, checksum bytes, file length) all describe on-disk
+    // extents, which creation really does reserve.
+    let resident_bitmap_bytes = 0;
     let region_crc_len = if crc_enabled {
-        crc_table_len(spec, &cell_counts)?
+        crc_table_len(spec, &commit_plans, &cell_counts)?
     } else {
         0
     };
@@ -539,24 +1327,33 @@ pub(crate) fn create_layout(
         resident_bitmap_bytes,
     )?;
 
+    // PERF-02: only the fixed-size descriptor tables and the checksum-region
+    // header are written explicitly. The commit maps, per-cell checksums, and
+    // validity bitmaps are established as a zero extent by `set_len`, so
+    // creation cost does not scale with the cell count. A never-written page is
+    // recognised by its `PAGE_STATE_UNINITIALIZED` digest, which is exactly the
+    // zero extent, and is therefore distinguishable from a page that was
+    // written and happens to hold zeros.
+    // Requested before the reserved regions are established so that `set_len`
+    // leaves them as holes rather than allocated clusters; see
+    // `AllocatedExtents` for why open depends on that distinction.
+    mark_file_sparse(file);
     file.seek(SeekFrom::Start(header_len))?;
     file.write_all(&header)?;
     file.write_all(&dimension_table)?;
     file.write_all(&block_table)?;
     file.write_all(&category_table)?;
-    write_zeros(file, commit_map_len)?;
+    count_create_metadata_bytes(
+        usize_to_u64(header.len())?
+            .saturating_add(usize_to_u64(dimension_table.len())?)
+            .saturating_add(usize_to_u64(block_table.len())?)
+            .saturating_add(usize_to_u64(category_table.len())?),
+    );
     file.set_len(append_log_start)?;
     if has_crc {
         file.seek(SeekFrom::Start(region_crc_off))?;
-        write_crc_table(
-            file,
-            spec,
-            &commit_plans,
-            &block_offsets,
-            &dimension_table,
-            &block_table,
-            &category_table,
-        )?;
+        write_crc_header(file, &dimension_table, &block_table, &category_table)?;
+        count_create_metadata_bytes(MCRC_HEADER_LEN);
     }
     file.seek(SeekFrom::Start(append_log_start))?;
     Ok(layout)
@@ -604,10 +1401,6 @@ pub(crate) fn read_layout_at_len(
     spec.read_limits
         .check(ReadLimitKey::MatrixSlotRegionLen, header.slot_region_len)?;
     let block_bitmap_len = matrix_block_bitmap_len(spec, &cell_counts)?;
-    let resident_bitmap_bytes =
-        matrix_resident_bitmap_len(header.commit_map_len, block_bitmap_len)?;
-    spec.read_limits
-        .check(ReadLimitKey::MatrixBitmapBytes, resident_bitmap_bytes)?;
     let accounted_crc_bytes =
         matrix_accounted_crc_len(crc_enabled, header.region_crc_len, block_bitmap_len)?;
     spec.read_limits
@@ -654,15 +1447,34 @@ pub(crate) fn read_layout_at_len(
         &expected_commit_plans,
         &block_offsets,
     )?;
-    let commit_bits = read_commit_bitmaps(file, &commit_plans)?;
-    let crc_verification = verify_crc_table(
+    let mut crc_verification = verify_crc_header(
         file,
         crc_layout.as_ref(),
         &[&dimension_table, &block_table, &category_table],
-        &commit_plans,
-        &commit_bits,
+        commit_plans.len(),
     )?;
-    let crc_valid_bits = read_crc_valid_bits(spec, file, crc_layout.as_ref(), &block_offsets)?;
+    // PERF-02: one allocation-map query replaces streaming every page of every
+    // commit map and validity bitmap. Ranges the filesystem reports as holes
+    // were never written and therefore read as zero.
+    let extents = AllocatedExtents::query(file);
+    record_open_allocation_map(extents.as_ref());
+    let mut budget = ResidentBitmapBudget::new(spec.read_limits);
+    let commit_bits = load_commit_bitmaps(
+        file,
+        crc_layout.as_ref(),
+        &commit_plans,
+        extents.as_ref(),
+        &mut budget,
+        &mut crc_verification,
+    )?;
+    let crc_valid_bits = load_crc_valid_bits(
+        spec,
+        file,
+        crc_layout.as_ref(),
+        &block_offsets,
+        extents.as_ref(),
+        &mut budget,
+    )?;
 
     layout_from_parts(
         dimensions,
@@ -677,7 +1489,7 @@ pub(crate) fn read_layout_at_len(
         crc_verification.commit_findings,
         crc_verification.findings,
         header.append_log_start,
-        resident_bitmap_bytes,
+        budget.used,
     )
 }
 
@@ -736,16 +1548,26 @@ pub(crate) fn write_cell<T: VarveMatrixBlock>(
     }
     file.seek(SeekFrom::Start(offset))?;
     write_slot_payload(file, &payload)?;
-    set_bit(
-        Arc::make_mut(&mut layout.blocks[block_index].written_bits).as_mut_slice(),
-        ordinal,
-        true,
-    )?;
-    set_bit(
-        Arc::make_mut(&mut layout.blocks[block_index].current_write_bits).as_mut_slice(),
-        ordinal,
-        true,
-    )?;
+    charge_current_write_bit(layout, block_index, ordinal)?;
+    Ok(())
+}
+
+/// Records that this session wrote `ordinal`, charging the page it makes
+/// resident before the memory is taken.
+fn charge_current_write_bit(
+    layout: &mut MatrixLayout,
+    block_index: usize,
+    ordinal: u64,
+) -> Result<()> {
+    let index = ordinal / 8;
+    let byte = layout.blocks[block_index].current_write_bits.byte(index)?;
+    let cost = layout.blocks[block_index]
+        .current_write_bits
+        .materialisation_cost(index, byte | (1u8 << (ordinal % 8)))?;
+    layout.charge_resident_bitmap(cost)?;
+    layout.blocks[block_index]
+        .current_write_bits
+        .set(ordinal, true)?;
     Ok(())
 }
 
@@ -777,16 +1599,7 @@ pub(crate) fn write_cell_payload<T: VarveMatrixBlock>(
     }
     file.seek(SeekFrom::Start(offset))?;
     write_slot_payload(file, payload)?;
-    set_bit(
-        Arc::make_mut(&mut layout.blocks[block_index].written_bits).as_mut_slice(),
-        ordinal,
-        true,
-    )?;
-    set_bit(
-        Arc::make_mut(&mut layout.blocks[block_index].current_write_bits).as_mut_slice(),
-        ordinal,
-        true,
-    )?;
+    charge_current_write_bit(layout, block_index, ordinal)?;
     Ok(())
 }
 
@@ -837,7 +1650,7 @@ pub(crate) fn cell_status<T: VarveMatrixBlock>(
     let block_index = layout.block_index(T::ID)?;
     let ordinal = layout.ordinal_for_block(block_index, key)?;
     let commit_index = layout.commit_index(T::CATEGORY)?;
-    if get_bit(&layout.commits[commit_index].bits, ordinal)? {
+    if layout.commits[commit_index].bits.get(ordinal)? {
         Ok(MatrixCellStatus::Committed)
     } else {
         Ok(MatrixCellStatus::NotCommitted)
@@ -854,10 +1667,8 @@ pub(crate) fn commit_cell<T: VarveMatrixBlock>(
     ensure_commit_publishable(layout, T::CATEGORY)?;
     let block_index = layout.block_index(T::ID)?;
     let ordinal = layout.ordinal_for_block(block_index, key)?;
-    let written = get_bit(&layout.blocks[block_index].written_bits, ordinal)?;
-    let written_this_session = get_bit(&layout.blocks[block_index].current_write_bits, ordinal)?;
-    if !written || (!written_this_session && slot_is_all_zero(layout, file, block_index, ordinal)?)
-    {
+    let written_this_session = layout.blocks[block_index].current_write_bits.get(ordinal)?;
+    if !written_this_session && slot_is_all_zero(layout, file, block_index, ordinal)? {
         return Err(Error::MatrixCellNotWritten);
     }
     let crc_valid_update = prepare_cell_crc_valid(layout, block_index, ordinal, true)?;
@@ -910,13 +1721,20 @@ pub(crate) fn clear_category(
     let cleared = count_committed(&layout.commits[commit_index])?;
     let commit_kind = layout.commits[commit_index].kind;
     let map_offset = layout.commits[commit_index].map_offset;
-    let crc_offset = layout.commits[commit_index].crc_offset;
-    let quarantined_len = layout.commits[commit_index]
-        .quarantined_raw_bits
-        .as_ref()
-        .map(|bits| usize_to_u64(bits.len()))
-        .transpose()?
-        .unwrap_or(0);
+    let digest_offset = layout.commits[commit_index].digest_offset;
+    let map_len = layout.commits[commit_index].bits.byte_len;
+    let page_count = layout.commits[commit_index].bits.page_count;
+    // Everything the category held becomes non-resident again.
+    let released = layout.commits[commit_index]
+        .bits
+        .resident_bytes()
+        .saturating_add(
+            layout.commits[commit_index]
+                .quarantined_raw_bits
+                .as_ref()
+                .map(SparseBitmap::resident_bytes)
+                .unwrap_or(0),
+        );
     let cleared_valid = if commit_kind == MatrixCommitKind::Cell {
         let block_index = block_index_for_category(spec, layout, category)?;
         layout.blocks[block_index]
@@ -926,35 +1744,50 @@ pub(crate) fn clear_category(
         None
     };
 
+    // A whole-category clear restores exactly the post-create encoding: an
+    // all-zero commit map whose every page digest reads `{0, UNINITIALIZED}`.
+    // That is byte-identical to the zero extent `set_len` leaves behind, so the
+    // regions are punched back into holes where the platform supports it,
+    // making the clear independent of the cell count instead of writing
+    // `Theta(cell_count / 8)` zero bytes. Where hole punching is unavailable
+    // the fallback writes the same zeros as before.
     if let Some((block_index, valid_offset)) = cleared_valid {
-        file.seek(SeekFrom::Start(valid_offset))?;
-        write_zeros(
+        zero_range(
             file,
-            usize_to_u64(layout.blocks[block_index].crc_valid_bits.len())?,
+            valid_offset,
+            layout.blocks[block_index].crc_valid_bits.byte_len,
         )?;
     }
-    if let Some(crc_offset) = crc_offset {
-        write_crc_at(
-            file,
-            crc_offset,
-            crc32_zeroes(usize_to_u64(layout.commits[commit_index].bits.len())?)?,
-        )?;
+    if let Some(digest_offset) = digest_offset {
+        let digest_len = page_count
+            .checked_mul(PAGE_DIGEST_LEN)
+            .ok_or(Error::InvalidMatrixLayout)?;
+        if !punch_zero_range(file, digest_offset, digest_len) {
+            count_category_clear_bytes_written(digest_len);
+            for page in 0..page_count {
+                write_page_digest(
+                    file,
+                    page_digest_offset(digest_offset, page)?,
+                    0,
+                    PAGE_STATE_UNINITIALIZED,
+                )?;
+            }
+        }
     }
-    file.seek(SeekFrom::Start(map_offset))?;
-    write_zeros(file, usize_to_u64(layout.commits[commit_index].bits.len())?)?;
+    zero_range(file, map_offset, map_len)?;
 
     if let Some((block_index, _)) = cleared_valid {
-        Arc::make_mut(&mut layout.blocks[block_index].crc_valid_bits).fill(0);
+        layout.blocks[block_index].crc_valid_bits.clear();
     }
     {
         let commit = &mut layout.commits[commit_index];
-        Arc::make_mut(&mut commit.bits).fill(0);
+        commit.bits.clear();
         commit.quarantined_raw_bits = None;
         commit.quarantine_finding = None;
     }
     layout.resident_bitmap_bytes = layout
         .resident_bitmap_bytes
-        .checked_sub(quarantined_len)
+        .checked_sub(released)
         .ok_or(Error::InvalidMatrixLayout)?;
     Ok(cleared)
 }
@@ -1292,46 +2125,46 @@ pub(crate) fn rebuild_commit_map_from_crc<T: VarveMatrixBlock>(
         return Err(Error::InvalidMatrixLayout);
     }
 
-    let rebuilt_len = usize_to_u64(layout.commits[commit_index].bits.len())?;
-    let peak_bitmap_bytes = layout
-        .resident_bitmap_bytes
-        .checked_add(rebuilt_len)
-        .ok_or(Error::ResourceArithmeticOverflow {
-            resource: ReadLimitKey::MatrixBitmapBytes.resource(),
-        })?;
-    layout
-        .read_limits
-        .check(ReadLimitKey::MatrixBitmapBytes, peak_bitmap_bytes)?;
-    let mut rebuilt = filled_bytes(rebuilt_len, 0)?;
+    // The rebuilt map is materialised page by page and charged the same way,
+    // so a rebuild is admitted on the pages it actually needs rather than on
+    // the dense worst case of the whole map.
+    let mut budget = ResidentBitmapBudget {
+        limits: layout.read_limits,
+        used: layout.resident_bitmap_bytes,
+    };
+    let mut rebuilt = SparseBitmap::new(layout.commits[commit_index].bit_count)?;
     let mut committed = 0u64;
     for ordinal in 0..block.cell_count {
         let slot_offset = layout.slot_offset(block_index, ordinal)?;
         let actual = crc32_file_range(file, slot_offset, block.slot_stride)?;
         let stored = read_crc_at(file, indexed_crc_offset(crc_offset, ordinal)?)?;
-        let valid = get_bit(&block.crc_valid_bits, ordinal)? && actual == stored;
+        let valid = block.crc_valid_bits.get(ordinal)? && actual == stored;
         if valid {
             committed += 1;
         }
-        set_bit(&mut rebuilt, ordinal, valid)?;
+        budget.charge(rebuilt.set(ordinal, valid)?)?;
     }
 
     let commit = &layout.commits[commit_index];
-    write_commit_crc(file, commit.crc_offset, &rebuilt)?;
-    file.seek(SeekFrom::Start(commit.map_offset))?;
-    file.write_all(&rebuilt)?;
+    write_commit_map_pages(file, commit.map_offset, commit.digest_offset, &rebuilt)?;
     let commit = &mut layout.commits[commit_index];
-    let quarantined_len = commit
-        .quarantined_raw_bits
-        .as_ref()
-        .map(|bits| usize_to_u64(bits.len()))
-        .transpose()?
-        .unwrap_or(0);
-    commit.bits = Arc::new(rebuilt);
+    let released = commit
+        .bits
+        .resident_bytes()
+        .checked_add(
+            commit
+                .quarantined_raw_bits
+                .as_ref()
+                .map(SparseBitmap::resident_bytes)
+                .unwrap_or(0),
+        )
+        .ok_or(Error::InvalidMatrixLayout)?;
+    commit.bits = rebuilt;
     commit.quarantined_raw_bits = None;
     commit.quarantine_finding = None;
-    layout.resident_bitmap_bytes = layout
-        .resident_bitmap_bytes
-        .checked_sub(quarantined_len)
+    layout.resident_bitmap_bytes = budget
+        .used
+        .checked_sub(released)
         .ok_or(Error::InvalidMatrixLayout)?;
     Ok(committed)
 }
@@ -1342,7 +2175,7 @@ pub(crate) fn is_single_committed(layout: &MatrixLayout, name: &str) -> Result<b
         return Err(Error::MatrixCommitMissing(name.to_string()));
     }
     ensure_commit_publishable(layout, name)?;
-    get_bit(&commit.bits, 0)
+    commit.bits.get(0)
 }
 
 pub(crate) fn set_single_committed(
@@ -1368,7 +2201,7 @@ pub(crate) fn is_channel_committed(
         return Err(Error::MatrixCommitMissing(name.to_string()));
     }
     ensure_commit_publishable(layout, name)?;
-    get_bit(&commit.bits, channel)
+    commit.bits.get(channel)
 }
 
 pub(crate) fn set_channel_committed(
@@ -1481,18 +2314,18 @@ fn set_commit_bit(
 }
 
 struct BitmapByteUpdate {
-    byte_index: usize,
+    byte_index: u64,
     byte_offset: u64,
     byte_value: u8,
 }
 
 struct CommitBitUpdate {
     bitmap: BitmapByteUpdate,
-    crc: Option<(u64, u32)>,
+    digest: Option<(u64, u32)>,
 }
 
 fn prepare_bitmap_update(
-    bits: &[u8],
+    bits: &SparseBitmap,
     bit_count: u64,
     base_offset: u64,
     ordinal: u64,
@@ -1501,8 +2334,8 @@ fn prepare_bitmap_update(
     if ordinal >= bit_count {
         return Err(Error::InvalidMatrixLayout);
     }
-    let byte_index = usize::try_from(ordinal / 8).map_err(|_| Error::InvalidMatrixLayout)?;
-    let current = *bits.get(byte_index).ok_or(Error::InvalidMatrixLayout)?;
+    let byte_index = ordinal / 8;
+    let current = bits.byte(byte_index)?;
     let mask = 1u8 << (ordinal % 8);
     let byte_value = if value {
         current | mask
@@ -1510,7 +2343,7 @@ fn prepare_bitmap_update(
         current & !mask
     };
     let byte_offset = base_offset
-        .checked_add(u64::try_from(byte_index).map_err(|_| Error::InvalidMatrixLayout)?)
+        .checked_add(byte_index)
         .ok_or(Error::InvalidMatrixLayout)?;
     Ok(BitmapByteUpdate {
         byte_index,
@@ -1550,14 +2383,22 @@ fn prepare_commit_bit(
         ordinal,
         value,
     )?;
-    let crc = match commit.crc_offset {
-        Some(offset) => Some((
-            offset,
-            crc32_bytes_with_replacement(&commit.bits, bitmap.byte_index, bitmap.byte_value)?,
-        )),
+    // PERF-01: only the page holding the mutated byte is rehashed, so the cost
+    // of a commit-bit mutation is bounded by `BITMAP_PAGE_BYTES` regardless of
+    // how many bits the category has.
+    let digest = match commit.digest_offset {
+        Some(base) => {
+            let page = bitmap.byte_index / BITMAP_PAGE_BYTES;
+            let within = usize::try_from(bitmap.byte_index % BITMAP_PAGE_BYTES)
+                .map_err(|_| Error::InvalidMatrixLayout)?;
+            let page_bytes = commit.bits.page_bytes(page)?;
+            count_bitmap_bytes_hashed(usize_to_u64(page_bytes.len())?);
+            let crc = crc32_bytes_with_replacement(page_bytes, within, bitmap.byte_value)?;
+            Some((page_digest_offset(base, page)?, crc))
+        }
         None => None,
     };
-    Ok(CommitBitUpdate { bitmap, crc })
+    Ok(CommitBitUpdate { bitmap, digest })
 }
 
 fn apply_commit_bit(
@@ -1566,22 +2407,47 @@ fn apply_commit_bit(
     commit_index: usize,
     update: CommitBitUpdate,
 ) -> Result<()> {
-    if let Some((offset, crc)) = update.crc {
-        write_crc_at(file, offset, crc)?;
+    let cost = layout.commits[commit_index]
+        .bits
+        .materialisation_cost(update.bitmap.byte_index, update.bitmap.byte_value)?;
+    layout.charge_resident_bitmap(cost)?;
+    if let Some((offset, crc)) = update.digest {
+        write_page_digest(file, offset, crc, PAGE_STATE_INITIALIZED)?;
     }
     write_bitmap_byte(file, &update.bitmap)?;
-    *Arc::make_mut(&mut layout.commits[commit_index].bits)
-        .get_mut(update.bitmap.byte_index)
-        .ok_or(Error::InvalidMatrixLayout)? = update.bitmap.byte_value;
+    layout.commits[commit_index]
+        .bits
+        .set_byte(update.bitmap.byte_index, update.bitmap.byte_value)?;
     Ok(())
 }
 
-fn write_commit_crc(file: &mut File, crc_offset: Option<u64>, bits: &[u8]) -> Result<()> {
-    let Some(crc_offset) = crc_offset else {
-        return Ok(());
-    };
-    let crc = crc32_bytes(bits)?;
-    write_crc_at(file, crc_offset, crc)
+// Whole-map publication (rebuild and recovery) rewrites every page together
+// with its digest, keeping full-map verification available without ever making
+// a single-bit mutation cost more than one page.
+fn write_commit_map_pages(
+    file: &mut File,
+    map_offset: u64,
+    digest_offset: Option<u64>,
+    bits: &SparseBitmap,
+) -> Result<()> {
+    for page in 0..bits.page_count {
+        let bytes = bits.page_bytes(page)?;
+        if let Some(base) = digest_offset {
+            write_page_digest(
+                file,
+                page_digest_offset(base, page)?,
+                crc32_bytes(bytes)?,
+                PAGE_STATE_INITIALIZED,
+            )?;
+        }
+        let offset = page
+            .checked_mul(BITMAP_PAGE_BYTES)
+            .and_then(|delta| map_offset.checked_add(delta))
+            .ok_or(Error::InvalidMatrixLayout)?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(bytes)?;
+    }
+    Ok(())
 }
 
 fn update_cell_crc(
@@ -1651,10 +2517,14 @@ fn apply_cell_crc_valid(
     block_index: usize,
     update: BitmapByteUpdate,
 ) -> Result<()> {
+    let cost = layout.blocks[block_index]
+        .crc_valid_bits
+        .materialisation_cost(update.byte_index, update.byte_value)?;
+    layout.charge_resident_bitmap(cost)?;
     write_bitmap_byte(file, &update)?;
-    *Arc::make_mut(&mut layout.blocks[block_index].crc_valid_bits)
-        .get_mut(update.byte_index)
-        .ok_or(Error::InvalidMatrixLayout)? = update.byte_value;
+    layout.blocks[block_index]
+        .crc_valid_bits
+        .set_byte(update.byte_index, update.byte_value)?;
     Ok(())
 }
 
@@ -1668,6 +2538,18 @@ fn verify_cell_crc(
     let Some(crc_offset) = layout.blocks[block_index].crc_offset else {
         return Ok(());
     };
+    // PERF-02: the per-cell checksum region is no longer initialised at create,
+    // so the validity bit is the authority on whether a stored checksum exists.
+    // Without it a never-written cell would be checked against a zero extent.
+    if layout.blocks[block_index].crc_valid_offset.is_some()
+        && !layout.blocks[block_index].crc_valid_bits.get(ordinal)?
+    {
+        return Err(Error::MatrixChecksumMismatch {
+            offset: layout.slot_offset(block_index, ordinal)?,
+            expected: 0,
+            actual: crc32_bytes(payload)?,
+        });
+    }
     let expected = read_crc_at(file, indexed_crc_offset(crc_offset, ordinal)?)?;
     let actual = crc32_bytes(payload)?;
     if expected != actual {
@@ -1724,14 +2606,10 @@ fn crc32_file_range(_file: &mut File, _offset: u64, _len: u64) -> Result<u32> {
     Err(Error::IntegrityFeatureDisabled)
 }
 
+// The set-bit total is maintained incrementally by `SparseBitmap`, so progress
+// and resume reporting no longer scan the whole category per call.
 fn count_committed(commit: &MatrixCommitLayout) -> Result<u64> {
-    let mut count = 0u64;
-    for ordinal in 0..commit.bit_count {
-        if get_bit(&commit.bits, ordinal)? {
-            count += 1;
-        }
-    }
-    Ok(count)
+    Ok(commit.bits.ones())
 }
 
 fn dimension_values(
@@ -1890,15 +2768,6 @@ fn matrix_block_bitmap_len(spec: FormatSpec, cell_counts: &HashMap<String, u64>)
     })
 }
 
-fn matrix_resident_bitmap_len(commit_map_len: u64, block_bitmap_len: u64) -> Result<u64> {
-    block_bitmap_len
-        .checked_mul(2)
-        .and_then(|write_maps| write_maps.checked_add(commit_map_len))
-        .ok_or(Error::ResourceArithmeticOverflow {
-            resource: ReadLimitKey::MatrixBitmapBytes.resource(),
-        })
-}
-
 fn matrix_accounted_crc_len(
     crc_enabled: bool,
     region_crc_len: u64,
@@ -1915,7 +2784,7 @@ fn matrix_accounted_crc_len(
     }
 }
 
-fn zero_commit_bitmaps(commit_plans: &[CommitPlan]) -> Result<Vec<Vec<u8>>> {
+fn zero_commit_bitmaps(commit_plans: &[CommitPlan]) -> Result<Vec<SparseBitmap>> {
     let mut bitmaps = Vec::new();
     try_reserve_vec(
         &mut bitmaps,
@@ -1923,7 +2792,7 @@ fn zero_commit_bitmaps(commit_plans: &[CommitPlan]) -> Result<Vec<Vec<u8>>> {
         ReadLimitKey::MatrixBitmapBytes.resource(),
     )?;
     for (_, _, bit_count) in commit_plans {
-        bitmaps.push(filled_bytes(bit_bytes(*bit_count)?, 0)?);
+        bitmaps.push(SparseBitmap::new(*bit_count)?);
     }
     Ok(bitmaps)
 }
@@ -1932,7 +2801,7 @@ fn zero_crc_valid_bitmaps(
     spec: FormatSpec,
     crc_enabled: bool,
     block_offsets: &HashMap<u32, (u64, u64, u64)>,
-) -> Result<HashMap<u32, Vec<u8>>> {
+) -> Result<HashMap<u32, SparseBitmap>> {
     let mut bitmaps = HashMap::new();
     if !crc_enabled {
         return Ok(bitmaps);
@@ -1946,7 +2815,7 @@ fn zero_crc_valid_bitmaps(
         let (_, _, cell_count) = *block_offsets
             .get(&block.block_id)
             .ok_or(Error::MatrixBlockMissing(block.block_id))?;
-        bitmaps.insert(block.block_id, filled_bytes(bit_bytes(cell_count)?, 0)?);
+        bitmaps.insert(block.block_id, SparseBitmap::new(cell_count)?);
     }
     Ok(bitmaps)
 }
@@ -2031,13 +2900,13 @@ fn layout_from_parts(
     commit_offsets: &HashMap<String, (u64, u64)>,
     block_offsets: &HashMap<u32, (u64, u64, u64)>,
     aux_offsets: &HashMap<String, (u64, u64)>,
-    commit_bits: Vec<Vec<u8>>,
+    commit_bits: Vec<SparseBitmap>,
     crc: Option<MatrixCrcLayout>,
-    mut crc_valid_bits: HashMap<u32, Vec<u8>>,
+    mut crc_valid_bits: HashMap<u32, SparseBitmap>,
     mut commit_findings: HashMap<String, MatrixRecoveryFinding>,
     crc_findings: Vec<MatrixRecoveryFinding>,
     append_log_start: u64,
-    mut resident_bitmap_bytes: u64,
+    resident_bitmap_bytes: u64,
 ) -> Result<MatrixLayout> {
     if commit_bits.len() != commit_plans.len() {
         return Err(Error::InvalidMatrixLayout);
@@ -2055,24 +2924,20 @@ fn layout_from_parts(
         let (map_offset, map_len) = *commit_offsets
             .get(name)
             .ok_or_else(|| Error::MatrixCommitMissing(name.clone()))?;
-        if usize_to_u64(raw_bits.len())? != map_len {
+        if raw_bits.byte_len != map_len {
             return Err(Error::InvalidMatrixLayout);
         }
         let quarantine_finding = commit_findings.remove(name);
+        // Quarantine retains the raw map that the load already charged and
+        // installs an empty replacement beside it, so it takes no further
+        // resident bytes. The charge that admits it happened page by page as
+        // the map was read.
         let (bits, quarantined_raw_bits) = if quarantine_finding.is_some() {
-            resident_bitmap_bytes = resident_bitmap_bytes.checked_add(map_len).ok_or(
-                Error::ResourceArithmeticOverflow {
-                    resource: ReadLimitKey::MatrixBitmapBytes.resource(),
-                },
-            )?;
             spec.read_limits
                 .check(ReadLimitKey::MatrixBitmapBytes, resident_bitmap_bytes)?;
-            (
-                Arc::new(filled_bytes(map_len, 0)?),
-                Some(Arc::new(raw_bits)),
-            )
+            (SparseBitmap::new(*bit_count)?, Some(raw_bits))
         } else {
-            (Arc::new(raw_bits), None)
+            (raw_bits, None)
         };
         commits.push(MatrixCommitLayout {
             name: name.clone(),
@@ -2082,12 +2947,13 @@ fn layout_from_parts(
             bits,
             quarantined_raw_bits,
             quarantine_finding,
-            crc_offset: crc
+            digest_offset: crc
                 .as_ref()
                 .map(|crc| {
-                    crc.commit_crc_offset(
-                        u64::try_from(commit_index).map_err(|_| Error::InvalidMatrixLayout)?,
-                    )
+                    crc.commit_digest_offsets
+                        .get(commit_index)
+                        .copied()
+                        .ok_or(Error::InvalidMatrixLayout)
                 })
                 .transpose()?,
         });
@@ -2117,13 +2983,12 @@ fn layout_from_parts(
             Some(_) => crc_valid_bits
                 .remove(&block.block_id)
                 .ok_or(Error::InvalidMatrixLayout)?,
-            None => Vec::new(),
+            None => SparseBitmap::new(0)?,
         };
-        if crc.is_some() && usize_to_u64(crc_valid_bits_for_block.len())? != crc_valid_len {
+        if crc.is_some() && crc_valid_bits_for_block.byte_len != crc_valid_len {
             return Err(Error::InvalidMatrixLayout);
         }
-        let written_bits = filled_bytes(crc_valid_len, 0xFF)?;
-        let current_write_bits = filled_bytes(crc_valid_len, 0)?;
+        let current_write_bits = SparseBitmap::new(cell_count)?;
         blocks.push(MatrixBlockLayout {
             block_id: block.block_id,
             dimensions: [
@@ -2135,15 +3000,24 @@ fn layout_from_parts(
             cell_count,
             crc_offset: crc
                 .as_ref()
-                .map(|crc| crc.block_crc_offset(spec, block_offsets, block_index))
+                .map(|crc| {
+                    crc.block_crc_offsets
+                        .get(block_index)
+                        .copied()
+                        .ok_or(Error::InvalidMatrixLayout)
+                })
                 .transpose()?,
             crc_valid_offset: crc
                 .as_ref()
-                .map(|crc| crc.block_valid_offset(spec, block_offsets, block_index))
+                .map(|crc| {
+                    crc.block_valid_offsets
+                        .get(block_index)
+                        .copied()
+                        .ok_or(Error::InvalidMatrixLayout)
+                })
                 .transpose()?,
-            crc_valid_bits: Arc::new(crc_valid_bits_for_block),
-            written_bits: Arc::new(written_bits),
-            current_write_bits: Arc::new(current_write_bits),
+            crc_valid_bits: crc_valid_bits_for_block,
+            current_write_bits,
         });
     }
     if !crc_valid_bits.is_empty() {
@@ -2164,7 +3038,7 @@ fn layout_from_parts(
             byte_len,
         });
     }
-    Ok(MatrixLayout {
+    let layout = MatrixLayout {
         dimensions,
         commits,
         blocks,
@@ -2174,91 +3048,9 @@ fn layout_from_parts(
         read_limits: spec.read_limits,
         resident_bitmap_bytes,
         fatal_access_blocked,
-    })
-}
-
-impl MatrixCrcLayout {
-    fn commit_crc_offset(&self, commit_index: u64) -> Result<u64> {
-        self.region_offset
-            .checked_add(MCRC_HEADER_LEN)
-            .and_then(|offset| {
-                commit_index
-                    .checked_mul(CRC_LEN)
-                    .and_then(|delta| offset.checked_add(delta))
-            })
-            .ok_or(Error::InvalidMatrixLayout)
-    }
-
-    fn block_crc_offset(
-        &self,
-        spec: FormatSpec,
-        block_offsets: &HashMap<u32, (u64, u64, u64)>,
-        block_index: usize,
-    ) -> Result<u64> {
-        let mut offset = self.slot_crc_base(spec)?;
-        for block in &spec.matrix_blocks[..block_index] {
-            let (_, _, cell_count) = *block_offsets
-                .get(&block.block_id)
-                .ok_or(Error::MatrixBlockMissing(block.block_id))?;
-            offset = offset
-                .checked_add(
-                    cell_count
-                        .checked_mul(CRC_LEN)
-                        .ok_or(Error::InvalidMatrixLayout)?,
-                )
-                .ok_or(Error::InvalidMatrixLayout)?;
-        }
-        Ok(offset)
-    }
-
-    fn block_valid_offset(
-        &self,
-        spec: FormatSpec,
-        block_offsets: &HashMap<u32, (u64, u64, u64)>,
-        block_index: usize,
-    ) -> Result<u64> {
-        let mut offset = self.slot_valid_base(spec, block_offsets)?;
-        for block in &spec.matrix_blocks[..block_index] {
-            let (_, _, cell_count) = *block_offsets
-                .get(&block.block_id)
-                .ok_or(Error::MatrixBlockMissing(block.block_id))?;
-            offset = offset
-                .checked_add(bit_bytes(cell_count)?)
-                .ok_or(Error::InvalidMatrixLayout)?;
-        }
-        Ok(offset)
-    }
-
-    fn slot_crc_base(&self, spec: FormatSpec) -> Result<u64> {
-        let commit_crc_len = usize_to_u64(spec.matrix_commits.len())?
-            .checked_mul(CRC_LEN)
-            .ok_or(Error::InvalidMatrixLayout)?;
-        self.region_offset
-            .checked_add(MCRC_HEADER_LEN)
-            .and_then(|value| value.checked_add(commit_crc_len))
-            .ok_or(Error::InvalidMatrixLayout)
-    }
-
-    fn slot_valid_base(
-        &self,
-        spec: FormatSpec,
-        block_offsets: &HashMap<u32, (u64, u64, u64)>,
-    ) -> Result<u64> {
-        let mut offset = self.slot_crc_base(spec)?;
-        for block in spec.matrix_blocks {
-            let (_, _, cell_count) = *block_offsets
-                .get(&block.block_id)
-                .ok_or(Error::MatrixBlockMissing(block.block_id))?;
-            offset = offset
-                .checked_add(
-                    cell_count
-                        .checked_mul(CRC_LEN)
-                        .ok_or(Error::InvalidMatrixLayout)?,
-                )
-                .ok_or(Error::InvalidMatrixLayout)?;
-        }
-        Ok(offset)
-    }
+    };
+    record_open_resident_bitmap_bytes(&layout);
+    Ok(layout)
 }
 
 fn matrix_crc_enabled(spec: FormatSpec) -> Result<bool> {
@@ -2287,13 +3079,19 @@ fn validate_crc_presence(enabled: bool, header: &MatrixHeaderFields) -> Result<(
     }
 }
 
-fn crc_table_len(spec: FormatSpec, cell_counts: &HashMap<String, u64>) -> Result<u64> {
-    let commit_crc_len = usize_to_u64(spec.matrix_commits.len())?
-        .checked_mul(CRC_LEN)
-        .ok_or(Error::InvalidMatrixLayout)?;
-    let mut len = MCRC_HEADER_LEN
-        .checked_add(commit_crc_len)
-        .ok_or(Error::InvalidMatrixLayout)?;
+// Region layout (MCRC v2): header, then one page-digest array per commit
+// category, then the per-cell checksum array and validity bitmap of each block.
+fn crc_table_len(
+    spec: FormatSpec,
+    commit_plans: &[CommitPlan],
+    cell_counts: &HashMap<String, u64>,
+) -> Result<u64> {
+    let mut len = MCRC_HEADER_LEN;
+    for (_, _, bit_count) in commit_plans {
+        len = len
+            .checked_add(page_digest_len(bit_bytes(*bit_count)?)?)
+            .ok_or(Error::InvalidMatrixLayout)?;
+    }
     for block in spec.matrix_blocks {
         let cell_count = *cell_counts
             .get(block.category)
@@ -2325,41 +3123,71 @@ fn crc_layout_from_parts(
     if region_crc_off == 0 || region_crc_len < MCRC_HEADER_LEN {
         return Err(Error::InvalidMatrixLayout);
     }
-    let commit_crc_len = usize_to_u64(commit_plans.len())?
-        .checked_mul(CRC_LEN)
+    let mut cursor = region_crc_off
+        .checked_add(MCRC_HEADER_LEN)
         .ok_or(Error::InvalidMatrixLayout)?;
-    let mut expected_len = MCRC_HEADER_LEN
-        .checked_add(commit_crc_len)
-        .ok_or(Error::InvalidMatrixLayout)?;
+    let mut commit_digest_offsets = Vec::new();
+    try_reserve_vec(
+        &mut commit_digest_offsets,
+        commit_plans.len(),
+        MATRIX_DESCRIPTOR_RESOURCE,
+    )?;
+    for (_, _, bit_count) in commit_plans {
+        commit_digest_offsets.push(cursor);
+        cursor = cursor
+            .checked_add(page_digest_len(bit_bytes(*bit_count)?)?)
+            .ok_or(Error::InvalidMatrixLayout)?;
+    }
+    let mut block_crc_offsets = Vec::new();
+    try_reserve_vec(
+        &mut block_crc_offsets,
+        spec.matrix_blocks.len(),
+        MATRIX_DESCRIPTOR_RESOURCE,
+    )?;
     for block in spec.matrix_blocks {
         let (_, _, cell_count) = *block_offsets
             .get(&block.block_id)
             .ok_or(Error::MatrixBlockMissing(block.block_id))?;
-        expected_len = expected_len
+        block_crc_offsets.push(cursor);
+        cursor = cursor
             .checked_add(
                 cell_count
                     .checked_mul(CRC_LEN)
                     .ok_or(Error::InvalidMatrixLayout)?,
             )
             .ok_or(Error::InvalidMatrixLayout)?;
-        expected_len = expected_len
+    }
+    let mut block_valid_offsets = Vec::new();
+    try_reserve_vec(
+        &mut block_valid_offsets,
+        spec.matrix_blocks.len(),
+        MATRIX_DESCRIPTOR_RESOURCE,
+    )?;
+    for block in spec.matrix_blocks {
+        let (_, _, cell_count) = *block_offsets
+            .get(&block.block_id)
+            .ok_or(Error::MatrixBlockMissing(block.block_id))?;
+        block_valid_offsets.push(cursor);
+        cursor = cursor
             .checked_add(bit_bytes(cell_count)?)
             .ok_or(Error::InvalidMatrixLayout)?;
     }
+    let expected_len = cursor
+        .checked_sub(region_crc_off)
+        .ok_or(Error::InvalidMatrixLayout)?;
     if region_crc_len != expected_len {
         return Err(Error::InvalidMatrixLayout);
     }
     Ok(Some(MatrixCrcLayout {
         region_offset: region_crc_off,
-        region_len: region_crc_len,
+        commit_digest_offsets,
+        block_crc_offsets,
+        block_valid_offsets,
     }))
 }
 
-fn write_crc_table(
+fn write_crc_header(
     file: &mut File,
-    spec: FormatSpec,
-    commit_plans: &[CommitPlan],
-    block_offsets: &HashMap<u32, (u64, u64, u64)>,
     dimension_table: &[u8],
     block_table: &[u8],
     category_table: &[u8],
@@ -2371,59 +3199,36 @@ fn write_crc_table(
         &crc32_segments(&[dimension_table, block_table, category_table])?.to_le_bytes(),
     );
     file.write_all(&header)?;
-    for (_, _, bit_count) in commit_plans {
-        file.write_all(&crc32_zeroes(bit_bytes(*bit_count)?)?.to_le_bytes())?;
-    }
-    for block in spec.matrix_blocks {
-        let (_, _, cell_count) = *block_offsets
-            .get(&block.block_id)
-            .ok_or(Error::MatrixBlockMissing(block.block_id))?;
-        let zero_crc = crc32_zeroes(block.slot_stride)?;
-        write_repeated_u32(file, zero_crc, cell_count)?;
-    }
-    for block in spec.matrix_blocks {
-        let (_, _, cell_count) = *block_offsets
-            .get(&block.block_id)
-            .ok_or(Error::MatrixBlockMissing(block.block_id))?;
-        write_zeros(file, bit_bytes(cell_count)?)?;
-    }
     Ok(())
 }
 
-fn verify_crc_table(
+fn verify_crc_header(
     file: &mut File,
     crc: Option<&MatrixCrcLayout>,
     metadata_segments: &[&[u8]],
-    commit_plans: &[StoredCommitPlan],
-    commit_bits: &[Vec<u8>],
+    commit_count: usize,
 ) -> Result<MatrixCrcVerification> {
     let Some(crc) = crc else {
         return Ok(MatrixCrcVerification::default());
     };
-    let commit_crc_len = usize_to_u64(commit_plans.len())?
-        .checked_mul(CRC_LEN)
-        .ok_or(Error::InvalidMatrixLayout)?;
-    let prefix_len = MCRC_HEADER_LEN
-        .checked_add(commit_crc_len)
-        .ok_or(Error::InvalidMatrixLayout)?;
-    if prefix_len > crc.region_len {
-        return Err(Error::InvalidMatrixLayout);
-    }
     file.seek(SeekFrom::Start(crc.region_offset))?;
     let mut header = [0u8; MCRC_HEADER_LEN as usize];
     file.read_exact(&mut header)?;
-    if &header[0..4] != MCRC_MAGIC
-        || u16::from_le_bytes(header[4..6].try_into().expect("slice")) != MCRC_VERSION
-        || header[6..8] != [0; 2]
-        || header[12..16] != [0; 4]
-    {
+    if &header[0..4] != MCRC_MAGIC || header[6..8] != [0; 2] || header[12..16] != [0; 4] {
         return Err(Error::InvalidMatrixLayout);
+    }
+    let version = u16::from_le_bytes(header[4..6].try_into().expect("slice"));
+    if version != MCRC_VERSION {
+        return Err(Error::FormatVersionMismatch {
+            expected: MCRC_VERSION,
+            actual: version,
+        });
     }
 
     let mut verification = MatrixCrcVerification::default();
     try_reserve_map(
         &mut verification.commit_findings,
-        commit_plans.len(),
+        commit_count,
         MATRIX_DESCRIPTOR_RESOURCE,
     )?;
     let stored_metadata = u32::from_le_bytes(header[8..12].try_into().expect("slice"));
@@ -2437,38 +3242,147 @@ fn verify_crc_table(
             ),
         });
     }
-
-    if commit_bits.len() != commit_plans.len() {
-        return Err(Error::InvalidMatrixLayout);
-    }
-    for (index, ((name, _, _, _, map_len), bits)) in
-        commit_plans.iter().zip(commit_bits).enumerate()
-    {
-        if usize_to_u64(bits.len())? != *map_len {
-            return Err(Error::InvalidMatrixLayout);
-        }
-        let stored = read_crc_at(file, crc.commit_crc_offset(usize_to_u64(index)?)?)?;
-        let actual = crc32_bytes(bits)?;
-        if stored != actual {
-            let finding = MatrixRecoveryFinding {
-                kind: MatrixCorruptionKind::CommitMap,
-                severity: MatrixCorruptionSeverity::Recoverable,
-                message: format!(
-                    "matrix commit map crc mismatch for {name}: expected {stored:#010x}, got {actual:#010x}"
-                ),
-            };
-            verification.commit_findings.insert(name.clone(), finding);
-        }
-    }
     Ok(verification)
 }
 
-fn read_crc_valid_bits(
+/// Streams a bitmap region one page at a time, materialising only the pages
+/// that carry a set bit.
+///
+/// With `digest_base`, each page is authenticated against its stored digest:
+/// `PAGE_STATE_UNINITIALIZED` asserts the page was never published and must
+/// still read as zero, while `PAGE_STATE_INITIALIZED` asserts the recorded
+/// checksum. The two states are distinct on disk, so a page that was written
+/// with zeros is never confused with one that was never written. Without a
+/// digest base the region is unauthenticated, exactly as before this format
+/// version, and the load only decides residency.
+///
+/// PERF-02: a page is skipped without any I/O when the filesystem proves that
+/// neither the page nor its digest slot has ever been written. Such a page is
+/// `PAGE_STATE_UNINITIALIZED` holding zeros, which is precisely what reading it
+/// would have established, so skipping changes neither residency nor the set of
+/// reported findings — a stray byte written into an untouched page allocates it
+/// and is therefore still read and still reported.
+fn load_paged_bitmap(
+    file: &mut File,
+    base_offset: u64,
+    bit_count: u64,
+    digest_base: Option<u64>,
+    extents: Option<&AllocatedExtents>,
+    budget: &mut ResidentBitmapBudget,
+    resource: &'static str,
+) -> Result<(SparseBitmap, bool)> {
+    let mut bits = SparseBitmap::new(bit_count)?;
+    let mut intact = true;
+    for page in 0..bits.page_count {
+        let len = bits.page_len(page)?;
+        let offset = page
+            .checked_mul(BITMAP_PAGE_BYTES)
+            .and_then(|delta| base_offset.checked_add(delta))
+            .ok_or(Error::InvalidMatrixLayout)?;
+        let digest_offset = digest_base
+            .map(|base| page_digest_offset(base, page))
+            .transpose()?;
+        if !range_may_hold_data(extents, offset, len) {
+            // The page is a hole, so it reads as zero without being read. Its
+            // digest still has to agree, because a digest recorded for a page
+            // whose bytes never reached the disk is a torn commit and must stay
+            // detectable. Where the digest slot is itself a hole the page costs
+            // no I/O at all.
+            let Some(digest_offset) = digest_offset else {
+                continue;
+            };
+            if !range_may_hold_data(extents, digest_offset, PAGE_DIGEST_LEN) {
+                continue;
+            }
+            let zeros =
+                &ZERO_PAGE[..usize::try_from(len).map_err(|_| Error::InvalidMatrixLayout)?];
+            let (stored, state) = read_page_digest(file, digest_offset)?;
+            count_open_bitmap_bytes_read(PAGE_DIGEST_LEN);
+            intact &= match state {
+                PAGE_STATE_UNINITIALIZED => stored == 0,
+                PAGE_STATE_INITIALIZED => crc32_bytes(zeros)? == stored,
+                _ => false,
+            };
+            continue;
+        }
+        let bytes = read_range(file, offset, len, resource)?;
+        count_open_bitmap_bytes_read(len);
+        if let Some(digest_offset) = digest_offset {
+            let (stored, state) = read_page_digest(file, digest_offset)?;
+            count_open_bitmap_bytes_read(PAGE_DIGEST_LEN);
+            let page_ok = match state {
+                PAGE_STATE_UNINITIALIZED => stored == 0 && bytes.iter().all(|byte| *byte == 0),
+                PAGE_STATE_INITIALIZED => crc32_bytes(&bytes)? == stored,
+                _ => false,
+            };
+            intact &= page_ok;
+        }
+        if bytes.iter().any(|byte| *byte != 0) {
+            budget.charge(len)?;
+        }
+        bits.insert_loaded_page(page, bytes)?;
+    }
+    Ok((bits, intact))
+}
+
+fn load_commit_bitmaps(
+    file: &mut File,
+    crc: Option<&MatrixCrcLayout>,
+    commits: &[StoredCommitPlan],
+    extents: Option<&AllocatedExtents>,
+    budget: &mut ResidentBitmapBudget,
+    verification: &mut MatrixCrcVerification,
+) -> Result<Vec<SparseBitmap>> {
+    let mut bitmaps = Vec::new();
+    try_reserve_vec(
+        &mut bitmaps,
+        commits.len(),
+        ReadLimitKey::MatrixBitmapBytes.resource(),
+    )?;
+    for (index, (name, _, bit_count, map_offset, map_len)) in commits.iter().enumerate() {
+        if bit_bytes(*bit_count)? != *map_len {
+            return Err(Error::InvalidMatrixLayout);
+        }
+        let digest_base = crc
+            .map(|crc| {
+                crc.commit_digest_offsets
+                    .get(index)
+                    .copied()
+                    .ok_or(Error::InvalidMatrixLayout)
+            })
+            .transpose()?;
+        let (bits, intact) = load_paged_bitmap(
+            file,
+            *map_offset,
+            *bit_count,
+            digest_base,
+            extents,
+            budget,
+            ReadLimitKey::MatrixBitmapBytes.resource(),
+        )?;
+        if !intact {
+            verification.commit_findings.insert(
+                name.clone(),
+                MatrixRecoveryFinding {
+                    kind: MatrixCorruptionKind::CommitMap,
+                    severity: MatrixCorruptionSeverity::Recoverable,
+                    message: format!("matrix commit map page crc mismatch for {name}"),
+                },
+            );
+        }
+        bitmaps.push(bits);
+    }
+    Ok(bitmaps)
+}
+
+fn load_crc_valid_bits(
     spec: FormatSpec,
     file: &mut File,
     crc: Option<&MatrixCrcLayout>,
     block_offsets: &HashMap<u32, (u64, u64, u64)>,
-) -> Result<HashMap<u32, Vec<u8>>> {
+    extents: Option<&AllocatedExtents>,
+    budget: &mut ResidentBitmapBudget,
+) -> Result<HashMap<u32, SparseBitmap>> {
     let Some(crc) = crc else {
         return Ok(HashMap::new());
     };
@@ -2482,16 +3396,21 @@ fn read_crc_valid_bits(
         let (_, _, cell_count) = *block_offsets
             .get(&block.block_id)
             .ok_or(Error::MatrixBlockMissing(block.block_id))?;
-        let offset = crc.block_valid_offset(spec, block_offsets, block_index)?;
-        valid_bits.insert(
-            block.block_id,
-            read_range(
-                file,
-                offset,
-                bit_bytes(cell_count)?,
-                ReadLimitKey::MatrixCrcBytes.resource(),
-            )?,
-        );
+        let offset = crc
+            .block_valid_offsets
+            .get(block_index)
+            .copied()
+            .ok_or(Error::InvalidMatrixLayout)?;
+        let (bits, _) = load_paged_bitmap(
+            file,
+            offset,
+            cell_count,
+            None,
+            extents,
+            budget,
+            ReadLimitKey::MatrixCrcBytes.resource(),
+        )?;
+        valid_bits.insert(block.block_id, bits);
     }
     Ok(valid_bits)
 }
@@ -2554,12 +3473,16 @@ fn read_header(file: &mut File, header_len: u64) -> Result<MatrixHeaderFields> {
         return Err(Error::InvalidMatrixLayout);
     }
     let version = u16::from_le_bytes(bytes[4..6].try_into().expect("slice"));
+    // A version-1 artifact describes the pre-paging physical representation and
+    // is stale-regenerable, not readable under version 2.
+    if version != VMAT_VERSION {
+        return Err(Error::FormatVersionMismatch {
+            expected: VMAT_VERSION,
+            actual: version,
+        });
+    }
     let header_len = u32::from_le_bytes(bytes[8..12].try_into().expect("slice"));
-    if version != VMAT_VERSION
-        || header_len != VMAT_HEADER_LEN
-        || bytes[6..8] != [0; 2]
-        || bytes[128..160] != [0; 32]
-    {
+    if header_len != VMAT_HEADER_LEN || bytes[6..8] != [0; 2] || bytes[128..160] != [0; 32] {
         return Err(Error::InvalidMatrixLayout);
     }
     let mut pos = 12;
@@ -2865,7 +3788,7 @@ fn validate_dimension_derived_lengths(
     cell_counts: &HashMap<String, u64>,
 ) -> Result<()> {
     let expected_crc_len = if crc_enabled {
-        crc_table_len(spec, cell_counts)?
+        crc_table_len(spec, commit_plans, cell_counts)?
     } else {
         0
     };
@@ -2917,24 +3840,6 @@ fn validate_commit_table(
         return Err(Error::InvalidMatrixLayout);
     }
     Ok(offsets)
-}
-
-fn read_commit_bitmaps(file: &mut File, commits: &[StoredCommitPlan]) -> Result<Vec<Vec<u8>>> {
-    let mut bitmaps = Vec::new();
-    try_reserve_vec(
-        &mut bitmaps,
-        commits.len(),
-        ReadLimitKey::MatrixBitmapBytes.resource(),
-    )?;
-    for (_, _, _, map_offset, map_len) in commits {
-        bitmaps.push(read_range(
-            file,
-            *map_offset,
-            *map_len,
-            ReadLimitKey::MatrixBitmapBytes.resource(),
-        )?);
-    }
-    Ok(bitmaps)
 }
 
 fn validate_layout_ranges(
@@ -3154,26 +4059,6 @@ fn write_zeros(file: &mut File, len: u64) -> Result<()> {
     Ok(())
 }
 
-fn write_repeated_u32(file: &mut File, value: u32, count: u64) -> Result<()> {
-    const ENTRIES_PER_CHUNK: usize = 2048;
-    let value = value.to_le_bytes();
-    let mut chunk = [0u8; ENTRIES_PER_CHUNK * 4];
-    for entry in chunk.chunks_exact_mut(4) {
-        entry.copy_from_slice(&value);
-    }
-    let mut remaining = count;
-    while remaining > 0 {
-        let entries = remaining.min(ENTRIES_PER_CHUNK as u64);
-        let bytes = usize::try_from(entries)
-            .map_err(|_| Error::InvalidMatrixLayout)?
-            .checked_mul(4)
-            .ok_or(Error::InvalidMatrixLayout)?;
-        file.write_all(&chunk[..bytes])?;
-        remaining -= entries;
-    }
-    Ok(())
-}
-
 fn bit_bytes(bit_count: u64) -> Result<u64> {
     bit_count
         .checked_add(7)
@@ -3279,6 +4164,119 @@ impl<'a> Cursor<'a> {
         try_reserve_vec(&mut owned, len, MATRIX_DESCRIPTOR_RESOURCE)?;
         owned.extend_from_slice(bytes);
         String::from_utf8(owned).map_err(|_| Error::InvalidMatrixLayout)
+    }
+}
+
+#[cfg(test)]
+mod allocated_extents_tests {
+    use super::*;
+
+    fn extents(ranges: &[(u64, u64)]) -> AllocatedExtents {
+        AllocatedExtents {
+            ranges: ranges.to_vec(),
+        }
+    }
+
+    #[test]
+    fn overlap_is_exact_at_every_boundary() {
+        let map = extents(&[(4096, 8192), (16384, 20480)]);
+        // Fully inside a hole.
+        assert!(!map.may_hold_data(0, 4096));
+        assert!(!map.may_hold_data(8192, 8192));
+        assert!(!map.may_hold_data(20480, 4096));
+        // Touching, straddling, and contained by an allocated range.
+        assert!(map.may_hold_data(4095, 2));
+        assert!(map.may_hold_data(4096, 1));
+        assert!(map.may_hold_data(8191, 1));
+        assert!(map.may_hold_data(0, 8192));
+        assert!(map.may_hold_data(16384, 4096));
+        // Beyond every range.
+        assert!(!map.may_hold_data(1 << 40, 4096));
+        // A zero-length range reads nothing.
+        assert!(!map.may_hold_data(4096, 0));
+    }
+
+    #[test]
+    fn an_empty_map_proves_every_range_is_a_hole() {
+        assert!(!extents(&[]).may_hold_data(0, u64::MAX));
+    }
+
+    #[test]
+    fn a_length_that_overflows_is_treated_as_unproven() {
+        assert!(extents(&[]).may_hold_data(u64::MAX, 2));
+    }
+}
+
+#[cfg(test)]
+mod sparse_bitmap_tests {
+    use super::*;
+
+    #[test]
+    fn pages_materialize_only_when_they_carry_a_set_bit() {
+        let bits = 3 * BITMAP_PAGE_BYTES * 8;
+        let mut map = SparseBitmap::new(bits).expect("bitmap");
+        assert_eq!(map.page_count, 3);
+        assert_eq!(map.resident_bytes(), 0);
+
+        // Clearing an already-clear bit must not fault a page in.
+        map.set(0, false).expect("clear");
+        assert_eq!(map.resident_bytes(), 0);
+
+        map.set(bits - 1, true).expect("set");
+        assert_eq!(map.resident_bytes(), BITMAP_PAGE_BYTES);
+        assert_eq!(map.ones(), 1);
+        assert!(map.get(bits - 1).expect("get"));
+        assert!(!map.get(0).expect("get"));
+    }
+
+    #[test]
+    fn set_bit_totals_track_every_transition() {
+        let mut map = SparseBitmap::new(64).expect("bitmap");
+        for ordinal in 0..64 {
+            map.set(ordinal, true).expect("set");
+        }
+        assert_eq!(map.ones(), 64);
+        for ordinal in 0..64 {
+            map.set(ordinal, true).expect("idempotent set");
+        }
+        assert_eq!(map.ones(), 64);
+        for ordinal in 0..32 {
+            map.set(ordinal, false).expect("clear");
+        }
+        assert_eq!(map.ones(), 32);
+        map.clear();
+        assert_eq!(map.ones(), 0);
+        assert_eq!(map.resident_bytes(), 0);
+    }
+
+    #[test]
+    fn a_short_trailing_page_keeps_its_exact_length() {
+        // 8 bits past a page boundary: the second page holds a single byte.
+        let mut map = SparseBitmap::new(BITMAP_PAGE_BYTES * 8 + 8).expect("bitmap");
+        assert_eq!(map.page_count, 2);
+        assert_eq!(map.page_len(1).expect("page len"), 1);
+        assert_eq!(map.page_bytes(1).expect("page bytes").len(), 1);
+        map.set(BITMAP_PAGE_BYTES * 8, true).expect("set");
+        assert_eq!(map.resident_bytes(), 1);
+        assert_eq!(map.page_bytes(1).expect("page bytes"), &[1u8]);
+        assert!(map.get(BITMAP_PAGE_BYTES * 8 + 8).is_err());
+    }
+
+    #[test]
+    fn loading_an_all_zero_page_leaves_it_unmaterialized() {
+        let mut map = SparseBitmap::new(BITMAP_PAGE_BYTES * 8).expect("bitmap");
+        map.insert_loaded_page(0, vec![0; BITMAP_PAGE_BYTES as usize])
+            .expect("load zero page");
+        assert_eq!(map.resident_bytes(), 0);
+        assert_eq!(map.ones(), 0);
+
+        let mut bytes = vec![0; BITMAP_PAGE_BYTES as usize];
+        bytes[7] = 0b0000_0101;
+        map.insert_loaded_page(0, bytes).expect("load live page");
+        assert_eq!(map.resident_bytes(), BITMAP_PAGE_BYTES);
+        assert_eq!(map.ones(), 2);
+        assert!(map.get(56).expect("get"));
+        assert!(map.get(58).expect("get"));
     }
 }
 

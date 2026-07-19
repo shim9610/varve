@@ -6,26 +6,32 @@ use std::path::{Path, PathBuf};
 
 use crate::collections::{MaterializationBudget, ensure_registered_block};
 use crate::disk_index::{
-    DiskIndexBatchOptions, DiskIndexFrontier, DiskIndexMetadata, DiskIndexMode, DiskIndexOptions,
-    DiskIndexSnapshot, DiskIndexStore, DiskIndexTail, DiskIndexWriteBatch, batch_item_fixed_bytes,
+    DiskIndexBatchOptions, DiskIndexDigest, DiskIndexError, DiskIndexFrontier, DiskIndexMetadata,
+    DiskIndexMode, DiskIndexOptions, DiskIndexPrimaryGeneration, DiskIndexSnapshot, DiskIndexStore,
+    DiskIndexTail, DiskIndexWriteBatch, PRIMARY_GENERATION_WINDOW, batch_item_fixed_bytes,
     state_sidecar_path, tail_limit_for_spec,
 };
 use crate::file::{
     NativeStreamScanner, PreparedStreamRecord, ReplaceDurability, WriterLock,
+    fresh_stream_creation_nonce, prepare_stream_creation_nonce_record,
     prepare_stream_manifest_record, prepare_stream_tombstone_record, prepare_stream_user_record,
-    publish_temp_path_atomically, read_file_header, write_file_header,
+    publish_temp_path_atomically, read_file_header, read_stream_creation_nonce, write_file_header,
 };
 use crate::scan_control::{ScanCancelled, ScanProgressDriver};
 use crate::traits::KeyedBlockContract;
 use crate::{
-    AppendInfo, BlockEvent, BlockKind, CommitPolicy, Error, FormatSpec, IntegrityPolicy,
-    LayoutPreset, MANIFEST_BLOCK_ID, ManifestPolicy, ResourceLimits, Result, ScanOptions,
-    ScanProgress, ScanProgressOptions, SnapshotFile, TOMBSTONE_BLOCK_ID, VarveBlock,
+    AppendInfo, BlockEvent, BlockKind, CREATION_NONCE_BLOCK_ID, CommitPolicy, Error, FormatSpec,
+    IntegrityPolicy, LayoutPreset, MANIFEST_BLOCK_ID, ManifestPolicy, ResourceLimits, Result,
+    ScanOptions, ScanProgress, ScanProgressOptions, SnapshotFile, TOMBSTONE_BLOCK_ID, VarveBlock,
     VarveKeyedBlock,
 };
 
 const STREAM_WRITER_POISON_CONTEXT: &str = "stream";
-const INTERNAL_BLOCK_IDS: [u32; 2] = [MANIFEST_BLOCK_ID, TOMBSTONE_BLOCK_ID];
+const INTERNAL_BLOCK_IDS: [u32; 3] = [
+    MANIFEST_BLOCK_ID,
+    TOMBSTONE_BLOCK_ID,
+    CREATION_NONCE_BLOCK_ID,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamOptions {
@@ -190,7 +196,12 @@ where
         identity,
         checkpoint_frontier(&checkpoint),
         tail_limit_for_spec(reader.spec).map_err(state_error)?,
-    );
+    )
+    .with_primary_generation(primary_generation(
+        reader.spec,
+        &reader.snapshot,
+        checkpoint.logical_eof,
+    )?);
     progress.complete(&mut observer).map_err(scan_cancelled)?;
     // The checkpoint is only valid for the exact file object the retained
     // snapshot scanned. Re-resolve the pathname immediately before publishing
@@ -294,6 +305,7 @@ impl VarveStreamReader {
         let snapshot = store
             .begin_snapshot_with_mode(identity, DiskIndexMode::StateOnly, physical_len)
             .map_err(state_error)?;
+        verify_primary_generation(reader.spec, snapshot.primary_generation(), &reader.snapshot)?;
         reader.snapshot = reader.snapshot.with_len(snapshot.committed_eof())?;
         reader._state = Some(StreamReaderState {
             _snapshot: snapshot,
@@ -552,7 +564,12 @@ impl VarveStreamWriter {
             identity,
             checkpoint_frontier(&checkpoint),
             tail_limit_for_spec(writer.spec).map_err(state_error)?,
-        );
+        )
+        .with_primary_generation(primary_generation(
+            writer.spec,
+            &writer.snapshot,
+            writer.snapshot.len(),
+        )?);
         let store = create_state_store(
             &path,
             state_options(options),
@@ -628,6 +645,22 @@ impl VarveStreamWriter {
             poisoned: false,
             _lock: lock,
         };
+        // STO-01: stamp the per-create nonce as the very first record of the
+        // log, before anything else can be appended. It has to live inside the
+        // primary because an equal-length in-place rewrite preserves the OS
+        // object, the header bytes and the schema hash — everything except the
+        // primary's own content. One record at create; zero cost per append.
+        {
+            let sequence = writer.next_sequence()?;
+            let offset = writer.snapshot.len();
+            let record = prepare_stream_creation_nonce_record(
+                spec,
+                fresh_stream_creation_nonce(),
+                sequence,
+                offset,
+            )?;
+            writer.append_prepared(CREATION_NONCE_BLOCK_ID, record)?;
+        }
         if spec.manifest_policy == ManifestPolicy::Embedded {
             let sequence = writer.next_sequence()?;
             let offset = writer.snapshot.len();
@@ -651,7 +684,11 @@ impl VarveStreamWriter {
                         tail_limit_for_spec(spec).map_err(state_error)?,
                     )
                     .map_err(state_error)?;
-                Ok((stream_checkpoint_from_state(&state), store))
+                Ok((
+                    stream_checkpoint_from_state(&state),
+                    state.metadata.primary_generation,
+                    store,
+                ))
             })?;
         writer.state = Some(StreamWriterState::new(
             store,
@@ -667,7 +704,8 @@ impl VarveStreamWriter {
         load_checkpoint: impl FnOnce(
             crate::disk_index::DiskIndexIdentity,
             u64,
-        ) -> Result<(StreamCheckpoint, T)>,
+        )
+            -> Result<(StreamCheckpoint, DiskIndexPrimaryGeneration, T)>,
     ) -> Result<(Self, T)> {
         let spec = stream_spec(spec, options, false)?;
         let path = std::fs::canonicalize(path.as_ref())?;
@@ -677,7 +715,10 @@ impl VarveStreamWriter {
         let header_len = read_file_header(spec, &mut file)?;
         let physical_snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, physical_len)?;
         let identity = primary_identity(spec, &physical_snapshot)?;
-        let (checkpoint, loaded) = load_checkpoint(identity, physical_len)?;
+        let (checkpoint, generation, loaded) = load_checkpoint(identity, physical_len)?;
+        // STO-01: the sidecar must belong to this generation of the primary,
+        // not merely to the same file object with the same header bytes.
+        verify_primary_generation(spec, generation, &physical_snapshot)?;
         checkpoint.validate(spec, header_len, physical_len)?;
         file.seek(SeekFrom::Start(checkpoint.logical_eof))?;
         let snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, checkpoint.logical_eof)?;
@@ -722,6 +763,7 @@ impl VarveStreamWriter {
                 tail_limit_for_spec(spec).map_err(state_error)?,
             )
             .map_err(state_error)?;
+        verify_primary_generation(spec, guard.primary_generation(), &physical_snapshot)?;
         let checkpoint = stream_checkpoint_from_frontier(guard.frontier(), guard.tails());
         let base_eof = guard.base_eof();
         checkpoint.validate(spec, header_len, base_eof)?;
@@ -1154,9 +1196,23 @@ impl VarveStreamWriter {
     }
 
     fn commit_state_chunk(&mut self) -> Result<()> {
+        // STO-01: re-stamp the generation witness while its window is still
+        // filling. Once the window is full it is frozen for the file's life,
+        // so steady-state appends pay nothing here.
+        let pending = match self.state.as_ref().and_then(|state| state.batch.as_ref()) {
+            Some(batch) if batch.primary_generation().len < PRIMARY_GENERATION_WINDOW => Some(
+                primary_generation(self.spec, &self.snapshot, self.snapshot.len())?,
+            ),
+            _ => None,
+        };
         let Some(state) = self.state.as_mut() else {
             return Ok(());
         };
+        if let (Some(generation), Some(batch)) = (pending, state.batch.as_mut()) {
+            batch
+                .set_primary_generation(generation)
+                .map_err(state_error)?;
+        }
         let Some(batch) = state.batch.take() else {
             return Ok(());
         };
@@ -1431,6 +1487,81 @@ fn create_state_store(
         .map_err(state_error)
 }
 
+/// Computes the primary generation witness for `snapshot` (STO-01).
+///
+/// The witness has two independent parts:
+///
+/// * The **per-create nonce** stamped inside the primary at create. This is
+///   what makes the witness a true generation identity: an equal-length
+///   in-place rewrite preserves the OS object, the header bytes and the schema
+///   hash, but a primary created by a different `create` call carries a
+///   different nonce no matter how much content the two generations share.
+///   It is folded in explicitly rather than relied upon to fall inside the
+///   content window below, so the guarantee does not depend on record sizes.
+/// * A **content digest** over the first `min(eof, window)` bytes, bounded by
+///   [`PRIMARY_GENERATION_WINDOW`]. This is defence in depth against accidental
+///   truncation/overwrite of a primary that carries no nonce (legacy primaries,
+///   and primaries bootstrapped from a resident `VarveFile`). It is a CRC-based
+///   accident detector, not an adversary-resistant hash.
+///
+/// Both parts are bounded work: one small read of the leading window plus one
+/// bounded point read of the leading record, regardless of file size. This runs
+/// at create, at open, and on commits only while the window is still filling —
+/// never per record and never per lookup.
+pub(crate) fn primary_generation(
+    spec: FormatSpec,
+    snapshot: &SnapshotFile,
+    len: u64,
+) -> Result<DiskIndexPrimaryGeneration> {
+    crate::disk_index::primary_generation_scan();
+    let len = len.min(PRIMARY_GENERATION_WINDOW);
+    let prefix = snapshot.read_vec_at(0, len, PRIMARY_GENERATION_WINDOW, "primary generation")?;
+    let header_len = {
+        let mut file = snapshot.try_clone_file()?;
+        read_file_header(spec, &mut file)?
+    };
+    // A primary that carries no nonce folds in a zero value *and* a zero
+    // presence flag, so "carries no nonce" can never collide with "carries an
+    // all-zero nonce".
+    let (nonce_present, nonce) = match read_stream_creation_nonce(spec, snapshot, header_len) {
+        Some(nonce) => (1u8, nonce),
+        None => (0u8, [0u8; 16]),
+    };
+    let mut digest = [0u8; 32];
+    for lane in 0..8u32 {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(b"varve-primary-generation-v2");
+        hasher.update(&lane.to_le_bytes());
+        hasher.update(&[nonce_present]);
+        hasher.update(&nonce);
+        hasher.update(&len.to_le_bytes());
+        hasher.update(&prefix);
+        digest[(lane as usize) * 4..(lane as usize + 1) * 4]
+            .copy_from_slice(&hasher.finalize().to_le_bytes());
+    }
+    Ok(DiskIndexPrimaryGeneration {
+        len,
+        digest: DiskIndexDigest::from_bytes(digest),
+    })
+}
+
+/// Rejects a sidecar that was published against a different generation of the
+/// same file object: an equal-length in-place rewrite preserves OS identity,
+/// schema hash and header bytes, but not the recorded leading bytes.
+pub(crate) fn verify_primary_generation(
+    spec: FormatSpec,
+    recorded: DiskIndexPrimaryGeneration,
+    snapshot: &SnapshotFile,
+) -> Result<()> {
+    if recorded.len > snapshot.len() {
+        return Err(state_error(DiskIndexError::PrimaryGenerationMismatch));
+    }
+    if primary_generation(spec, snapshot, recorded.len)? != recorded {
+        return Err(state_error(DiskIndexError::PrimaryGenerationMismatch));
+    }
+    Ok(())
+}
+
 pub(crate) fn primary_identity(
     spec: FormatSpec,
     snapshot: &SnapshotFile,
@@ -1699,6 +1830,16 @@ mod tests {
             let stream_path = directory.path().join("stream.varve");
             let spec = spec(index_policy, commit_policy).with_integrity_policy(integrity_policy);
             let mut resident = crate::VarveFile::create(spec, &resident_path)?;
+            // STO-01: a stream primary opens with an internal creation-nonce
+            // record, so the resident file gets an equally shaped leading
+            // record. Sequences and record offsets then line up exactly and the
+            // user-record region must still match byte for byte.
+            resident.write_record(
+                crate::CREATION_NONCE_BLOCK_ID,
+                1,
+                crate::file::RECORD_FLAG_INTERNAL,
+                &[0u8; 16],
+            )?;
             let mut stream =
                 VarveStreamWriter::create(spec, &stream_path, StreamOptions::default())?;
             for value in [3, 5, 8, 13] {
@@ -1707,7 +1848,28 @@ mod tests {
             }
             resident.flush()?;
             stream.flush()?;
-            assert_eq!(std::fs::read(resident_path)?, std::fs::read(stream_path)?);
+            let resident_bytes = std::fs::read(&resident_path)?;
+            let stream_bytes = std::fs::read(&stream_path)?;
+            assert_eq!(resident_bytes.len(), stream_bytes.len());
+            let mut file = std::fs::File::open(&stream_path)?;
+            let header_len = crate::file::read_file_header(spec, &mut file)?;
+            let nonce_record_len = crate::file::RECORD_HEADER_LEN
+                + 16
+                + if spec.spec_needs_record_footer() {
+                    crate::file::RECORD_FOOTER_LEN
+                } else {
+                    0
+                };
+            let user_start = usize::try_from(header_len + nonce_record_len).unwrap();
+            assert_eq!(
+                resident_bytes[..header_len as usize],
+                stream_bytes[..header_len as usize]
+            );
+            assert_eq!(
+                resident_bytes[user_start..],
+                stream_bytes[user_start..],
+                "user records must encode identically in the resident and streaming writers"
+            );
         }
         Ok(())
     }
@@ -1739,10 +1901,33 @@ mod tests {
         batch.sync()?;
 
         assert_eq!(info.records, 100);
-        assert_eq!(info.first_sequence, Some(0));
-        assert_eq!(info.last_sequence, Some(99));
+        // Sequence 0 belongs to the internal creation-nonce record (STO-01).
+        assert_eq!(info.first_sequence, Some(1));
+        assert_eq!(info.last_sequence, Some(100));
         assert_eq!(info.write_calls, 7);
-        assert_eq!(std::fs::read(single_path)?, std::fs::read(batch_path)?);
+        assert_stream_bodies_match(spec, &single_path, &batch_path)?;
+        Ok(())
+    }
+
+    /// Asserts two stream primaries are byte-identical apart from their
+    /// per-create nonce, which is by construction unique to each create.
+    fn assert_stream_bodies_match(spec: FormatSpec, left: &Path, right: &Path) -> Result<()> {
+        let left_bytes = fs::read(left)?;
+        let right_bytes = fs::read(right)?;
+        assert_eq!(left_bytes.len(), right_bytes.len());
+        let mut file = File::open(left)?;
+        let header_len = crate::file::read_file_header(spec, &mut file)?;
+        let nonce_record_len = crate::file::RECORD_HEADER_LEN
+            + 16
+            + if spec.spec_needs_record_footer() {
+                crate::file::RECORD_FOOTER_LEN
+            } else {
+                0
+            };
+        let header_end = usize::try_from(header_len).unwrap();
+        let body_start = usize::try_from(header_len + nonce_record_len).unwrap();
+        assert_eq!(left_bytes[..header_end], right_bytes[..header_end]);
+        assert_eq!(left_bytes[body_start..], right_bytes[body_start..]);
         Ok(())
     }
 
@@ -1866,7 +2051,9 @@ mod tests {
             DiskIndexOptions::default(),
             DiskIndexMetadata::new_state(
                 identity,
-                DiskIndexFrontier::new(clean_len, 1, Some(1)),
+                // Two records: the internal creation nonce plus the one push,
+                // so the exclusive sequence frontier moves from 1 to 2.
+                DiskIndexFrontier::new(clean_len, 2, Some(2)),
                 tail_limit_for_spec(spec).map_err(state_error)?,
             ),
             &[DiskIndexTail {
@@ -1903,6 +2090,10 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("keyed-bypass.varve");
         let mut writer = VarveStreamWriter::create(keyed_spec(), &path, StreamOptions::default())?;
+        // Baseline rather than a literal: a fresh primary already holds its
+        // internal creation-nonce record (STO-01). The contract under test is
+        // that the rejected calls append nothing on top of it.
+        let baseline = writer.checkpoint().record_count;
         assert!(matches!(
             writer.push_with_prev_key_info(&KeyedTestBlock(1), None),
             Err(Error::StreamingUnsupported)
@@ -1911,7 +2102,7 @@ mod tests {
             writer.delete_with_prev_key_info::<KeyedTestBlock>(&1, None),
             Err(Error::StreamingUnsupported)
         ));
-        assert_eq!(writer.checkpoint().record_count, 0);
+        assert_eq!(writer.checkpoint().record_count, baseline);
         Ok(())
     }
 
@@ -1922,6 +2113,7 @@ mod tests {
         let mut writer =
             VarveStreamWriter::create(bounded_encode_spec(), &path, StreamOptions::default())?;
         let clean_len = fs::metadata(&path)?.len();
+        let baseline = writer.checkpoint().record_count;
         assert!(matches!(
             writer.push_info(&OversizedBlock),
             Err(Error::LimitExceeded {
@@ -1931,7 +2123,7 @@ mod tests {
             })
         ));
         assert_eq!(fs::metadata(&path)?.len(), clean_len);
-        assert_eq!(writer.checkpoint().record_count, 0);
+        assert_eq!(writer.checkpoint().record_count, baseline);
         writer.sync()?;
         Ok(())
     }
@@ -1991,7 +2183,9 @@ mod tests {
         }
         {
             let mut writer = VarveStreamWriter::open(spec, &path, StreamOptions::default())?;
-            assert_eq!(writer.push_info(&TestBlock(128))?.sequence, 128);
+            // Sequence 0 belongs to the internal creation-nonce record, so the
+            // 129th user append carries sequence 129 (STO-01).
+            assert_eq!(writer.push_info(&TestBlock(128))?.sequence, 129);
             writer.sync()?;
         }
         let reader = VarveStreamReader::open(spec, &path, StreamOptions::default())?;

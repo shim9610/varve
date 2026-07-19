@@ -215,8 +215,11 @@ literal value to pin. The hash covers wire layout, not just field membership:
 fields are hashed in declaration order with their encoding ordinal, and each
 block's endian override, keyedness, and generated codec fingerprint are folded
 in (`FormatSpec::SCHEMA_HASH_ALGORITHM_VERSION` names the algorithm revision,
-currently 2). Reordering field declarations changes the hash because it changes
-the canonical bytes. Omitting `schema_hash` stores 0 and disables the open-time
+currently 3). Each field also contributes its codec's `SCHEMA_ID`, so a
+hand-written codec must declare one (the derive refuses a field whose codec does
+not) and must revise it whenever its bytes change; see
+`docs/custom-codec-guide.md`. Reordering field declarations changes the hash
+because it changes the canonical bytes. Omitting `schema_hash` stores 0 and disables the open-time
 comparison entirely — only do that when schema locking is deliberately
 unwanted.
 
