@@ -8,6 +8,7 @@
 //! stays exclusive and typed, sidecar rebuild serves fresh databases to new
 //! handles, and CRC point lookups verify the payload with a single read.
 
+#[cfg(feature = "integrity")]
 use std::fs;
 use std::path::Path;
 
