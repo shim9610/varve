@@ -479,15 +479,34 @@ fn zero_copy_rejects_raw_payload_size_mismatch() -> varve::Result<()> {
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn temp_path(name: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
+struct TempPath {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for TempPath {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for TempPath {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+fn temp_path(name: &str) -> TempPath {
+    let dir = tempfile::tempdir().expect("create per-test temp directory");
+    let path = dir.path().join(format!(
         "varve_mmap_zero_copy_{name}_{}_{}_{}.vrv",
         std::process::id(),
         std::thread::current().name().unwrap_or("anon"),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    path
+    TempPath { path, _dir: dir }
 }
 
 fn cleanup(path: &PathBuf) {

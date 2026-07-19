@@ -950,6 +950,17 @@ pub struct FormatSpec {
     pub magic: &'static [u8],
     pub version: u16,
     pub endian: Endian,
+    /// Declared schema hash compared against the value stored in a file's
+    /// native header when the file is opened.
+    ///
+    /// Schema-hash comparison is opt-in: leaving this at `0` (the default)
+    /// records the computed hash when files are created but **disables** the
+    /// open-time equality check, so any schema-hash-bearing file of this
+    /// format opens without a [`Error::SchemaHashMismatch`]. Pin a non-zero
+    /// value (typically [`FormatSpec::computed_schema_hash`], via
+    /// `schema_hash: computed;` in `varve_format!` or
+    /// [`FormatSpec::with_computed_schema_hash`]) to make mismatched schemas
+    /// fail closed at open.
     pub schema_hash: u64,
     pub extension: Option<&'static str>,
     pub index_policy: IndexPolicy,
@@ -964,6 +975,19 @@ pub struct FormatSpec {
     pub matrix_commits: &'static [MatrixCommitDescriptor],
     pub matrix_blocks: &'static [MatrixBlockDescriptor],
     pub matrix_aux: &'static [MatrixAuxDescriptor],
+    /// Per-block schema identity of the implementations backing
+    /// [`FormatSpec::blocks`], as `(block_id, declared endian override,
+    /// keyedness, generated schema fingerprint)` tuples (API2-01).
+    ///
+    /// `varve_format!` fills this from the registered block types so
+    /// [`FormatSpec::computed_schema_hash`] covers the per-block encoding
+    /// inputs that [`BlockDescriptor`] alone does not carry (endian override,
+    /// keyedness, and the generated codec identity). Hand-built specs may
+    /// leave it empty; the computed hash then records the absence explicitly.
+    /// The fingerprint values themselves stay process-local: they are never
+    /// compared against on-disk descriptors, only folded into the computed
+    /// hash and checked by the in-process registration gate.
+    pub block_identities: &'static [(u32, Option<Endian>, bool, u64)],
     pub layout: LayoutSpec,
     pub read_limits: ReadLimits,
     /// Explicit opt-in that keeps matrix data access available when the
@@ -991,11 +1015,21 @@ pub struct FormatSpecBuilder {
     matrix_commits: &'static [MatrixCommitDescriptor],
     matrix_blocks: &'static [MatrixBlockDescriptor],
     matrix_aux: &'static [MatrixAuxDescriptor],
+    block_identities: &'static [(u32, Option<Endian>, bool, u64)],
     layout: LayoutSpec,
     read_limits: ReadLimits,
 }
 
 impl FormatSpec {
+    /// Version of the [`FormatSpec::computed_schema_hash`] algorithm.
+    ///
+    /// v2 (API2-01, pre-1.0 breaking change): hashes the field encoding
+    /// ordinal in declaration order and folds in per-block endian,
+    /// keyedness, and generated codec identity from
+    /// [`FormatSpec::block_identities`]. Values computed by v1 do not match
+    /// v2 for any spec.
+    pub const SCHEMA_HASH_ALGORITHM_VERSION: u16 = 2;
+
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
         magic: &'static [u8],
@@ -1026,6 +1060,7 @@ impl FormatSpec {
             matrix_commits: &[],
             matrix_blocks: &[],
             matrix_aux: &[],
+            block_identities: &[],
             layout: LayoutSpec::varve_native(),
             read_limits: ReadLimits::MISSING,
             matrix_fatal_forensics: false,
@@ -1037,8 +1072,25 @@ impl FormatSpec {
         self
     }
 
+    /// Pins [`FormatSpec::schema_hash`] to the computed hash, opting this
+    /// format into the open-time schema-hash equality check. Without this
+    /// (or an explicit non-zero literal), `schema_hash` stays `0` and the
+    /// comparison is disabled; see [`FormatSpec::schema_hash`].
     pub fn with_computed_schema_hash(mut self) -> Self {
         self.schema_hash = self.computed_schema_hash();
+        self
+    }
+
+    /// Attaches the per-block schema identities folded into
+    /// [`FormatSpec::computed_schema_hash`]; see
+    /// [`FormatSpec::block_identities`]. Call before
+    /// [`FormatSpec::with_computed_schema_hash`] so the pinned hash covers
+    /// the identities.
+    pub const fn with_block_identities(
+        mut self,
+        block_identities: &'static [(u32, Option<Endian>, bool, u64)],
+    ) -> Self {
+        self.block_identities = block_identities;
         self
     }
 
@@ -1668,9 +1720,9 @@ impl FormatSpec {
                 "block {} {} v{} {:?}\n",
                 block.id, block.name, block.version, block.kind
             ));
-            let mut fields = block.fields.to_vec();
-            fields.sort_by_key(|field| field.id);
-            for field in fields {
+            // Declaration order: fixed/matrix payload bytes follow it, and
+            // the v2 schema hash covers the encoding ordinal.
+            for field in block.fields {
                 output.push_str(&format!(
                     "  field {} {} {:?} {:?}\n",
                     field.id, field.name, field.wire_type, field.presence
@@ -1680,9 +1732,22 @@ impl FormatSpec {
         output
     }
 
+    /// Deterministic hash of the wire-relevant schema declaration
+    /// (algorithm version [`FormatSpec::SCHEMA_HASH_ALGORITHM_VERSION`]).
+    ///
+    /// Version 2 (API2-01) additionally covers, per block: the field
+    /// **encoding ordinal** (fixed/matrix payload bytes follow field
+    /// declaration order, so two blocks with the same field id/name/type set
+    /// in different declaration order must hash differently), and — when
+    /// [`FormatSpec::block_identities`] is populated — the block's endian
+    /// override, keyedness, and generated codec fingerprint.
+    ///
+    /// The computed value is stored in newly created files. Whether it is
+    /// *compared* at open is a separate opt-in; see
+    /// [`FormatSpec::schema_hash`].
     pub fn computed_schema_hash(&self) -> u64 {
         let mut hash = Fnv1a64::new();
-        hash.write_bytes(b"varve-schema-v1");
+        hash.write_bytes(b"varve-schema-v2");
         hash.write_u16(self.version);
         hash.write_u8(self.endian.to_byte());
         match self.extension {
@@ -1735,9 +1800,26 @@ impl FormatSpec {
             hash.write_str(block.name);
             hash.write_u16(block.version);
             hash.write_u8(block_kind_hash_byte(block.kind));
-            let mut fields = block.fields.to_vec();
-            fields.sort_by_key(|field| field.id);
-            for field in fields {
+            // Per-block identity: endian override, keyedness, and generated
+            // codec fingerprint, with an explicit absence marker so a spec
+            // without identities can never collide with one that has them.
+            match self.block_identity(block.id) {
+                Some((_, endian, keyed, fingerprint)) => {
+                    hash.write_u8(1);
+                    hash.write_u8(match endian {
+                        Some(endian) => endian.to_byte(),
+                        None => 0,
+                    });
+                    hash.write_u8(u8::from(keyed));
+                    hash.write_bytes(&fingerprint.to_le_bytes());
+                }
+                None => hash.write_u8(0),
+            }
+            // Fixed/matrix encoding follows field declaration order, so hash
+            // the ordinal alongside each field instead of sorting by id.
+            hash.write_bytes(&(block.fields.len() as u64).to_le_bytes());
+            for (ordinal, field) in block.fields.iter().enumerate() {
+                hash.write_u32(ordinal as u32);
                 hash.write_u32(field.id);
                 hash.write_str(field.name);
                 hash.write_u16(field.wire_type as u16);
@@ -1745,6 +1827,16 @@ impl FormatSpec {
             }
         }
         hash.finish()
+    }
+
+    /// Returns the `(block_id, endian override, keyedness, fingerprint)`
+    /// identity declared for `id`, if any; see
+    /// [`FormatSpec::block_identities`].
+    pub fn block_identity(&self, id: u32) -> Option<(u32, Option<Endian>, bool, u64)> {
+        self.block_identities
+            .iter()
+            .copied()
+            .find(|identity| identity.0 == id)
     }
 
     pub fn validate(self) -> Result<()> {
@@ -1802,6 +1894,18 @@ impl FormatSpec {
             for other in &self.blocks[(index + 1)..] {
                 if block.id == other.id {
                     return Err(Error::InvalidFormatSpec("duplicate block id"));
+                }
+            }
+        }
+        for (index, identity) in self.block_identities.iter().enumerate() {
+            if !self.blocks.iter().any(|block| block.id == identity.0) {
+                return Err(Error::InvalidFormatSpec(
+                    "block identity references an unregistered block",
+                ));
+            }
+            for other in &self.block_identities[(index + 1)..] {
+                if identity.0 == other.0 {
+                    return Err(Error::InvalidFormatSpec("duplicate block identity"));
                 }
             }
         }
@@ -2635,6 +2739,7 @@ impl FormatSpecBuilder {
             matrix_commits: &[],
             matrix_blocks: &[],
             matrix_aux: &[],
+            block_identities: &[],
             layout: LayoutSpec::varve_native(),
             read_limits: ReadLimits::MISSING,
         }
@@ -2725,6 +2830,15 @@ impl FormatSpecBuilder {
         self
     }
 
+    /// See [`FormatSpec::block_identities`].
+    pub const fn block_identities(
+        mut self,
+        block_identities: &'static [(u32, Option<Endian>, bool, u64)],
+    ) -> Self {
+        self.block_identities = block_identities;
+        self
+    }
+
     pub const fn layout(mut self, layout: LayoutSpec) -> Self {
         self.layout = layout;
         self
@@ -2760,6 +2874,7 @@ impl FormatSpecBuilder {
             self.matrix_blocks,
         )
         .with_matrix_aux(self.matrix_aux)
+        .with_block_identities(self.block_identities)
         .with_layout(self.layout)
         .with_read_limits(self.read_limits);
         spec.validate()?;

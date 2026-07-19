@@ -11,11 +11,12 @@ use crate::disk_index::{
     state_sidecar_path, tail_limit_for_spec,
 };
 use crate::file::{
-    NativeStreamScanner, PreparedStreamRecord, WriterLock, prepare_stream_manifest_record,
-    prepare_stream_tombstone_record, prepare_stream_user_record, read_file_header,
-    replace_path_atomically, write_file_header,
+    NativeStreamScanner, PreparedStreamRecord, ReplaceDurability, WriterLock,
+    prepare_stream_manifest_record, prepare_stream_tombstone_record, prepare_stream_user_record,
+    publish_temp_path_atomically, read_file_header, write_file_header,
 };
 use crate::scan_control::{ScanCancelled, ScanProgressDriver};
+use crate::traits::KeyedBlockContract;
 use crate::{
     AppendInfo, BlockEvent, BlockKind, CommitPolicy, Error, FormatSpec, IntegrityPolicy,
     LayoutPreset, MANIFEST_BLOCK_ID, ManifestPolicy, ResourceLimits, Result, ScanOptions,
@@ -598,14 +599,22 @@ impl VarveStreamWriter {
             .read(true)
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .open(&path)?;
         // Bind the authoritative object lock onto the freshly created file. The
         // acquire-time probe cannot lock a file that did not exist yet, so
         // without this a hard-link alias opened after creation would win a
         // second writer role (DUR-02). Mirrors VarveFile::create_impl and
         // VarveLayoutWriter::create_inner.
+        //
+        // DUR2-05: the bind must happen before any destructive initialization.
+        // Opening with `.truncate(true)` would clear the object inside the
+        // pre-bind window, so a losing concurrent creator could truncate the
+        // winner's freshly initialized file before its own bind fails. Open
+        // without truncate, bind, then truncate through the bound handle.
         lock.bind_native(&file, &path)?;
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
         write_file_header(spec, &mut file)?;
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         let mut writer = Self {
@@ -821,6 +830,10 @@ impl VarveStreamWriter {
         key: &T::Key,
         previous: Option<u64>,
     ) -> Result<AppendInfo> {
+        // API2-03: every public keyed generic entry point evaluates the
+        // compile-time keyedness contract post-monomorphization; the
+        // registration below stays as the runtime backstop.
+        let () = KeyedBlockContract::<T>::OK;
         self.ensure_writable()?;
         ensure_registered_block::<T>(self.spec)?;
         if self.spec.index_policy.keyed_offset_chain {
@@ -1400,7 +1413,20 @@ fn create_state_store(
     crate::scalable_fault_point("create.sidecar_complete");
     let store = store?;
     drop(store);
-    replace_path_atomically(&temporary, &sidecar)?;
+    // DUR2-01: the temp guard is handed to publication so an indeterminate
+    // outcome preserves the replacement for reconciliation.
+    match publish_temp_path_atomically(temporary, &sidecar)? {
+        ReplaceDurability::Durable => {}
+        ReplaceDurability::ParentSyncPending(sync_error) => {
+            // Publication already happened: keep the published state sidecar
+            // and report the pending parent-directory durability instead of
+            // silently promoting it to full success.
+            return Err(Error::PublishedButParentSyncPending {
+                path: sidecar.display().to_string(),
+                source: Box::new(sync_error),
+            });
+        }
+    }
     DiskIndexStore::open_validated(&sidecar, options, metadata.identity, metadata.mode)
         .map_err(state_error)
 }

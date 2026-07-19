@@ -3,10 +3,11 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
+use crate::codec::encode_to_vec_limited;
 use crate::format::ReadLimitKey;
 use crate::{
     BlockKind, Decoder, Error, FormatSpec, IntegrityPolicy, MatrixCommitKind, ReadLimits, Result,
-    VarveMatrixBlock, encode_to_vec,
+    VarveMatrixBlock,
 };
 
 const VMAT_MAGIC: &[u8; 4] = b"VMAT";
@@ -17,6 +18,7 @@ const MCRC_VERSION: u16 = 1;
 const MCRC_HEADER_LEN: u64 = 16;
 const CRC_LEN: u64 = 4;
 const MATRIX_BYTES_RESOURCE: &str = "matrix bytes";
+const MATRIX_SLOT_PAYLOAD_RESOURCE: &str = "matrix slot payload";
 const MATRIX_DESCRIPTOR_RESOURCE: &str = "matrix descriptors";
 #[allow(dead_code)]
 const MATRIX_SIDECAR_RESOURCE: &str = "matrix sidecar";
@@ -692,7 +694,33 @@ pub(crate) fn write_cell<T: VarveMatrixBlock>(
     let ordinal = layout.ordinal_for_block(block_index, key)?;
     let offset = layout.slot_offset(block_index, ordinal)?;
     let slot_stride = layout.blocks[block_index].slot_stride;
-    let payload = encode_to_vec(value, T::ENDIAN.unwrap_or(spec.endian))?;
+    // DEF-02: the slot stride is the hard bound for the encode itself, so a
+    // hostile or miswritten `VarveMatrixBlock` encode can never buffer more
+    // than one byte past the stride before the typed error fires. The cap is
+    // `slot_stride + 1` (not `slot_stride`) so an encode of exactly one extra
+    // byte still completes and the exact-size check below reports its true
+    // length; anything larger stops buffering at the first over-limit write
+    // and the overflow is mapped back to the existing `MatrixSizeMismatch`
+    // contract, with `actual` being the encoded length observed at cutoff.
+    let payload = match encode_to_vec_limited(
+        value,
+        T::ENDIAN.unwrap_or(spec.endian),
+        slot_stride.saturating_add(1),
+        MATRIX_SLOT_PAYLOAD_RESOURCE,
+    ) {
+        Ok(payload) => payload,
+        Err(Error::LimitExceeded {
+            resource: MATRIX_SLOT_PAYLOAD_RESOURCE,
+            actual,
+            ..
+        }) => {
+            return Err(Error::MatrixSizeMismatch {
+                expected: slot_stride,
+                actual,
+            });
+        }
+        Err(err) => return Err(err),
+    };
     if payload.len() as u64 != slot_stride {
         return Err(Error::MatrixSizeMismatch {
             expected: slot_stride,
@@ -1360,6 +1388,12 @@ pub(crate) fn set_channel_committed(
 }
 
 fn ensure_matrix_block<T: VarveMatrixBlock>(spec: FormatSpec) -> Result<()> {
+    // DEF-01: run the common registration gate first, exactly like the
+    // fixed/variable block paths. It enforces the process-local first-seen
+    // schema-fingerprint and keyedness contract, so a manual matrix type
+    // with the same shape/stride but different codec/decode semantics is
+    // rejected before any cell read, write, or mmap view.
+    crate::collections::ensure_registered_block::<T>(spec)?;
     let descriptor = spec.block(T::ID).ok_or(Error::UnregisteredBlock(T::ID))?;
     if descriptor.kind != BlockKind::Matrix || T::KIND != BlockKind::Matrix {
         return Err(Error::BlockKindMismatch {

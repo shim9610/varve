@@ -1,6 +1,6 @@
+use std::fs::OpenOptions;
 #[cfg(feature = "integrity")]
 use std::fs::read;
-use std::fs::{OpenOptions, remove_file};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::panic::catch_unwind;
 use std::path::{Path, PathBuf};
@@ -177,29 +177,24 @@ struct VmatHeader {
 
 struct TempMatrix {
     path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempMatrix {
     fn new(name: &str) -> Self {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let dir = tempfile::tempdir().expect("create per-test temp directory");
+        let path = dir.path().join(format!(
             "varve_{name}_{}_{}_{}.vrv",
             std::process::id(),
             std::thread::current().name().unwrap_or("test"),
             id
         ));
-        let _ = remove_file(&path);
-        Self { path }
+        Self { path, _dir: dir }
     }
 
     fn path(&self) -> &Path {
         &self.path
-    }
-}
-
-impl Drop for TempMatrix {
-    fn drop(&mut self) {
-        let _ = remove_file(&self.path);
     }
 }
 
@@ -247,7 +242,9 @@ fn fresh_reader_rejects_uncommitted_matrix_overwrite() {
 }
 
 fn read_vmat_header(path: &Path, spec: FormatSpec) -> VmatHeader {
-    let offset = u64::try_from(spec.magic.len()).expect("magic length") + 18;
+    // Native file header, then the 24-byte matrix creation-nonce region
+    // (DUR2-03), then the VMAT layout header.
+    let offset = u64::try_from(spec.magic.len()).expect("magic length") + 18 + 24;
     let mut file = OpenOptions::new()
         .read(true)
         .open(path)

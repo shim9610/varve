@@ -239,7 +239,7 @@ fn reducer_applies_stateful_segment_metadata() -> varve::Result<()> {
 #[test]
 fn sidecar_policy_checks_presence_and_identity() -> varve::Result<()> {
     let main = temp_path("adapter_toolkit_sidecar", "bin");
-    let sidecar = temp_path("adapter_toolkit_sidecar", "idx");
+    let sidecar = main.with_extension("idx");
     cleanup(&main);
     cleanup(&sidecar);
     write(&main, b"main")?;
@@ -547,10 +547,31 @@ fn stable_fingerprint(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn temp_path(name: &str, extension: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!("varve_{name}_{}.{}", std::process::id(), extension));
-    path
+struct TempPath {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for TempPath {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for TempPath {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+fn temp_path(name: &str, extension: &str) -> TempPath {
+    let dir = tempfile::tempdir().expect("create per-test temp directory");
+    let path = dir
+        .path()
+        .join(format!("varve_{name}_{}.{}", std::process::id(), extension));
+    TempPath { path, _dir: dir }
 }
 
 fn cleanup(path: &PathBuf) {

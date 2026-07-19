@@ -68,7 +68,7 @@ scan, and decode files.
 | `version` | Format version. | Required. This is the whole-format version, not the per-block version. |
 | `limits` | Optional operational defaults or explicit `trusted_unbounded`. | Optional and partial. Runtime policy does not change schema hashes or wire bytes. |
 | `endian` | `little` or `big`. | Optional in simple cases, but recommended. Block override wins over format endian; otherwise little-endian is the default. |
-| `schema_hash` | `computed` or a literal integer. | `computed` hashes the declared policies, blocks, fields, and custom layout descriptors. Pin a literal after release if you want exact schema locking. |
+| `schema_hash` | `computed` or a literal integer. | `computed` hashes the declared policies, blocks, fields in declaration order with encoding ordinals, per-block endian/keyedness/codec identities, and custom layout descriptors. Omission stores 0 and disables the open-time comparison. Pin a literal after release if you want exact schema locking. |
 | `extension` | Recommended extension metadata. | Informational and embedded in manifests when enabled. It does not rename files. |
 | `preset` | `varve_native` or `none`. | Omitted means native unless a custom layout is declared. `none` lets the declared layout own byte zero. |
 | `index` | `scan_on_open`, `checkpoint_on_flush`, or a list. | Offset-chain indexes are written automatically in `VARVE3` footers. |
@@ -499,9 +499,14 @@ Keep these rules stable:
 - Semantic migrations are explicit user Rust code through migration traits and
   migration read APIs.
 
-`schema_hash: computed` catches accidental changes to the declared contract.
-For released formats, compute the hash, pin it as a literal, and require a
-migration path for incompatible changes.
+`schema_hash: computed` catches accidental changes to the declared contract,
+including field declaration reorder, per-block endian changes, keyedness
+changes, and generated codec identity changes — the hash covers wire layout,
+not just field membership. For released formats, compute the hash, pin it as a
+literal, and require a migration path for incompatible changes. Note that the
+hash algorithm itself is versioned pre-1.0
+(`FormatSpec::SCHEMA_HASH_ALGORITHM_VERSION`); an algorithm revision changes
+every computed value, so pinned literals must be re-derived when it moves.
 
 ## Matrix Storage
 

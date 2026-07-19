@@ -197,6 +197,14 @@ The smoke suite reports wall time, records/sec, and file size. Compare small, me
   `max(INDEX_CHECKPOINT_MIN_RECORDS, records_at_last_checkpoint / 2)`, keeping
   cumulative checkpoint bytes `O(N)` across `O(log N)` checkpoints. Per-flush /
   per-record full-index checkpoints are a blocking regression.
+- The flush-time checkpoint predicate itself must be O(1). The writer carries
+  incremental cadence state (eligible records since the last checkpoint plus a
+  precomputed geometric threshold) maintained at the append site, restored on
+  rollback, recovered once at open, and recomputed on generation rebind. A
+  predicate that reverse-scans the index per flush is a blocking regression:
+  it makes flush-per-record workloads O(N²) in CPU even when checkpoint bytes
+  are linear. The same applies to the per-flush uncommitted-tail check, which
+  is a single newest-entry inspection, not a scan.
 - CRC typed reads must decode the already-read, checksum-validated payload
   buffer once. A CRC point lookup or streaming typed scan must not read the
   covered payload twice, and a typed scan must not checksum or read the payloads
@@ -215,6 +223,12 @@ bounded; the review numbers are before-context:
   the quadratic term. Open/recovery is unaffected because the scan reads every
   native record and merely validates whatever checkpoints it encounters, so a
   sparse or checkpoint-less tail still recovers.
+- after the byte growth was linearized, the flush predicate still reverse
+  searched the index per flush (the 2026-07-19 re-review simulated 179,392
+  predicate entry touches at 1,024 records vs 11,253,678 at 8,192 — 62.7x for
+  8x the input). The predicate is now two scalar compares against
+  incrementally maintained cadence state; a fault-injection counter test pins
+  near-linear growth of index entries touched.
 - CRC typed point lookup and streaming scan read each covered payload twice
   (integrity-none `4,194,416 B` vs CRC `8,388,832 B` on a 4 MiB point lookup).
   The validated payload buffer is now handed straight to typed decode, so the

@@ -17,8 +17,8 @@ use std::path::PathBuf;
 use varve::{
     BlockDescriptor, BlockKind, Endian, Error, FormatSpec, IndexPolicy, IntegrityPolicy,
     ManifestPolicy, MatrixBlockDescriptor, MatrixCommitDescriptor, MatrixCommitKind,
-    MatrixDimensionDescriptor, MatrixDimensions, MatrixKey, ReadLimits, RecoveryPolicy, VarveBlock,
-    VarveDecode, VarveEncode, VarveMatrixBlock,
+    MatrixDimensionDescriptor, MatrixDimensions, MatrixKey, MatrixResumeSignal, ReadLimits,
+    RecoveryPolicy, VarveBlock, VarveDecode, VarveEncode, VarveMatrixBlock,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,7 +100,8 @@ fn identity_spec() -> FormatSpec {
 fn same_spec_sibling_file_sidecar_is_rejected() -> varve::Result<()> {
     let path_a = temp_path("sidecar_identity_a");
     let path_b = temp_path("sidecar_identity_b");
-    let sidecar = temp_path("sidecar_identity_state").with_extension("sidecar");
+    let sidecar_owner = temp_path("sidecar_identity_state");
+    let sidecar = sidecar_owner.with_extension("sidecar");
     cleanup(&path_a);
     cleanup(&path_b);
     let _ = remove_file(&sidecar);
@@ -157,10 +158,127 @@ fn same_spec_sibling_file_sidecar_is_rejected() -> varve::Result<()> {
     Ok(())
 }
 
+// DUR2-03: recreating a matrix on the same pathname reuses the same OS file
+// object with identical schema, dimensions and layout offsets, so before the
+// per-create creation nonce every sidecar published against the previous
+// logical matrix (the review reproduced a stale generation-41 sidecar being
+// accepted) was indistinguishable from a fresh one. The recreated matrix must
+// refuse the pre-recreate sidecar as stale.
+#[test]
+fn same_object_matrix_recreation_rejects_stale_sidecar() -> varve::Result<()> {
+    let path = temp_path("sidecar_identity_recreate");
+    let sidecar_owner = temp_path("sidecar_identity_recreate_state");
+    let sidecar = sidecar_owner.with_extension("sidecar");
+    cleanup(&path);
+    let _ = remove_file(&sidecar);
+
+    let spec = identity_spec();
+
+    // The first logical matrix publishes a sidecar at generation 41.
+    {
+        let dims = MatrixDimensions::from_pairs([("scan", 2), ("ch", 2)]);
+        let mut writer = spec.create_writer_with_dims(&path, dims)?;
+        writer.write_matrix_cell(MatrixKey::new(0, 0), &IdentityCell { value: 1 })?;
+        writer.commit_matrix_cell::<IdentityCell>(MatrixKey::new(0, 0))?;
+        writer.write_matrix_sidecar("analysis", &sidecar, 41, b"stale-resume")?;
+        writer.flush()?;
+    }
+
+    // Recreate the matrix at the same pathname with the same dimensions. The
+    // OS file object, schema hash and layout offsets are all unchanged; only
+    // the creation nonce distinguishes the new logical matrix.
+    {
+        let dims = MatrixDimensions::from_pairs([("scan", 2), ("ch", 2)]);
+        let mut writer = spec.create_writer_with_dims(&path, dims)?;
+        writer.write_matrix_cell(MatrixKey::new(0, 0), &IdentityCell { value: 2 })?;
+        writer.commit_matrix_cell::<IdentityCell>(MatrixKey::new(0, 0))?;
+        writer.flush()?;
+    }
+    {
+        let reader = spec.open_reader(&path)?;
+        assert!(
+            matches!(
+                reader.read_matrix_sidecar("analysis", &sidecar),
+                Err(Error::MatrixSidecarMismatch("creation nonce"))
+            ),
+            "a recreated matrix must not accept the pre-recreate sidecar",
+        );
+        // A caller-supplied expected generation must not substitute for the
+        // native creation identity: even asking for the stale sidecar's own
+        // generation is refused on the nonce.
+        assert!(matches!(
+            reader.read_matrix_sidecar_with_generation("analysis", &sidecar, 41),
+            Err(Error::MatrixSidecarMismatch("creation nonce"))
+        ));
+        // The verified resume signal treats the stale sidecar as regenerable.
+        assert_eq!(
+            reader.matrix_verified_sidecar_resume_signal("analysis", &sidecar)?,
+            MatrixResumeSignal::DiscardRecommended
+        );
+    }
+
+    // The recreated matrix can publish and read back its own fresh sidecar.
+    {
+        let mut writer = spec.open_writer(&path)?;
+        writer.write_matrix_sidecar("analysis", &sidecar, 1, b"fresh-resume")?;
+        writer.flush()?;
+    }
+    {
+        let reader = spec.open_reader(&path)?;
+        let (manifest, payload) = reader.read_matrix_sidecar("analysis", &sidecar)?;
+        assert_eq!(manifest.generation, 1);
+        assert_eq!(payload, b"fresh-resume");
+    }
+
+    cleanup(&path);
+    let _ = remove_file(&sidecar);
+    Ok(())
+}
+
+// API2-02: the exclusive matrix creation path keeps one handle from the
+// ownership claim through initialization, so diagnostics never has to close a
+// claim handle and re-open the pathname with truncation.
+#[test]
+fn create_new_with_dims_is_exclusive_and_initializes_the_claimed_handle() -> varve::Result<()> {
+    let path = temp_path("sidecar_identity_create_new");
+    cleanup(&path);
+
+    let spec = identity_spec();
+    let dims = MatrixDimensions::from_pairs([("scan", 2), ("ch", 2)]);
+    {
+        let mut writer = varve::VarveFile::create_new_with_dims(spec, &path, dims)?;
+        writer.write_matrix_cell(MatrixKey::new(0, 0), &IdentityCell { value: 7 })?;
+        writer.commit_matrix_cell::<IdentityCell>(MatrixKey::new(0, 0))?;
+        writer.flush()?;
+    }
+
+    // A pre-existing target is refused instead of truncated.
+    let dims = MatrixDimensions::from_pairs([("scan", 2), ("ch", 2)]);
+    match varve::VarveFile::create_new_with_dims(spec, &path, dims) {
+        Err(Error::Io(error)) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        }
+        other => panic!("expected AlreadyExists, got {other:?}"),
+    }
+
+    // The refused create left the existing matrix untouched.
+    {
+        let mut reader = varve::VarveFile::open_readonly(spec, &path)?;
+        assert_eq!(
+            reader.read_matrix_cell::<IdentityCell>(MatrixKey::new(0, 0))?,
+            IdentityCell { value: 7 }
+        );
+    }
+
+    cleanup(&path);
+    Ok(())
+}
+
 #[test]
 fn failed_publish_leaves_original_sidecar_intact() -> varve::Result<()> {
     let path = temp_path("sidecar_publish_intact");
-    let sidecar = temp_path("sidecar_publish_state").with_extension("sidecar");
+    let sidecar_owner = temp_path("sidecar_publish_state");
+    let sidecar = sidecar_owner.with_extension("sidecar");
     cleanup(&path);
     let _ = remove_file(&sidecar);
 
@@ -209,12 +327,33 @@ fn failed_publish_leaves_original_sidecar_intact() -> varve::Result<()> {
     Ok(())
 }
 
-fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
+struct TempPath {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for TempPath {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for TempPath {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+fn temp_path(name: &str) -> TempPath {
+    let dir = tempfile::tempdir().expect("create per-test temp directory");
+    let path = dir.path().join(format!(
         "varve_{name}_{}_{}.vrv",
         std::process::id(),
         std::thread::current().name().unwrap_or("test")
-    ))
+    ));
+    TempPath { path, _dir: dir }
 }
 
 fn cleanup(path: &PathBuf) {

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt::Debug;
-use std::fs::{OpenOptions, remove_file};
+use std::fs::remove_file;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -264,6 +264,9 @@ impl FormatSelfTest {
         T: VarveKeyedBlock + Clone + PartialEq + Debug + 'static,
         T::Key: Debug,
     {
+        // API2-03: compile-time keyedness contract; the self-test write/read
+        // closures below rely on `T` being genuinely keyed.
+        let () = crate::traits::KeyedBlockContract::<T>::OK;
         let key = value.key();
         let write_value = value.clone();
         let expected = value;
@@ -391,12 +394,13 @@ impl FormatSelfTest {
             return report;
         }
 
-        // API-01: the self-test must never truncate or delete a pre-existing
-        // caller file. The append path relies on the atomic exclusive-create
-        // constructor; the matrix path exclusively claims the target first
-        // because `create_with_dims` would otherwise truncate an existing
-        // file. Cleanup below only ever removes paths this run proved it
-        // created.
+        // API-01/API2-02: the self-test must never truncate or delete a
+        // pre-existing caller file. Both paths rely on atomic
+        // exclusive-create constructors that keep the exclusively created
+        // handle locked from the claim through complete initialization, so
+        // there is no window in which the claimed pathname is re-opened by
+        // name and a concurrent swap could redirect a truncating constructor.
+        // Cleanup below only ever removes objects this run proved it created.
         let mut writer = if self.spec.has_matrix_blocks() {
             let Some(dims) = self.dims.clone() else {
                 report.steps.push(SelfTestStepReport::failed(
@@ -407,28 +411,17 @@ impl FormatSelfTest {
                 ));
                 return report;
             };
-            if record_create_result(
-                &mut report,
-                "claim target path",
-                claim_fresh_path(&self.path),
-            )
-            .is_none()
-            {
-                // Nothing was created, so leave the filesystem untouched.
-                return report;
-            }
-            let created = record_result(
+            let created = record_create_result(
                 &mut report,
                 "create matrix file",
-                VarveFile::create_with_dims(self.spec, &self.path, dims),
+                VarveFile::create_new_with_dims(self.spec, &self.path, dims),
             );
             let Some(writer) = created else {
-                // The claim above proved this run created the (empty) target,
-                // so cleanup may remove the native path — but never the
-                // writer-lock marker, which a concurrent writer may own.
-                if self.cleanup {
-                    let _ = remove_file(&self.path);
-                }
+                // Creation failed without leaving a handle that proves what
+                // now sits at the pathname, so the target is left untouched;
+                // only the marker the failed claim may have created is tidied
+                // through the identity-checked protocol.
+                remove_unowned_lock_marker(&self.path);
                 return report;
             };
             writer
@@ -440,11 +433,19 @@ impl FormatSelfTest {
             );
             let Some(writer) = created else {
                 // Creation failed without proving ownership of the path, so
-                // leave the filesystem untouched.
+                // the target is left untouched; only the marker the failed
+                // claim may have created is tidied through the
+                // identity-checked protocol.
+                remove_unowned_lock_marker(&self.path);
                 return report;
             };
             writer
         };
+        // API2-02: remember which file object this run created so cleanup can
+        // refuse to delete a file another process has since swapped in at the
+        // same pathname. If the identity cannot be captured, cleanup skips
+        // the native file rather than guessing.
+        let created_identity = writer.native_object_identity().ok();
 
         let mut write_failed = false;
         for case in &self.cases {
@@ -463,7 +464,7 @@ impl FormatSelfTest {
 
         if write_failed {
             if self.cleanup {
-                cleanup_path(&self.path);
+                cleanup_run_artifacts(&self.path, created_identity.as_deref());
             }
             return report;
         }
@@ -475,7 +476,7 @@ impl FormatSelfTest {
         );
         let Some(mut reader) = reader.take() else {
             if self.cleanup {
-                cleanup_path(&self.path);
+                cleanup_run_artifacts(&self.path, created_identity.as_deref());
             }
             return report;
         };
@@ -489,7 +490,7 @@ impl FormatSelfTest {
 
         if self.cleanup {
             drop(reader);
-            cleanup_path(&self.path);
+            cleanup_run_artifacts(&self.path, created_identity.as_deref());
         }
         report
     }
@@ -812,7 +813,8 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::WriterPoisoned(_)
         | Error::WriteRollbackFailed { .. }
         | Error::PublishedButRebindFailed { .. }
-        | Error::PublishedButParentSyncPending { .. } => DiagnosticDomain::Environment,
+        | Error::PublishedButParentSyncPending { .. }
+        | Error::ReplacePublicationIndeterminate { .. } => DiagnosticDomain::Environment,
 
         #[cfg(feature = "high-cardinality-dev")]
         Error::PublishedButIndexStale { .. } => DiagnosticDomain::Environment,
@@ -909,19 +911,6 @@ fn uses_zstd_compression(spec: FormatSpec) -> bool {
     global || block
 }
 
-/// Exclusively creates an empty file at `path` so the self-test run proves it
-/// owns the target before any truncating constructor touches it. Fails with
-/// [`Error::Io`] of kind [`ErrorKind::AlreadyExists`] without modifying a
-/// pre-existing caller file.
-fn claim_fresh_path(path: &Path) -> Result<()> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map(drop)
-        .map_err(Error::Io)
-}
-
 /// Like [`record_result`], but reports an already-existing target path as a
 /// caller-usage failure with a hint instead of a generic environment error.
 fn record_create_result<T>(
@@ -1006,9 +995,102 @@ where
     }
 }
 
-fn cleanup_path(path: &Path) {
+/// Removes the artifacts this self-test run created, verifying identity
+/// before every deletion (API2-02).
+///
+/// The native target is only removed while the pathname still resolves to the
+/// file object this run created; a file another process has since swapped in
+/// at the same pathname is left untouched. The writer-lock marker is only
+/// removed after re-acquiring it through the standard writer-lock protocol,
+/// so a marker locked or populated by a foreign writer survives.
+fn cleanup_run_artifacts(path: &Path, created_identity: Option<&[u8]>) {
+    if let Some(identity) = created_identity {
+        remove_path_if_same_object(path, identity);
+    }
+    remove_unowned_lock_marker(path);
+}
+
+/// Deletes `path` only while the file object bound to the pathname is still
+/// `expected_identity`.
+///
+/// The handle is opened without delete or write sharing, which pins the
+/// pathname for the whole check-and-delete: no other process can delete or
+/// rename over the name while the handle is open, and the deletion itself is
+/// issued on that same verified handle, so the identity check cannot be
+/// invalidated by a concurrent pathname swap.
+#[cfg(windows)]
+fn remove_path_if_same_object(path: &Path, expected_identity: &[u8]) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FileDispositionInfo,
+        SetFileInformationByHandle,
+    };
+
+    let Ok(file) = std::fs::OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+    else {
+        return;
+    };
+    match crate::file::opened_file_identity(&file) {
+        Ok(identity) if identity == expected_identity => {}
+        _ => return,
+    }
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: the handle stays open with DELETE access for the duration of
+    // the call and the info pointer references a live FILE_DISPOSITION_INFO
+    // of the size passed alongside it.
+    unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as HANDLE,
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        );
+    }
+}
+
+/// Deletes `path` only while the file object bound to the pathname is still
+/// `expected_identity`.
+///
+/// POSIX has no unlink-by-handle, so a hostile swap in the window between the
+/// identity check and the unlink below remains possible; the check reduces
+/// the unverified window to that single syscall boundary.
+#[cfg(not(windows))]
+fn remove_path_if_same_object(path: &Path, expected_identity: &[u8]) {
+    let Ok(file) = std::fs::File::open(path) else {
+        return;
+    };
+    match crate::file::opened_file_identity(&file) {
+        Ok(identity) if identity == expected_identity => {}
+        _ => return,
+    }
     let _ = remove_file(path);
+}
+
+/// Removes the pathname's writer-lock marker only when this process can
+/// re-acquire it through the standard writer-lock protocol (API2-02).
+///
+/// Acquisition with the default refuse policy fails while another writer
+/// holds the marker guard lock or has populated the marker with its own run
+/// token, so only a quiescent, unowned marker is ever deleted. The native
+/// single-writer object lock stays authoritative regardless, so losing a
+/// marker to this race can never admit a second writer.
+fn remove_unowned_lock_marker(path: &Path) {
     let mut lock = OsString::from(path.as_os_str());
     lock.push(".lock");
-    let _ = remove_file(PathBuf::from(lock));
+    let marker = PathBuf::from(lock);
+    if !marker.exists() {
+        // Avoid recreating a marker that is already gone: acquisition below
+        // would create one just to delete it again.
+        return;
+    }
+    let Ok(guard) = crate::file::WriterLock::acquire(path) else {
+        return;
+    };
+    let _ = remove_file(&marker);
+    drop(guard);
 }

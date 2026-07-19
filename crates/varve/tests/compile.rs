@@ -33,6 +33,7 @@ fn macro_compile_contracts() {
     tests.compile_fail("tests/ui/fail_duplicate_limit_key.rs");
     tests.compile_fail("tests/ui/fail_manual_block_fingerprint_mismatch.rs");
     tests.compile_fail("tests/ui/fail_keyed_contradiction.rs");
+    tests.compile_fail("tests/ui/fail_keyed_contradiction_merge.rs");
     #[cfg(not(feature = "high-cardinality-dev"))]
     tests.compile_fail("tests/ui/fail_key_index_requires_feature.rs");
 }
@@ -49,6 +50,8 @@ fn high_cardinality_compile_contracts() {
     tests.compile_fail("tests/ui/fail_petabyte_chain_stream_keyed_batch.rs");
     tests.compile_fail("tests/ui/fail_petabyte_chain_unindexed_keyed_mutation.rs");
     tests.compile_fail("tests/ui/fail_manual_block_missing_keyedness.rs");
+    tests.compile_fail("tests/ui/fail_keyed_contradiction_stream_delete.rs");
+    tests.compile_fail("tests/ui/fail_keyed_contradiction_indexed_delete.rs");
 }
 
 #[cfg(feature = "mmap")]

@@ -20,28 +20,103 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  clippy-and-test:
-    name: clippy + test (${{ matrix.os }})
+  # Every feature combination is linted individually. `cargo clippy` uses the
+  # workspace rustc wrapper, so `-p varve` also lints `varve-core` and
+  # `varve-macros` under the exact feature set the umbrella crate enables.
+  feature-matrix:
+    name: clippy (${{ matrix.features.name }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        features:
+          - { name: no-default, flags: "-p varve --no-default-features" }
+          - { name: default, flags: "-p varve" }
+          - {
+              name: integrity,
+              flags: "-p varve --no-default-features --features integrity",
+            }
+          - {
+              name: mmap,
+              flags: "-p varve --no-default-features --features mmap",
+            }
+          - {
+              name: zero-copy,
+              flags: "-p varve --no-default-features --features zero-copy",
+            }
+          - {
+              name: compression-zstd,
+              flags: "-p varve --no-default-features --features compression-zstd",
+            }
+          - {
+              name: high-cardinality-dev,
+              flags: "-p varve --no-default-features --features high-cardinality-dev",
+            }
+          - {
+              name: scalable-fault-injection,
+              flags: "-p varve --no-default-features --features scalable-fault-injection",
+            }
+          - { name: all-features, flags: "--workspace --all-features" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features.name }}
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --workspace --all-features
+        run: cargo clippy --locked --all-targets ${{ matrix.features.flags }} -- -D warnings
 
-  supply-chain:
-    name: deny + audit (non-blocking)
+  # Full test runs stay limited to the default and all-feature sets; the
+  # feature matrix above already type-checks and lints every other
+  # combination. Tests go through the hygiene runner so leaked temp
+  # artifacts fail CI (docs/test-artifact-hygiene.md).
+  test:
+    name: test (${{ matrix.features.name }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        features:
+          - { name: default, flags: "" }
+          - { name: all-features, flags: "--all-features" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.features.name }}
+      - name: Test
+        run: cargo run --locked -p varve-test-runner -- test --workspace --locked ${{ matrix.features.flags }}
+
+  # API2-05 regression guard: a downstream crate that renames the varve
+  # dependency (`vv = { package = "varve", … }`) must compile and run with no
+  # `extern crate` workaround. trybuild cannot express a renamed dependency
+  # (it reuses the host crate's dependency graph), so this is a standalone
+  # fixture crate outside the workspace; unit tests on the token-rewrite
+  # helper demonstrably missed the `IDENT: ::varve::…` expansion shape that
+  # only a real downstream build exercises.
+  renamed-dependency:
+    name: renamed-dependency fixture
     runs-on: ubuntu-latest
-    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: renamed-dependency
+          workspaces: tools/rename-fixture
+      - name: Build and run the renamed-dependency fixture
+        working-directory: tools/rename-fixture
+        run: cargo run --locked
+
+  # Release gate: audit/deny failures block the merge.
+  supply-chain:
+    name: deny + audit
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -53,3 +128,22 @@ jobs:
         run: |
           cargo install cargo-audit --locked
           cargo audit
+
+  # Build the committed tree exactly as a source package consumer sees it:
+  # `git archive` contains only tracked files, so a workspace member or
+  # fixture that exists locally but was never committed fails here
+  # (REL-01 regression guard).
+  clean-archive:
+    name: clean source archive
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Unpack tracked files only
+        run: git archive --format=tar --prefix=varve-archive/ HEAD | tar -x -C "$RUNNER_TEMP"
+      - name: cargo metadata
+        working-directory: ${{ runner.temp }}/varve-archive
+        run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
+      - name: cargo check
+        working-directory: ${{ runner.temp }}/varve-archive
+        run: cargo check --workspace --all-targets --all-features --locked

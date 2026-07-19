@@ -4,6 +4,24 @@ Varve migrations are explicit. Normal typed reads reject block version
 mismatches; migration code names both the source and target block types and
 performs semantic conversion in Rust.
 
+## Unreleased Pre-1.0 Wire Changes
+
+The current unreleased changes are wire-breaking under the pre-1.0 policy;
+there is no automatic migration path for these three surfaces:
+
+- The computed schema hash algorithm moved to version 2
+  (`FormatSpec::SCHEMA_HASH_ALGORITHM_VERSION`). Every computed value changes.
+  Files whose header pins a v1 computed hash fail open with
+  `SchemaHashMismatch`; recreate them (or re-derive and re-pin literal hashes
+  in the declaration). Files with `schema_hash` omitted (stored 0) are
+  unaffected because the comparison is disabled.
+- Matrix native files gained a creation-nonce region after the native file
+  header. Matrix files created before this change are refused with
+  `InvalidMatrixLayout`; recreate them. Non-matrix native files are unchanged.
+- The matrix sidecar envelope is version 3. Version-1/2 sidecars are refused
+  as `MatrixSidecarMismatch("sidecar version")` and simply regenerate —
+  sidecars are regenerable resume state, not data.
+
 ## Move Limits To Handle Creation
 
 `limits { ... }` is no longer mandatory and may be partial. Resource policy is

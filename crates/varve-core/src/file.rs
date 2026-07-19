@@ -14,10 +14,10 @@ use crate::{
     IndexPolicy, IntegrityPolicy, KeyedBlockVec, ManifestPolicy, MatrixCellStatus,
     MatrixCommitEvent, MatrixDimensions, MatrixKey, MatrixRecoveryAction, MatrixRecoveryReport,
     MatrixResumeSignal, RecoveryPolicy, Result, SnapshotFile, VariableCompression, VarveBlock,
-    VarveKeyedBlock, VarveMatrixBlock, VarveMerge, VarveMigration, VarveReplaceBlock, WireType,
+    VarveEncode, VarveKeyedBlock, VarveMatrixBlock, VarveMerge, VarveMigration, VarveReplaceBlock,
+    WireType,
     codec::encode_to_vec_limited,
     collections::MaterializationBudget,
-    encode_to_vec,
     format::ReadLimitKey,
     native_layout::{
         decode_native_internal_key_envelope, decode_native_internal_op_envelope,
@@ -63,14 +63,29 @@ const COMPRESSION_ENVELOPE_VERSION: u8 = 1;
 const FILE_COMPRESSION_MAGIC: &[u8; 4] = b"VCHD";
 const FILE_COMPRESSION_VERSION: u8 = 1;
 const MATRIX_SIDECAR_MAGIC: &[u8; 4] = b"VSID";
-// v2 binds the sidecar to the native file's OS-object identity and matrix
-// layout generation (DUR-04/05). v1 envelopes are refused as stale/regenerable.
-const MATRIX_SIDECAR_VERSION: u16 = 2;
+// v2 bound the sidecar to the native file's OS-object identity and matrix
+// layout generation (DUR-04/05). v3 additionally binds it to the per-create
+// creation nonce stamped into the native matrix file, so recreating a matrix
+// on the same OS file object invalidates every earlier sidecar (DUR2-03).
+// v1/v2 envelopes are refused as stale/regenerable.
+const MATRIX_SIDECAR_VERSION: u16 = 3;
 // Fixed header: 48-byte v1 prefix + 32-byte native fingerprint + 8-byte matrix
-// layout generation.
-const MATRIX_SIDECAR_FIXED_LEN: usize = 88;
+// layout generation + 16-byte matrix creation nonce.
+const MATRIX_SIDECAR_FIXED_LEN: usize = 104;
 const MATRIX_SIDECAR_FINGERPRINT_OFFSET: usize = 48;
 const MATRIX_SIDECAR_LAYOUT_GENERATION_OFFSET: usize = 80;
+const MATRIX_SIDECAR_CREATION_NONCE_OFFSET: usize = 88;
+// Per-create identity region stamped between the native file header and the
+// matrix layout header of every matrix file (DUR2-03). `create_with_dims`
+// reuses the OS file object when the pathname already exists, so OS identity,
+// schema hash and layout offsets are all stable across a same-dims recreate;
+// the nonce is the only value that distinguishes the new logical matrix from
+// the one every existing sidecar was published against.
+const MATRIX_CREATION_NONCE_MAGIC: &[u8; 4] = b"VMNC";
+const MATRIX_CREATION_NONCE_VERSION: u16 = 1;
+const MATRIX_CREATION_NONCE_LEN: usize = 16;
+// Magic (4) + version (2) + reserved (2) + nonce (16).
+const MATRIX_CREATION_NONCE_REGION_LEN: usize = 8 + MATRIX_CREATION_NONCE_LEN;
 #[cfg(feature = "integrity")]
 const STREAM_BUFFER_LEN: usize = 64 * 1024;
 const WRITER_LOCK_MAX_LEN: u64 = 16 * 1024;
@@ -128,6 +143,11 @@ pub struct MatrixSidecarManifest {
     /// The matrix layout generation the sidecar was published against, so a
     /// reader whose native layout has changed rejects the stale sidecar.
     pub matrix_layout_generation: u64,
+    /// The per-create creation nonce of the native matrix file the sidecar was
+    /// published against. Recreating a matrix on the same OS file object keeps
+    /// the OS identity and layout offsets stable, so this nonce is what makes
+    /// every pre-recreate sidecar refusable as stale (DUR2-03).
+    pub matrix_creation_nonce: [u8; MATRIX_CREATION_NONCE_LEN],
 }
 
 /// Identity of the native matrix file a sidecar is bound to.
@@ -138,6 +158,7 @@ pub struct MatrixSidecarManifest {
 pub(crate) struct MatrixNativeIdentity {
     fingerprint: [u8; 32],
     layout_generation: u64,
+    creation_nonce: [u8; MATRIX_CREATION_NONCE_LEN],
 }
 
 pub trait MatrixNumeric: Copy {
@@ -536,12 +557,107 @@ impl SequenceState {
     }
 }
 
+/// O(1) writer-side state behind [`VarveFile::needs_index_checkpoint`]
+/// (PERF2-02).
+///
+/// The original predicate reverse-searched the resident index for the last
+/// checkpoint and re-counted the suffix on every flush, which made the
+/// cumulative flush CPU O(N^2) for flush-per-record workloads even after the
+/// checkpoint *bytes* were made amortized O(N). This state mirrors exactly
+/// what that scan recomputed and is maintained incrementally at the single
+/// index append site, restored on append rollback, and recovered with one
+/// bounded reverse walk wherever the resident index is loaded or replaced
+/// wholesale (open, recovery, and generation rebinds).
+///
+/// Invariant: at all times this equals `CheckpointCadence::from_index(&index)`
+/// for the current resident index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CheckpointCadence {
+    /// Entries appended since the last full checkpoint whose presence would
+    /// change the serialized checkpoint (everything but commit markers).
+    eligible_since_checkpoint: usize,
+    /// Geometric growth threshold derived from the last checkpoint's index
+    /// position: `max(INDEX_CHECKPOINT_MIN_RECORDS, records_at_last_checkpoint / 2)`.
+    next_threshold: usize,
+}
+
+impl CheckpointCadence {
+    /// Cadence for a freshly created file with an empty resident index.
+    fn new_empty() -> Self {
+        Self {
+            eligible_since_checkpoint: 0,
+            next_threshold: INDEX_CHECKPOINT_MIN_RECORDS,
+        }
+    }
+
+    /// Recovers the cadence with a single reverse walk that stops at the last
+    /// checkpoint record, so reopen pays the live-tail length exactly once
+    /// instead of every flush paying it again.
+    fn from_index(index: &[RecordIndexEntry]) -> Self {
+        let mut eligible: usize = 0;
+        let mut touched: u64 = 0;
+        for (position, entry) in index.iter().enumerate().rev() {
+            touched = touched.saturating_add(1);
+            if entry.block_id == INDEX_BLOCK_ID {
+                note_checkpoint_cadence_index_touches(touched);
+                return Self {
+                    eligible_since_checkpoint: eligible,
+                    next_threshold: core::cmp::max(INDEX_CHECKPOINT_MIN_RECORDS, position / 2),
+                };
+            }
+            if entry.block_id != COMMIT_BLOCK_ID {
+                eligible = eligible.saturating_add(1);
+            }
+        }
+        note_checkpoint_cadence_index_touches(touched);
+        Self {
+            eligible_since_checkpoint: eligible,
+            next_threshold: INDEX_CHECKPOINT_MIN_RECORDS,
+        }
+    }
+
+    /// Advances the cadence for the entry just pushed at `position` in the
+    /// resident index. A checkpoint record resets the tail count and derives
+    /// the next geometric threshold from its own position (the number of
+    /// entries it serialized); commit markers never alter checkpoint identity;
+    /// every other record grows the eligible tail by one.
+    fn note_appended(&mut self, position: usize, block_id: u32) {
+        note_checkpoint_cadence_index_touches(1);
+        if block_id == INDEX_BLOCK_ID {
+            self.eligible_since_checkpoint = 0;
+            self.next_threshold = core::cmp::max(INDEX_CHECKPOINT_MIN_RECORDS, position / 2);
+        } else if block_id != COMMIT_BLOCK_ID {
+            self.eligible_since_checkpoint = self.eligible_since_checkpoint.saturating_add(1);
+        }
+    }
+}
+
+#[cfg(feature = "scalable-fault-injection")]
+std::thread_local! {
+    static CHECKPOINT_CADENCE_INDEX_TOUCHES: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+/// Counts resident index entries examined by the checkpoint flush-cadence
+/// machinery on this thread (PERF2-02 regression evidence). Inert without the
+/// `scalable-fault-injection` feature.
+#[inline]
+fn note_checkpoint_cadence_index_touches(count: u64) {
+    #[cfg(feature = "scalable-fault-injection")]
+    CHECKPOINT_CADENCE_INDEX_TOUCHES
+        .with(|touches| touches.set(touches.get().saturating_add(count)));
+    #[cfg(not(feature = "scalable-fault-injection"))]
+    let _ = count;
+}
+
 #[derive(Clone, Copy, Debug)]
 struct AppendSnapshot {
     eof: u64,
     cursor: u64,
     sequence_state: SequenceState,
     index_len: usize,
+    checkpoint_cadence: CheckpointCadence,
 }
 
 #[cfg(test)]
@@ -647,8 +763,10 @@ pub enum ReplaceStrategy {
 #[derive(Debug)]
 pub struct MmapPayloads {
     spec: FormatSpec,
+    // Sorted by `record_offset` (append-log order), so snapshot membership is
+    // a binary search on this one copy instead of a second full HashSet copy
+    // of every entry (PERF2-07).
     index: Vec<RecordIndexEntry>,
-    entry_set: std::collections::HashSet<RecordIndexEntry>,
     by_block: HashMap<u32, Vec<usize>>,
     mmap: memmap2::Mmap,
 }
@@ -668,7 +786,15 @@ impl MmapPayloads {
     }
 
     pub fn payload_window(&self, entry: &RecordIndexEntry) -> Result<&[u8]> {
-        if !self.entry_set.contains(entry) {
+        // Entries occupy disjoint physical extents, so `record_offset` is
+        // unique within the snapshot: binary search finds the only candidate
+        // and the full equality compare keeps the exact-match contract that
+        // the former per-entry hash-set copy provided (PERF2-07).
+        let position = self
+            .index
+            .binary_search_by_key(&entry.record_offset, |candidate| candidate.record_offset)
+            .map_err(|_| Error::MmapEntryNotInSnapshot)?;
+        if self.index[position] != *entry {
             return Err(Error::MmapEntryNotInSnapshot);
         }
         self.payload_window_unchecked(entry)
@@ -966,7 +1092,13 @@ pub struct VarveFile {
     mode: OpenMode,
     index: Vec<RecordIndexEntry>,
     matrix: Option<crate::matrix::MatrixLayout>,
+    // Present exactly when `matrix` is present: read once at open/create time
+    // so sidecar identity checks never touch the file per operation (DUR2-03).
+    matrix_creation_nonce: Option<[u8; MATRIX_CREATION_NONCE_LEN]>,
     sequence_state: SequenceState,
+    // O(1) flush-cadence state for `needs_index_checkpoint`; must equal
+    // `CheckpointCadence::from_index(&index)` at all times (PERF2-02).
+    checkpoint_cadence: CheckpointCadence,
     poisoned: bool,
     _lock: Option<WriterLock>,
 }
@@ -1211,6 +1343,19 @@ impl VarveWriter {
     ) -> Result<Self> {
         Ok(Self {
             file: VarveFile::create_with_dims(spec, path, dims)?,
+        })
+    }
+
+    /// Creates a new native matrix file, failing if `path` already exists.
+    ///
+    /// See [`VarveFile::create_new_with_dims`].
+    pub fn create_new_with_dims<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        dims: MatrixDimensions,
+    ) -> Result<Self> {
+        Ok(Self {
+            file: VarveFile::create_new_with_dims(spec, path, dims)?,
         })
     }
 
@@ -1630,10 +1775,16 @@ impl VarveFile {
         if exclusive {
             options.create_new(true);
         } else {
-            options.create(true).truncate(true);
+            options.create(true);
         }
         let mut file = options.open(&path)?;
+        // DUR2-05: bind the single-writer object lock before any destructive
+        // initialization. Opening with `.truncate(true)` would clear the new
+        // object inside the pre-bind window where a concurrent creator that
+        // lost the race could still hold an unbound handle to it.
         lock.bind_native(&file, &path)?;
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
         write_file_header(spec, &mut file)?;
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         let mut file = Self {
@@ -1644,7 +1795,9 @@ impl VarveFile {
             mode: OpenMode::ReadWrite,
             index: Vec::new(),
             matrix: None,
+            matrix_creation_nonce: None,
             sequence_state: SequenceState::Available(0),
+            checkpoint_cadence: CheckpointCadence::new_empty(),
             poisoned: false,
             _lock: Some(lock),
         };
@@ -1657,23 +1810,59 @@ impl VarveFile {
         path: P,
         dims: MatrixDimensions,
     ) -> Result<Self> {
+        Self::create_with_dims_impl(spec, path.as_ref(), dims, false)
+    }
+
+    /// Creates a new native matrix file, failing if `path` already exists.
+    ///
+    /// Unlike [`VarveFile::create_with_dims`], this never reuses or truncates
+    /// an existing file object: the exclusive create *is* the ownership claim,
+    /// and the same handle is kept locked from that claim through the complete
+    /// matrix initialization. Diagnostic scaffolding (the format self-test)
+    /// must use this instead of claiming the pathname with a separate handle
+    /// and then re-opening it by name (API2-02).
+    pub fn create_new_with_dims<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        dims: MatrixDimensions,
+    ) -> Result<Self> {
+        Self::create_with_dims_impl(spec, path.as_ref(), dims, true)
+    }
+
+    fn create_with_dims_impl(
+        spec: FormatSpec,
+        path: &Path,
+        dims: MatrixDimensions,
+        exclusive: bool,
+    ) -> Result<Self> {
         let spec = spec.resolve_entrypoint();
         spec.validate()?;
         ensure_native_write_limits(spec)?;
         check_initial_native_file_len(spec)?;
         if !spec.has_matrix_blocks() {
-            return Self::create(spec, path);
+            return Self::create_impl(spec, path, exclusive);
         }
-        let path = path.as_ref().to_path_buf();
+        let path = path.to_path_buf();
         let mut lock = WriterLock::acquire(&path)?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        if exclusive {
+            options.create_new(true);
+        } else {
+            options.create(true);
+        }
+        let mut file = options.open(&path)?;
+        // DUR2-05: bind the single-writer object lock before any destructive
+        // initialization; see `create_impl`.
         lock.bind_native(&file, &path)?;
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
         write_file_header(spec, &mut file)?;
+        // DUR2-03: stamp a fresh creation nonce so this logical matrix is
+        // distinguishable from any earlier matrix that lived in the same OS
+        // file object at the same layout offsets.
+        let creation_nonce = fresh_matrix_creation_nonce();
+        write_matrix_creation_nonce_region(&mut file, creation_nonce)?;
         let header_len = file.stream_position()?;
         let matrix = crate::matrix::create_layout(spec, &mut file, header_len, &dims)?;
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
@@ -1685,7 +1874,9 @@ impl VarveFile {
             mode: OpenMode::ReadWrite,
             index: Vec::new(),
             matrix: Some(matrix),
+            matrix_creation_nonce: Some(creation_nonce),
             sequence_state: SequenceState::Available(0),
+            checkpoint_cadence: CheckpointCadence::new_empty(),
             poisoned: false,
             _lock: Some(lock),
         };
@@ -1703,11 +1894,17 @@ impl VarveFile {
         lock.bind_native(&file, &path)?;
         let captured_len = check_open_file_len(spec, &file)?;
         let header_len = read_file_header(spec, &mut file)?;
-        let matrix = read_matrix_layout_if_needed(spec, &mut file, header_len, captured_len)?;
+        let (matrix, matrix_creation_nonce) = split_matrix_state(read_matrix_layout_if_needed(
+            spec,
+            &mut file,
+            header_len,
+            captured_len,
+        )?);
         let append_start = append_log_start(header_len, matrix.as_ref());
         let index = load_index(spec, &mut file, append_start, ScanIntent::Writer)?;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
         let sequence_state = SequenceState::from_index(&index);
+        let checkpoint_cadence = CheckpointCadence::from_index(&index);
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         Ok(Self {
             spec,
@@ -1717,7 +1914,9 @@ impl VarveFile {
             mode: OpenMode::ReadWrite,
             index,
             matrix,
+            matrix_creation_nonce,
             sequence_state,
+            checkpoint_cadence,
             poisoned: false,
             _lock: Some(lock),
         })
@@ -1737,11 +1936,17 @@ impl VarveFile {
         lock.bind_native(&file, &path)?;
         let captured_len = check_open_file_len(spec, &file)?;
         let header_len = read_file_header(spec, &mut file)?;
-        let matrix = read_matrix_layout_if_needed(spec, &mut file, header_len, captured_len)?;
+        let (matrix, matrix_creation_nonce) = split_matrix_state(read_matrix_layout_if_needed(
+            spec,
+            &mut file,
+            header_len,
+            captured_len,
+        )?);
         let append_start = append_log_start(header_len, matrix.as_ref());
         let index = load_index(spec, &mut file, append_start, ScanIntent::Writer)?;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
         let sequence_state = SequenceState::from_index(&index);
+        let checkpoint_cadence = CheckpointCadence::from_index(&index);
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         Ok(Self {
             spec,
@@ -1751,7 +1956,9 @@ impl VarveFile {
             mode: OpenMode::ReadWrite,
             index,
             matrix,
+            matrix_creation_nonce,
             sequence_state,
+            checkpoint_cadence,
             poisoned: false,
             _lock: Some(lock),
         })
@@ -1765,10 +1972,16 @@ impl VarveFile {
         let mut file = OpenOptions::new().read(true).open(&path)?;
         let captured_len = check_open_file_len(spec, &file)?;
         let header_len = read_file_header(spec, &mut file)?;
-        let matrix = read_matrix_layout_if_needed(spec, &mut file, header_len, captured_len)?;
+        let (matrix, matrix_creation_nonce) = split_matrix_state(read_matrix_layout_if_needed(
+            spec,
+            &mut file,
+            header_len,
+            captured_len,
+        )?);
         let append_start = append_log_start(header_len, matrix.as_ref());
         let index = load_index(spec, &mut file, append_start, ScanIntent::ReadOnly)?;
         let sequence_state = SequenceState::from_index(&index);
+        let checkpoint_cadence = CheckpointCadence::from_index(&index);
         let logical_len = validated_snapshot_len(append_start, &index)?;
         let snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, logical_len)?;
         Ok(Self {
@@ -1779,7 +1992,9 @@ impl VarveFile {
             mode: OpenMode::ReadOnly,
             index,
             matrix,
+            matrix_creation_nonce,
             sequence_state,
+            checkpoint_cadence,
             poisoned: false,
             _lock: None,
         })
@@ -1804,12 +2019,18 @@ impl VarveFile {
         spec.read_limits
             .check(ReadLimitKey::FileLen, original_len)?;
         let header_len = read_file_header(spec, &mut file)?;
-        let matrix = read_matrix_layout_if_needed(spec, &mut file, header_len, original_len)?;
+        let (matrix, matrix_creation_nonce) = split_matrix_state(read_matrix_layout_if_needed(
+            spec,
+            &mut file,
+            header_len,
+            original_len,
+        )?);
         let append_start = append_log_start(header_len, matrix.as_ref());
         let index = load_index(spec, &mut file, append_start, ScanIntent::Recover)?;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
         let recovered_len = file.metadata()?.len();
         let sequence_state = SequenceState::from_index(&index);
+        let checkpoint_cadence = CheckpointCadence::from_index(&index);
         let records_preserved = index.len();
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         Ok((
@@ -1821,7 +2042,9 @@ impl VarveFile {
                 mode: OpenMode::ReadWrite,
                 index,
                 matrix,
+                matrix_creation_nonce,
                 sequence_state,
+                checkpoint_cadence,
                 poisoned: false,
                 _lock: Some(lock),
             },
@@ -1872,7 +2095,7 @@ impl VarveFile {
         }
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         let endian = T::ENDIAN.unwrap_or(self.spec.endian);
-        let payload = encode_to_vec(block, endian)?;
+        let payload = encode_logical_payload_limited(self.spec, block, endian)?;
         self.write_user_record(T::ID, T::VERSION, T::KIND, &payload, prev_same_key_offset)
     }
 
@@ -1891,6 +2114,11 @@ impl VarveFile {
     where
         T: VarveKeyedBlock,
     {
+        // API2-03: keyed generic entry points evaluate the compile-time
+        // keyedness contract post-monomorphization; the registration below
+        // stays as the runtime backstop. This terminal site also covers the
+        // VarveFile::delete and VarveReader/VarveWriter delete wrappers.
+        let () = crate::traits::KeyedBlockContract::<T>::OK;
         self.ensure_write()?;
         self.ensure_user_block::<T>()?;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
@@ -1912,13 +2140,30 @@ impl VarveFile {
         self.ensure_write()?;
         self.ensure_user_block::<T>()?;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
-        let payload = encode_internal_op_payload::<T>(self.spec.endian, key, op)?;
+        let payload = encode_internal_op_payload::<T>(self.spec, key, op)?;
         self.write_record(OP_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, &payload)
     }
 
     pub fn write_metadata(&mut self, key: &str, value: &[u8]) -> Result<u64> {
+        // Encoded as (String, Vec<u8>): an 8-byte length prefix per part.
+        const METADATA_ENVELOPE_LEN: u64 = 16;
         self.ensure_write()?;
-        let payload = encode_to_vec(&(key.to_string(), value.to_vec()), self.spec.endian)?;
+        // DEF-02: reject an oversized entry with the typed limit error before
+        // the caller's key and value are cloned or encoded.
+        let entry_len = (key.len() as u64)
+            .checked_add(value.len() as u64)
+            .and_then(|len| len.checked_add(METADATA_ENVELOPE_LEN))
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "metadata entry length",
+            })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::LogicalPayloadLen, entry_len)?;
+        let payload = encode_logical_payload_limited(
+            self.spec,
+            &(key.to_string(), value.to_vec()),
+            self.spec.endian,
+        )?;
         self.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, &payload)
     }
 
@@ -2033,7 +2278,11 @@ impl VarveFile {
         let old: T = materialization.decode(&old_payload, T::ENDIAN.unwrap_or(self.spec.endian))?;
         T::validate_replacement(&old, block)?;
 
-        let encoded = encode_to_vec(block, T::ENDIAN.unwrap_or(self.spec.endian))?;
+        let encoded = encode_logical_payload_limited(
+            self.spec,
+            block,
+            T::ENDIAN.unwrap_or(self.spec.endian),
+        )?;
         let replacement = prepare_user_record_payload(self.spec, T::ID, T::KIND, &encoded)?;
         let replacement_len = u64::try_from(replacement.bytes.len())
             .map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
@@ -2139,10 +2388,7 @@ impl VarveFile {
                     source: Box::new(sync_error),
                 })
             }
-            Err(error) => {
-                let _ = remove_file(&temp_path);
-                Err(error)
-            }
+            Err(error) => Err(self.fail_publication(&temp_path, error)),
         }
     }
 
@@ -2177,7 +2423,7 @@ impl VarveFile {
             .ok_or(Error::UnexpectedEof)?;
 
         let endian = T::ENDIAN.unwrap_or(self.spec.endian);
-        let payload = encode_to_vec(block, endian)?;
+        let payload = encode_logical_payload_limited(self.spec, block, endian)?;
         let payload_len =
             u64::try_from(payload.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
         self.spec
@@ -2280,10 +2526,7 @@ impl VarveFile {
                     source: Box::new(sync_error),
                 })
             }
-            Err(error) => {
-                let _ = remove_file(&temp_path);
-                Err(error)
-            }
+            Err(error) => Err(self.fail_publication(&temp_path, error)),
         }
     }
 
@@ -2316,7 +2559,11 @@ impl VarveFile {
             .nth(index)
             .map(|(position, _)| position)
             .ok_or(Error::UnexpectedEof)?;
-        let payload = encode_to_vec(block, T::ENDIAN.unwrap_or(self.spec.endian))?;
+        let payload = encode_logical_payload_limited(
+            self.spec,
+            block,
+            T::ENDIAN.unwrap_or(self.spec.endian),
+        )?;
         let payload_len =
             u64::try_from(payload.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
         self.spec
@@ -2413,7 +2660,7 @@ impl VarveFile {
             .ok_or(Error::UnexpectedEof)?;
         let sequence = self.sequence_state.available()?;
         let endian = T::ENDIAN.unwrap_or(self.spec.endian);
-        let replacement = encode_to_vec(block, endian)?;
+        let replacement = encode_logical_payload_limited(self.spec, block, endian)?;
         let replacement = prepare_user_record_payload(self.spec, T::ID, T::KIND, &replacement)?;
         let replacement_len = u64::try_from(replacement.bytes.len())
             .map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
@@ -2508,10 +2755,7 @@ impl VarveFile {
                     source: Box::new(sync_error),
                 })
             }
-            Err(error) => {
-                let _ = remove_file(&temp_path);
-                Err(error)
-            }
+            Err(error) => Err(self.fail_publication(&temp_path, error)),
         }
     }
 
@@ -2651,6 +2895,10 @@ impl VarveFile {
         T: VarveKeyedBlock,
         T::Key: Eq + Hash + Clone,
     {
+        // API2-03: compile-time keyedness contract (also covers the
+        // VarveReader::keyed_blocks wrapper); registration is the runtime
+        // backstop.
+        let () = crate::traits::KeyedBlockContract::<T>::OK;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         let mut entries = Vec::new();
         let mut state: HashMap<T::Key, (MergeOrder, Option<RecordIndexEntry>)> = HashMap::new();
@@ -2772,6 +3020,10 @@ impl VarveFile {
         T: VarveKeyedBlock,
         T::Key: Eq + Hash,
     {
+        // API2-03: compile-time keyedness contract (also covers the
+        // VarveReader/VarveWriter key_tail_offsets wrappers); registration is
+        // the runtime backstop.
+        let () = crate::traits::KeyedBlockContract::<T>::OK;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         let mut tails: HashMap<T::Key, (MergeOrder, u64)> = HashMap::new();
         let mut budget = MaterializationBudget::new(self.spec);
@@ -3181,11 +3433,15 @@ impl VarveFile {
     /// in the schema hash, then pairs it with the matrix layout generation.
     fn matrix_native_identity(&self) -> Result<MatrixNativeIdentity> {
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
+        let creation_nonce = self
+            .matrix_creation_nonce
+            .ok_or(Error::MatrixLayoutMissing)?;
         let file = self.snapshot.try_clone_file()?;
         let fingerprint = native_object_fingerprint(self.spec, &file)?;
         Ok(MatrixNativeIdentity {
             fingerprint,
             layout_generation: matrix.append_log_start(),
+            creation_nonce,
         })
     }
 
@@ -3203,6 +3459,15 @@ impl VarveFile {
         read_writer_lock_info(path.as_ref())
     }
 
+    /// OS-object identity bytes of this writer's native file.
+    ///
+    /// Diagnostic scaffolding captures this at creation time so cleanup can
+    /// refuse to delete a file that another process has since swapped in at
+    /// the same pathname (API2-02).
+    pub(crate) fn native_object_identity(&self) -> Result<Vec<u8>> {
+        opened_file_identity(&self.file)
+    }
+
     /// Arms `count` injected post-publication parent-directory sync failures.
     ///
     /// Fault-testing hook only: each armed failure makes the next
@@ -3212,6 +3477,33 @@ impl VarveFile {
     #[doc(hidden)]
     pub fn inject_parent_sync_failures(count: u64) {
         INJECTED_PARENT_SYNC_FAILURES.store(count, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Arms `count` injected indeterminate replacement failures (DUR2-01).
+    ///
+    /// Fault-testing hook only: each armed failure makes the next atomic
+    /// pathname publication fail with
+    /// [`Error::ReplacePublicationIndeterminate`] before touching the target,
+    /// which models an unreconciled Windows `ReplaceFileW` 1176/1177 outcome
+    /// that cannot be produced on demand by a real filesystem.
+    #[cfg(feature = "scalable-fault-injection")]
+    #[doc(hidden)]
+    pub fn inject_replace_indeterminate_failures(count: u64) {
+        INJECTED_REPLACE_INDETERMINATE_FAILURES.store(count, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Returns the cumulative number of resident index entries this thread's
+    /// checkpoint flush-cadence machinery has examined (PERF2-02).
+    ///
+    /// Fault-testing hook only: regression tests delta-measure this around a
+    /// flush-per-record workload to pin the cadence work at O(1) per flush
+    /// (near-linear cumulative touches) instead of the historical O(N) rescan
+    /// per flush. The counter is thread-local so concurrently running tests
+    /// cannot pollute each other's measurements.
+    #[cfg(feature = "scalable-fault-injection")]
+    #[doc(hidden)]
+    pub fn checkpoint_cadence_index_touches() -> u64 {
+        CHECKPOINT_CADENCE_INDEX_TOUCHES.with(|touches| touches.get())
     }
 
     #[cfg(feature = "mmap")]
@@ -3277,14 +3569,15 @@ impl VarveFile {
                 requested: mmap_index_bytes,
             })?;
         index.extend(self.index.iter().cloned());
-        let mut entry_set = std::collections::HashSet::new();
-        entry_set
-            .try_reserve(self.index.len())
-            .map_err(|_| Error::AllocationFailed {
-                resource: "mmap entry set",
-                requested: mmap_index_bytes,
-            })?;
-        entry_set.extend(self.index.iter().cloned());
+        // Records occupy contiguous ascending physical extents, so the copied
+        // index is strictly offset-ordered; `payload_window` relies on this
+        // for its binary-search membership check (PERF2-07).
+        debug_assert!(
+            index
+                .windows(2)
+                .all(|pair| pair[0].record_offset < pair[1].record_offset),
+            "resident index must be strictly ordered by record offset",
+        );
         let mut by_block: HashMap<u32, Vec<usize>> = HashMap::new();
         by_block
             .try_reserve(
@@ -3309,7 +3602,6 @@ impl VarveFile {
         Ok(MmapPayloads {
             spec: self.spec,
             index,
-            entry_set,
             by_block,
             mmap,
         })
@@ -3411,6 +3703,9 @@ impl VarveFile {
                 self.file = file;
                 self.snapshot = snapshot;
                 self.index = new_index;
+                // The resident index was replaced wholesale; recover the O(1)
+                // flush-cadence state once for the new generation (PERF2-02).
+                self.checkpoint_cadence = CheckpointCadence::from_index(&self.index);
                 self.publish_sequence(sequence);
                 Ok(sequence)
             }
@@ -3447,6 +3742,9 @@ impl VarveFile {
                 self.file = file;
                 self.snapshot = snapshot;
                 self.index = new_index;
+                // The resident index was replaced wholesale; recover the O(1)
+                // flush-cadence state once for the new generation (PERF2-02).
+                self.checkpoint_cadence = CheckpointCadence::from_index(&self.index);
                 Ok(info)
             }
             Err(source) => {
@@ -3481,6 +3779,23 @@ impl VarveFile {
         } else {
             Ok(())
         }
+    }
+
+    /// Handles a failed atomic publication for a copy-on-write writer.
+    ///
+    /// Pre-publication failures leave the target untouched, so the temp file
+    /// is deleted and the writer stays usable. An indeterminate outcome
+    /// ([`Error::ReplacePublicationIndeterminate`]) means the pathname state
+    /// is unknown: the temp file is preserved for out-of-band reconciliation
+    /// and the writer is poisoned so a blind retry cannot publish over an
+    /// unknown generation (DUR2-01).
+    fn fail_publication(&mut self, temp_path: &Path, error: Error) -> Error {
+        if matches!(error, Error::ReplacePublicationIndeterminate { .. }) {
+            self.poisoned = true;
+        } else {
+            let _ = remove_file(temp_path);
+        }
+        error
     }
 
     fn finish_matrix_mutation<T>(&mut self, result: Result<T>) -> Result<T> {
@@ -3596,6 +3911,7 @@ impl VarveFile {
             cursor: self.file.stream_position()?,
             sequence_state: self.sequence_state,
             index_len: self.index.len(),
+            checkpoint_cadence: self.checkpoint_cadence,
         };
         let record_offset = snapshot.eof;
         let payload_offset = record_offset.checked_add(RECORD_HEADER_LEN).ok_or(
@@ -3703,6 +4019,10 @@ impl VarveFile {
         };
         let info = AppendInfo::from(&entry);
         self.index.push(entry);
+        // Single index append site: keep the O(1) flush-cadence state in
+        // lockstep with the resident index (PERF2-02).
+        self.checkpoint_cadence
+            .note_appended(self.index.len() - 1, block_id);
         self.snapshot = new_snapshot;
         self.publish_sequence(sequence);
         Ok(info)
@@ -3711,6 +4031,7 @@ impl VarveFile {
     fn rollback_append(&mut self, snapshot: AppendSnapshot, operation_error: Error) -> Error {
         self.index.truncate(snapshot.index_len);
         self.sequence_state = snapshot.sequence_state;
+        self.checkpoint_cadence = snapshot.checkpoint_cadence;
 
         #[cfg(test)]
         let truncate_result =
@@ -3814,14 +4135,14 @@ impl VarveFile {
     }
 
     fn has_uncommitted_since_last_commit(&self) -> bool {
-        let start = self
-            .index
-            .iter()
-            .rposition(|entry| entry.block_id == COMMIT_BLOCK_ID)
-            .map_or(0, |position| position + 1);
-        self.index[start..]
-            .iter()
-            .any(|entry| entry.block_id != COMMIT_BLOCK_ID)
+        // Every entry after the last commit marker is by definition not a
+        // commit marker, so "any non-commit entry after the last commit"
+        // reduces to "the newest entry is not a commit marker". The former
+        // reverse search re-walked the index on every flush, adding another
+        // O(N^2) cumulative flush cost for marker-on-flush formats (PERF2-02).
+        self.index
+            .last()
+            .is_some_and(|entry| entry.block_id != COMMIT_BLOCK_ID)
     }
 
     /// Decides whether `flush`/`commit` should serialize a fresh full index
@@ -3845,32 +4166,20 @@ impl VarveFile {
     /// Open/recovery does not depend on this cadence: the scan reads every
     /// native record and merely validates whatever checkpoints it encounters,
     /// so sparse checkpoints and a checkpoint-less tail both recover correctly.
+    ///
+    /// The decision itself is O(1) (PERF2-02): [`CheckpointCadence`] carries
+    /// the eligible-tail count and the geometric threshold that the original
+    /// implementation recomputed by reverse-searching the resident index on
+    /// every flush, which made cumulative flush CPU O(N^2) for
+    /// flush-per-record workloads.
     fn needs_index_checkpoint(&self) -> bool {
-        if self.index.is_empty() {
-            return false;
-        }
-        let last_checkpoint_position = self
-            .index
-            .iter()
-            .rposition(|entry| entry.block_id == INDEX_BLOCK_ID);
-        let start = last_checkpoint_position.map_or(0, |position| position + 1);
-        // Records that would change the serialized checkpoint. Commit markers
-        // do not alter index identity, so on their own they never force a new
-        // checkpoint (rule a).
-        let new_records = self.index[start..]
-            .iter()
-            .filter(|entry| entry.block_id != COMMIT_BLOCK_ID)
-            .count();
-        if new_records == 0 {
-            return false;
-        }
-        // The checkpoint record sits at `last_checkpoint_position` and serialized
-        // exactly that many prior entries, so its position is a faithful proxy
-        // for the byte cost of the last checkpoint (rule b).
-        let records_at_last_checkpoint = last_checkpoint_position.unwrap_or(0);
-        let threshold =
-            core::cmp::max(INDEX_CHECKPOINT_MIN_RECORDS, records_at_last_checkpoint / 2);
-        new_records >= threshold
+        // Rule (a): commit markers never grow the eligible tail, so an
+        // unchanged checkpoint is suppressed by `eligible_since_checkpoint`
+        // staying at zero. Rule (b): the threshold was derived from the last
+        // checkpoint's position, whose entry count is a faithful proxy for
+        // that checkpoint's byte cost.
+        let new_records = self.checkpoint_cadence.eligible_since_checkpoint;
+        new_records != 0 && new_records >= self.checkpoint_cadence.next_threshold
     }
 }
 
@@ -5232,11 +5541,19 @@ where
                 source: Box::new(sync_error),
             })
         }
-        Err(error) => {
-            let _ = remove_file(&temp_path);
-            Err(error)
-        }
+        Err(error) => Err(preserve_temp_on_indeterminate(&temp_path, error)),
     }
+}
+
+/// Deletes a publication temp file after a pre-publication failure, but
+/// preserves it after [`Error::ReplacePublicationIndeterminate`]: in that
+/// state the temp may be the only surviving copy of the new generation and is
+/// required for out-of-band reconciliation (DUR2-01).
+fn preserve_temp_on_indeterminate(temp_path: &Path, error: Error) -> Error {
+    if !matches!(error, Error::ReplacePublicationIndeterminate { .. }) {
+        let _ = remove_file(temp_path);
+    }
+    error
 }
 
 fn apply_merge_file<T, P>(
@@ -5363,6 +5680,30 @@ fn should_apply<T>(current: Option<&(MergeOrder, Option<T>)>, order: MergeOrder)
     current.is_none_or(|(old_order, _)| order >= *old_order)
 }
 
+/// Encodes a writer-supplied value with the format's logical-payload limit as
+/// the encode hard bound (DEF-02).
+///
+/// Every resident writer entry point routes its value encoding through this
+/// bound so an oversized value fails with the typed limit error while the
+/// encoder stops buffering at the limit, instead of materializing an
+/// arbitrarily large encoding first and only then failing the limit check.
+fn encode_logical_payload_limited<T: VarveEncode>(
+    spec: FormatSpec,
+    value: &T,
+    endian: Endian,
+) -> Result<Vec<u8>> {
+    let logical_limit = spec
+        .read_limits
+        .require(ReadLimitKey::LogicalPayloadLen)?
+        .unwrap_or(u64::MAX);
+    encode_to_vec_limited(
+        value,
+        endian,
+        logical_limit,
+        ReadLimitKey::LogicalPayloadLen.resource(),
+    )
+}
+
 fn encode_internal_key_payload<T>(spec: FormatSpec, key: &T::Key) -> Result<Vec<u8>>
 where
     T: VarveKeyedBlock,
@@ -5442,13 +5783,54 @@ pub(crate) fn decode_stream_tombstone_key<T: VarveKeyedBlock>(
     decode_internal_key_payload::<T>(spec.endian, &payload, &mut budget)
 }
 
-fn encode_internal_op_payload<T>(endian: Endian, key: &T::Key, op: &T::Op) -> Result<Vec<u8>>
+fn encode_internal_op_payload<T>(spec: FormatSpec, key: &T::Key, op: &T::Op) -> Result<Vec<u8>>
 where
     T: VarveMerge,
 {
-    let key_payload = encode_to_vec(key, endian)?;
-    let op_payload = encode_to_vec(op, endian)?;
+    const ENVELOPE_LEN: u64 = 20;
+    let logical_limit = spec
+        .read_limits
+        .require(ReadLimitKey::LogicalPayloadLen)?
+        .unwrap_or(u64::MAX);
+    let key_limit = logical_limit
+        .checked_sub(ENVELOPE_LEN)
+        .ok_or(Error::LimitExceeded {
+            resource: ReadLimitKey::LogicalPayloadLen.resource(),
+            actual: ENVELOPE_LEN,
+            limit: logical_limit,
+        })?;
+    let key_payload = encode_to_vec_limited(
+        key,
+        spec.endian,
+        key_limit,
+        ReadLimitKey::LogicalPayloadLen.resource(),
+    )?;
+    // DEF-02: the op encoder inherits whatever budget the key left over, so
+    // the combined encoding can never buffer past the logical payload limit.
+    let op_limit = key_limit - key_payload.len() as u64;
+    let op_payload = encode_to_vec_limited(
+        op,
+        spec.endian,
+        op_limit,
+        ReadLimitKey::LogicalPayloadLen.resource(),
+    )?;
+    let total_len = ENVELOPE_LEN
+        .checked_add(key_payload.len() as u64)
+        .and_then(|len| len.checked_add(op_payload.len() as u64))
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "internal op payload length",
+        })?;
+    spec.read_limits
+        .check(ReadLimitKey::LogicalPayloadLen, total_len)?;
+    let total_len_usize =
+        usize::try_from(total_len).map_err(|_| Error::LengthOverflow { value: total_len })?;
     let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(total_len_usize)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "internal op payload",
+            requested: total_len,
+        })?;
     payload.extend_from_slice(&T::ID.to_le_bytes());
     payload.extend_from_slice(&(key_payload.len() as u64).to_le_bytes());
     payload.extend_from_slice(&key_payload);
@@ -5514,21 +5896,113 @@ fn read_matrix_layout_if_needed(
     file: &mut File,
     header_len: u64,
     captured_len: u64,
-) -> Result<Option<crate::matrix::MatrixLayout>> {
+) -> Result<Option<(crate::matrix::MatrixLayout, [u8; MATRIX_CREATION_NONCE_LEN])>> {
     if spec.has_matrix_blocks() {
-        Ok(Some(crate::matrix::read_layout_at_len(
-            spec,
-            file,
-            header_len,
-            captured_len,
-        )?))
+        // The creation nonce region sits between the native file header and
+        // the matrix layout header (DUR2-03).
+        let creation_nonce = read_matrix_creation_nonce_region(file, header_len)?;
+        let layout_start = header_len
+            .checked_add(MATRIX_CREATION_NONCE_REGION_LEN as u64)
+            .ok_or(Error::InvalidMatrixLayout)?;
+        let layout = crate::matrix::read_layout_at_len(spec, file, layout_start, captured_len)?;
+        Ok(Some((layout, creation_nonce)))
     } else {
         Ok(None)
     }
 }
 
+#[allow(clippy::type_complexity)]
+fn split_matrix_state(
+    state: Option<(crate::matrix::MatrixLayout, [u8; MATRIX_CREATION_NONCE_LEN])>,
+) -> (
+    Option<crate::matrix::MatrixLayout>,
+    Option<[u8; MATRIX_CREATION_NONCE_LEN]>,
+) {
+    match state {
+        Some((layout, nonce)) => (Some(layout), Some(nonce)),
+        None => (None, None),
+    }
+}
+
 fn append_log_start(header_len: u64, matrix: Option<&crate::matrix::MatrixLayout>) -> u64 {
     matrix.map_or(header_len, crate::matrix::MatrixLayout::append_log_start)
+}
+
+/// Produces a fresh 128-bit matrix creation nonce (DUR2-03).
+///
+/// This is a uniqueness value, not a cryptographic secret: it only has to
+/// differ between two `create_with_dims` calls that reuse the same OS file
+/// object. Wall-clock nanoseconds, the process id and a per-process counter
+/// are mixed through FNV-1a into two independent 64-bit lanes.
+fn fresh_matrix_creation_nonce() -> [u8; MATRIX_CREATION_NONCE_LEN] {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CREATION_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = CREATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let pid = u64::from(std::process::id());
+
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+    const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut nonce = [0u8; MATRIX_CREATION_NONCE_LEN];
+    for lane in 0u64..2 {
+        let mut hash = FNV_OFFSET_BASIS;
+        for word in [lane, nanos as u64, (nanos >> 64) as u64, pid, counter] {
+            for byte in word.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+        }
+        let lane = lane as usize;
+        nonce[lane * 8..(lane + 1) * 8].copy_from_slice(&hash.to_le_bytes());
+    }
+    // The raw entropy words survive the mix: XOR them back in so even a
+    // degenerate clock (nanos == 0 on every call) cannot collapse two creates
+    // in the same process to the same nonce (the counter still differs).
+    for (index, byte) in nanos
+        .to_le_bytes()
+        .iter()
+        .chain(counter.to_le_bytes().iter())
+        .take(MATRIX_CREATION_NONCE_LEN)
+        .enumerate()
+    {
+        nonce[index] ^= byte.rotate_left((index % 7) as u32);
+    }
+    nonce
+}
+
+fn write_matrix_creation_nonce_region(
+    file: &mut File,
+    nonce: [u8; MATRIX_CREATION_NONCE_LEN],
+) -> Result<()> {
+    let mut region = [0u8; MATRIX_CREATION_NONCE_REGION_LEN];
+    region[0..4].copy_from_slice(MATRIX_CREATION_NONCE_MAGIC);
+    region[4..6].copy_from_slice(&MATRIX_CREATION_NONCE_VERSION.to_le_bytes());
+    // region[6..8] stays zero (reserved).
+    region[8..].copy_from_slice(&nonce);
+    file.write_all(&region)?;
+    Ok(())
+}
+
+fn read_matrix_creation_nonce_region(
+    file: &mut File,
+    offset: u64,
+) -> Result<[u8; MATRIX_CREATION_NONCE_LEN]> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut region = [0u8; MATRIX_CREATION_NONCE_REGION_LEN];
+    file.read_exact(&mut region)?;
+    if &region[0..4] != MATRIX_CREATION_NONCE_MAGIC
+        || region[4..6] != MATRIX_CREATION_NONCE_VERSION.to_le_bytes()
+        || region[6..8] != [0; 2]
+    {
+        return Err(Error::InvalidMatrixLayout);
+    }
+    let mut nonce = [0u8; MATRIX_CREATION_NONCE_LEN];
+    nonce.copy_from_slice(&region[8..]);
+    Ok(nonce)
 }
 
 pub(crate) fn ensure_native_write_limits(spec: FormatSpec) -> Result<()> {
@@ -5556,7 +6030,14 @@ pub(crate) fn check_initial_native_file_len(spec: FormatSpec) -> Result<()> {
             resource: "file length",
         }
     })?;
-    let header_len = native_file_header_len(spec, extension_len);
+    let mut header_len = native_file_header_len(spec, extension_len);
+    if spec.has_matrix_blocks() {
+        header_len = header_len
+            .checked_add(MATRIX_CREATION_NONCE_REGION_LEN as u64)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "file length",
+            })?;
+    }
     spec.read_limits.check(ReadLimitKey::FileLen, header_len)
 }
 
@@ -6108,9 +6589,12 @@ fn load_index(
     header_len: u64,
     intent: ScanIntent,
 ) -> Result<Vec<RecordIndexEntry>> {
-    let entries = scan_records_from(spec, file, header_len, intent)?;
-    validate_unique_sequences(&entries)?;
-    Ok(entries)
+    // Sequence uniqueness is validated exactly once, inside
+    // `scan_records_from`, on the complete scanned entry list *before* any
+    // commit-boundary truncation; a truncated prefix of a duplicate-free list
+    // is still duplicate-free, so revalidating here would only repeat the
+    // N-element copy+sort on every open (PERF2-07).
+    scan_records_from(spec, file, header_len, intent)
 }
 
 fn validated_snapshot_len(append_start: u64, entries: &[RecordIndexEntry]) -> Result<u64> {
@@ -6476,6 +6960,10 @@ fn scan_records_from(
         }
         entries.push(entry);
     }
+    // Single sequence-uniqueness witness for the whole load path: `load_index`
+    // relies on this check and must not repeat it (PERF2-07). It runs on the
+    // full scanned list, so the commit-boundary truncation below can only
+    // shrink an already-validated set.
     validate_unique_sequences(&entries)?;
     if spec.commit_policy.is_transaction_marker() {
         let Some(position) = latest_commit_position else {
@@ -6706,12 +7194,14 @@ fn mmap_index_bytes_for_count(count: usize) -> Result<u64> {
     let count = u64::try_from(count).map_err(|_| Error::ResourceArithmeticOverflow {
         resource: "mmap index bytes",
     })?;
+    // One index entry copy plus one `by_block` position per record; the
+    // former second full entry copy for the membership hash set is gone
+    // (PERF2-07).
     let entry_bytes = u64::try_from(size_of::<RecordIndexEntry>())
         .map_err(|_| Error::ResourceArithmeticOverflow {
             resource: "mmap index bytes",
         })?
-        .checked_mul(2)
-        .and_then(|bytes| bytes.checked_add(size_of::<usize>() as u64))
+        .checked_add(size_of::<usize>() as u64)
         .ok_or(Error::ResourceArithmeticOverflow {
             resource: "mmap index bytes",
         })?;
@@ -6995,6 +7485,7 @@ fn write_matrix_sidecar_file<P: AsRef<Path>>(
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&manifest.native_fingerprint);
     bytes.extend_from_slice(&manifest.matrix_layout_generation.to_le_bytes());
+    bytes.extend_from_slice(&manifest.matrix_creation_nonce);
     debug_assert_eq!(bytes.len(), MATRIX_SIDECAR_FIXED_LEN);
     bytes.extend_from_slice(&manifest.format_magic);
     bytes.extend_from_slice(manifest.category.as_bytes());
@@ -7033,10 +7524,7 @@ fn write_matrix_sidecar_file<P: AsRef<Path>>(
                 source: Box::new(sync_error),
             })
         }
-        Err(error) => {
-            let _ = remove_file(&temp_path);
-            Err(error)
-        }
+        Err(error) => Err(preserve_temp_on_indeterminate(&temp_path, error)),
     }
 }
 
@@ -7060,8 +7548,9 @@ fn read_matrix_sidecar_file<P: AsRef<Path>>(
     }
     let version = u16::from_le_bytes(fixed[4..6].try_into().expect("slice"));
     if version != MATRIX_SIDECAR_VERSION {
-        // A different envelope version (notably legacy v1, which lacked native
-        // identity) is refused as stale and regenerable rather than trusted.
+        // A different envelope version (legacy v1 lacked native identity,
+        // legacy v2 lacked the matrix creation nonce) is refused as stale and
+        // regenerable rather than trusted.
         return Err(Error::MatrixSidecarMismatch("sidecar version"));
     }
     let format_version = u16::from_le_bytes(fixed[8..10].try_into().expect("slice"));
@@ -7079,10 +7568,13 @@ fn read_matrix_sidecar_file<P: AsRef<Path>>(
         &fixed[MATRIX_SIDECAR_FINGERPRINT_OFFSET..MATRIX_SIDECAR_LAYOUT_GENERATION_OFFSET],
     );
     let matrix_layout_generation = u64::from_le_bytes(
-        fixed[MATRIX_SIDECAR_LAYOUT_GENERATION_OFFSET..MATRIX_SIDECAR_FIXED_LEN]
+        fixed[MATRIX_SIDECAR_LAYOUT_GENERATION_OFFSET..MATRIX_SIDECAR_CREATION_NONCE_OFFSET]
             .try_into()
             .expect("slice"),
     );
+    let mut matrix_creation_nonce = [0u8; MATRIX_CREATION_NONCE_LEN];
+    matrix_creation_nonce
+        .copy_from_slice(&fixed[MATRIX_SIDECAR_CREATION_NONCE_OFFSET..MATRIX_SIDECAR_FIXED_LEN]);
     let plan = crate::matrix::matrix_sidecar_read_plan(
         spec,
         file_len,
@@ -7094,6 +7586,10 @@ fn read_matrix_sidecar_file<P: AsRef<Path>>(
         reserved,
         trailing_reserved,
     )?;
+    // DEF-03: only the small fixed header and the bounded magic/category
+    // prefix are read before identity validation. A sidecar that belongs to a
+    // different native file, schema, category or generation is rejected here,
+    // before the payload is ever allocated, read or hashed.
     file.seek(SeekFrom::Start(plan.format_magic_offset))?;
     let mut format_magic = try_alloc_bytes(magic_len, "sidecar format magic")?;
     file.read_exact(&mut format_magic)?;
@@ -7102,16 +7598,6 @@ fn read_matrix_sidecar_file<P: AsRef<Path>>(
     file.read_exact(&mut category_bytes)?;
     let category_text =
         String::from_utf8(category_bytes).map_err(|_| Error::InvalidMatrixSidecar)?;
-    file.seek(SeekFrom::Start(plan.payload_offset))?;
-    let mut payload = try_alloc_bytes(plan.payload_len, "sidecar payload")?;
-    file.read_exact(&mut payload)?;
-    let actual = crc32_bytes(&payload)?;
-    if actual != payload_crc32 {
-        return Err(Error::MatrixSidecarChecksumMismatch {
-            expected: payload_crc32,
-            actual,
-        });
-    }
     let manifest = MatrixSidecarManifest {
         format_magic,
         format_version,
@@ -7122,8 +7608,19 @@ fn read_matrix_sidecar_file<P: AsRef<Path>>(
         payload_crc32,
         native_fingerprint,
         matrix_layout_generation,
+        matrix_creation_nonce,
     };
     validate_matrix_sidecar_manifest(spec, category, expected_generation, identity, &manifest)?;
+    file.seek(SeekFrom::Start(plan.payload_offset))?;
+    let mut payload = try_alloc_bytes(plan.payload_len, "sidecar payload")?;
+    file.read_exact(&mut payload)?;
+    let actual = crc32_bytes(&payload)?;
+    if actual != payload_crc32 {
+        return Err(Error::MatrixSidecarChecksumMismatch {
+            expected: payload_crc32,
+            actual,
+        });
+    }
     Ok((manifest, payload))
 }
 
@@ -7182,6 +7679,7 @@ fn matrix_sidecar_manifest_for(
         payload_crc32: crc32_bytes(payload)?,
         native_fingerprint: identity.fingerprint,
         matrix_layout_generation: identity.layout_generation,
+        matrix_creation_nonce: identity.creation_nonce,
     })
 }
 
@@ -7212,6 +7710,13 @@ fn validate_matrix_sidecar_manifest(
     }
     if manifest.matrix_layout_generation != identity.layout_generation {
         return Err(Error::MatrixSidecarMismatch("matrix layout generation"));
+    }
+    // Same OS object, schema and layout offsets are not enough: a matrix
+    // recreated in the same file object gets a fresh creation nonce, so every
+    // sidecar published against the previous logical matrix is refused as
+    // stale and regenerable (DUR2-03).
+    if manifest.matrix_creation_nonce != identity.creation_nonce {
+        return Err(Error::MatrixSidecarMismatch("creation nonce"));
     }
     if let Some(expected_generation) = expected_generation
         && manifest.generation != expected_generation
@@ -7251,7 +7756,7 @@ fn native_object_fingerprint(spec: FormatSpec, file: &File) -> Result<[u8; 32]> 
 }
 
 #[cfg(unix)]
-fn opened_file_identity(file: &File) -> Result<Vec<u8>> {
+pub(crate) fn opened_file_identity(file: &File) -> Result<Vec<u8>> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = file.metadata()?;
@@ -7262,7 +7767,7 @@ fn opened_file_identity(file: &File) -> Result<Vec<u8>> {
 }
 
 #[cfg(windows)]
-fn opened_file_identity(file: &File) -> Result<Vec<u8>> {
+pub(crate) fn opened_file_identity(file: &File) -> Result<Vec<u8>> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
@@ -7317,14 +7822,60 @@ pub(crate) fn create_rewrite_temp_file(path: &Path) -> Result<(PathBuf, File)> {
     .into())
 }
 
+/// Classification of a failed Windows `ReplaceFileW` call (DUR2-01).
+///
+/// Derived from the documented contract
+/// (<https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-replacefilew>):
+/// `ERROR_UNABLE_TO_REMOVE_REPLACED` (1175) leaves the replaced file intact
+/// under its original name, `ERROR_UNABLE_TO_MOVE_REPLACEMENT` (1176) and
+/// `ERROR_UNABLE_TO_MOVE_REPLACEMENT_2` (1177) can leave the two files'
+/// names, streams and attributes partially moved (the target pathname may
+/// already have changed), and every other error occurs before any mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplacePublicationFailure {
+    /// `ERROR_UNABLE_TO_REMOVE_REPLACED` (1175): the replaced file is intact
+    /// under its original name; nothing was mutated.
+    ReplacedFileIntact,
+    /// Any other documented pre-publication error: both files retain their
+    /// original names.
+    PrePublication,
+    /// 1176/1177: the pathname state is indeterminate. The replacement temp
+    /// file must be preserved and a writer bound to the target must not
+    /// blindly retry the publication.
+    IndeterminatePublication,
+}
+
+const ERROR_UNABLE_TO_REMOVE_REPLACED: i32 = 1175;
+const ERROR_UNABLE_TO_MOVE_REPLACEMENT: i32 = 1176;
+const ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: i32 = 1177;
+
+/// Classifies a raw `ReplaceFileW` OS error per the Microsoft contract.
+///
+/// Pure and platform-independent so the classification is unit-testable on
+/// every host; only the Windows publication path feeds it live errors.
+pub fn classify_replace_publication_error(raw_os_error: i32) -> ReplacePublicationFailure {
+    match raw_os_error {
+        ERROR_UNABLE_TO_REMOVE_REPLACED => ReplacePublicationFailure::ReplacedFileIntact,
+        ERROR_UNABLE_TO_MOVE_REPLACEMENT | ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 => {
+            ReplacePublicationFailure::IndeterminatePublication
+        }
+        _ => ReplacePublicationFailure::PrePublication,
+    }
+}
+
 /// Outcome of a pathname publication whose rename step succeeded.
 ///
-/// `Err` from [`replace_path_atomically`] always means the publication itself
-/// failed and the target pathname still resolves to the previous generation.
-/// Once the rename has happened the target is already the new generation, so a
-/// later durability failure must not be reported as a plain error: callers
-/// must keep operating on the published generation (rebind or poison the
-/// writer) and surface [`Error::PublishedButParentSyncPending`] instead.
+/// `Err` from [`replace_path_atomically`] means the publication itself failed.
+/// With one exception the target pathname still resolves to the previous
+/// generation and the caller may delete its temp file; the exception is
+/// [`Error::ReplacePublicationIndeterminate`], after which the pathname state
+/// is unknown, the replacement temp file must be preserved for reconciliation
+/// and any writer bound to the target must be poisoned instead of retrying
+/// (DUR2-01). Once the rename has happened the target is already the new
+/// generation, so a later durability failure must not be reported as a plain
+/// error: callers must keep operating on the published generation (rebind or
+/// poison the writer) and surface [`Error::PublishedButParentSyncPending`]
+/// instead.
 #[derive(Debug)]
 pub(crate) enum ReplaceDurability {
     /// The replacement is visible at the target path and the parent-directory
@@ -7335,11 +7886,46 @@ pub(crate) enum ReplaceDurability {
     ParentSyncPending(Error),
 }
 
+/// Publishes a [`tempfile::TempPath`]-guarded replacement at `target` via
+/// [`replace_path_atomically`], taking ownership of the RAII guard so its
+/// pathname deletion can be disarmed when the publication outcome is
+/// indeterminate.
+///
+/// After [`Error::ReplacePublicationIndeterminate`] the replacement temp may
+/// be the only surviving copy of the new generation and must be preserved for
+/// out-of-band reconciliation, so the guard is disarmed before the error
+/// propagates (DUR2-01). Every other `Err` is a documented pre-publication
+/// failure — the target pathname is untouched — so dropping the guard deletes
+/// the unpublished temp as usual; on `Ok` the rename already consumed the temp
+/// pathname and the guard's drop is a no-op.
+#[cfg(feature = "high-cardinality-dev")]
+pub(crate) fn publish_temp_path_atomically(
+    temporary: tempfile::TempPath,
+    target: &Path,
+) -> Result<ReplaceDurability> {
+    match replace_path_atomically(&temporary, target) {
+        Err(error) => {
+            if matches!(error, Error::ReplacePublicationIndeterminate { .. }) {
+                // `keep` only forgets the guard; if it ever reports an error
+                // it hands the guard back, so forget it manually rather than
+                // letting the drop delete the replacement we must preserve.
+                if let Err(persist_error) = temporary.keep() {
+                    std::mem::forget(persist_error.path);
+                }
+            }
+            Err(error)
+        }
+        published => published,
+    }
+}
+
 #[cfg(not(windows))]
 pub(crate) fn replace_path_atomically(
     replacement: &Path,
     target: &Path,
 ) -> Result<ReplaceDurability> {
+    #[cfg(feature = "scalable-fault-injection")]
+    take_injected_replace_indeterminate(replacement, target)?;
     crate::scalable_fault_point("replace.atomic");
     let replace = std::fs::rename(replacement, target);
     crate::scalable_fault_point("replace.atomic");
@@ -7358,6 +7944,9 @@ pub(crate) fn replace_path_atomically(
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 
+    #[cfg(feature = "scalable-fault-injection")]
+    take_injected_replace_indeterminate(replacement, target)?;
+
     if !target.exists() {
         crate::scalable_fault_point("replace.atomic");
         let replace = std::fs::rename(replacement, target);
@@ -7368,6 +7957,13 @@ pub(crate) fn replace_path_atomically(
             Err(error) => Ok(ReplaceDurability::ParentSyncPending(error)),
         };
     }
+
+    // Captured before the call so an indeterminate 1176/1177 failure can be
+    // reconciled cheaply afterwards: if the target pathname then resolves to
+    // this exact OS object, the replacement de facto owns the target name.
+    let replacement_identity = File::open(replacement)
+        .ok()
+        .and_then(|file| opened_file_identity(&file).ok());
 
     let replacement_wide: Vec<u16> = replacement
         .as_os_str()
@@ -7392,12 +7988,52 @@ pub(crate) fn replace_path_atomically(
     };
     crate::scalable_fault_point("replace.atomic");
     if ok == 0 {
-        return Err(std::io::Error::last_os_error().into());
+        let os_error = std::io::Error::last_os_error();
+        return match classify_replace_publication_error(os_error.raw_os_error().unwrap_or(0)) {
+            // 1175 is a documented no-mutation outcome and every other code is
+            // a documented pre-publication failure: both names are unchanged,
+            // so the caller may treat this as "target untouched" and delete
+            // its temp file.
+            ReplacePublicationFailure::ReplacedFileIntact
+            | ReplacePublicationFailure::PrePublication => Err(os_error.into()),
+            ReplacePublicationFailure::IndeterminatePublication => {
+                if replacement_identity
+                    .as_deref()
+                    .is_some_and(|identity| path_resolves_to_object(target, identity))
+                {
+                    // Reconciled: the replacement object now owns the target
+                    // pathname, so the publication effectively happened.
+                    match sync_parent_directory(target) {
+                        Ok(()) => Ok(ReplaceDurability::Durable),
+                        Err(error) => Ok(ReplaceDurability::ParentSyncPending(error)),
+                    }
+                } else {
+                    // Unreconciled: names may be partially moved. The caller
+                    // must preserve the replacement temp file and poison any
+                    // writer bound to the target (DUR2-01).
+                    Err(Error::ReplacePublicationIndeterminate {
+                        path: target.display().to_string(),
+                        replacement: replacement.display().to_string(),
+                        source: os_error,
+                    })
+                }
+            }
+        };
     }
     match sync_parent_directory(target) {
         Ok(()) => Ok(ReplaceDurability::Durable),
         Err(error) => Ok(ReplaceDurability::ParentSyncPending(error)),
     }
+}
+
+/// Returns whether `path` currently resolves to the OS file object with the
+/// given identity bytes. Any open or identity failure counts as "no".
+#[cfg(windows)]
+fn path_resolves_to_object(path: &Path, identity: &[u8]) -> bool {
+    File::open(path)
+        .ok()
+        .and_then(|file| opened_file_identity(&file).ok())
+        .is_some_and(|current| current == identity)
 }
 
 #[cfg(unix)]
@@ -7424,33 +8060,26 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
     #[cfg(test)]
     record_parent_directory_sync();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // DUR2-02: FlushFileBuffers requires GENERIC_WRITE on the handle
+    // (https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers),
+    // so the directory must be opened with write access; a read-only directory
+    // handle fails the flush with ERROR_ACCESS_DENIED on NTFS and the earlier
+    // code silently promoted that refusal to `Durable`. Any open or flush
+    // failure now propagates so the caller reports `ParentSyncPending`
+    // instead of a false durability claim.
     let directory = OpenOptions::new()
         .read(true)
+        .write(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(parent)?;
     crate::scalable_fault_point("replace.parent_sync");
     #[cfg(feature = "scalable-fault-injection")]
     take_injected_parent_sync_failure()?;
-    let sync = match directory.sync_all() {
-        Ok(()) => Ok(()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::PermissionDenied
-                    | std::io::ErrorKind::InvalidInput
-                    | std::io::ErrorKind::Unsupported
-            ) =>
-        {
-            // Windows filesystems commonly reject FlushFileBuffers on a
-            // directory handle. ReplaceFileW/rename has already completed;
-            // do not turn that platform limitation into a false write failure.
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
-    };
+    let sync = directory.sync_all();
     crate::scalable_fault_point("replace.parent_sync");
-    sync
+    sync?;
+    Ok(())
 }
 
 #[cfg(feature = "scalable-fault-injection")]
@@ -7471,6 +8100,39 @@ fn take_injected_parent_sync_failure() -> Result<()> {
         ) {
             Ok(_) => {
                 return Err(std::io::Error::other("injected parent-directory sync failure").into());
+            }
+            Err(observed) => current = observed,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "scalable-fault-injection")]
+static INJECTED_REPLACE_INDETERMINATE_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "scalable-fault-injection")]
+fn take_injected_replace_indeterminate(replacement: &Path, target: &Path) -> Result<()> {
+    use std::sync::atomic::Ordering;
+
+    let mut current = INJECTED_REPLACE_INDETERMINATE_FAILURES.load(Ordering::Acquire);
+    while current != 0 {
+        match INJECTED_REPLACE_INDETERMINATE_FAILURES.compare_exchange(
+            current,
+            current - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // The publication is not attempted, so from the caller's
+                // perspective this behaves exactly like an unreconciled
+                // 1176/1177: the pathname state is unknown and the temp file
+                // still exists.
+                return Err(Error::ReplacePublicationIndeterminate {
+                    path: target.display().to_string(),
+                    replacement: replacement.display().to_string(),
+                    source: std::io::Error::other("injected indeterminate replacement failure"),
+                });
             }
             Err(observed) => current = observed,
         }
@@ -8734,13 +9396,33 @@ mod tests {
                 first.is_ok() || second.is_ok(),
                 "round {round}: both replacements failed"
             );
-            let published = std::fs::read(&target)?;
-            assert!(
-                published == old || published == a || published == b,
-                "round {round}: target was a partial or mixed generation (len={}, first={:?}, first_result={first:?}, second_result={second:?})",
-                published.len(),
-                published.first()
-            );
+            let unreconciled_indeterminate_loser = [&first, &second]
+                .into_iter()
+                .any(|result| matches!(result, Err(Error::ReplacePublicationIndeterminate { .. })));
+            match std::fs::read(&target) {
+                Ok(published) => {
+                    assert!(
+                        published == old || published == a || published == b,
+                        "round {round}: target was a partial or mixed generation (len={}, first={:?}, first_result={first:?}, second_result={second:?})",
+                        published.len(),
+                        published.first()
+                    );
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && unreconciled_indeterminate_loser =>
+                {
+                    // Documented ReplaceFileW outcome: on 1176 with no backup
+                    // name, the losing replace can unlink the target name. The
+                    // loser must have reported the unreconciled
+                    // ReplacePublicationIndeterminate error (DUR2-01) so its
+                    // caller preserves the temp file and poisons the writer.
+                }
+                Err(error) => panic!(
+                    "round {round}: reading target failed without an indeterminate loser \
+                     (error={error:?}, first_result={first:?}, second_result={second:?})"
+                ),
+            }
             let mut retained = Vec::new();
             old_handle.seek(SeekFrom::Start(0))?;
             old_handle.read_to_end(&mut retained)?;

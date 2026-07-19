@@ -14,19 +14,13 @@ error[E0080]: evaluation panicked: this type implements VarveKeyedBlock but decl
   | |_____- in this macro invocation
 
 note: erroneous constant encountered
- --> $WORKSPACE/crates/varve-core/src/file.rs
-  |
-  |         let () = crate::traits::KeyedBlockContract::<T>::OK;
-  |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-note: the above error was encountered while instantiating `fn VarveFile::keyed_blocks::<ContradictoryKeyed>`
-  --> tests/ui/fail_keyed_contradiction.rs:43:5
-   |
-43 |     file.keyed_blocks::<ContradictoryKeyed>()
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-note: erroneous constant encountered
- --> $WORKSPACE/crates/varve-core/src/collections.rs
+ --> $WORKSPACE/crates/varve-core/src/stream.rs
   |
   |         let () = KeyedBlockContract::<T>::OK;
   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn VarveStreamWriter::delete_with_prev_key_info::<ContradictoryKeyed>`
+  --> tests/ui/fail_keyed_contradiction_stream_delete.rs:43:5
+   |
+43 |     writer.delete_with_prev_key_info::<ContradictoryKeyed>(&0u64, None)
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

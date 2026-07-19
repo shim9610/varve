@@ -385,13 +385,34 @@ fn write_native_value(path: &Path, value: u64) -> varve::Result<()> {
     file.flush()
 }
 
-fn temp_path(label: &str) -> PathBuf {
+struct TempPath {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for TempPath {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for TempPath {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+fn temp_path(label: &str) -> TempPath {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    std::env::temp_dir().join(format!(
+    let dir = tempfile::tempdir().expect("create per-test temp directory");
+    let path = dir.path().join(format!(
         "varve_native_security_{label}_{}_{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
+    ));
+    TempPath { path, _dir: dir }
 }
 
 fn lock_path(path: &Path) -> PathBuf {

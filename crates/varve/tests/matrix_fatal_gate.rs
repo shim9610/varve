@@ -4,7 +4,7 @@
 //! and surfaces the full recovery report.
 #![cfg(feature = "integrity")]
 
-use std::fs::{OpenOptions, read, remove_file};
+use std::fs::{OpenOptions, read};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,29 +75,24 @@ fn matrix_spec() -> FormatSpec {
 
 struct TempMatrix {
     path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempMatrix {
     fn new(name: &str) -> Self {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
+        let dir = tempfile::tempdir().expect("create per-test temp directory");
+        let path = dir.path().join(format!(
             "varve_{name}_{}_{}_{}.vrv",
             std::process::id(),
             std::thread::current().name().unwrap_or("test"),
             id
         ));
-        let _ = remove_file(&path);
-        Self { path }
+        Self { path, _dir: dir }
     }
 
     fn path(&self) -> &Path {
         &self.path
-    }
-}
-
-impl Drop for TempMatrix {
-    fn drop(&mut self) {
-        let _ = remove_file(&self.path);
     }
 }
 
@@ -116,7 +111,9 @@ fn write_committed_cell(spec: FormatSpec, path: &Path, key: MatrixKey, value: u3
 }
 
 fn region_crc_off(path: &Path, spec: FormatSpec) -> u64 {
-    let offset = u64::try_from(spec.magic.len()).expect("magic length") + 18;
+    // Native file header, then the 24-byte matrix creation-nonce region
+    // (DUR2-03), then the VMAT layout header.
+    let offset = u64::try_from(spec.magic.len()).expect("magic length") + 18 + 24;
     let mut file = OpenOptions::new()
         .read(true)
         .open(path)

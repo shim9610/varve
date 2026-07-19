@@ -238,10 +238,13 @@ Sidecar protocol failures retain their public `DiskIndexError` source inside
 distinguish dirty, stale, identity, plan, metadata, and I/O failures without
 parsing error text.
 
-Atomic sidecar publication syncs the parent directory on Unix. On Windows it
-requests a directory flush after `ReplaceFileW`/rename; filesystems that reject
-directory `FlushFileBuffers` keep the completed atomic replacement instead of
-turning it into a false write failure.
+Atomic sidecar publication syncs the parent directory after the
+`ReplaceFileW`/rename (the Windows directory handle is opened with the write
+access `FlushFileBuffers` requires). A parent-sync failure is never silently
+promoted to full durability: sidecar create, stream bootstrap, and disk-index
+rebuild surface `Error::PublishedButParentSyncPending` while keeping the
+completed atomic replacement in place, so the published sidecar remains usable
+and the pending state is a durability warning, not a rollback.
 
 ### Long Scan Progress And Cancellation
 

@@ -66,15 +66,21 @@ let report = MatrixFormat::self_test("matrix-check.varve")
 ```
 
 Use a temporary path. The self-test is non-destructive: it creates the target
-with exclusive create (`create_new` for append formats; a `create_new` claim
-before the matrix constructor, which would otherwise truncate) and never
-truncates or deletes a pre-existing file. A pre-existing path is reported as a
-failed step in the `CallerUsage` domain (message: "target path already exists;
-the self-test never truncates or deletes pre-existing files", backed by an
-`AlreadyExists` I/O error) — for append formats at the `create file` step, for
-matrix formats at the new `claim target path` step — before any modification.
-`cleanup(true)` only ever removes files the run itself created (the created
-native file and its `.lock`); it never deletes a caller file it did not create.
+with exclusive create (`create_new` for append formats,
+`create_new_with_dims` for matrix formats) and never truncates or deletes a
+pre-existing file. The matrix path holds the one exclusively created,
+lock-bound handle from the claim through matrix initialization, so there is no
+window in which the claimed pathname is re-opened. A pre-existing path is
+reported as a failed step in the `CallerUsage` domain (message: "target path
+already exists; the self-test never truncates or deletes pre-existing files",
+backed by an `AlreadyExists` I/O error) — for append formats at the
+`create file` step, for matrix formats at the `create matrix file` step —
+before any modification. `cleanup(true)` only ever removes files the run
+itself created (the created native file and its `.lock`), verified by
+identity: the native file is deleted only while the pathname still resolves to
+the file object this run created, and the marker only after re-acquiring it
+through the standard writer-lock protocol. A file or marker swapped in by
+another process survives cleanup.
 
 ## Resource-Limit Failures
 

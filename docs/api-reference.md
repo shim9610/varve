@@ -49,7 +49,11 @@ that must prove they created and own the file (diagnostic scaffolding, self-test
 scaffolding) and must never destroy caller data, `VarveFile::create_new(spec, path)`
 and `VarveWriter::create_new(spec, path)` open with `create_new`: they never
 truncate or reuse an existing path and fail with an `AlreadyExists` I/O error if
-one exists.
+one exists. Matrix formats have the same pair —
+`VarveFile::create_new_with_dims(spec, path, dims)` and
+`VarveWriter::create_new_with_dims` — which keep the one exclusively created,
+lock-bound handle from claim through matrix initialization, with no pathname
+re-open window in between.
 
 Generated typed methods depend on block names:
 
@@ -78,8 +82,9 @@ Generated typed methods depend on block names:
 | `tighten_read_limits(limits)` | component-wise meet; a finite ceiling can never be widened |
 | `with_matrix_spec(dims, commits, blocks)` | manual matrix registry |
 | `with_matrix_aux(aux)` | manual matrix aux registry |
-| `validate()` | check static spec consistency |
-| `computed_schema_hash()` | deterministic schema fingerprint |
+| `with_block_identities(identities)` | attach the per-block identity table (endian override, keyedness, generated codec fingerprint) hashed by `computed_schema_hash()`; generated `spec()` does this automatically |
+| `validate()` | check static spec consistency, including duplicate/unregistered block identities |
+| `computed_schema_hash()` | deterministic schema fingerprint (algorithm version `FormatSpec::SCHEMA_HASH_ALGORITHM_VERSION`, currently 2) |
 | `effective_layout()` | physical layout plan using header/segment/lead-in/raw/footer vocabulary |
 | `inspect_layout_file(path)` | validate a native or custom file and return physical layout ranges |
 | `schema_debug_dump()` | human-readable schema dump |
@@ -89,6 +94,16 @@ Generated typed methods depend on block names:
 
 Use the generated `Format::spec()` path unless you need derive-first or manual
 registry construction.
+
+The computed schema hash covers wire layout, not just field membership: fields
+are hashed in declaration order with their encoding ordinal and a field-count
+frame, and each block's endian override, keyedness, and generated codec
+fingerprint are folded in through `block_identities`. Reordering same-typed
+field declarations, changing a per-block endian, or changing a codec identity
+therefore changes the hash. Omitting `schema_hash` in a declaration stores 0
+and disables the open-time comparison; use `schema_hash: computed` (or pin a
+literal derived from `computed_schema_hash()`) whenever schema locking is
+wanted.
 
 ### ReadLimit And ReadLimits
 
@@ -158,6 +173,16 @@ Common `VarveWriter` APIs:
 | `flush()` | write buffered records/checkpoints/manifests/marker |
 | `sync()` | request durable persistence |
 
+Writer encoding is limit-bounded end to end: push, metadata, replacement, and
+keyed-op entry points encode through a budgeted encoder, so an oversized value
+fails with `Error::LimitExceeded { resource: "logical payload length" }` and
+buffering stops at the limit instead of materializing the full encoding first.
+Generated nested variable fields inherit the parent encoder's remaining budget
+(`Encoder::encode_nested_to_vec`), and matrix cell writes bound the encode by
+the slot stride while preserving the exact-size `MatrixSizeMismatch` error.
+With `checkpoint_on_flush`, the flush-time checkpoint decision is O(1) writer
+state, not an index scan, so flush-per-record workloads stay linear.
+
 Common `VarveReader` APIs:
 
 | API | Meaning |
@@ -223,6 +248,15 @@ match that source rather than parse display text. redb database lock contention
 maps to `Error::IndexBusy`. Bootstrap refuses an existing `.vks`, and rebuild
 refuses a dirty `.vki`, so neither operation can bless an unsynced tail.
 
+Sidecar publication reports durability honestly: stream/indexed sidecar
+create, stream bootstrap, and disk-index rebuild can return
+`Error::PublishedButParentSyncPending` when the sidecar was atomically
+published but the parent-directory sync failed. The published sidecar is
+preserved and usable; treat the error as a durability warning, not as "nothing
+was published". Under CRC policies, `rebuild_disk_index` reads and verifies
+only the payloads the index plan needs; `verify_all()` is the whole-file
+integrity scan.
+
 With `high-cardinality-dev`, manual `VarveBlock` implementations must state
 `IS_KEYED` explicitly. This is a compile-time chain-safety requirement; macro
 generated blocks already provide the exact value.
@@ -251,12 +285,18 @@ layout write error is rolled back to the prior EOF when possible. If rollback
 fails, the handle returns `WriteRollbackFailed`, becomes poisoned, and rejects
 later mutation, `flush`, and `sync` with `WriterPoisoned`.
 
-Copy-on-write replacement has a distinct post-publication failure state.
+Copy-on-write replacement has distinct post-publication failure states.
 `PublishedButRebindFailed { sequence, source }` means the new generation was
 already atomically published, but the current writer could not reopen and bind
 to it. Discard the poisoned writer and reopen the path to inspect the published
 state. Do not blindly retry the same logical update: publication may already
-have applied it.
+have applied it. On Windows, `ReplacePublicationIndeterminate` means
+`ReplaceFileW` failed with error 1176/1177 and reconciliation could not prove
+the outcome: the pathname state is unknown, the replacement temp file is
+preserved, and the writer is poisoned. Inspect the pathname and the preserved
+temp separately; `classify_replace_publication_error(raw_os_error)` exposes
+the underlying classification (1175 = replaced file intact, 1176/1177 =
+indeterminate, everything else = pre-publication).
 
 `varve::Error` is `#[non_exhaustive]`. Downstream exhaustive matches must keep a
 wildcard arm so new diagnostics can be added without another enum-shape break.
@@ -308,11 +348,15 @@ fingerprint is process-local and is deliberately not part of the wire format or
 on-disk descriptors.
 
 Keyedness is an invariant, not a free-form flag. A type that implements
-`VarveKeyedBlock` must declare `VarveBlock::IS_KEYED = true`; keyed-only generic
-entry points evaluate `KeyedBlockContract::<T>::OK`, turning an
+`VarveKeyedBlock` must declare `VarveBlock::IS_KEYED = true`; every public
+keyed generic entry point — keyed collections, stream and indexed
+lookup/push/delete, merge and compact, low-level `VarveFile`/reader/writer
+deletes, `keyed_blocks`, `key_tail_offsets`, disk-index descriptors, and the
+self-test keyed case — evaluates `KeyedBlockContract::<T>::OK`, turning an
 `impl VarveKeyedBlock` with `IS_KEYED = false` into a post-monomorphization
-compile error. Registration also rejects a keyedness disagreement for the same
-block id (`Error::BlockKeyednessMismatch`). Under `high-cardinality-dev` manual
+compile error. First-seen registration remains the runtime backstop and also
+rejects a keyedness disagreement for the same block id
+(`Error::BlockKeyednessMismatch`). Under `high-cardinality-dev` manual
 implementations must state `IS_KEYED` explicitly (no chain-unsafe default).
 
 ## Matrix API
@@ -340,6 +384,13 @@ typed wrappers.
 Lower-level matrix calls use `MatrixKey { scan, ch }`. Generated format-first
 wrappers expose block-specific key structs such as `CellKey { scan, ch }` and
 convert them into the runtime key internally.
+
+Matrix cell read, write, and mmap access enforce the same typed registration
+gate as the append-log APIs before any structural checks: a manual matrix
+block that matches a registered block's id, shape, and stride but declares a
+different `SCHEMA_FINGERPRINT` or keyedness is rejected with
+`BlockSchemaFingerprintMismatch` / `BlockKeyednessMismatch` instead of
+decoding foreign cells.
 
 When integrity verification finds a damaged commit map, open preserves the raw
 bytes as recovery evidence but quarantines them from visibility. Cell categories
@@ -661,7 +712,7 @@ Normal typed reads reject block-version mismatch. Migration is explicit.
 | `with_matrix_cell(key, value)` | write/commit/read matrix sample |
 | `with_uncommitted_matrix_cell(key, value)` | verify uncommitted read rejection |
 | `with_matrix_aux(name, offset, bytes)` | write/read aux sample |
-| `cleanup(true)` | after the run, remove only files the run itself created (its native file and `.lock`) |
+| `cleanup(true)` | after the run, remove only files the run itself created (its native file and `.lock`), verified by object identity |
 
 Report domains:
 
@@ -674,9 +725,14 @@ Report domains:
 | `Environment` | filesystem, locks, concurrent processes |
 | `LibraryInvariant` | possible Varve bug after simple codecs are ruled out |
 
-The self-test is non-destructive: it claims the target with exclusive create and
-refuses a pre-existing path as a `CallerUsage` failed step instead of truncating
-it; `cleanup(true)` deletes only files the run created.
+The self-test is non-destructive: it claims the target with exclusive create
+(one exclusively created, lock-bound handle held through matrix
+initialization) and refuses a pre-existing path as a `CallerUsage` failed step
+instead of truncating it. `cleanup(true)` is identity-checked: the native file
+is deleted only while the pathname still resolves to the object this run
+created, and the `.lock` marker only after re-acquiring it through the writer
+lock protocol, so a swapped-in foreign file or a foreign-owned marker
+survives.
 
 ## Feature Flags
 
@@ -692,19 +748,21 @@ it; `cleanup(true)` deletes only files the run created.
 | Error | Usually means |
 | --- | --- |
 | `InvalidMagic` | wrong file type or corrupt header |
-| `SchemaHashMismatch` | reader spec does not match writer spec |
+| `SchemaHashMismatch` | reader spec does not match writer spec; also raised for files pinned with a computed hash from a previous hash-algorithm version |
 | `BlockVersionMismatch` | block version changed without migration |
 | `CompressionFeatureDisabled` | enable `compression-zstd` or disable compression |
 | `IntegrityFeatureDisabled` | enable `integrity` or disable CRC policy |
 | `MatrixDimensionsRequired` | matrix file creation needs runtime dimensions |
 | `MatrixNotCommitted` | slot bytes exist but commit bit is clear |
 | `MatrixFatalCorruption` | recovery found a fatal matrix finding; default access is fail-closed. Use `FormatSpec::with_matrix_fatal_forensics()` for forensic read-through |
-| `MatrixSidecarMismatch(reason)` | matrix sidecar rejected: wrong native identity, layout generation, or sidecar version; regenerate the sidecar |
+| `MatrixSidecarMismatch(reason)` | matrix sidecar rejected: wrong native identity, layout generation, creation nonce, or sidecar version; regenerate the sidecar |
+| `InvalidMatrixLayout` | matrix layout bytes are not valid for this build — including a matrix file created before the creation-nonce region existed; recreate the matrix file |
 | `MatrixSizeMismatch` | encoded matrix payload does not match slot stride |
 | `BlockSchemaFingerprintMismatch` | two block impls share an id but declare different `SCHEMA_FINGERPRINT` |
 | `BlockKeyednessMismatch` | two block impls share an id but disagree on keyedness |
-| `PublishedButParentSyncPending` | atomic replacement published, but parent-directory durability is unconfirmed; not a rollback |
+| `PublishedButParentSyncPending` | atomic replacement published, but parent-directory durability is unconfirmed; not a rollback. Also surfaced by redb sidecar create/bootstrap/rebuild |
 | `PublishedButRebindFailed` | replacement published but the writer could not rebind and was poisoned |
+| `ReplacePublicationIndeterminate` | Windows `ReplaceFileW` 1176/1177 with unresolvable pathname state; temp preserved, writer poisoned, do not blindly retry |
 | `WriterLockHeld` | another writer or stale lock exists |
 | `WriterLockBreakRefused` | the explicit lock policy did not prove removal was allowed |
 | `ScanCancelled { progress }` | an explicit scalable scan stopped cooperatively at the reported boundary |

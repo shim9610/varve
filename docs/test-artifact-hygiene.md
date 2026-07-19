@@ -28,6 +28,10 @@ The runner creates a new `varve-test-session-*` directory with an atomic
 `std::env::temp_dir()`, `tempfile`, Python temporary-file helpers, and child
 processes use the same owned session root.
 
+CI runs the default-feature and all-feature test suites through this runner
+(`.github/workflows/ci.yml`), so an artifact leaked past the session directory
+fails the build.
+
 ## Success And Failure
 
 On success the runner recursively removes only the uniquely named session it
@@ -40,6 +44,25 @@ later run never reuses that path.
 
 Process-interruption tests place child artifacts under the inherited session;
 the parent test owns their lifecycle.
+
+## Per-Test Owned Directories
+
+The runner is the outer safety net, not the only one. Each integration test
+owns its scratch directory directly: path helpers (`temp_path`, `TempMatrix`,
+crash-test roots) create a fresh `tempfile::tempdir()` and return a guard that
+keeps the directory alive for the test's lifetime. Dropping the guard removes
+the directory recursively, so the native file, any sidecar, and the empty
+`.lock` writer marker are collected together — including on assertion failure
+and panic, and even when the suite is run with plain `cargo test` outside the
+runner.
+
+Empty `.lock` markers are intentional in production: they persist beside a
+native file to keep the single-writer claim race-free, and Varve never deletes
+a marker it cannot prove it owns. Test cleanup is therefore a directory-scope
+concern, never a marker-scope one. Scavenging of crash-orphaned temp files on
+production paths is deliberately not implemented; if added, it must be a
+separate opt-in API that verifies age, PID, exclusive object ownership, and
+name format before touching anything.
 
 ## File-Creation Tests
 

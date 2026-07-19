@@ -71,6 +71,7 @@ pub struct Encoder {
     endian: Endian,
     output: Vec<u8>,
     max_len: Option<u64>,
+    limit_resource: &'static str,
     overflow: Option<(u64, u64)>,
 }
 
@@ -80,15 +81,17 @@ impl Encoder {
             endian,
             output: Vec::new(),
             max_len: None,
+            limit_resource: "encoded payload",
             overflow: None,
         }
     }
 
-    pub(crate) fn new_limited(endian: Endian, max_len: u64) -> Self {
+    pub(crate) fn new_limited(endian: Endian, max_len: u64, resource: &'static str) -> Self {
         Self {
             endian,
             output: Vec::new(),
             max_len: Some(max_len),
+            limit_resource: resource,
             overflow: None,
         }
     }
@@ -101,15 +104,31 @@ impl Encoder {
         self.output
     }
 
-    pub(crate) fn try_into_inner(self, resource: &'static str) -> Result<Vec<u8>> {
+    pub(crate) fn try_into_inner(self) -> Result<Vec<u8>> {
         if let Some((actual, limit)) = self.overflow {
             return Err(Error::LimitExceeded {
-                resource,
+                resource: self.limit_resource,
                 actual,
                 limit,
             });
         }
         Ok(self.output)
+    }
+
+    /// Encodes a nested value into its own buffer while inheriting this
+    /// encoder's remaining output budget (DEF-02).
+    ///
+    /// A nested field encoded through this method can never buffer past the
+    /// limit its parent writer entry point imposed: the child encoder is
+    /// capped at the parent's remaining budget and reports the same typed
+    /// [`Error::LimitExceeded`] resource on overflow. An unlimited parent
+    /// yields an unlimited child, matching [`encode_to_vec`].
+    pub fn encode_nested_to_vec<T: VarveEncode>(&self, value: &T) -> Result<Vec<u8>> {
+        let Some(max_len) = self.max_len else {
+            return encode_to_vec(value, self.endian);
+        };
+        let remaining = max_len.saturating_sub(self.output.len() as u64);
+        encode_to_vec_limited(value, self.endian, remaining, self.limit_resource)
     }
 
     pub fn write_all(&mut self, bytes: &[u8]) {
@@ -445,9 +464,9 @@ pub(crate) fn encode_to_vec_limited<T: VarveEncode>(
     max_len: u64,
     resource: &'static str,
 ) -> Result<Vec<u8>> {
-    let mut encoder = Encoder::new_limited(endian, max_len);
+    let mut encoder = Encoder::new_limited(endian, max_len, resource);
     value.encode_varve(&mut encoder)?;
-    encoder.try_into_inner(resource)
+    encoder.try_into_inner()
 }
 
 pub fn decode_from_slice<T: VarveDecode>(bytes: &[u8], endian: Endian) -> Result<T> {
@@ -958,18 +977,50 @@ mod tests {
 
     #[test]
     fn limited_encoder_stops_before_the_over_limit_allocation() {
-        let mut encoder = Encoder::new_limited(Endian::Little, 8);
+        let mut encoder = Encoder::new_limited(Endian::Little, 8, "test payload");
         encoder.write_all(&[1; 8]);
         encoder.write_all(&[2; 1024]);
         encoder.write_all(&[3; 1024]);
         assert_eq!(encoder.output.len(), 8);
         assert!(matches!(
-            encoder.try_into_inner("test payload"),
+            encoder.try_into_inner(),
             Err(Error::LimitExceeded {
                 resource: "test payload",
                 actual: 1032,
                 limit: 8,
             })
         ));
+    }
+
+    #[test]
+    fn nested_encode_inherits_the_parent_remaining_budget() {
+        let mut encoder = Encoder::new_limited(Endian::Little, 16, "test payload");
+        encoder.write_all(&[1; 4]);
+        // 12 bytes of budget remain; a Vec<u8> encodes as an 8-byte length
+        // prefix plus its bytes, so a 4-byte nested value fits exactly ...
+        let nested = encoder
+            .encode_nested_to_vec(&vec![2u8; 4])
+            .expect("nested value within the remaining budget");
+        assert_eq!(nested.len(), 12);
+        // ... while a value larger than the remaining budget is refused with
+        // the parent's typed resource before it is buffered.
+        let error = encoder
+            .encode_nested_to_vec(&vec![3u8; 1024])
+            .expect_err("nested value beyond the remaining budget");
+        assert!(matches!(
+            error,
+            Error::LimitExceeded {
+                resource: "test payload",
+                limit: 12,
+                ..
+            }
+        ));
+
+        // An unlimited parent still yields an unlimited child.
+        let unlimited = Encoder::new(Endian::Little);
+        let payload = unlimited
+            .encode_nested_to_vec(&vec![4u8; 1024])
+            .expect("unlimited nested encode");
+        assert_eq!(payload.len(), 8 + 1024);
     }
 }

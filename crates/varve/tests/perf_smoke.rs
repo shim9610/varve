@@ -1172,17 +1172,36 @@ fn perf_layout_segment_info(raw_offset: u64, raw_len: u64) -> LayoutSegmentInfo 
     }
 }
 
-fn temp_path(name: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
+struct TempPath {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for TempPath {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for TempPath {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+fn temp_path(name: &str) -> TempPath {
+    let dir = tempfile::tempdir().expect("create per-test temp directory");
+    let path = dir.path().join(format!(
         "varve_perf_smoke_{name}_{}_{}.vrv",
         std::process::id(),
         std::thread::current().name().unwrap_or("anon")
     ));
-    path
+    TempPath { path, _dir: dir }
 }
 
-fn cleanup_many<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) {
+fn cleanup_many<'a>(paths: impl IntoIterator<Item = &'a TempPath>) {
     for path in paths {
         cleanup(path);
     }

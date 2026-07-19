@@ -256,6 +256,18 @@ pub enum Error {
         source: Box<Error>,
     },
 
+    #[error(
+        "replacement publication at {path} failed in an indeterminate state: the OS reports the \
+         file names may be partially moved; the replacement file was preserved at {replacement} \
+         and the writer is unusable until the pathname is reconciled out of band: {source}"
+    )]
+    ReplacePublicationIndeterminate {
+        path: String,
+        replacement: String,
+        #[source]
+        source: io::Error,
+    },
+
     #[error("merge op referenced a missing target")]
     MissingMergeTarget,
 

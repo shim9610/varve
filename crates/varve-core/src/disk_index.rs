@@ -649,6 +649,9 @@ impl DiskIndexDescriptor {
         T: VarveKeyedBlock,
         T::Key: VarveDiskKey,
     {
+        // API2-03: compile-time keyedness contract at the descriptor root,
+        // covering the whole disk-index plan path for `T`.
+        let () = crate::traits::KeyedBlockContract::<T>::OK;
         Self {
             block_id: T::ID,
             block_version: T::VERSION,
@@ -680,6 +683,13 @@ impl fmt::Debug for DiskIndexDescriptor {
 pub struct DiskIndexPlan {
     descriptors: &'static [DiskIndexDescriptor],
     digest: DiskIndexDigest,
+    /// Witness that this exact plan value already passed [`Self::validate`]
+    /// against the referenced format blocks. Block existence and version
+    /// checks depend only on `FormatSpec::blocks`, so a matching slice
+    /// (compared as a fat pointer) proves the earlier validation still holds
+    /// and open paths do not repeat the per-descriptor walk or the digest
+    /// recomputation that canonicalization already performed.
+    validated_blocks: Option<&'static [crate::BlockDescriptor]>,
 }
 
 impl DiskIndexPlan {
@@ -692,6 +702,7 @@ impl DiskIndexPlan {
         Ok(Self {
             descriptors,
             digest,
+            validated_blocks: Some(spec.blocks),
         })
     }
 
@@ -702,18 +713,28 @@ impl DiskIndexPlan {
         Self {
             descriptors,
             digest,
+            validated_blocks: None,
         }
     }
 
     pub fn validate(self, spec: FormatSpec) -> DiskIndexResult<Self> {
-        validate_descriptors(spec, self.descriptors)?;
         if self.digest.is_zero() {
             return Err(DiskIndexError::PlanDigestIsZero);
         }
+        if self
+            .validated_blocks
+            .is_some_and(|blocks| std::ptr::eq(blocks, spec.blocks))
+        {
+            return Ok(self);
+        }
+        validate_descriptors(spec, self.descriptors)?;
         if compute_plan_digest(self.descriptors)? != self.digest {
             return Err(DiskIndexError::PlanDigestMismatch);
         }
-        Ok(self)
+        Ok(Self {
+            validated_blocks: Some(spec.blocks),
+            ..self
+        })
     }
 
     pub const fn descriptors(self) -> &'static [DiskIndexDescriptor] {
@@ -743,6 +764,15 @@ fn validate_descriptors(
     if descriptors.is_empty() {
         return Err(DiskIndexError::PlanEmpty);
     }
+    // Format blocks are not required to be sorted, so index them once by id
+    // and resolve each descriptor with a binary search: O((D + B) log B)
+    // instead of the previous per-descriptor linear scan (O(D * B)).
+    let mut blocks: Vec<(u32, u16)> = spec
+        .blocks
+        .iter()
+        .map(|block| (block.id, block.version))
+        .collect();
+    blocks.sort_unstable_by_key(|(id, _)| *id);
     let mut previous = None;
     for descriptor in descriptors {
         if previous.is_some_and(|block_id| block_id >= descriptor.block_id) {
@@ -754,18 +784,17 @@ fn validate_descriptors(
                 block_id: descriptor.block_id,
             });
         }
-        let block = spec
-            .blocks
-            .iter()
-            .find(|block| block.id == descriptor.block_id)
-            .ok_or(DiskIndexError::PlanBlockMissing {
+        let block = blocks
+            .binary_search_by_key(&descriptor.block_id, |(id, _)| *id)
+            .map(|index| blocks[index])
+            .map_err(|_| DiskIndexError::PlanBlockMissing {
                 block_id: descriptor.block_id,
             })?;
-        if block.version != descriptor.block_version {
+        if block.1 != descriptor.block_version {
             return Err(DiskIndexError::PlanBlockVersionMismatch {
                 block_id: descriptor.block_id,
                 expected: descriptor.block_version,
-                actual: block.version,
+                actual: block.1,
             });
         }
     }
@@ -775,20 +804,25 @@ fn validate_descriptors(
 fn compute_plan_digest(descriptors: &[DiskIndexDescriptor]) -> DiskIndexResult<DiskIndexDigest> {
     let descriptor_count =
         u32::try_from(descriptors.len()).map_err(|_| DiskIndexError::PlanNotCanonical)?;
+    // Materialize each codec identity once instead of re-allocating the
+    // string for every digest lane.
+    let mut codecs = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        let codec = descriptor.key_codec_identity();
+        u32::try_from(codec.len()).map_err(|_| DiskIndexError::PlanCodecIdentityMissing {
+            block_id: descriptor.block_id,
+        })?;
+        codecs.push(codec);
+    }
     let mut digest = [0u8; 32];
     for lane in 0..8u32 {
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(b"varve-disk-index-plan-v1");
         hasher.update(&lane.to_le_bytes());
         hasher.update(&descriptor_count.to_le_bytes());
-        for descriptor in descriptors {
-            let codec = descriptor.key_codec_identity();
+        for (descriptor, codec) in descriptors.iter().zip(&codecs) {
             let codec = codec.as_bytes();
-            let codec_len = u32::try_from(codec.len()).map_err(|_| {
-                DiskIndexError::PlanCodecIdentityMissing {
-                    block_id: descriptor.block_id,
-                }
-            })?;
+            let codec_len = codec.len() as u32;
             hasher.update(&descriptor.block_id.to_le_bytes());
             hasher.update(&descriptor.block_version.to_le_bytes());
             hasher.update(&descriptor.key_wire_type.to_le_bytes());
@@ -1017,6 +1051,7 @@ pub(crate) const TOMBSTONE_RECORD_FLAGS: u16 = 0x8000;
 #[cfg(test)]
 std::thread_local! {
     static TOMBSTONE_KEY_DECODE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PLAN_PAYLOAD_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1027,6 +1062,22 @@ pub(crate) fn reset_tombstone_key_decode_calls() {
 #[cfg(test)]
 pub(crate) fn tombstone_key_decode_calls() -> usize {
     TOMBSTONE_KEY_DECODE_CALLS.get()
+}
+
+/// Test hook: number of native record payloads materialized by plan
+/// extraction. Rebuild must read each indexed payload exactly once. The
+/// asserting test requires a CRC policy, so the accessors are unused in
+/// integrity-less builds.
+#[cfg(test)]
+#[cfg_attr(not(feature = "integrity"), allow(dead_code))]
+pub(crate) fn reset_plan_payload_reads() {
+    PLAN_PAYLOAD_READS.set(0);
+}
+
+#[cfg(test)]
+#[cfg_attr(not(feature = "integrity"), allow(dead_code))]
+pub(crate) fn plan_payload_reads() -> usize {
+    PLAN_PAYLOAD_READS.get()
 }
 
 /// Extracts the sidecar update for one scanned native record.
@@ -1052,6 +1103,8 @@ pub(crate) fn extract_plan_update(
         let logical_len = entry.logical_payload_len_snapshot(spec, snapshot)?;
         let mut budget = MaterializationBudget::new(spec);
         budget.consume(logical_len)?;
+        #[cfg(test)]
+        PLAN_PAYLOAD_READS.with(|reads| reads.set(reads.get() + 1));
         let payload = entry.read_logical_payload_snapshot(spec, snapshot)?;
         // Envelope prefix: target block id (u32 LE) followed by the key length.
         let target = payload
@@ -1107,6 +1160,8 @@ where
     let logical_len = entry.logical_payload_len_snapshot(spec, snapshot)?;
     let mut budget = MaterializationBudget::new(spec);
     budget.consume(logical_len)?;
+    #[cfg(test)]
+    PLAN_PAYLOAD_READS.with(|reads| reads.set(reads.get() + 1));
     let payload = entry.read_logical_payload_snapshot(spec, snapshot)?;
     let value: T = budget.decode(&payload, T::ENDIAN.unwrap_or(spec.endian))?;
     let indexed = DiskIndexEntry::Put {
@@ -1186,15 +1241,50 @@ struct SharedSidecar {
     write_gate: Arc<AtomicUsize>,
 }
 
-fn shared_sidecar_registry() -> &'static Mutex<HashMap<Vec<u8>, SharedSidecar>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<Vec<u8>, SharedSidecar>>> = OnceLock::new();
+impl SharedSidecar {
+    fn empty() -> Self {
+        Self {
+            database: Weak::new(),
+            write_gate: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+/// Per-identity initialization cell. The process-global registry mutex only
+/// guards the identity -> slot map; the (possibly slow) redb open of a cache
+/// miss runs under the slot's own mutex, so unrelated sidecar opens never
+/// serialize behind each other while racing opens of one identity still
+/// cannot both reach redb.
+type SharedSidecarSlot = Arc<Mutex<SharedSidecar>>;
+
+fn shared_sidecar_registry() -> &'static Mutex<HashMap<Vec<u8>, SharedSidecarSlot>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<Vec<u8>, SharedSidecarSlot>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn lock_shared_registry() -> std::sync::MutexGuard<'static, HashMap<Vec<u8>, SharedSidecar>> {
+fn lock_shared_registry() -> std::sync::MutexGuard<'static, HashMap<Vec<u8>, SharedSidecarSlot>> {
     shared_sidecar_registry()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Drops slots whose database is gone and that no in-flight open still holds.
+/// A slot mutex is only probed with `try_lock`: a held lock means an open is
+/// in progress, so the slot is live and must be kept — and the global lock is
+/// therefore never blocked on a slow slot initialization.
+fn prune_shared_registry(registry: &mut HashMap<Vec<u8>, SharedSidecarSlot>) {
+    registry.retain(|_, slot| {
+        if Arc::strong_count(slot) > 1 {
+            return true;
+        }
+        match slot.try_lock() {
+            Ok(shared) => shared.database.strong_count() != 0,
+            Err(std::sync::TryLockError::WouldBlock) => true,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().database.strong_count() != 0
+            }
+        }
+    });
 }
 
 /// Removes the process-local shared-database entry for the sidecar currently
@@ -1207,7 +1297,20 @@ pub(crate) fn invalidate_shared_database(path: &Path) {
     if let Some(identity) = identity {
         registry.remove(&identity);
     }
-    registry.retain(|_, shared| shared.database.strong_count() != 0);
+    prune_shared_registry(&mut registry);
+}
+
+fn shared_sidecar_slot(identity: &[u8]) -> SharedSidecarSlot {
+    let mut registry = lock_shared_registry();
+    prune_shared_registry(&mut registry);
+    match registry.get(identity) {
+        Some(slot) => Arc::clone(slot),
+        None => {
+            let slot = Arc::new(Mutex::new(SharedSidecar::empty()));
+            registry.insert(identity.to_vec(), Arc::clone(&slot));
+            slot
+        }
+    }
 }
 
 fn open_shared_database(
@@ -1221,25 +1324,23 @@ fn open_shared_database(
         let database = Arc::new(open_database(path, options, true)?);
         let identity = sidecar_path_identity(path)?;
         let write_gate = Arc::new(AtomicUsize::new(0));
-        let mut registry = lock_shared_registry();
-        registry.retain(|_, shared| shared.database.strong_count() != 0);
-        registry.insert(
-            identity,
-            SharedSidecar {
-                database: Arc::downgrade(&database),
-                write_gate: Arc::clone(&write_gate),
-            },
-        );
+        let slot = shared_sidecar_slot(&identity);
+        let mut shared = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        *shared = SharedSidecar {
+            database: Arc::downgrade(&database),
+            write_gate: Arc::clone(&write_gate),
+        };
+        drop(shared);
         return Ok((database, write_gate));
     }
     let identity = sidecar_path_identity(path)?;
-    // The registry mutex is held across the miss-open-insert sequence so two
-    // racing opens of the same file cannot both reach redb.
-    let mut registry = lock_shared_registry();
-    registry.retain(|_, shared| shared.database.strong_count() != 0);
-    if let Some(shared) = registry.get(&identity)
-        && let Some(database) = shared.database.upgrade()
-    {
+    // The global registry lock is only held for the map access inside
+    // `shared_sidecar_slot`; the slot mutex serializes the miss-open-insert
+    // sequence per identity, so two racing opens of the same file cannot both
+    // reach redb while opens of unrelated sidecars proceed concurrently.
+    let slot = shared_sidecar_slot(&identity);
+    let mut shared = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(database) = shared.database.upgrade() {
         return Ok((database, Arc::clone(&shared.write_gate)));
     }
     let database = Arc::new(open_database(path, options, false)?);
@@ -1250,13 +1351,10 @@ fn open_shared_database(
         return Err(DiskIndexError::Busy);
     }
     let write_gate = Arc::new(AtomicUsize::new(0));
-    registry.insert(
-        identity,
-        SharedSidecar {
-            database: Arc::downgrade(&database),
-            write_gate: Arc::clone(&write_gate),
-        },
-    );
+    *shared = SharedSidecar {
+        database: Arc::downgrade(&database),
+        write_gate: Arc::clone(&write_gate),
+    };
     Ok((database, write_gate))
 }
 
@@ -1330,10 +1428,47 @@ impl Drop for WriteGateGuard {
     }
 }
 
+/// Last committed tail collection of this handle, keyed by the metadata tail
+/// digest it was committed under. Lets the next write batch skip re-reading
+/// and re-validating every tail row when nothing else committed in between:
+/// the digest comparison against the freshly read metadata proves the cached
+/// map is exactly the persisted collection.
+struct TailCache {
+    digest: DiskIndexDigest,
+    tails: BTreeMap<u32, DiskIndexTail>,
+}
+
+fn store_tail_cache(
+    cache: &Mutex<Option<TailCache>>,
+    digest: DiskIndexDigest,
+    tails: BTreeMap<u32, DiskIndexTail>,
+) {
+    *cache.lock().unwrap_or_else(PoisonError::into_inner) = Some(TailCache { digest, tails });
+}
+
+/// Takes the cached tail map when it provably matches the current working
+/// root. Ownership moves into the batch; the cache is refilled on commit, so
+/// an aborted or failed batch can never leak staged tails back into it.
+fn take_tail_cache(
+    cache: &Mutex<Option<TailCache>>,
+    metadata: DiskIndexMetadata,
+) -> Option<BTreeMap<u32, DiskIndexTail>> {
+    let mut slot = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    let cached = slot.take()?;
+    if cached.digest == metadata.working_tail_digest
+        && u32::try_from(cached.tails.len()).ok() == Some(metadata.working_tail_count)
+    {
+        Some(cached.tails)
+    } else {
+        None
+    }
+}
+
 pub struct DiskIndexStore {
     database: Arc<Database>,
     options: DiskIndexOptions,
     write_gate: Arc<AtomicUsize>,
+    tail_cache: Arc<Mutex<Option<TailCache>>>,
 }
 
 impl DiskIndexStore {
@@ -1358,6 +1493,7 @@ impl DiskIndexStore {
             database,
             options,
             write_gate,
+            tail_cache: Arc::new(Mutex::new(None)),
         };
         store.initialize(metadata, tails)?;
         Ok(store)
@@ -1382,6 +1518,7 @@ impl DiskIndexStore {
             database,
             options,
             write_gate,
+            tail_cache: Arc::new(Mutex::new(None)),
         };
         store.validate_envelope()?;
         Ok(store)
@@ -1595,13 +1732,21 @@ impl DiskIndexStore {
             return Err(DiskIndexError::DirtyStateRequired);
         }
         validate_savepoint_set(metadata, savepoints)?;
-        let tails = read_tail_map_write(&transaction, metadata)?;
+        // Reuse this handle's last committed tail map when the working tail
+        // digest proves nothing else committed in between; only a cache miss
+        // pays the full per-tail read and validation pass.
+        let tails = match take_tail_cache(&self.tail_cache, metadata) {
+            Some(tails) => tails,
+            None => read_tail_map_write(&transaction, metadata)?,
+        };
         Ok(DiskIndexWriteBatch {
             transaction,
             _gate: gate,
             metadata,
             tails,
             changed_tails: BTreeSet::new(),
+            pending_latest: BTreeMap::new(),
+            tail_cache: Arc::clone(&self.tail_cache),
             options: self.options,
             records: 0,
             bytes: 0,
@@ -1784,7 +1929,9 @@ impl DiskIndexStore {
         if matches!(metadata.mode, DiskIndexMode::DiskPlan(_)) {
             transaction.open_table(LATEST_TABLE).map_err(storage)?;
         }
-        transaction.commit().map_err(storage)
+        transaction.commit().map_err(storage)?;
+        store_tail_cache(&self.tail_cache, digest, tail_map);
+        Ok(())
     }
 }
 
@@ -1795,6 +1942,13 @@ pub(crate) struct DiskIndexWriteBatch {
     metadata: DiskIndexMetadata,
     tails: BTreeMap<u32, DiskIndexTail>,
     changed_tails: BTreeSet<u32>,
+    /// Latest-table rows staged by this batch. Buffering the encoded rows in
+    /// memory keeps the per-record hot path free of redb table opens: commit
+    /// opens `LATEST_TABLE` once and drains the map. Memory stays bounded by
+    /// the batch byte budget, whose per-item accounting covers each staged
+    /// key and encoded value.
+    pending_latest: BTreeMap<Vec<u8>, [u8; LATEST_LEN]>,
+    tail_cache: Arc<Mutex<Option<TailCache>>>,
     options: DiskIndexOptions,
     records: usize,
     bytes: usize,
@@ -1843,6 +1997,10 @@ impl DiskIndexWriteBatch {
             return Err(DiskIndexError::KeyTableUnavailable);
         }
         let composite = composite_key(block_id, canonical_key, self.options.max_key_bytes)?;
+        // Rows staged by this batch shadow the last committed table row.
+        if let Some(value) = self.pending_latest.get(&composite) {
+            return latest_pointer(block_id, decode_latest(value)?);
+        }
         let table = self.transaction.open_table(LATEST_TABLE).map_err(storage)?;
         let Some(value) = table.get(composite.as_slice()).map_err(storage)? else {
             return Ok(DiskIndexRecordPointer {
@@ -1898,17 +2056,11 @@ impl DiskIndexWriteBatch {
             update.block_id,
             update.physical,
         );
-        let result = (|| {
-            let mut latest = self.transaction.open_table(LATEST_TABLE).map_err(storage)?;
-            latest
-                .insert(key.as_slice(), value.as_slice())
-                .map_err(storage)?;
-            Ok(())
-        })();
-        if let Err(error) = result {
-            self.poisoned = true;
-            return Err(error);
-        }
+        // Stage the row in memory; commit opens the latest table once for
+        // the whole batch instead of once per record. A later update of the
+        // same key within the batch overwrites the staged row, exactly like
+        // the redb insert it replaces.
+        self.pending_latest.insert(key, value);
         self.metadata.working = next;
         if let Some(tail) = tail {
             self.tails.insert(tail.block_id, tail);
@@ -1972,7 +2124,14 @@ impl DiskIndexWriteBatch {
     pub(crate) fn commit(mut self) -> DiskIndexResult<()> {
         self.ensure_usable()?;
         if self.records == 0 && self.changed_tails.is_empty() {
-            return self.transaction.abort().map_err(storage);
+            debug_assert!(self.pending_latest.is_empty());
+            // Nothing was staged: the map is still exactly the committed
+            // collection, so hand it back for the next batch.
+            let digest = self.metadata.working_tail_digest;
+            let tails = std::mem::take(&mut self.tails);
+            self.transaction.abort().map_err(storage)?;
+            store_tail_cache(&self.tail_cache, digest, tails);
+            return Ok(());
         }
 
         let tail_count =
@@ -1980,12 +2139,35 @@ impl DiskIndexWriteBatch {
                 actual: self.tails.len() as u64,
                 limit: self.metadata.tail_limit,
             })?;
-        let digest = tail_digest(self.tails.values().copied());
+        let digest = if self.changed_tails.is_empty() {
+            self.metadata.working_tail_digest
+        } else {
+            tail_digest(self.tails.values().copied())
+        };
         self.metadata.working_tail_count = tail_count;
         self.metadata.working_tail_digest = digest;
         validate_metadata(self.metadata)?;
-        validate_tail_collection(&self.tails, self.metadata.working)?;
+        // Only tails staged by this batch need revalidation against the final
+        // frontier: every unchanged tail was validated when its map was read
+        // (or previously committed), against a frontier this batch has only
+        // advanced monotonically.
+        for block_id in &self.changed_tails {
+            let tail = self
+                .tails
+                .get(block_id)
+                .ok_or(DiskIndexError::InvalidTail("changed tail disappeared"))?;
+            validate_tail(*tail, self.metadata.working)?;
+        }
 
+        if !self.pending_latest.is_empty() {
+            // The single latest-table open of the batch.
+            let mut latest = self.transaction.open_table(LATEST_TABLE).map_err(storage)?;
+            for (key, value) in &self.pending_latest {
+                latest
+                    .insert(key.as_slice(), value.as_slice())
+                    .map_err(storage)?;
+            }
+        }
         if !self.changed_tails.is_empty() {
             let mut table = self.transaction.open_table(TAILS_TABLE).map_err(storage)?;
             for block_id in &self.changed_tails {
@@ -2002,7 +2184,9 @@ impl DiskIndexWriteBatch {
         crate::scalable_fault_point("append.sidecar_batch_commit");
         let commit = self.transaction.commit();
         crate::scalable_fault_point("append.sidecar_batch_commit");
-        commit.map_err(storage)
+        commit.map_err(storage)?;
+        store_tail_cache(&self.tail_cache, digest, self.tails);
+        Ok(())
     }
 
     fn ensure_usable(&self) -> DiskIndexResult<()> {
@@ -2627,16 +2811,6 @@ fn canonical_tail_map(
         }
     }
     Ok(map)
-}
-
-fn validate_tail_collection(
-    tails: &BTreeMap<u32, DiskIndexTail>,
-    frontier: DiskIndexFrontier,
-) -> DiskIndexResult<()> {
-    for tail in tails.values() {
-        validate_tail(*tail, frontier)?;
-    }
-    Ok(())
 }
 
 fn validate_tail(tail: DiskIndexTail, frontier: DiskIndexFrontier) -> DiskIndexResult<()> {
@@ -3351,6 +3525,43 @@ mod tests {
         assert!(matches!(
             wrong.validate(spec()),
             Err(DiskIndexError::PlanDigestMismatch)
+        ));
+    }
+
+    #[test]
+    fn canonical_witness_does_not_skip_validation_against_another_spec() {
+        static BLOCKS_V2: &[BlockDescriptor] = &[BlockDescriptor {
+            id: PlanItem::ID,
+            name: "PlanItem",
+            version: 2,
+            kind: PlanItem::KIND,
+            fields: &[],
+        }];
+        let other = FormatSpec::new(
+            b"VDIX",
+            1,
+            Endian::Little,
+            42,
+            IndexPolicy::KeyedOffsetChain,
+            IntegrityPolicy::None,
+            RecoveryPolicy::Strict,
+            ManifestPolicy::None,
+            BLOCKS_V2,
+        )
+        .with_read_limits(ReadLimits::STANDARD);
+
+        // The canonical witness only elides revalidation for the exact block
+        // slice it was canonicalized against; a spec with different blocks
+        // still runs the full descriptor check.
+        let plan = plan();
+        assert!(plan.validate(spec()).is_ok());
+        assert!(matches!(
+            plan.validate(other),
+            Err(DiskIndexError::PlanBlockVersionMismatch {
+                block_id: 10,
+                expected: 1,
+                actual: 2,
+            })
         ));
     }
 

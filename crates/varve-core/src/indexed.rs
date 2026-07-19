@@ -10,13 +10,14 @@ use crate::disk_index::{
     DiskIndexWriteBatch, VarveDiskKey, read_metadata_read_only, sidecar_path, tail_limit_for_spec,
 };
 use crate::file::{
-    NativeStreamScanner, RECORD_FOOTER_LEN, RECORD_HEADER_LEN, WriterLock,
+    NativeStreamScanner, RECORD_FOOTER_LEN, RECORD_HEADER_LEN, ReplaceDurability, WriterLock,
     decode_stream_tombstone_key, prepare_stream_tombstone_record, prepare_stream_user_record,
-    read_file_header, read_stream_entry_at, replace_path_atomically,
+    publish_temp_path_atomically, read_file_header, read_stream_entry_at,
 };
 use crate::native_layout::{decode_native_record_footer, read_native_record_header};
 use crate::scalable_extent::UntrustedRecordPointer;
 use crate::stream::{StreamCheckpoint, StreamTail, primary_identity};
+use crate::traits::KeyedBlockContract;
 use crate::{
     AppendInfo, BatchAppendError, BatchAppendInfo, BatchOptions, Error, FormatSpec,
     RecordIndexEntry, Result, ScanOptions, ScanProgress, SnapshotFile, StreamOptions,
@@ -31,6 +32,16 @@ pub struct DiskIndexRebuildReport {
     pub scanned_bytes: u64,
 }
 
+/// Rebuilds the disk-index sidecar from the native log.
+///
+/// Under CRC integrity policies each indexed record's payload (plan puts and
+/// tombstones) is read and checksum-verified exactly once; payloads of
+/// records outside the plan are not read at all. Use
+/// [`VarveStreamReader::verify_all`] for a whole-file integrity scan.
+///
+/// [`Error::PublishedButParentSyncPending`] means the rebuilt sidecar was
+/// already published at its pathname and only the parent-directory entry's
+/// durability is unconfirmed; the published sidecar is preserved.
 pub fn rebuild_disk_index(
     spec: FormatSpec,
     path: impl AsRef<Path>,
@@ -148,6 +159,10 @@ impl VarveIndexedReader {
         T: VarveKeyedBlock,
         T::Key: VarveDiskKey,
     {
+        // API2-03: every public keyed generic entry point evaluates the
+        // compile-time keyedness contract post-monomorphization; the
+        // registration in `ensure_indexed` stays as the runtime backstop.
+        let () = KeyedBlockContract::<T>::OK;
         self.ensure_indexed::<T>()?;
         let pointer = self.index.lookup_pointer(T::ID, key).map_err(index_error)?;
         self.validate_candidate::<T>(key, pointer)?;
@@ -159,6 +174,8 @@ impl VarveIndexedReader {
         T: VarveKeyedBlock,
         T::Key: VarveDiskKey,
     {
+        // API2-03: compile-time keyedness contract at the public entry point.
+        let () = KeyedBlockContract::<T>::OK;
         self.ensure_indexed::<T>()?;
         let pointer = self.index.lookup_pointer(T::ID, key).map_err(index_error)?;
         match pointer.entry {
@@ -446,6 +463,8 @@ impl VarveIndexedWriter {
         T: VarveKeyedBlock,
         T::Key: VarveDiskKey,
     {
+        // API2-03: compile-time keyedness contract at the public entry point.
+        let () = KeyedBlockContract::<T>::OK;
         self.ensure_writable::<T>()?;
         let key = value.key();
         self.ensure_batch()?;
@@ -498,6 +517,8 @@ impl VarveIndexedWriter {
         T: VarveKeyedBlock,
         T::Key: VarveDiskKey,
     {
+        // API2-03: compile-time keyedness contract at the public entry point.
+        let () = KeyedBlockContract::<T>::OK;
         self.ensure_writable::<T>()?;
         self.ensure_batch()?;
         let canonical_key =
@@ -555,6 +576,8 @@ impl VarveIndexedWriter {
         I: IntoIterator,
         I::Item: Borrow<T>,
     {
+        // API2-03: compile-time keyedness contract at the public entry point.
+        let () = KeyedBlockContract::<T>::OK;
         let start = self.stream.snapshot().len();
         let mut written = BatchAppendInfo {
             start_offset: start,
@@ -614,6 +637,8 @@ impl VarveIndexedWriter {
         &mut self,
         key: &T::Key,
     ) -> Result<AppendInfo> {
+        // API2-03: compile-time keyedness contract at the public entry point.
+        let () = KeyedBlockContract::<T>::OK;
         self.ensure_not_poisoned()?;
         ensure_registered_block::<T>(self.stream.spec())?;
         if self.indexed_blocks.contains(&T::ID) {
@@ -1115,7 +1140,21 @@ where
     let mut batch = store.begin_write_batch().map_err(index_error)?;
     let mut batch_records = 0usize;
     let mut records = 0u64;
-    let mut scanner = NativeStreamScanner::from_snapshot(spec, snapshot.clone())?;
+    // Under CRC policies the sequential scanner would stream every record's
+    // payload through the checksum pre-pass, and `extract_plan_update` would
+    // then materialize each indexed payload a second time. Scan frames only:
+    // extraction performs the single payload read for indexed records
+    // (tombstones and plan puts) and verifies the record checksum over that
+    // in-memory buffer against the real spec. Payloads of records outside the
+    // plan are not read at all; `VarveStreamReader::verify_all` remains the
+    // whole-file integrity scan.
+    let scan_spec = spec.with_integrity_policy(crate::IntegrityPolicy::None);
+    let mut scanner = NativeStreamScanner::from_snapshot(scan_spec, snapshot.clone())?;
+    debug_assert_eq!(
+        scanner.spec().integrity_policy,
+        crate::IntegrityPolicy::None,
+        "rebuild requires an integrity-stripped scanner spec",
+    );
     let mut covered = header_eof;
     while let Some(entry) = scanner.next_entry()? {
         let end = entry.checked_physical_end()?;
@@ -1197,7 +1236,22 @@ where
     // replaced so no later open can upgrade a database backed by the old
     // file object, even if the OS reuses its native identity.
     crate::disk_index::invalidate_shared_database(&path);
-    replace_path_atomically(&temporary, &path)?;
+    // DUR2-01: publication takes ownership of the temp guard so an
+    // indeterminate outcome preserves the replacement for out-of-band
+    // reconciliation instead of the guard blind-deleting it by pathname.
+    match publish_temp_path_atomically(temporary, &path)? {
+        ReplaceDurability::Durable => {}
+        ReplaceDurability::ParentSyncPending(sync_error) => {
+            // The rebuilt sidecar is already visible at `path`; only the
+            // parent-directory entry's durability is pending. Preserve the
+            // published sidecar and surface the durability gap exactly like
+            // the native and matrix publication paths.
+            return Err(Error::PublishedButParentSyncPending {
+                path: path.display().to_string(),
+                source: Box::new(sync_error),
+            });
+        }
+    }
     Ok(DiskIndexRebuildReport {
         records,
         scanned_bytes: covered.saturating_sub(header_eof),
@@ -1281,7 +1335,20 @@ fn create_index_store(
     // See `rebuild_index`: the replaced file's shared-database entry must not
     // survive publication of the new sidecar object.
     crate::disk_index::invalidate_shared_database(&sidecar);
-    replace_path_atomically(&temporary, &sidecar)?;
+    // DUR2-01: the temp guard is handed to publication so an indeterminate
+    // outcome preserves the replacement for reconciliation.
+    match publish_temp_path_atomically(temporary, &sidecar)? {
+        ReplaceDurability::Durable => {}
+        ReplaceDurability::ParentSyncPending(sync_error) => {
+            // Publication already happened: keep the published sidecar and
+            // report the pending parent-directory durability instead of
+            // silently promoting it to full success.
+            return Err(Error::PublishedButParentSyncPending {
+                path: sidecar.display().to_string(),
+                source: Box::new(sync_error),
+            });
+        }
+    }
     DiskIndexStore::open_validated(&sidecar, options, metadata.identity, metadata.mode)
         .map_err(index_error)
 }
@@ -1953,6 +2020,113 @@ mod tests {
         assert_eq!(reader.get::<Item2>(&2)?, None);
         // Tombstoned keys stay in the latest table: capacity follows K-ever.
         assert_eq!(reader.historical_distinct_keys()?, 2);
+        Ok(())
+    }
+
+    /// PERF2-03: a CRC rebuild must traverse each indexed payload exactly
+    /// once. The scanner runs with an integrity-stripped spec (frame reads
+    /// only), and `extract_plan_update` owns the single checksum-verified
+    /// payload read; payloads of records outside the plan are never
+    /// materialized.
+    #[cfg(feature = "integrity")]
+    #[test]
+    fn crc_rebuild_materializes_each_indexed_payload_exactly_once() -> Result<()> {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct Blob(String);
+
+        impl VarveEncode for Blob {
+            const WIRE_TYPE: WireType = <String as VarveEncode>::WIRE_TYPE;
+
+            fn encode_varve(&self, encoder: &mut Encoder) -> Result<()> {
+                self.0.encode_varve(encoder)
+            }
+        }
+
+        impl VarveDecode for Blob {
+            const WIRE_TYPE: WireType = <String as VarveDecode>::WIRE_TYPE;
+
+            fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
+                Ok(Self(String::decode_varve(decoder)?))
+            }
+        }
+
+        impl VarveBlock for Blob {
+            const ID: u32 = 12;
+            const VERSION: u16 = 1;
+            const KIND: BlockKind = BlockKind::Variable;
+            const ENDIAN: Option<crate::Endian> = None;
+            const SCHEMA_FINGERPRINT: u64 = 0x424C_4F42_0000_000C;
+            const IS_KEYED: bool = false;
+        }
+
+        static BLOCKS_CRC: &[BlockDescriptor] = &[
+            BlockDescriptor {
+                id: Item::ID,
+                name: "Item",
+                version: Item::VERSION,
+                kind: Item::KIND,
+                fields: &[],
+            },
+            BlockDescriptor {
+                id: Blob::ID,
+                name: "Blob",
+                version: Blob::VERSION,
+                kind: Blob::KIND,
+                fields: &[],
+            },
+        ];
+
+        fn spec_crc() -> FormatSpec {
+            FormatSpec::new(
+                b"VIDC",
+                1,
+                crate::Endian::Little,
+                0,
+                IndexPolicy::KeyedOffsetChain,
+                IntegrityPolicy::Crc32WithHeader,
+                RecoveryPolicy::Strict,
+                ManifestPolicy::None,
+                BLOCKS_CRC,
+            )
+            .with_read_limits(ReadLimits::STANDARD)
+        }
+        fn plan_crc() -> DiskIndexPlan {
+            const INDEXED: &[DiskIndexedBlock] = &[DiskIndexedBlock::of::<Item>()];
+            DiskIndexPlan::canonical(spec_crc(), INDEXED).unwrap()
+        }
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("single-payload-read.varve");
+        let options = DiskIndexOptions::default();
+        {
+            let mut writer = VarveIndexedWriter::create(spec_crc(), &path, options, plan_crc())?;
+            writer.push_info(&Item {
+                key: 1,
+                value: "indexed-one".into(),
+            })?;
+            writer.push_info(&Item {
+                key: 2,
+                value: "indexed-two".into(),
+            })?;
+            // Blob is registered in the format but outside the plan: its
+            // payload must not be materialized by the rebuild at all.
+            writer.push_unindexed_info(&Blob("unindexed".into()))?;
+            writer.delete_info::<Item>(&1)?;
+            writer.sync()?;
+        }
+        fs::remove_file(sidecar_path(&path))?;
+
+        crate::disk_index::reset_plan_payload_reads();
+        let report = rebuild_disk_index(spec_crc(), &path, options, plan_crc())?;
+        assert_eq!(report.records, 4);
+        // Two indexed puts and one tombstone: three payload materializations,
+        // never a scanner checksum pre-pass on top and never the unindexed
+        // record's payload.
+        assert_eq!(crate::disk_index::plan_payload_reads(), 3);
+
+        let reader = VarveIndexedReader::open(spec_crc(), &path, options, plan_crc())?;
+        assert_eq!(reader.get::<Item>(&1)?, None);
+        assert_eq!(reader.get::<Item>(&2)?.unwrap().value, "indexed-two");
         Ok(())
     }
 

@@ -171,8 +171,8 @@ mod enabled {
 
     #[test]
     fn scalable_crash_fault_matrix() {
-        let root = unique_root("matrix");
-        fs::create_dir_all(&root).expect("create crash matrix root");
+        let root_dir = unique_root("matrix");
+        let root = root_dir.path().to_path_buf();
         let mut discovered = Vec::new();
         let mut catalog = BTreeSet::new();
 
@@ -232,14 +232,13 @@ mod enabled {
             assert_boundary_oracle(scenario, &run, &event);
         }
 
-        fs::remove_dir_all(&root).expect("remove crash matrix root");
+        root_dir.close().expect("remove crash matrix root");
     }
 
     #[test]
     fn scalable_fault_environment_is_inert_until_armed() {
-        let root = unique_root("inert");
-        fs::create_dir_all(&root).expect("create inert test root");
-        let trace = root.join("trace.tsv");
+        let root_dir = unique_root("inert");
+        let trace = root_dir.path().join("trace.tsv");
         let status = Command::new(env::current_exe().expect("locate integration test executable"))
             .args([
                 "--ignored",
@@ -256,7 +255,7 @@ mod enabled {
             "environment alone activated a fault: {status}"
         );
         assert!(!trace.exists(), "an unarmed hook created a trace file");
-        fs::remove_dir_all(&root).expect("remove inert test root");
+        root_dir.close().expect("remove inert test root");
     }
 
     #[test]
@@ -847,14 +846,17 @@ mod enabled {
             .expect("parse base EOF")
     }
 
-    fn unique_root(label: &str) -> PathBuf {
+    fn unique_root(label: &str) -> tempfile::TempDir {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before epoch")
             .as_nanos();
-        env::temp_dir().join(format!(
-            "varve-scalable-fault-{label}-{}-{nonce}",
-            std::process::id()
-        ))
+        tempfile::Builder::new()
+            .prefix(&format!(
+                "varve-scalable-fault-{label}-{}-{nonce}-",
+                std::process::id()
+            ))
+            .tempdir()
+            .expect("create crash test root")
     }
 }

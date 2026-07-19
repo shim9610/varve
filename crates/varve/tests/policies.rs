@@ -1175,10 +1175,31 @@ fn tamper_byte(path: &Path, offset: u64) -> varve::Result<()> {
     Ok(())
 }
 
-fn temp_path(name: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!("varve_policy_{name}_{}.vrv", std::process::id()));
-    path
+struct TempPath {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for TempPath {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TempPath {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn temp_path(name: &str) -> TempPath {
+    let dir = tempfile::tempdir().expect("create per-test temp directory");
+    let path = dir
+        .path()
+        .join(format!("varve_policy_{name}_{}.vrv", std::process::id()));
+    TempPath { path, _dir: dir }
 }
 
 fn writer_lock_path(path: &Path) -> PathBuf {

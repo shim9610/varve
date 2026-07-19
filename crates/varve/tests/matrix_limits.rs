@@ -1,4 +1,4 @@
-use std::fs::{OpenOptions, metadata, remove_file};
+use std::fs::{OpenOptions, metadata};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -146,25 +146,23 @@ fn two_block_spec(limits: ReadLimits) -> FormatSpec {
     .with_read_limits(limits)
 }
 
-struct TempMatrix(PathBuf);
+struct TempMatrix {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
 
 impl TempMatrix {
     fn new(name: &str) -> Self {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("varve-{name}-{}-{id}.vrv", std::process::id()));
-        let _ = remove_file(&path);
-        Self(path)
+        let dir = tempfile::tempdir().expect("create per-test temp directory");
+        let path = dir
+            .path()
+            .join(format!("varve-{name}-{}-{id}.vrv", std::process::id()));
+        Self { path, _dir: dir }
     }
 
     fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempMatrix {
-    fn drop(&mut self) {
-        let _ = remove_file(&self.0);
+        &self.path
     }
 }
 
@@ -286,7 +284,8 @@ fn hostile_dimension_is_rejected_before_derived_bitmap_or_slot_work() -> varve::
             .create_with_dims(fixture.path(), dimensions)?,
     );
 
-    let header_offset = 18 + u64::try_from(b"MLIM".len()).expect("magic length");
+    // Native file header + 24-byte matrix creation-nonce region (DUR2-03).
+    let header_offset = 18 + 24 + u64::try_from(b"MLIM".len()).expect("magic length");
     let dimension_value_offset = header_offset + VMAT_HEADER_LEN + 2 + 4;
     let mut file = OpenOptions::new().write(true).open(fixture.path())?;
     file.seek(SeekFrom::Start(dimension_value_offset))?;
@@ -361,7 +360,8 @@ fn nonzero_vmat_flags_are_rejected_as_noncanonical() -> varve::Result<()> {
     let dimensions = MatrixDimensions::from_pairs([("scan", 2), ("ch", 2)]);
     drop(spec.create_with_dims(fixture.path(), dimensions)?);
 
-    let header_offset = 18 + u64::try_from(spec.magic.len()).expect("magic length");
+    // Native file header + 24-byte matrix creation-nonce region (DUR2-03).
+    let header_offset = 18 + 24 + u64::try_from(spec.magic.len()).expect("magic length");
     let mut file = OpenOptions::new().write(true).open(fixture.path())?;
     file.seek(SeekFrom::Start(header_offset + 6))?;
     file.write_all(&1u16.to_le_bytes())?;
@@ -382,7 +382,8 @@ fn quarantined_commit_map_copy_is_counted_before_allocation() -> varve::Result<(
     let dimensions = MatrixDimensions::from_pairs([("scan", 4), ("ch", 4)]);
     drop(spec.create_with_dims(fixture.path(), dimensions)?);
 
-    let header_offset = 18 + u64::try_from(spec.magic.len()).expect("magic length");
+    // Native file header + 24-byte matrix creation-nonce region (DUR2-03).
+    let header_offset = 18 + 24 + u64::try_from(spec.magic.len()).expect("magic length");
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)

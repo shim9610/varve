@@ -164,10 +164,16 @@ The runner gives every command a fresh temporary root, preserves that root on
 failure, and requires verified cleanup on success. Cargo build caches remain
 reusable and are not treated as test data.
 
-The same gates run in CI (`.github/workflows/ci.yml`) on Ubuntu and Windows:
-`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
---all-features -- -D warnings`, and `cargo test --workspace --all-features`, plus
-a non-blocking `cargo deny` / `cargo audit` supply-chain job.
+CI (`.github/workflows/ci.yml`) runs on Ubuntu and Windows: `cargo fmt --all
+-- --check`; a per-feature Clippy matrix with `-D warnings` and `--locked`
+covering no-default-features, default, each optional feature alone
+(`integrity`, `mmap`, `zero-copy`, `compression-zstd`, `high-cardinality-dev`,
+`scalable-fault-injection`), and the all-feature workspace union; default and
+all-feature test runs through `varve-test-runner` so a leaked test artifact
+fails the build; a blocking `cargo deny` / `cargo audit` supply-chain job; a
+renamed-dependency macro fixture; and a clean-archive job that builds only the
+committed tree (`git archive` + `cargo metadata`/`cargo check --locked`) so an
+uncommitted workspace member cannot pass CI.
 
 Optional compatibility harnesses use Python reference libraries:
 

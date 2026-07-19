@@ -605,7 +605,7 @@ fn adapter_caller_path_is_never_removed() -> varve::Result<()> {
     let input = AdapterInputFile::from_path(&path);
     let clone = input.clone();
     assert!(!input.is_temporary());
-    assert_eq!(input.path(), path);
+    assert_eq!(input.path(), path.as_path());
     drop(input);
     drop(clone);
 
@@ -666,19 +666,38 @@ fn assert_layout_poisoned<T>(result: varve::Result<T>) {
     assert!(matches!(result, Err(Error::WriterPoisoned("layout"))));
 }
 
-fn temp_path(name: &str, extension: &str) -> PathBuf {
+struct TempPath {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for TempPath {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TempPath {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn temp_path(name: &str, extension: &str) -> TempPath {
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
 
     let unique = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
+    let dir = tempfile::tempdir().expect("create per-test temp directory");
+    let path = dir.path().join(format!(
         "varve_layout_adapter_hardening_{}_{}_{}.{}",
         std::process::id(),
         name,
         unique,
         extension
     ));
-    path
+    TempPath { path, _dir: dir }
 }
 
 fn cleanup(path: &Path) {

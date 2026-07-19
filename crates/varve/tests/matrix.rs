@@ -125,11 +125,59 @@ impl VarveBlock for BadSizedCell {
     const VERSION: u16 = MatrixCell::VERSION;
     const KIND: BlockKind = BlockKind::Matrix;
     const ENDIAN: Option<Endian> = None;
-    const SCHEMA_FINGERPRINT: u64 = 0x6BED1E9E5DD7FAFD;
+    // Mirrors `MatrixCell`'s fingerprint (the documented escape hatch) so the
+    // DEF-01 first-seen registration gate passes and the encode-size check
+    // below is what fires, keeping the stride-mismatch contract covered.
+    const SCHEMA_FINGERPRINT: u64 = MatrixCell::SCHEMA_FINGERPRINT;
     const IS_KEYED: bool = false;
 }
 
 impl VarveMatrixBlock for BadSizedCell {
+    const DIMENSIONS: [&'static str; 2] = MatrixCell::DIMENSIONS;
+    const CATEGORY: &'static str = MatrixCell::CATEGORY;
+    const SLOT_STRIDE: u64 = MatrixCell::SLOT_STRIDE;
+}
+
+/// A hostile matrix block whose encode streams far more than the slot stride
+/// in small chunks (1 MiB total in 4 KiB writes). DEF-02: `write_matrix_cell`
+/// must cut the encode off at the slot-stride bound instead of materializing
+/// the whole encoding before the size check fires.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChunkedOversizedCell;
+
+impl VarveEncode for ChunkedOversizedCell {
+    const WIRE_TYPE: varve::WireType = varve::WireType::Nested;
+
+    fn encode_varve(&self, encoder: &mut varve::Encoder) -> varve::Result<()> {
+        // 256 chunks x 4096 bytes = 1 MiB if fully materialized.
+        for _ in 0..256 {
+            encoder.write_all(&[0xAB; 4096]);
+        }
+        Ok(())
+    }
+}
+
+impl VarveDecode for ChunkedOversizedCell {
+    const WIRE_TYPE: varve::WireType = varve::WireType::Nested;
+
+    fn decode_varve(_decoder: &mut varve::Decoder<'_>) -> varve::Result<Self> {
+        Ok(Self)
+    }
+}
+
+impl VarveBlock for ChunkedOversizedCell {
+    const ID: u32 = MatrixCell::ID;
+    const VERSION: u16 = MatrixCell::VERSION;
+    const KIND: BlockKind = BlockKind::Matrix;
+    const ENDIAN: Option<Endian> = None;
+    // Mirrors `MatrixCell`'s fingerprint (the documented escape hatch) so the
+    // DEF-01 first-seen registration gate passes and the bounded-encode size
+    // check is what fires.
+    const SCHEMA_FINGERPRINT: u64 = MatrixCell::SCHEMA_FINGERPRINT;
+    const IS_KEYED: bool = false;
+}
+
+impl VarveMatrixBlock for ChunkedOversizedCell {
     const DIMENSIONS: [&'static str; 2] = MatrixCell::DIMENSIONS;
     const CATEGORY: &'static str = MatrixCell::CATEGORY;
     const SLOT_STRIDE: u64 = MatrixCell::SLOT_STRIDE;
@@ -523,6 +571,45 @@ fn matrix_random_order_write_read_commit_and_append_log_coexist() -> varve::Resu
         );
     }
 
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn matrix_write_cell_bounds_hostile_encode_at_the_slot_stride() -> varve::Result<()> {
+    let path = temp_path("matrix_chunked_oversized");
+    cleanup(&path);
+    let spec = matrix_spec();
+    let dims = MatrixDimensions::from_pairs([("scan", 3), ("ch", 2)]);
+    let mut writer = spec.create_writer_with_dims(&path, dims)?;
+
+    // DEF-02: the encode is hard-bounded by the slot stride, so a hostile
+    // encode that streams 1 MiB in 4 KiB chunks is cut off at its FIRST
+    // over-stride write (actual = 4096) instead of being fully materialized
+    // before the size check (which would report actual = 1_048_576). The
+    // exact `actual` value is the behavioral pin that buffering stopped at
+    // the bound; `Encoder::write_all` checks the budget before extending, so
+    // nothing past the first over-limit chunk is ever buffered.
+    assert!(matches!(
+        writer.write_matrix_cell(MatrixKey::new(0, 0), &ChunkedOversizedCell),
+        Err(Error::MatrixSizeMismatch {
+            expected: 4,
+            actual: 4096,
+        })
+    ));
+
+    // The typed rejection leaves the writer usable and the slot untouched.
+    writer.write_matrix_cell(MatrixKey::new(0, 0), &MatrixCell { value: 5 })?;
+    writer.commit_matrix_cell::<MatrixCell>(MatrixKey::new(0, 0))?;
+    writer.flush()?;
+    drop(writer);
+
+    let mut reader = spec.open_reader(&path)?;
+    assert_eq!(
+        reader.read_matrix_cell::<MatrixCell>(MatrixKey::new(0, 0))?,
+        MatrixCell { value: 5 }
+    );
+    drop(reader);
     cleanup(&path);
     Ok(())
 }
@@ -1313,7 +1400,10 @@ struct VmatOffsets {
 
 fn read_vmat_offsets(path: &PathBuf, spec: FormatSpec) -> varve::Result<VmatOffsets> {
     let mut file = OpenOptions::new().read(true).open(path)?;
-    let header_len = spec.magic.len() as u64 + 18;
+    // Native file header (magic + marker + version + endian + flags + schema
+    // hash), then the 24-byte matrix creation-nonce region (DUR2-03), then the
+    // VMAT layout header this helper decodes.
+    let header_len = spec.magic.len() as u64 + 18 + 24;
     file.seek(SeekFrom::Start(header_len))?;
     let mut header = [0; 160];
     file.read_exact(&mut header)?;
@@ -1328,12 +1418,33 @@ fn read_vmat_offsets(path: &PathBuf, spec: FormatSpec) -> varve::Result<VmatOffs
     })
 }
 
-fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
+struct TempPath {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for TempPath {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for TempPath {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+fn temp_path(name: &str) -> TempPath {
+    let dir = tempfile::tempdir().expect("create per-test temp directory");
+    let path = dir.path().join(format!(
         "varve_{name}_{}_{}.vrv",
         std::process::id(),
         std::thread::current().name().unwrap_or("test")
-    ))
+    ));
+    TempPath { path, _dir: dir }
 }
 
 fn cleanup(path: &PathBuf) {

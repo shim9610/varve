@@ -18,7 +18,8 @@ durability model:
 Safe append-log fixed replacement is copy-on-write. The replacement generation
 is written in the target directory, flushed and synced, fully reopened and
 validated, then atomically published. Publication failure leaves the original
-path generation unchanged. An already-open reader remains bound to its retained
+path generation unchanged, with the single Windows exception of the typed
+indeterminate state described below. An already-open reader remains bound to its retained
 file object and captured logical EOF rather than reopening the pathname.
 If publication succeeds but the writer cannot reopen the published pathname,
 Varve returns `PublishedButRebindFailed` and poisons that writer. This is not a
@@ -64,11 +65,48 @@ outcomes explicitly rather than letting a late error escape before rebinding:
 - If the post-publication re-bind itself fails, the writer is poisoned and
   `PublishedButRebindFailed` is returned.
 
-Any error from replacement other than these two typed post-publication states
-means publication did not happen and the original generation still stands.
-Exclusive-create constructors (`VarveFile::create_new`, `VarveWriter::create_new`)
-open with `create_new`, never truncating or reusing an existing path; they fail
-with an `AlreadyExists` I/O error instead.
+On Windows, `ReplaceFileW` failures are classified per the documented OS
+contract (`classify_replace_publication_error`, pure and unit-testable on every
+platform):
+
+- `ERROR_UNABLE_TO_REMOVE_REPLACED` (1175) is the documented no-mutation
+  failure: the replaced file is intact under its original name.
+- Every other error except the two below occurs before any mutation; both
+  files retain their original names and the temp may be deleted.
+- `ERROR_UNABLE_TO_MOVE_REPLACEMENT` (1176) and
+  `ERROR_UNABLE_TO_MOVE_REPLACEMENT_2` (1177) can leave the two files' names,
+  streams, and attributes partially moved. Varve captures the replacement's OS
+  object identity before the call and reconciles on 1176/1177: if the target
+  pathname already resolves to the replacement object, the publication is
+  treated as complete and proceeds through the normal rebind path. Otherwise
+  Varve returns the typed `Error::ReplacePublicationIndeterminate`: the
+  replacement temp file is preserved for reconciliation, and a writer bound to
+  the target is poisoned so a blind retry is impossible. Callers must inspect
+  the pathname and the preserved temp separately before acting.
+
+Any error from replacement other than these typed post-publication and
+indeterminate states means publication did not happen and the original
+generation still stands.
+
+The parent-directory sync itself is honest about refusal. `FlushFileBuffers`
+requires `GENERIC_WRITE` on the handle, so the Windows implementation opens the
+parent directory with write access, and no open or flush failure is ever
+promoted to a `Durable` result. On filesystems that refuse a directory
+write-open or flush, every publication surfaces
+`PublishedButParentSyncPending` rather than a false durability claim; the same
+honesty applies to the redb sidecar publication sites (stream/indexed sidecar
+create, stream bootstrap, disk-index rebuild), which surface the pending state
+while preserving the already-published sidecar instead of silently discarding
+it.
+
+Exclusive-create constructors (`VarveFile::create_new`,
+`VarveWriter::create_new`, and the matrix `create_new_with_dims` pair) open
+with `create_new`, never truncating or reusing an existing path; they fail
+with an `AlreadyExists` I/O error instead. All create paths bind the
+single-writer object lock before destructive initialization: open without
+truncate, bind the lock on the file object, then `set_len(0)` and write the
+header, so a losing concurrent creator can never truncate the winner's freshly
+initialized file inside the pre-bind window.
 
 The unsafe exclusive in-place replacement method does not provide that snapshot
 guarantee. Its safety contract requires process-wide and cross-process
@@ -180,21 +218,37 @@ state in their own payload or metadata until the policy is promoted.
 
 ## Matrix Sidecar Identity And Atomic Publication
 
-The matrix sidecar manifest is version 2 (88-byte fixed header). Beyond the
-existing format/schema/category/caller-generation/length/CRC fields it binds the
-sidecar to a specific native file with two additions:
+The matrix sidecar manifest is version 3 (104-byte fixed header). Beyond the
+existing format/schema/category/caller-generation/length/CRC fields it binds
+the sidecar to a specific native file and a specific logical creation with
+three additions:
 
 - a native object fingerprint that folds the OS file identity (Windows
-  volume + file id, Unix device + inode) with the schema hash, and
-- a matrix layout generation.
+  volume + file id, Unix device + inode) with the schema hash,
+- a matrix layout generation, and
+- the 16-byte matrix creation nonce.
 
-A reader recomputes the fingerprint from its own native file and rejects a
-mismatch as `MatrixSidecarMismatch("native identity")` or
-`MatrixSidecarMismatch("matrix layout generation")`. A version-1 or otherwise
-unrecognized envelope is refused as `MatrixSidecarMismatch("sidecar version")`.
-Because sidecars are regenerable resume state, a refused sidecar is a
-regenerate-and-retry signal, not data loss — so a same-spec sibling file can no
-longer silently adopt another file's sidecar.
+The creation nonce closes the same-object recreation gap: OS file identity and
+layout offsets are stable when a matrix is recreated into the same
+pathname/file object with the same dimensions, so identity and generation
+alone could accept the previous creation's sidecar. Every matrix create stamps
+a fresh nonce region (`VMNC` magic, version, 128-bit nonce) between the native
+file header and the matrix layout header; the nonce is read once at open and
+cached in the handle, adding no per-operation cost. A caller-supplied
+application generation cannot substitute for the native creation identity.
+
+A reader recomputes the identity from its own native file and rejects a
+mismatch as `MatrixSidecarMismatch("native identity")`,
+`MatrixSidecarMismatch("matrix layout generation")`, or
+`MatrixSidecarMismatch("creation nonce")`. A version-1, version-2, or
+otherwise unrecognized envelope is refused as
+`MatrixSidecarMismatch("sidecar version")`. Because sidecars are regenerable
+resume state, a refused sidecar is a regenerate-and-retry signal, not data
+loss — so neither a same-spec sibling file nor a recreated matrix in the same
+file object can silently adopt another creation's sidecar. All fixed-header
+identity fields and the small payload magic/category prefix are validated
+before any payload allocation, read, or hash, so an obviously foreign sidecar
+is rejected without configured-limit-sized work.
 
 Publication is atomic and ordered. `write_matrix_sidecar` writes the new
 manifest to a same-directory RAII temp file, `sync`s it, atomically replaces the

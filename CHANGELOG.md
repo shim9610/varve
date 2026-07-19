@@ -37,8 +37,38 @@ increment the minor version.
   `Error::BlockKeyednessMismatch` for typed registration.
 - `Error::PublishedButParentSyncPending` typed post-publication replacement state
   distinct from a rollback.
-- GitHub Actions CI (Ubuntu + Windows) running fmt, Clippy, all-feature tests,
-  and a non-blocking `cargo deny`/`cargo audit` job.
+- `ReplacePublicationFailure` and the pure, platform-independent
+  `classify_replace_publication_error(raw_os_error)` classifier for Windows
+  `ReplaceFileW` failures, plus `Error::ReplacePublicationIndeterminate` for OS
+  errors 1176/1177, where the target pathname state is unknown. On that error
+  the replacement temp file is preserved for reconciliation and a writer bound
+  to the target is poisoned; blind retry is forbidden.
+- Exclusive-create matrix constructors `VarveFile::create_new_with_dims` and
+  `VarveWriter::create_new_with_dims` that hold the single exclusively created,
+  lock-bound handle from claim through matrix initialization (no pathname
+  re-open window). The matrix self-test uses this path.
+- `FormatSpec::block_identities` (with `with_block_identities` and the builder
+  setter): a per-block identity table `(block_id, endian override, keyedness,
+  generated codec fingerprint)` that `varve_format!` emits and
+  `computed_schema_hash()` folds into the hash.
+  `FormatSpec::SCHEMA_HASH_ALGORITHM_VERSION` names the hash algorithm
+  revision (now 2). `validate()` rejects duplicate or unregistered identities.
+- `MatrixSidecarManifest::matrix_creation_nonce`: the 16-byte per-create nonce
+  that binds a sidecar to one logical matrix creation, not just one OS file
+  object.
+- `Encoder::encode_nested_to_vec`, which caps a child encoder at the parent's
+  remaining logical-payload budget; generated variable-block field encoding
+  uses it so nested fields cannot stage bytes past the writer's limit.
+- GitHub Actions CI (Ubuntu + Windows): rustfmt; a per-feature Clippy matrix
+  (`-D warnings`, `--locked`) covering no-default-features, default, each
+  optional feature alone (`integrity`, `mmap`, `zero-copy`,
+  `compression-zstd`, `high-cardinality-dev`, `scalable-fault-injection`), and
+  the all-feature workspace union; default and all-feature test runs through
+  `varve-test-runner` so leaked test artifacts fail the build; a **blocking**
+  `cargo deny`/`cargo audit` supply-chain job; a renamed-dependency fixture
+  build (`vv = { package = "varve", ... }`); and a clean-archive job that
+  unpacks `git archive HEAD` and runs `cargo metadata`/`cargo check --locked`
+  so an uncommitted workspace member can never pass CI again.
 
 ### Changed
 
@@ -51,13 +81,87 @@ increment the minor version.
   parent-sync failure after a successful rename rebinds the writer and returns
   `PublishedButParentSyncPending`; a failed rebind poisons the writer with
   `PublishedButRebindFailed`. Any other replacement error means publication did
-  not happen.
+  not happen — with one Windows exception: `ReplacePublicationIndeterminate`
+  (`ReplaceFileW` errors 1176/1177) means the pathname state is unknown. The
+  Windows path first captures the replacement's OS object identity and, on
+  1176/1177, reconciles: if the target already resolves to the replacement
+  object the publication is treated as complete; otherwise the typed
+  indeterminate error is returned with the temp preserved and the writer
+  poisoned.
+- Windows parent-directory sync is honest: `FlushFileBuffers` requires
+  `GENERIC_WRITE`, so the parent directory is now opened with write access, and
+  open/flush refusals (`PermissionDenied`, `InvalidInput`, `Unsupported`) are
+  no longer promoted to a `Durable` result. A read-only directory handle fails
+  the flush with `ERROR_ACCESS_DENIED` on NTFS (verified live on an NTFS
+  host), so the former code silently misreported `Durable` there; publications
+  on filesystems that refuse a directory write-open/flush now surface
+  `PublishedButParentSyncPending` instead.
+- The redb sidecar publication sites (stream/indexed sidecar create, stream
+  bootstrap, disk-index rebuild) no longer discard the replacement durability
+  state: a parent-sync failure surfaces as `PublishedButParentSyncPending`
+  while the already-published sidecar is preserved and usable.
+- Every matrix create stamps a fresh 24-byte creation-nonce region (`VMNC`
+  magic, version, 128-bit nonce) between the native file header and the matrix
+  layout header, cached in the handle at open/create (zero per-operation
+  cost). The nonce is folded into the sidecar identity, so recreating a matrix
+  into the same pathname/file object with the same dimensions can no longer
+  adopt the previous generation's sidecar: stale sidecars are refused as
+  `MatrixSidecarMismatch("creation nonce")`, and a caller-supplied generation
+  cannot substitute for the native creation identity.
+- File creation binds the single-writer object lock before destructive
+  initialization: create paths open without truncate, bind the native object
+  lock, then `set_len(0)` and write the header, closing the window where a
+  losing concurrent creator could truncate the winner's freshly initialized
+  file.
+- Matrix sidecar reads validate all fixed-header identity fields and the small
+  payload magic/category prefix before any payload allocation, read, or hash,
+  so an obviously foreign sidecar is rejected without doing
+  configured-limit-sized work.
+- `needs_index_checkpoint` is O(1): the writer keeps a counter of eligible
+  records since the last checkpoint and a precomputed geometric threshold,
+  maintained incrementally at the append site, restored on rollback, recovered
+  once at open, and recomputed at generation rebind. The former per-flush reverse
+  index scan made flush-per-record workloads O(N²) in CPU even after the
+  checkpoint byte growth was linearized. The adjacent per-flush
+  uncommitted-tail scan is also O(1) now.
+- Matrix cell read, write, and mmap access enforce the common typed
+  registration gate (`ensure_registered_block`) first, so a manual matrix
+  block with the same shape and stride but a different schema fingerprint or
+  keyedness is rejected (`BlockSchemaFingerprintMismatch` /
+  `BlockKeyednessMismatch`) instead of decoding foreign cells.
+- The compile-time keyedness contract (`KeyedBlockContract::<T>::OK`) is now
+  evaluated at every public keyed generic entry point — stream delete, indexed
+  lookup/get/push/delete, merge/compact, low-level `VarveFile`/reader/writer
+  delete, `keyed_blocks`, `key_tail_offsets`, disk-index descriptors, and the
+  self-test keyed case — with first-seen runtime registration retained as the
+  backstop. A `VarveKeyedBlock` impl declaring `IS_KEYED = false` fails
+  compilation at each of these sites.
+- All resident writer entry points (push, metadata, replacements, keyed op
+  envelopes) encode through the limit-bounded encoder: an oversized value
+  fails with the typed `LimitExceeded { resource: "logical payload length" }`
+  error and the encoder stops buffering at the limit instead of materializing
+  the full encoding first. Matrix cell writes bound the encode by the slot
+  stride and keep the exact-size `MatrixSizeMismatch` contract.
+- Matrix self-test cleanup is identity-checked: the native target is deleted
+  only while the pathname still resolves to the file object this run created
+  (race-free delete-by-handle on Windows; check-then-unlink with a documented
+  one-syscall residual window on Unix), and the `.lock` marker is removed only
+  after re-acquiring it through the standard writer-lock protocol, so
+  foreign-owned or populated markers survive.
+- `varve_format!`-generated code works when the `varve` dependency is renamed
+  in `Cargo.toml` (resolved via `proc-macro-crate`); the
+  `extern crate vv as varve` workaround is no longer needed.
+- Integration tests own per-test temporary directories (`tempfile::tempdir()`
+  guards), so native files, sidecars, and `.lock` markers are collected on
+  drop even under plain `cargo test`, on panic, or early return; nothing is
+  left in the system temp root. See `docs/test-artifact-hygiene.md`.
 - Matrix `Fatal` recovery findings fail-close every default read/write/aux/
   resume/rebuild accessor with `Error::MatrixFatalCorruption` via an `O(1)` flag
   precomputed at open; `matrix_recovery_report()` stays readable.
-- The matrix sidecar manifest is version 2 (88-byte header) binding a native
-  object fingerprint and matrix layout generation, published atomically through a
-  same-directory temp with native-then-sidecar ordering and parent sync.
+- The matrix sidecar manifest is version 3 (104-byte fixed header) binding a
+  native object fingerprint, matrix layout generation, and the matrix creation
+  nonce, published atomically through a same-directory temp with
+  native-then-sidecar ordering and parent sync.
 - `CheckpointOnFlush` spaces full index checkpoints geometrically, bounding
   cumulative checkpoint bytes to `O(N)` instead of the former `O(N²)`.
 - CRC typed point lookups and streaming scans read each covered payload once and
@@ -110,9 +214,35 @@ increment the minor version.
 - Matrix access is fail-closed when recovery records a `Fatal` finding; readers
   that relied on reading through fatal-state files must opt in with
   `FormatSpec::with_matrix_fatal_forensics()`.
-- The matrix sidecar format is version 2. Version-1 sidecars are refused as
-  `MatrixSidecarMismatch("sidecar version")`; regenerate them (sidecars are
-  regenerable resume state, so no native file migration is required).
+- The computed schema hash algorithm is version 2
+  (`FormatSpec::SCHEMA_HASH_ALGORITHM_VERSION`): fields are hashed in
+  declaration order with their encoding ordinal and a field-count frame, and
+  per-block endian overrides, keyedness, and generated codec fingerprints are
+  folded in via `FormatSpec::block_identities`. This closes the hole where two
+  blocks with the same field id/name/type set in a different declaration order
+  — and therefore different canonical bytes — hashed identically. **Every
+  computed hash value changes.** A file created with a pinned v1 computed hash
+  fails open with `SchemaHashMismatch` until recreated (pre-1.0 policy: no
+  migration path). `schema_hash: computed` declarations recompute
+  automatically at build time; release-pinned literal hashes must be
+  re-derived. Omitting `schema_hash` still stores 0 and disables the open-time
+  comparison, unchanged.
+- Matrix native files gain the 24-byte creation-nonce region between the
+  native file header and the matrix layout header. Matrix files created before
+  this change are refused with `InvalidMatrixLayout` at the nonce region
+  (pre-1.0 policy: recreate them). Non-matrix native files are unchanged.
+- The matrix sidecar format is version 3 (fixed header grew from 88 to 104
+  bytes for the creation nonce). Version-1 and version-2 sidecars are refused
+  as `MatrixSidecarMismatch("sidecar version")`; regenerate them (sidecars are
+  regenerable resume state, so no native file migration is required beyond the
+  matrix-native recreation above).
+- `FormatSpec` gained the public field `block_identities`; code constructing
+  `FormatSpec` with an exhaustive struct literal must add it. Construction
+  through `FormatSpec::new(...)`, the builder, or generated `spec()` is
+  unaffected (defaults to empty).
+- Under CRC policies, `rebuild_disk_index` no longer reads the payloads of
+  records outside the index plan; a corrupt unindexed payload no longer fails
+  a rebuild. `verify_all()` remains the whole-file integrity scan.
 
 ## 0.3.0 - 2026-07-17
 

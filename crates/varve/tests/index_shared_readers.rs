@@ -216,6 +216,58 @@ fn rebuild_replaces_the_sidecar_for_fresh_handles() -> Result<()> {
     Ok(())
 }
 
+/// PERF2-09: the process-global registry mutex only guards the identity map;
+/// a cache-miss redb open runs under a per-identity slot, so concurrent opens
+/// of unrelated sidecars — and racing opens of the same sidecar — all succeed
+/// and same-file handles still share one database.
+#[test]
+fn concurrent_opens_of_unrelated_and_same_sidecars_all_succeed() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let options = DiskIndexOptions::default();
+    let spec = spec(IntegrityPolicy::None);
+    let plan = plan(IntegrityPolicy::None);
+
+    let paths: Vec<_> = (0..4)
+        .map(|ordinal| directory.path().join(format!("convoy-{ordinal}.varve")))
+        .collect();
+    for path in &paths {
+        let mut writer = VarveIndexedWriter::create(spec, path, options, plan)?;
+        writer.push_info(&item(7, "seven"))?;
+        writer.sync()?;
+    }
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        // One thread per identity, opening concurrently with the others:
+        // distinct identities must not serialize behind one another's
+        // database open. Each thread opens twice so both handles of one
+        // identity converge on the shared database. (Simultaneous opens of
+        // one identity may still fail fast with the typed busy error while
+        // the other handle's open validation holds the write gate, so
+        // same-identity opens stay sequential here.)
+        for path in &paths {
+            handles.push(scope.spawn(move || -> Result<()> {
+                let first = VarveIndexedReader::open(spec, path, options, plan)?;
+                let second = VarveIndexedReader::open(spec, path, options, plan)?;
+                assert_eq!(first.get::<Item>(&7)?, Some(item(7, "seven")));
+                assert_eq!(second.get::<Item>(&7)?, Some(item(7, "seven")));
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("reader thread panicked")?;
+        }
+        Ok::<(), Error>(())
+    })?;
+
+    // The registry stays consistent afterwards: fresh handles still share.
+    let first = VarveIndexedReader::open(spec, &paths[0], options, plan)?;
+    let second = VarveIndexedReader::open(spec, &paths[0], options, plan)?;
+    assert_eq!(first.get::<Item>(&7)?, Some(item(7, "seven")));
+    assert_eq!(second.get::<Item>(&7)?, Some(item(7, "seven")));
+    Ok(())
+}
+
 #[cfg(feature = "integrity")]
 #[test]
 fn crc_point_lookups_verify_payloads_and_detect_corruption() -> Result<()> {

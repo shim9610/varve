@@ -8,8 +8,8 @@ use std::fs::remove_file;
 use std::path::{Path, PathBuf};
 
 use varve::{
-    BlockKind, Decoder, Encoder, Endian, Error, VarveBlock, VarveDecode, VarveEncode,
-    VarveKeyedBlock, WireType, varve_format,
+    BlockKind, Decoder, Encoder, Endian, Error, MatrixDimensions, MatrixKey, VarveBlock,
+    VarveDecode, VarveEncode, VarveKeyedBlock, VarveMatrixBlock, WireType, varve_format,
 };
 
 #[derive(Clone, Debug, PartialEq, VarveBlock)]
@@ -205,13 +205,113 @@ impl VarveKeyedBlock for KeyedMirror {
     }
 }
 
-fn temp_path(name: &str) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
+varve_format! {
+    pub format InvariantMatrixFormat {
+        magic: b"IMTX";
+        version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
+        endian: little;
+        dims {
+            scan: u32,
+            ch: u32,
+        }
+        commit: cell_bitmap {
+            keyspace = [scan, ch];
+            categories = [analysis];
+        };
+        blocks {
+            matrix MatrixGenCell(id = 62, dims = [scan, ch], category = analysis) {
+                value: u32,
+            }
+        }
+    }
+}
+
+/// DEF-01 probe: same block id/version/kind, same dimensions, category, and
+/// slot stride as the generated matrix cell — but different decode semantics
+/// (i32 vs u32) and therefore an honest different fingerprint. Without the
+/// common registration gate this type passed every shape check.
+#[derive(Clone, Debug, PartialEq)]
+struct MatrixImpostorCell {
+    value: i32,
+}
+
+impl VarveEncode for MatrixImpostorCell {
+    const WIRE_TYPE: WireType = WireType::Nested;
+
+    fn encode_varve(&self, encoder: &mut Encoder) -> varve::Result<()> {
+        self.value.encode_varve(encoder)
+    }
+}
+
+impl VarveDecode for MatrixImpostorCell {
+    const WIRE_TYPE: WireType = WireType::Nested;
+
+    fn decode_varve(decoder: &mut Decoder<'_>) -> varve::Result<Self> {
+        Ok(Self {
+            value: i32::decode_varve(decoder)?,
+        })
+    }
+}
+
+impl VarveBlock for MatrixImpostorCell {
+    const ID: u32 = <MatrixGenCell as VarveBlock>::ID;
+    const VERSION: u16 = <MatrixGenCell as VarveBlock>::VERSION;
+    const KIND: BlockKind = BlockKind::Matrix;
+    const ENDIAN: Option<Endian> = None;
+    const IS_KEYED: bool = false;
+    const SCHEMA_FINGERPRINT: u64 = 0xF00D_FACE_CAFE_0001;
+}
+
+impl VarveMatrixBlock for MatrixImpostorCell {
+    const DIMENSIONS: [&'static str; 2] = <MatrixGenCell as VarveMatrixBlock>::DIMENSIONS;
+    const CATEGORY: &'static str = <MatrixGenCell as VarveMatrixBlock>::CATEGORY;
+    const SLOT_STRIDE: u64 = <MatrixGenCell as VarveMatrixBlock>::SLOT_STRIDE;
+}
+
+struct TempPath {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for TempPath {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for TempPath {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+fn temp_path(name: &str) -> TempPath {
+    let dir = tempfile::tempdir().expect("create per-test temp directory");
+    let path = dir.path().join(format!(
         "varve_manual_invariants_{name}_{}.vrv",
         std::process::id()
     ));
-    path
+    TempPath { path, _dir: dir }
 }
 
 fn cleanup(path: &Path) {
@@ -342,6 +442,104 @@ fn keyed_mirror_with_agreeing_keyedness_registers_and_reads() -> varve::Result<(
             id: 5,
             name: "beta".to_string(),
         })
+    );
+
+    cleanup(&path);
+    Ok(())
+}
+
+/// Creates a matrix file with one committed generated cell, registering the
+/// generated type as the first-seen contract for the matrix block id.
+fn create_matrix_fixture(path: &Path) -> varve::Result<()> {
+    let dims = MatrixDimensions::from_pairs([("scan", 2), ("ch", 1)]);
+    let mut writer = InvariantMatrixFormat::spec().create_writer_with_dims(path, dims)?;
+    writer.write_matrix_cell(MatrixKey::new(0, 0), &MatrixGenCell { value: 41 })?;
+    writer.commit_matrix_cell::<MatrixGenCell>(MatrixKey::new(0, 0))?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn assert_matrix_impostor_rejected(result: Result<(), Error>) {
+    match result {
+        Err(Error::BlockSchemaFingerprintMismatch {
+            block_id,
+            registered,
+            declared,
+        }) => {
+            assert_eq!(block_id, <MatrixGenCell as VarveBlock>::ID);
+            assert_eq!(
+                registered,
+                <MatrixGenCell as VarveBlock>::SCHEMA_FINGERPRINT
+            );
+            assert_eq!(declared, 0xF00D_FACE_CAFE_0001);
+        }
+        other => panic!("expected BlockSchemaFingerprintMismatch, got {other:?}"),
+    }
+}
+
+/// DEF-01: a same-stride manual matrix type with a different fingerprint is
+/// rejected by the common registration gate on the cell read path.
+#[test]
+fn matrix_impostor_same_stride_read_is_rejected() -> varve::Result<()> {
+    let path = temp_path("matrix_impostor_read");
+    cleanup(&path);
+    create_matrix_fixture(&path)?;
+
+    let mut reader = InvariantMatrixFormat::spec().open_reader(&path)?;
+    assert_eq!(
+        reader.read_matrix_cell::<MatrixGenCell>(MatrixKey::new(0, 0))?,
+        MatrixGenCell { value: 41 }
+    );
+    assert_matrix_impostor_rejected(
+        reader
+            .read_matrix_cell::<MatrixImpostorCell>(MatrixKey::new(0, 0))
+            .map(|_| ()),
+    );
+
+    cleanup(&path);
+    Ok(())
+}
+
+/// DEF-01: the same gate guards the cell write path.
+#[test]
+fn matrix_impostor_same_stride_write_is_rejected() -> varve::Result<()> {
+    let path = temp_path("matrix_impostor_write");
+    cleanup(&path);
+    create_matrix_fixture(&path)?;
+
+    let mut writer = InvariantMatrixFormat::spec().open_writer(&path)?;
+    writer.write_matrix_cell(MatrixKey::new(1, 0), &MatrixGenCell { value: 7 })?;
+    assert_matrix_impostor_rejected(
+        writer
+            .write_matrix_cell(MatrixKey::new(1, 0), &MatrixImpostorCell { value: -7 })
+            .map(|_| ()),
+    );
+
+    cleanup(&path);
+    Ok(())
+}
+
+/// DEF-01: the same gate guards the mmap cell window path.
+#[cfg(feature = "mmap")]
+#[test]
+fn matrix_impostor_same_stride_mmap_is_rejected() -> varve::Result<()> {
+    let path = temp_path("matrix_impostor_mmap");
+    cleanup(&path);
+    create_matrix_fixture(&path)?;
+
+    let reader = InvariantMatrixFormat::spec().open_reader(&path)?;
+    // SAFETY: the file is not mutated for the mapping's lifetime; no other
+    // handle, thread, or process touches this test-owned temp path.
+    let mapped = unsafe { reader.mmap_matrix()? };
+    assert!(
+        mapped
+            .cell_payload_window::<MatrixGenCell>(MatrixKey::new(0, 0))
+            .is_ok()
+    );
+    assert_matrix_impostor_rejected(
+        mapped
+            .cell_payload_window::<MatrixImpostorCell>(MatrixKey::new(0, 0))
+            .map(|_| ()),
     );
 
     cleanup(&path);

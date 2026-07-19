@@ -59,8 +59,9 @@ pub use file::{
     AppendInfo, BlockEvent, COMMIT_BLOCK_ID, FileMatrixDurabilityBarrier, INDEX_BLOCK_ID,
     MANIFEST_BLOCK_ID, METADATA_BLOCK_ID, MatrixDurabilityBarrier, MatrixNumeric,
     MatrixSidecarManifest, OP_BLOCK_ID, OpenMode, RecordIndexEntry, RecoveryReport,
-    ReplaceStrategy, ReplacementInfo, SchemaBlockDescriptor, SchemaFieldDescriptor, SchemaManifest,
-    TOMBSTONE_BLOCK_ID, VarveFile, VarveReader, VarveWriter, WriterLockBreakPolicy, WriterLockInfo,
+    ReplacePublicationFailure, ReplaceStrategy, ReplacementInfo, SchemaBlockDescriptor,
+    SchemaFieldDescriptor, SchemaManifest, TOMBSTONE_BLOCK_ID, VarveFile, VarveReader, VarveWriter,
+    WriterLockBreakPolicy, WriterLockInfo, classify_replace_publication_error,
     clear_stale_writer_lock, compact_keyed_files, merge_keyed_files,
 };
 #[cfg(feature = "mmap")]

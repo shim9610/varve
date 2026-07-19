@@ -785,9 +785,16 @@ impl LayoutWriter {
             .read(true)
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .open(&path)?;
+        // DUR2-05: bind the single-writer object lock before any destructive
+        // initialization. Opening with `.truncate(true)` would clear the new
+        // object inside the pre-bind window where a losing concurrent creator
+        // could still hold an unbound handle to it; truncate through the bound
+        // handle instead. Mirrors VarveFile::create_impl.
         lock.bind_native(&file, &path)?;
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
         if let Some(header) = spec.layout.file_header() {
             write_static_layout_fields(&mut file, header.fields, fields, spec.endian)?;
         }

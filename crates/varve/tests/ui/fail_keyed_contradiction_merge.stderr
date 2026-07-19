@@ -14,19 +14,13 @@ error[E0080]: evaluation panicked: this type implements VarveKeyedBlock but decl
   | |_____- in this macro invocation
 
 note: erroneous constant encountered
- --> $WORKSPACE/crates/varve-core/src/file.rs
+ --> $WORKSPACE/crates/varve-core/src/merge.rs
   |
-  |         let () = crate::traits::KeyedBlockContract::<T>::OK;
-  |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |     let () = KeyedBlockContract::<T>::OK;
+  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-note: the above error was encountered while instantiating `fn VarveFile::keyed_blocks::<ContradictoryKeyed>`
-  --> tests/ui/fail_keyed_contradiction.rs:43:5
+note: the above error was encountered while instantiating `fn compact_keyed_file::<ContradictoryKeyed, &Path>`
+  --> tests/ui/fail_keyed_contradiction_merge.rs:55:5
    |
-43 |     file.keyed_blocks::<ContradictoryKeyed>()
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-note: erroneous constant encountered
- --> $WORKSPACE/crates/varve-core/src/collections.rs
-  |
-  |         let () = KeyedBlockContract::<T>::OK;
-  |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+55 |     compact_keyed_file::<ContradictoryKeyed, &Path>(spec, input, output)
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

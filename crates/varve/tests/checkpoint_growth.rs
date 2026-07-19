@@ -5,6 +5,16 @@
 // record count nearly quadrupled the file. This test pins the amortized O(N)
 // behavior and verifies that sparse checkpoints and a checkpoint-less tail
 // still recover every native record.
+//
+// PERF2-02 regression: the checkpoint *decision* must also be O(1) per flush.
+// The first fix linearized the file bytes but still reverse-searched the
+// resident index on every flush (179,392 predicate entry touches at 1,024
+// records vs 11,253,678 at 8,192 in the 2026-07-19 re-verification), keeping
+// cumulative flush CPU O(N^2). The cadence-touch test below delta-measures a
+// thread-local counter of index entries examined by the cadence machinery and
+// pins near-linear cumulative touches, and the reopen test pins that the O(1)
+// writer state recovered at open makes exactly the same checkpoint decisions
+// as an uninterrupted writer.
 
 use std::fs::remove_file;
 use std::path::PathBuf;
@@ -147,12 +157,153 @@ fn checkpointless_tail_recovers_from_empty_file() -> varve::Result<()> {
     Ok(())
 }
 
-fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
+/// Returns the index positions of every full checkpoint record in `path`.
+fn checkpoint_positions(path: &PathBuf) -> varve::Result<Vec<usize>> {
+    let file = GrowthFormat::open_readonly(path)?;
+    Ok(file
+        .index_entries()
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.block_id == INDEX_BLOCK_ID)
+        .map(|(position, _)| position)
+        .collect())
+}
+
+// PERF2-02: the O(1) flush-cadence state recovered at reopen must make the
+// writer take exactly the same checkpoint decisions as a writer that never
+// restarted. Any recovery bug (forgetting the live tail, resetting the
+// geometric threshold, or double-counting the suffix) shifts or duplicates a
+// checkpoint record and diverges the two index layouts.
+#[test]
+fn reopened_writer_recovers_checkpoint_cadence() -> varve::Result<()> {
+    let continuous = temp_path("checkpoint_growth_cadence_cont");
+    let restarted = temp_path("checkpoint_growth_cadence_restart");
+    cleanup(&continuous);
+    cleanup(&restarted);
+
+    let records = 96u32;
+    let split = 48u32;
+    write_flush_every_record(&continuous, records)?;
+
+    {
+        let mut file = GrowthFormat::create(&restarted)?;
+        for value in 0..split {
+            file.push(&GrowthBlock { value })?;
+            file.flush()?;
+        }
+    }
+    {
+        let mut file = GrowthFormat::open(&restarted)?;
+        // Nothing eligible was appended since the last flush of the previous
+        // session, so a bare flush after reopen must not spend a checkpoint;
+        // if it did, the layouts below could not match.
+        file.flush()?;
+        for value in split..records {
+            file.push(&GrowthBlock { value })?;
+            file.flush()?;
+        }
+    }
+
+    let continuous_checkpoints = checkpoint_positions(&continuous)?;
+    let restarted_checkpoints = checkpoint_positions(&restarted)?;
+    assert!(
+        !continuous_checkpoints.is_empty(),
+        "workload too small to spend any checkpoint; the comparison is vacuous",
+    );
+    assert_eq!(
+        restarted_checkpoints, continuous_checkpoints,
+        "reopened writer diverged from the uninterrupted checkpoint cadence",
+    );
+
+    // The restart must also not have lost any data.
+    let file = GrowthFormat::open_readonly(&restarted)?;
+    let blocks = file.blocks::<GrowthBlock>()?;
+    assert_eq!(blocks.len() as u32, records);
+    for value in 0..records {
+        assert_eq!(blocks.get(value as usize)?, Some(GrowthBlock { value }));
+    }
+    drop(file);
+
+    cleanup(&continuous);
+    cleanup(&restarted);
+    Ok(())
+}
+
+// PERF2-02: cumulative index-entry touches by the checkpoint cadence machinery
+// must stay near-linear in the number of flush-per-record appends. The
+// pre-fix predicate re-walked the resident index on every flush, so doubling
+// the record count roughly quadrupled the touches; the O(1) state keeps the
+// ratio at ~2x. The counter is thread-local, so concurrent tests in this
+// binary cannot pollute the delta measurements.
+#[cfg(feature = "scalable-fault-injection")]
+#[test]
+fn checkpoint_cadence_touches_grow_linearly() -> varve::Result<()> {
+    use varve::VarveFile;
+
+    fn measure(records: u32, name: &str) -> varve::Result<u64> {
+        let path = temp_path(name);
+        cleanup(&path);
+        let before = VarveFile::checkpoint_cadence_index_touches();
+        write_flush_every_record(&path, records)?;
+        let after = VarveFile::checkpoint_cadence_index_touches();
+        cleanup(&path);
+        Ok(after - before)
+    }
+
+    let touches_256 = measure(256, "checkpoint_growth_touches_256")?;
+    let touches_512 = measure(512, "checkpoint_growth_touches_512")?;
+
+    // O(1) cadence work per append/flush: generous constant-factor slack, but
+    // nowhere near the ~8,500 touches the per-flush rescan needed at N=256.
+    assert!(
+        touches_256 <= 4 * 256 + 64,
+        "cadence touches look super-linear at 256 records: {touches_256}",
+    );
+    assert!(
+        touches_512 <= 4 * 512 + 64,
+        "cadence touches look super-linear at 512 records: {touches_512}",
+    );
+    // Near-linear growth: doubling the input must not triple the touches
+    // (the quadratic predicate produced ~4x here).
+    assert!(
+        touches_512 <= 3 * touches_256,
+        "cadence touches grow super-linearly: 256 -> {touches_256}, 512 -> {touches_512}",
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "scalable-fault-injection"))]
+#[test]
+#[ignore = "requires the scalable-fault-injection feature"]
+fn checkpoint_cadence_touches_grow_linearly() {}
+
+struct TempPath {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for TempPath {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for TempPath {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+fn temp_path(name: &str) -> TempPath {
+    let dir = tempfile::tempdir().expect("create per-test temp directory");
+    let path = dir.path().join(format!(
         "varve_{name}_{}_{}.vrv",
         std::process::id(),
         std::thread::current().name().unwrap_or("test")
-    ))
+    ));
+    TempPath { path, _dir: dir }
 }
 
 fn cleanup(path: &PathBuf) {

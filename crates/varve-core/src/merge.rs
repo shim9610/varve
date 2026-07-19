@@ -1,6 +1,7 @@
 use std::hash::Hash;
 use std::path::Path;
 
+use crate::traits::KeyedBlockContract;
 use crate::{FormatSpec, Result, VarveKeyedBlock};
 
 pub trait VarveMerge: VarveKeyedBlock + Clone {
@@ -32,6 +33,9 @@ where
     T::Key: Eq + Hash,
     P: AsRef<Path>,
 {
+    // API2-03: every public keyed generic entry point evaluates the
+    // compile-time keyedness contract post-monomorphization.
+    let () = KeyedBlockContract::<T>::OK;
     let empty: &[P] = &[];
     crate::file::compact_keyed_files::<T, P>(spec, input, empty, output)
 }

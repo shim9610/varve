@@ -1,5 +1,5 @@
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Group, TokenStream as TokenStream2, TokenTree};
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
@@ -11,7 +11,7 @@ use syn::{
 #[proc_macro_derive(VarveBlock, attributes(varve))]
 pub fn derive_varve_block(input: TokenStream) -> TokenStream {
     match expand_varve_block(parse_macro_input!(input as DeriveInput)) {
-        Ok(tokens) => tokens.into(),
+        Ok(tokens) => rebrand_facade(tokens).into(),
         Err(error) => error.to_compile_error().into(),
     }
 }
@@ -19,9 +19,163 @@ pub fn derive_varve_block(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn varve_format(input: TokenStream) -> TokenStream {
     match syn::parse::<FormatInput>(input) {
-        Ok(input) => expand_format(input).into(),
+        Ok(input) => rebrand_facade(expand_format(input)).into(),
         Err(error) => error.to_compile_error().into(),
     }
+}
+
+/// Name under which the calling crate depends on the `varve` facade, when it
+/// differs from the literal `varve` (API2-05).
+///
+/// Generated code references the facade as `::varve::__core::…`, which fails
+/// with E0433 when the dependency is renamed (`vv = { package = "varve", … }`).
+/// `proc-macro-crate` resolves the rename from the calling crate's manifest.
+/// `FoundCrate::Itself` (the facade's own integration tests, where `::varve`
+/// resolves normally) and resolution errors both fall back to the literal
+/// `varve` name.
+fn renamed_facade_ident() -> Option<Ident> {
+    match proc_macro_crate::crate_name("varve") {
+        Ok(proc_macro_crate::FoundCrate::Name(name)) if name != "varve" => {
+            Some(Ident::new(&name, proc_macro2::Span::call_site()))
+        }
+        Ok(proc_macro_crate::FoundCrate::Name(_) | proc_macro_crate::FoundCrate::Itself)
+        | Err(_) => None,
+    }
+}
+
+/// Rewrites path-leading `::varve` segments in generated tokens to the
+/// resolved facade name. No-op in the common non-renamed case.
+fn rebrand_facade(tokens: TokenStream2) -> TokenStream2 {
+    match renamed_facade_ident() {
+        Some(facade) => rebrand_facade_tokens(tokens, &facade),
+        None => tokens,
+    }
+}
+
+/// Whether `ident` can be a path segment immediately preceding a `::`
+/// separator, i.e. whether `ident::…` continues a path rather than beginning
+/// an absolute one. Path-prefix keywords (`crate`, `super`, `self`, `Self`)
+/// and every non-keyword ident qualify; other keywords (`impl`, `as`, `dyn`,
+/// `for`, …) cannot precede a path segment, so a `::` after them is
+/// path-leading.
+fn ident_can_end_path_prefix(ident: &Ident) -> bool {
+    let name = ident.to_string();
+    matches!(name.as_str(), "crate" | "super" | "self" | "Self")
+        || !matches!(
+            name.as_str(),
+            "as" | "async"
+                | "await"
+                | "break"
+                | "const"
+                | "continue"
+                | "dyn"
+                | "else"
+                | "enum"
+                | "extern"
+                | "false"
+                | "fn"
+                | "for"
+                | "if"
+                | "impl"
+                | "in"
+                | "let"
+                | "loop"
+                | "match"
+                | "mod"
+                | "move"
+                | "mut"
+                | "pub"
+                | "ref"
+                | "return"
+                | "static"
+                | "struct"
+                | "trait"
+                | "true"
+                | "type"
+                | "unsafe"
+                | "use"
+                | "where"
+                | "while"
+        )
+}
+
+/// Replaces every ident spelled `varve` that begins an absolute path
+/// (`::varve`) with `facade`, recursing into groups.
+///
+/// Only generated code produces absolute `::varve` paths: a user crate that
+/// renamed the dependency cannot name `::varve` in the field types or
+/// attributes the macros embed, so the rewrite never touches user tokens.
+/// Idents preceded by a path prefix (`crate::varve`, `<T as Tr>::varve`) or
+/// with no leading `::` (`self.varve`) are left alone.
+///
+/// A leading `::` is recognized in two shapes:
+/// - a 2-colon run whose first colon does not follow a path prefix
+///   (statement/expression position: `= ::varve::…`, `(::varve::…)`), and
+/// - the tail of a 3-or-more-colon run: Rust has no `:::` token, so a run of
+///   three or more colons is always a lone `:` (type ascription, struct
+///   field, trait bound, …) followed by an absolute-path `::` — the pervasive
+///   generated shape `IDENT: ::varve::__core::…`. `run_is_leading` is latched
+///   at the run's first colon (the ascription colon, which follows an ident),
+///   so this shape must be accepted by run length rather than by the latch.
+fn rebrand_facade_tokens(tokens: TokenStream2, facade: &Ident) -> TokenStream2 {
+    let mut output: Vec<TokenTree> = Vec::new();
+    // Consecutive `:` puncts seen immediately before the current token, and
+    // whether that colon run begins a path rather than continuing one.
+    let mut colon_run = 0usize;
+    let mut run_is_leading = false;
+    // Whether the previous non-colon token can end a path prefix (an ident
+    // or the closing `>` of a qualified path).
+    let mut prev_ends_path = false;
+    // Char of the immediately preceding punct token, to tell the `>` of a
+    // qualified path apart from the second half of `->` / `=>`.
+    let mut prev_punct: Option<char> = None;
+    for tree in tokens {
+        match tree {
+            TokenTree::Punct(punct) if punct.as_char() == ':' => {
+                if colon_run == 0 {
+                    run_is_leading = !prev_ends_path;
+                }
+                colon_run += 1;
+                prev_punct = Some(':');
+                output.push(TokenTree::Punct(punct));
+            }
+            TokenTree::Ident(ident) => {
+                prev_ends_path = ident_can_end_path_prefix(&ident);
+                if colon_run >= 2 && (run_is_leading || colon_run >= 3) && ident == "varve" {
+                    let mut renamed = facade.clone();
+                    renamed.set_span(ident.span());
+                    output.push(TokenTree::Ident(renamed));
+                } else {
+                    output.push(TokenTree::Ident(ident));
+                }
+                colon_run = 0;
+                prev_punct = None;
+            }
+            TokenTree::Group(group) => {
+                let rebranded = rebrand_facade_tokens(group.stream(), facade);
+                let mut rebuilt = Group::new(group.delimiter(), rebranded);
+                rebuilt.set_span(group.span());
+                output.push(TokenTree::Group(rebuilt));
+                colon_run = 0;
+                prev_ends_path = false;
+                prev_punct = None;
+            }
+            TokenTree::Punct(punct) => {
+                let char = punct.as_char();
+                prev_ends_path = char == '>' && !matches!(prev_punct, Some('-') | Some('='));
+                prev_punct = Some(char);
+                colon_run = 0;
+                output.push(TokenTree::Punct(punct));
+            }
+            literal @ TokenTree::Literal(_) => {
+                colon_run = 0;
+                prev_ends_path = false;
+                prev_punct = None;
+                output.push(literal);
+            }
+        }
+    }
+    output.into_iter().collect()
 }
 
 fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
@@ -228,7 +382,12 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
         let ty = &field.ty;
         let field_id = field.field_id;
         quote! {
-            let payload = ::varve::__core::encode_to_vec(&self.#name, encoder.endian())?;
+            // DEF-02: the nested field encoder inherits the parent encoder's
+            // remaining output budget, so a limit-bounded writer entry point
+            // surfaces its typed limit error before an oversized field is
+            // ever fully buffered, instead of after staging the whole child
+            // encoding.
+            let payload = encoder.encode_nested_to_vec(&self.#name)?;
             ::varve::__core::write_field(
                 encoder,
                 #field_id,
@@ -2059,6 +2218,19 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
             }
         }
     });
+    // Per-block schema identities folded into the computed schema hash:
+    // endian override, keyedness, and the generated codec fingerprint
+    // (API2-01). `BlockDescriptor` alone does not carry these.
+    let block_identities = blocks.iter().map(|block| {
+        quote! {
+            (
+                <#block as ::varve::__core::VarveBlock>::ID,
+                <#block as ::varve::__core::VarveBlock>::ENDIAN,
+                <#block as ::varve::__core::VarveBlock>::IS_KEYED,
+                <#block as ::varve::__core::VarveBlock>::SCHEMA_FINGERPRINT,
+            )
+        }
+    });
 
     let duplicate_asserts = pairwise(&blocks).into_iter().map(|(left, right)| {
         quote! {
@@ -2371,6 +2543,14 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 const BLOCKS: &[::varve::__core::BlockDescriptor] = &[
                     #(#descriptors,)*
                 ];
+                const BLOCK_IDENTITIES: &[(
+                    u32,
+                    ::core::option::Option<::varve::__core::Endian>,
+                    bool,
+                    u64,
+                )] = &[
+                    #(#block_identities,)*
+                ];
                 ::varve::__core::FormatSpec::new(
                     #magic,
                     #version,
@@ -2387,6 +2567,7 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 .with_compression_policy(#compression)
                 .with_read_limits(#read_limits)
                 #matrix_spec_step
+                .with_block_identities(BLOCK_IDENTITIES)
                 .with_layout(#layout)
                 #schema_hash_step
             }
@@ -5508,6 +5689,92 @@ mod tests {
     fn parse_inline_test_block(block: TokenStream2) -> Result<InlineBlock> {
         let parser = |input: ParseStream<'_>| parse_inline_block(input);
         syn::parse::Parser::parse2(parser, block)
+    }
+
+    /// API2-05: absolute facade paths are rewritten to the renamed dependency.
+    #[test]
+    fn rebrand_rewrites_absolute_facade_paths() {
+        let facade = Ident::new("vv", proc_macro2::Span::call_site());
+        let tokens = quote! {
+            impl ::varve::__core::VarveBlock for Foo {
+                const ID: u32 = <Bar as ::varve::__core::VarveBlock>::ID;
+            }
+        };
+        let rebranded = rebrand_facade_tokens(tokens, &facade).to_string();
+        assert!(rebranded.contains(":: vv :: __core :: VarveBlock"));
+        assert!(!rebranded.contains("varve"));
+    }
+
+    /// API2-05 regression: `IDENT: ::varve::…` merges the type-ascription
+    /// colon with the leading `::` into a 3-colon run, whose leading-ness the
+    /// first-colon latch misjudges (it follows an ident). Rust has no `:::`
+    /// token, so the final `::` of a 3+ colon run always begins an absolute
+    /// path and must be rewritten. This is the pervasive generated shape
+    /// (`const WIRE_TYPE: ::varve::__core::WireType`, typed fn params, trait
+    /// bounds, struct-literal fields) that the original fix missed.
+    #[test]
+    fn rebrand_rewrites_absolute_paths_after_type_ascription_colon() {
+        let facade = Ident::new("vv", proc_macro2::Span::call_site());
+        let tokens = quote! {
+            const WIRE_TYPE: ::varve::__core::WireType =
+                ::varve::__core::WireType::Fixed;
+            static SPEC: ::varve::__core::FormatSpec = make();
+            fn probe<T: ::varve::__core::VarveBlock>(
+                spec: ::varve::__core::FormatSpec,
+            ) -> u32
+            where
+                T: ::varve::__core::VarveKeyedBlock,
+            {
+                let descriptor = Descriptor {
+                    kind: ::varve::__core::BlockKind::Fixed,
+                };
+                let bound: ::varve::__core::WireType = descriptor.kind.wire();
+                <T as ::varve::__core::VarveBlock>::ID
+            }
+        };
+        let rebranded = rebrand_facade_tokens(tokens, &facade).to_string();
+        assert!(
+            !rebranded.contains("varve"),
+            "unrewritten facade path survived: {rebranded}"
+        );
+        assert!(rebranded.contains("WIRE_TYPE : :: vv :: __core :: WireType"));
+        assert!(rebranded.contains("spec : :: vv :: __core :: FormatSpec"));
+        assert!(rebranded.contains("T : :: vv :: __core :: VarveKeyedBlock"));
+        assert!(rebranded.contains("kind : :: vv :: __core :: BlockKind"));
+        assert!(rebranded.contains("< T as :: vv :: __core :: VarveBlock > :: ID"));
+    }
+
+    /// API2-05: user tokens that merely contain the ident `varve` without a
+    /// leading `::` (field access, relative paths, qualified-path members,
+    /// strings) survive the rewrite unchanged.
+    #[test]
+    fn rebrand_leaves_non_facade_tokens_alone() {
+        let facade = Ident::new("vv", proc_macro2::Span::call_site());
+        let tokens = quote! {
+            fn probe(value: crate::varve::Local, other: some::varve::Path) {
+                let _ = value.varve;
+                let _ = <T as Trait>::varve;
+                let _ = "::varve::__core";
+            }
+        };
+        let rebranded = rebrand_facade_tokens(tokens.clone(), &facade).to_string();
+        assert_eq!(rebranded, tokens.to_string());
+    }
+
+    /// API2-05: the rewrite recurses into delimited groups.
+    #[test]
+    fn rebrand_recurses_into_groups() {
+        let facade = Ident::new("renamed_facade", proc_macro2::Span::call_site());
+        let tokens = quote! {
+            fn body() -> ::varve::__core::Result<()> {
+                ::core::result::Result::Ok(::varve::__core::noop())
+            }
+        };
+        let rebranded = rebrand_facade_tokens(tokens, &facade).to_string();
+        assert!(rebranded.contains(":: renamed_facade :: __core :: Result"));
+        assert!(rebranded.contains(":: renamed_facade :: __core :: noop"));
+        assert!(rebranded.contains(":: core :: result :: Result :: Ok"));
+        assert!(!rebranded.contains(":: varve"));
     }
 
     #[test]

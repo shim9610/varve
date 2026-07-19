@@ -211,7 +211,14 @@ let diagnostics = AppFormat::diagnostics();
 
 `schema_hash: computed;` is the convenient default in format-first declarations.
 For release-pinned schemas, `computed_schema_hash()` can be used to decide what
-literal value to pin.
+literal value to pin. The hash covers wire layout, not just field membership:
+fields are hashed in declaration order with their encoding ordinal, and each
+block's endian override, keyedness, and generated codec fingerprint are folded
+in (`FormatSpec::SCHEMA_HASH_ALGORITHM_VERSION` names the algorithm revision,
+currently 2). Reordering field declarations changes the hash because it changes
+the canonical bytes. Omitting `schema_hash` stores 0 and disables the open-time
+comparison entirely — only do that when schema locking is deliberately
+unwanted.
 
 For generated API and file sanity checks, use `AppFormat::self_test(path)` with
 representative sample values and `AppFormat::diagnose_file(path)` for existing
