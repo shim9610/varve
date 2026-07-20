@@ -25,6 +25,24 @@ ignore = false
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# F-05: `crates/varve-macros` dev-depends on the facade by path only, so its
+# doctests compile against the code the macro generates. A path dependency
+# carries no version requirement, which cargo-deny scores as a wildcard, so the
+# release-gating root `cargo deny check` reported `bans FAILED` while packaging
+# passed - cargo strips path-only DEV dependencies from the published manifest,
+# so the edge never reaches crates.io.
+#
+# Adding an explicit `version` instead would be worse, not better: the
+# dev-dependency then survives into the published manifest and
+# `cargo package -p varve-macros` fails with "no matching package named `varve`
+# found" for any version the facade has not already published. The cycle is
+# only publishable while the edge stays path-only.
+#
+# This exception is narrow rather than a blanket allowance. cargo-deny still
+# denies every wildcard on a registry dependency, and still denies a wildcard
+# path dependency that is NOT a dev-dependency of a published crate - both were
+# verified against this file by temporarily introducing each shape.
+allow-wildcard-paths = true
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"

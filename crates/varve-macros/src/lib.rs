@@ -5716,8 +5716,14 @@ fn writer_methods(block: &InlineBlock) -> Vec<TokenStream2> {
                     let prev = self.#tails.get(key).copied();
                     // API3-01/API3-02: see the push path.
                     self.inner.reserve_keyed_tail_slot(&mut self.#tails, key)?;
+                    // F-03: the push path owns its key already; delete borrows
+                    // the caller's. Clone it *before* the tombstone becomes
+                    // authoritative, so a heap-owning or panicking `Clone`
+                    // cannot run after the mutation, and move the owned key
+                    // into the slot reserved above.
+                    let owned_key = ::core::clone::Clone::clone(key);
                     let info = self.inner.delete_with_prev_key_info::<#ty>(key, prev)?;
-                    self.#tails.insert(key.clone(), info.record_offset);
+                    self.#tails.insert(owned_key, info.record_offset);
                     ::core::result::Result::Ok(info)
                 }
             },
@@ -5820,8 +5826,11 @@ fn writer_trait_impl_methods(block: &InlineBlock) -> Vec<TokenStream2> {
                     let prev = self.#tails.get(key).copied();
                     // API3-01/API3-02: see the push path.
                     self.inner.reserve_keyed_tail_slot(&mut self.#tails, key)?;
+                    // F-03: clone the borrowed key before the authoritative
+                    // delete; see the inherent `delete` method.
+                    let owned_key = ::core::clone::Clone::clone(key);
                     let info = self.inner.delete_with_prev_key_info::<#ty>(key, prev)?;
-                    self.#tails.insert(key.clone(), info.record_offset);
+                    self.#tails.insert(owned_key, info.record_offset);
                     ::core::result::Result::Ok(info)
                 }
             },

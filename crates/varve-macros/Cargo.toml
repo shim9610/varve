@@ -31,10 +31,18 @@ proc-macro = true
 # were `ignore`d, so nothing compiled them and they were free to drift out of
 # sync with the macros they document. Compiling them needs the facade, which
 # depends on this crate — a dev-dependency cycle, which cargo supports. The
-# dependency is path-only on purpose: cargo strips path-only dev-dependencies
-# from the published manifest, so this never becomes a real dependency of the
-# `.crate` archive (verified by the `package-archives` CI job, which builds each
-# archive with verification enabled).
+# dependency stays path-resolved on purpose: cargo strips path-only
+# dev-dependencies from the published manifest, so this never becomes a real
+# dependency of the `.crate` archive (verified by the `package-archives` CI job,
+# which builds each archive with verification enabled).
+#
+# F-05: this must NOT be given an explicit `version`. Adding one keeps the
+# dev-dependency in the published manifest and `cargo package -p varve-macros`
+# then fails with "no matching package named `varve` found", because the facade
+# version being released is not on crates.io yet. Path-only is what makes the
+# cycle publishable. cargo-deny scores the missing version as a wildcard, so
+# `deny.toml` carries a documented, narrow `allow-wildcard-paths` exception for
+# exactly this shape.
 varve = { path = "../varve" }
 
 [dependencies]

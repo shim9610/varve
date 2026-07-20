@@ -385,10 +385,15 @@ typed error rather than migrated in place. See **Breaking** below.
   to prove never-published pages still read as zero, it takes that proof from
   the filesystem's allocated-range map
   (`FSCTL_QUERY_ALLOCATED_RANGES` on Windows, `SEEK_DATA`/`SEEK_HOLE`
-  elsewhere) and skips reported holes. Detection strength is unchanged, because
-  writing a stray byte into an untouched page allocates that page and brings it
-  back into the read set, and a skipped page's digest is still read when the
-  digest slot itself is allocated. As shipped in this release, open enumerates
+  elsewhere) and skips reported holes. Where the allocation map is available,
+  detection strength is unchanged, because writing a stray byte into an
+  untouched page allocates that page and brings it back into the read set, and a
+  skipped page's digest is still read when the digest slot itself is allocated.
+  Where the platform supplies no usable map, every persisted-index page is still
+  verified, but a never-indexed page is not visited, so a stray byte written out
+  of band into a page the matrix never published is not detected at open; that
+  page is never loaded, so the loss is corruption visibility, not unchecked
+  acceptance. As shipped in this release, open enumerates
   the union of the persisted page index and that map in `O(Q)` for `Q` candidate
   pages; where the platform or filesystem cannot answer, or the file is
   fragmented past the tracked extent ceiling, the page index alone drives

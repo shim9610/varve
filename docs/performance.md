@@ -153,10 +153,17 @@ The scalable family covers bounded *ingest and lookup*. It does not cover
 merge/compact: the keyed merge/compact family is resident-only and explicitly
 not PB-scale (see the entries below and `docs/api-reference.md`). Matrix storage
 is a third, separate mode: its integrity metadata is paged and sparse rather
-than resident-per-cell. Create and open are bounded by live state rather than by
-cell count; whole-category clear is bounded by live state **only where the
-platform supports range removal**, and streams `Theta(cells / 8)` zero bytes
-otherwise — see the two entries below for the exact conditions.
+than resident-per-cell. Create is bounded by live state rather than by cell
+count. Open is bounded by **candidate pages**, not by live state: it visits the
+union of the `L` pages named by the persisted page index and the `A` pages the
+filesystem allocation map reports as written, costing `O(L + A)` time,
+`Theta(L + A)` temporary memory, and up to `O(4096U)` page-byte I/O for `U`
+distinct candidate pages. Tracking live state is the *sparse-allocation
+operating case*, not an unconditional bound: a densely allocated bitmap region
+makes `A` proportional to that region's page count even when few bits are live.
+Whole-category clear is bounded by live state **only where the platform supports
+range removal**, and streams `Theta(cells / 8)` zero bytes otherwise — see the
+two entries below for the exact conditions.
 
 ## Covered Paths
 
@@ -291,11 +298,19 @@ one is a regression even if wall time happens not to move on a small fixture.
 
   Matrix open enumerates the union of the persisted page index and the
   filesystem allocation map in `O(Q)` time and `Theta(Q)` temporary memory,
-  where `Q` is the number of candidate pages — the pages currently holding state
-  plus any the allocation map reports as written. It is independent of the
-  logical matrix width and of the number of pages the matrix has published
-  historically. There is no sort. Any reintroduction of a sort, or of a scan
-  over `0..page_count`, is a blocking regression.
+  where `Q` is the number of candidate pages — the `L` pages currently holding
+  state plus the `A` pages the allocation map reports as written, so
+  `Q <= L + A`. Reading those candidates costs up to `O(4096U)` page bytes for
+  `U` distinct candidate pages. It is independent of the logical matrix width and
+  of the number of pages the matrix has published historically. There is no sort.
+  Any reintroduction of a sort, or of a scan over `0..page_count`, is a blocking
+  regression.
+
+  `Q` is a candidate count, not a live-state count. `A` follows how densely the
+  file is allocated, so a densely allocated bitmap region can make open's work
+  proportional to that region even when few bits are live. Open tracking live
+  state is the sparse-allocation operating case, which is what this design
+  targets; it is not a worst-case guarantee.
 
   The persisted page index is the primary source and is authoritative on its own:
   when the filesystem cannot answer an allocated-range query, enumeration still
@@ -303,7 +318,12 @@ one is a regression even if wall time happens not to move on a small fixture.
   over every page of every map, `Theta(cells / 8)`; that behaviour is gone and
   any documentation still describing it is stale.) A never-written page is
   proved zero either by the index not naming it or by the allocation map, not by
-  reading it.
+  reading it. Every persisted-index page is verified on every platform;
+  never-indexed pages are additionally checked only where the platform supplies a
+  usable allocation map, so where it does not, a stray byte written out of band
+  into a page the matrix never published is not detected at open. That page is
+  never loaded, so it is not trusted either — the loss is corruption visibility,
+  not unchecked acceptance.
 
   Whole-category clear removes the byte range where the platform supports it —
   Windows via `FSCTL_SET_ZERO_DATA`, Linux via `fallocate`

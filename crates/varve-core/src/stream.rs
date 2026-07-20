@@ -1441,35 +1441,49 @@ fn state_chunk_records(spec: FormatSpec, batch: DiskIndexBatchOptions) -> usize 
 /// post-publication identity re-check (F-09), where a non-cooperating pathname
 /// mutator would have to land to make the published sidecar stale.
 ///
-/// The armed hook is keyed by the primary it belongs to, so an unrelated test
-/// publishing a sidecar concurrently cannot consume another test's hook.
+/// Armed hooks are held in a path-keyed table, and consumption removes **only**
+/// the entry whose primary matches (F-04). An earlier single-slot cell let one
+/// test's registration silently replace another still-armed test's hook, which
+/// made the parallel library run nondeterministic.
 #[cfg(test)]
 pub(crate) fn interpose_after_state_publication(primary: &Path) {
     let mut armed = PUBLICATION_INTERPOSITION
         .lock()
         .expect("publication interposition");
-    let matches = armed
-        .as_ref()
-        .is_some_and(|(target, _)| target.as_path() == primary);
-    if !matches {
+    let Some(position) = armed
+        .iter()
+        .position(|(target, _)| target.as_path() == primary)
+    else {
         return;
-    }
-    let (_, hook) = armed.take().expect("the armed hook was just observed");
+    };
+    let (_, hook) = armed.swap_remove(position);
     drop(armed);
     hook();
 }
 
 #[cfg(test)]
-type PublicationInterposition = std::sync::Mutex<Option<(PathBuf, Box<dyn FnOnce() + Send>)>>;
+type PublicationInterposition = std::sync::Mutex<Vec<(PathBuf, Box<dyn FnOnce() + Send>)>>;
 
 #[cfg(test)]
-static PUBLICATION_INTERPOSITION: PublicationInterposition = std::sync::Mutex::new(None);
+static PUBLICATION_INTERPOSITION: PublicationInterposition = std::sync::Mutex::new(Vec::new());
 
+/// Arms a test-only hook for one primary path.
+///
+/// Registering a second hook for a path that still has one armed is a test
+/// defect - the first hook would be lost silently - so it panics rather than
+/// overwriting. Hooks for *different* paths coexist, which is what lets the
+/// stream and indexed sidecar tests run in parallel.
 #[cfg(test)]
 pub(crate) fn set_publication_interposition(primary: &Path, hook: Box<dyn FnOnce() + Send>) {
-    *PUBLICATION_INTERPOSITION
+    let mut armed = PUBLICATION_INTERPOSITION
         .lock()
-        .expect("publication interposition") = Some((primary.to_path_buf(), hook));
+        .expect("publication interposition");
+    assert!(
+        !armed.iter().any(|(target, _)| target.as_path() == primary),
+        "a publication interposition is already armed for {}",
+        primary.display(),
+    );
+    armed.push((primary.to_path_buf(), hook));
 }
 
 /// Retires a sidecar that was published for a primary the pathname stopped

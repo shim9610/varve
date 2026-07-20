@@ -368,9 +368,12 @@ sparse set/clear workload no longer holds residency proportional to every page i
 has ever touched. Loading a page is idempotent, so a duplicate page-index entry
 cannot double-count.
 
-Open cost is bounded by the pages that carry data, not by the bitmap width: the
-visit set comes from the page index and the allocation map (see *Page Index*
-above), and the index scan itself starts at 64 bytes and grows geometrically.
+Open cost is bounded by the *candidate* pages, not by the bitmap width: the visit
+set comes from the page index and the allocation map (see *Page Index* above),
+and the index scan itself starts at 64 bytes and grows geometrically. Only the
+index term follows the pages that carry data; the allocation term follows how
+densely the file is allocated, so "bounded by the pages that carry data" is the
+sparse-allocation operating case rather than a worst-case bound.
 Not everything in the matrix is width-independent: `rebuild_commit_map_from_crc`
 is linear in cells by construction — it re-derives every cell's validity from its
 stored CRC — and `clear_category`'s digest reset falls back to a per-page write
@@ -383,22 +386,32 @@ allocated (`FSCTL_QUERY_ALLOCATED_RANGES` on Windows, `SEEK_DATA`/`SEEK_HOLE`
 elsewhere) and skips the ranges it reports as holes: a hole has never been
 written since creation, so it reads as zero and cannot hold stray bytes, and
 writing a stray byte into an untouched page necessarily allocates that page and
-brings it back into the read set. Detection strength is therefore unchanged.
-The page digest of a skipped page is still read when the digest slot itself is
-allocated, so a digest recorded for a page whose bytes never reached disk stays
-detectable.
+brings it back into the read set. Where the allocation map is available,
+detection strength is therefore unchanged. The page digest of a skipped page is
+still read when the digest slot itself is allocated, so a digest recorded for a
+page whose bytes never reached disk stays detectable.
 
-The allocation map is a *secondary* source, and open's cost is not stated in
-terms of it. Open enumerates the union of the persisted page index and the
-allocation map in `O(Q)` time for `Q` candidate pages — the pages currently
-holding state plus any the map reports as written — independently of the logical
-matrix width and of how many pages the matrix has published historically. Where
-the platform or filesystem cannot answer the query, or the file is fragmented
-past the tracked extent ceiling, the allocation map is simply absent: the page
-index alone drives enumeration, which still costs `O(live pages)`, and the only
-loss is the ability to skip reading an indexed page the filesystem would have
-proved zero. Since layout version 3 there is no full-logical-scan fallback; any
-text describing one is stale.
+The allocation map is a *secondary* source. Open enumerates the union of the
+persisted page index and the allocation map in `O(Q)` time for `Q` candidate
+pages — the `L` pages currently holding state plus the `A` pages the map reports
+as written — with `Theta(L + A)` temporary memory and up to `O(4096U)` page-byte
+reads for `U` distinct candidates, independently of the logical matrix width and
+of how many pages the matrix has published historically. `A` is not a live-state
+figure: a densely allocated bitmap region contributes candidates in proportion to
+that region, so open tracking live state is the sparse-allocation operating case
+and not a worst-case guarantee.
+
+Where the platform or filesystem cannot answer the query, or the file is
+fragmented past the tracked extent ceiling, the allocation map is simply absent:
+the page index alone drives enumeration, which still costs `O(live pages)`. Two
+things are then lost. The ability to skip reading an indexed page the filesystem
+would have proved zero, and the coverage of pages the matrix never indexed —
+every persisted-index page is verified on every platform, but a never-indexed
+page is additionally checked only where a usable allocation map exists, so a
+stray byte written out of band into a page the matrix never published is not
+detected at open. It is not accepted either: that page is never loaded. Since
+layout version 3 there is no full-logical-scan fallback; any text describing one
+is stale.
 
 Clearing a whole commit category asks the filesystem to remove the byte ranges
 of the map, its page index, and its page digests rather than writing zeros, so

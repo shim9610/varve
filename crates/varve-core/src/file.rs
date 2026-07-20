@@ -1698,8 +1698,18 @@ impl VarveWriter {
     ///   [`ReadLimitKey::KeyedTailBytes`]) before the memory is taken, so
     ///   policy - not just the allocator - can refuse it;
     /// - it is **fallible before the record becomes authoritative**, so the
-    ///   post-append `insert` cannot allocate and therefore cannot fail after
-    ///   the append it describes has succeeded (API3-01).
+    ///   post-append `insert` does not have to grow the map's own table and
+    ///   therefore cannot fail *for that reason* after the append it describes
+    ///   has succeeded (API3-01).
+    ///
+    /// F-03: that second property covers the map's inline table only. Because
+    /// this reservation cannot charge or reserve heap owned by `K` (see the
+    /// paragraph on inline storage below), a caller that has to *produce* the
+    /// owned key - `Clone`-ing a borrowed one, say - must do so **before** the
+    /// authoritative mutation and move the result in afterwards. A
+    /// heap-owning `K::Clone` can allocate, and a user-defined `Clone` can
+    /// panic; neither may run after the record is committed. The generated
+    /// keyed writers do exactly this in their `delete_*` methods.
     ///
     /// API3-05: this charges only the *incremental* growth. The map the
     /// generated writer starts from is built at writer construction by

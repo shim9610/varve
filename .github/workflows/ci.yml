@@ -54,8 +54,10 @@ jobs:
 
   # Lints a fixed LIST of feature configurations, not every combinatorial
   # subset: no-default, default, each optional feature on its own, and
-  # all-features. With 7 optional features the full power set is 128
-  # configurations; this job runs 9 of them on each of two operating systems.
+  # all-features. The facade exposes 6 optional features (`integrity`, `mmap`,
+  # `zero-copy`, `compression-zstd`, `high-cardinality-dev`,
+  # `scalable-fault-injection`), so the full power set is 64 configurations;
+  # this job runs 9 of them on each of two operating systems.
   # The singletons catch a feature that does not compile alone, and
   # `--all-features` catches a conflict between any two — the gap is a defect
   # that needs a specific pair or triple of features and is invisible under

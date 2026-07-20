@@ -652,6 +652,145 @@ fn page_index_residency_returns_to_baseline_across_page_churn() -> varve::Result
     Ok(())
 }
 
+/// F-01: a whole-category clear must refund **every** counter it releases.
+///
+/// A cell-category clear drops four resident structures: the commit bitmap's
+/// payload pages, the validity bitmap's payload pages, and the persisted
+/// page-index tracking of both. Only the commit payload was refunded, so each
+/// populate/clear cycle left the validity payload and both index charges
+/// standing for memory that had already been freed. Nothing on disk was lost —
+/// the failure mode is `Error::LimitExceeded` for residency the matrix no longer
+/// holds, after enough cycles.
+///
+/// The assertion is per cycle, not just at the end: a leak that is refunded
+/// late still refuses admissions in between.
+#[test]
+fn category_clear_refunds_payload_and_page_index_residency_every_cycle() -> varve::Result<()> {
+    // One cell in each of eight distinct commit-map pages, so both the commit
+    // bitmap and the validity bitmap materialise eight pages and index eight
+    // entries per cycle.
+    const PAGE_ORDINALS: [u64; 8] = [
+        0, 32_768, 65_536, 98_304, 131_072, 163_840, 196_608, 229_376,
+    ];
+    /// 262_144 cells, i.e. eight commit-map pages.
+    const CHURN_SCANS: u64 = 2048;
+
+    let dir = temp_dir("category-clear-refund");
+    let path = dir.path().join("matrix.varve");
+    let mut writer = spec().create_writer_with_dims(&path, dims(CHURN_SCANS))?;
+
+    // Cycle zero fixes the baseline. What survives a clear is the session
+    // write-tracking map, which `clear_matrix_category` deliberately does not
+    // touch: this writer really did write those slots, and that stays true.
+    // It has no persisted page index, so the index baseline is zero.
+    for ordinal in PAGE_ORDINALS {
+        writer.write_matrix_cell(key(ordinal), &ScalingCell { value: 5 })?;
+        writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
+    }
+    assert_eq!(
+        writer.clear_matrix_category(ScalingCell::CATEGORY)?,
+        PAGE_ORDINALS.len() as u64
+    );
+    let payload_baseline = MatrixRecoveryReport::matrix_resident_bitmap_bytes();
+    let index_baseline = MatrixRecoveryReport::matrix_resident_page_index_bytes();
+    assert_eq!(
+        payload_baseline,
+        PAGE_ORDINALS.len() as u64 * PAGE_BYTES,
+        "residency after a whole-category clear is not the session \
+         write-tracking pages alone"
+    );
+    assert_eq!(
+        index_baseline, 0,
+        "a cleared category still tracks persisted page-index entries"
+    );
+
+    for round in 0..4 {
+        for ordinal in PAGE_ORDINALS {
+            writer.write_matrix_cell(key(ordinal), &ScalingCell { value: 6 })?;
+            writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
+        }
+        let payload_peak = MatrixRecoveryReport::matrix_resident_bitmap_bytes();
+        let index_peak = MatrixRecoveryReport::matrix_resident_page_index_bytes();
+        assert!(
+            payload_peak > payload_baseline,
+            "round {round} committed cells without making a page resident \
+             ({payload_peak} vs {payload_baseline})"
+        );
+        assert!(
+            index_peak > index_baseline,
+            "round {round} published eight pages without tracking an index entry"
+        );
+
+        assert_eq!(
+            writer.clear_matrix_category(ScalingCell::CATEGORY)?,
+            PAGE_ORDINALS.len() as u64
+        );
+        let payload_after = MatrixRecoveryReport::matrix_resident_bitmap_bytes();
+        let index_after = MatrixRecoveryReport::matrix_resident_page_index_bytes();
+        assert_eq!(
+            payload_after, payload_baseline,
+            "round {round} left payload residency charged after a whole-category \
+             clear: {payload_after} vs {payload_baseline}"
+        );
+        assert_eq!(
+            index_after, index_baseline,
+            "round {round} left page-index residency charged after a \
+             whole-category clear: {index_after} vs {index_baseline}"
+        );
+    }
+
+    // The refunds must not have desynchronised the layout: the category is
+    // still usable and still counts what it holds.
+    for ordinal in PAGE_ORDINALS {
+        writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
+    }
+    assert_eq!(
+        writer.clear_matrix_category(ScalingCell::CATEGORY)?,
+        PAGE_ORDINALS.len() as u64
+    );
+    writer.flush()?;
+    Ok(())
+}
+
+/// F-01, the same contract under a runtime ceiling: repeated populate/clear
+/// cycles must not exhaust `max_matrix_bitmap_bytes`.
+///
+/// This is the failure a caller actually sees. The counters above prove the
+/// accounting; this proves the admission decision made from it, on a ceiling
+/// sized for a little over one cycle's peak.
+#[test]
+fn repeated_populate_clear_cycles_do_not_exhaust_the_bitmap_ceiling() -> varve::Result<()> {
+    const PAGE_ORDINALS: [u64; 4] = [0, 32_768, 65_536, 98_304];
+    const CHURN_SCANS: u64 = 2048;
+    // Three bitmaps (commit, validity, session write tracking) of four pages
+    // each, plus generous room for page-index tracking. A single cycle fits;
+    // four cycles only fit if every clear refunds what it released.
+    const CEILING: u64 = 3 * 4 * PAGE_BYTES + 4096;
+
+    let dir = temp_dir("category-clear-ceiling");
+    let path = dir.path().join("matrix.varve");
+    let bounded =
+        spec().with_read_limits(ReadLimits::STANDARD.with_max_matrix_bitmap_bytes(CEILING));
+    let mut writer = bounded.create_writer_with_dims(&path, dims(CHURN_SCANS))?;
+
+    for round in 0..4 {
+        for ordinal in PAGE_ORDINALS {
+            writer
+                .write_matrix_cell(key(ordinal), &ScalingCell { value: 4 })
+                .unwrap_or_else(|err| panic!("round {round} write refused: {err:?}"));
+            writer
+                .commit_matrix_cell::<ScalingCell>(key(ordinal))
+                .unwrap_or_else(|err| panic!("round {round} commit refused: {err:?}"));
+        }
+        assert_eq!(
+            writer.clear_matrix_category(ScalingCell::CATEGORY)?,
+            PAGE_ORDINALS.len() as u64
+        );
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 /// Reopen must materialise and visit the *live* pages, not every page the file
 /// has ever published — including where no allocation map is available, which
 /// is exactly the case the persisted index exists to serve.

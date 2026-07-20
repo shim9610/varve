@@ -1,7 +1,9 @@
 # Varve Invariant Checklist
 
-Status: living document. Last pass 2026-07-20, against the working tree on
-`codex/dev-next` at the round-7 re-verification (parent commit `060851a`).
+Status: living document. Last pass 2026-07-21, against the working tree on
+`codex/dev-next` at the round-8 pass (parent commit `4ed3280`, review
+`docs/performance-stability-review-2026-07-20-4ed3280-final.md`). The previous
+pass was the round-7 re-verification (parent commit `060851a`).
 
 **Scope of the inventory below, stated honestly.** It is a rounds-3-to-5
 inventory plus the round-6/7 work, not a rounds-1-to-5 inventory. It was built
@@ -148,7 +150,7 @@ five invariants; `spot` = checked the specific invariant most at risk; `carried`
 | Structure | Where | Added | 1 | 2 | 3 | 4 | 5 | Audit |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Resident keyed-tail cache | `VarveFile`, `crates/varve-core/src/file.rs` | round 4 (PERF-05) | **fixed round 6, completed round 7** | n/a | ok | ok | ok | deep - was `try_reserve`-only; round 6 charged the incremental growth to `ReadLimits::max_keyed_tail_bytes` before the append (API3-02) but charged the *initial build* only after the whole map existed, so the charge gated retention rather than the peak. Round 7 (API3-05) moved the charge into the build. Ordering was fixed in round 5 (F-01) |
-| Generated keyed writer tail maps | `crates/varve-macros/src/lib.rs`, `VarveFile::key_tail_offsets` | pre-existing, unaudited until round 6 | **fixed round 6 (growth), round 7 (initial build)** | n/a | **fixed round 6** | ok | ok | deep - round 6 fixed only the *incremental* insert. The dominant allocation is the map built at writer construction (`writer_tail_inits` -> `VarveFile::key_tail_offsets`), which had no charge at all: a file with `N` distinct keys forced an `N`-entry map whatever the ceiling said, and the ceiling only refused further growth within the session. Round 6's own test could not see this - it only ever created a fresh file. Round 7 charges the build as it proceeds (API3-05); regression: `generated_keyed_writer_refuses_to_open_a_file_over_the_tail_budget` |
+| Generated keyed writer tail maps | `crates/varve-macros/src/lib.rs`, `VarveFile::key_tail_offsets` | pre-existing, unaudited until round 6 | **fixed round 6 (growth), round 7 (initial build)** | n/a | **fixed round 6, again round 8 (F-03)** | ok | ok | deep - round 8: both generated `delete_*` bodies (the inherent one and the writer-trait impl) cloned the key *after* `delete_with_prev_key_info` had already appended the tombstone, so a panicking or allocating `K::Clone` left a durable tombstone with no matching tail-map update. The clone now happens after `reserve_keyed_tail_slot` and before the authoritative mutation, and the only post-mutation step is a `HashMap::insert` into a slot reserved beforehand with an already-owned key. The generated PUSH path was checked and was already correct (`VarveKeyedBlock::key` returns an owned key produced before the reservation); the scalable/indexed generated delete keeps no tail map. Regressions: the four `crates/varve/tests/generated_keyed_atomicity.rs` tests, which fail on file length against the pre-fix ordering. Note this does **not** close open item 2 - the clone is reordered, not budgeted. Round 6 fixed only the *incremental* insert. The dominant allocation is the map built at writer construction (`writer_tail_inits` -> `VarveFile::key_tail_offsets`), which had no charge at all: a file with `N` distinct keys forced an `N`-entry map whatever the ceiling said, and the ceiling only refused further growth within the session. Round 6's own test could not see this - it only ever created a fresh file. Round 7 charges the build as it proceeds (API3-05); regression: `generated_keyed_writer_refuses_to_open_a_file_over_the_tail_budget` |
 | Resident block tails (`BlockTails`) | `crates/varve-core/src/file.rs` | round 3 (PERF3-03) | ok - bounded by the format's declared block count, not by file content; the post-append `Vec::insert` runs at most once per distinct block id | n/a | ok | ok | ok | deep |
 | Process-global block-contract cache | `crates/varve-core/src/collections.rs` | round 4 | ok - bounded by the program's own `(spec, block id)` set, and only for hand-built specs; not chosen by file content | n/a | ok | ok | ok | deep |
 | Shared sidecar `Database` registry | `crates/varve-core/src/disk_index.rs` | round 3 | ok - one slot per open sidecar path, bounded by handles the caller opens; pruning is amortised | n/a | ok | ok | ok | spot |
@@ -166,18 +168,20 @@ five invariants; `spot` = checked the specific invariant most at risk; `carried`
 | `KeyedMergeEstimate` | `crates/varve-core/src/file.rs` | round 3 (PERF-03), corrected round 5 (F-04) | ok - renamed to `peak_resident_structural_bytes()` and documented as a structural estimate, explicitly **not** an upper bound, with its four exclusions named | carried |
 | `ReadLimits::UNTRUSTED` | `crates/varve-core/src/format.rs` | round 3 | ok | spot |
 | `ReadLimits::max_keyed_tail_bytes` | `crates/varve-core/src/format.rs` | **this round** | new - the dimension the keyed-tail charge needs; `STANDARD` leaves it at `u64::MAX`, `UNTRUSTED` sets 256 MiB | deep |
-| Matrix resident bitmap budget (payload + index) | `crates/varve-core/src/matrix.rs` | round 5 (F-03) | ok | carried |
+| Matrix resident bitmap budget (payload + index) | `crates/varve-core/src/matrix.rs` | round 5 (F-03) | **fixed round 8 (F-01 refund, F-02 rollback)** | deep - both round-8 blockers were defects in exactly this round-5 structure, so the previous `carried` was not an audit. Two contracts are now recorded and tested. (a) `clear_category` totals the commit-bitmap, quarantined-copy, and validity-bitmap payloads *and* the matching `resident_index_bytes()` before clearing anything, then `checked_sub`s both counters, so a populate/clear cycle returns to its exact baseline instead of leaking a charge per cycle and eventually returning `LimitExceeded` for released memory. (b) `apply_commit_bit`, `apply_cell_crc_valid`, and `charge_current_write_bit` release their payload precharge on any `Err` from a fallible step, so a failed first-page mutation leaves the counters as they were. Deliberate narrowings, stated in code comments: a retained page-index entry is *not* refunded (it is real resident memory), and `current_write_bits` is not cleared by a commit-category clear (the statement it records stays true). Regressions: `matrix_integrity_scaling.rs::category_clear_refunds_payload_and_page_index_residency_every_cycle`, `::repeated_populate_clear_cycles_do_not_exhaust_the_bitmap_ceiling`, and the three `matrix::mutation_precharge_rollback_tests` |
 
 ### Published contracts and claims
 
 | Claim | Where | Status | Audit |
 | --- | --- | --- | --- |
 | Merge sizing entry point | `docs/api-reference.md`, `docs/performance.md`, `docs/update-compact-guide.md` | ok - "upper bound" retracted everywhere; only the three count fields are labelled bounds | spot |
-| Matrix open complexity | `docs/performance.md` | ok - stated as O(Q) time, Theta(Q) memory, no sort, over the candidate-page union | carried |
+| Matrix open complexity | `docs/performance.md`, `docs/matrix-storage-design.md`, `CHANGELOG.md`, `pages_to_visit` / `matrix_open_bitmap_pages_visited` rustdoc | **corrected round 8 (F-07)** - the candidate-page bound is now stated as the worst case in every public copy: `L` indexed pages plus `A` allocation-derived candidates, `O(L+A)` time, `Theta(L+A)` temporary memory, up to `O(4096U)` page-byte I/O for `U` distinct pages. Live-state cost is described as the sparse-allocation *operating case*, not an unconditional bound; the surviving `O(live pages)` uses are the no-allocation-map case, where the index alone drives enumeration, and are correct | deep |
+| Matrix open corruption visibility (allocation-map coverage) | `crates/varve-core/src/matrix.rs` (`matrix_open_allocation_map_available`, `pages_to_visit`, `load_paged_bitmap`), `docs/performance.md`, `docs/matrix-storage-design.md`, `CHANGELOG.md` | **corrected round 8 (F-06)** - documentation only, no behaviour change. The guarantee that holds everywhere is now separated from the one that does not: every persisted-index page is verified on every platform, and allocation-map pages are additionally checked only where the platform supplies a usable map. An omitted page is never loaded, so this is a corruption-visibility limit, not unchecked acceptance. Previously the unconditional "detection strength is unchanged" claim was published in four places; the last surviving copy (`CHANGELOG.md`) was corrected in this round's integration pass | deep |
 | Whole-category clear cost | `docs/performance.md`, `docs/matrix-storage-design.md` | ok - names the two range-removal mechanisms and states the Theta(cells/8) streaming fallback, with the runtime accessor that proves which ran | carried |
 | Durability wording | `docs/durability-model.md` | ok | spot |
 | Limits table | `docs/declaration-and-internals.md`, `docs/api-reference.md` | updated this round with `keyed_tail` | deep |
-| Immutable-CI / feature-matrix wording | `README.md`, `.github/workflows/ci.yml` | ok - narrowed to what is actually pinned and to the nine configurations actually run | carried |
+| Immutable-CI / feature-matrix wording | `README.md`, `.github/workflows/ci.yml` | **corrected round 8 (F-08)** - the lint-matrix comment claimed 7 optional features and a 128-configuration power set; the facade exposes 6 (`integrity`, `mmap`, `zero-copy`, `compression-zstd`, `high-cardinality-dev`, `scalable-fault-injection`), so the power set is 64. The nine configured jobs were already correct and are unchanged | deep |
+| Dependency-policy exception (`allow-wildcard-paths`) | `deny.toml`, `crates/varve-macros/Cargo.toml` | **added round 8 (F-05)** - the root `cargo deny check` reported `bans FAILED` because `varve-macros` dev-depends on the facade by path only, which carries no version requirement. The review's preferred correction (add `version = "0.4.0"`) was implemented and **rejected with evidence**: a dev-dependency *with* a version survives into the published manifest, so `cargo package -p varve-macros` then fails with "no matching package named `varve` found" - the facade version being released is not on crates.io yet, and this recurs on every version bump. The report's stated alternative was taken instead: `allow-wildcard-paths = true`, which cargo-deny applies only to path dev-dependencies of published crates. Narrowness verified in both directions by temporarily introducing each shape - a registry wildcard and a non-dev path wildcard are both still denied. Root `cargo deny check` and verified `cargo package` now both pass, which the version route cannot achieve simultaneously; the published `varve-macros` manifest has an empty `[dev-dependencies]`, confirming the edge never reaches crates.io. **Do not "fix" this back to an explicit version.** Residual: `tools/public-api-fixture` and `tools/rename-fixture` declare the same version-less path dependency, but are detached workspaces with no cargo-deny job, so they do not affect the root gate today | deep |
 
 ### Platform-conditional paths
 
@@ -228,9 +232,23 @@ recommended remediation.
    `docs/api-reference.md` and in the field's own rustdoc.
 4. **The sidecar publication interposition hook in `crates/varve-core/src/stream.rs`
    is `#[cfg(test)]` process-global state**, keyed by the canonical primary path.
-   It is compiled out of every non-test build, but a test that arms it and then
-   fails before the publication point leaves it armed for the rest of that
-   binary's run. A thread-local cell would be tidier.
+   It is compiled out of every non-test build. Narrowed in round 8 (F-04): it
+   was a single `Mutex<Option<(PathBuf, Hook)>>`, so one slot held one hook and
+   a second test arming it silently discarded the first — under a parallel
+   `cargo test -p varve-core --all-features --lib` the two sidecar-retirement
+   tests raced for that slot. It is now a `Mutex<Vec<(PathBuf, Hook)>>`:
+   consumption `swap_remove`s only the entry whose path matches, and
+   registration asserts that no hook is already armed for the same path, so a
+   duplicate registration is a loud failure rather than an abandoned hook. A
+   test that arms it and then fails before the publication point still leaves
+   its entry armed for the rest of that binary's run, but that leak is now
+   *visible* — the next registration for the same path asserts — rather than
+   silently changing another test's behaviour. A thread-local cell would still
+   be tidier. Reproduction note for CI: the race is thread-count dependent and
+   did not reproduce at `RUST_TEST_THREADS=4` on the round-8 integration host;
+   it was proved directly by forcing the interleaving
+   (`--test-threads=2 retires_a_sidecar_published_for_a_replaced_primary`),
+   which failed 15 of 15 runs pre-fix and passed 20 of 20 post-fix.
 5. **Windows writer-lock marker removal has no directory confinement.**
    `remove_unowned_lock_marker` (`crates/varve-core/src/diagnostics.rs`)
    captures the marker's identity by opening the same unverified pathname, so
