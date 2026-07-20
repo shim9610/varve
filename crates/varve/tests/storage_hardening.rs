@@ -370,3 +370,210 @@ fn cleanup(path: &PathBuf) {
     lock.push(".lock");
     let _ = remove_file(PathBuf::from(lock));
 }
+
+// STO3-01 (report finding STO-01): keyed compact/merge opens its rewrite temp
+// through `VarveFile::create`, which creates `<temp>.lock`. Dropping that
+// writer cleared the marker's contents but left the file, so a *successful*
+// compact deposited an empty marker for a pathname whose native file no longer
+// exists. Markers for real user paths are deliberately persistent stable
+// identities; only this generated, exclusively owned temp pathname is litter.
+//
+// DUR3-01 (report finding DUR-01): `sync` synced file contents but never the
+// parent directory for a pathname the handle created, while atomic replacement
+// did. `sync` now makes the created pathname durable too, once.
+
+#[derive(Clone, Debug, PartialEq, varve::VarveBlock)]
+#[varve(id = 711, version = 1, kind = "variable", key = "key")]
+struct StorageKeyedValue {
+    #[varve(field_id = 1)]
+    key: u64,
+    #[varve(field_id = 2)]
+    payload: String,
+}
+
+#[derive(Clone, Debug, PartialEq, varve::VarveBlock)]
+#[varve(id = 712, version = 1, kind = "variable")]
+struct StorageKeyedOp {
+    #[varve(field_id = 1)]
+    rename_to: String,
+}
+
+impl varve::VarveMerge for StorageKeyedValue {
+    type Op = StorageKeyedOp;
+
+    fn apply_op(&mut self, op: Self::Op) -> varve::Result<()> {
+        self.payload = op.rename_to;
+        Ok(())
+    }
+}
+
+varve_format! {
+    pub struct StorageKeyedFormat {
+        magic: b"VSTKY";
+        version: 1;
+        endian: little;
+        blocks: [StorageKeyedValue, StorageKeyedOp];
+    }
+}
+
+fn lock_marker(path: &std::path::Path) -> PathBuf {
+    let mut marker = path.as_os_str().to_os_string();
+    marker.push(".lock");
+    PathBuf::from(marker)
+}
+
+/// Names of leftover internal rewrite artifacts in `directory`.
+fn rewrite_leftovers(directory: &std::path::Path) -> varve::Result<Vec<String>> {
+    let mut leftovers = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if name.contains(".rewrite.") {
+            leftovers.push(name);
+        }
+    }
+    leftovers.sort();
+    Ok(leftovers)
+}
+
+/// STO3-01: the reviewers' fixture. A compact that succeeds must leave nothing
+/// behind for the temp it generated, while the markers for the caller's own
+/// paths keep behaving exactly as designed.
+#[test]
+fn successful_keyed_compact_leaves_no_marker_for_its_internal_temp() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("compact-input.varve");
+    let output = directory.path().join("compact-output.varve");
+
+    {
+        let mut file = StorageKeyedFormat::create(&input)?;
+        for key in 0..64u64 {
+            file.push(&StorageKeyedValue {
+                key,
+                payload: format!("v0-{key}"),
+            })?;
+        }
+        // Supersede half the keys so the compact actually drops records.
+        for key in 0..32u64 {
+            file.push(&StorageKeyedValue {
+                key,
+                payload: format!("v1-{key}"),
+            })?;
+        }
+        file.flush()?;
+    }
+
+    assert!(
+        rewrite_leftovers(directory.path())?.is_empty(),
+        "the fixture must start clean"
+    );
+
+    varve::compact_keyed_file::<StorageKeyedValue, _>(
+        StorageKeyedFormat::spec(),
+        input.as_path(),
+        output.as_path(),
+    )?;
+
+    let leftovers = rewrite_leftovers(directory.path())?;
+    assert!(
+        leftovers.is_empty(),
+        "a successful compact must leave no internal rewrite artifact: {leftovers:?}"
+    );
+
+    // The publication really happened, so the check above is about hygiene and
+    // not about a compact that silently did nothing.
+    let compacted = StorageKeyedFormat::open(&output)?;
+    assert_eq!(compacted.blocks::<StorageKeyedValue>()?.len(), 64);
+    drop(compacted);
+
+    // Markers for the caller's own paths are stable identities and stay put:
+    // the temp cleanup must not have generalized into deleting user markers.
+    assert!(
+        lock_marker(&output).exists(),
+        "the output's own writer-lock marker is a stable identity and must remain"
+    );
+    // And they still work: the output is lockable again, from the marker that
+    // survived.
+    {
+        let mut reopened = StorageKeyedFormat::spec().open_writer(&output)?;
+        reopened.push(&StorageKeyedValue {
+            key: 1_000,
+            payload: "after".to_string(),
+        })?;
+        reopened.flush()?;
+    }
+    assert!(lock_marker(&output).exists());
+    Ok(())
+}
+
+/// STO3-01: a compact that fails before publication must not leave the temp's
+/// marker either - the temp itself is deleted, so its marker would name
+/// nothing.
+#[test]
+fn refused_keyed_compact_leaves_no_marker_for_its_internal_temp() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("refused-input.varve");
+    let output = directory.path().join("refused-output.varve");
+
+    {
+        let mut file = StorageKeyedFormat::create(&input)?;
+        for key in 0..16u64 {
+            file.push(&StorageKeyedValue {
+                key,
+                payload: format!("v-{key}"),
+            })?;
+        }
+        file.flush()?;
+    }
+
+    let refused = varve::compact_keyed_file_with_key_limit::<StorageKeyedValue, _>(
+        StorageKeyedFormat::spec(),
+        input.as_path(),
+        output.as_path(),
+        8,
+    )
+    .expect_err("a key ceiling below the input cardinality must be refused");
+    assert!(
+        matches!(refused, Error::LimitExceeded { .. }),
+        "expected a typed cardinality refusal, got {refused:?}"
+    );
+
+    assert!(!output.exists(), "a refused compact must publish nothing");
+    let leftovers = rewrite_leftovers(directory.path())?;
+    assert!(
+        leftovers.is_empty(),
+        "a refused compact must leave no internal rewrite artifact: {leftovers:?}"
+    );
+    Ok(())
+}
+
+/// DUR3-01: `sync` on a file this handle created reports durability for the
+/// pathname as well as the contents, and repeating it stays cheap and typed.
+#[test]
+fn create_and_sync_reports_pathname_durability() -> varve::Result<()> {
+    let path = temp_path("create-sync-durability");
+    let mut file = StorageFormat::create(&*path)?;
+    file.push(&StorageValue { value: 11 })?;
+    file.flush()?;
+    // A failure here is reported as a typed pending-parent-sync error rather
+    // than a silent success; on a working filesystem it must succeed.
+    file.sync()?;
+    file.push(&StorageValue { value: 12 })?;
+    file.flush()?;
+    file.sync()?;
+    drop(file);
+
+    let reopened = StorageFormat::open(&*path)?;
+    assert_eq!(reopened.blocks::<StorageValue>()?.len(), 2);
+    drop(reopened);
+
+    // An existing pathname is not re-established by opening it, and syncing a
+    // reopened writer still succeeds.
+    let mut writer = StorageFormat::spec().open_writer(&*path)?;
+    writer.push(&StorageValue { value: 13 })?;
+    writer.flush()?;
+    writer.sync()?;
+    drop(writer);
+
+    cleanup(&path);
+    Ok(())
+}

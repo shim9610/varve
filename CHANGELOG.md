@@ -8,6 +8,62 @@ increment the minor version.
 
 ### Added
 
+- Stable codec identities for the two built-in public value types (API-03,
+  API-04). `ChunkedBytes` and `PackedBitmap` now declare a non-zero, structurally
+  derived `SCHEMA_ID` on both `VarveEncode` and `VarveDecode`
+  (`ChunkedBytes` = `0x0b01_19b7_650d_1366`, folded from the `chunked_bytes` tag,
+  `CHUNKED_VERSION`, and `Vec<u8>`'s identity; `PackedBitmap` folded the same way
+  from the `packed_bitmap` tag and the `u64` + `Vec<u8>` it emits). Both are const
+  expressions over compile-time constants, so they are build- and
+  platform-stable. **This restores documented public API:** the mandatory
+  non-zero field-codec identity contract had made `blob: ChunkedBytes` and
+  `mask: PackedBitmap` fail to compile as derived fields. Encoded bytes and
+  `WIRE_TYPE` are unchanged.
+- `tools/public-api-fixture`: a downstream crate, outside the workspace like
+  `tools/rename-fixture`, that derives fixed, variable, and matrix blocks over
+  **every** public codec and field type the documentation lists — the scalars,
+  `bool`, `String`, `Vec<u8>`, the typed vectors, fixed and nested arrays, 2/3/4
+  tuples, `Option`, `BTreeMap`, `HashMap`, `()`, `ChunkedBytes`, and
+  `PackedBitmap` — and round-trips each one, plus a real file round-trip through
+  a `varve_format!` declaration. It runs as its own CI job (`public-api
+  fixture`). This is the gate whose absence let the identity contract silently
+  reject public API: nothing in the workspace derived a block over the public
+  surface the way a consumer does.
+- `KeyedMergeEstimate::peak_resident_bytes()` and the new public field
+  `largest_input_open_transient_bytes` (PERF-05): the `8N` sequence-uniqueness
+  temporary an input's open can hold alongside its resident index was previously
+  omitted from the estimate, understating the peak. `KeyedMergeEstimate` is
+  `#[non_exhaustive]`, so the added field is not breaking.
+- `VarveFile::block_tail_entries_moved()`, a `#[doc(hidden)]` fault-injection
+  counter gated on `scalable-fault-injection`, mirroring
+  `block_tail_index_touches`. It counts tuples *displaced* in the tail vector
+  rather than index visits, which is the cost the old counter could not see.
+- A persisted per-page index region in the matrix layout (PERF-01): one 8-byte
+  entry per published bitmap page, stored as `page + 1` so a zero entry
+  terminates the array and no count field can tear. It sits between the static
+  aux regions and the `MCRC` region, and open builds its visit set from it
+  rather than from the logical page count. See Breaking for the layout version.
+- CI jobs: `public-api fixture` (above); `test (compression-without-integrity)`
+  and `test (integrity-without-compression)`, which run the **test** suite for
+  the two singleton feature configurations that own `cfg`-exclusive behaviour
+  and previously ran in no test job at all (CI-01); `msrv (1.95.0)`, which pins
+  the declared `rust-version` floor and both checks and tests against it, and
+  fails if the pin and the manifests disagree (CI-02); and `package contents`,
+  which asserts that all three published `.crate` file lists contain
+  `README.md`, `LICENSE-MIT`, and `LICENSE-APACHE` (DOC-01).
+- Packaged documentation and licenses (DOC-01). All three crates set
+  `readme = "../../README.md"` and carry `LICENSE-MIT`/`LICENSE-APACHE` in their
+  own directory, so `cargo package --list` now includes them. The `varve` facade
+  gained crate-level rustdoc (entry points, a runnable getting-started example,
+  the complete Cargo feature table, and the guide index), and `VarveBlock` and
+  `varve_format!` gained entry-point rustdoc covering their attributes, the
+  generated items, the schema-fingerprint derivation, and the mandatory field
+  codec identity rule.
+- The API feature table documents the two previously omitted exported features
+  and labels them: `high-cardinality-dev` is **experimental** (surface and
+  sidecar layout may change without a major version) and
+  `scalable-fault-injection` is **test infrastructure**, not a production
+  feature.
 - Documented resident scale contract and caller-side guards for the keyed
   merge/compact family (PERF-03). `merge_keyed_files`, `compact_keyed_files`,
   and `compact_keyed_file` are resident operations and are explicitly **not**
@@ -140,6 +196,122 @@ increment the minor version.
 
 ### Changed
 
+- `HashMap` decoding charges the hash table it actually allocates (SAFE-01).
+  Decoding used the shared per-entry map model, whose floor of one byte for a
+  zero-sized entry let a declared count near `2^30` pass the standard 1 GiB
+  materialization budget and then reserve a multi-hundred-megabyte table; a
+  bounded randomized run ended at its RSS ceiling on exactly this path.
+  `HashMap` now uses its own `preflight_hash_map_count`, which keeps the
+  wire-length screen and the "a collection count cannot make bounded input
+  progress" rejection and then charges a deliberate over-estimate of hashbrown's
+  allocation: `next_power_of_two(ceil(len * 8 / 7)) * (size_of::<T>() + 1)`, plus
+  a 16-byte control group and the entry alignment. The `+ 1` per bucket is the
+  control byte, which is why a zero-sized entry can no longer be charged one
+  byte. All of it is checked arithmetic; an overflowing model returns
+  `Error::LimitExceeded` instead of attempting the reservation. Independently,
+  `try_reserve` is now given `len.min(1024)`, so a hostile count pre-allocates
+  nothing before an entry is proven decodable, while maps of at most 1024
+  entries — the common case — reserve exactly as before.
+- Typed block registration validates the block's byte order (API-01).
+  `BlockContract` carries the `Option<Endian>` override from the authoritative
+  `FormatSpec::block_identities` entry, and every typed entry point (push,
+  `blocks`, `keyed_blocks`, merge, replace, matrix cell read/write, mmap windows,
+  indexed and stream) compares the *resolved* byte order —
+  `declared.unwrap_or(spec.endian)` on both sides — before any I/O. A manual type
+  that mirrors a generated block's id and fingerprint but declares the opposite
+  endian used to register successfully and byte-swap every value it read; it is
+  now rejected with `Error::EndianMismatch`. Two declarations that resolve to the
+  same byte order are still accepted, because they genuinely produce identical
+  bytes.
+- The first-use block-contract cache can no longer alias two formats (API-02).
+  For any block id the format declares an identity for — which is every block of
+  every `varve_format!`-generated spec — the contract is now validated directly
+  from the spec's immutable `&'static` data and the process-global cache is
+  neither read nor written. That is also strictly cheaper on the per-record
+  append path: it removes a global `RwLock` shared-lock acquire and a binary
+  search that grew with every format in the process. The cache survives only for
+  hand-built specs that declare no identity, and its key gained both slice
+  lengths (`blocks` pointer + length, `block_identities` pointer + length, block
+  id), so an empty or prefix view of a static array can no longer share an entry
+  with the full view. Registration order is now provably irrelevant for
+  identity-bearing formats.
+- Matrix open is index- and extent-driven, not page-count-driven (PERF-01).
+  `load_paged_bitmap` no longer loops `0..page_count`. Its visit set is the union
+  of the persisted page index and, where the platform can answer, the pages the
+  filesystem allocation map reports as written — enumerated by walking allocated
+  *ranges*, not pages. Neither term derives from the logical page count, and an
+  unavailable or over-cap allocation map now falls back to the index instead of
+  treating every logical page as readable data. The index scan grows
+  geometrically from a 64-byte request, so an empty index costs one small read
+  regardless of map width. Index entries are written before the page and digest
+  they describe, so a torn append can only name a page that still reads as
+  uninitialised zeros — a state open already accepts. Recorded trade-off: with no
+  allocation map available, a stray byte written out of band into a page the
+  matrix never published is no longer detected at open. With an allocation map
+  present — the normal case — detection is unchanged.
+- Sparse bitmap pages are evicted when their last bit clears (PERF-02). A page is
+  now `BitmapPage { bytes, ones }` with a maintained set-bit count, so "is this
+  page all zero" is `O(1)` on the mutated page; a page that loses its final set
+  bit is dropped immediately and its bytes refunded to the resident bitmap
+  budget. Nothing scans the page or the map on the hot path. Long-running sparse
+  set/clear activity no longer holds residency proportional to historically
+  touched pages.
+- `BlockTails::from_index` no longer has a schema-width quadratic term
+  (PERF-03). Tail construction records the newest offset per block id in a map
+  and sorts the distinct ids exactly once: `O(N + B log B)` time and `O(B)`
+  memory, replacing the incremental form's `O(N log B + B^2)` tuple movement.
+  The append path deliberately keeps sorted-vector insertion — at most one
+  insertion per distinct id for the whole life of a file, `O(log B)` lookups, and
+  no hashing on the hot path.
+- Keyed merge/compact publish honest cost formulas (PERF-05). The rustdoc for
+  `merge_keyed_files`, `compact_keyed_files`, and `merge::compact_keyed_file` now
+  states the per-input open's `O(N log N)` sequence-uniqueness sort and the `8N`
+  temporary it can hold alongside the resident index. `validate_unique_sequences`
+  also gained an allocation-free fast path: the writer hands out sequences
+  monotonically, so a file scanned in offset order is proven unique in one pass
+  with no `Vec` and no sort, and only a reordered or hostile input pays the copy
+  and sort. The estimate still charges the transient unconditionally, because the
+  sort is the guaranteed bound — `peak_resident_bytes()` is therefore a true
+  upper bound that is loose by `8N` in the common case.
+- Keyed compact/merge removes its own internal rewrite-temp lock marker
+  (STO-01). `write_keyed_values_atomically` unlinks `<temp>.lock` on every exit,
+  after the temp's `VarveFile` (and therefore its `WriterLock`) is dropped and
+  while the caller still holds the output's writer lock. This is safe precisely
+  because the pathname is generated with `create_new` and the output's writer
+  lock excludes any competing rewrite that could regenerate it — none of which is
+  true of a user path, whose markers remain persistent stable identities and are
+  untouched. If the temp itself is preserved (the `ReplacePublicationIndeterminate`
+  case) its marker is preserved with it.
+- `sync()` and `commit_durable()` make a *created* pathname durable (DUR-01,
+  decision recorded). The atomic replacement path already synced the parent
+  directory and reported a pending parent sync, so a create path that did not was
+  internally inconsistent with a public contract that promises durable
+  persistence. A handle that created its pathname now also fsyncs the parent
+  directory on its first successful `sync`/`commit_durable`: one directory fsync
+  per created file, never repeated, never on the append path, and never for a
+  handle that merely opened an existing pathname. See Breaking for the error a
+  refused directory sync produces.
+- The test runner defaults to locked dependency resolution (REL-01). The
+  documented no-argument invocation and every forwarded command now run Cargo
+  with `--locked`, inserted after the subcommand and never after a literal `--`,
+  so the local completion gate resolves exactly as CI does and a stale
+  `Cargo.lock` fails the command instead of being silently refreshed by it. An
+  explicit `--locked`, `--frozen`, or `--offline` from the caller is preserved.
+- The benchmark reports each operation against its own denominator (BENCH-01).
+  Merge and compact consume the base file plus every delta record (updates,
+  deletes, inserts) and emit the surviving live values; all three previously
+  reported "records/sec" against the original base record count, which was
+  neither. Each line now prints input events per second plus the live values
+  emitted, and the emitted count is asserted against the file the run actually
+  produced. Codec, append, and open/scan lines are unchanged — `records` was
+  already their true denominator.
+- CI gates are pinned to immutable identities (CI-03). Every action is
+  referenced by commit id with its release in a trailing comment
+  (`actions/checkout` v4.2.2, `Swatinem/rust-cache` v2.9.1,
+  `EmbarkStudios/cargo-deny-action` v2.1.1, `dtolnay/rust-toolchain` master with
+  an explicit `toolchain` input), and `cargo-audit` is installed with an exact
+  `--version`, so a future run of the workflow evaluates the same code it
+  evaluates today.
 - Matrix commit-map integrity is paged (PERF-01). The single per-category commit
   CRC is replaced by an array of 8-byte per-page digests (`crc32` plus a state
   word, one per 4 KiB of bitmap). A commit-bit mutation rehashes only the page
@@ -343,6 +515,47 @@ increment the minor version.
 
 ### Breaking
 
+- **Wire-breaking, stale-regenerable:** the matrix layout is `VMAT` version 3.
+  Two header fields, `page_index_off` and `page_index_len`, are appended as
+  fields 13 and 14 — after `append_log_start`, so every previously defined field
+  keeps its index — and the reserved tail shrinks from 32 to 16 bytes. The region
+  order becomes `… | slot region | static aux | page index | MCRC | append log`,
+  so `append_log_start` and the total matrix file length change. A version 2
+  artifact is refused at open with the typed
+  `Error::FormatVersionMismatch { expected: 3, actual: 2 }`, the same
+  stale-regenerable contract version 1 already had; recreate it.
+- **Breaking (compile):** `PackedBitmap` is no longer accepted as a fixed-width
+  matrix field. It owns a `Vec<u8>` and encodes a `bit_len` plus a variable byte
+  string, so it has no encoded width fixed by its type and therefore no
+  compile-time slot stride; the previous acceptance matched on the source
+  *spelling* and took a stride from `size_of::<PackedBitmap>()`, which is the
+  size of a `Vec` plus a `u64`, not the width of the bytes it emits. It remains
+  fully usable as an ordinary variable field. Relatedly, inline matrix
+  `SLOT_STRIDE` is now generated from each element's `VarveEncode::WIRE_TYPE`
+  rather than `size_of`, so a *user* type merely spelled `u32` or `PackedBitmap`
+  can no longer be laundered through the syntactic pre-filter: anything without a
+  fixed encoded width fails const evaluation.
+- **Breaking (runtime, intentional tightening):** a `VarveBlock` implementation
+  whose `ENDIAN`, resolved through `FormatSpec::endian`, disagrees with the
+  format's own declaration for that block id is now rejected at typed
+  registration with `Error::EndianMismatch` (API-01). This only affects code that
+  declares a byte order contradicting the format's — that is, exactly the silent
+  byte swap this catches. Manual mirrors that copy the generated block's `ENDIAN`
+  alongside its `SCHEMA_FINGERPRINT` are unaffected, and generated code always
+  agrees with itself.
+- **Breaking (runtime):** the first `VarveFile::sync()` or `commit_durable()` on
+  a handle that *created* its pathname can now return
+  `Error::PublishedButParentSyncPending` where it previously returned `Ok(())`,
+  on a filesystem that refuses the directory sync (DUR-01). The file's contents
+  are durable and the pathname is visible; only its directory entry's durability
+  is unconfirmed, and the request stays pending so a later `sync` retries it.
+  Subsequent syncs, and handles that merely opened an existing pathname, are
+  unchanged.
+- **Breaking (runtime):** decoding a very large `HashMap` under a tight explicit
+  materialization limit can now fail with `Error::LimitExceeded` where it
+  previously succeeded (SAFE-01). That is the fix: the old charge under-counted
+  the allocation actually performed. The error variant and its
+  `resource: "HashMap entries"` string are unchanged.
 - Wire-breaking, stale-regenerable: the matrix layout is `VMAT` version 2 with
   an `MCRC` version 2 integrity region. Region lengths, `append_log_start`, and
   total matrix file length all change. A version 1 artifact is refused at open

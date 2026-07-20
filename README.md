@@ -191,14 +191,36 @@ covering no-default-features, default, each optional feature alone
 (`integrity`, `mmap`, `zero-copy`, `compression-zstd`, `high-cardinality-dev`,
 `scalable-fault-injection`), and the all-feature workspace union; default and
 all-feature test runs through `varve-test-runner` so a leaked test artifact
-fails the build; a blocking `cargo deny` / `cargo audit` supply-chain job; a
+fails the build; test runs for the two singleton feature configurations that own
+`cfg`-exclusive behaviour (compression without integrity, integrity without
+compression), which the default and all-feature runs both compile out; a job
+pinned to the declared MSRV (1.95.0) that checks and tests against it and fails
+if the pin and the manifests disagree; a `package contents` job asserting that
+every published `.crate` file list contains `README.md`, `LICENSE-MIT`, and
+`LICENSE-APACHE`; a blocking `cargo deny` / `cargo audit` supply-chain job; a
 blocking locked fuzz-workspace job (`cargo metadata --locked`, `cargo check
 --locked --all-targets`, `cargo audit`, `cargo deny`, and a final
 `git diff --exit-code -- fuzz/Cargo.lock`, in that order, so no step can hide a
 stale lockfile by regenerating it); a renamed-dependency macro fixture; and a
 clean-archive job that builds only the committed tree (`git archive` +
-`cargo metadata`/`cargo check --locked`, including the fuzz workspace) so an
-uncommitted workspace member cannot pass CI.
+`cargo metadata`/`cargo check --locked`, including the fuzz workspace and both
+out-of-workspace fixtures) so an uncommitted workspace member cannot pass CI.
+
+Two of those jobs build crates that deliberately sit outside the workspace,
+because some contracts only exist from a consumer's point of view:
+`tools/rename-fixture` proves the macros work when the `varve` dependency is
+renamed, and `tools/public-api-fixture` derives fixed, variable, and matrix
+blocks over **every** public codec and field type the documentation lists and
+round-trips each one. The second exists because a mandatory field-codec identity
+contract was once added without any test that a documented public type still
+compiled as a derived field, and it silently broke `ChunkedBytes` and
+`PackedBitmap` fields; nothing inside the workspace noticed, because nothing
+inside the workspace derived a block over the public surface the way a consumer
+does.
+
+Every CI action is pinned to a commit id and every installed cargo tool to an
+exact version, so a future run of the workflow evaluates the same gate code it
+evaluates today.
 
 Job results block merges only where branch protection lists them as required
 status checks; adding a job to the workflow does not by itself make it a gate.

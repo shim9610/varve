@@ -27,12 +27,14 @@ fn run() -> io::Result<ExitCode> {
     let cargo_args = if cargo_args.is_empty() {
         vec![
             OsString::from("test"),
+            OsString::from("--locked"),
             OsString::from("--workspace"),
             OsString::from("--all-features"),
         ]
     } else {
         cargo_args
     };
+    let cargo_args = ensure_locked_resolution(cargo_args);
     reject_recursive_invocation(&cargo_args)?;
 
     let session = TestSession::create()?;
@@ -73,6 +75,44 @@ fn workspace_root() -> &'static Path {
         .parent()
         .and_then(Path::parent)
         .expect("test runner must live under tools/<crate>")
+}
+
+/// Make locked dependency resolution the runner's default (REL-01).
+///
+/// The runner is the documented local completion gate, and CI runs every Cargo
+/// command with `--locked`. Without this, the documented no-argument invocation
+/// (and any forwarded command that omits the flag) resolves *unlocked*, so a
+/// stale `Cargo.lock` is silently refreshed by the very command that is
+/// supposed to prove the committed tree builds. The local gate then passes on a
+/// lockfile CI has never seen.
+///
+/// The flag is inserted immediately after the Cargo subcommand, which is where
+/// Cargo accepts it, and never after a literal `--` (everything there belongs
+/// to the test binary, not to Cargo).
+///
+/// An explicit resolution mode always wins: `--locked`, `--frozen` (which
+/// implies locked), and `--offline` are left exactly as the caller wrote them,
+/// so deliberately updating a lockfile stays possible with
+/// `cargo run -p varve-test-runner -- test --offline` … or simply by calling
+/// `cargo` directly.
+fn ensure_locked_resolution(mut args: Vec<OsString>) -> Vec<OsString> {
+    let cargo_args_end = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let already_specified = args[..cargo_args_end]
+        .iter()
+        .any(|arg| arg == "--locked" || arg == "--frozen" || arg == "--offline");
+    if already_specified {
+        return args;
+    }
+    // The subcommand is the first argument Cargo does not read as a flag.
+    let insert_at = args[..cargo_args_end]
+        .iter()
+        .position(|arg| !arg.to_string_lossy().starts_with('-'))
+        .map_or(cargo_args_end, |subcommand| subcommand + 1);
+    args.insert(insert_at, OsString::from("--locked"));
+    args
 }
 
 fn reject_recursive_invocation(args: &[OsString]) -> io::Result<()> {
@@ -228,6 +268,60 @@ mod tests {
     #[test]
     fn cleanup_refuses_paths_outside_owned_session_namespace() {
         assert!(cleanup_owned_session(Path::new(".")).is_err());
+    }
+
+    fn locked(args: &[&str]) -> Vec<String> {
+        ensure_locked_resolution(args.iter().map(OsString::from).collect())
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// REL-01: the local completion gate must resolve dependencies exactly the
+    /// way CI does, so a stale lockfile fails the command instead of being
+    /// silently refreshed by it.
+    #[test]
+    fn forwarded_commands_default_to_locked_resolution() {
+        assert_eq!(
+            locked(&["test", "--workspace"]),
+            ["test", "--locked", "--workspace"]
+        );
+        assert_eq!(
+            locked(&["test", "-p", "varve", "--test", "roundtrip"]),
+            ["test", "--locked", "-p", "varve", "--test", "roundtrip"]
+        );
+        assert_eq!(
+            locked(&["run", "-p", "varve", "--example", "perf_bench"]),
+            ["run", "--locked", "-p", "varve", "--example", "perf_bench"]
+        );
+    }
+
+    /// The flag belongs to Cargo, so it must never land in the arguments the
+    /// test binary receives after `--`.
+    #[test]
+    fn locked_is_inserted_before_the_test_binary_arguments() {
+        assert_eq!(
+            locked(&["test", "--workspace", "--", "--nocapture"]),
+            ["test", "--locked", "--workspace", "--", "--nocapture"]
+        );
+        // A `--locked` that appears only *after* the separator is an argument
+        // of the test binary and does not satisfy Cargo.
+        assert_eq!(
+            locked(&["test", "--", "--locked"]),
+            ["test", "--locked", "--", "--locked"]
+        );
+    }
+
+    /// An explicit resolution mode is the caller's decision and is preserved.
+    #[test]
+    fn explicit_resolution_modes_are_left_alone() {
+        for explicit in ["--locked", "--frozen", "--offline"] {
+            assert_eq!(
+                locked(&["test", explicit, "--workspace"]),
+                ["test", explicit, "--workspace"],
+                "{explicit} must not be overridden"
+            );
+        }
     }
 
     #[test]

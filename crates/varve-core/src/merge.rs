@@ -38,9 +38,13 @@ where
 /// distinct key ever seen - including keys whose latest record is a tombstone -
 /// plus the live values that survive to the output:
 ///
-/// - time: `Theta(records + decoded bytes) + O(K-live log K-live)`;
-/// - memory: `O(K-ever + resident input index + retained live values)`, where
-///   `K-ever` is the number of distinct keys in `input`.
+/// - time: `Theta(records + decoded bytes) + O(N log N) + O(K-live log K-live)`,
+///   where the `O(N log N)` term is the input open's sequence-uniqueness sort
+///   over its `N` records; it degrades to `Theta(N)` when the input's sequences
+///   ascend with offset, but the sort is the guaranteed bound (PERF3-05);
+/// - memory: `O(K-ever + resident input index + 8N uniqueness temporary +
+///   retained live values)`, where `K-ever` is the number of distinct keys in
+///   `input`.
 ///
 /// Nothing here spills to disk, so `K-ever` must fit in memory. Varve exports
 /// no bounded-memory external merge/compact; the scalable stream and indexed

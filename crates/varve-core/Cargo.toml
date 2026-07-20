@@ -7,6 +7,13 @@ rust-version.workspace = true
 version.workspace = true
 description = "Runtime, codecs, and storage primitives for Varve binary formats"
 documentation = "https://docs.rs/varve-core"
+# DOC-01: the published `.crate` file must carry the project README and both
+# license texts, not just a license expression in metadata. `readme` may point
+# outside the package directory (cargo copies the file in as `README.md`);
+# `include`/`exclude` may not, so the two license texts are real files in this
+# directory and are picked up by cargo's default file selection. Verify with
+# `cargo package --locked --offline --no-verify -p varve-core --list`.
+readme = "../../README.md"
 
 [features]
 default = []

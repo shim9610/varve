@@ -380,17 +380,32 @@ name/type identities, and each field's resolved codec `SCHEMA_ID`).
 
 Typed registration validates against the format, not against whichever type
 arrived first. When the `FormatSpec` declares an identity for the block id — as
-every `varve_format!`-generated spec does — that immutable `(keyedness,
-fingerprint)` pair is the authority, and a `T` that disagrees is rejected with
-`Error::BlockSchemaFingerprintMismatch` or `Error::BlockKeyednessMismatch`
-before anything is cached or written. Call order therefore cannot decide which
-wire type a process accepts. The process registry is only a cache of an
-already-validated result, keyed by the spec's block table *and* identity table,
-so two specs that share a descriptor table but declare different identities
-cannot alias one cached contract. A hand-built spec with an empty identity
-table keeps the older first-use behaviour for the block ids it does not cover:
-the first `T` seen defines the contract and later disagreeing types are
-rejected. A manual block mirroring a generated one must reuse that block's
+every `varve_format!`-generated spec does — that immutable
+`(endian, keyedness, fingerprint)` triple is the authority, and a `T` that
+disagrees is rejected with `Error::BlockSchemaFingerprintMismatch`,
+`Error::BlockKeyednessMismatch`, or `Error::EndianMismatch` before anything is
+cached or written. Call order therefore cannot decide which wire type a process
+accepts.
+
+Endian is compared *after resolution*, not as an opaque tag. Every typed path
+resolves a block's byte order as `T::ENDIAN.unwrap_or(spec.endian)`, so the check
+compares `registered.unwrap_or(spec.endian)` with `T::ENDIAN.unwrap_or(spec.endian)`.
+A declared override that contradicts the format's own declaration is rejected —
+that is the silent byte swap this exists to catch — while two declarations that
+resolve to the same byte order are accepted, because they genuinely produce
+identical bytes.
+
+For an identity-bearing block id the contract is a pure function of the spec's
+immutable `&'static` data, so it is validated inline and the process-global
+first-use cache is neither read nor written; registration order is provably
+irrelevant, and the append path takes no global lock for it. A hand-built spec
+with an empty identity table keeps the older first-use behaviour for the block
+ids it does not cover: the first `T` seen defines the contract and later
+disagreeing types are rejected. That residual cache is keyed by the spec's block
+table *and* identity table, each as pointer **and length**, so an empty or prefix
+view of a static array can no longer share an entry with the full view, and two
+specs that share a descriptor table but declare different identities cannot alias
+one cached contract. A failed validation is never cached as success. A manual block mirroring a generated one must reuse that block's
 fingerprint constant. The fingerprint is process-local and is deliberately not
 part of the wire format or on-disk descriptors, except where a disk-index
 descriptor records it (see below).
@@ -429,6 +444,16 @@ typed wrappers.
 | `rebuild_matrix_commit_from_crc::<T>()` | rebuild commit map from slot CRC evidence |
 | `write_matrix_cell_durable` | write/commit with ordered durability barrier |
 
+Matrix slot types must have a width fixed by the type itself, because a slot
+needs a stride the compiler knows. Scalars and fixed arrays of them qualify.
+`PackedBitmap` does **not**: it owns a `Vec<u8>` and encodes a `bit_len` plus a
+variable byte string, so it is rejected as a matrix field — it remains a normal
+variable-field codec with a stable non-zero `SCHEMA_ID`. Classification does not
+rely on the source spelling: inline `SLOT_STRIDE` is generated from each
+element's `VarveEncode::WIRE_TYPE` rather than `size_of`, so a user type merely
+*named* `u32` or `PackedBitmap` cannot be laundered through the syntactic
+pre-filter — a wire type with no fixed width fails const evaluation.
+
 Lower-level matrix calls use `MatrixKey { scan, ch }`. Generated format-first
 wrappers expose block-specific key structs such as `CellKey { scan, ch }` and
 convert them into the runtime key internally.
@@ -453,7 +478,7 @@ poisons the writer; successful replacement becomes readable only after a new
 commit. Matrix layout and commit maps are snapshotted on open, but slot bytes are
 in-place storage. Do not overlap a reader with writes to slots it may read.
 Immutable concurrent matrix snapshots require a future generation/version or
-read-lease design and are not promised by VMAT v2.
+read-lease design and are not promised by VMAT v3.
 
 When recovery finds a `Fatal` matrix finding (for example a metadata CRC
 mismatch), default matrix access is fail-closed: every default read, write, aux,
@@ -748,8 +773,14 @@ resident operations and are deliberately **not** PB-scale. Each opens its
 inputs as whole `VarveFile` values and retains one map entry per distinct key
 ever seen, tombstoned keys included:
 
-- time: `Theta(records + decoded bytes) + O(K-live log K-live)`
-- memory: `O(K-ever + largest resident input index + retained live values)`
+- time: `Theta(records + decoded bytes) + O(N log N) + O(K-live log K-live)`,
+  where the `O(N log N)` term is the per-input open's sequence-uniqueness sort
+  over that input's `N` records. It degrades to `Theta(N)` for the ordinary case
+  of a file whose sequences ascend with offset — which is what a Varve writer
+  produces — but the sort is the guaranteed bound for a reordered or hostile
+  input;
+- memory: `O(K-ever + largest resident input index + 8N uniqueness temporary for
+  that input + retained live values)`
 
 Nothing spills to disk, so `K-ever` must fit in memory. Varve exports no
 bounded-memory external merge or compact; the scalable stream and indexed
@@ -758,12 +789,19 @@ writers cover bounded *ingest*, not bounded merge/compact.
 Callers whose key cardinality is not known to be resident-sized should either
 size the run first with `estimate_keyed_merge` - which reports
 `input_records`, `key_bearing_records`, `max_distinct_keys` (an upper bound on
-`K-ever`), `largest_input_index_bytes`, and `max_state_bytes` without decoding
-any value - or bound it with a `*_with_key_limit` entry point, which fails with
+`K-ever`), `largest_input_index_bytes`, `largest_input_open_transient_bytes`,
+and `max_state_bytes` without decoding any value - or bound it with a `*_with_key_limit` entry point, which fails with
 `Error::LimitExceeded { resource: "merge distinct keys", .. }` at the key
 boundary and publishes no output. `estimate_keyed_merge` itself opens each
 input as a resident file, so it costs `O(largest input index)`; it reports that
 number but is not bounded below it.
+
+`KeyedMergeEstimate::peak_resident_bytes()` is the recommended sizing entry
+point: it is the merge state plus the largest input's resident index plus the
+`8N` transient that input's open can hold alongside it. The transient is charged
+unconditionally because the sort is the guaranteed bound, so the value is a true
+upper bound that is loose by `8N` whenever the fast path applies — which is
+strictly preferable to an estimate that can understate a live allocation.
 
 ## Migration API
 
@@ -812,12 +850,21 @@ survives.
 
 ## Feature Flags
 
-| Feature | Enables |
-| --- | --- |
-| `integrity` | CRC32 integrity and matrix/sidecar CRC checks |
-| `compression-zstd` | zstd record compression |
-| `mmap` | mmap payload/matrix views |
-| `zero-copy` | raw mmap views; implies `mmap` |
+| Feature | Enables | Stability |
+| --- | --- | --- |
+| `integrity` | CRC32 integrity and matrix/sidecar CRC checks | stable |
+| `compression-zstd` | zstd record compression | stable |
+| `mmap` | mmap payload/matrix views | stable, `unsafe` entry points |
+| `zero-copy` | raw mmap views; implies `mmap` | stable, `unsafe` entry points |
+| `high-cardinality-dev` | disk-backed index, streaming and indexed handles, scan-control | **experimental**: the surface and the sidecar layout may change without a major version |
+| `scalable-fault-injection` | fault-injection counters and hooks for the scalable-path tests; implies `high-cardinality-dev` | **test infrastructure**: not a production feature; the counters it exposes are `#[doc(hidden)]` |
+
+All features are off by default. `high-cardinality-dev` and
+`scalable-fault-injection` are listed because they are exported and therefore
+reachable, not because they are recommended: the first is explicitly
+experimental and the second exists to let the test suite inject faults and read
+counters. Neither is covered by the stability expectations the rest of this
+document assumes.
 
 ## Common Error Interpretation
 
@@ -834,7 +881,7 @@ survives.
 | `MatrixSidecarMismatch(reason)` | matrix sidecar rejected: wrong native identity, layout generation, creation nonce, or sidecar version; regenerate the sidecar |
 | `InvalidMatrixLayout` | matrix layout bytes are not valid for this build — including a matrix file created before the creation-nonce region existed; recreate the matrix file |
 | `MatrixSizeMismatch` | encoded matrix payload does not match slot stride |
-| `FormatVersionMismatch { expected, actual }` | container/layout version is not the one this build writes — including a `VMAT`/`MCRC` layout version 1 matrix file; the artifact is stale and regenerable |
+| `FormatVersionMismatch { expected, actual }` | container/layout version is not the one this build writes — including a `VMAT` layout version 1 or 2 matrix file (v3 is current; the `MCRC` integrity table is at v2); the artifact is stale and regenerable |
 | `KeyedChainRequiresKeyedApi { block_id }` | generic `push`/`push_info` cannot maintain the keyed offset chain; use `push_keyed`/`push_keyed_info` or the generated keyed writer |
 | `LimitExceeded { resource: "variable field ids" }` | decoding charged the materialization budget for distinct variable field ids above 63 and the budget ran out |
 | `LimitExceeded { resource: "merge distinct keys" }` | a `*_with_key_limit` merge/compact hit the caller's `K-ever` ceiling; nothing was published |

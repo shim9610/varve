@@ -62,10 +62,24 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Files whose static spec contains matrix blocks store a 24-byte `VMNC`
   creation-nonce region and then a `VMAT` layout region immediately after the
   normal Varve file header.
-- `VMAT` layout version 2 stores runtime dimensions, matrix block layout,
+- `VMAT` layout version 3 stores runtime dimensions, matrix block layout,
   commit bitmap offsets, slot region offsets, derived static aux region
-  placement, optional offset-table metadata, region CRC metadata, and
-  `append_log_start`.
+  placement, optional offset-table metadata, region CRC metadata,
+  `append_log_start`, and the persisted page-index region
+  (`page_index_off`, `page_index_len`).
+- The two page-index fields are header fields 13 and 14, appended after
+  `append_log_start` so every previously defined field keeps its index; the
+  reserved tail shrank from 32 to 16 bytes. The region order is
+  `VMAT header | dimension table | block table | commit categories | commit maps
+  | slot region | static aux | page index | MCRC | append log`.
+- The page index holds one 8-byte entry per bitmap page that has been published
+  with a set bit, encoded as `page + 1` so a zero entry terminates the array;
+  there is no count field, so a torn append cannot produce a torn count. Entries
+  are written before the page and digest they describe, so the worst a torn
+  append can do is name a page that still reads as uninitialised zeros, which
+  open already accepts. Open derives the pages it visits from this index unioned
+  with the allocated ranges the platform reports, never from the logical page
+  count.
 - The append-log scanner starts at `append_log_start` for matrix files and at the
   normal header length for non-matrix files.
 - Matrix slot payloads are fixed-stride, bounded, and addressed directly by
@@ -75,8 +89,8 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Static matrix aux regions are declared in the format spec, preallocated after
   slot payloads, excluded from commit bitmap validity, and exposed through
   `matrix_aux_len`, `read_matrix_aux`, and writer-only `write_matrix_aux`.
-- With `integrity: crc32`, `VMAT` v2 includes an `MCRC` v2 table after the slot
-  region and any static aux regions. It stores a CRC32 over the metadata tables,
+- With `integrity: crc32`, `VMAT` v3 includes an `MCRC` v2 table after the slot
+  region, any static aux regions, and the page index. It stores a CRC32 over the metadata tables,
   an 8-byte digest (`crc32` plus a state word) per 4 KiB page of every commit
   map, and a CRC32 plus a validity bit per dense cell slot. A commit-bit
   mutation rehashes only the affected page, and a page whose state word says
@@ -87,9 +101,11 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   extent, and those bitmaps are held sparsely in memory after open, so neither
   create-time metadata I/O nor post-open bitmap residency scales with cell
   count.
-- A `VMAT`/`MCRC` layout version 1 artifact is refused at open with
-  `Error::FormatVersionMismatch { expected: 2, actual: 1 }`; it is stale and
-  regenerable, not migratable.
+- A `VMAT` layout version 1 or 2 artifact is refused at open with
+  `Error::FormatVersionMismatch { expected: 3, actual: <1 or 2> }`; it is stale
+  and regenerable, not migratable. Version 1 describes the pre-paging physical
+  representation and version 2 carries no page-index region. The `MCRC`
+  integrity table remains version 2.
 - P0 commit operations are logical visibility operations under the explicit
   `flush`/`sync` durability model, not implicit per-cell fsync operations.
 - Same-size matrix overwrites update the existing slot range and must not change
@@ -166,6 +182,17 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   a block field must therefore declare a value that changes whenever its emitted
   bytes change; identical source spelling is no longer enough to make two custom
   codecs share a schema identity.
+- Every built-in public codec declares an identity, including the two value-level
+  helpers: `ChunkedBytes` folds the `chunked_bytes` tag, its container-format
+  version, and `Vec<u8>`'s identity; `PackedBitmap` folds the `packed_bitmap` tag
+  with the `u64` bit length and `Vec<u8>` payload it emits. Both are const
+  expressions over compile-time constants, so they are stable across builds and
+  platforms, and both are usable as ordinary derived variable fields.
+- `PackedBitmap` is **not** a fixed-width matrix field. A matrix slot needs a
+  stride known at compile time, and a `Vec`-backed encoding has none. Inline
+  matrix `SLOT_STRIDE` is generated from each element's `VarveEncode::WIRE_TYPE`
+  rather than the Rust object size, so a type without a fixed encoded width is
+  rejected during const evaluation whatever it is spelled.
 - Enum-like values should use explicit custom codecs; automatic enum representation inference is out of scope.
 - Length and count limits are format-author policy. Varve's built-in decoders
   avoid large allocation-before-validation patterns where the remaining bytes

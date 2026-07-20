@@ -1,0 +1,5 @@
+error: P0 matrix fields must be fixed-width scalar or fixed-array types
+  --> tests/ui/fail_matrix_shadowed_packed_bitmap.rs:43:17
+   |
+43 |                 value: PackedBitmap,
+   |                 ^^^^^

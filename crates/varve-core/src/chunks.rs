@@ -152,8 +152,26 @@ impl ChunkedBytes {
     }
 }
 
+/// Structural codec identity of [`ChunkedBytes`] (API-03).
+///
+/// Derived exactly the way the built-in container codecs in
+/// [`crate::codec`] derive theirs: a tag naming this codec, folded with the
+/// identity of the codec whose bytes it actually emits (`Vec<u8>`), and with
+/// [`CHUNKED_VERSION`] as the arity component so a container-format version
+/// bump changes the identity rather than silently reusing it. The value is a
+/// const expression over compile-time constants only, so it is stable across
+/// builds, distinct from `Vec<u8>`'s own `bytes` identity, and non-zero — which
+/// is what `#[derive(VarveBlock)]` requires of every field codec, and therefore
+/// what makes a documented `ChunkedBytes` variable field compile.
+const CHUNKED_BYTES_SCHEMA_ID: u64 = crate::codec::container_schema_id_with_arity(
+    b"chunked_bytes",
+    CHUNKED_VERSION as u64,
+    &[<Vec<u8> as VarveEncode>::SCHEMA_ID],
+);
+
 impl VarveEncode for ChunkedBytes {
     const WIRE_TYPE: WireType = WireType::Bytes;
+    const SCHEMA_ID: u64 = CHUNKED_BYTES_SCHEMA_ID;
 
     fn encode_varve(&self, encoder: &mut crate::Encoder) -> Result<()> {
         self.encoded.encode_varve(encoder)
@@ -162,6 +180,9 @@ impl VarveEncode for ChunkedBytes {
 
 impl VarveDecode for ChunkedBytes {
     const WIRE_TYPE: WireType = WireType::Bytes;
+    // Symmetric codec: `decode_varve` accepts exactly what `encode_varve`
+    // emits, so it declares the same identity, as the built-in codecs do.
+    const SCHEMA_ID: u64 = CHUNKED_BYTES_SCHEMA_ID;
 
     fn decode_varve(decoder: &mut crate::Decoder<'_>) -> Result<Self> {
         Self::from_encoded(Vec::<u8>::decode_varve(decoder)?)

@@ -5,9 +5,11 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+#[cfg(all(feature = "compression-zstd", feature = "integrity"))]
+use varve::CompressionLevel;
 use varve::{
-    Decoder, Encoder, Endian, Error, FieldHeader, VarveBlock, VarveDecode, VarveEncode, WireType,
-    decode_from_slice, encode_to_vec, read_field_header, write_field,
+    ChunkedBytes, Decoder, Encoder, Endian, Error, FieldHeader, VarveBlock, VarveDecode,
+    VarveEncode, WireType, decode_from_slice, encode_to_vec, read_field_header, write_field,
 };
 
 const DUPLICATE_MAP_BYTES: [u8; 12] = [2, 0, 0, 0, 0, 0, 0, 0, 7, 9, 7, 99];
@@ -455,4 +457,159 @@ fn duplicate_large_field_ids_are_rejected_without_extra_charge() {
         Endian::Little,
         8,
     ));
+}
+
+/// SAFE-01. `HashMap::try_reserve(len)` allocates a real open-addressed table:
+/// buckets are rounded up to a power of two at a 7/8 load factor and *every*
+/// bucket owns a control byte, so a zero-sized entry costs far more than the
+/// one byte the old preflight floor charged it. With that floor the standard
+/// 1 GiB budget admitted close to one billion declared entries for
+/// `HashMap<(), ()>` and the reservation crossed a 1 GiB RSS ceiling from an
+/// 11-byte input.
+///
+/// The count here sits *below* the budget in entry terms — one million entries
+/// against a one-million-byte budget, which the old one-byte-per-entry model
+/// accepted — so this covers the case the pre-existing
+/// `zero_width_maps_terminate_on_hostile_counts` (a count above the budget,
+/// rejected as non-progressing) does not. It must fail with the typed budget
+/// error before any table is allocated, so its own footprint stays negligible.
+#[test]
+fn zero_sized_hash_map_entries_are_charged_their_real_table_cost() {
+    const DECLARED: u64 = 1_000_000;
+    const BUDGET: u64 = 1_000_000;
+
+    let encoded = DECLARED.to_le_bytes();
+    // Sanity: the count is not rejected as non-progressing; it is genuinely
+    // within the budget under the discredited one-byte-per-entry model.
+    const { assert!(DECLARED <= BUDGET) };
+
+    match Decoder::decode_from_slice_limited::<HashMap<(), ()>>(&encoded, Endian::Little, BUDGET) {
+        Err(Error::LimitExceeded {
+            resource,
+            actual,
+            limit,
+        }) => {
+            assert_eq!(resource, "HashMap entries");
+            assert_eq!(limit, BUDGET);
+            // 2^21 buckets * 1 control byte each, the smallest power-of-two
+            // table that holds 1_000_000 entries at a 7/8 load factor.
+            assert!(
+                actual >= 2_097_152,
+                "charge {actual} must model the real bucket array"
+            );
+        }
+        Err(error) => panic!("expected a budget rejection, got {error:?}"),
+        Ok(_) => panic!("a zero-sized-entry map outran its budget"),
+    }
+
+    // The same input under the standard 1 GiB budget: this is the fuzz
+    // artifact's shape, and it must be a typed rejection rather than a
+    // gigabyte-scale reservation.
+    const FUZZ_DECLARED: u64 = 1_000_000_000;
+    let encoded = FUZZ_DECLARED.to_le_bytes();
+    const { assert!(FUZZ_DECLARED < Decoder::STANDARD_MATERIALIZATION_LIMIT) };
+    assert!(matches!(
+        decode_from_slice::<HashMap<(), ()>>(&encoded, Endian::Little),
+        Err(Error::LimitExceeded {
+            resource: "HashMap entries",
+            ..
+        })
+    ));
+}
+
+/// The tightened charge must bound the reservation without rejecting maps that
+/// genuinely fit: honest small maps still decode, and a sized-entry map is
+/// charged more than its raw `size_of` footprint because the table is.
+#[test]
+fn hash_map_budget_still_admits_honest_maps() {
+    assert_eq!(
+        decode_from_slice::<HashMap<u16, u32>>(&VALID_MAP_BYTES, Endian::Little)
+            .expect("honest map decodes"),
+        HashMap::from([(1u16, 10u32), (2, 20)])
+    );
+
+    // Two entries of `(u16, u32)` occupy 16 bytes of `size_of`, but the table
+    // that holds them is larger; a budget equal to the raw entry bytes must not
+    // be treated as sufficient.
+    assert!(matches!(
+        Decoder::decode_from_slice_limited::<HashMap<u16, u32>>(
+            &VALID_MAP_BYTES,
+            Endian::Little,
+            16,
+        ),
+        Err(Error::LimitExceeded {
+            resource: "HashMap entries",
+            ..
+        })
+    ));
+}
+
+/// API-03. `ChunkedBytes` is a documented variable-field codec, so it must
+/// declare a stable non-zero identity (the derive rejects zero) that is
+/// distinct from the `Vec<u8>` codec whose bytes it rides on. The literals are
+/// pinned so an accidental retag or format-version bump is a visible test
+/// change rather than a silent identity drift.
+#[test]
+fn chunked_bytes_declares_a_stable_non_zero_schema_identity() {
+    const ENCODE_ID: u64 = <ChunkedBytes as VarveEncode>::SCHEMA_ID;
+    const DECODE_ID: u64 = <ChunkedBytes as VarveDecode>::SCHEMA_ID;
+
+    assert_ne!(ENCODE_ID, 0);
+    assert_eq!(ENCODE_ID, DECODE_ID);
+    assert_eq!(ENCODE_ID, 0x0b01_19b7_650d_1366);
+    assert_ne!(ENCODE_ID, <Vec<u8> as VarveEncode>::SCHEMA_ID);
+    assert_eq!(<ChunkedBytes as VarveEncode>::WIRE_TYPE, WireType::Bytes);
+}
+
+/// The identity change must not disturb the bytes: a chunked payload still
+/// roundtrips through the ordinary codec entry points.
+/// Requires both features: `from_zstd_chunks` needs the zstd encoder and the
+/// chunk framing carries an integrity digest, so without them the constructor
+/// returns `CompressionFeatureDisabled` / `IntegrityFeatureDisabled` rather
+/// than exercising the codec. The identity assertions above stay ungated.
+#[cfg(all(feature = "compression-zstd", feature = "integrity"))]
+#[test]
+fn chunked_bytes_roundtrips_through_the_codec() -> varve::Result<()> {
+    let payload: Vec<u8> = (0..1024u32).map(|index| (index % 251) as u8).collect();
+    let chunked = ChunkedBytes::from_zstd_chunks(&payload, 128, CompressionLevel::Fast)?;
+    let encoded = encode_to_vec(&chunked, Endian::Little)?;
+    let decoded: ChunkedBytes = decode_from_slice(&encoded, Endian::Little)?;
+    assert_eq!(decoded, chunked);
+    assert_eq!(
+        decoded.decode_to_vec()?,
+        payload,
+        "chunked payload must survive the roundtrip"
+    );
+    Ok(())
+}
+
+/// API-03, the actual regression: a variable block with a documented
+/// `ChunkedBytes` field (docs/spec.md:52) must compile. `#[derive(VarveBlock)]`
+/// rejects at compile time every field whose codec identity is zero, so before
+/// the identity above existed this declaration did not build at all.
+///
+/// The declaration itself is the compile-time half of the regression and stays
+/// ungated so every feature configuration builds it; only the runtime
+/// roundtrip below needs zstd + integrity to construct a `ChunkedBytes`.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, VarveBlock)]
+#[varve(id = 901, version = 1, kind = "variable")]
+struct ChunkedVariable {
+    #[varve(field_id = 1)]
+    blob: ChunkedBytes,
+}
+
+#[cfg(all(feature = "compression-zstd", feature = "integrity"))]
+#[test]
+fn chunked_bytes_is_usable_as_a_derived_variable_field() -> varve::Result<()> {
+    let payload: Vec<u8> = (0..600u32).map(|index| (index % 97) as u8).collect();
+    let record = ChunkedVariable {
+        blob: ChunkedBytes::from_zstd_chunks(&payload, 64, CompressionLevel::Fast)?,
+    };
+    let encoded = encode_to_vec(&record, Endian::Little)?;
+    let decoded: ChunkedVariable = decode_from_slice(&encoded, Endian::Little)?;
+    assert_eq!(decoded, record);
+    assert_eq!(decoded.blob.decode_to_vec()?, payload);
+    assert_ne!(ChunkedVariable::SCHEMA_FINGERPRINT, 0);
+    Ok(())
 }

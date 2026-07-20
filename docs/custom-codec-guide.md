@@ -80,6 +80,21 @@ Choosing a value:
   describe different wire meanings.
 - Never reuse another codec's value to make an old hash keep matching.
 
+Every built-in codec already declares one, so this is a rule about *your* types,
+not a gap you have to work around. Scalars declare leaf identities; containers —
+`Option`, `Vec`, arrays, tuples, `BTreeMap`, `HashMap` — fold their elements'
+identities together with a tag and arity; and the two value-level helpers do the
+same: `ChunkedBytes` folds the `chunked_bytes` tag, its container-format version,
+and `Vec<u8>`'s identity, and `PackedBitmap` folds the `packed_bitmap` tag with
+the `u64` bit length and `Vec<u8>` payload it emits. Both are const expressions
+over compile-time constants, so they are stable across builds and platforms, and
+both work as ordinary derived variable fields.
+
+Note the version component in `ChunkedBytes`: folding the container-format
+version into the identity means bumping that version changes the identity rather
+than silently reusing it. That is a good pattern to copy for any codec whose
+framing carries its own version.
+
 Enum-like values should use this same explicit pattern. Pick a stable
 integer or string representation, reject unknown discriminants unless they are
 part of the format contract, and bump the block or field-level semantic version

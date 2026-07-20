@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
-use std::mem::size_of;
+use std::mem::{align_of, size_of};
 
 use crate::{Endian, Error, Result};
 
@@ -78,7 +78,7 @@ const fn schema_id_u64(acc: u64, value: u64) -> u64 {
 }
 
 /// Identity of a leaf codec whose byte layout is fully described by `tag`.
-const fn leaf_schema_id(tag: &[u8]) -> u64 {
+pub(crate) const fn leaf_schema_id(tag: &[u8]) -> u64 {
     schema_id_bytes(SCHEMA_ID_SEED, tag)
 }
 
@@ -99,7 +99,11 @@ const fn container_schema_id(tag: &[u8], elements: &[u64]) -> u64 {
 /// [`container_schema_id`] for containers whose arity is part of the layout
 /// rather than an element identity (arrays), so `[T; 0]` is not mistaken for
 /// an identity-less element.
-const fn container_schema_id_with_arity(tag: &[u8], arity: u64, elements: &[u64]) -> u64 {
+pub(crate) const fn container_schema_id_with_arity(
+    tag: &[u8],
+    arity: u64,
+    elements: &[u64],
+) -> u64 {
     let mut acc = schema_id_u64(leaf_schema_id(tag), arity);
     let mut index = 0;
     while index < elements.len() {
@@ -134,7 +138,8 @@ pub trait VarveEncode {
     /// its emitted bytes change. That requirement is enforced, not merely
     /// documented, wherever it can collide: `#[derive(VarveBlock)]` rejects at
     /// compile time *any* field whose codec resolves to `SCHEMA_ID == 0`,
-    /// regardless of [`WireType`], and [`container_schema_id`] propagates the
+    /// regardless of [`WireType`], and the crate-private `container_schema_id`
+    /// helper propagates the
     /// zero outward so wrapping an identity-less codec in `Option`, `Vec`, an
     /// array, a map or a tuple cannot launder it into an identity.
     const SCHEMA_ID: u64 = 0;
@@ -456,8 +461,13 @@ impl<'a> Decoder<'a> {
         )
     }
 
-    fn preflight_map_count<K: VarveDecode, V: VarveDecode>(
-        &mut self,
+    /// Wire-length screen shared by both map codecs.
+    ///
+    /// Returns the declared count unchanged once the remaining input could
+    /// physically carry it; the caller then charges its own materialization
+    /// model on top.
+    fn screen_map_wire_length<K: VarveDecode, V: VarveDecode>(
+        &self,
         len: usize,
         resource: &'static str,
     ) -> Result<()> {
@@ -469,7 +479,52 @@ impl<'a> Decoder<'a> {
         if minimum_wire_bytes > self.remaining() {
             return Err(Error::UnexpectedEof);
         }
+        Ok(())
+    }
+
+    /// Preflight for a node-per-entry map (`BTreeMap`), whose storage really is
+    /// driven by the entries it has already accepted.
+    fn preflight_map_count<K: VarveDecode, V: VarveDecode>(
+        &mut self,
+        len: usize,
+        resource: &'static str,
+    ) -> Result<()> {
+        self.screen_map_wire_length::<K, V>(len, resource)?;
         self.preflight_count(len, 0, size_of::<(K, V)>(), resource)
+    }
+
+    /// Preflight for an open-addressed hash table (`HashMap`), whose storage is
+    /// driven by the *declared* count long before any entry is validated
+    /// (SAFE-01).
+    ///
+    /// `preflight_count` floors a zero-byte entry at a one-byte charge, which
+    /// is a wild under-estimate for a hash table: a `HashMap<(), ()>` pays a
+    /// control byte per bucket and rounds the bucket count up to a power of
+    /// two, so a one-byte-per-entry charge let the standard 1 GiB budget admit
+    /// close to one billion declared entries and hand `try_reserve` a
+    /// multi-gigabyte table. Charge [`hash_table_reservation_bytes`] instead,
+    /// which over-approximates what hashbrown actually allocates.
+    fn preflight_hash_map_count<K: VarveDecode, V: VarveDecode>(
+        &mut self,
+        len: usize,
+        resource: &'static str,
+    ) -> Result<()> {
+        self.screen_map_wire_length::<K, V>(len, resource)?;
+        // Preserved from `preflight_count`: a count that no amount of bounded
+        // input can make progress against is a canonical-encoding fault, not a
+        // budget fault, and rejecting it here keeps hostile `u64::MAX` counts
+        // out of the arithmetic below.
+        if u64::try_from(len).unwrap_or(u64::MAX) > self.materialization_remaining {
+            return Err(Error::InvalidCanonicalEncoding(
+                "collection count cannot make bounded input progress",
+            ));
+        }
+        let bytes = hash_table_reservation_bytes::<(K, V)>(len).ok_or(Error::LimitExceeded {
+            resource,
+            actual: u64::MAX,
+            limit: self.materialization_limit,
+        })?;
+        self.charge_materialization(bytes, resource)
     }
 
     fn note_field_id(&mut self, field_id: u32) -> Result<()> {
@@ -951,13 +1006,18 @@ where
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
         let len = decoder.read_len()?;
-        decoder.preflight_map_count::<K, V>(len, "HashMap entries")?;
+        decoder.preflight_hash_map_count::<K, V>(len, "HashMap entries")?;
         let mut values = HashMap::new();
+        // SAFE-01: reserve only a bounded prefix of the declared count, so a
+        // hostile count cannot materialize a table before a single entry has
+        // been proven decodable. The charge above already bounds the table this
+        // map can reach; this bounds what it can reach *on a claim alone*.
+        let preallocated = len.min(MAP_PREALLOCATION_ENTRIES);
         values
-            .try_reserve(len)
+            .try_reserve(preallocated)
             .map_err(|_| Error::AllocationFailed {
                 resource: "HashMap entries",
-                requested: allocation_request::<(K, V)>(len),
+                requested: allocation_request::<(K, V)>(preallocated),
             })?;
         if len == 0 {
             return Ok(values);
@@ -1068,6 +1128,60 @@ const fn minimum_wire_size(wire_type: WireType) -> usize {
 
 fn allocation_request<T>(len: usize) -> u64 {
     u64::try_from(len.saturating_mul(size_of::<T>())).unwrap_or(u64::MAX)
+}
+
+/// Trailing bytes a hashbrown table carries beyond `buckets * (size_of::<T>()
+/// + 1)`: one control group of duplicated control bytes.
+const HASH_TABLE_GROUP_BYTES: u64 = 16;
+
+/// Entries a map codec reserves for before it has validated a single entry
+/// (SAFE-01).
+///
+/// The declared count is attacker-chosen, so a table sized from it up front is
+/// an allocation granted on nothing but a claim. Reserving a small fixed prefix
+/// instead keeps the common small-map decode allocation-exact while leaving a
+/// hostile count nothing to pre-allocate; beyond this bound the table grows
+/// through `insert`'s own amortized doubling, which performs no syscalls and no
+/// per-entry allocation.
+const MAP_PREALLOCATION_ENTRIES: usize = 1024;
+
+/// Upper bound on the heap a `HashMap<K, V>` allocates when asked to hold `len`
+/// entries, with `T = (K, V)`.
+///
+/// Derivation, from what hashbrown actually allocates:
+///
+/// * `try_reserve(len)` on an empty map requests a table with capacity `len`.
+/// * Entries live at a maximum 7/8 load factor, so the table needs at least
+///   `ceil(len * 8 / 7)` buckets.
+/// * The bucket count is rounded **up to a power of two**, which can almost
+///   double that figure again.
+/// * Every bucket owns one `T` *and* one control byte — this is why the true
+///   floor is never one byte per entry, not even for a zero-sized `T`.
+/// * The allocation additionally carries one control group of trailing
+///   duplicated control bytes, plus up to `align_of::<T>()` bytes of padding
+///   placing the bucket array.
+///
+/// So the charge is
+/// `next_power_of_two(ceil(len * 8 / 7)) * (size_of::<T>() + 1) + 16 +
+/// align_of::<T>()`. It deliberately over-estimates: hashbrown's own
+/// small-table specializations only ever allocate less, and the guard must
+/// never charge less than the reservation it guards. `None` means the model
+/// overflowed `u64`, which the caller must report as a budget rejection rather
+/// than attempt.
+fn hash_table_reservation_bytes<T>(len: usize) -> Option<u64> {
+    if len == 0 {
+        return Some(0);
+    }
+    let len = u64::try_from(len).ok()?;
+    let buckets = len
+        .checked_mul(8)?
+        .checked_add(6)?
+        .checked_div(7)?
+        .checked_next_power_of_two()?;
+    buckets
+        .checked_mul((size_of::<T>() as u64).checked_add(1)?)?
+        .checked_add(HASH_TABLE_GROUP_BYTES)?
+        .checked_add(align_of::<T>() as u64)
 }
 
 macro_rules! tuple_codec {

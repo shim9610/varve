@@ -95,7 +95,7 @@ fn codec_bench(records: usize) -> varve::Result<()> {
         }
         Ok(())
     })?;
-    report("encode/decode fixed", records, None, elapsed);
+    report("encode/decode fixed", Work::records(records), None, elapsed);
 
     let user = bench_user(42);
     let elapsed = timed(|| {
@@ -106,7 +106,12 @@ fn codec_bench(records: usize) -> varve::Result<()> {
         }
         Ok(())
     })?;
-    report("encode/decode variable", records, None, elapsed);
+    report(
+        "encode/decode variable",
+        Work::records(records),
+        None,
+        elapsed,
+    );
     Ok(())
 }
 
@@ -125,7 +130,7 @@ fn append_open_scan_bench(records: usize) -> varve::Result<()> {
         file.flush()?;
         file.sync()
     })?;
-    report("append fixed", records, Some(&path), elapsed);
+    report("append fixed", Work::records(records), Some(&path), elapsed);
 
     let elapsed = timed(|| {
         let file = BenchFormat::open_readonly(&path)?;
@@ -133,7 +138,12 @@ fn append_open_scan_bench(records: usize) -> varve::Result<()> {
         assert_eq!(file.blocks::<BenchPoint>()?.len(), records);
         Ok(())
     })?;
-    report("open/scan fixed", records, Some(&path), elapsed);
+    report(
+        "open/scan fixed",
+        Work::records(records),
+        Some(&path),
+        elapsed,
+    );
 
     cleanup(&path);
     Ok(())
@@ -146,6 +156,21 @@ fn merge_compact_bench(records: usize) -> varve::Result<()> {
     let compacted = temp_path("compacted");
     let direct = temp_path("direct_compacted");
     cleanup_many([&base, &delta, &merged, &compacted, &direct]);
+
+    // BENCH-01: the exact shape of the workload, so each report below can name
+    // its own denominator instead of borrowing the base record count.
+    let updates = records / 4;
+    let deletes = records / 3 - records / 4;
+    let inserts = records / 5;
+    let delta_records = updates + deletes + inserts;
+    // Every merge/compact input record is read and applied: the base file plus
+    // the whole delta file.
+    let base_plus_delta_events = records + delta_records;
+    // `merge_keyed_files` and `compact_keyed_files` both write the surviving
+    // live values, so this is what comes out of either of them — and, because
+    // `merged` holds exactly these values, it is also what the second compact
+    // both reads and writes.
+    let live_values = records - deletes + inserts;
 
     {
         let mut file = BenchFormat::create(&base)?;
@@ -184,7 +209,12 @@ fn merge_compact_bench(records: usize) -> varve::Result<()> {
             merged.as_path(),
         )
     })?;
-    report("merge keyed files", records, Some(&merged), elapsed);
+    report(
+        "merge keyed files",
+        Work::events(base_plus_delta_events, live_values),
+        Some(&merged),
+        elapsed,
+    );
 
     let elapsed = timed(|| {
         compact_keyed_file::<BenchUser, _>(
@@ -193,7 +223,14 @@ fn merge_compact_bench(records: usize) -> varve::Result<()> {
             compacted.as_path(),
         )
     })?;
-    report("compact merged", records, Some(&compacted), elapsed);
+    // The already-merged input holds only live values, so this compact both
+    // reads and writes exactly `live_values`.
+    report(
+        "compact merged",
+        Work::events(live_values, live_values),
+        Some(&compacted),
+        elapsed,
+    );
 
     let elapsed = timed(|| {
         compact_keyed_files::<BenchUser, _>(
@@ -203,13 +240,18 @@ fn merge_compact_bench(records: usize) -> varve::Result<()> {
             direct.as_path(),
         )
     })?;
-    report("compact base+deltas", records, Some(&direct), elapsed);
+    report(
+        "compact base+deltas",
+        Work::events(base_plus_delta_events, live_values),
+        Some(&direct),
+        elapsed,
+    );
 
-    let expected = records - (records / 3 - records / 4) + records / 5;
     let direct_file = BenchFormat::open_readonly(&direct)?;
     assert_eq!(
         direct_file.materialized_keyed_blocks::<BenchUser>()?.len(),
-        expected
+        live_values,
+        "the reported live-value denominator must be the count actually emitted"
     );
 
     cleanup_many([&base, &delta, &merged, &compacted, &direct]);
@@ -230,20 +272,59 @@ fn timed(operation: impl FnOnce() -> varve::Result<()>) -> varve::Result<Duratio
     Ok(start.elapsed())
 }
 
-fn report(label: &str, records: usize, path: Option<&Path>, elapsed: Duration) {
+/// What a throughput number is actually per (BENCH-01).
+///
+/// The merge and compact operations do not process `records` items: their input
+/// is the base file *plus* every delta record (updates, deletes, and inserts),
+/// and their output is the set of surviving live values, which is smaller than
+/// both. Reporting all three operations against the original base record count
+/// produced a rate that was neither the events consumed nor the values emitted.
+/// Each call site now states its own denominator.
+struct Work {
+    /// Items the operation actually consumed, and the unit to print.
+    processed: usize,
+    unit: &'static str,
+    /// Live values written out, where that differs from what was consumed.
+    emitted: Option<usize>,
+}
+
+impl Work {
+    fn records(count: usize) -> Self {
+        Self {
+            processed: count,
+            unit: "records",
+            emitted: None,
+        }
+    }
+
+    fn events(processed: usize, emitted: usize) -> Self {
+        Self {
+            processed,
+            unit: "input events",
+            emitted: Some(emitted),
+        }
+    }
+}
+
+fn report(label: &str, work: Work, path: Option<&Path>, elapsed: Duration) {
     let seconds = elapsed.as_secs_f64();
-    let records_per_sec = if seconds > 0.0 {
-        records as f64 / seconds
+    let per_sec = if seconds > 0.0 {
+        work.processed as f64 / seconds
     } else {
         f64::INFINITY
     };
     let bytes = path
         .and_then(|path| metadata(path).ok())
         .map_or(0, |m| m.len());
+    let unit = work.unit;
+    let emitted = match work.emitted {
+        Some(count) => format!(" | {count:>9} live values out"),
+        None => String::new(),
+    };
     println!(
-        "{label:>24}: {:>9.3} ms | {:>12.0} records/sec | {:>10} bytes",
+        "{label:>24}: {:>9.3} ms | {:>12.0} {unit}/sec | {:>10} bytes{emitted}",
         seconds * 1_000.0,
-        records_per_sec,
+        per_sec,
         bytes
     );
 }

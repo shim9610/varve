@@ -8,16 +8,25 @@ wave.
 - Matrix storage is a second storage mode beside the existing append log.
 - Runtime dimensions are a P0 dependency and are persisted at create time.
 - Matrix files store a 24-byte `VMNC` creation-nonce region and then a `VMAT`
-  v2 layout region immediately after the normal Varve header. A `VMAT`/`MCRC`
-  version 1 artifact is refused at open with
-  `Error::FormatVersionMismatch { expected: 2, actual: 1 }`.
+  v3 layout region immediately after the normal Varve header. A `VMAT`
+  version 1 or 2 artifact is refused at open with
+  `Error::FormatVersionMismatch { expected: 3, actual: <1 or 2> }`; both are
+  stale and regenerable. The `MCRC` integrity table remains version 2.
+- `VMAT` v3 adds a persisted page-index region between the static aux regions
+  and the `MCRC` region, described by header fields 13 and 14
+  (`page_index_off`, `page_index_len`), which are appended after
+  `append_log_start` so every earlier field keeps its index; the reserved tail
+  shrinks from 32 to 16 bytes. The index holds one 8-byte entry per published
+  bitmap page, stored as `page + 1` so a zero entry terminates the array and no
+  count field can tear. Entries precede the page and digest they describe, so a
+  torn append can only name a page that still reads as uninitialised zeros.
 - Dense cells use deterministic addressing:
   `ordinal = scan * n_channels + ch` and
   `offset = slot_region_start + ordinal * slot_stride`.
 - Slot payloads are fixed-stride, bounded, canonical encoded values.
 - Commit bitmaps are the only normal read-time validity source.
 - Readers snapshot layout metadata and commit maps on open. Slot bytes remain
-  live in-place storage, so VMAT v2 does not promise immutable concurrent reads
+  live in-place storage, so VMAT v3 does not promise immutable concurrent reads
   across an overwrite of the same slot.
 - Same-size overwrite writes the existing slot range and must not change file
   length.
@@ -41,7 +50,7 @@ wave.
 - P0 includes storage primitives and generated helpers for cell-category bits,
   single global bits, and per-channel bits. Matrix cell reads use cell-category
   bits; singles/per-channel are status flags until a domain block binds them.
-- In VMAT v2 each matrix block owns one unique cell commit category. Sharing a
+- In VMAT v3 each matrix block owns one unique cell commit category. Sharing a
   cell category across multiple matrix blocks is rejected until multi-block
   category rebuild semantics are explicitly defined.
 - `commit_*` before a successful slot write is rejected with
@@ -88,7 +97,7 @@ Current implementation status:
   `matrix_verified_sidecar_resume_signal_with_generation` or
   `read_matrix_sidecar_with_generation`.
 - When `integrity: crc32` is enabled, VMAT writes an `MCRC` v2 CRC table after
-  the slot region and any static aux regions. It covers matrix metadata tables,
+  the slot region, any static aux regions, and the page index. It covers matrix metadata tables,
   every 4 KiB page of each commit map (one `crc32` plus a state word per page,
   where an uninitialized page must still read as all zeros), and each dense cell
   slot. A commit-bit mutation rehashes exactly one page, creation writes no
@@ -109,7 +118,11 @@ Current implementation status:
 
 Current implementation status:
 
-- `PackedBitmap` provides the LSB-first packed bitmap primitive.
+- `PackedBitmap` provides the LSB-first packed bitmap primitive. It is a
+  variable-width value: it declares a stable non-zero codec `SCHEMA_ID` and is
+  usable as an ordinary derived variable field, but it is deliberately not a
+  fixed-width matrix slot type, because a `Vec`-backed encoding has no
+  compile-time stride.
 - `matrix_cell_payload` exposes checked positional slot payload reads for view
   builders.
 - With the `mmap` feature, unsafe `mmap_matrix()` exposes committed matrix slot

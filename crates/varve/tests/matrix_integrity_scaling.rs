@@ -26,8 +26,8 @@ use varve::{
 const PAGE_BYTES: u64 = 4096;
 /// Native file header, then the 24-byte matrix creation-nonce region (DUR2-03).
 const NATIVE_PREFIX_LEN: u64 = 18 + 24;
-/// Current on-disk matrix layout version.
-const VMAT_VERSION: u16 = 2;
+/// Current on-disk matrix layout version (v3 adds the persisted page index).
+const VMAT_VERSION: u16 = 3;
 
 /// `CHANNELS` bits per scan, so a scan count of `n` yields `n * CHANNELS` cells
 /// and a commit map of `n * CHANNELS / 8` bytes.
@@ -326,6 +326,230 @@ fn open_bitmap_bytes_read_do_not_scale_with_cell_count() -> varve::Result<()> {
     Ok(())
 }
 
+/// The loop bound itself must not follow the logical page count.
+///
+/// Bytes read were always the weaker witness: a `0..page_count` loop that skips
+/// every page still runs `page_count` times, which is 4.29 billion iterations
+/// per bitmap for a 1 PiB payload of 8-byte cells. Open now visits the union of
+/// the persisted page index and the pages the allocation map reports, so two
+/// matrices whose logical sizes differ by 4x but that hold the same live pages
+/// must visit exactly the same number of pages.
+#[test]
+fn open_bitmap_pages_visited_do_not_scale_with_cell_count() -> varve::Result<()> {
+    const CELLS: u64 = 64;
+    let dir = temp_dir("pages-visited");
+
+    let mut measured = Vec::new();
+    for (name, scans) in [("small", SMALL_WIDE_SCANS), ("large", LARGE_WIDE_SCANS)] {
+        let path = dir.path().join(format!("{name}.varve"));
+        fill(&path, scans, CELLS)?;
+        MatrixRecoveryReport::reset_matrix_integrity_counters();
+        drop(spec().open_readonly(&path)?);
+        measured.push(MatrixRecoveryReport::matrix_open_bitmap_pages_visited());
+    }
+
+    let (small, large) = (measured[0], measured[1]);
+    // With an allocation map available the visit set also covers the pages the
+    // filesystem reports as written, and a filesystem allocates in runs rather
+    // than in 4 KiB pages, so the two fixtures may differ by up to one run.
+    // What must not happen is the 4x logical ratio appearing in the counts.
+    // `open_stays_bounded_without_an_allocation_map` asserts exact equality on
+    // the allocation-map-free path, where the count is purely index-driven.
+    const ALLOCATION_RUN_PAGES: u64 = 64;
+    assert!(
+        large.abs_diff(small) <= ALLOCATION_RUN_PAGES,
+        "open page visits scaled with cell count: {small} vs {large}"
+    );
+    // The whole fixture lives in the first page of each map, so the visit count
+    // must stay far below the map width.
+    let large_logical_pages = (LARGE_WIDE_SCANS * CHANNELS / 8).div_ceil(PAGE_BYTES);
+    assert!(
+        large < large_logical_pages,
+        "open visited {large} pages, not meaningfully below the logical page count \
+         {large_logical_pages}"
+    );
+    // The small fixture's own logical page count is the honest scale-free
+    // witness: a loop that followed logical size would have visited at least
+    // four times as many pages for the large one.
+    let small_logical_pages = (SMALL_WIDE_SCANS * CHANNELS / 8).div_ceil(PAGE_BYTES);
+    assert!(
+        large < small_logical_pages,
+        "open visited {large} pages for the 4x matrix, not below the smaller \
+         matrix's logical page count {small_logical_pages}"
+    );
+    Ok(())
+}
+
+/// The bound must survive the loss of the allocation map.
+///
+/// A platform that cannot answer, or a file fragmented past the tracked-extent
+/// cap, used to fall back to treating every logical page as readable data —
+/// turning a sparse but fragmented PB file into a dense one. The persisted page
+/// index is the fallback now, so the visit count is still the published pages
+/// and still identical across a 4x difference in logical size.
+#[test]
+fn open_stays_bounded_without_an_allocation_map() -> varve::Result<()> {
+    const CELLS: u64 = 64;
+    let dir = temp_dir("no-alloc-map");
+
+    let mut measured = Vec::new();
+    let mut read_bytes = Vec::new();
+    for (name, scans) in [("small", SMALL_WIDE_SCANS), ("large", LARGE_WIDE_SCANS)] {
+        let path = dir.path().join(format!("{name}.varve"));
+        fill(&path, scans, CELLS)?;
+        MatrixRecoveryReport::reset_matrix_integrity_counters();
+        MatrixRecoveryReport::force_matrix_allocation_map_unavailable(true);
+        let opened = spec().open_readonly(&path);
+        MatrixRecoveryReport::force_matrix_allocation_map_unavailable(false);
+        drop(opened?);
+        assert!(
+            !MatrixRecoveryReport::matrix_open_allocation_map_available(),
+            "the allocation map was still available for {name}"
+        );
+        measured.push(MatrixRecoveryReport::matrix_open_bitmap_pages_visited());
+        read_bytes.push(MatrixRecoveryReport::matrix_open_bitmap_bytes_read());
+    }
+
+    let (small, large) = (measured[0], measured[1]);
+    assert_eq!(
+        small, large,
+        "open page visits scaled with cell count without an allocation map: {small} vs {large}"
+    );
+    let (small_bytes, large_bytes) = (read_bytes[0], read_bytes[1]);
+    assert_eq!(
+        small_bytes, large_bytes,
+        "open reads scaled with cell count without an allocation map: \
+         {small_bytes} vs {large_bytes}"
+    );
+    // Without an allocation map the old loader read the complete commit map and
+    // validity bitmap: a quarter of the cell count in bytes.
+    let large_dense = LARGE_WIDE_SCANS * CHANNELS / 4;
+    assert!(
+        large_bytes < large_dense,
+        "open read {large_bytes} bytes, not meaningfully below the dense cost {large_dense}"
+    );
+    Ok(())
+}
+
+/// Index-driven open must keep detecting corruption in a page it does visit,
+/// and rebuild must still recover the category — with no allocation map to fall
+/// back on.
+#[test]
+fn published_page_corruption_is_detected_without_an_allocation_map() -> varve::Result<()> {
+    const CELLS: u64 = 8;
+    let dir = temp_dir("no-alloc-map-corruption");
+    let path = dir.path().join("matrix.varve");
+    fill(&path, SMALL_WIDE_SCANS, CELLS)?;
+
+    patch_byte(&path, commit_map_off(&path), 0x00);
+
+    MatrixRecoveryReport::force_matrix_allocation_map_unavailable(true);
+    let opened = spec().open_reader(&path);
+    MatrixRecoveryReport::force_matrix_allocation_map_unavailable(false);
+    let reader = opened?;
+    assert!(
+        !MatrixRecoveryReport::matrix_open_allocation_map_available(),
+        "the allocation map was still available"
+    );
+    assert!(matches!(
+        reader.matrix_cell_status::<ScalingCell>(key(0)),
+        Err(Error::MatrixCommitQuarantined(name)) if name == ScalingCell::CATEGORY
+    ));
+    assert!(
+        reader
+            .matrix_recovery_report()
+            .findings
+            .iter()
+            .any(|finding| finding.kind == MatrixCorruptionKind::CommitMap),
+        "index-driven open missed corruption in a published page"
+    );
+    drop(reader);
+
+    let mut writer = spec().open_writer(&path)?;
+    assert_eq!(
+        writer.rebuild_matrix_commit_from_crc::<ScalingCell>()?,
+        CELLS
+    );
+    assert_eq!(
+        writer.read_matrix_cell::<ScalingCell>(key(3))?,
+        ScalingCell { value: 4 }
+    );
+    drop(writer);
+
+    // The rebuilt map must reopen cleanly through the index alone.
+    MatrixRecoveryReport::force_matrix_allocation_map_unavailable(true);
+    let opened = spec().open_reader(&path);
+    MatrixRecoveryReport::force_matrix_allocation_map_unavailable(false);
+    let reader = opened?;
+    assert!(
+        !reader
+            .matrix_recovery_report()
+            .findings
+            .iter()
+            .any(|finding| finding.kind == MatrixCorruptionKind::CommitMap),
+        "rebuild did not restore a cleanly readable commit map"
+    );
+    assert!(matches!(
+        reader.matrix_cell_status::<ScalingCell>(key(0)),
+        Ok(varve::MatrixCellStatus::Committed)
+    ));
+    Ok(())
+}
+
+/// A page whose final set bit is cleared must be released, not retained.
+///
+/// Set/clear churn used to hold residency proportional to the pages a writer
+/// had historically touched, even at `ones == 0`, because only a whole-map
+/// clear, rebuild, or reopen released a page. Residency must instead return to
+/// the value it had before the page was touched.
+#[test]
+fn cleared_pages_are_evicted_and_residency_returns_to_baseline() -> varve::Result<()> {
+    let dir = temp_dir("page-eviction");
+    let path = dir.path().join("matrix.varve");
+    let mut writer = spec().create_writer_with_dims(&path, dims(LARGE_SCANS))?;
+
+    // All three cells fall in the first page of every map, so a cycle over them
+    // materialises and then empties exactly one commit page and one validity
+    // page. The session's write-tracking map is not part of the cycle: it
+    // records that this writer wrote the slots, which stays true.
+    const ORDINALS: [u64; 3] = [0, 1, 2];
+    for ordinal in ORDINALS {
+        writer.write_matrix_cell(key(ordinal), &ScalingCell { value: 9 })?;
+        writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
+        writer.clear_matrix_cell::<ScalingCell>(key(ordinal))?;
+    }
+    let baseline = MatrixRecoveryReport::matrix_resident_bitmap_bytes();
+    assert_eq!(
+        baseline, PAGE_BYTES,
+        "residency after clearing every committed cell is not the single \
+         session write-tracking page"
+    );
+
+    // Repeating the cycle must return to that baseline every time rather than
+    // retaining a page per historically touched page.
+    for round in 0..4 {
+        for ordinal in ORDINALS {
+            writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
+        }
+        let peak = MatrixRecoveryReport::matrix_resident_bitmap_bytes();
+        assert!(
+            peak > baseline,
+            "round {round} committed cells without making a page resident \
+             ({peak} vs {baseline})"
+        );
+        for ordinal in ORDINALS {
+            writer.clear_matrix_cell::<ScalingCell>(key(ordinal))?;
+        }
+        let after = MatrixRecoveryReport::matrix_resident_bitmap_bytes();
+        assert_eq!(
+            after, baseline,
+            "round {round} left cleared bitmap pages resident: {after} vs {baseline}"
+        );
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 /// The skipped ranges must not become a blind spot: a stray byte written into a
 /// page that no commit ever touched allocates that page, so it is still read
 /// and still quarantines the category — at a cell count where hole skipping is
@@ -526,14 +750,14 @@ fn previous_layout_version_artifact_is_rejected_typed() -> varve::Result<()> {
     {
         let mut file = OpenOptions::new().write(true).open(&path)?;
         file.seek(SeekFrom::Start(vmat_header_offset() + 4))?;
-        file.write_all(&1u16.to_le_bytes())?;
+        file.write_all(&2u16.to_le_bytes())?;
     }
 
     assert!(matches!(
         spec().open_readonly(&path),
         Err(Error::FormatVersionMismatch {
             expected,
-            actual: 1
+            actual: 2
         }) if expected == VMAT_VERSION
     ));
     Ok(())

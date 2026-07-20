@@ -101,7 +101,7 @@
   not copy bytes or prevent an uncoordinated external writer from mutating that
   same object. Matrix readers must not overlap reads with writes to the same
   in-place slot; true immutable matrix snapshots require versioned slots,
-  generations, or read leases that are outside VMAT v2.
+  generations, or read leases that are outside VMAT v3.
 - Durability is explicit: `flush` pushes buffered bytes to the OS, and `sync` performs durable fsync.
 - Native append and streamed custom-layout writes snapshot EOF and in-memory
   publication state. Returned write errors roll back when possible; rollback
@@ -153,7 +153,7 @@
 - `FormatSpec::schema_debug_dump()` emits a human-readable view for inspection and support.
 - Migration is explicit with `VarveMigration<From, To>` and `blocks_migrated::<From, To, M>()`.
 - Valid native 0.1 wire contracts remain readable in 0.3. Wire changes on the
-  unreleased branch (computed schema hash v3, matrix `VMAT`/`MCRC` v2,
+  unreleased branch (computed schema hash v3, matrix `VMAT` v3 with `MCRC` v2,
   disk-index sidecar metadata v3) are pre-1.0 breaking changes with no in-place
   migration: affected artifacts are refused with a typed error and regenerated.
 
@@ -278,10 +278,13 @@
   rebuild from CRC evidence. Commit-map integrity is per 4 KiB page and per-cell
   metadata is created as a sparse zero extent and held sparsely in memory, so
   neither commit-bit maintenance, create-time metadata I/O, post-open bitmap
-  residency, nor open-time reads scale with cell count (open takes its
-  never-written proof from the filesystem allocated-range map, and whole-category
-  clear punches a hole). That change is `VMAT`/`MCRC` layout
-  version 2; version 1 matrix files are refused with `FormatVersionMismatch`.
+  residency, nor open-time reads scale with cell count. Open derives the pages it
+  visits from a persisted page index unioned with the filesystem allocated-range
+  map, never from the logical page count, and whole-category clear punches a
+  hole; a sparse page whose last set bit is cleared is evicted and refunded
+  rather than kept resident. That change is `VMAT` layout version 3 (with the
+  `MCRC` integrity table at version 2); version 1 and version 2 matrix files are
+  refused with `FormatVersionMismatch`.
   Matrix integrity also provides injectable ordered durability barriers and an
   optional `integrity`-gated sidecar identity/CRC envelope. Safe matrix
   recovery clear actions are public. P2 now includes static noncommit aux

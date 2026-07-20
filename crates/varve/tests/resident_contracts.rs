@@ -392,3 +392,255 @@ fn append_time_predecessor_lookup_never_reads_the_resident_index() -> varve::Res
     );
     Ok(())
 }
+
+// PERF3-03 (report finding PERF-03): `BlockTails::from_index` claimed
+// `O(N log B)` but inserted every first-seen block id into a sorted vector, so
+// an index whose first appearances descend by id moved `0 + 1 + ... + (B - 1)`
+// tuples - a real `O(N log B + B^2)`. The previous test could not see this
+// because it counted resident *index visits*, which the insertion cost does
+// not touch. Construction now orders the distinct ids once.
+//
+// PERF3-05 (report finding PERF-05): every resident input open could copy all
+// `N` sequences into an `8N` temporary and sort it, and `KeyedMergeEstimate`
+// charged neither the temporary nor the sort. The estimate is the published
+// way to size this resident-only family, so an estimate that omits a live
+// allocation is a defect in the deliverable itself.
+
+varve_format! {
+    pub format ResidentWideFormat {
+        magic: b"RESWID";
+        version: 1;
+        index: scan_on_open;
+        blocks {
+            fixed Wide30(id = 30) {
+                tag: u32,
+            }
+            fixed Wide31(id = 31) {
+                tag: u32,
+            }
+            fixed Wide32(id = 32) {
+                tag: u32,
+            }
+            fixed Wide33(id = 33) {
+                tag: u32,
+            }
+            fixed Wide34(id = 34) {
+                tag: u32,
+            }
+            fixed Wide35(id = 35) {
+                tag: u32,
+            }
+            fixed Wide36(id = 36) {
+                tag: u32,
+            }
+            fixed Wide37(id = 37) {
+                tag: u32,
+            }
+            fixed Wide38(id = 38) {
+                tag: u32,
+            }
+            fixed Wide39(id = 39) {
+                tag: u32,
+            }
+            fixed Wide40(id = 40) {
+                tag: u32,
+            }
+            fixed Wide41(id = 41) {
+                tag: u32,
+            }
+            fixed Wide42(id = 42) {
+                tag: u32,
+            }
+            fixed Wide43(id = 43) {
+                tag: u32,
+            }
+            fixed Wide44(id = 44) {
+                tag: u32,
+            }
+            fixed Wide45(id = 45) {
+                tag: u32,
+            }
+        }
+    }
+}
+
+/// PERF3-03: wholesale block-tail construction must move no tuples at all, in
+/// the exact worst case that used to be quadratic. This counter observes
+/// vector movement, which is the cost the index-visit counter cannot see.
+#[cfg(feature = "scalable-fault-injection")]
+#[test]
+fn block_tail_construction_has_no_quadratic_term() -> varve::Result<()> {
+    /// Appends `rounds` descending sweeps over all 16 block ids and reopens the
+    /// file. Returns `(tuples moved while appending, tuples moved by the
+    /// reopen)`.
+    fn measure(rounds: u32, name: &str) -> varve::Result<(u64, u64)> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join(name);
+        let mut file = ResidentWideFormat::create(&path)?;
+        let before_appends = VarveFile::block_tail_entries_moved();
+        for round in 0..rounds {
+            // Descending first appearances are the worst case for insertion
+            // into a vector kept sorted ascending by block id.
+            file.push(&Wide45 { tag: round })?;
+            file.push(&Wide44 { tag: round })?;
+            file.push(&Wide43 { tag: round })?;
+            file.push(&Wide42 { tag: round })?;
+            file.push(&Wide41 { tag: round })?;
+            file.push(&Wide40 { tag: round })?;
+            file.push(&Wide39 { tag: round })?;
+            file.push(&Wide38 { tag: round })?;
+            file.push(&Wide37 { tag: round })?;
+            file.push(&Wide36 { tag: round })?;
+            file.push(&Wide35 { tag: round })?;
+            file.push(&Wide34 { tag: round })?;
+            file.push(&Wide33 { tag: round })?;
+            file.push(&Wide32 { tag: round })?;
+            file.push(&Wide31 { tag: round })?;
+            file.push(&Wide30 { tag: round })?;
+        }
+        let after_appends = VarveFile::block_tail_entries_moved();
+        file.flush()?;
+        drop(file);
+
+        let reopened = ResidentWideFormat::open(&path)?;
+        let after_open = VarveFile::block_tail_entries_moved();
+        drop(reopened);
+        Ok((after_appends - before_appends, after_open - after_appends))
+    }
+
+    let (small_appends, small_open) = measure(4, "wide-tails-4.varve")?;
+    let (large_appends, large_open) = measure(64, "wide-tails-64.varve")?;
+
+    // Calibration: the counter is wired and this really is the worst case. The
+    // append path still inserts, but only once per distinct id for the whole
+    // life of the file, so its movement does not grow with the record count.
+    assert_eq!(
+        small_appends, large_appends,
+        "insertion movement must depend on distinct ids, not record count"
+    );
+    assert!(
+        small_appends >= (16 * 15) / 2,
+        "descending ids must be the insertion worst case: {small_appends}"
+    );
+    // The regression: rebuilding the tails on open must not repeat that
+    // movement, for any record count.
+    assert_eq!(
+        small_open, 0,
+        "tail construction must not move tuples: {small_open}"
+    );
+    assert_eq!(
+        large_open, 0,
+        "tail construction must not move tuples: {large_open}"
+    );
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, varve::VarveBlock)]
+#[varve(id = 60, version = 1, kind = "variable", key = "user_id")]
+struct ResidentMergeUser {
+    #[varve(field_id = 1)]
+    user_id: u64,
+    #[varve(field_id = 2)]
+    name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, varve::VarveBlock)]
+#[varve(id = 61, version = 1, kind = "variable")]
+struct ResidentMergeUserOp {
+    #[varve(field_id = 1)]
+    rename_to: String,
+}
+
+impl varve::VarveMerge for ResidentMergeUser {
+    type Op = ResidentMergeUserOp;
+
+    fn apply_op(&mut self, op: Self::Op) -> varve::Result<()> {
+        self.name = op.rename_to;
+        Ok(())
+    }
+}
+
+varve_format! {
+    pub struct ResidentEstimateFormat {
+        magic: b"RESEST";
+        version: 1;
+        endian: little;
+        blocks: [ResidentMergeUser, ResidentMergeUserOp];
+    }
+}
+
+/// PERF3-05: the pre-flight estimate must charge the transient an input open
+/// allocates alongside its resident index, so `peak_resident_bytes` bounds the
+/// real peak instead of understating it.
+#[test]
+fn resident_merge_estimate_includes_the_open_time_transient() -> varve::Result<()> {
+    const BASE_KEYS: u64 = 300;
+    const DELTA_KEYS: u64 = 40;
+
+    fn write_input(path: &Path, keys: u64) -> varve::Result<()> {
+        let mut file = ResidentEstimateFormat::create(path)?;
+        for key in 0..keys {
+            file.push(&ResidentMergeUser {
+                user_id: key,
+                name: format!("user-{key}"),
+            })?;
+        }
+        file.flush()?;
+        Ok(())
+    }
+
+    let directory = tempfile::tempdir()?;
+    let base = directory.path().join("estimate-base.varve");
+    let delta = directory.path().join("estimate-delta.varve");
+    write_input(&base, BASE_KEYS)?;
+    write_input(&delta, DELTA_KEYS)?;
+
+    let estimate = varve::estimate_keyed_merge::<ResidentMergeUser, _>(
+        ResidentEstimateFormat::spec(),
+        base.as_path(),
+        &[delta.as_path()],
+    )?;
+
+    // Derived floor: the largest input holds at least `BASE_KEYS` records and
+    // the uniqueness witness copies one `u64` per record of that input.
+    let floor = BASE_KEYS * (size_of::<u64>() as u64);
+    assert!(
+        estimate.largest_input_open_transient_bytes >= floor,
+        "the open transient must be charged: {} < {floor}",
+        estimate.largest_input_open_transient_bytes
+    );
+    assert!(
+        estimate.peak_resident_bytes()
+            >= estimate.max_state_bytes + estimate.largest_input_index_bytes + floor,
+        "the peak must include the state, the largest index, and the transient"
+    );
+    // The transient is a per-input cost, so it tracks the largest input rather
+    // than the delta or the total.
+    let base_only = varve::estimate_keyed_merge::<ResidentMergeUser, _>(
+        ResidentEstimateFormat::spec(),
+        base.as_path(),
+        &[],
+    )?;
+    assert_eq!(
+        base_only.largest_input_open_transient_bytes, estimate.largest_input_open_transient_bytes,
+        "a smaller delta must not change the largest input's transient"
+    );
+
+    let bigger = directory.path().join("estimate-bigger.varve");
+    write_input(&bigger, BASE_KEYS * 4)?;
+    let bigger_estimate = varve::estimate_keyed_merge::<ResidentMergeUser, _>(
+        ResidentEstimateFormat::spec(),
+        bigger.as_path(),
+        &[base.as_path()],
+    )?;
+    assert!(
+        bigger_estimate.largest_input_open_transient_bytes
+            > estimate.largest_input_open_transient_bytes,
+        "the transient must scale with the largest input's record count"
+    );
+    assert!(
+        bigger_estimate.peak_resident_bytes() > estimate.peak_resident_bytes(),
+        "the peak bound must grow with the inputs"
+    );
+    Ok(())
+}

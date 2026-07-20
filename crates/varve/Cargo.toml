@@ -7,6 +7,10 @@ rust-version.workspace = true
 version.workspace = true
 description = "Format-first, append-friendly custom binary formats for Rust"
 documentation = "https://docs.rs/varve"
+# DOC-01: see the note in `crates/varve-core/Cargo.toml`. README is pulled in
+# from the repository root; `LICENSE-MIT` and `LICENSE-APACHE` are files in this
+# directory because `include` cannot reference paths outside the package.
+readme = "../../README.md"
 keywords = ["binary", "serialization", "storage", "format", "append"]
 categories = ["encoding", "filesystem", "data-structures"]
 

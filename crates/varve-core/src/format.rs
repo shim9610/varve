@@ -987,6 +987,21 @@ pub struct FormatSpec {
     /// The fingerprint values themselves stay process-local: they are never
     /// compared against on-disk descriptors, only folded into the computed
     /// hash and checked by the in-process registration gate.
+    ///
+    /// Where an entry exists for a block id it is **authoritative** for that
+    /// id's registration contract, including the endian override (API-01):
+    /// typed registration rejects any [`crate::VarveBlock`] implementation
+    /// whose `ENDIAN`, resolved through [`FormatSpec::endian`], disagrees with
+    /// the entry's — a manual type can no longer request a block written
+    /// big-endian through a little-endian implementation and read
+    /// byte-swapped values. `None` in the endian position means "no override;
+    /// inherit [`FormatSpec::endian`]", which is how it is both hashed
+    /// (as an explicit absence marker) and compared (after resolution).
+    ///
+    /// The slices supplied here and to [`FormatSpec::blocks`] are identified
+    /// by address *and* length wherever varve caches per-block validation, so
+    /// an empty or prefix view of an array is never mistaken for the full view
+    /// (API-02).
     pub block_identities: &'static [(u32, Option<Endian>, bool, u64)],
     pub layout: LayoutSpec,
     pub read_limits: ReadLimits,

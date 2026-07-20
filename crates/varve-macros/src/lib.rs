@@ -8,6 +8,65 @@ use syn::{
     Visibility, braced, bracketed, parenthesized, parse_macro_input,
 };
 
+/// Derives [`VarveBlock`] — and the codec impls it needs — for one stored
+/// record type.
+///
+/// Re-exported by the `varve` facade as `varve::VarveBlock`; depend on `varve`,
+/// not on this crate directly.
+///
+/// # Attributes
+///
+/// The block itself is configured with `#[varve(...)]` on the struct:
+///
+/// | Key | Meaning |
+/// | --- | --- |
+/// | `id = <u32>` | block id, below `0xFFFF_FF00` (ids at or above that are reserved for internal records) |
+/// | `version = <u16>` | block version; defaults to `1` |
+/// | `kind = "fixed" \| "variable" \| "matrix"` | encoding shape |
+/// | `key = "<field>"` | marks the block keyed and names the key field |
+/// | `endian = "little" \| "big"` | per-block byte-order override; otherwise the format's byte order applies |
+///
+/// Fields of a `variable` block take `#[varve(field_id = <u32>)]`, which is the
+/// wire identity that lets readers skip unknown fields. `fixed` blocks are
+/// positional and take no field ids.
+///
+/// ```ignore
+/// #[derive(Clone, Debug, PartialEq, varve::VarveBlock)]
+/// #[varve(id = 2, version = 1, kind = "variable", key = "id")]
+/// struct User {
+///     #[varve(field_id = 1)]
+///     id: u64,
+///     #[varve(field_id = 2)]
+///     name: String,
+/// }
+/// ```
+///
+/// # Generated schema fingerprint
+///
+/// The derive computes `VarveBlock::SCHEMA_FINGERPRINT` deterministically
+/// (FNV-1a 64 over the canonical schema: id, version, kind, endian, keyedness,
+/// ordered field name/type identities, and each field's resolved codec
+/// `SCHEMA_ID`). A manual block that mirrors a derived one must reuse that
+/// block's fingerprint constant.
+///
+/// # Field codec identity
+///
+/// Every field type must declare a **non-zero** `VarveEncode::SCHEMA_ID` and
+/// `VarveDecode::SCHEMA_ID`. A field whose codec leaves the trait default `0`
+/// fails to compile with a message naming the field. Wrapping the codec in
+/// `Option`, `Vec`, an array, a map, or a tuple does not satisfy the rule:
+/// container identities fold their elements, so a missing element identity
+/// propagates outward. Every built-in codec — including `ChunkedBytes` and
+/// `PackedBitmap` — declares one. See `docs/custom-codec-guide.md`.
+///
+/// # Matrix blocks
+///
+/// `kind = "matrix"` additionally requires every field to have a width fixed by
+/// its type, because a matrix slot needs a compile-time stride. Scalars and
+/// fixed arrays of them qualify; anything that owns heap storage does not, and
+/// is rejected during const evaluation of the generated `SLOT_STRIDE`.
+///
+/// [`VarveBlock`]: https://docs.rs/varve/latest/varve/trait.VarveBlock.html
 #[proc_macro_derive(VarveBlock, attributes(varve))]
 pub fn derive_varve_block(input: TokenStream) -> TokenStream {
     match expand_varve_block(parse_macro_input!(input as DeriveInput)) {
@@ -16,6 +75,59 @@ pub fn derive_varve_block(input: TokenStream) -> TokenStream {
     }
 }
 
+/// Declares a whole binary format: its header identity, resource limits,
+/// policies, block set, and a typed API generated from them.
+///
+/// Re-exported by the `varve` facade as `varve::varve_format!`; depend on
+/// `varve`, not on this crate directly. This is the format-first entry point —
+/// the declaration is the single source of truth for the on-disk contract and
+/// for the Rust API that reads and writes it.
+///
+/// ```ignore
+/// varve::varve_format! {
+///     pub format AppFormat {
+///         magic: b"APPF";
+///         version: 1;
+///         limits { /* file_len, records, record_payload, … */ }
+///         endian: little;
+///         schema_hash: computed;
+///         extension: "appf";
+///         blocks {
+///             fixed Point(id = 1, version = 1) { x: u32, y: u32 }
+///             variable User(id = 2, version = 1, key = [id]) { id: u64, name: String }
+///         }
+///     }
+/// }
+/// ```
+///
+/// # Sections
+///
+/// | Section | Meaning |
+/// | --- | --- |
+/// | `magic`, `version`, `extension` | file header identity |
+/// | `limits { … }` | the resource ceilings every read is checked against |
+/// | `endian` | format byte order; a block may override it |
+/// | `schema_hash` | `computed` (derived from the declaration) or a pinned literal |
+/// | `index`, `commit`, `manifest`, `integrity`, `compression` | policies |
+/// | `dims`, `commit: cell_bitmap`, `aux` | preallocated-matrix declarations |
+/// | `layout { … }` | custom physical layout, for non-Varve-native byte shapes |
+/// | `blocks { … }` | `fixed` / `variable` / `matrix` block declarations |
+///
+/// # What is generated
+///
+/// A `FormatSpec` constructor (`AppFormat::spec()`), one block type per
+/// declaration with its `VarveBlock` impl, typed reader/writer handles
+/// (`AppFormat::open_reader`, `create_writer_with_dims`, …), and per-block
+/// accessors: `push_point`, `points()`, `delete_user`, and for matrix blocks
+/// `write_cell`/`commit_cell`/`cell`/`cell_status` plus a key struct such as
+/// `CellKey { scan, ch }`.
+///
+/// Generated code refers to the facade as `::varve::…` and rewrites that path
+/// when the dependency is renamed (`vv = { package = "varve", … }`), so no
+/// `extern crate` alias is needed downstream.
+///
+/// See `docs/declaration-and-internals.md` and `docs/format-author-guide.md`
+/// for the full grammar.
 #[proc_macro]
 pub fn varve_format(input: TokenStream) -> TokenStream {
     match syn::parse::<FormatInput>(input) {
@@ -2071,6 +2183,24 @@ fn validate_matrix_format(
     Ok(())
 }
 
+/// Syntactic pre-filter for matrix field types (API-04).
+///
+/// A matrix slot needs a stride the compiler knows, so only types whose encoded
+/// width is fixed by the type itself can occupy one. This check exists to
+/// produce a readable diagnostic pointing at the offending field; it is *not*
+/// the authority on the classification, because a source identifier is not a
+/// type: a user type spelled `u32` reaches this list too. The authority is the
+/// generated `SLOT_STRIDE`, which resolves each element type's
+/// `VarveEncode::WIRE_TYPE` and fails to compile for anything without a fixed
+/// encoded width — see [`matrix_slot_stride_tokens`].
+///
+/// `PackedBitmap` is deliberately absent. The built-in owns a `Vec<u8>` and
+/// encodes a `bit_len` plus a variable byte string, so it has no fixed encoded
+/// width; the previous entry matched on the *spelling* alone, which both
+/// admitted the built-in with a stride taken from `size_of` (its Rust object
+/// size, not its encoded width) and silently admitted any user type that
+/// happened to share the name. It remains usable as an ordinary variable field,
+/// where it now carries a non-zero codec identity.
 fn matrix_field_is_fixed_width(ty: &Type) -> bool {
     match ty {
         Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
@@ -2089,11 +2219,58 @@ fn matrix_field_is_fixed_width(ty: &Type) -> bool {
                     | "i128"
                     | "f32"
                     | "f64"
-                    | "PackedBitmap"
             )
         }),
         Type::Array(array) => matrix_field_is_fixed_width(&array.elem),
         _ => false,
+    }
+}
+
+/// The compile-time slot stride of an inline matrix block (API-04).
+///
+/// Every field contributes the encoded width of its own codec, resolved through
+/// `VarveEncode::WIRE_TYPE` rather than taken from `size_of`. The two disagree
+/// for any type that owns heap storage — `size_of::<PackedBitmap>()` is the
+/// width of a `Vec` plus a `u64`, not the width of the bytes it emits — so
+/// deriving the stride from the Rust object size could publish a matrix whose
+/// slots do not match the values written into them. A wire type with no fixed
+/// width has no stride, and the const evaluation of this expression is what
+/// rejects it, whatever the field type is spelled.
+fn matrix_slot_stride_tokens(fields: &[InlineField]) -> TokenStream2 {
+    let terms = fields.iter().map(|field| {
+        let mut ty = &field.ty;
+        let mut count = quote!(1u64);
+        while let Type::Array(array) = ty {
+            let len = &array.len;
+            count = quote!(#count * ((#len) as u64));
+            ty = &array.elem;
+        }
+        quote!(#count * __varve_matrix_encoded_width(
+            <#ty as ::varve::__core::VarveEncode>::WIRE_TYPE
+        ))
+    });
+    quote! {
+        {
+            const fn __varve_matrix_encoded_width(wire: ::varve::__core::WireType) -> u64 {
+                match wire {
+                    ::varve::__core::WireType::Bool
+                    | ::varve::__core::WireType::U8
+                    | ::varve::__core::WireType::I8 => 1,
+                    ::varve::__core::WireType::U16 | ::varve::__core::WireType::I16 => 2,
+                    ::varve::__core::WireType::U32
+                    | ::varve::__core::WireType::I32
+                    | ::varve::__core::WireType::F32 => 4,
+                    ::varve::__core::WireType::U64
+                    | ::varve::__core::WireType::I64
+                    | ::varve::__core::WireType::F64 => 8,
+                    ::varve::__core::WireType::U128 | ::varve::__core::WireType::I128 => 16,
+                    _ => panic!(
+                        "matrix fields must have a width fixed by their type; this codec does not"
+                    ),
+                }
+            }
+            0u64 #( + #terms )*
+        }
     }
 }
 
@@ -3649,15 +3826,12 @@ fn inline_block_tokens(vis: &Visibility, block: &InlineBlock, dims: &[MatrixDim]
             .iter()
             .map(|dim| matrix_storage_dimension_name(dim, dims).unwrap_or_else(|| dim.to_string()));
         let category = meta.category.to_string();
-        let stride_terms = block.fields.iter().map(|field| {
-            let ty = &field.ty;
-            quote!(::core::mem::size_of::<#ty>() as u64)
-        });
+        let stride = matrix_slot_stride_tokens(&block.fields);
         quote! {
             impl ::varve::__core::VarveMatrixBlock for #name {
                 const DIMENSIONS: [&'static str; 2] = [#(#matrix_dims,)*];
                 const CATEGORY: &'static str = #category;
-                const SLOT_STRIDE: u64 = 0u64 #( + #stride_terms )*;
+                const SLOT_STRIDE: u64 = #stride;
             }
         }
     } else {

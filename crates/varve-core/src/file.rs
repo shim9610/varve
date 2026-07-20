@@ -682,15 +682,29 @@ impl BlockTails {
     }
 
     /// Recovers the tails with one forward pass over the resident index, so a
-    /// reopen pays `O(N log B)` exactly once instead of every append paying
-    /// its own reverse scan.
+    /// reopen pays the pass exactly once instead of every append paying its own
+    /// reverse scan.
+    ///
+    /// The pass keeps the newest offset per block id in a hash map and orders
+    /// the distinct ids exactly once, so construction is `O(N + B log B)` time
+    /// and `O(B)` memory. Replaying the pass through [`Self::note_appended`]
+    /// instead - which is what this did originally - inserts every first-seen
+    /// id into the sorted vector, and an index whose first appearances are in
+    /// descending id order moves `0 + 1 + ... + (B - 1)` tuples. That made the
+    /// real bound `O(N log B + B^2)`, not the `O(N log B)` the comment here
+    /// used to claim (PERF3-03). The append path keeps the sorted-vector
+    /// insertion: it pays at most one insertion per distinct id over the whole
+    /// life of the file and buys `O(log B)` lookups with no hashing on the hot
+    /// path.
     fn from_index(index: &[RecordIndexEntry]) -> Self {
         note_block_tail_index_touches(index.len() as u64);
-        let mut tails = Self::new_empty();
+        let mut newest: HashMap<u32, u64> = HashMap::new();
         for entry in index {
-            tails.note_appended(entry.block_id, entry.record_offset);
+            newest.insert(entry.block_id, entry.record_offset);
         }
-        tails
+        let mut tails: Vec<(u32, u64)> = newest.into_iter().collect();
+        tails.sort_unstable_by_key(|(block_id, _)| *block_id);
+        Self { tails }
     }
 
     fn tail(&self, block_id: u32) -> Option<u64> {
@@ -710,7 +724,13 @@ impl BlockTails {
     fn note_appended(&mut self, block_id: u32, record_offset: u64) {
         match self.tails.binary_search_by_key(&block_id, |(id, _)| *id) {
             Ok(position) => self.tails[position].1 = record_offset,
-            Err(position) => self.tails.insert(position, (block_id, record_offset)),
+            Err(position) => {
+                // Every insertion shifts the tuples above it; counting them is
+                // what makes the historical quadratic construction term
+                // observable to a regression test (PERF3-03).
+                note_block_tail_entries_moved((self.tails.len() - position) as u64);
+                self.tails.insert(position, (block_id, record_offset));
+            }
         }
     }
 }
@@ -730,6 +750,25 @@ std::thread_local! {
 fn note_block_tail_index_touches(count: u64) {
     #[cfg(feature = "scalable-fault-injection")]
     BLOCK_TAIL_INDEX_TOUCHES.with(|touches| touches.set(touches.get().saturating_add(count)));
+    #[cfg(not(feature = "scalable-fault-injection"))]
+    let _ = count;
+}
+
+#[cfg(feature = "scalable-fault-injection")]
+std::thread_local! {
+    static BLOCK_TAIL_ENTRIES_MOVED: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+/// Counts tuples displaced by sorted-vector insertion in the block-tail table
+/// on this thread (PERF3-03 regression evidence). Index *visits* cannot see
+/// this cost, which is why the quadratic construction term survived the
+/// previous review. Inert without the `scalable-fault-injection` feature.
+#[inline]
+fn note_block_tail_entries_moved(count: u64) {
+    #[cfg(feature = "scalable-fault-injection")]
+    BLOCK_TAIL_ENTRIES_MOVED.with(|moved| moved.set(moved.get().saturating_add(count)));
     #[cfg(not(feature = "scalable-fault-injection"))]
     let _ = count;
 }
@@ -1221,6 +1260,11 @@ pub struct VarveFile {
     // Lazily built keyed-offset-chain predecessors for the generic keyed
     // append path; a cached map is either absent or exact (API2-05).
     keyed_tails: KeyedTails,
+    // True while this handle has created a pathname whose directory entry has
+    // not been made durable yet. Cleared by the first successful durability
+    // request, so the parent sync happens once per created file and never on
+    // the append path (DUR3-01).
+    pending_pathname_parent_sync: bool,
     poisoned: bool,
     _lock: Option<WriterLock>,
 }
@@ -1943,6 +1987,10 @@ impl VarveFile {
             checkpoint_cadence: CheckpointCadence::new_empty(),
             block_tails: BlockTails::new_empty(),
             keyed_tails: KeyedTails::new_empty(),
+            // DUR3-01: this handle established the pathname, so its
+            // directory entry is not durable until the first durability
+            // request syncs the parent directory.
+            pending_pathname_parent_sync: true,
             poisoned: false,
             _lock: Some(lock),
         };
@@ -2024,6 +2072,10 @@ impl VarveFile {
             checkpoint_cadence: CheckpointCadence::new_empty(),
             block_tails: BlockTails::new_empty(),
             keyed_tails: KeyedTails::new_empty(),
+            // DUR3-01: this handle established the pathname, so its
+            // directory entry is not durable until the first durability
+            // request syncs the parent directory.
+            pending_pathname_parent_sync: true,
             poisoned: false,
             _lock: Some(lock),
         };
@@ -2067,6 +2119,7 @@ impl VarveFile {
             checkpoint_cadence,
             block_tails,
             keyed_tails: KeyedTails::new_empty(),
+            pending_pathname_parent_sync: false,
             poisoned: false,
             _lock: Some(lock),
         })
@@ -2112,6 +2165,7 @@ impl VarveFile {
             checkpoint_cadence,
             block_tails,
             keyed_tails: KeyedTails::new_empty(),
+            pending_pathname_parent_sync: false,
             poisoned: false,
             _lock: Some(lock),
         })
@@ -2151,6 +2205,7 @@ impl VarveFile {
             checkpoint_cadence,
             block_tails,
             keyed_tails: KeyedTails::new_empty(),
+            pending_pathname_parent_sync: false,
             poisoned: false,
             _lock: None,
         })
@@ -2204,6 +2259,7 @@ impl VarveFile {
                 checkpoint_cadence,
                 block_tails,
                 keyed_tails: KeyedTails::new_empty(),
+                pending_pathname_parent_sync: false,
                 poisoned: false,
                 _lock: Some(lock),
             },
@@ -3151,22 +3207,60 @@ impl VarveFile {
                 .rev()
                 .find(|entry| entry.block_id == COMMIT_BLOCK_ID)
         {
+            let info = AppendInfo::from(entry);
             self.file.flush()?;
             self.file.sync_all()?;
-            return Ok(AppendInfo::from(entry));
+            // DUR3-01: a durable commit on a file this handle created must
+            // also establish the pathname; this happens once, not per commit.
+            self.sync_created_pathname_once()?;
+            return Ok(info);
         }
         self.file.flush()?;
         self.file.sync_data()?;
         let info = self.write_commit_marker()?;
         self.file.flush()?;
         self.file.sync_all()?;
+        self.sync_created_pathname_once()?;
         Ok(info)
     }
 
+    /// Requests durable persistence of everything written so far.
+    ///
+    /// This syncs the file's contents and, for a pathname this handle created,
+    /// its parent directory entry exactly once (DUR3-01). Without the second
+    /// step a power loss could leave a fully synced object with no name on
+    /// platforms that require an explicit directory sync, which would not be
+    /// "durably persisted" in any useful sense; the atomic replacement path
+    /// already syncs the parent and reports a pending parent sync, so creation
+    /// now makes the same guarantee through the same machinery.
+    ///
+    /// The parent sync costs one directory fsync per created file, never
+    /// recurs, and is not on the append path. A failed parent sync is reported
+    /// as [`Error::PublishedButParentSyncPending`] - the contents are durable
+    /// and the pathname is visible, only its directory entry's durability is
+    /// unconfirmed - and leaves the request pending, so a later `sync` retries
+    /// it.
     pub fn sync(&mut self) -> Result<()> {
         self.ensure_not_poisoned()?;
         self.file.sync_all()?;
-        Ok(())
+        self.sync_created_pathname_once()
+    }
+
+    /// Makes a pathname created by this handle durable, at most once.
+    fn sync_created_pathname_once(&mut self) -> Result<()> {
+        if !self.pending_pathname_parent_sync {
+            return Ok(());
+        }
+        match sync_parent_directory(&self.path) {
+            Ok(()) => {
+                self.pending_pathname_parent_sync = false;
+                Ok(())
+            }
+            Err(error) => Err(Error::PublishedButParentSyncPending {
+                path: self.path.display().to_string(),
+                source: Box::new(error),
+            }),
+        }
     }
 
     pub fn blocks<T: VarveBlock>(&self) -> Result<BlockVec<T>> {
@@ -3839,6 +3933,19 @@ impl VarveFile {
     #[doc(hidden)]
     pub fn block_tail_index_touches() -> u64 {
         BLOCK_TAIL_INDEX_TOUCHES.with(|touches| touches.get())
+    }
+
+    /// Returns the cumulative number of block-tail tuples this thread has
+    /// displaced by inserting into the sorted tail vector (PERF3-03).
+    ///
+    /// Fault-testing hook only. Wholesale tail construction must not advance
+    /// this counter at all: it orders the distinct block ids once instead of
+    /// inserting each first-seen id, so a reverse-ordered index no longer pays
+    /// the `Theta(B^2)` movement the index-visit counter above cannot see.
+    #[cfg(feature = "scalable-fault-injection")]
+    #[doc(hidden)]
+    pub fn block_tail_entries_moved() -> u64 {
+        BLOCK_TAIL_ENTRIES_MOVED.with(|moved| moved.get())
     }
 
     #[cfg(feature = "mmap")]
@@ -5784,6 +5891,14 @@ fn decompress_with_algorithm(
 /// Every field is an upper bound derived from record *counts* only: producing
 /// it decodes nothing and retains no values, so a caller can size or refuse a
 /// merge before paying for it.
+///
+/// Peak resident bytes are [`Self::peak_resident_bytes`]: the merge state, the
+/// largest input's resident index, and the transient that input's open can
+/// allocate alongside its index. The transient used to be omitted, which
+/// understated the peak by `8` bytes per record of the largest input
+/// (PERF3-05); since the published contract of this family *is* "size it before
+/// you run it", an estimate that leaves a live allocation out is a defect in
+/// the deliverable itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct KeyedMergeEstimate {
@@ -5798,9 +5913,29 @@ pub struct KeyedMergeEstimate {
     /// Resident index bytes for the largest single input, which is opened
     /// whole while its records are applied.
     pub largest_input_index_bytes: u64,
+    /// Transient bytes the largest single input's open can allocate *on top of*
+    /// its resident index, and which are live at the same time as that index:
+    /// the sequence-uniqueness witness copies one `u64` per record when the
+    /// file's sequences are not already ascending in offset order (PERF3-05).
+    pub largest_input_open_transient_bytes: u64,
     /// Upper bound on the merge-state map itself, excluding the heap owned by
     /// individual keys and decoded values.
     pub max_state_bytes: u64,
+}
+
+impl KeyedMergeEstimate {
+    /// Upper bound on bytes resident at the merge's peak.
+    ///
+    /// The merge state lives for the whole operation while one input at a time
+    /// is opened, so the peak is the state plus the largest input's index plus
+    /// the transients that input's open holds alongside its index. Saturates
+    /// instead of overflowing: a saturated bound is still a refusal signal.
+    #[must_use]
+    pub fn peak_resident_bytes(&self) -> u64 {
+        self.max_state_bytes
+            .saturating_add(self.largest_input_index_bytes)
+            .saturating_add(self.largest_input_open_transient_bytes)
+    }
 }
 
 /// Estimates the resident cost of merging `base` with `deltas` for block `T`.
@@ -5869,6 +6004,14 @@ where
     estimate.largest_input_index_bytes = estimate
         .largest_input_index_bytes
         .max(index_bytes_for_count(file.index.len())?);
+    // PERF3-05: the open that produced `file` also validates sequence
+    // uniqueness, which can copy every sequence into an `8N` temporary held
+    // alongside the resident index. Charging it here keeps
+    // `peak_resident_bytes` an honest upper bound instead of one that ignores
+    // a live allocation.
+    estimate.largest_input_open_transient_bytes = estimate
+        .largest_input_open_transient_bytes
+        .max(sequence_uniqueness_transient_bytes(file.index.len())?);
     Ok(())
 }
 
@@ -5881,9 +6024,14 @@ where
 /// distinct key ever seen - including keys whose latest record is a tombstone -
 /// plus the live values that survive to the output:
 ///
-/// - time: `Theta(records + decoded bytes) + O(K-live log K-live)`;
-/// - memory: `O(K-ever + largest resident input index + retained live values)`,
-///   where `K-ever` is the number of distinct keys across all inputs.
+/// - time: `Theta(records + decoded bytes) + O(N log N) + O(K-live log K-live)`,
+///   where the `O(N log N)` term is the per-input open's sequence-uniqueness
+///   sort over that input's `N` records. It degrades to `Theta(N)` for the
+///   ordinary case of a file whose sequences ascend with offset, but the sort
+///   is the guaranteed bound (PERF3-05);
+/// - memory: `O(K-ever + largest resident input index + 8N uniqueness
+///   temporary for that input + retained live values)`, where `K-ever` is the
+///   number of distinct keys across all inputs.
 ///
 /// Nothing here spills to disk, so `K-ever` must fit in memory. Varve exports
 /// no bounded-memory external merge/compact; the scalable stream and indexed
@@ -5935,7 +6083,8 @@ where
 /// # Scale contract
 ///
 /// Identical to [`merge_keyed_files`]: resident, `O(K-ever + largest resident
-/// input index + retained live values)` memory, not PB-scale. See that
+/// input index + 8N uniqueness temporary for that input + retained live
+/// values)` memory, not PB-scale. See that
 /// function for the full bound, [`estimate_keyed_merge`] for a pre-flight
 /// estimate, and [`compact_keyed_files_with_key_limit`] for a typed guard.
 pub fn compact_keyed_files<T, P>(spec: FormatSpec, base: P, deltas: &[P], output: P) -> Result<()>
@@ -6049,10 +6198,11 @@ where
     })();
     if let Err(error) = result {
         let _ = remove_file(&temp_path);
+        remove_rewrite_temp_lock_marker(&temp_path);
         return Err(error);
     }
 
-    match replace_path_atomically(&temp_path, output) {
+    let published = match replace_path_atomically(&temp_path, output) {
         Ok(ReplaceDurability::Durable) => Ok(()),
         // Publication already happened; the temp file no longer exists and the
         // target pathname resolves to the merged generation, so the caller
@@ -6064,7 +6214,39 @@ where
             })
         }
         Err(error) => Err(preserve_temp_on_indeterminate(&temp_path, error)),
+    };
+    remove_rewrite_temp_lock_marker(&temp_path);
+    published
+}
+
+/// Removes the writer-lock marker that an internal rewrite temp left behind
+/// (STO3-01).
+///
+/// Opening the temp through [`VarveFile::create`] creates `<temp>.lock`.
+/// Dropping that writer clears the marker's *contents* but deliberately keeps
+/// the file: for a real user path the marker is a stable identity, and
+/// unlinking it while another process may already hold the OS lock on that
+/// inode would let a third process create a fresh marker at the same pathname
+/// and "acquire" a lock on a different inode - exactly the race the persistent
+/// marker exists to prevent. None of that applies to this pathname:
+///
+/// - it was generated by [`create_rewrite_temp_file`] with `create_new`, so
+///   this operation exclusively owns it;
+/// - the only way to regenerate the same name is another rewrite of the same
+///   output in the same process, and the caller holds the output's writer lock
+///   across the whole publication, so no such rewrite can be in flight;
+/// - by the time this runs the temp has been published or deleted, so the
+///   marker names a file that no longer exists.
+///
+/// The caller must therefore have dropped the temp's `VarveFile` (releasing its
+/// [`WriterLock`]) and must still hold the target's writer lock. If the temp is
+/// still present - the indeterminate-publication case, where it is preserved
+/// for out-of-band reconciliation - its marker is left with it.
+fn remove_rewrite_temp_lock_marker(temp_path: &Path) {
+    if temp_path.exists() {
+        return;
     }
+    let _ = remove_file(lock_path(temp_path));
 }
 
 /// Deletes a publication temp file after a pre-publication failure, but
@@ -7852,15 +8034,40 @@ fn mmap_index_bytes_for_count(count: usize) -> Result<u64> {
         })
 }
 
-fn validate_unique_sequences(entries: &[RecordIndexEntry]) -> Result<()> {
-    let requested = u64::try_from(entries.len())
+/// Bytes the sequence-uniqueness witness allocates for `records` entries.
+///
+/// This is the transient every resident input open can pay on top of its
+/// resident index, so [`KeyedMergeEstimate`] has to charge it (PERF3-05).
+fn sequence_uniqueness_transient_bytes(records: usize) -> Result<u64> {
+    u64::try_from(records)
         .map_err(|_| Error::ResourceArithmeticOverflow {
             resource: "sequence uniqueness index",
         })?
         .checked_mul(size_of::<u64>() as u64)
         .ok_or(Error::ResourceArithmeticOverflow {
             resource: "sequence uniqueness index",
-        })?;
+        })
+}
+
+/// Rejects a native file that reuses a record sequence.
+///
+/// Fast path (PERF3-05): the writer hands out sequences from a monotonically
+/// increasing counter, so an ordinary append-only file scanned in offset order
+/// is strictly increasing. Verifying that costs one allocation-free pass and
+/// proves uniqueness outright. Only an input whose records are *not* in
+/// ascending sequence order - a rewritten or externally reordered generation -
+/// falls back to the sorted copy, which costs `O(N log N)` time and an explicit
+/// `8N` temporary. The fallback is still the published worst case, so the
+/// resident merge estimate charges it unconditionally rather than assuming the
+/// fast path.
+fn validate_unique_sequences(entries: &[RecordIndexEntry]) -> Result<()> {
+    if entries
+        .windows(2)
+        .all(|pair| pair[0].sequence < pair[1].sequence)
+    {
+        return Ok(());
+    }
+    let requested = sequence_uniqueness_transient_bytes(entries.len())?;
     let mut sequences = Vec::new();
     sequences
         .try_reserve_exact(entries.len())
@@ -10229,6 +10436,114 @@ mod tests {
             Err(Error::LengthOverflow { .. }) | Err(Error::InvalidIndexCheckpoint)
         ));
         Ok(())
+    }
+
+    /// DUR3-01: `sync` on a file this handle created must make the pathname
+    /// durable, not only its contents - and must do so exactly once, never per
+    /// sync and never on the append path.
+    #[test]
+    fn create_then_sync_makes_the_new_pathname_durable_once() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("create-parent-sync.varve");
+        let spec = replace_test_spec();
+
+        reset_parent_directory_sync_calls();
+        let mut writer = VarveFile::create(spec, &path)?;
+        writer.push(&ReplaceTestBlock { value: 1 })?;
+        writer.push(&ReplaceTestBlock { value: 2 })?;
+        writer.flush()?;
+        assert_eq!(
+            parent_directory_sync_calls(),
+            0,
+            "creating and appending must not sync the parent directory"
+        );
+
+        writer.sync()?;
+        assert_eq!(
+            parent_directory_sync_calls(),
+            1,
+            "the first sync must make the created pathname durable"
+        );
+
+        writer.sync()?;
+        writer.push(&ReplaceTestBlock { value: 3 })?;
+        writer.flush()?;
+        writer.sync()?;
+        assert_eq!(
+            parent_directory_sync_calls(),
+            1,
+            "the pathname is durable already; later syncs must not repeat it"
+        );
+        drop(writer);
+
+        // A handle that merely opens an existing pathname created nothing, so
+        // it owes no directory entry.
+        reset_parent_directory_sync_calls();
+        let mut reopened = VarveFile::open(spec, &path)?;
+        reopened.sync()?;
+        assert_eq!(
+            parent_directory_sync_calls(),
+            0,
+            "opening an existing pathname must not sync the parent directory"
+        );
+        Ok(())
+    }
+
+    /// PERF3-03: wholesale tail construction must have no quadratic term. The
+    /// worst case is an index whose first appearances descend by block id,
+    /// which made every first-seen id shift the whole sorted vector.
+    #[test]
+    fn block_tail_construction_moves_nothing_for_reverse_ordered_block_ids() {
+        const BLOCKS: u32 = 1_024;
+
+        fn entry(block_id: u32, sequence: u64) -> RecordIndexEntry {
+            RecordIndexEntry {
+                block_id,
+                block_version: 1,
+                flags: 0,
+                sequence,
+                record_offset: sequence * 16,
+                payload_offset: sequence * 16 + 8,
+                payload_len: 8,
+                checksum: 0,
+                uncompressed_len_hint: 0,
+                footer_offset: None,
+                prev_same_block_offset: None,
+                prev_same_key_offset: None,
+                committed: false,
+            }
+        }
+
+        let mut index = Vec::new();
+        for (sequence, block_id) in (0..BLOCKS).rev().enumerate() {
+            index.push(entry(block_id, sequence as u64));
+        }
+        // A second descending round proves the tails track the *newest* record
+        // per block id, not the first.
+        for (offset, block_id) in (0..BLOCKS).rev().enumerate() {
+            index.push(entry(block_id, (BLOCKS as usize + offset) as u64));
+        }
+
+        let tails = BlockTails::from_index(&index);
+        assert_eq!(tails.tails.len(), BLOCKS as usize);
+        for (position, (block_id, _)) in tails.tails.iter().enumerate() {
+            assert_eq!(*block_id, position as u32, "tails must stay sorted by id");
+        }
+        for entry in &index[BLOCKS as usize..] {
+            assert_eq!(
+                tails.tail(entry.block_id),
+                Some(entry.record_offset),
+                "tail must be the newest record for its block id"
+            );
+        }
+
+        // Identical result to the incremental path, which is the maintained
+        // invariant; the difference is only how much movement it costs.
+        let mut incremental = BlockTails::new_empty();
+        for entry in &index {
+            incremental.note_appended(entry.block_id, entry.record_offset);
+        }
+        assert_eq!(incremental, tails);
     }
 
     #[test]

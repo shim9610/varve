@@ -1,0 +1,28 @@
+# Public-API surface fixture (API-03 / API-04 regression gate).
+#
+# A downstream crate that uses EVERY public codec helper and field type the
+# documentation tells users to put in a derived block. Deliberately NOT a
+# workspace member: a real consumer resolves the facade through its own
+# manifest, and this crate must fail exactly the way a user's crate would.
+#
+# This exists because the mandatory non-zero `SCHEMA_ID` contract for field
+# codecs was introduced without any test that a documented PUBLIC type still
+# compiles as a derived field. `ChunkedBytes` and `PackedBitmap` were both
+# silently made uncompilable by that change and shipped that way. Compiling and
+# running this crate is the gate that catches that class of regression.
+[package]
+name = "public-api-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# `compression-zstd` + `integrity` are required to CONSTRUCT a `ChunkedBytes`
+# value (docs/api-reference.md: "Compression requires the `compression-zstd`
+# feature ... `ChunkedBytes` additionally requires `integrity`"). Every other
+# type covered here is available with default features.
+varve = { path = "../../crates/varve", features = ["compression-zstd", "integrity"] }
+
+# Detach from the repository workspace: this crate must resolve `varve` the way
+# an external consumer does.
+[workspace]

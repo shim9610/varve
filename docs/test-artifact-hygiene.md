@@ -12,9 +12,9 @@ Run the full suite through the workspace test runner:
 cargo run -p varve-test-runner
 ```
 
-With no arguments it runs `cargo test --workspace --all-features`. Arguments
-are forwarded to Cargo, so focused and default-feature runs use the same
-cleanup contract:
+With no arguments it runs `cargo test --locked --workspace --all-features`.
+Arguments are forwarded to Cargo, so focused and default-feature runs use the
+same cleanup contract:
 
 ```text
 cargo run -p varve-test-runner -- test --workspace
@@ -22,15 +22,26 @@ cargo run -p varve-test-runner -- test -p varve --test roundtrip
 cargo run -p varve-test-runner -- run -p varve --example perf_bench
 ```
 
+Locked resolution is the default (REL-01). The runner inserts `--locked` after
+the Cargo subcommand — never after a literal `--`, where the arguments belong to
+the test binary — so the local completion gate resolves dependencies exactly the
+way CI does. Without it a stale `Cargo.lock` was silently refreshed by the very
+command meant to prove the committed tree builds, and the local gate then passed
+on a lockfile CI had never seen. An explicit `--locked`, `--frozen`, or
+`--offline` from the caller is preserved, so deliberately updating a lockfile
+remains possible.
+
 The runner creates a new `varve-test-session-*` directory with an atomic
 `create_dir` operation. It sets `TEMP`, `TMP`, `TMPDIR`, and
 `VARVE_TEST_SESSION_ROOT` for the child Cargo process. Consequently,
 `std::env::temp_dir()`, `tempfile`, Python temporary-file helpers, and child
 processes use the same owned session root.
 
-CI runs the default-feature and all-feature test suites through this runner
-(`.github/workflows/ci.yml`), so an artifact leaked past the session directory
-fails the build.
+CI runs the default-feature and all-feature test suites through this runner, plus
+the two singleton feature configurations that own `cfg`-exclusive behaviour
+(compression without integrity, integrity without compression) and the pinned
+MSRV job (`.github/workflows/ci.yml`), so an artifact leaked past the session
+directory fails the build.
 
 ## Success And Failure
 

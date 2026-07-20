@@ -33,12 +33,36 @@ there is no automatic migration path for these surfaces:
 - The matrix sidecar envelope is version 3. Version-1/2 sidecars are refused
   as `MatrixSidecarMismatch("sidecar version")` and simply regenerate —
   sidecars are regenerable resume state, not data.
-- The matrix layout is `VMAT` version 2 with an `MCRC` version 2 integrity
-  region (per-page commit digests instead of one CRC per commit category, and
-  no explicitly initialized per-cell metadata at create). A version 1 matrix
-  file is refused with `Error::FormatVersionMismatch { expected: 2, actual: 1 }`
+- The matrix layout is `VMAT` version 3 with an `MCRC` version 2 integrity
+  region. Version 2 introduced per-page commit digests instead of one CRC per
+  commit category and stopped explicitly initializing per-cell metadata at
+  create; version 3 adds the persisted page-index region between the static aux
+  regions and the `MCRC` region, described by two header fields appended after
+  `append_log_start` (so every earlier field keeps its index) with the reserved
+  tail shrinking from 32 to 16 bytes. A version 1 or version 2 matrix file is
+  refused with `Error::FormatVersionMismatch { expected: 3, actual: <1 or 2> }`
   and must be recreated; region lengths and total matrix file length change, so
   there is no in-place fixup.
+- Matrix open no longer walks every logical bitmap page: the pages it visits come
+  from the page index unioned with the filesystem allocated-range map. Recorded
+  trade-off — where no allocation map is available, a stray byte written out of
+  band into a page the matrix never published is no longer detected at open.
+- `PackedBitmap` is no longer accepted as a fixed-width matrix field (it has no
+  encoded width fixed by its type). It remains usable as a variable field, and
+  both it and `ChunkedBytes` now declare the stable non-zero codec `SCHEMA_ID`
+  that derived fields require — before that they could not be used as derived
+  fields at all.
+- A `VarveBlock` whose `ENDIAN`, resolved through `FormatSpec::endian`,
+  contradicts the format's own declaration for that block id is now rejected at
+  typed registration with `Error::EndianMismatch`. Manual mirrors of a generated
+  block must copy its `ENDIAN` alongside its `SCHEMA_FINGERPRINT`.
+- The first `sync`/`commit_durable` on a handle that *created* its pathname now
+  also fsyncs the parent directory, once per created file, and can return
+  `Error::PublishedButParentSyncPending` where it previously returned `Ok(())`.
+  Handles that opened an existing pathname are unchanged.
+- Decoding a very large `HashMap` under a tight explicit materialization limit
+  can now fail with `Error::LimitExceeded`: the charge is the hash table actually
+  allocated rather than a per-entry model that under-counted it.
 - Stream and disk-indexed primaries now begin with an internal creation-nonce
   record. Existing primaries keep working, but record counts, sequence numbers,
   and record offsets of newly created primaries shift by one relative to 0.3.0;

@@ -139,6 +139,10 @@ without matrix blocks continue to scan from the normal Varve header length.
 +---------------------------+
 | Matrix slot regions       |
 +---------------------------+
+| Static aux regions        |
++---------------------------+
+| Page index                |
++---------------------------+
 | Region CRC table          |
 +---------------------------+
 | Append-log record region  |
@@ -159,20 +163,21 @@ The matrix layout header stores:
 - matrix block count
 - commit category count
 - offsets and lengths for the dimension table, block table, commit maps,
-  optional offset tables, slot regions, region CRC table, and append-log start.
+  optional offset tables, slot regions, page index, region CRC table, and
+  append-log start.
 
-All integers in `VMAT` metadata are little-endian in layout version 2. Matrix
+All integers in `VMAT` metadata are little-endian in layout version 3. Matrix
 slot payloads still use the block/format endian policy for canonical field
 encoding. The append-log scanner must start from `append_log_start`, never from
 the normal header length, when the static spec contains matrix blocks.
 
-## VMAT Version 2 Header
+## VMAT Version 3 Header
 
 The header is deliberately simple and dense-layout oriented:
 
 ```text
 magic                 [u8; 4] = b"VMAT"
-layout_version        u16 = 2
+layout_version        u16 = 3
 flags                 u16
 header_len            u32
 dimension_count       u32
@@ -191,7 +196,17 @@ slot_region_len       u64
 region_crc_off        u64
 region_crc_len        u64
 append_log_start      u64
-reserved              [u8; 32]
+page_index_off        u64   // field 13, appended in v3
+page_index_len        u64   // field 14, appended in v3
+reserved              [u8; 16]
+```
+
+The two page-index fields are appended *after* `append_log_start` so every field
+defined by version 2 keeps its index; the reserved tail absorbs the 16 bytes they
+occupy. The region order is therefore
+
+```text
+... | slot region | static aux | page index | MCRC | append log
 ```
 
 Tables use length-prefixed UTF-8 names and fixed-width integers. Offsets are
@@ -203,18 +218,49 @@ table ranges that overlap incorrectly, point outside the file, or place
 P0 or `integrity: none` files set `region_crc_off = 0` and
 `region_crc_len = 0`. Static auxiliary regions, when declared by the format
 spec, are derived in declaration order immediately after the slot region. VMAT
-v2 does not store an auxiliary table; readers reconstruct aux offsets from the
+v3 does not store an auxiliary table; readers reconstruct aux offsets from the
 static `FormatSpec`, so changing aux names, byte lengths, or declaration order
 is a schema change.
 
 Layout version 2 replaced the version 1 integrity representation (see the next
-section). A version 1 artifact is refused at open with the typed
-`Error::FormatVersionMismatch { expected: 2, actual: 1 }`, matching the
+section), and layout version 3 added the page-index region. A version 1 or
+version 2 artifact is refused at open with the typed
+`Error::FormatVersionMismatch { expected: 3, actual: <1 or 2> }`, matching the
 container-version convention: such a file is stale and regenerable, never
-migrated in place.
+migrated in place. The `MCRC` integrity table itself remains version 2.
+
+### Page Index
+
+The page index is the bounded, persisted answer to "which bitmap pages does this
+file actually have data in". It holds one 8-byte entry per page that has been
+published with a set bit, appended the first time such a page is published, and
+encoded as `page + 1` so that a zero entry terminates the array. There is
+deliberately no count field: without one there is no torn-count failure mode, and
+the scan that reads it grows geometrically from a 64-byte request, so an empty
+index costs one small read no matter how wide the bitmap is.
+
+An entry is written *before* the page and digest it describes. A torn append can
+therefore leave an entry naming a page that still reads as uninitialised zeros —
+a state open already accepts — but never a written page with no entry.
+
+Open builds its visit set as the union of the index and, where the platform can
+answer, the pages the filesystem allocation map reports as written, enumerated by
+walking allocated *ranges* rather than pages. Neither term derives from the
+logical page count, and an unavailable or over-cap allocation map falls back to
+the index instead of treating every logical page as readable data. The page-digest
+array is deliberately not mapped back into the visit set: one allocation granule
+spans thousands of 8-byte digest slots, which would reinstate a width-proportional
+count. The index covers torn commits instead.
+
+Trade-off, recorded explicitly: when no allocation map is available, open visits
+only indexed pages, so a stray byte written out of band into a page the matrix
+never published is not detected at open. This is the same class as the documented
+hole-skip trade-off — a CRC cannot authenticate metadata against anyone who can
+write the file. With an allocation map present, which is the normal case,
+detection is unchanged.
 
 When `integrity: crc32` is enabled, the region CRC table is placed immediately
-after the derived aux region and before `append_log_start`.
+after the page index and before `append_log_start`.
 
 Region CRC table (`MCRC` v2):
 
@@ -275,6 +321,23 @@ bitmap bytes are therefore proportional to the pages that carry state, not to
 cell count — a freshly created matrix holds none at any size — and the running
 set-bit total each sparse map maintains makes committed-cell counting (and so
 resume signals and recovery reports) `O(1)` instead of a full scan.
+
+Residency is also released, not just acquired. Each page carries its own set-bit
+count, so "is this page now all zero" is an `O(1)` question on the page that was
+just mutated; a page that loses its final set bit is evicted immediately and its
+bytes refunded to the resident bitmap budget. Nothing scans the page or the map
+to decide that, so it costs nothing on the mutation path, and a long-running
+sparse set/clear workload no longer holds residency proportional to every page it
+has ever touched. Loading a page is idempotent, so a duplicate page-index entry
+cannot double-count.
+
+Open cost is bounded by the pages that carry data, not by the bitmap width: the
+visit set comes from the page index and the allocation map (see *Page Index*
+above), and the index scan itself starts at 64 bytes and grows geometrically.
+Not everything in the matrix is width-independent: `rebuild_commit_map_from_crc`
+is linear in cells by construction — it re-derives every cell's validity from its
+stored CRC — and `clear_category`'s digest reset falls back to a per-page write
+loop where hole punching is unavailable.
 
 Open is bounded the same way. Authenticating an uninitialized page means
 proving it still reads as zero, which would otherwise mean streaming every page
@@ -341,7 +404,7 @@ increasing `layout_version`; v2 keeps CRC offsets derived from table order.
 P0 includes dense matrix declarations, runtime dimensions, `VMAT` layout
 persistence, fixed-stride slots, direct addressing, commit maps, same-size
 overwrite, `NotCommitted`, and mixed matrix plus append-log scan behavior.
-In VMAT v2, a cell commit category belongs to exactly one matrix block.
+In VMAT v3, a cell commit category belongs to exactly one matrix block.
 
 P0 excludes recovery decisions, sidecars, compression, zero-copy, sparse or
 offset-table-backed matrices, declarative migration, and per-cell crash
@@ -477,7 +540,7 @@ Opening a matrix file creates a snapshot of layout metadata and commit maps.
 It does not copy the preallocated slot region. Applications must not overlap a
 reader with an in-place write to a slot that reader may access. True immutable
 concurrent snapshots require versioned slots/generations or a read-lease design
-outside VMAT v2.
+outside VMAT v3.
 Reading a cell:
 
 1. validates the key

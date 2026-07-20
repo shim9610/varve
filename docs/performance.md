@@ -26,6 +26,17 @@ The optional numeric argument is the record count. This example reports
 encode/decode, append, open/scan, merge, compact, and direct base+delta compact
 paths.
 
+Read the throughput column with its unit (BENCH-01). Codec, append, and
+open/scan lines are per **record**, and `records` really is their denominator.
+Merge and compact are per **input event**: their input is the base file plus
+every delta record — updates, deletes, and inserts — and their output is the set
+of surviving live values, which is smaller than both. Each of those lines also
+prints the live values emitted, and the run asserts that number against the file
+it actually produced. Reporting all three against the original base record count,
+as earlier revisions did, produced a rate that was neither the events consumed
+nor the values emitted; historical tables below predate the fix, so their
+merge/compact throughput figures should be read as elapsed time only.
+
 ## Reproducible Comparison Protocol
 
 For security or storage changes, build once, run one unrecorded warmup, then
@@ -183,7 +194,34 @@ bounded by the bytes actually written rather than by cell count.
 
 ## Output To Watch
 
-The smoke suite reports wall time, records/sec, and file size. Compare small, medium, and large cases. A suspicious change is usually visible as large-case growth that is much worse than the smaller cases, especially on open/scan, typed ordinal lookup, materialized keyed state, merge, or compact.
+The smoke suite reports wall time, records/sec, and file size (see the note
+above on what the benchmark's merge/compact denominators mean). Compare small, medium, and large cases. A suspicious change is usually visible as large-case growth that is much worse than the smaller cases, especially on open/scan, typed ordinal lookup, materialized keyed state, merge, or compact.
+
+## Scale Contracts Worth Re-checking
+
+These are the bounds the current implementation claims. A change that violates
+one is a regression even if wall time happens not to move on a small fixture.
+
+- Matrix open visits pages derived from the persisted page index and the
+  filesystem allocated-range map — never `0..page_count`. An extent cap must
+  never be allowed to reinterpret a sparse file as dense.
+- A commit-bit mutation rehashes exactly one 4 KiB page, and a sparse bitmap page
+  whose last set bit is cleared is evicted and refunded immediately, in `O(1)` on
+  the mutated page. Neither costs a scan of the page or of the map.
+- Resident block-tail construction is `O(N + B log B)` time and `O(B)` memory for
+  `N` records over `B` distinct block ids. The append path pays at most one
+  sorted-vector insertion per distinct id for the life of a file, and no hashing
+  per record.
+- Keyed merge/compact is resident: time
+  `Theta(records + decoded bytes) + O(N log N) + O(K-live log K-live)` and memory
+  `O(K-ever + largest input index + 8N uniqueness temporary + retained live
+  values)`. Size it with `KeyedMergeEstimate::peak_resident_bytes()`. The
+  `O(N log N)` sort degrades to `Theta(N)` for a file whose sequences ascend with
+  offset, which is what a Varve writer produces, but it is the guaranteed bound.
+- Typed block registration for an identity-bearing format takes no process-global
+  lock and does no address-keyed cache lookup on the append path.
+- A created pathname costs exactly one parent-directory fsync, on the first
+  `sync`/`commit_durable`, and never again.
 
 ## Current Regression Rules
 

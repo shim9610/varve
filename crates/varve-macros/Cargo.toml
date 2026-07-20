@@ -7,6 +7,10 @@ rust-version.workspace = true
 version.workspace = true
 description = "Procedural macros for declaring Varve binary formats and blocks"
 documentation = "https://docs.rs/varve-macros"
+# DOC-01: see the note in `crates/varve-core/Cargo.toml`. README is pulled in
+# from the repository root; `LICENSE-MIT` and `LICENSE-APACHE` are files in this
+# directory because `include` cannot reference paths outside the package.
+readme = "../../README.md"
 
 [features]
 default = []

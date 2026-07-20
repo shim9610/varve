@@ -8,15 +8,33 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # CI-03: every third-party gate is pinned to an immutable identity so a future
+  # run of this workflow evaluates the same code it evaluates today. Action refs
+  # are commit ids (a tag can be moved; a commit id cannot), with the human
+  # readable release next to them, and installed cargo tools carry an exact
+  # `--version`. Bump these deliberately, in a commit that says so.
+  #
+  #   actions/checkout                v4.2.2
+  #   Swatinem/rust-cache             v2.9.1
+  #   EmbarkStudios/cargo-deny-action v2.1.1
+  #   dtolnay/rust-toolchain          master (the action pins no toolchain of
+  #                                   its own; the toolchain is the `toolchain`
+  #                                   input below)
+  CARGO_AUDIT_VERSION: 0.22.2
+  # CI-02: the floor the packages declare (`rust-version` in the workspace
+  # Cargo.toml). Kept here so the MSRV job and the manifests are edited
+  # together.
+  MSRV: 1.95.0
 
 jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -59,20 +77,22 @@ jobs:
             }
           - { name: all-features, flags: "--workspace --all-features" }
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.features.name }}
       - name: Clippy
         run: cargo clippy --locked --all-targets ${{ matrix.features.flags }} -- -D warnings
 
-  # Full test runs stay limited to the default and all-feature sets; the
-  # feature matrix above already type-checks and lints every other
-  # combination. Tests go through the hygiene runner so leaked temp
-  # artifacts fail CI (docs/test-artifact-hygiene.md).
+  # Full test runs on both platforms stay limited to the default and all-feature
+  # sets; the feature matrix above type-checks and lints every other
+  # combination, and `feature-tests` below runs the configurations that have
+  # behaviour no other job can reach. Tests go through the hygiene runner so
+  # leaked temp artifacts fail CI (docs/test-artifact-hygiene.md).
   test:
     name: test (${{ matrix.features.name }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -81,16 +101,91 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         features:
-          - { name: default, flags: "" }
-          - { name: all-features, flags: "--all-features" }
+          - { name: default, flags: "--workspace" }
+          - { name: all-features, flags: "--workspace --all-features" }
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: test-${{ matrix.features.name }}
       - name: Test
-        run: cargo run --locked -p varve-test-runner -- test --workspace --locked ${{ matrix.features.flags }}
+        run: cargo run --locked -p varve-test-runner -- test --locked ${{ matrix.features.flags }}
+
+  # CI-01: the two configurations below own tests that run in NO other job.
+  # `compression.rs` gates behaviour on `compression-zstd` *without* `integrity`
+  # and on `integrity` *without* `compression-zstd`; the default job has
+  # neither feature and the all-features job has both, so those assertions were
+  # compiled out of every test run and only ever type-checked by Clippy.
+  #
+  # Deliberately scoped: single OS, and only `--test compression`, which is the
+  # only test binary in the workspace that contains `not(feature = ...)` cases
+  # (`compression.rs`). Adding the full feature matrix — or the whole package
+  # suite under each singleton — would multiply CI time for combinations the two
+  # jobs above already cover, without reaching any additional assertion.
+  feature-tests:
+    name: test (${{ matrix.features.name }}, ubuntu-latest)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - {
+              name: compression-without-integrity,
+              flags: "-p varve --no-default-features --features compression-zstd --test compression",
+            }
+          - {
+              name: integrity-without-compression,
+              flags: "-p varve --no-default-features --features integrity --test compression",
+            }
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: test-${{ matrix.features.name }}
+      - name: Test
+        run: cargo run --locked -p varve-test-runner -- test --locked ${{ matrix.features.flags }}
+
+  # CI-02: the packages declare `rust-version = 1.95`. Every other job installs
+  # moving stable, so once stable advances past the floor nothing proves the
+  # floor still builds. This job pins the declared MSRV exactly and both checks
+  # and tests against it, which is what makes the manifest claim true rather
+  # than aspirational.
+  msrv:
+    # Literal, not `${{ env.MSRV }}`: the `env` context is not available in
+    # `jobs.<id>.name`. The value is asserted against the manifests below.
+    name: msrv (1.95.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: ${{ env.MSRV }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: msrv
+      - name: Declared MSRV matches the toolchain under test
+        run: |
+          declared="$(cargo metadata --locked --no-deps --format-version 1 \
+            | tr ',' '\n' | grep -o '"rust_version":"[^"]*"' | head -n 1 \
+            | cut -d'"' -f4)"
+          echo "manifest rust-version: ${declared}"
+          case "${MSRV}" in
+            "${declared}"|"${declared}".*) ;;
+            *)
+              echo "::error::MSRV job pins ${MSRV} but the manifests declare ${declared}"
+              exit 1
+              ;;
+          esac
+      - name: cargo check
+        run: cargo check --locked --workspace --all-targets --all-features
+      - name: cargo test
+        run: cargo run --locked -p varve-test-runner -- test --locked --workspace --all-features
 
   # API2-05 regression guard: a downstream crate that renames the varve
   # dependency (`vv = { package = "varve", … }`) must compile and run with no
@@ -103,9 +198,11 @@ jobs:
     name: renamed-dependency fixture
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: renamed-dependency
           workspaces: tools/rename-fixture
@@ -113,20 +210,47 @@ jobs:
         working-directory: tools/rename-fixture
         run: cargo run --locked
 
+  # API-03/API-04 regression guard, and the structural gate for the whole class:
+  # a downstream crate that derives blocks over EVERY public codec and field
+  # type the documentation tells users to use. Round 3 added a mandatory
+  # non-zero `SCHEMA_ID` contract for field codecs and never gave the built-in
+  # public types `ChunkedBytes` and `PackedBitmap` an identity, so the derive
+  # macro began rejecting documented public API. No in-workspace test noticed,
+  # because none of them derived a block over the public surface the way a
+  # consumer does. This crate is outside the workspace for the same reason
+  # `rename-fixture` is: it must resolve `varve` through its own manifest.
+  public-api:
+    name: public-api fixture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: public-api
+          workspaces: tools/public-api-fixture
+      - name: Build and run the public-API fixture
+        working-directory: tools/public-api-fixture
+        run: cargo run --locked
+
   # Release gate: audit/deny failures block the merge.
   supply-chain:
     name: deny + audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
       - name: cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
       - name: cargo-audit
         run: |
-          cargo install cargo-audit --locked
+          cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION"
           cargo audit
 
   # REL-01 release gate: `fuzz/` is an independent workspace with its own
@@ -140,15 +264,17 @@ jobs:
     name: fuzz workspace (locked)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
       # Before any caching or tooling step: `Swatinem/rust-cache` and
       # cargo-deny both run an unlocked `cargo metadata`, which would rewrite a
       # stale lockfile and mask the very defect this job exists to catch.
       - name: Locked resolution
         working-directory: fuzz
         run: cargo metadata --locked --format-version 1 > /dev/null
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: fuzz
           workspaces: fuzz
@@ -157,18 +283,48 @@ jobs:
         run: cargo check --locked --all-targets
       - name: cargo-audit
         run: |
-          cargo install cargo-audit --locked
+          cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION"
           cargo audit --file fuzz/Cargo.lock
       # cargo-deny resolves `fuzz/deny.toml` from the fuzz workspace root; that
       # policy allows NCSA for `libfuzzer-sys`, which the publishable
       # workspace's policy deliberately does not.
       - name: cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
           manifest-path: fuzz/Cargo.toml
       - name: Fuzz lockfile was not rewritten
         run: git diff --exit-code -- fuzz/Cargo.lock
+
+  # DOC-01 release gate: the published `.crate` files must carry the README and
+  # the license texts, not just a license expression in metadata. `cargo package
+  # --list` is the authority on what a consumer actually receives, so the lists
+  # are printed here and the required files are asserted.
+  package-contents:
+    name: package contents
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: package-contents
+      - name: Packaged file lists include README and licenses
+        run: |
+          set -euo pipefail
+          for package in varve varve-core varve-macros; do
+            echo "=== ${package} ==="
+            listing="$(cargo package --locked --no-verify -p "${package}" --list)"
+            echo "${listing}"
+            for required in README.md LICENSE-MIT LICENSE-APACHE; do
+              if ! grep -qx "${required}" <<<"${listing}"; then
+                echo "::error::${package} package omits ${required}"
+                exit 1
+              fi
+            done
+          done
 
   # Build the committed tree exactly as a source package consumer sees it:
   # `git archive` contains only tracked files, so a workspace member or
@@ -178,8 +334,10 @@ jobs:
     name: clean source archive
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
       - name: Unpack tracked files only
         run: git archive --format=tar --prefix=varve-archive/ HEAD | tar -x -C "$RUNNER_TEMP"
       - name: cargo metadata
@@ -197,3 +355,12 @@ jobs:
       - name: cargo check (fuzz workspace)
         working-directory: ${{ runner.temp }}/varve-archive/fuzz
         run: cargo check --locked --all-targets
+      # The two out-of-workspace fixtures are tracked files too, and neither of
+      # the checks above resolves them. A fixture whose sources or lockfile were
+      # never committed must fail here, not in its own job on the next run.
+      - name: cargo metadata (rename fixture)
+        working-directory: ${{ runner.temp }}/varve-archive/tools/rename-fixture
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      - name: cargo metadata (public-api fixture)
+        working-directory: ${{ runner.temp }}/varve-archive/tools/public-api-fixture
+        run: cargo metadata --locked --format-version 1 > /dev/null

@@ -12,6 +12,8 @@ durability model:
 - `flush` pushes buffered bytes to the operating system
 - `sync` requests durable persistence
 - no per-cell fsync is implied
+- `sync` (and `commit_durable`) additionally makes a pathname *created by that
+  handle* durable — see "Created Pathname Durability" below
 - a returned write may be visible through the current writer handle before it is
   crash-durable
 
@@ -25,6 +27,35 @@ If publication succeeds but the writer cannot reopen the published pathname,
 Varve returns `PublishedButRebindFailed` and poisons that writer. This is not a
 publication rollback: callers must reopen and reconcile instead of blindly
 retrying the operation.
+
+## Created Pathname Durability
+
+Decision (DUR-01): `sync` and `commit_durable` establish the durability of a
+pathname the calling handle created, in addition to the file's contents.
+
+`sync_all` makes the file's bytes durable, but on platforms that require an
+explicit directory sync it does not make the newly created *directory entry*
+durable. A fully synced object with no surviving name does not deliver the
+"durable persistence" the public contract promises, and the atomic replacement
+path already syncs the parent directory and reports a pending parent sync — so a
+create path that did not was internally inconsistent with the rest of the model.
+
+The rule, precisely:
+
+- the parent directory is fsynced on the **first** successful `sync` or
+  `commit_durable` of a handle that created its pathname, and never again;
+- it costs one directory fsync per created file. It is not per sync, not per
+  commit, and never on the append path;
+- a handle that merely **opened** an existing pathname does not re-establish it,
+  because that name's durability is not this handle's to claim;
+- if the platform refuses the directory sync, the result is the typed
+  `Error::PublishedButParentSyncPending` rather than a silent success. The file
+  contents are durable and the pathname is visible; only the directory entry's
+  durability is unconfirmed, and the request stays pending so a later `sync`
+  retries it.
+
+This is a behaviour change: a first `sync` on a created file can now return
+`PublishedButParentSyncPending` where it previously returned `Ok(())`.
 
 ## Single-Writer Lock On The Native File Object
 
