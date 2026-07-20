@@ -787,7 +787,41 @@ fn note_block_tail_entries_moved(count: u64) {
 /// that record carried.
 #[derive(Debug, Default)]
 struct KeyedTails {
-    tails: HashMap<u32, HashMap<Vec<u8>, u64>>,
+    tails: HashMap<u32, KeyedTailMap>,
+}
+
+/// One block id's tail map plus the running total of the key payload bytes it
+/// owns (API3-02).
+///
+/// The total is maintained incrementally - one addition on the append that
+/// introduces a key, nothing at all when an existing key is overwritten - so
+/// charging the cache against [`ReadLimits::max_keyed_tail_bytes`] stays O(1)
+/// per append. Recomputing it by summing key lengths would be Theta(distinct
+/// keys) on the append hot path and is exactly what this field exists to
+/// avoid.
+#[derive(Debug, Default)]
+struct KeyedTailMap {
+    offsets: HashMap<Vec<u8>, u64>,
+    key_payload_bytes: u64,
+}
+
+impl KeyedTailMap {
+    /// Bytes this map is accountable for: its inline storage plus the key
+    /// payload heap it owns. Excludes `HashMap` control bytes and load-factor
+    /// slack, which the charge deliberately does not claim to cover.
+    fn charge_for(&self, additional_entries: usize, additional_key_bytes: u64) -> Result<u64> {
+        let inline = allocation_bytes::<(Vec<u8>, u64)>(
+            self.offsets.len().saturating_add(additional_entries),
+            "keyed tail offsets",
+        )?;
+        inline
+            .checked_add(self.key_payload_bytes)
+            .and_then(|total| total.checked_add(additional_key_bytes))
+            .ok_or(Error::AllocationFailed {
+                resource: "keyed tail offsets",
+                requested: u64::MAX,
+            })
+    }
 }
 
 impl KeyedTails {
@@ -803,6 +837,69 @@ impl KeyedTails {
 
     fn invalidate_all(&mut self) {
         self.tails.clear();
+    }
+}
+
+#[cfg(feature = "scalable-fault-injection")]
+std::thread_local! {
+    /// Armed pre-append keyed-tail reservation failures (API3-01).
+    static INJECTED_KEYED_TAIL_RESERVATION_FAILURES: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+    /// Armed post-append keyed-tail reservation losses (API3-01).
+    static INJECTED_KEYED_TAIL_COMMIT_LOSSES: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+/// Consumes one armed keyed-tail reservation failure (API3-01).
+///
+/// Inert without the `scalable-fault-injection` feature. Thread-local so
+/// concurrently running tests cannot arm each other's writers.
+#[inline]
+fn take_injected_keyed_tail_reservation_failure(requested: u64) -> Result<()> {
+    #[cfg(feature = "scalable-fault-injection")]
+    {
+        let armed = INJECTED_KEYED_TAIL_RESERVATION_FAILURES.with(|count| {
+            let current = count.get();
+            if current != 0 {
+                count.set(current - 1);
+            }
+            current != 0
+        });
+        if armed {
+            return Err(Error::AllocationFailed {
+                resource: "keyed tail offsets",
+                requested,
+            });
+        }
+    }
+    #[cfg(not(feature = "scalable-fault-injection"))]
+    let _ = requested;
+    Ok(())
+}
+
+/// Consumes one armed post-append keyed-tail reservation loss (API3-01).
+///
+/// Models the otherwise unreachable state in which the slot reserved before
+/// the append is no longer usable afterwards, so the infallible commit's
+/// discard-the-cache fallback can be exercised deterministically. Inert
+/// without the `scalable-fault-injection` feature.
+#[inline]
+fn take_injected_keyed_tail_commit_loss() -> bool {
+    #[cfg(feature = "scalable-fault-injection")]
+    {
+        INJECTED_KEYED_TAIL_COMMIT_LOSSES.with(|count| {
+            let current = count.get();
+            if current != 0 {
+                count.set(current - 1);
+            }
+            current != 0
+        })
+    }
+    #[cfg(not(feature = "scalable-fault-injection"))]
+    {
+        false
     }
 }
 
@@ -1583,6 +1680,59 @@ impl VarveWriter {
         self.file.key_tail_offsets::<T>()
     }
 
+    /// Reserves - and charges - the caller-owned keyed-tail slot that the
+    /// append which follows will occupy (API3-02).
+    ///
+    /// This is the generated keyed writer's counterpart to
+    /// `VarveFile::reserve_keyed_tail_slot`. The generated writer owns a
+    /// `HashMap<T::Key, u64>` per keyed block and used to grow it with a bare
+    /// `HashMap::insert` *after* the append. That insert is infallible in
+    /// signature only: it can allocate, and an allocation the allocator
+    /// refuses aborts the process instead of returning a typed error, with no
+    /// configured limit able to refuse the growth first.
+    ///
+    /// Calling this before the append gives the growth both properties the
+    /// resident path already has:
+    ///
+    /// - it is **charged** against [`ReadLimits::max_keyed_tail_bytes`] (key
+    ///   [`ReadLimitKey::KeyedTailBytes`]) before the memory is taken, so
+    ///   policy - not just the allocator - can refuse it;
+    /// - it is **fallible before the record becomes authoritative**, so the
+    ///   post-append `insert` cannot allocate and therefore cannot fail after
+    ///   the append it describes has succeeded (API3-01).
+    ///
+    /// API3-05: this charges only the *incremental* growth. The map the
+    /// generated writer starts from is built at writer construction by
+    /// [`VarveFile::key_tail_offsets`], which charges its own peak against the
+    /// same key - so the ceiling bounds the whole map, not merely what the
+    /// session adds to it.
+    ///
+    /// A key already present in `tails` needs no capacity and is charged
+    /// nothing: its slot is overwritten in place. The charged value is the
+    /// inline storage `(len + 1) * size_of::<(K, u64)>()`. Unlike the resident
+    /// path it cannot observe heap owned by `K`, because the generated writer
+    /// stores `T::Key` rather than a canonical byte payload; the value is
+    /// therefore an inline-storage charge, not a whole-structure bound.
+    #[doc(hidden)]
+    pub fn reserve_keyed_tail_slot<K>(&self, tails: &mut HashMap<K, u64>, key: &K) -> Result<()>
+    where
+        K: Eq + Hash,
+    {
+        if tails.contains_key(key) {
+            return Ok(());
+        }
+        let requested =
+            allocation_bytes::<(K, u64)>(tails.len().saturating_add(1), "keyed tail offsets")?;
+        self.spec()
+            .read_limits
+            .check(ReadLimitKey::KeyedTailBytes, requested)?;
+        tails.try_reserve(1).map_err(|_| Error::AllocationFailed {
+            resource: "keyed tail offsets",
+            requested,
+        })?;
+        Ok(())
+    }
+
     pub fn push<T: VarveBlock>(&mut self, block: &T) -> Result<u64> {
         self.file.push(block)
     }
@@ -2345,16 +2495,18 @@ impl VarveFile {
         }
         self.ensure_write()?;
         let key = encode_internal_key_payload::<T>(self.spec, &block.key())?;
-        let previous = self.keyed_tail_map::<T>()?.get(&key).copied();
+        // API3-01: every fallible part of the tail-cache update happens here,
+        // strictly before the append that the update describes. See
+        // [`VarveFile::reserve_keyed_tail_slot`].
+        let previous = self.reserve_keyed_tail_slot::<T>(&key)?;
         let info = self.push_with_prev_key_info_unlinked(block, previous)?;
-        let offset = info.record_offset;
-        self.insert_keyed_tail::<T>(key, offset)?;
+        self.commit_keyed_tail(T::ID, key, info.record_offset);
         Ok(info)
     }
 
     /// Returns the maintained keyed tails for `T`, building them from the
     /// resident index the first time this block type is used.
-    fn keyed_tail_map<T>(&mut self) -> Result<&mut HashMap<Vec<u8>, u64>>
+    fn keyed_tail_map<T>(&mut self) -> Result<&mut KeyedTailMap>
     where
         T: VarveKeyedBlock,
         T::Key: Eq + Hash,
@@ -2362,18 +2514,57 @@ impl VarveFile {
         if !self.keyed_tails.tails.contains_key(&T::ID) {
             let spec = self.spec;
             let typed = self.key_tail_offsets::<T>()?;
+            // API3-05: `typed` stays alive for the whole transcoding loop
+            // below, so every charge taken here adds its inline storage to the
+            // map being built. The charge therefore gates the *peak* of the
+            // build, not just what is retained afterwards.
+            let typed_inline =
+                allocation_bytes::<(T::Key, u64)>(typed.len(), "keyed tail offsets")?;
             let requested = allocation_bytes::<(Vec<u8>, u64)>(typed.len(), "keyed tail offsets")?;
-            let mut built: HashMap<Vec<u8>, u64> = HashMap::new();
+            let mut built = KeyedTailMap::default();
+            spec.read_limits.check(
+                ReadLimitKey::KeyedTailBytes,
+                typed_inline
+                    .checked_add(requested)
+                    .ok_or(Error::AllocationFailed {
+                        resource: "keyed tail offsets",
+                        requested: u64::MAX,
+                    })?,
+            )?;
             built
+                .offsets
                 .try_reserve(typed.len())
                 .map_err(|_| Error::AllocationFailed {
                     resource: "keyed tail offsets",
                     requested,
                 })?;
             for (key, offset) in &typed {
-                built.insert(encode_internal_key_payload::<T>(spec, key)?, *offset);
+                let payload = encode_internal_key_payload::<T>(spec, key)?;
+                // The key payload heap is charged as it accumulates, one
+                // payload at a time. The single payload just encoded is
+                // already allocated when it is charged - it is bounded by the
+                // per-key limits that governed the record it came from - but
+                // no *second* payload is taken until this one is admitted.
+                let live = typed_inline
+                    .checked_add(requested)
+                    .and_then(|total| total.checked_add(built.key_payload_bytes))
+                    .and_then(|total| total.checked_add(payload.len() as u64))
+                    .ok_or(Error::AllocationFailed {
+                        resource: "keyed tail offsets",
+                        requested: u64::MAX,
+                    })?;
+                spec.read_limits.check(ReadLimitKey::KeyedTailBytes, live)?;
+                built.key_payload_bytes =
+                    built.key_payload_bytes.saturating_add(payload.len() as u64);
+                built.offsets.insert(payload, *offset);
             }
-            let requested = allocation_bytes::<(u32, HashMap<Vec<u8>, u64>)>(
+            // API3-02: the completed map is charged to the same runtime limit
+            // the incremental growth is charged to, so a file whose distinct
+            // keys alone exceed the configured keyed-tail budget is refused
+            // here rather than retained.
+            spec.read_limits
+                .check(ReadLimitKey::KeyedTailBytes, built.charge_for(0, 0)?)?;
+            let requested = allocation_bytes::<(u32, KeyedTailMap)>(
                 self.keyed_tails.tails.len().saturating_add(1),
                 "keyed tail cache",
             )?;
@@ -2393,22 +2584,93 @@ impl VarveFile {
             .expect("keyed tail map for this block id was just installed"))
     }
 
-    fn insert_keyed_tail<T>(&mut self, key: Vec<u8>, record_offset: u64) -> Result<()>
+    /// Resolves `key`'s current predecessor *and* reserves the tail-cache slot
+    /// the append that follows will occupy (API3-01).
+    ///
+    /// The generic keyed mutation paths used to append first and only then
+    /// grow the resident tail cache. That ordering could return `Err` from a
+    /// cache reservation after the record or tombstone was already written,
+    /// indexed and published in writer state: the caller read "nothing
+    /// happened" while the record existed, and - worse - the stale cached
+    /// predecessor survived, so the next generic keyed mutation on the same
+    /// writer linked *around* the record that had in fact succeeded, silently
+    /// truncating the physical keyed chain.
+    ///
+    /// Every fallible step - building the map from the resident index,
+    /// the allocation arithmetic, and the `try_reserve` - therefore happens
+    /// here, before the append. Only the infallible
+    /// [`VarveFile::commit_keyed_tail`] runs afterwards, so a generic keyed
+    /// mutation can no longer fail after it has become authoritative.
+    ///
+    /// A key already present needs no capacity: its slot is overwritten in
+    /// place.
+    ///
+    /// API3-02: the growth is additionally *charged*, before it is taken,
+    /// against [`ReadLimits::max_keyed_tail_bytes`]. `try_reserve` alone only
+    /// reports an allocation the allocator refuses; the charge is what makes a
+    /// large-but-satisfiable cache refusable by configured policy.
+    ///
+    /// The charged value is the map's inline storage,
+    /// `(len + 1) * size_of::<(Vec<u8>, u64)>()`, plus the key payload bytes
+    /// the map owns - here the payloads already resident plus the one about to
+    /// be inserted. It is checked per keyed block id, not summed across block
+    /// ids, and it excludes `HashMap` control bytes and load-factor slack.
+    fn reserve_keyed_tail_slot<T>(&mut self, key: &[u8]) -> Result<Option<u64>>
     where
         T: VarveKeyedBlock,
         T::Key: Eq + Hash,
     {
+        let spec = self.spec;
         let tails = self.keyed_tail_map::<T>()?;
-        let requested = allocation_bytes::<(Vec<u8>, u64)>(
-            tails.len().saturating_add(1),
-            "keyed tail offsets",
-        )?;
-        tails.try_reserve(1).map_err(|_| Error::AllocationFailed {
-            resource: "keyed tail offsets",
-            requested,
-        })?;
-        tails.insert(key, record_offset);
-        Ok(())
+        if let Some(previous) = tails.offsets.get(key).copied() {
+            return Ok(Some(previous));
+        }
+        let requested = tails.charge_for(1, key.len() as u64)?;
+        // API3-02: charge the growth to a runtime resource limit, not only
+        // to the allocator. `try_reserve` alone turns an *impossible*
+        // allocation into a typed error but places no policy ceiling on a
+        // large-but-satisfiable cache, so a file with many distinct keys could
+        // grow the resident tail cache without any configured bound refusing
+        // it.
+        spec.read_limits
+            .check(ReadLimitKey::KeyedTailBytes, requested)?;
+        take_injected_keyed_tail_reservation_failure(requested)?;
+        tails
+            .offsets
+            .try_reserve(1)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "keyed tail offsets",
+                requested,
+            })?;
+        Ok(None)
+    }
+
+    /// Records `key`'s new tail after the append became authoritative
+    /// (API3-01). Infallible by construction.
+    ///
+    /// [`VarveFile::reserve_keyed_tail_slot`] already reserved the slot, so the
+    /// insert cannot allocate. If the reservation is nevertheless not
+    /// observable - the map was dropped in between, or capacity is somehow
+    /// gone - the cached map for this block id is *discarded* rather than left
+    /// holding the superseded predecessor. Dropping it is allocation-free and
+    /// always safe: the next generic keyed mutation rebuilds it from the
+    /// resident index, which already contains this record. The one outcome
+    /// this must never produce is a surviving stale predecessor.
+    fn commit_keyed_tail(&mut self, block_id: u32, key: Vec<u8>, record_offset: u64) {
+        let reservation_lost = take_injected_keyed_tail_commit_loss();
+        match self.keyed_tails.tails.get_mut(&block_id) {
+            Some(tails)
+                if !reservation_lost
+                    && (tails.offsets.contains_key(&key)
+                        || tails.offsets.capacity() > tails.offsets.len()) =>
+            {
+                let payload_len = key.len() as u64;
+                if tails.offsets.insert(key, record_offset).is_none() {
+                    tails.key_payload_bytes = tails.key_payload_bytes.saturating_add(payload_len);
+                }
+            }
+            _ => self.keyed_tails.invalidate(block_id),
+        }
     }
 
     pub fn push_with_prev_key_info<T: VarveBlock>(
@@ -2461,10 +2723,11 @@ impl VarveFile {
         }
         self.ensure_write()?;
         let key_payload = encode_internal_key_payload::<T>(self.spec, key)?;
-        let previous = self.keyed_tail_map::<T>()?.get(&key_payload).copied();
+        // API3-01: reserve before the tombstone becomes authoritative; see
+        // [`VarveFile::reserve_keyed_tail_slot`].
+        let previous = self.reserve_keyed_tail_slot::<T>(&key_payload)?;
         let info = self.delete_with_prev_key_info_unlinked::<T>(key, previous)?;
-        let offset = info.record_offset;
-        self.insert_keyed_tail::<T>(key_payload, offset)?;
+        self.commit_keyed_tail(T::ID, key_payload, info.record_offset);
         Ok(info.sequence)
     }
 
@@ -3430,6 +3693,35 @@ impl VarveFile {
         &self.index
     }
 
+    /// Builds the per-key tail offsets for `T` from the resident index.
+    ///
+    /// API3-05: every entry this admits is charged to
+    /// [`crate::ReadLimits::max_keyed_tail_bytes`] *before* the memory is taken, so
+    /// the configured ceiling bounds the **peak** of the build and not merely
+    /// what is retained afterwards.
+    ///
+    /// This is the entry point the generated keyed writers use to populate
+    /// their tail maps at construction (`writer_tail_inits`), and the one
+    /// `VarveFile::keyed_tail_map` uses to seed the resident cache. Before
+    /// this charge existed, both were guarded by `try_reserve` alone: a file
+    /// with `N` distinct keys forced an `N`-entry resident map whatever the
+    /// configured ceiling said, and `max_keyed_tail_bytes` - including
+    /// `UNTRUSTED`'s 256 MiB - only refused *further* growth within the
+    /// session.
+    ///
+    /// The charged value is the structural peak of this function, which is
+    /// larger than the map it returns: the build keeps a transient
+    /// `(MergeOrder, u64)` per key so it can resolve the winning record, and
+    /// that map is still alive when the returned map is reserved. The charge
+    /// is therefore `n * size_of::<(T::Key, (MergeOrder, u64))>()` while the
+    /// transient map grows to `n`, and the sum of both maps' inline storage at
+    /// the final reservation. Opening a file consequently charges more than
+    /// the steady-state map costs; the charge is a conservative model of what
+    /// is actually allocated, not of what survives.
+    ///
+    /// Like the incremental generated-writer charge it can only account for
+    /// inline storage, because the map holds `T::Key` rather than a canonical
+    /// byte payload; heap owned by a `T::Key` is not charged here.
     pub fn key_tail_offsets<T>(&self) -> Result<HashMap<T::Key, u64>>
     where
         T: VarveKeyedBlock,
@@ -3458,6 +3750,13 @@ impl VarveFile {
                             tails.len().saturating_add(1),
                             "key tail offsets",
                         )?;
+                        // API3-05: charge the growth before it is taken, so a
+                        // file whose distinct key count alone exceeds the
+                        // configured ceiling is refused during the build
+                        // rather than after the whole map is resident.
+                        self.spec
+                            .read_limits
+                            .check(ReadLimitKey::KeyedTailBytes, requested)?;
                         tails.try_reserve(1).map_err(|_| Error::AllocationFailed {
                             resource: "key tail offsets",
                             requested,
@@ -3478,6 +3777,13 @@ impl VarveFile {
                             tails.len().saturating_add(1),
                             "key tail offsets",
                         )?;
+                        // API3-05: charge the growth before it is taken, so a
+                        // file whose distinct key count alone exceeds the
+                        // configured ceiling is refused during the build
+                        // rather than after the whole map is resident.
+                        self.spec
+                            .read_limits
+                            .check(ReadLimitKey::KeyedTailBytes, requested)?;
                         tails.try_reserve(1).map_err(|_| Error::AllocationFailed {
                             resource: "key tail offsets",
                             requested,
@@ -3489,6 +3795,19 @@ impl VarveFile {
             }
         }
         let requested = allocation_bytes::<(T::Key, u64)>(tails.len(), "key tail offsets")?;
+        // API3-05: the transient ordering map is still alive while the
+        // returned map is reserved, so the peak charged here is the sum of
+        // both.
+        let peak =
+            allocation_bytes::<(T::Key, (MergeOrder, u64))>(tails.len(), "key tail offsets")?
+                .checked_add(requested)
+                .ok_or(Error::AllocationFailed {
+                    resource: "key tail offsets",
+                    requested: u64::MAX,
+                })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::KeyedTailBytes, peak)?;
         let mut offsets = HashMap::new();
         offsets
             .try_reserve(tails.len())
@@ -3905,6 +4224,47 @@ impl VarveFile {
     #[doc(hidden)]
     pub fn inject_replace_indeterminate_failures(count: u64) {
         INJECTED_REPLACE_INDETERMINATE_FAILURES.store(count, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Arms `count` injected rewrite-temp preparation failures (STO4-P2).
+    ///
+    /// Fault-testing hook only: each armed failure makes the next internal
+    /// merge/compact publication fail immediately after creating its rewrite
+    /// temp and before the scope that used to be responsible for deleting it.
+    /// The observable contract is that no `.rewrite.` artifact survives.
+    /// Thread-local.
+    #[cfg(feature = "scalable-fault-injection")]
+    #[doc(hidden)]
+    pub fn inject_rewrite_temp_preparation_failures(count: u64) {
+        INJECTED_REWRITE_TEMP_PREPARATION_FAILURES.with(|armed| armed.set(count));
+    }
+
+    /// Arms `count` injected generic keyed-tail reservation failures (API3-01).
+    ///
+    /// Fault-testing hook only: each armed failure makes the next generic
+    /// keyed push/delete fail its pre-append tail-cache reservation with
+    /// [`Error::AllocationFailed`]. The observable contract under this fault is
+    /// that the append did **not** happen, which is exactly what the previous
+    /// append-then-reserve ordering could not guarantee. Thread-local.
+    #[cfg(feature = "scalable-fault-injection")]
+    #[doc(hidden)]
+    pub fn inject_keyed_tail_reservation_failures(count: u64) {
+        INJECTED_KEYED_TAIL_RESERVATION_FAILURES.with(|armed| armed.set(count));
+    }
+
+    /// Arms `count` injected post-append keyed-tail reservation losses
+    /// (API3-01).
+    ///
+    /// Fault-testing hook only: each armed loss makes the next generic keyed
+    /// push/delete behave as if the slot reserved before the append were no
+    /// longer usable afterwards. The mutation still succeeds; the cached tail
+    /// map for that block id must be discarded rather than left holding the
+    /// superseded predecessor, so the following mutation still links to the
+    /// record that succeeded. Thread-local.
+    #[cfg(feature = "scalable-fault-injection")]
+    #[doc(hidden)]
+    pub fn inject_keyed_tail_commit_losses(count: u64) {
+        INJECTED_KEYED_TAIL_COMMIT_LOSSES.with(|armed| armed.set(count));
     }
 
     /// Returns the cumulative number of resident index entries this thread's
@@ -5888,51 +6248,89 @@ fn decompress_with_algorithm(
 /// Pre-flight cost estimate for the resident keyed merge/compact family
 /// (PERF2-03).
 ///
-/// Every field is an upper bound derived from record *counts* only: producing
-/// it decodes nothing and retains no values, so a caller can size or refuse a
-/// merge before paying for it.
+/// # This is an estimate, not an upper bound (PERF4-04)
 ///
-/// Peak resident bytes are [`Self::peak_resident_bytes`]: the merge state, the
-/// largest input's resident index, and the transient that input's open can
-/// allocate alongside its index. The transient used to be omitted, which
-/// understated the peak by `8` bytes per record of the largest input
-/// (PERF3-05); since the published contract of this family *is* "size it before
-/// you run it", an estimate that leaves a live allocation out is a defect in
-/// the deliverable itself.
+/// Every field is derived from record *counts* only: producing it decodes
+/// nothing and retains no value, so a caller can size or refuse a merge before
+/// paying for it. That cheapness is exactly why it cannot be a bound. Only
+/// [`Self::input_records`], [`Self::key_bearing_records`] and
+/// [`Self::max_distinct_keys`] are true upper bounds - they are counts. Every
+/// *byte* field counts **inline structural storage only**:
+/// `count * size_of::<...>()` for the container's own elements.
+///
+/// [`Self::peak_resident_structural_bytes`] therefore **excludes**, and the
+/// real peak exceeds it by:
+///
+/// - the heap owned by individual `Key` and `T` values. A `String` key or a
+///   `Vec` field is one pointer-sized triple in the map's entry array and an
+///   arbitrary allocation outside it, which the count model cannot see. For
+///   heap-owning types the shortfall is unbounded;
+/// - `HashMap` load-factor slack, control bytes and power-of-two bucket
+///   rounding: the map allocates strictly more than
+///   `entries * size_of::<entry>()`;
+/// - per-record decode scratch held while a value is being applied;
+/// - allocator metadata and fragmentation.
+///
+/// It was previously published as an upper bound. It never was one, and a
+/// sizing contract that understates by an unbounded amount is worse than one
+/// that says plainly what it counts - so the method was renamed rather than
+/// left to read as a guarantee. Callers that need a hard ceiling must bound
+/// the operation instead of sizing it, with
+/// [`merge_keyed_files_with_key_limit`], which refuses at a typed boundary.
+///
+/// The structural peak is the merge state plus the output vector - reserved
+/// while the map and its values are still alive - plus the largest input's
+/// resident index and the transient that input's open holds alongside it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct KeyedMergeEstimate {
-    /// Records across all inputs.
+    /// Records across all inputs. An exact count.
     pub input_records: u64,
     /// Records that can introduce a distinct key: values of `T`, tombstones,
-    /// and merge ops.
+    /// and merge ops. An exact count.
     pub key_bearing_records: u64,
     /// Upper bound on `K-ever`, the number of distinct keys the merge state
     /// retains. Tombstoned keys count: the collector keeps their entries.
     pub max_distinct_keys: u64,
     /// Resident index bytes for the largest single input, which is opened
-    /// whole while its records are applied.
+    /// whole while its records are applied:
+    /// `records * size_of::<RecordIndexEntry>()`.
     pub largest_input_index_bytes: u64,
     /// Transient bytes the largest single input's open can allocate *on top of*
     /// its resident index, and which are live at the same time as that index:
     /// the sequence-uniqueness witness copies one `u64` per record when the
     /// file's sequences are not already ascending in offset order (PERF3-05).
     pub largest_input_open_transient_bytes: u64,
-    /// Upper bound on the merge-state map itself, excluding the heap owned by
-    /// individual keys and decoded values.
+    /// Structural bytes of the merge-state map's entries at
+    /// [`Self::max_distinct_keys`] keys:
+    /// `max_distinct_keys * size_of::<(Key, (MergeOrder, Option<T>))>()`.
+    ///
+    /// This is not a bound on the map: it excludes hash-table load-factor
+    /// slack, control bytes and bucket rounding, and all heap owned by
+    /// individual keys and values.
     pub max_state_bytes: u64,
+    /// Structural bytes of the output vector, which is reserved for the
+    /// surviving entries while the merge state and its values are still alive
+    /// (PERF4-04): `max_distinct_keys * size_of::<(MergeOrder, T)>()`.
+    ///
+    /// Like [`Self::max_state_bytes`] this counts inline storage only.
+    pub max_output_values_bytes: u64,
 }
 
 impl KeyedMergeEstimate {
-    /// Upper bound on bytes resident at the merge's peak.
+    /// Structural bytes resident at the merge's peak. **Not an upper bound** -
+    /// see the type-level documentation for exactly what it omits.
     ///
     /// The merge state lives for the whole operation while one input at a time
-    /// is opened, so the peak is the state plus the largest input's index plus
-    /// the transients that input's open holds alongside its index. Saturates
-    /// instead of overflowing: a saturated bound is still a refusal signal.
+    /// is opened, and the output vector is reserved before the state is
+    /// dropped, so this sums [`Self::max_state_bytes`],
+    /// [`Self::max_output_values_bytes`], [`Self::largest_input_index_bytes`]
+    /// and [`Self::largest_input_open_transient_bytes`]. Saturates instead of
+    /// overflowing: a saturated estimate is still a refusal signal.
     #[must_use]
-    pub fn peak_resident_bytes(&self) -> u64 {
+    pub fn peak_resident_structural_bytes(&self) -> u64 {
         self.max_state_bytes
+            .saturating_add(self.max_output_values_bytes)
             .saturating_add(self.largest_input_index_bytes)
             .saturating_add(self.largest_input_open_transient_bytes)
     }
@@ -5945,6 +6343,10 @@ impl KeyedMergeEstimate {
 /// is one input's resident index. Use it to decide whether
 /// [`merge_keyed_files`] fits in available memory, or pass the result's
 /// `max_distinct_keys` to [`merge_keyed_files_with_key_limit`].
+///
+/// The byte fields of the result are structural estimates and not upper
+/// bounds; read [`KeyedMergeEstimate`] before treating any of them as a
+/// ceiling.
 pub fn estimate_keyed_merge<T, P>(
     spec: FormatSpec,
     base: P,
@@ -5964,10 +6366,13 @@ where
         accumulate_keyed_merge_estimate::<T, _>(spec, delta, &mut estimate)?;
     }
     estimate.max_distinct_keys = estimate.key_bearing_records;
-    estimate.max_state_bytes = allocation_bytes::<(T::Key, (MergeOrder, Option<T>))>(
-        usize::try_from(estimate.max_distinct_keys).unwrap_or(usize::MAX),
-        "merge state",
-    )?;
+    let keys = usize::try_from(estimate.max_distinct_keys).unwrap_or(usize::MAX);
+    estimate.max_state_bytes =
+        allocation_bytes::<(T::Key, (MergeOrder, Option<T>))>(keys, "merge state")?;
+    // PERF4-04: `collect_merged_keyed_values` reserves the output vector while
+    // the state map and every surviving value are still alive, so the two
+    // allocations overlap and both belong in the structural peak.
+    estimate.max_output_values_bytes = allocation_bytes::<(MergeOrder, T)>(keys, "merged values")?;
     Ok(estimate)
 }
 
@@ -6007,8 +6412,8 @@ where
     // PERF3-05: the open that produced `file` also validates sequence
     // uniqueness, which can copy every sequence into an `8N` temporary held
     // alongside the resident index. Charging it here keeps
-    // `peak_resident_bytes` an honest upper bound instead of one that ignores
-    // a live allocation.
+    // `peak_resident_structural_bytes` from ignoring a live allocation it can
+    // actually see.
     estimate.largest_input_open_transient_bytes = estimate
         .largest_input_open_transient_bytes
         .max(sequence_uniqueness_transient_bytes(file.index.len())?);
@@ -6177,11 +6582,18 @@ where
     I: IntoIterator<Item = T>,
 {
     let _lock = WriterLock::acquire(output)?;
-    let (temp_path, temp_file) = create_rewrite_temp_file(output)?;
+    // STO4-P2: the permission copy below is fallible and used to sit between
+    // the temp's creation and the first scope that cleaned it up, so its `?`
+    // could leave an empty temp behind. The guard owns the temp from creation,
+    // so *every* early return from here on unlinks it; the deliberate
+    // retentions below disarm it explicitly.
+    let mut temp = RewriteTemp::create(output)?;
+    take_injected_rewrite_temp_preparation_failure()?;
     if let Ok(metadata) = std::fs::metadata(output) {
-        temp_file.set_permissions(metadata.permissions())?;
+        temp.file().set_permissions(metadata.permissions())?;
     }
-    drop(temp_file);
+    temp.close();
+    let temp_path = temp.path().to_path_buf();
 
     let result = (|| {
         let mut out = VarveFile::create(spec, &temp_path)?;
@@ -6197,23 +6609,41 @@ where
         out.sync()
     })();
     if let Err(error) = result {
-        let _ = remove_file(&temp_path);
+        // Delete eagerly rather than at drop: the marker cleanup below is only
+        // correct once the temp itself is gone.
+        temp.cleanup_now();
         remove_rewrite_temp_lock_marker(&temp_path);
         return Err(error);
     }
 
     let published = match replace_path_atomically(&temp_path, output) {
-        Ok(ReplaceDurability::Durable) => Ok(()),
+        // The rename consumed the temp pathname; there is nothing left to
+        // unlink and the guard must not try.
+        Ok(ReplaceDurability::Durable) => {
+            temp.retain();
+            Ok(())
+        }
         // Publication already happened; the temp file no longer exists and the
         // target pathname resolves to the merged generation, so the caller
         // must not treat this as "target unchanged".
         Ok(ReplaceDurability::ParentSyncPending(sync_error)) => {
+            temp.retain();
             Err(Error::PublishedButParentSyncPending {
                 path: output.display().to_string(),
                 source: Box::new(sync_error),
             })
         }
-        Err(error) => Err(preserve_temp_on_indeterminate(&temp_path, error)),
+        Err(error) => {
+            if matches!(error, Error::ReplacePublicationIndeterminate { .. }) {
+                // DUR2-01: the temp may be the only surviving copy of the new
+                // generation. Preserving it is the whole point of this arm, so
+                // the guard is disarmed rather than allowed to unlink it.
+                temp.retain();
+            } else {
+                temp.cleanup_now();
+            }
+            Err(error)
+        }
     };
     remove_rewrite_temp_lock_marker(&temp_path);
     published
@@ -7266,7 +7696,7 @@ pub(crate) fn prepare_stream_creation_nonce_record(
 /// `VarveFile`).
 ///
 /// Cost is one bounded point read of the first record, performed only at open
-/// and at create — never on an append or lookup path.
+/// and at create ??never on an append or lookup path.
 ///
 /// Any failure to read or decode the leading record is reported as "no nonce"
 /// rather than as an error. That is fail-closed, not permissive: a primary that
@@ -8638,6 +9068,113 @@ pub(crate) fn opened_file_identity(file: &File) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// RAII owner of a rewrite/publication temp file (STO4-P2).
+///
+/// [`create_rewrite_temp_file`] hands back a bare `(PathBuf, File)`, so every
+/// fallible step between creation and the caller's first cleanup scope is a
+/// path that can leak an unpublished temp. This owns the temp from creation
+/// instead: any early return - including one from a `?` the author did not
+/// think about - unlinks it on drop.
+///
+/// Cleanup is *given up*, never assumed, through [`RewriteTemp::retain`]:
+/// after a successful rename the pathname is already consumed, and after
+/// [`Error::ReplacePublicationIndeterminate`] the temp may be the only
+/// surviving copy of the new generation and must be preserved for out-of-band
+/// reconciliation (DUR2-01). [`RewriteTemp::cleanup_now`] deletes eagerly for
+/// callers whose follow-up work (lock-marker removal) is only correct once the
+/// temp is gone.
+struct RewriteTemp {
+    path: PathBuf,
+    /// Closed by [`RewriteTemp::close`] before publication; Windows cannot
+    /// rename or delete a file through a live handle.
+    file: Option<File>,
+    armed: bool,
+}
+
+impl RewriteTemp {
+    fn create(target: &Path) -> Result<Self> {
+        let (path, file) = create_rewrite_temp_file(target)?;
+        Ok(Self {
+            path,
+            file: Some(file),
+            armed: true,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The open handle. Panics only if called after [`RewriteTemp::close`],
+    /// which is a caller bug rather than a runtime condition.
+    fn file(&self) -> &File {
+        self.file
+            .as_ref()
+            .expect("rewrite temp handle used after close")
+    }
+
+    /// Releases the handle while keeping the file and the cleanup obligation.
+    fn close(&mut self) {
+        self.file = None;
+    }
+
+    /// Closes and deletes the temp now, and gives up the obligation.
+    fn cleanup_now(&mut self) {
+        self.file = None;
+        if self.armed {
+            self.armed = false;
+            let _ = remove_file(&self.path);
+        }
+    }
+
+    /// Gives up the cleanup obligation: the temp was published, or is
+    /// deliberately preserved.
+    fn retain(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RewriteTemp {
+    fn drop(&mut self) {
+        self.file = None;
+        if self.armed {
+            let _ = remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(feature = "scalable-fault-injection")]
+std::thread_local! {
+    /// Armed post-creation rewrite-temp preparation failures (STO4-P2).
+    static INJECTED_REWRITE_TEMP_PREPARATION_FAILURES: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+/// Consumes one armed rewrite-temp preparation failure (STO4-P2).
+///
+/// Models the permission copy that sits between the temp's creation and the
+/// publication scope: a real `set_permissions` error cannot be produced on
+/// demand on every host, and it was exactly the step whose `?` used to leave an
+/// empty temp behind. Inert without the `scalable-fault-injection` feature.
+#[inline]
+fn take_injected_rewrite_temp_preparation_failure() -> Result<()> {
+    #[cfg(feature = "scalable-fault-injection")]
+    {
+        let armed = INJECTED_REWRITE_TEMP_PREPARATION_FAILURES.with(|count| {
+            let current = count.get();
+            if current != 0 {
+                count.set(current - 1);
+            }
+            current != 0
+        });
+        if armed {
+            return Err(std::io::Error::other("injected rewrite temp preparation failure").into());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn create_rewrite_temp_file(path: &Path) -> Result<(PathBuf, File)> {
     let base_name = path
         .file_name()
@@ -8742,7 +9279,7 @@ pub(crate) enum ReplaceDurability {
 /// be the only surviving copy of the new generation and must be preserved for
 /// out-of-band reconciliation, so the guard is disarmed before the error
 /// propagates (DUR2-01). Every other `Err` is a documented pre-publication
-/// failure — the target pathname is untouched — so dropping the guard deletes
+/// failure ??the target pathname is untouched ??so dropping the guard deletes
 /// the unpublished temp as usual; on `Ok` the rename already consumed the temp
 /// pathname and the guard's drop is a no-op.
 #[cfg(feature = "high-cardinality-dev")]

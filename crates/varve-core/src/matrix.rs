@@ -23,7 +23,15 @@ const VMAT_MAGIC: &[u8; 4] = b"VMAT";
 // map was unavailable or exceeded the tracked-extent cap. Version 2 artifacts
 // carry no index, so they are rejected as stale-regenerable rather than being
 // reinterpreted under the new rules.
-const VMAT_VERSION: u16 = 3;
+// PERF-01/SAFE: layout version 4 gives every persisted page index a validated
+// occupancy header and makes the array the *live* set rather than the history
+// of everything ever published. Version 3 arrays are terminator-scanned, so a
+// zeroed or garbage entry silently truncated enumeration and hid every later
+// committed page; and they never shed an entry, so both the array and its
+// in-memory tracking grew with historically touched pages. A version 3 array
+// has no header slot and a different entry base, so version 3 artifacts are
+// rejected as stale-regenerable rather than being reinterpreted.
+const VMAT_VERSION: u16 = 4;
 const VMAT_HEADER_LEN: u32 = 160;
 const MCRC_MAGIC: &[u8; 4] = b"MCRC";
 const MCRC_VERSION: u16 = 2;
@@ -34,19 +42,56 @@ const CRC_LEN: u64 = 4;
 // a never-touched page costs nothing at all.
 const BITMAP_PAGE_BYTES: u64 = 4096;
 const PAGE_DIGEST_LEN: u64 = 8;
-/// One persisted page-index entry: the little-endian page ordinal plus one, so
-/// that a zero entry is unambiguously "no entry here" and terminates the array.
+/// One persisted page-index slot: a little-endian `u64`.
+///
+/// Slot `0` is the occupancy header; slots `1..=count` are entries holding the
+/// page ordinal plus one, so that a zero entry inside the counted prefix is
+/// provably damage rather than an ambiguous "end of array" (VMAT v4).
 const PAGE_INDEX_ENTRY_LEN: u64 = 8;
+/// Slots reserved ahead of the first entry: the occupancy header.
+const PAGE_INDEX_HEADER_SLOTS: u64 = 1;
 /// Smallest persisted-page-index request (64 bytes).
 const PAGE_INDEX_MIN_SCAN_ENTRIES: u64 = 8;
 /// Largest persisted-page-index request (4 KiB).
 const PAGE_INDEX_SCAN_ENTRIES: u64 = 512;
+/// Largest occupancy count the page-index header can encode.
+///
+/// The header packs the count into the low 48 bits and a derived check value
+/// into the high 16, so a single 8-byte slot carries its own redundancy. A
+/// matrix whose page count would exceed this is refused at layout time rather
+/// than being written with an unrepresentable header.
+const PAGE_INDEX_MAX_ENTRIES: u64 = (1u64 << 48) - 1;
+/// Odd 64-bit mixing constant used to derive the page-index header check bits.
+///
+/// This is a redundancy code, not authentication: it detects a torn or
+/// bit-flipped header slot, and deliberately makes no claim against an actor
+/// who can rewrite the file, exactly as [`write_page_digest`] documents for the
+/// digest array.
+const PAGE_INDEX_HEADER_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Modelled resident cost of one page-index *slot* (the `Vec<u64>` element).
+///
+/// Deliberately double the 8 bytes the element itself occupies, so the charge
+/// stays above the amortised spare capacity a growing `Vec` holds. This is a
+/// conservative model, not a measurement of the live allocation.
+const PAGE_INDEX_SLOT_RESIDENT_BYTES: u64 = 16;
+/// Modelled resident cost of one page-index *page-to-slot map* entry.
+///
+/// A `HashMap<u64, u64>` entry is 16 bytes of key/value plus one control byte,
+/// held at a 7/8 load factor: about 20 bytes. Charged as 32 so the model stays
+/// above any small-table specialisation on the supported toolchains.
+const PAGE_INDEX_MAP_RESIDENT_BYTES: u64 = 32;
+/// Modelled resident cost of tracking one newly indexed page.
+const PAGE_INDEX_ENTRY_RESIDENT_BYTES: u64 =
+    PAGE_INDEX_SLOT_RESIDENT_BYTES + PAGE_INDEX_MAP_RESIDENT_BYTES;
 const PAGE_STATE_UNINITIALIZED: u32 = 0;
 const PAGE_STATE_INITIALIZED: u32 = 1;
 const ZERO_PAGE: [u8; BITMAP_PAGE_BYTES as usize] = [0; BITMAP_PAGE_BYTES as usize];
 const MATRIX_BYTES_RESOURCE: &str = "matrix bytes";
 const MATRIX_SLOT_PAYLOAD_RESOURCE: &str = "matrix slot payload";
 const MATRIX_DESCRIPTOR_RESOURCE: &str = "matrix descriptors";
+/// Allocation resource for the ordinary `PackedBitmap` codec, which is usable
+/// in plain variable fields and must not report matrix-shaped failures there.
+const PACKED_BITMAP_RESOURCE: &str = "packed bitmap bytes";
 #[allow(dead_code)]
 const MATRIX_SIDECAR_RESOURCE: &str = "matrix sidecar";
 
@@ -56,7 +101,9 @@ type StoredCommitPlan = (String, MatrixCommitKind, u64, u64, u64);
 /// Upper bound on the number of filesystem extents tracked for one matrix file.
 ///
 /// A file fragmented beyond this is dense enough that skipping holes would save
-/// nothing, so the query gives up and every byte is read exactly as before.
+/// nothing, so the query gives up and reports no allocation map at all. Open
+/// then enumerates from the persisted page index alone, which still names every
+/// page holding state; it does not fall back to reading every page.
 const MAX_TRACKED_EXTENTS: usize = 8192;
 
 /// The byte ranges of a matrix file that the filesystem reports as allocated,
@@ -74,11 +121,17 @@ const MAX_TRACKED_EXTENTS: usize = 8192;
 /// proof is obtained from the filesystem instead of from the bytes. Writing a
 /// stray byte into an untouched page necessarily allocates that page, so the
 /// detection strength of open is unchanged — corruption is still read and still
-/// reported. Open therefore costs `O(bytes actually written)` rather than
-/// `O(cell_count)`.
+/// reported.
 ///
-/// `None` means "unknown": the platform or filesystem cannot prove anything, in
-/// which case every page is read exactly as it was before this change.
+/// This map is a *secondary* source. Open enumerates the union of it and the
+/// persisted page index in `O(Q)` for `Q` candidate pages (see
+/// [`pages_to_visit`]), never `O(cell_count)`.
+///
+/// `None` means "unknown": the platform or filesystem cannot answer, or the
+/// file is fragmented past [`MAX_TRACKED_EXTENTS`]. Enumeration then comes from
+/// the persisted page index alone and still costs `O(live pages)`. Since `VMAT`
+/// v3 there is no full-logical-scan fallback; unallocated-but-indexed pages are
+/// simply read rather than skipped.
 #[derive(Clone, Debug, Default)]
 struct AllocatedExtents {
     /// Half-open `[start, end)` ranges, sorted and disjoint.
@@ -408,12 +461,24 @@ fn punch_zero_range_native(_file: &mut File, _offset: u64, _len: u64) -> bool {
     false
 }
 
-/// Zeroes `[offset, offset + len)` with a hole punch where possible, falling
-/// back to writing zeros.
+/// Zeroes `[offset, offset + len)` by removing the range where the platform
+/// and filesystem support it, and by streaming zero bytes where they do not.
+///
+/// F-08, stated exactly rather than qualitatively: range removal is attempted
+/// on Windows (`FSCTL_SET_ZERO_DATA`) and Linux (`FALLOC_FL_PUNCH_HOLE`) only,
+/// and even there it fails on filesystems without sparse support. Every other
+/// target, and every failed attempt, streams `len` zero bytes, which is
+/// `Theta(len)` — for a whole-category clear that is `Theta(cells / 8)`, not
+/// cell-count independent. The outcome is recorded unconditionally so a caller
+/// can *detect* the slow path with
+/// [`MatrixRecoveryReport::matrix_last_zero_range_streamed_bytes`] rather than
+/// having to infer it from the target triple.
 fn zero_range(file: &mut File, offset: u64, len: u64) -> Result<()> {
     if punch_zero_range(file, offset, len) {
+        sparse_zeroing::record(0);
         return Ok(());
     }
+    sparse_zeroing::record(len);
     count_category_clear_bytes_written(len);
     file.seek(SeekFrom::Start(offset))?;
     write_zeros(file, len)
@@ -429,6 +494,41 @@ std::thread_local! {
     };
 }
 
+/// Always-compiled observation of the sparse-zeroing fallback (PERF-03/F-08).
+///
+/// Whole-category clear and whole-map rebuild ask the filesystem to *remove* a
+/// byte range. Where that is unavailable the range has to be streamed as zero
+/// bytes instead, which is `Theta(bitmap bytes)` rather than cell-count
+/// independent. A caller must be able to detect that it is on the slow path
+/// without enabling a test-only feature, so this counter is not feature gated.
+mod sparse_zeroing {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        /// Bytes the most recent [`super::zero_range`] call had to stream
+        /// because the range could not be removed. Zero after a successful
+        /// removal.
+        pub(super) static LAST_STREAMED_BYTES: Cell<u64> = const { Cell::new(0) };
+        /// Bytes streamed by every [`super::zero_range`] call on this thread.
+        pub(super) static TOTAL_STREAMED_BYTES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record(streamed: u64) {
+        LAST_STREAMED_BYTES.with(|cell| cell.set(streamed));
+        if streamed != 0 {
+            TOTAL_STREAMED_BYTES.with(|cell| cell.set(cell.get().saturating_add(streamed)));
+        }
+    }
+
+    pub(super) fn last() -> u64 {
+        LAST_STREAMED_BYTES.with(Cell::get)
+    }
+
+    pub(super) fn total() -> u64 {
+        TOTAL_STREAMED_BYTES.with(Cell::get)
+    }
+}
+
 #[cfg(any(test, feature = "scalable-fault-injection"))]
 mod scaling_counters {
     use std::cell::Cell;
@@ -442,6 +542,7 @@ mod scaling_counters {
         pub(super) static OPEN_ALLOCATION_MAP_AVAILABLE: Cell<u64> = const { Cell::new(0) };
         pub(super) static OPEN_BITMAP_PAGES_VISITED: Cell<u64> = const { Cell::new(0) };
         pub(super) static FORCE_NO_ALLOCATION_MAP: Cell<u64> = const { Cell::new(0) };
+        pub(super) static PAGE_INDEX_BYTES_RESIDENT: Cell<u64> = const { Cell::new(0) };
     }
 
     pub(super) fn add(cell: &'static std::thread::LocalKey<Cell<u64>>, value: u64) {
@@ -551,6 +652,10 @@ fn record_open_resident_bitmap_bytes(layout: &MatrixLayout) {
         &scaling_counters::OPEN_BITMAP_BYTES_RESIDENT,
         commits.saturating_add(blocks),
     );
+    scaling_counters::set(
+        &scaling_counters::PAGE_INDEX_BYTES_RESIDENT,
+        layout.resident_page_index_bytes,
+    );
 }
 
 #[cfg(not(any(test, feature = "scalable-fault-injection")))]
@@ -565,6 +670,17 @@ fn record_resident_bitmap_bytes(bytes: u64) {
 
 #[cfg(not(any(test, feature = "scalable-fault-injection")))]
 fn record_resident_bitmap_bytes(_bytes: u64) {}
+
+/// Tracks the modelled resident cost of persisted page-index tracking, so
+/// F-03's "resident cost follows live state" contract is observable rather than
+/// asserted.
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+fn record_resident_page_index_bytes(bytes: u64) {
+    scaling_counters::set(&scaling_counters::PAGE_INDEX_BYTES_RESIDENT, bytes);
+}
+
+#[cfg(not(any(test, feature = "scalable-fault-injection")))]
+fn record_resident_page_index_bytes(_bytes: u64) {}
 
 #[cfg(test)]
 pub(crate) fn inject_partial_slot_write_failure() {
@@ -656,11 +772,25 @@ pub struct PackedBitmap {
     bytes: Vec<u8>,
 }
 
+/// Byte length of a `PackedBitmap` carrying `bit_len` bits.
+///
+/// Deliberately separate from [`bit_bytes`]: `PackedBitmap` is an ordinary
+/// variable-field codec that happens to live in this module, so its failures
+/// must be codec failures. Reporting `InvalidMatrixLayout` for a malformed
+/// bitmap in a non-matrix field told the caller to look at a matrix layout that
+/// may not even exist.
+fn packed_bitmap_bytes(bit_len: u64) -> Result<u64> {
+    bit_len
+        .checked_add(7)
+        .map(|value| value / 8)
+        .ok_or(Error::LengthOverflow { value: bit_len })
+}
+
 impl PackedBitmap {
     pub fn new(bit_len: u64) -> Result<Self> {
         Ok(Self {
             bit_len,
-            bytes: filled_bytes(bit_bytes(bit_len)?, 0)?,
+            bytes: filled_bytes_for(packed_bitmap_bytes(bit_len)?, 0, PACKED_BITMAP_RESOURCE)?,
         })
     }
 
@@ -670,14 +800,18 @@ impl PackedBitmap {
 
     pub fn get(&self, ordinal: u64) -> Result<bool> {
         if ordinal >= self.bit_len {
-            return Err(Error::InvalidMatrixLayout);
+            return Err(Error::InvalidCanonicalEncoding(
+                "packed bitmap ordinal is past its bit length",
+            ));
         }
         get_bit(&self.bytes, ordinal)
     }
 
     pub fn set(&mut self, ordinal: u64, value: bool) -> Result<()> {
         if ordinal >= self.bit_len {
-            return Err(Error::InvalidMatrixLayout);
+            return Err(Error::InvalidCanonicalEncoding(
+                "packed bitmap ordinal is past its bit length",
+            ));
         }
         set_bit(&mut self.bytes, ordinal, value)
     }
@@ -729,8 +863,13 @@ impl crate::VarveDecode for PackedBitmap {
     fn decode_varve(decoder: &mut crate::Decoder<'_>) -> Result<Self> {
         let bit_len = <u64 as crate::VarveDecode>::decode_varve(decoder)?;
         let bytes = <Vec<u8> as crate::VarveDecode>::decode_varve(decoder)?;
-        if bytes.len() as u64 != bit_bytes(bit_len)? {
-            return Err(Error::InvalidMatrixLayout);
+        // Ordinary malformed codec input, so an ordinary decode error: this
+        // type is accepted in plain variable fields and must not report a
+        // matrix-layout fault there.
+        if bytes.len() as u64 != packed_bitmap_bytes(bit_len)? {
+            return Err(Error::InvalidCanonicalEncoding(
+                "packed bitmap payload length does not match its bit length",
+            ));
         }
         Ok(Self { bit_len, bytes })
     }
@@ -775,6 +914,55 @@ pub struct MatrixRecoveryReport {
     pub recommended_actions: Vec<MatrixRecoveryAction>,
 }
 
+/// Always-available cost qualification for whole-range zeroing (F-08).
+///
+/// Whole-category clear, whole-map rebuild, and page-index rebuild all ask the
+/// filesystem to remove a byte range. Where removal is unavailable the range is
+/// streamed as zero bytes, which costs `Theta(bitmap bytes)`. These accessors
+/// are deliberately *not* behind a test-only feature: a caller that depends on
+/// the cheap path must be able to detect at runtime that it did not get it.
+impl MatrixRecoveryReport {
+    /// Whether this build targets a platform with a range-removal call at all.
+    ///
+    /// Necessary but **not** sufficient: the call still fails on filesystems
+    /// without sparse-file support, in which case the streaming fallback runs
+    /// and [`Self::matrix_last_zero_range_streamed_bytes`] reports it.
+    pub const fn matrix_sparse_zeroing_supported() -> bool {
+        cfg!(any(windows, target_os = "linux"))
+    }
+
+    /// Bytes the most recent *single* range-zeroing request on this thread had
+    /// to stream because the range could not be removed.
+    ///
+    /// `0` means that one range was removed without writing it, and any nonzero
+    /// value is proof that the caller is on the `Theta(bytes)` fallback path —
+    /// but the scope is deliberately narrow in two ways a caller must respect:
+    ///
+    /// * **One request, not one operation.** A whole-category clear issues
+    ///   several range requests (validity bitmap, page indexes, page digests,
+    ///   commit map). This reports only the last of them, so a `0` here does
+    ///   not prove the whole clear avoided streaming. To qualify an operation,
+    ///   read [`Self::matrix_total_zero_range_streamed_bytes`] before and after
+    ///   it: the delta is nonzero exactly when some request streamed.
+    /// * **This thread only.** Both counters are thread-local. A clear
+    ///   performed on a worker thread is invisible to a reader on another
+    ///   thread, which would see `0` and wrongly conclude it took the cheap
+    ///   path. Sample the counters on the thread that ran the operation.
+    pub fn matrix_last_zero_range_streamed_bytes() -> u64 {
+        sparse_zeroing::last()
+    }
+
+    /// Bytes streamed by every range-zeroing request **on this thread** since
+    /// it started, across all matrices.
+    ///
+    /// This is the counter to qualify a whole operation with: take it before
+    /// and after, on the thread performing the operation, and a nonzero delta
+    /// is exact proof that at least one range had to be streamed.
+    pub fn matrix_total_zero_range_streamed_bytes() -> u64 {
+        sparse_zeroing::total()
+    }
+}
+
 /// Thread-local observability counters for the paged matrix integrity
 /// representation (PERF-01/PERF-02 scaling contracts).
 ///
@@ -792,6 +980,16 @@ impl MatrixRecoveryReport {
     /// sparse extent established with `set_len`.
     pub fn matrix_create_metadata_bytes_written() -> u64 {
         scaling_counters::get(&scaling_counters::CREATE_METADATA_BYTES_WRITTEN)
+    }
+
+    /// Modelled resident bytes held by persisted page-index tracking on this
+    /// thread (F-03).
+    ///
+    /// This is the second term of the `ReadLimitKey::MatrixBitmapBytes` charge.
+    /// It follows the *live* page set, so set/clear churn returns it to its
+    /// starting value instead of growing with historically touched pages.
+    pub fn matrix_resident_page_index_bytes() -> u64 {
+        scaling_counters::get(&scaling_counters::PAGE_INDEX_BYTES_RESIDENT)
     }
 
     /// Resident bitmap bytes held by the most recently created or opened matrix
@@ -821,9 +1019,11 @@ impl MatrixRecoveryReport {
     /// Whether the most recent matrix open obtained a filesystem allocation map.
     ///
     /// When this is false the platform or filesystem could not prove any range
-    /// unwritten, so every page was read exactly as it was before the paged
-    /// representation existed: correctness is unaffected, but open cost falls
-    /// back to `O(cell_count / 8)`.
+    /// unwritten, so no page could be skipped without reading it. Enumeration
+    /// is unaffected: it comes from the persisted page index, which names every
+    /// page holding state, so open still costs `O(live pages)` rather than
+    /// `O(cell_count / 8)`. What is lost is only the ability to skip the read
+    /// of an indexed page whose bytes the filesystem would have proved zero.
     pub fn matrix_open_allocation_map_available() -> bool {
         scaling_counters::get(&scaling_counters::OPEN_ALLOCATION_MAP_AVAILABLE) != 0
     }
@@ -869,6 +1069,7 @@ impl MatrixRecoveryReport {
         scaling_counters::set(&scaling_counters::CATEGORY_CLEAR_BYTES_WRITTEN, 0);
         scaling_counters::set(&scaling_counters::OPEN_ALLOCATION_MAP_AVAILABLE, 0);
         scaling_counters::set(&scaling_counters::OPEN_BITMAP_PAGES_VISITED, 0);
+        scaling_counters::set(&scaling_counters::PAGE_INDEX_BYTES_RESIDENT, 0);
     }
 }
 
@@ -920,26 +1121,27 @@ struct SparseBitmap {
     page_count: u64,
     pages: HashMap<u64, BitmapPage>,
     ones: u64,
-    /// Pages recorded in this bitmap's persisted page index (PERF-01).
+    /// Page named by each occupied slot of the persisted page index, in slot
+    /// order, including any duplicate a crash-interrupted removal left behind.
     ///
-    /// A page is added the first time it is published with a set bit and is
-    /// never removed while the map lives, because the persisted array is
-    /// append-only: an evicted all-zero page still has an on-disk digest to
-    /// authenticate. The set is therefore bounded by the pages the matrix has
-    /// actually published — `8` bytes for every `4096` bytes of bitmap, i.e.
-    /// `1/512` — and never by the logical page count. A hostile file cannot
-    /// inflate it either: the loader stops at the first entry that is zero or
-    /// out of range, so the set is bounded by the index bytes the file really
-    /// contains.
+    /// This mirrors the persisted array exactly: `index_slots.len()` is the
+    /// occupancy count written into the array's header slot, and entry `k`
+    /// lives at slot `k + 1` on disk.
+    index_slots: Vec<u64>,
+    /// First slot naming each distinct page, so a page can be found, skipped,
+    /// and *removed* in `O(1)` (F-03).
     ///
-    /// It is *not* charged against `ReadLimitKey::MatrixBitmapBytes`, which
-    /// measures bitmap page residency; see the release notes for the follow-up
-    /// that widens that limit to cover index tracking as well.
-    indexed_pages: std::collections::HashSet<u64>,
-    /// Entries present in the persisted array, including any duplicate a
-    /// crash-interrupted append may have left behind. Appends are written here,
-    /// so a duplicate can never overwrite a live entry.
-    index_len: u64,
+    /// A page joins the index the first time it is published holding a set bit
+    /// and leaves it again when its final set bit clears, so both this map and
+    /// the persisted array track **live** pages rather than every page the
+    /// matrix has ever published. That is what keeps the resident cost of the
+    /// index proportional to live state and not to historical churn.
+    ///
+    /// Both terms are charged against `ReadLimitKey::MatrixBitmapBytes` through
+    /// [`ResidentBitmapBudget::charge_index`] before the memory is taken, using
+    /// the [`PAGE_INDEX_ENTRY_RESIDENT_BYTES`] model, so the limit bounds the
+    /// whole resident matrix bitmap footprint and not just its payload pages.
+    indexed_pages: HashMap<u64, u64>,
 }
 
 impl SparseBitmap {
@@ -951,31 +1153,89 @@ impl SparseBitmap {
             page_count: page_count_for(byte_len)?,
             pages: HashMap::new(),
             ones: 0,
-            indexed_pages: std::collections::HashSet::new(),
-            index_len: 0,
+            index_slots: Vec::new(),
+            indexed_pages: HashMap::new(),
         })
     }
 
-    /// Records that `page` is present in the persisted page index.
+    /// Entries the persisted array currently holds.
+    fn index_len(&self) -> Result<u64> {
+        usize_to_u64(self.index_slots.len())
+    }
+
+    /// Records that `page` occupies the next persisted index slot.
     ///
-    /// A repeat of an already-known page adds nothing to the set but still
-    /// advances the on-disk entry count, so a duplicate left behind by a
-    /// crash-interrupted append can never be overwritten by a later one.
-    fn note_indexed_page(&mut self, page: u64) -> Result<()> {
-        self.index_len = self
-            .index_len
-            .checked_add(1)
-            .ok_or(Error::InvalidMatrixLayout)?;
-        if self.indexed_pages.contains(&page) {
-            return Ok(());
+    /// The residency the tracking will take is charged against the resident
+    /// bitmap budget *before* it is taken, and refunded if the reservation then
+    /// fails, so no allocation escapes the limit (F-03). A repeat of a page
+    /// already named by an earlier slot — which only a crash-interrupted
+    /// removal can produce — still occupies its own slot, so the mirror never
+    /// drifts from the array.
+    fn note_indexed_page(&mut self, page: u64, budget: &mut ResidentBitmapBudget) -> Result<()> {
+        let slot = self.index_len()?;
+        if slot >= self.page_count || slot >= PAGE_INDEX_MAX_ENTRIES {
+            return Err(Error::InvalidMatrixLayout);
         }
-        try_reserve_set(
-            &mut self.indexed_pages,
-            1,
-            ReadLimitKey::MatrixBitmapBytes.resource(),
-        )?;
-        self.indexed_pages.insert(page);
+        let known = self.indexed_pages.contains_key(&page);
+        let charge = if known {
+            PAGE_INDEX_SLOT_RESIDENT_BYTES
+        } else {
+            PAGE_INDEX_ENTRY_RESIDENT_BYTES
+        };
+        budget.charge_index(charge)?;
+        let reserved = (|| -> Result<()> {
+            try_reserve_vec(
+                &mut self.index_slots,
+                1,
+                ReadLimitKey::MatrixBitmapBytes.resource(),
+            )?;
+            if !known {
+                try_reserve_map(
+                    &mut self.indexed_pages,
+                    1,
+                    ReadLimitKey::MatrixBitmapBytes.resource(),
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = reserved {
+            budget.release_index(charge);
+            return Err(err);
+        }
+        self.index_slots.push(page);
+        if !known {
+            self.indexed_pages.insert(page, slot);
+        }
         Ok(())
+    }
+
+    /// Mirrors the on-disk swap that overwrote `slot` with the array's last
+    /// entry, `moved`.
+    ///
+    /// Allocation-free by construction: the only map mutations are a removal
+    /// and an in-place value update, so this can be used to resynchronise the
+    /// mirror after a partially applied removal without any chance of failing
+    /// a second time.
+    fn mirror_index_swap(&mut self, page: u64, slot: u64, moved: u64, last: u64) {
+        self.indexed_pages.remove(&page);
+        if slot == last {
+            return;
+        }
+        if let Ok(slot_index) = usize::try_from(slot)
+            && slot_index < self.index_slots.len()
+        {
+            self.index_slots[slot_index] = moved;
+        }
+        if let Some(held) = self.indexed_pages.get_mut(&moved)
+            && *held == last
+        {
+            *held = slot;
+        }
+    }
+
+    /// Mirrors the occupancy header shrinking by one.
+    fn mirror_index_pop(&mut self) {
+        self.index_slots.pop();
     }
 
     fn page_len(&self, page: u64) -> Result<u64> {
@@ -1189,7 +1449,7 @@ impl SparseBitmap {
         self.pages.clear();
         self.ones = 0;
         self.indexed_pages.clear();
-        self.index_len = 0;
+        self.index_slots.clear();
     }
 
     fn ones(&self) -> u64 {
@@ -1201,6 +1461,15 @@ impl SparseBitmap {
             .values()
             .map(|page| page.bytes.len() as u64)
             .fold(0u64, u64::saturating_add)
+    }
+
+    /// Modelled resident cost of this bitmap's page-index tracking (F-03).
+    fn resident_index_bytes(&self) -> u64 {
+        let slots = usize_to_u64(self.index_slots.len()).unwrap_or(u64::MAX);
+        let distinct = usize_to_u64(self.indexed_pages.len()).unwrap_or(u64::MAX);
+        slots
+            .saturating_mul(PAGE_INDEX_SLOT_RESIDENT_BYTES)
+            .saturating_add(distinct.saturating_mul(PAGE_INDEX_MAP_RESIDENT_BYTES))
     }
 }
 
@@ -1214,37 +1483,83 @@ impl SparseBitmap {
 /// resident bitmap bytes at all. The charge now tracks the pages actually
 /// materialised, so the limit means what it says and still fails closed: every
 /// growth is checked before the memory is used.
+/// F-03: page-index tracking is charged here too, so
+/// `ReadLimitKey::MatrixBitmapBytes` bounds the whole resident matrix bitmap
+/// footprint — payload pages *and* the structure that names them — rather than
+/// leaving the index outside every runtime limit. The two terms are kept apart
+/// only so the existing payload-residency contracts stay observable; every
+/// admission decision is made on their sum.
 #[derive(Clone, Copy, Debug)]
 struct ResidentBitmapBudget {
     limits: ReadLimits,
     pages: u64,
+    index: u64,
 }
 
 impl ResidentBitmapBudget {
     fn new(limits: ReadLimits) -> Self {
-        Self { limits, pages: 0 }
+        Self {
+            limits,
+            pages: 0,
+            index: 0,
+        }
     }
 
-    fn resume(limits: ReadLimits, pages: u64) -> Self {
-        Self { limits, pages }
+    fn resume(limits: ReadLimits, pages: u64, index: u64) -> Self {
+        Self {
+            limits,
+            pages,
+            index,
+        }
     }
 
     fn charge(&mut self, bytes: u64) -> Result<()> {
         if bytes == 0 {
             return Ok(());
         }
-        self.pages = self
+        let next = self
             .pages
             .checked_add(bytes)
             .ok_or(Error::ResourceArithmeticOverflow {
                 resource: ReadLimitKey::MatrixBitmapBytes.resource(),
             })?;
-        self.limits
-            .check(ReadLimitKey::MatrixBitmapBytes, self.pages)
+        let total = next
+            .checked_add(self.index)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: ReadLimitKey::MatrixBitmapBytes.resource(),
+            })?;
+        self.limits.check(ReadLimitKey::MatrixBitmapBytes, total)?;
+        self.pages = next;
+        Ok(())
     }
 
     fn release(&mut self, bytes: u64) {
         self.pages = self.pages.saturating_sub(bytes);
+    }
+
+    /// Charges page-index tracking before the memory is taken.
+    fn charge_index(&mut self, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let next = self
+            .index
+            .checked_add(bytes)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: ReadLimitKey::MatrixBitmapBytes.resource(),
+            })?;
+        let total = next
+            .checked_add(self.pages)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: ReadLimitKey::MatrixBitmapBytes.resource(),
+            })?;
+        self.limits.check(ReadLimitKey::MatrixBitmapBytes, total)?;
+        self.index = next;
+        Ok(())
+    }
+
+    fn release_index(&mut self, bytes: u64) {
+        self.index = self.index.saturating_sub(bytes);
     }
 }
 
@@ -1261,16 +1576,57 @@ fn page_digest_len(byte_len: u64) -> Result<u64> {
         .ok_or(Error::InvalidMatrixLayout)
 }
 
-/// On-disk size of one bitmap's persisted page index: one entry per page.
+/// On-disk size of one bitmap's persisted page index: an occupancy header slot
+/// plus one entry per page.
 ///
-/// That is `8` bytes per `4096` bytes of bitmap, i.e. `1/512` of the map it
-/// describes and the same order as the page-digest array beside it. Like both
-/// of those regions it is established as a zero extent and is only ever written
-/// where a page is actually published.
+/// That is `8` bytes per `4096` bytes of bitmap plus a fixed `8`, i.e. about
+/// `1/512` of the map it describes and the same order as the page-digest array
+/// beside it. Like both of those regions it is established as a zero extent —
+/// which decodes as "no entries" — and is only ever written where a page is
+/// actually published.
 fn index_page_array_len(page_count: u64) -> Result<u64> {
+    if page_count > PAGE_INDEX_MAX_ENTRIES {
+        // The occupancy header cannot represent this many entries, so the
+        // matrix is refused at layout time rather than written with a header
+        // that could not be validated on the way back in.
+        return Err(Error::InvalidMatrixLayout);
+    }
     page_count
-        .checked_mul(PAGE_INDEX_ENTRY_LEN)
+        .checked_add(PAGE_INDEX_HEADER_SLOTS)
+        .and_then(|slots| slots.checked_mul(PAGE_INDEX_ENTRY_LEN))
         .ok_or(Error::InvalidMatrixLayout)
+}
+
+/// Check bits folded into the page-index occupancy header.
+///
+/// `check(0) == 0`, so a never-written (all-zero) header slot decodes as an
+/// empty index and a freshly created matrix needs no explicit write. Every
+/// nonzero count produces a nonzero header, so "zero header" and "count zero"
+/// are the same statement rather than two indistinguishable ones.
+const fn page_index_header_check(count: u64) -> u64 {
+    (count.wrapping_mul(PAGE_INDEX_HEADER_MIX) >> 48) << 48
+}
+
+/// Encodes an occupancy count into the page index's header slot.
+fn page_index_header_value(count: u64) -> Result<u64> {
+    if count > PAGE_INDEX_MAX_ENTRIES {
+        return Err(Error::InvalidMatrixLayout);
+    }
+    Ok(count | page_index_header_check(count))
+}
+
+/// Decodes the page index's header slot, or `None` when it is damaged.
+///
+/// This is a redundancy code over a single 8-byte slot, so it catches a torn
+/// write or a bit flip; it is explicitly not authentication against an actor
+/// who can rewrite the file, exactly as [`write_page_digest`] records for the
+/// digest array.
+fn page_index_header_count(value: u64, capacity: u64) -> Option<u64> {
+    let count = value & PAGE_INDEX_MAX_ENTRIES;
+    if value != count | page_index_header_check(count) || count > capacity {
+        return None;
+    }
+    Some(count)
 }
 
 fn page_index_len(byte_len: u64) -> Result<u64> {
@@ -1349,6 +1705,10 @@ pub struct MatrixLayout {
     append_log_start: u64,
     read_limits: ReadLimits,
     resident_bitmap_bytes: u64,
+    /// Modelled resident cost of every persisted page index this layout tracks
+    /// (F-03). Charged against `ReadLimitKey::MatrixBitmapBytes` together with
+    /// `resident_bitmap_bytes`, and released as pages leave the live set.
+    resident_page_index_bytes: u64,
     // Precomputed at open time so accessors gate on a single flag instead of
     // scanning findings per cell access.
     fatal_access_blocked: bool,
@@ -1420,21 +1780,39 @@ impl MatrixLayout {
         self.append_log_start
     }
 
+    /// The resident bitmap budget this layout currently holds.
+    ///
+    /// `ResidentBitmapBudget` is `Copy`, so a mutation path can take it out,
+    /// charge against it while holding a mutable borrow of one bitmap, and
+    /// write it back with [`Self::adopt_budget`].
+    fn budget(&self) -> ResidentBitmapBudget {
+        ResidentBitmapBudget::resume(
+            self.read_limits,
+            self.resident_bitmap_bytes,
+            self.resident_page_index_bytes,
+        )
+    }
+
+    fn adopt_budget(&mut self, budget: ResidentBitmapBudget) {
+        self.resident_bitmap_bytes = budget.pages;
+        self.resident_page_index_bytes = budget.index;
+        record_resident_bitmap_bytes(budget.pages);
+        record_resident_page_index_bytes(budget.index);
+    }
+
     /// Charges newly resident bitmap bytes against
     /// `ReadLimitKey::MatrixBitmapBytes` before the memory is taken.
+    ///
+    /// F-03: the limit is applied to the payload pages *and* the page-index
+    /// tracking that names them, so no part of the resident matrix bitmap
+    /// footprint sits outside a runtime resource limit.
     fn charge_resident_bitmap(&mut self, bytes: u64) -> Result<()> {
         if bytes == 0 {
             return Ok(());
         }
-        let next = self.resident_bitmap_bytes.checked_add(bytes).ok_or(
-            Error::ResourceArithmeticOverflow {
-                resource: ReadLimitKey::MatrixBitmapBytes.resource(),
-            },
-        )?;
-        self.read_limits
-            .check(ReadLimitKey::MatrixBitmapBytes, next)?;
-        self.resident_bitmap_bytes = next;
-        record_resident_bitmap_bytes(next);
+        let mut budget = self.budget();
+        budget.charge(bytes)?;
+        self.adopt_budget(budget);
         Ok(())
     }
 
@@ -1710,6 +2088,8 @@ pub(crate) fn create_layout(
         Vec::new(),
         append_log_start,
         resident_bitmap_bytes,
+        // Creation publishes no page, so no page-index entry is tracked yet.
+        0,
     )?;
 
     // PERF-02: only the fixed-size descriptor tables and the checksum-region
@@ -1870,7 +2250,10 @@ pub(crate) fn read_layout_at_len(
         &page_index_layout,
         &block_offsets,
         extents.as_ref(),
-        &mut budget,
+        &mut PagedBitmapSink {
+            budget: &mut budget,
+            findings: &mut crc_verification.findings,
+        },
     )?;
 
     layout_from_parts(
@@ -1888,6 +2271,7 @@ pub(crate) fn read_layout_at_len(
         crc_verification.findings,
         header.append_log_start,
         budget.pages,
+        budget.index,
     )
 }
 
@@ -2173,7 +2557,14 @@ pub(crate) fn clear_category(
         let digest_len = page_count
             .checked_mul(PAGE_DIGEST_LEN)
             .ok_or(Error::InvalidMatrixLayout)?;
-        if !punch_zero_range(file, digest_offset, digest_len) {
+        if punch_zero_range(file, digest_offset, digest_len) {
+            sparse_zeroing::record(0);
+        } else {
+            // F-08: this range is zeroed by an explicit per-page digest loop
+            // rather than by `zero_range`, so it has to record its own outcome.
+            // Without this, a clear whose digest array streamed but whose final
+            // map range was removed would report zero streamed bytes.
+            sparse_zeroing::record(digest_len);
             count_category_clear_bytes_written(digest_len);
             for page in 0..page_count {
                 write_page_digest(
@@ -2540,7 +2931,7 @@ pub(crate) fn rebuild_commit_map_from_crc<T: VarveMatrixBlock>(
     // The rebuilt map is materialised page by page and charged the same way,
     // so a rebuild is admitted on the pages it actually needs rather than on
     // the dense worst case of the whole map.
-    let mut budget = ResidentBitmapBudget::resume(layout.read_limits, layout.resident_bitmap_bytes);
+    let mut budget = layout.budget();
     let mut rebuilt = SparseBitmap::new(layout.commits[commit_index].bit_count)?;
     let mut committed = 0u64;
     for ordinal in 0..block.cell_count {
@@ -2567,6 +2958,7 @@ pub(crate) fn rebuild_commit_map_from_crc<T: VarveMatrixBlock>(
         index_offset,
         &previous,
         &mut rebuilt,
+        &mut budget,
     )?;
     let commit = &mut layout.commits[commit_index];
     let released = commit
@@ -2580,14 +2972,23 @@ pub(crate) fn rebuild_commit_map_from_crc<T: VarveMatrixBlock>(
                 .unwrap_or(0),
         )
         .ok_or(Error::InvalidMatrixLayout)?;
+    // The replaced map's own page-index tracking goes with it.
+    let released_index = commit.bits.resident_index_bytes().saturating_add(
+        commit
+            .quarantined_raw_bits
+            .as_ref()
+            .map(SparseBitmap::resident_index_bytes)
+            .unwrap_or(0),
+    );
     commit.bits = rebuilt;
     commit.quarantined_raw_bits = None;
     commit.quarantine_finding = None;
-    layout.resident_bitmap_bytes = budget
+    budget.pages = budget
         .pages
         .checked_sub(released)
         .ok_or(Error::InvalidMatrixLayout)?;
-    record_resident_bitmap_bytes(layout.resident_bitmap_bytes);
+    budget.release_index(released_index);
+    layout.adopt_budget(budget);
     Ok(committed)
 }
 
@@ -2823,8 +3224,10 @@ fn prepare_commit_bit(
     Ok(CommitBitUpdate { bitmap, digest })
 }
 
+/// Byte offset of entry `slot`, which lives past the occupancy header slot.
 fn page_index_entry_offset(base: u64, slot: u64) -> Result<u64> {
-    slot.checked_mul(PAGE_INDEX_ENTRY_LEN)
+    slot.checked_add(PAGE_INDEX_HEADER_SLOTS)
+        .and_then(|slot| slot.checked_mul(PAGE_INDEX_ENTRY_LEN))
         .and_then(|delta| base.checked_add(delta))
         .ok_or(Error::InvalidMatrixLayout)
 }
@@ -2836,12 +3239,36 @@ fn write_page_index_entry(file: &mut File, base: u64, slot: u64, page: u64) -> R
     Ok(())
 }
 
-/// Rewrites the persisted page index as the exact, deduplicated set of pages
-/// this bitmap knows about, terminating it where capacity allows.
+/// Publishes the validated occupancy count for a persisted page index.
 ///
-/// Only needed after a crash-interrupted append leaves a duplicate entry and
-/// the array subsequently fills; the cost is proportional to the indexed pages,
-/// never to the logical page count.
+/// Written *after* the entry it admits, so a crash between the two loses only
+/// an entry naming a page whose bytes had not been written yet — the entry is
+/// always recorded before the bitmap byte that needs it.
+fn write_page_index_header(file: &mut File, base: u64, count: u64) -> Result<()> {
+    let value = page_index_header_value(count)?;
+    file.seek(SeekFrom::Start(base))?;
+    file.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+fn read_page_index_header(file: &mut File, base: u64) -> Result<u64> {
+    file.seek(SeekFrom::Start(base))?;
+    let mut bytes = [0; PAGE_INDEX_ENTRY_LEN as usize];
+    file.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+/// Rewrites the persisted page index as the exact, deduplicated set of live
+/// pages this bitmap knows about.
+///
+/// Only needed after a crash-interrupted append or removal leaves a duplicate
+/// entry and the array subsequently fills; the cost is proportional to the
+/// indexed pages, never to the logical page count.
+///
+/// The occupancy header is written last, so a crash mid-rewrite leaves the old,
+/// larger count naming a prefix of the new order plus a tail of the old one:
+/// every live page is still named, which is the only property enumeration
+/// needs. It never *shrinks* the named set before the shorter count is durable.
 fn compact_page_index(file: &mut File, base: u64, bits: &mut SparseBitmap) -> Result<()> {
     let mut pages = Vec::new();
     try_reserve_vec(
@@ -2849,17 +3276,18 @@ fn compact_page_index(file: &mut File, base: u64, bits: &mut SparseBitmap) -> Re
         bits.indexed_pages.len(),
         ReadLimitKey::MatrixBitmapBytes.resource(),
     )?;
-    pages.extend(bits.indexed_pages.iter().copied());
+    pages.extend(bits.indexed_pages.keys().copied());
     pages.sort_unstable();
     for (slot, page) in pages.iter().enumerate() {
         write_page_index_entry(file, base, usize_to_u64(slot)?, *page)?;
     }
     let used = usize_to_u64(pages.len())?;
-    if used < bits.page_count {
-        file.seek(SeekFrom::Start(page_index_entry_offset(base, used)?))?;
-        file.write_all(&0u64.to_le_bytes())?;
+    write_page_index_header(file, base, used)?;
+    bits.index_slots.clear();
+    bits.index_slots.extend(pages.iter().copied());
+    for (slot, page) in pages.iter().enumerate() {
+        bits.indexed_pages.insert(*page, usize_to_u64(slot)?);
     }
-    bits.index_len = used;
     Ok(())
 }
 
@@ -2879,19 +3307,100 @@ fn record_page_index_entry(
     base: u64,
     bits: &mut SparseBitmap,
     page: u64,
+    budget: &mut ResidentBitmapBudget,
 ) -> Result<()> {
-    if bits.indexed_pages.contains(&page) {
+    if bits.indexed_pages.contains_key(&page) {
         return Ok(());
     }
-    if bits.index_len >= bits.page_count {
+    let mut slot = bits.index_len()?;
+    if slot >= bits.page_count {
+        let before = bits.index_len()?;
         compact_page_index(file, base, bits)?;
-        if bits.index_len >= bits.page_count {
+        slot = bits.index_len()?;
+        budget.release_index(
+            before
+                .saturating_sub(slot)
+                .saturating_mul(PAGE_INDEX_SLOT_RESIDENT_BYTES),
+        );
+        if slot >= bits.page_count {
             return Err(Error::InvalidMatrixLayout);
         }
     }
-    write_page_index_entry(file, base, bits.index_len, page)?;
-    bits.note_indexed_page(page)?;
+    write_page_index_entry(file, base, slot, page)?;
+    bits.note_indexed_page(page, budget)?;
+    // The occupancy header follows the entry it admits: a crash in between
+    // leaves an uncounted entry naming a page whose bytes had not been written
+    // yet, which is exactly the state an unpublished page already has.
+    //
+    // A *failure* here must also unwind the mirror. Leaving the page marked as
+    // indexed in memory while the persisted count still excludes it would make
+    // the next attempt skip the entry, and the bitmap byte that follows would
+    // then be written into a page no reopen could find.
+    if let Err(err) = write_page_index_header(file, base, bits.index_len()?) {
+        // The entry just pushed is the last one, so the swap degenerates to
+        // dropping it.
+        bits.mirror_index_swap(page, slot, page, slot);
+        bits.mirror_index_pop();
+        budget.release_index(PAGE_INDEX_ENTRY_RESIDENT_BYTES);
+        return Err(err);
+    }
     Ok(())
+}
+
+/// Removes `page` from the persisted page index once its final set bit clears.
+///
+/// F-03: this is what makes both the array and its in-memory mirror track
+/// *live* pages instead of every page ever published. It runs strictly after
+/// the bitmap byte that emptied the page is durable, because the safe direction
+/// is a superset: an entry naming an all-zero page costs one extra page read at
+/// open and nothing else, whereas dropping an entry for a page that still holds
+/// committed bits would hide them.
+///
+/// For the same reason it reports no error. Every failure path resynchronises
+/// the mirror with whatever the disk actually holds and leaves the index a
+/// superset of the live set; turning a successful, already-published mutation
+/// into an `Err` because an *optimisation* failed is the defect this review
+/// records as F-01 elsewhere in the tree.
+///
+/// `O(1)`: the vacated slot is overwritten with the array's last entry and the
+/// occupancy count is decremented — two 8-byte writes, no scan.
+fn release_page_index_entry(
+    file: &mut File,
+    base: u64,
+    bits: &mut SparseBitmap,
+    page: u64,
+    budget: &mut ResidentBitmapBudget,
+) {
+    let Some(slot) = bits.indexed_pages.get(&page).copied() else {
+        return;
+    };
+    let Ok(len) = bits.index_len() else {
+        return;
+    };
+    let Some(last) = len.checked_sub(1) else {
+        return;
+    };
+    let Ok(last_index) = usize::try_from(last) else {
+        return;
+    };
+    let Some(moved) = bits.index_slots.get(last_index).copied() else {
+        return;
+    };
+    if slot != last && write_page_index_entry(file, base, slot, moved).is_err() {
+        // Nothing was changed on disk, so nothing changes in the mirror.
+        return;
+    }
+    if write_page_index_header(file, base, last).is_err() {
+        // The swap landed but the shorter count did not: the array still holds
+        // `last + 1` entries, with `moved` now named twice and `page` gone.
+        // Mirror exactly that and refund only the map entry that was dropped.
+        bits.mirror_index_swap(page, slot, moved, last);
+        budget.release_index(PAGE_INDEX_MAP_RESIDENT_BYTES);
+        return;
+    }
+    bits.mirror_index_swap(page, slot, moved, last);
+    bits.mirror_index_pop();
+    budget.release_index(PAGE_INDEX_ENTRY_RESIDENT_BYTES);
 }
 
 /// Records the persisted page index entry for the page holding `byte_index`,
@@ -2910,22 +3419,56 @@ fn record_mutated_page_index(
     byte_value: u8,
 ) -> Result<()> {
     let page = byte_index / BITMAP_PAGE_BYTES;
-    let (base, bits) = match target {
-        PageIndexTarget::Commit(index) => (
+    let mut budget = layout.budget();
+    let outcome = (|| -> Result<()> {
+        let (base, bits) = match page_index_target(layout, target) {
+            Some(parts) => parts,
+            None => return Ok(()),
+        };
+        if bits.indexed_pages.contains_key(&page)
+            || bits.page_ones_after(byte_index, byte_value)? == 0
+        {
+            return Ok(());
+        }
+        record_page_index_entry(file, base, bits, page, &mut budget)
+    })();
+    layout.adopt_budget(budget);
+    outcome
+}
+
+/// Drops the persisted page index entry for the page holding `byte_index` now
+/// that the page is empty (F-03).
+fn release_mutated_page_index(
+    layout: &mut MatrixLayout,
+    file: &mut File,
+    target: PageIndexTarget,
+    byte_index: u64,
+) {
+    let page = byte_index / BITMAP_PAGE_BYTES;
+    let mut budget = layout.budget();
+    if let Some((base, bits)) = page_index_target(layout, target) {
+        release_page_index_entry(file, base, bits, page, &mut budget);
+    }
+    layout.adopt_budget(budget);
+}
+
+/// The persisted index base and bitmap a target names, or `None` where the
+/// target keeps no persisted index (a session write-tracking map, or a validity
+/// bitmap in a format without checksums).
+fn page_index_target(
+    layout: &mut MatrixLayout,
+    target: PageIndexTarget,
+) -> Option<(u64, &mut SparseBitmap)> {
+    match target {
+        PageIndexTarget::Commit(index) => Some((
             layout.commits[index].index_offset,
             &mut layout.commits[index].bits,
-        ),
+        )),
         PageIndexTarget::CrcValid(index) => {
-            let Some(base) = layout.blocks[index].crc_valid_index_offset else {
-                return Ok(());
-            };
-            (base, &mut layout.blocks[index].crc_valid_bits)
+            let base = layout.blocks[index].crc_valid_index_offset?;
+            Some((base, &mut layout.blocks[index].crc_valid_bits))
         }
-    };
-    if bits.indexed_pages.contains(&page) || bits.page_ones_after(byte_index, byte_value)? == 0 {
-        return Ok(());
     }
-    record_page_index_entry(file, base, bits, page)
 }
 
 #[derive(Clone, Copy)]
@@ -2959,6 +3502,16 @@ fn apply_commit_bit(
         .bits
         .set_byte(update.bitmap.byte_index, update.bitmap.byte_value)?;
     layout.settle_page_delta(delta);
+    if delta.released != 0 {
+        // The page is now byte-for-byte the zero page, and the bitmap byte that
+        // made it so is already durable, so its index entry can go (F-03).
+        release_mutated_page_index(
+            layout,
+            file,
+            PageIndexTarget::Commit(commit_index),
+            update.bitmap.byte_index,
+        );
+    }
     Ok(())
 }
 
@@ -2973,6 +3526,7 @@ fn write_commit_map_pages(
     index_offset: u64,
     previous: &SparseBitmap,
     bits: &mut SparseBitmap,
+    budget: &mut ResidentBitmapBudget,
 ) -> Result<()> {
     let mut pages = Vec::new();
     try_reserve_vec(
@@ -2983,28 +3537,30 @@ fn write_commit_map_pages(
             .saturating_add(bits.pages.len()),
         ReadLimitKey::MatrixBitmapBytes.resource(),
     )?;
-    pages.extend(previous.indexed_pages.iter().copied());
+    pages.extend(previous.indexed_pages.keys().copied());
     pages.extend(bits.pages.keys().copied());
     pages.sort_unstable();
     pages.dedup();
 
     // The index is rebuilt from scratch: a page that the rebuild leaves all
     // zero is written back as the uninitialised encoding and drops out of the
-    // index entirely, so it costs nothing at the next open.
+    // index entirely, so it costs nothing at the next open. Zeroing the region
+    // also resets the occupancy header, which is the encoding for "no entries".
     zero_range(
         file,
         index_offset,
         index_page_array_len(previous.page_count)?,
     )?;
+    budget.release_index(bits.resident_index_bytes());
     bits.indexed_pages.clear();
-    bits.index_len = 0;
+    bits.index_slots.clear();
     for page in pages {
         if page >= bits.page_count {
             return Err(Error::InvalidMatrixLayout);
         }
         let materialised = bits.pages.contains_key(&page);
         if materialised {
-            record_page_index_entry(file, index_offset, bits, page)?;
+            record_page_index_entry(file, index_offset, bits, page, budget)?;
         }
         let bytes = bits.page_bytes(page)?;
         if let Some(base) = digest_offset {
@@ -3108,6 +3664,14 @@ fn apply_cell_crc_valid(
         .crc_valid_bits
         .set_byte(update.byte_index, update.byte_value)?;
     layout.settle_page_delta(delta);
+    if delta.released != 0 {
+        release_mutated_page_index(
+            layout,
+            file,
+            PageIndexTarget::CrcValid(block_index),
+            update.byte_index,
+        );
+    }
     Ok(())
 }
 
@@ -3491,6 +4055,7 @@ fn layout_from_parts(
     crc_findings: Vec<MatrixRecoveryFinding>,
     append_log_start: u64,
     resident_bitmap_bytes: u64,
+    resident_page_index_bytes: u64,
 ) -> Result<MatrixLayout> {
     if commit_bits.len() != commit_plans.len() {
         return Err(Error::InvalidMatrixLayout);
@@ -3517,8 +4082,14 @@ fn layout_from_parts(
         // resident bytes. The charge that admits it happened page by page as
         // the map was read.
         let (bits, quarantined_raw_bits) = if quarantine_finding.is_some() {
-            spec.read_limits
-                .check(ReadLimitKey::MatrixBitmapBytes, resident_bitmap_bytes)?;
+            spec.read_limits.check(
+                ReadLimitKey::MatrixBitmapBytes,
+                resident_bitmap_bytes
+                    .checked_add(resident_page_index_bytes)
+                    .ok_or(Error::ResourceArithmeticOverflow {
+                        resource: ReadLimitKey::MatrixBitmapBytes.resource(),
+                    })?,
+            )?;
             (SparseBitmap::new(*bit_count)?, Some(raw_bits))
         } else {
             (raw_bits, None)
@@ -3646,6 +4217,7 @@ fn layout_from_parts(
         append_log_start,
         read_limits: spec.read_limits,
         resident_bitmap_bytes,
+        resident_page_index_bytes,
         fatal_access_blocked,
     };
     record_open_resident_bitmap_bytes(&layout);
@@ -3928,64 +4500,117 @@ struct PagedBitmapSource<'a> {
     extents: Option<&'a AllocatedExtents>,
 }
 
+/// Mutable state every paged-bitmap load contributes to: the resident budget
+/// that admits its memory and the findings list that records its damage.
+struct PagedBitmapSink<'a> {
+    budget: &'a mut ResidentBitmapBudget,
+    findings: &'a mut Vec<MatrixRecoveryFinding>,
+}
+
 /// Loads the persisted page index into `bits`.
 ///
-/// The array is append-only and every entry is `page + 1`, so a zero entry is
-/// the end of the array and the scan stops there: reading costs
-/// `O(indexed pages)`, not `O(page_count)`. A chunk the filesystem proves to be
-/// a hole is all zeros and therefore also the end. A garbage entry — the only
-/// thing a torn append can leave, and only in the final slot — likewise ends
-/// the array rather than being trusted.
+/// F-06, the whole point of the v4 header: enumeration length comes from a
+/// *validated occupancy count*, never from scanning for a terminator. The old
+/// representation treated a zero or out-of-range entry as the successful end of
+/// the array, so a single damaged entry silently truncated enumeration — every
+/// later committed page went unvisited, its cells answered `NotCommitted`, and
+/// no finding was produced at all. Damage now has exactly one outcome: the
+/// entry is reported as a fatal finding and enumeration continues, so a damaged
+/// index can cost visibility of one page but can never hide the rest.
+///
+/// The header slot carries its own redundancy, so a torn or flipped header is
+/// detected too. There the true count is unknowable, so the index contributes
+/// nothing and a fatal finding is raised; enumeration falls back to whatever
+/// the allocation map can prove. Silence is never an outcome.
+///
+/// Cost is `O(count)` entries read — the live pages — and never `O(page_count)`.
 fn load_page_index(
     file: &mut File,
     source: &PagedBitmapSource<'_>,
     bits: &mut SparseBitmap,
+    sink: &mut PagedBitmapSink<'_>,
     resource: &'static str,
+    label: &str,
 ) -> Result<()> {
-    let capacity = bits.page_count;
+    let capacity = bits.page_count.min(PAGE_INDEX_MAX_ENTRIES);
+    if capacity == 0 {
+        return Ok(());
+    }
+    // A region the filesystem proves to be a hole holds a zero header, which is
+    // the encoding for "no entries". Reading it would answer the same thing.
+    if !range_may_hold_data(source.extents, source.index_base, PAGE_INDEX_ENTRY_LEN) {
+        return Ok(());
+    }
+    let header = read_page_index_header(file, source.index_base)?;
+    count_open_bitmap_bytes_read(PAGE_INDEX_ENTRY_LEN);
+    let Some(count) = page_index_header_count(header, capacity) else {
+        sink.findings.push(MatrixRecoveryFinding {
+            kind: MatrixCorruptionKind::CommitMap,
+            severity: MatrixCorruptionSeverity::Fatal,
+            message: format!(
+                "matrix page index header for {label} is damaged ({header:#018x}); the set of \
+                 published pages cannot be enumerated from it"
+            ),
+        });
+        return Ok(());
+    };
+
     let mut scanned = 0u64;
-    // The request grows geometrically from a single cache line, so an empty or
-    // nearly empty index costs one small read whatever the map's width: without
-    // an allocation map to prove the array a hole, a fixed chunk would make the
-    // very first read proportional to the logical page count.
+    // The request grows geometrically from a single cache line, so a nearly
+    // empty index costs one small read whatever the map's width.
     let mut window = PAGE_INDEX_MIN_SCAN_ENTRIES;
-    while scanned < capacity {
-        let entries = window.min(capacity - scanned);
+    let mut damaged = 0u64;
+    while scanned < count {
+        let entries = window.min(count - scanned);
         window = window.saturating_mul(2).min(PAGE_INDEX_SCAN_ENTRIES);
-        let offset = scanned
-            .checked_mul(PAGE_INDEX_ENTRY_LEN)
-            .and_then(|delta| source.index_base.checked_add(delta))
-            .ok_or(Error::InvalidMatrixLayout)?;
+        let offset = page_index_entry_offset(source.index_base, scanned)?;
         let len = entries
             .checked_mul(PAGE_INDEX_ENTRY_LEN)
             .ok_or(Error::InvalidMatrixLayout)?;
-        if !range_may_hold_data(source.extents, offset, len) {
-            break;
-        }
         let bytes = read_range(file, offset, len, resource)?;
         count_open_bitmap_bytes_read(len);
         for entry in bytes.chunks_exact(PAGE_INDEX_ENTRY_LEN as usize) {
             let raw = u64::from_le_bytes(entry.try_into().expect("chunk"));
-            // `raw` is `page + 1`, so zero is the terminator and anything past
-            // `capacity` names a page this bitmap does not have.
-            if raw == 0 || raw > capacity {
-                return Ok(());
+            // `raw` is `page + 1`. Inside the counted prefix a zero or
+            // out-of-range value is damage, not an end marker, so it is
+            // reported and skipped rather than ending the scan.
+            if raw == 0 || raw > bits.page_count {
+                damaged = damaged.saturating_add(1);
+                continue;
             }
-            bits.note_indexed_page(raw - 1)?;
+            bits.note_indexed_page(raw - 1, sink.budget)?;
         }
         scanned += entries;
+    }
+    if damaged != 0 {
+        sink.findings.push(MatrixRecoveryFinding {
+            kind: MatrixCorruptionKind::CommitMap,
+            severity: MatrixCorruptionSeverity::Fatal,
+            message: format!(
+                "matrix page index for {label} has {damaged} unusable entries out of {count}; \
+                 the pages they named cannot be located"
+            ),
+        });
     }
     Ok(())
 }
 
-/// The ascending, deduplicated set of pages open has to look at.
+/// The deduplicated set of pages open has to look at.
 ///
 /// PERF-01: it is the union of the persisted page index — the pages this matrix
-/// has ever published — and, where the platform can answer, the pages the
+/// currently holds state in — and, where the platform can answer, the pages the
 /// allocation map reports as holding bytes. The first term keeps open bounded
 /// when no allocation map exists; the second keeps a stray byte written into a
 /// page the matrix never published detectable, exactly as before. Neither term
 /// is derived from the logical page count.
+///
+/// F-07: building the union is `O(Q)` in the candidate entries, not
+/// `O(Q log Q)`. The index term is already distinct, because it is materialised
+/// through a page-to-slot map, and the allocation term arrives in ascending
+/// order, so cross-duplicates are removed with a hash probe and neighbour
+/// comparison in a single linear pass instead of a sort. The result is not
+/// sorted: the loader visits pages independently, and `insert_loaded_page` is
+/// idempotent, so ordering buys nothing that would justify the extra `log Q`.
 ///
 /// The page-digest array is deliberately *not* mapped back into this set. A
 /// digest written without its page is a torn commit, but the index entry for
@@ -4000,19 +4625,34 @@ fn pages_to_visit(
 ) -> Result<Vec<u64>> {
     let mut pages = Vec::new();
     try_reserve_vec(&mut pages, bits.indexed_pages.len(), resource)?;
-    pages.extend(bits.indexed_pages.iter().copied());
-    if let Some(extents) = source.extents {
-        extents.allocated_units(
-            source.base_offset,
-            bits.byte_len,
-            BITMAP_PAGE_BYTES,
-            bits.page_count,
-            &mut pages,
-            resource,
-        )?;
+    pages.extend(bits.indexed_pages.keys().copied());
+    let Some(extents) = source.extents else {
+        return Ok(pages);
+    };
+    let boundary = pages.len();
+    extents.allocated_units(
+        source.base_offset,
+        bits.byte_len,
+        BITMAP_PAGE_BYTES,
+        bits.page_count,
+        &mut pages,
+        resource,
+    )?;
+    // The allocation term is non-decreasing across extents, so one pass drops
+    // both its own repeats at extent boundaries and anything the index already
+    // named.
+    let mut write = boundary;
+    let mut previous: Option<u64> = None;
+    for read in boundary..pages.len() {
+        let page = pages[read];
+        if previous == Some(page) || bits.indexed_pages.contains_key(&page) {
+            continue;
+        }
+        previous = Some(page);
+        pages[write] = page;
+        write += 1;
     }
-    pages.sort_unstable();
-    pages.dedup();
+    pages.truncate(write);
     Ok(pages)
 }
 
@@ -4042,14 +4682,15 @@ fn load_paged_bitmap(
     file: &mut File,
     source: PagedBitmapSource<'_>,
     bit_count: u64,
-    budget: &mut ResidentBitmapBudget,
+    sink: &mut PagedBitmapSink<'_>,
     resource: &'static str,
+    label: &str,
 ) -> Result<(SparseBitmap, bool)> {
     let base_offset = source.base_offset;
     let digest_base = source.digest_base;
     let extents = source.extents;
     let mut bits = SparseBitmap::new(bit_count)?;
-    load_page_index(file, &source, &mut bits, resource)?;
+    load_page_index(file, &source, &mut bits, sink, resource, label)?;
     let pages = pages_to_visit(&source, &bits, resource)?;
     count_open_bitmap_pages_visited(usize_to_u64(pages.len())?);
     let mut intact = true;
@@ -4098,7 +4739,7 @@ fn load_paged_bitmap(
             intact &= page_ok;
         }
         if bytes.iter().any(|byte| *byte != 0) {
-            budget.charge(len)?;
+            sink.budget.charge(len)?;
         }
         bits.insert_loaded_page(page, bytes)?;
     }
@@ -4146,8 +4787,12 @@ fn load_commit_bitmaps(
                 extents,
             },
             *bit_count,
-            budget,
+            &mut PagedBitmapSink {
+                budget,
+                findings: &mut verification.findings,
+            },
             ReadLimitKey::MatrixBitmapBytes.resource(),
+            &format!("commit category {name}"),
         )?;
         if !intact {
             verification.commit_findings.insert(
@@ -4171,7 +4816,7 @@ fn load_crc_valid_bits(
     page_index: &MatrixPageIndexLayout,
     block_offsets: &HashMap<u32, (u64, u64, u64)>,
     extents: Option<&AllocatedExtents>,
-    budget: &mut ResidentBitmapBudget,
+    sink: &mut PagedBitmapSink<'_>,
 ) -> Result<HashMap<u32, SparseBitmap>> {
     let Some(crc) = crc else {
         return Ok(HashMap::new());
@@ -4205,8 +4850,9 @@ fn load_crc_valid_bits(
                 extents,
             },
             cell_count,
-            budget,
+            sink,
             ReadLimitKey::MatrixCrcBytes.resource(),
+            &format!("block {} validity bitmap", block.block_id),
         )?;
         valid_bits.insert(block.block_id, bits);
     }
@@ -4771,22 +5417,6 @@ fn try_reserve_map<K: Eq + std::hash::Hash, V>(
         .ok_or(Error::ResourceArithmeticOverflow { resource })?;
     values
         .try_reserve(additional)
-        .map_err(|_| Error::AllocationFailed {
-            resource,
-            requested,
-        })
-}
-
-fn try_reserve_set<K: Eq + std::hash::Hash>(
-    set: &mut std::collections::HashSet<K>,
-    additional: usize,
-    resource: &'static str,
-) -> Result<()> {
-    let requested = additional
-        .checked_mul(std::mem::size_of::<K>().max(1))
-        .and_then(|bytes| u64::try_from(bytes).ok())
-        .ok_or(Error::ResourceArithmeticOverflow { resource })?;
-    set.try_reserve(additional)
         .map_err(|_| Error::AllocationFailed {
             resource,
             requested,

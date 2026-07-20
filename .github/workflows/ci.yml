@@ -8,11 +8,25 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  # CI-03: every third-party gate is pinned to an immutable identity so a future
-  # run of this workflow evaluates the same code it evaluates today. Action refs
-  # are commit ids (a tag can be moved; a commit id cannot), with the human
-  # readable release next to them, and installed cargo tools carry an exact
-  # `--version`. Bump these deliberately, in a commit that says so.
+  # CI-03: every third-party ACTION and every installed cargo TOOL is pinned to
+  # an immutable identity. Action refs are commit ids (a tag can be moved; a
+  # commit id cannot), with the human readable release next to them, and
+  # installed cargo tools carry an exact `--version`. Bump these deliberately,
+  # in a commit that says so.
+  #
+  # This is deliberately NOT a claim that a CI run is reproducible. Two inputs
+  # are rolling by design and are not pinned here:
+  #
+  #   * the runner images `ubuntu-latest` and `windows-latest`, which GitHub
+  #     rebuilds continuously (system libraries, linkers, preinstalled tools);
+  #   * the `stable` toolchain requested by every job except `msrv`, which
+  #     advances every six weeks.
+  #
+  # Pinning those would defeat what they exist to catch — a break on a newer
+  # compiler or image — so the `msrv (1.95.0)` job is the only job in this
+  # workflow that evaluates a fixed toolchain, and no job evaluates a fixed
+  # image. A red run on an unchanged commit is therefore an expected outcome,
+  # not evidence of a workflow defect.
   #
   #   actions/checkout                v4.2.2
   #   Swatinem/rust-cache             v2.9.1
@@ -38,9 +52,16 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  # Every feature combination is linted individually. `cargo clippy` uses the
-  # workspace rustc wrapper, so `-p varve` also lints `varve-core` and
-  # `varve-macros` under the exact feature set the umbrella crate enables.
+  # Lints a fixed LIST of feature configurations, not every combinatorial
+  # subset: no-default, default, each optional feature on its own, and
+  # all-features. With 7 optional features the full power set is 128
+  # configurations; this job runs 9 of them on each of two operating systems.
+  # The singletons catch a feature that does not compile alone, and
+  # `--all-features` catches a conflict between any two — the gap is a defect
+  # that needs a specific pair or triple of features and is invisible under
+  # both, which no job here claims to cover. `cargo clippy` uses the workspace
+  # rustc wrapper, so `-p varve` also lints `varve-core` and `varve-macros`
+  # under the exact feature set the umbrella crate enables.
   feature-matrix:
     name: clippy (${{ matrix.features.name }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -235,6 +256,39 @@ jobs:
         working-directory: tools/public-api-fixture
         run: cargo run --locked
 
+  # DOC-02 (F-12) release gate: docs.rs builds the published documentation with
+  # warnings that nothing in this workflow previously evaluated — a broken
+  # intra-doc link, an unresolved `[`Type`]`, or a private-item link renders as
+  # plain text on the published page and no other job notices. `RUSTDOCFLAGS`
+  # applies to the rustdoc invocation for every crate in the graph, so
+  # `--workspace` covers all three published crates at once, and
+  # `--document-private-items` is deliberately NOT used: the gate must evaluate
+  # exactly the surface a user sees on docs.rs.
+  #
+  # `--all-features` matches the docs.rs default for this project and is what
+  # makes feature-gated items (and the links into them) visible to the check.
+  #
+  # Rustdoc EXAMPLES are gated by the `test` jobs above, not here: the runner
+  # forwards to plain `cargo test`, which compiles and runs doctests. That is
+  # only meaningful because the two proc-macro entry-point examples are no
+  # longer ```ignore — while they were, they compiled in no job at all and were
+  # free to drift from the macros they document.
+  rustdoc:
+    name: rustdoc (-D warnings)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: rustdoc
+      - name: cargo doc
+        run: cargo doc --locked --workspace --all-features --no-deps
+
   # Release gate: audit/deny failures block the merge.
   supply-chain:
     name: deny + audit
@@ -300,6 +354,10 @@ jobs:
   # the license texts, not just a license expression in metadata. `cargo package
   # --list` is the authority on what a consumer actually receives, so the lists
   # are printed here and the required files are asserted.
+  #
+  # Scope note (F-11): this job is about NAMES only. `--no-verify` means no
+  # archive is created and nothing is compiled, so it cannot detect an archive
+  # that does not build. `package-archives` below is the job that does that.
   package-contents:
     name: package contents
     runs-on: ubuntu-latest
@@ -325,6 +383,85 @@ jobs:
               fi
             done
           done
+
+  # REL-02 (F-11) release gate: `package contents` above proves only what the
+  # file LIST says. It runs with `--no-verify`, so no `.crate` archive is ever
+  # created and nothing is ever built from one. Every other job in this workflow
+  # builds the checkout by path. The bytes a crates.io user actually downloads
+  # were therefore never compiled anywhere.
+  #
+  # This job closes that. It has two halves:
+  #
+  #   1. `cargo package --locked` WITHOUT `--no-verify` for all three crates.
+  #      Cargo writes the real `.crate` archives and then compiles each one from
+  #      a temporary registry, so an inter-crate version requirement that no
+  #      published version can satisfy, a source file excluded from the archive,
+  #      or a path-only dependency that survives into the published manifest
+  #      fails here.
+  #   2. A STAGED CONSUMER. Verification proves each archive builds; it does not
+  #      prove a downstream crate can USE the published surface. So the archives
+  #      are extracted and the public-API fixture's source is rebuilt against
+  #      the extracted trees through `[patch.crates-io]` — a crate outside this
+  #      repository, resolving `varve` by version, exercising every documented
+  #      codec and field type, and running to completion. Deliberately not
+  #      `--locked`: a real consumer resolves its own lockfile.
+  #
+  # The extracted `varve` requires `varve-core`/`varve-macros` by VERSION, so
+  # all three patch entries are required and all three are exercised.
+  package-archives:
+    name: package archives + staged consumer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: package-archives
+      - name: Build and verify the .crate archives
+        run: |
+          set -euo pipefail
+          cargo package --locked -p varve-core -p varve-macros -p varve
+      - name: Stage a consumer against the packaged artifacts
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | tr '{,' '\n\n' | grep -o '"version":"[^"]*"' | head -n 1 \
+            | cut -d'"' -f4)"
+          echo "packaged version: ${version}"
+
+          staged="${RUNNER_TEMP}/staged"
+          consumer="${RUNNER_TEMP}/staged-consumer"
+          mkdir -p "${staged}" "${consumer}/src"
+          for package in varve-core varve-macros varve; do
+            archive="target/package/${package}-${version}.crate"
+            test -f "${archive}" || { echo "::error::missing ${archive}"; exit 1; }
+            tar -xzf "${archive}" -C "${staged}"
+          done
+
+          # Same source as the `public-api fixture` job, different resolution:
+          # that job builds the checkout by path, this one builds the archives.
+          cp tools/public-api-fixture/src/main.rs "${consumer}/src/main.rs"
+          cat > "${consumer}/Cargo.toml" <<EOF
+          [package]
+          name = "staged-consumer"
+          version = "0.0.0"
+          edition = "2024"
+          publish = false
+
+          [dependencies]
+          varve = { version = "${version}", features = ["compression-zstd", "integrity"] }
+
+          [patch.crates-io]
+          varve = { path = "${staged}/varve-${version}" }
+          varve-core = { path = "${staged}/varve-core-${version}" }
+          varve-macros = { path = "${staged}/varve-macros-${version}" }
+
+          [workspace]
+          EOF
+          cd "${consumer}"
+          cargo run
 
   # Build the committed tree exactly as a source package consumer sees it:
   # `git archive` contains only tracked files, so a workspace member or

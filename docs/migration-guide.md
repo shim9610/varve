@@ -33,20 +33,51 @@ there is no automatic migration path for these surfaces:
 - The matrix sidecar envelope is version 3. Version-1/2 sidecars are refused
   as `MatrixSidecarMismatch("sidecar version")` and simply regenerate —
   sidecars are regenerable resume state, not data.
-- The matrix layout is `VMAT` version 3 with an `MCRC` version 2 integrity
-  region. Version 2 introduced per-page commit digests instead of one CRC per
+- The matrix layout is `VMAT` version 4 with an `MCRC` version 2 integrity
+  region. Within this release the layout moved 1 -> 2 -> 3 -> 4; only version 4
+  ships. Version 2 introduced per-page commit digests instead of one CRC per
   commit category and stopped explicitly initializing per-cell metadata at
   create; version 3 adds the persisted page-index region between the static aux
   regions and the `MCRC` region, described by two header fields appended after
   `append_log_start` (so every earlier field keeps its index) with the reserved
-  tail shrinking from 32 to 16 bytes. A version 1 or version 2 matrix file is
-  refused with `Error::FormatVersionMismatch { expected: 3, actual: <1 or 2> }`
-  and must be recreated; region lengths and total matrix file length change, so
-  there is no in-place fixup.
+  tail shrinking from 32 to 16 bytes. Layout version 4 then changed the
+  page-index encoding: the region gained a validated occupancy header slot and
+  became `(page_count + 1) * 8` bytes, entry count comes from that header rather
+  than from a terminator scan, and entries are released when a page empties. A
+  version 1, 2, or 3 matrix file is refused with
+  `Error::FormatVersionMismatch { expected: 4, actual: <1, 2, or 3> }` and must
+  be recreated; region lengths and total matrix file length change, so there is
+  no in-place fixup.
 - Matrix open no longer walks every logical bitmap page: the pages it visits come
-  from the page index unioned with the filesystem allocated-range map. Recorded
-  trade-off — where no allocation map is available, a stray byte written out of
-  band into a page the matrix never published is no longer detected at open.
+  from the page index unioned with the filesystem allocated-range map, merged in
+  one linear pass with no sort. Recorded trade-off — where no allocation map is
+  available, a stray byte written out of band into a page the matrix never
+  published is no longer detected at open.
+- A damaged page-index entry is no longer silent. In layout version 3 a zeroed
+  entry terminated enumeration and hid every later committed page; in version 4
+  it is a `Fatal` `MatrixCorruptionKind::CommitMap` finding and enumeration
+  continues past it. Files that previously opened "clean" with a damaged index
+  will now report a fatal finding, which is the correct outcome.
+- A matrix whose bitmap page count would exceed `2^48 - 1` (about 1 EiB of
+  bitmap) is refused at layout time with `Error::InvalidMatrixLayout`. No
+  realistic configuration reaches this.
+- `PackedBitmap::new`/`get`/`set` and its decode now report
+  `Error::InvalidCanonicalEncoding` / `Error::LengthOverflow` and a
+  non-matrix allocation resource instead of `Error::InvalidMatrixLayout`, since
+  it is an ordinary variable-field codec. Callers matching on
+  `InvalidMatrixLayout` for these cases must update.
+- A matrix field may now be spelled as a **type alias** of a supported scalar
+  (`type Word = u32;`). Eligibility was previously decided by a whitelist of
+  literal primitive spellings, which rejected aliases even though the generated
+  `SLOT_STRIDE` would have accepted them. Nothing that compiled before stops
+  compiling.
+- `KeyedMergeEstimate::peak_resident_bytes()` is **renamed** to
+  `peak_resident_structural_bytes()` and is documented as a structural estimate
+  rather than an upper bound, which is what it always was; its value now also
+  includes the output vector reserved while the merge state is alive. The new
+  public field `max_output_values_bytes` reports that term. There is no
+  compiling alias, deliberately: the old name's contract was false and callers
+  must re-read the sizing text rather than silently keep a wrong guarantee.
 - `PackedBitmap` is no longer accepted as a fixed-width matrix field (it has no
   encoded width fixed by its type). It remains usable as a variable field, and
   both it and `ChunkedBytes` now declare the stable non-zero codec `SCHEMA_ID`

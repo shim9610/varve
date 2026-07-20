@@ -14,18 +14,26 @@ const VMAT_HEADER_LEN: u64 = 160;
 const HEADER_U64_OFFSET: u64 = 24;
 #[cfg(feature = "integrity")]
 const COMMIT_MAP_OFFSET_INDEX: u64 = 6;
+/// Modelled resident cost of tracking one page in a persisted page index
+/// (F-03). The page-index term is charged against the same
+/// `max_matrix_bitmap_bytes` limit as the payload pages, so the whole resident
+/// matrix bitmap footprint is bounded rather than just part of it.
+#[cfg(feature = "integrity")]
+const TEST_PAGE_INDEX_ENTRY_BYTES: u64 = 48;
 /// Resident bitmap bytes held by the 4x4 fixture once a single cell has been
 /// written and committed: the commit-map, checksum-validity, and current-write
-/// pages, each a 2-byte short page for a 16-cell block. The budget now charges
-/// the pages actually materialised rather than the dense worst case of every
-/// map, so this constant tracks residency, not the reserved on-disk extents.
+/// pages, each a 2-byte short page for a 16-cell block, plus the page-index
+/// tracking for the two *persisted* maps. The current-write map is session
+/// state with no persisted index. The budget charges the pages actually
+/// materialised rather than the dense worst case of every map, so this constant
+/// tracks residency, not the reserved on-disk extents.
 #[cfg(feature = "integrity")]
-const TEST_BITMAP_BYTES: u64 = 6;
+const TEST_BITMAP_BYTES: u64 = 6 + 2 * TEST_PAGE_INDEX_ENTRY_BYTES;
 /// Residency of the same fixture after a reopen: the persisted commit-map and
-/// checksum-validity pages only. The current-write map is session state and
-/// starts empty at every open.
+/// checksum-validity pages and their page-index tracking only. The
+/// current-write map is session state and starts empty at every open.
 #[cfg(feature = "integrity")]
-const TEST_REOPEN_BITMAP_BYTES: u64 = 4;
+const TEST_REOPEN_BITMAP_BYTES: u64 = 4 + 2 * TEST_PAGE_INDEX_ENTRY_BYTES;
 /// Residency of a single materialised commit-map page of the same fixture.
 #[cfg(feature = "integrity")]
 const TEST_COMMIT_PAGE_BYTES: u64 = 2;

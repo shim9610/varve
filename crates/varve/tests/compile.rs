@@ -11,6 +11,10 @@ fn macro_compile_contracts() {
     tests.pass("tests/ui/pass_optional_partial_limits.rs");
     tests.pass("tests/ui/pass_replacement_api.rs");
     tests.pass("tests/ui/pass_packed_bitmap_variable_field.rs");
+    // F-10: matrix field eligibility is decided by the generated `SLOT_STRIDE`
+    // (which resolves `VarveEncode::WIRE_TYPE`), not by the source spelling, so
+    // an alias of a supported scalar compiles.
+    tests.pass("tests/ui/pass_matrix_type_alias.rs");
     tests.compile_fail("tests/ui/fail_duplicate_id.rs");
     tests.compile_fail("tests/ui/fail_duplicate_field_id.rs");
     tests.compile_fail("tests/ui/fail_zero_field_id.rs");
@@ -34,6 +38,9 @@ fn macro_compile_contracts() {
     // its name.
     tests.compile_fail("tests/ui/fail_matrix_packed_bitmap_field.rs");
     tests.compile_fail("tests/ui/fail_matrix_shadowed_packed_bitmap.rs");
+    // F-10: the permissive shape check still refuses source forms that can
+    // never denote a fixed-stride type.
+    tests.compile_fail("tests/ui/fail_matrix_tuple_field.rs");
     tests.compile_fail("tests/ui/fail_duplicate_format_key.rs");
     tests.compile_fail("tests/ui/fail_generic_derive.rs");
     tests.compile_fail("tests/ui/fail_unknown_limit_key.rs");

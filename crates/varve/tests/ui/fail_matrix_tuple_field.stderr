@@ -1,0 +1,5 @@
+error: P0 matrix fields must be a named type (or an array of one) whose codec has a fixed encoded width; references, raw pointers, slices, tuples, trait objects, `impl Trait` and function pointers can never occupy a matrix slot
+  --> tests/ui/fail_matrix_tuple_field.rs:34:17
+   |
+34 |                 value: (u32, u32),
+   |                 ^^^^^

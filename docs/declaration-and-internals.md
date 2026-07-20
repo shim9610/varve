@@ -100,6 +100,7 @@ It limits one-shot payload allocation and materialization.
 | `matrix_bitmap`, `matrix_crc`, `matrix_metadata`, `matrix_slot_region` | matrix allocation and physical-region ceilings |
 | `sidecar` | complete matrix sidecar size |
 | `mmap` | bytes owned by one mmap handle |
+| `keyed_tail` | resident keyed-tail cache of one keyed block id: the map that resolves a keyed append's predecessor in O(1). Charged before the memory is taken, per block id, covering both the map's initial build from file content and its later growth, as inline storage plus (on the resident paths) the key payload bytes the map owns. The build charge is the structural peak and is larger than the map it produces |
 
 Compatibility APIs tighten the resolved policy:
 

@@ -14,10 +14,28 @@ readme = "../../README.md"
 
 [features]
 default = []
-high-cardinality-dev = []
+# The dev-dependency edge keeps the doctests consistent with the code this
+# feature makes the macro GENERATE: with `high-cardinality-dev` on, every
+# expanded format emits scalable stream/indexed APIs, which only exist in the
+# facade when its matching feature is on too. Without this the `varve_format!`
+# doctest fails under `-p varve-macros --all-features`. It adds nothing to a
+# normal build — `varve` is a dev-dependency, so this cannot pull the facade
+# into the published dependency graph.
+high-cardinality-dev = ["varve/high-cardinality-dev"]
 
 [lib]
 proc-macro = true
+
+[dev-dependencies]
+# DOC-02 (F-12): the two rustdoc examples on `VarveBlock` and `varve_format!`
+# were `ignore`d, so nothing compiled them and they were free to drift out of
+# sync with the macros they document. Compiling them needs the facade, which
+# depends on this crate — a dev-dependency cycle, which cargo supports. The
+# dependency is path-only on purpose: cargo strips path-only dev-dependencies
+# from the published manifest, so this never becomes a real dependency of the
+# `.crate` archive (verified by the `package-archives` CI job, which builds each
+# archive with verification enabled).
+varve = { path = "../varve" }
 
 [dependencies]
 proc-macro-crate = "3.4.0"

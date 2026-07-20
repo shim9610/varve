@@ -18,16 +18,19 @@ use std::path::Path;
 use varve::{
     BlockDescriptor, BlockKind, Endian, Error, FormatSpec, IndexPolicy, IntegrityPolicy,
     MatrixBlockDescriptor, MatrixCommitDescriptor, MatrixCommitKind, MatrixCorruptionKind,
-    MatrixDimensionDescriptor, MatrixDimensions, MatrixKey, MatrixRecoveryReport, ReadLimits,
-    VarveBlock, VarveMatrixBlock,
+    MatrixCorruptionSeverity, MatrixDimensionDescriptor, MatrixDimensions, MatrixKey,
+    MatrixRecoveryReport, ReadLimits, VarveBlock, VarveMatrixBlock,
 };
 
 /// Commit-map page size used by the paged integrity representation.
 const PAGE_BYTES: u64 = 4096;
 /// Native file header, then the 24-byte matrix creation-nonce region (DUR2-03).
 const NATIVE_PREFIX_LEN: u64 = 18 + 24;
-/// Current on-disk matrix layout version (v3 adds the persisted page index).
-const VMAT_VERSION: u16 = 3;
+/// Current on-disk matrix layout version (v4 gives the persisted page index a
+/// validated occupancy header and makes it the live set, not the history).
+const VMAT_VERSION: u16 = 4;
+/// One persisted page-index slot.
+const PAGE_INDEX_SLOT_LEN: u64 = 8;
 
 /// `CHANNELS` bits per scan, so a scan count of `n` yields `n * CHANNELS` cells
 /// and a commit map of `n * CHANNELS / 8` bytes.
@@ -142,6 +145,48 @@ fn header_u64(path: &Path, index: u64) -> u64 {
 
 fn commit_map_off(path: &Path) -> u64 {
     header_u64(path, 6)
+}
+
+/// Base of the persisted page-index region. The first category's array starts
+/// here: slot 0 is the occupancy header, slot `k + 1` is entry `k`.
+fn page_index_off(path: &Path) -> u64 {
+    header_u64(path, 13)
+}
+
+fn patch_u64(path: &Path, offset: u64, value: u64) {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open matrix for mutation");
+    file.seek(SeekFrom::Start(offset)).expect("seek");
+    file.write_all(&value.to_le_bytes()).expect("patch u64");
+}
+
+fn read_u64_at(path: &Path, offset: u64) -> u64 {
+    use std::io::Read;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .expect("open matrix");
+    file.seek(SeekFrom::Start(offset)).expect("seek");
+    let mut bytes = [0; 8];
+    file.read_exact(&mut bytes).expect("read u64");
+    u64::from_le_bytes(bytes)
+}
+
+/// Opens with filesystem allocation-map discovery disabled, which is also what
+/// a file fragmented past the tracked-extent cap produces. The persisted page
+/// index is then the *only* way to find a written page.
+fn open_without_allocation_map(path: &Path, forensics: bool) -> varve::Result<varve::VarveReader> {
+    let spec = if forensics {
+        spec().with_matrix_fatal_forensics()
+    } else {
+        spec()
+    };
+    MatrixRecoveryReport::force_matrix_allocation_map_unavailable(true);
+    let opened = spec.open_reader(path);
+    MatrixRecoveryReport::force_matrix_allocation_map_unavailable(false);
+    opened
 }
 
 fn patch_byte(path: &Path, offset: u64, value: u8) {
@@ -550,6 +595,312 @@ fn cleared_pages_are_evicted_and_residency_returns_to_baseline() -> varve::Resul
     Ok(())
 }
 
+// F-03: page-index residency and enumeration follow live state ---------------
+
+/// The persisted page index must track the pages a matrix *currently* holds
+/// state in, not every page it has ever published.
+///
+/// Before F-03 the tracking set was append-only: a page whose final bit cleared
+/// released its 4 KiB payload but kept its id forever, so resident memory was
+/// `Theta(4096 * live + set(historically touched))` and the second term was
+/// bounded only by the total page count. Payload accounting alone could not see
+/// it, which is why the existing eviction test passed. This measures the index
+/// term directly, and the same quantity is charged to
+/// `ReadLimits::max_matrix_bitmap_bytes`.
+#[test]
+fn page_index_residency_returns_to_baseline_across_page_churn() -> varve::Result<()> {
+    // One cell in each of eight distinct commit-map pages.
+    const PAGE_ORDINALS: [u64; 8] = [
+        0, 32_768, 65_536, 98_304, 131_072, 163_840, 196_608, 229_376,
+    ];
+    // 262_144 cells, i.e. eight commit-map pages.
+    const CHURN_SCANS: u64 = 2048;
+
+    let dir = temp_dir("index-churn");
+    let path = dir.path().join("matrix.varve");
+    let mut writer = spec().create_writer_with_dims(&path, dims(CHURN_SCANS))?;
+
+    MatrixRecoveryReport::reset_matrix_integrity_counters();
+    let baseline = MatrixRecoveryReport::matrix_resident_page_index_bytes();
+    assert_eq!(baseline, 0, "a fresh matrix already tracks index entries");
+
+    let mut peaks = Vec::new();
+    for round in 0..4 {
+        for ordinal in PAGE_ORDINALS {
+            writer.write_matrix_cell(key(ordinal), &ScalingCell { value: 7 })?;
+            writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
+        }
+        peaks.push(MatrixRecoveryReport::matrix_resident_page_index_bytes());
+        for ordinal in PAGE_ORDINALS {
+            writer.clear_matrix_cell::<ScalingCell>(key(ordinal))?;
+        }
+        let after = MatrixRecoveryReport::matrix_resident_page_index_bytes();
+        assert_eq!(
+            after, baseline,
+            "round {round} retained page-index entries for pages that are now empty"
+        );
+    }
+    assert!(
+        peaks[0] > 0,
+        "publishing eight distinct pages tracked no index entry at all"
+    );
+    assert!(
+        peaks.iter().all(|peak| *peak == peaks[0]),
+        "page-index residency grew with historical churn: {peaks:?}"
+    );
+    writer.flush()?;
+    Ok(())
+}
+
+/// Reopen must materialise and visit the *live* pages, not every page the file
+/// has ever published — including where no allocation map is available, which
+/// is exactly the case the persisted index exists to serve.
+#[test]
+fn reopen_after_churn_visits_only_live_pages() -> varve::Result<()> {
+    const CHURN_SCANS: u64 = 2048;
+    const HISTORIC: [u64; 7] = [32_768, 65_536, 98_304, 131_072, 163_840, 196_608, 229_376];
+
+    let dir = temp_dir("index-reopen");
+    let path = dir.path().join("matrix.varve");
+    {
+        let mut writer = spec().create_writer_with_dims(&path, dims(CHURN_SCANS))?;
+        // One cell that stays committed, in page 0.
+        writer.write_matrix_cell(key(0), &ScalingCell { value: 1 })?;
+        writer.commit_matrix_cell::<ScalingCell>(key(0))?;
+        // Seven more pages that are published and then emptied again.
+        for ordinal in HISTORIC {
+            writer.write_matrix_cell(key(ordinal), &ScalingCell { value: 2 })?;
+            writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
+            writer.clear_matrix_cell::<ScalingCell>(key(ordinal))?;
+        }
+        writer.flush()?;
+    }
+
+    MatrixRecoveryReport::reset_matrix_integrity_counters();
+    let reader = open_without_allocation_map(&path, false)?;
+    let visited = MatrixRecoveryReport::matrix_open_bitmap_pages_visited();
+    let index_bytes = MatrixRecoveryReport::matrix_resident_page_index_bytes();
+    assert!(
+        !MatrixRecoveryReport::matrix_open_allocation_map_available(),
+        "the allocation map was not actually disabled for this fixture"
+    );
+    // The commit map contributes its one live page and the validity bitmap its
+    // own; the seven historically touched pages contribute nothing.
+    assert!(
+        visited <= 4,
+        "reopen visited {visited} pages for two live pages of state"
+    );
+    assert!(
+        index_bytes <= 4 * 48,
+        "reopen materialised {index_bytes} bytes of page-index tracking for two live pages"
+    );
+    assert!(matches!(
+        reader.matrix_cell_status::<ScalingCell>(key(0)),
+        Ok(varve::MatrixCellStatus::Committed)
+    ));
+    for ordinal in HISTORIC {
+        assert!(matches!(
+            reader.matrix_cell_status::<ScalingCell>(key(ordinal)),
+            Ok(varve::MatrixCellStatus::NotCommitted)
+        ));
+    }
+    Ok(())
+}
+
+// F-06: damaged page-index entries are reported, never silently truncating ---
+
+/// A damaged page-index entry used to be read as a successful end-of-array, so
+/// every *later* published page went unvisited, its cells answered
+/// `NotCommitted`, and no finding was produced. With no filesystem allocation
+/// map there was no second way to find them: corruption hid data instead of
+/// being reported.
+///
+/// The occupancy header now states how many entries exist, so a zeroed entry
+/// inside that prefix is provable damage: it is reported as a fatal finding and
+/// the scan continues to the pages after it.
+#[test]
+fn damaged_page_index_entry_is_reported_and_later_pages_still_load() -> varve::Result<()> {
+    const SECOND_PAGE_ORDINAL: u64 = 32_768;
+    let dir = temp_dir("index-damage");
+    let path = dir.path().join("matrix.varve");
+    {
+        let mut writer = spec().create_writer_with_dims(&path, dims(LARGE_SCANS))?;
+        for ordinal in [0, SECOND_PAGE_ORDINAL] {
+            writer.write_matrix_cell(key(ordinal), &ScalingCell { value: 3 })?;
+            writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
+        }
+        writer.flush()?;
+    }
+
+    let base = page_index_off(&path);
+    assert_eq!(
+        read_u64_at(&path, base) & ((1u64 << 48) - 1),
+        2,
+        "fixture did not publish exactly two commit-map pages"
+    );
+    // Destroy the *first* entry, which is the one an end-of-array scan would
+    // have stopped on.
+    patch_u64(&path, base + PAGE_INDEX_SLOT_LEN, 0);
+
+    let reader = open_without_allocation_map(&path, true)?;
+    let report = reader.matrix_recovery_report();
+    assert!(
+        report.findings.iter().any(
+            |finding| finding.severity == MatrixCorruptionSeverity::Fatal
+                && finding.kind == MatrixCorruptionKind::CommitMap
+        ),
+        "a damaged page-index entry produced no fatal finding: {:?}",
+        report.findings
+    );
+    // And the page named by the entry *after* the damaged one is still found.
+    assert!(
+        matches!(
+            reader.matrix_cell_status::<ScalingCell>(key(SECOND_PAGE_ORDINAL)),
+            Ok(varve::MatrixCellStatus::Committed)
+        ),
+        "the page after the damaged entry was silently truncated away"
+    );
+    Ok(())
+}
+
+/// The occupancy header itself carries redundancy, so a torn or flipped header
+/// is damage rather than an authoritative "empty index".
+#[test]
+fn damaged_page_index_header_is_reported_not_read_as_empty() -> varve::Result<()> {
+    let dir = temp_dir("index-header-damage");
+    let path = dir.path().join("matrix.varve");
+    fill(&path, LARGE_SCANS, 4)?;
+
+    let base = page_index_off(&path);
+    // A plausible-looking count with no matching check bits.
+    patch_u64(&path, base, 1);
+
+    let reader = open_without_allocation_map(&path, true)?;
+    let report = reader.matrix_recovery_report();
+    assert!(
+        report.findings.iter().any(
+            |finding| finding.severity == MatrixCorruptionSeverity::Fatal
+                && finding.kind == MatrixCorruptionKind::CommitMap
+        ),
+        "a damaged page-index header produced no fatal finding: {:?}",
+        report.findings
+    );
+    Ok(())
+}
+
+/// A never-written index region is all zeros, which is the encoding for "no
+/// entries" and must stay a clean, finding-free open.
+#[test]
+fn zero_page_index_region_is_an_empty_index_not_damage() -> varve::Result<()> {
+    let dir = temp_dir("index-empty");
+    let path = dir.path().join("matrix.varve");
+    drop(spec().create_writer_with_dims(&path, dims(LARGE_SCANS))?);
+
+    let reader = open_without_allocation_map(&path, false)?;
+    assert!(
+        reader.matrix_recovery_report().findings.is_empty(),
+        "an untouched page index was reported as damaged: {:?}",
+        reader.matrix_recovery_report().findings
+    );
+    Ok(())
+}
+
+// F-08: the streaming-zero fallback is detectable ----------------------------
+
+/// Whole-category clear removes a byte range where the platform and filesystem
+/// can, and streams zeros where they cannot. The second path is
+/// `Theta(bitmap bytes)`, so a caller must be able to detect that it is on it
+/// rather than having to infer it from the target triple.
+#[test]
+fn whole_category_clear_reports_whether_it_streamed_zeros() -> varve::Result<()> {
+    let dir = temp_dir("clear-qualification");
+    let path = dir.path().join("matrix.varve");
+    fill(&path, SMALL_WIDE_SCANS, 8)?;
+
+    let mut writer = spec().open_writer(&path)?;
+    let before = MatrixRecoveryReport::matrix_total_zero_range_streamed_bytes();
+    assert_eq!(writer.clear_matrix_category(ScalingCell::CATEGORY)?, 8);
+    let streamed = MatrixRecoveryReport::matrix_last_zero_range_streamed_bytes();
+    let total = MatrixRecoveryReport::matrix_total_zero_range_streamed_bytes();
+    if streamed == 0 {
+        assert!(
+            MatrixRecoveryReport::matrix_sparse_zeroing_supported(),
+            "a range was removed on a target with no range-removal call"
+        );
+    } else {
+        // The slow path is allowed, but it must be visible and it must agree
+        // with the cumulative byte counter.
+        assert!(
+            total >= streamed,
+            "the streaming fallback ran without being counted"
+        );
+    }
+
+    // The whole-operation contract, which the last-request counter cannot
+    // express: a clear issues several range requests, so the qualification a
+    // caller is told to use is the delta of the cumulative counter over the
+    // operation. On a target with no range-removal call at all, every one of
+    // those requests must have streamed, so the delta cannot be zero.
+    let delta = total - before;
+    if !MatrixRecoveryReport::matrix_sparse_zeroing_supported() {
+        assert!(
+            delta > 0,
+            "a clear on a target without range removal reported no streamed bytes"
+        );
+    }
+    assert!(
+        delta >= streamed,
+        "the cumulative counter did not account for the last range request"
+    );
+    Ok(())
+}
+
+/// F-08 accounting completeness: every range a whole-category clear zeroes is
+/// accounted for, including the page-digest array.
+///
+/// The digest array is not zeroed through `zero_range`: the clear punches it
+/// directly and falls back to an explicit per-page digest loop. That loop used
+/// to record nothing, so a clear whose digest array streamed while its final
+/// range was removed reported zero streamed bytes and a caller would have
+/// concluded it took the cheap path.
+///
+/// The assertion that does not depend on which path the host filesystem takes:
+/// whatever the clear streamed, the cumulative counter must account for at
+/// least as many bytes as the counter of explicitly written clear bytes, which
+/// is charged by *both* the `zero_range` fallback and the digest loop. A range
+/// zeroed by writing but not recorded breaks this inequality.
+#[test]
+fn whole_category_clear_accounts_for_every_range_it_zeroes() -> varve::Result<()> {
+    let dir = temp_dir("clear-accounting");
+    let path = dir.path().join("matrix.varve");
+    fill(&path, SMALL_WIDE_SCANS, 8)?;
+
+    let streamed_before = MatrixRecoveryReport::matrix_total_zero_range_streamed_bytes();
+    let written_before = MatrixRecoveryReport::matrix_category_clear_bytes_written();
+
+    let mut writer = spec().open_writer(&path)?;
+    assert_eq!(writer.clear_matrix_category(ScalingCell::CATEGORY)?, 8);
+
+    let streamed = MatrixRecoveryReport::matrix_total_zero_range_streamed_bytes() - streamed_before;
+    let written = MatrixRecoveryReport::matrix_category_clear_bytes_written() - written_before;
+    assert!(
+        streamed >= written,
+        "the clear wrote {written} zero bytes but only accounted for {streamed}: \
+         some range was zeroed by writing without recording it"
+    );
+    if written == 0 {
+        assert_eq!(
+            streamed, 0,
+            "no zero byte was written, so nothing may be reported as streamed"
+        );
+        assert!(
+            MatrixRecoveryReport::matrix_sparse_zeroing_supported(),
+            "every range was removed on a target with no range-removal call"
+        );
+    }
+    Ok(())
+}
+
 /// The skipped ranges must not become a blind spot: a stray byte written into a
 /// page that no commit ever touched allocates that page, so it is still read
 /// and still quarantines the category — at a cell count where hole skipping is
@@ -758,6 +1109,30 @@ fn previous_layout_version_artifact_is_rejected_typed() -> varve::Result<()> {
         Err(Error::FormatVersionMismatch {
             expected,
             actual: 2
+        }) if expected == VMAT_VERSION
+    ));
+    Ok(())
+}
+
+/// The version 3 page index has no occupancy header and a different entry base,
+/// so a v3 artifact is stale-regenerable rather than reinterpretable.
+#[test]
+fn version_three_page_index_artifact_is_rejected_typed() -> varve::Result<()> {
+    let dir = temp_dir("stale-v3");
+    let path = dir.path().join("matrix.varve");
+    fill(&path, 2, 4)?;
+
+    {
+        let mut file = OpenOptions::new().write(true).open(&path)?;
+        file.seek(SeekFrom::Start(vmat_header_offset() + 4))?;
+        file.write_all(&3u16.to_le_bytes())?;
+    }
+
+    assert!(matches!(
+        spec().open_readonly(&path),
+        Err(Error::FormatVersionMismatch {
+            expected,
+            actual: 3
         }) if expected == VMAT_VERSION
     ));
     Ok(())

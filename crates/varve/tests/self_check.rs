@@ -261,6 +261,48 @@ fn self_test_cleanup_removes_files_created_by_the_run() {
     );
 }
 
+/// F-05. On POSIX, `unlink` names a pathname rather than the object whose
+/// identity was checked, so cleanup is only safe in a directory no other
+/// unprivileged principal can bind names in. In any other directory the
+/// destructive step must be declined *and reported* — a silent skip would look
+/// like a successful tidy-up, and deleting anyway would be the check-to-unlink
+/// window the previous code merely acknowledged in a comment.
+#[test]
+#[cfg(unix)]
+fn self_test_cleanup_refuses_a_directory_other_users_can_write() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().expect("private temp directory");
+    let shared = directory.path().join("shared");
+    std::fs::create_dir(&shared).expect("create the shared directory");
+    // World-writable and *not* sticky: any local user could rename another
+    // file over the artifact between the identity check and the deletion.
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777))
+        .expect("relax the directory permissions");
+    let path = shared.join("varve_self_check_shared_dir.vrv");
+
+    let report = SelfCheckFormat::self_test(&path)
+        .with_block(Point { x: 3, y: 4 })
+        .cleanup(true)
+        .run();
+
+    assert!(
+        !report.passed(),
+        "a refused cleanup must be reported, not silently skipped: {report:#?}"
+    );
+    let refusal = report
+        .failures()
+        .find(|step| step.name == "cleanup")
+        .expect("the refusal must appear as a cleanup step");
+    assert_eq!(refusal.domain, Some(DiagnosticDomain::Environment));
+    assert!(refusal.hint.is_some());
+    assert!(
+        path.exists(),
+        "a refused cleanup must leave the artifact in place"
+    );
+    let _ = remove_file(&path);
+}
+
 #[test]
 fn matrix_self_test_reports_missing_dims_as_caller_usage() {
     let path = temp_path("missing_dims");

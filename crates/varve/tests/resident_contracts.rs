@@ -39,6 +39,46 @@ varve_format! {
     }
 }
 
+// API3-02: the generated keyed writer stores `T::Key` rather than a canonical
+// byte payload, so its charge is inline storage only - a different (smaller)
+// per-entry cost that needs its own budget to sit on the same boundary.
+varve_format! {
+    pub format GeneratedTailBudgetFormat {
+        magic: b"GENBGT";
+        version: 1;
+        limits {
+            keyed_tail: 40;
+        }
+        index: keyed_offset_chain;
+        blocks {
+            variable Tracked(id = 41, key = [id]) {
+                id: u64,
+                value: u32,
+            }
+        }
+    }
+}
+
+// API3-02: a keyed-chaining format with a deliberately tiny keyed-tail budget,
+// so the resident and generated keyed writers must both refuse growth of the
+// resident tail cache at a typed boundary.
+varve_format! {
+    pub format ResidentTailBudgetFormat {
+        magic: b"RESBGT";
+        version: 1;
+        limits {
+            keyed_tail: 120;
+        }
+        index: keyed_offset_chain;
+        blocks {
+            variable Budgeted(id = 31, key = [id]) {
+                id: u64,
+                value: u32,
+            }
+        }
+    }
+}
+
 varve_format! {
     pub format ResidentPlainFormat {
         magic: b"RESPLN";
@@ -570,8 +610,9 @@ varve_format! {
 }
 
 /// PERF3-05: the pre-flight estimate must charge the transient an input open
-/// allocates alongside its resident index, so `peak_resident_bytes` bounds the
-/// real peak instead of understating it.
+/// allocates alongside its resident index, so
+/// `peak_resident_structural_bytes` does not ignore a live allocation it can
+/// actually see.
 #[test]
 fn resident_merge_estimate_includes_the_open_time_transient() -> varve::Result<()> {
     const BASE_KEYS: u64 = 300;
@@ -610,9 +651,9 @@ fn resident_merge_estimate_includes_the_open_time_transient() -> varve::Result<(
         estimate.largest_input_open_transient_bytes
     );
     assert!(
-        estimate.peak_resident_bytes()
+        estimate.peak_resident_structural_bytes()
             >= estimate.max_state_bytes + estimate.largest_input_index_bytes + floor,
-        "the peak must include the state, the largest index, and the transient"
+        "the structural peak must include the state, the largest index, and the transient"
     );
     // The transient is a per-input cost, so it tracks the largest input rather
     // than the delta or the total.
@@ -639,8 +680,717 @@ fn resident_merge_estimate_includes_the_open_time_transient() -> varve::Result<(
         "the transient must scale with the largest input's record count"
     );
     assert!(
-        bigger_estimate.peak_resident_bytes() > estimate.peak_resident_bytes(),
-        "the peak bound must grow with the inputs"
+        bigger_estimate.peak_resident_structural_bytes()
+            > estimate.peak_resident_structural_bytes(),
+        "the structural peak must grow with the inputs"
+    );
+    Ok(())
+}
+
+// API3-01 (report finding F-01): the generic keyed mutation paths appended the
+// record first and only then grew the resident keyed-tail cache. A failing
+// cache reservation therefore returned `Err` *after* the record was written,
+// indexed and published in writer state, and the superseded predecessor stayed
+// cached - so the next generic keyed mutation on the same writer linked around
+// a record that had in fact succeeded, silently truncating the physical keyed
+// chain. Reservation now happens before the append and the post-append commit
+// is infallible.
+
+/// Arming helper: the hooks are thread-local, and the test harness gives every
+/// test its own thread, so this cannot leak into a sibling test.
+#[cfg(feature = "scalable-fault-injection")]
+fn assert_tail_allocation_failure(error: &Error) {
+    assert!(
+        matches!(
+            error,
+            Error::AllocationFailed {
+                resource: "keyed tail offsets",
+                ..
+            }
+        ),
+        "expected a typed keyed-tail allocation failure, got {error:?}"
+    );
+}
+
+/// A failed tail reservation on the push path must mean the record was never
+/// appended, and must leave the cache able to link the next mutation.
+#[cfg(feature = "scalable-fault-injection")]
+#[test]
+fn keyed_push_tail_reservation_fails_before_the_append() -> varve::Result<()> {
+    let item_id = <Item as varve::VarveBlock>::ID;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("keyed-push-reserve-fail.varve");
+
+    let mut file = ResidentChainFormat::create(&path)?;
+    let first = file.push_keyed_info(&Item { id: 4, value: 1 })?;
+
+    // Key 9 is absent from the cache, so this push has to reserve a slot.
+    VarveFile::inject_keyed_tail_reservation_failures(1);
+    let error = file
+        .push_keyed(&Item { id: 9, value: 1 })
+        .expect_err("the injected tail reservation must fail the push");
+    VarveFile::inject_keyed_tail_reservation_failures(0);
+    assert_tail_allocation_failure(&error);
+
+    // Same writer: the cache must still describe the file exactly.
+    file.push_keyed(&Item { id: 4, value: 2 })?;
+    file.push_keyed(&Item { id: 9, value: 1 })?;
+    file.flush()?;
+    drop(file);
+
+    let records = chain(&path, item_id)?;
+    assert_eq!(
+        records.len(),
+        3,
+        "the failed push must not have appended a record"
+    );
+    assert_eq!(records[0].2, None, "first record of key 4");
+    assert_eq!(
+        records[1].2,
+        Some(first.record_offset),
+        "key 4 must still link to its predecessor after the failed push"
+    );
+    assert_eq!(
+        records[2].2, None,
+        "key 9's first surviving record has no predecessor, because the \
+         refused push wrote nothing to link to"
+    );
+    Ok(())
+}
+
+/// The same contract on the tombstone path.
+#[cfg(feature = "scalable-fault-injection")]
+#[test]
+fn keyed_delete_tail_reservation_fails_before_the_append() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("keyed-delete-reserve-fail.varve");
+
+    let mut file = ResidentChainFormat::create(&path)?;
+    let first = file.push_keyed_info(&Item { id: 4, value: 1 })?;
+
+    // Key 9 is absent from the cache, so this delete has to reserve a slot.
+    VarveFile::inject_keyed_tail_reservation_failures(1);
+    let error = file
+        .delete::<Item>(&9)
+        .expect_err("the injected tail reservation must fail the delete");
+    VarveFile::inject_keyed_tail_reservation_failures(0);
+    assert_tail_allocation_failure(&error);
+
+    file.delete::<Item>(&4)?;
+    file.flush()?;
+    drop(file);
+
+    let tombstones = chain(&path, varve::TOMBSTONE_BLOCK_ID)?;
+    assert_eq!(
+        tombstones.len(),
+        1,
+        "the failed delete must not have appended a tombstone"
+    );
+    assert_eq!(
+        tombstones[0].2,
+        Some(first.record_offset),
+        "the surviving tombstone must link to the record it supersedes"
+    );
+    Ok(())
+}
+
+/// If the reserved slot is somehow unusable after the append, the cached map
+/// must be discarded, never left holding the superseded predecessor: the next
+/// mutation has to link to the record that succeeded, not around it.
+#[cfg(feature = "scalable-fault-injection")]
+#[test]
+fn keyed_tail_commit_loss_never_links_around_the_committed_record() -> varve::Result<()> {
+    let item_id = <Item as varve::VarveBlock>::ID;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("keyed-commit-loss.varve");
+
+    let mut file = ResidentChainFormat::create(&path)?;
+    let first = file.push_keyed_info(&Item { id: 4, value: 1 })?;
+
+    VarveFile::inject_keyed_tail_commit_losses(1);
+    let second = file.push_keyed_info(&Item { id: 4, value: 2 })?;
+    VarveFile::inject_keyed_tail_commit_losses(0);
+
+    let third = file.push_keyed_info(&Item { id: 4, value: 3 })?;
+
+    VarveFile::inject_keyed_tail_commit_losses(1);
+    file.delete::<Item>(&4)?;
+    VarveFile::inject_keyed_tail_commit_losses(0);
+
+    file.push_keyed(&Item { id: 4, value: 4 })?;
+    file.flush()?;
+    drop(file);
+
+    let records = chain(&path, item_id)?;
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[0].2, None);
+    assert_eq!(records[1].2, Some(first.record_offset));
+    assert_eq!(
+        records[2].2,
+        Some(second.record_offset),
+        "a lost cache update must not make the next push link around the \
+         record that succeeded"
+    );
+
+    let tombstones = chain(&path, varve::TOMBSTONE_BLOCK_ID)?;
+    assert_eq!(tombstones.len(), 1);
+    assert_eq!(
+        tombstones[0].2,
+        Some(third.record_offset),
+        "the tombstone links to the newest record for the key"
+    );
+    assert_eq!(
+        records[3].2,
+        Some(tombstones[0].0),
+        "a lost cache update on the tombstone must not make the next push \
+         link around the tombstone"
+    );
+    Ok(())
+}
+
+// PERF4-04 (report finding F-04): `KeyedMergeEstimate::peak_resident_bytes()`
+// was published as an *upper bound* while its state term counted only
+// `count * size_of::<(Key, (MergeOrder, Option<T>))>()`. That omits HashMap
+// bucket slack and control bytes, the output vector reserved while the map is
+// still alive, and - without limit - every byte of heap owned by a `Key` or a
+// `T`. It is now named and documented as a structural estimate, and the output
+// vector is charged. The test below measures a real allocated high-water mark
+// so the *documented weaker property* is verified against behaviour rather
+// than re-derived from the same arithmetic.
+
+/// Thread-attributed allocation high-water mark.
+///
+/// The measurement window is opened and closed on one thread and the test
+/// harness gives every test its own thread, so a concurrently running sibling
+/// test cannot pollute it. All state is `const`-initialised thread-local
+/// `Cell`s, so the hook itself never allocates and cannot recurse.
+mod peak_allocations {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    std::thread_local! {
+        /// `(measuring, live bytes, peak live bytes)`.
+        static STATE: Cell<(bool, i64, i64)> = const { Cell::new((false, 0, 0)) };
+    }
+
+    fn note(delta: i64) {
+        let _ = STATE.try_with(|state| {
+            let (measuring, live, peak) = state.get();
+            if !measuring {
+                return;
+            }
+            let live = live + delta;
+            state.set((true, live, if live > peak { live } else { peak }));
+        });
+    }
+
+    pub struct PeakTracking;
+
+    // SAFETY: every method forwards to `System` unchanged and only records
+    // sizes around it, so the allocator contract is exactly `System`'s.
+    unsafe impl GlobalAlloc for PeakTracking {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                note(layout.size() as i64);
+            }
+            pointer
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                note(layout.size() as i64);
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            note(-(layout.size() as i64));
+            unsafe { System.dealloc(pointer, layout) }
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let moved = unsafe { System.realloc(pointer, layout, new_size) };
+            if !moved.is_null() {
+                note(new_size as i64 - layout.size() as i64);
+            }
+            moved
+        }
+    }
+
+    /// Runs `body` and returns its result with the peak live heap observed on
+    /// this thread while it ran.
+    pub fn measure<R>(body: impl FnOnce() -> R) -> (R, u64) {
+        STATE.with(|state| state.set((true, 0, 0)));
+        let result = body();
+        let (_, _, peak) = STATE.with(|state| state.get());
+        STATE.with(|state| state.set((false, 0, 0)));
+        (result, u64::try_from(peak).unwrap_or(0))
+    }
+}
+
+#[global_allocator]
+static PEAK_TRACKING_ALLOCATOR: peak_allocations::PeakTracking = peak_allocations::PeakTracking;
+
+/// PERF4-04: the estimate is a structural count model. Its documented identity
+/// must hold exactly, and - for heap-owning `Key`/`T` - the real allocated
+/// peak must exceed it, which is precisely why the old "upper bound" wording
+/// was a defect rather than a rounding error.
+#[test]
+fn resident_merge_estimate_is_structural_and_not_an_allocated_bound() -> varve::Result<()> {
+    const KEYS: u64 = 256;
+    /// Big enough that the `String` heap the count model cannot see dominates
+    /// every structural term put together.
+    const NAME_BYTES: usize = 4096;
+
+    fn write_input(path: &Path, keys: u64) -> varve::Result<()> {
+        let mut file = ResidentEstimateFormat::create(path)?;
+        for key in 0..keys {
+            file.push(&ResidentMergeUser {
+                user_id: key,
+                name: "n".repeat(NAME_BYTES),
+            })?;
+        }
+        file.flush()?;
+        Ok(())
+    }
+
+    let directory = tempfile::tempdir()?;
+    let base = directory.path().join("peak-base.varve");
+    let delta = directory.path().join("peak-delta.varve");
+    let merged = directory.path().join("peak-merged.varve");
+    write_input(&base, KEYS)?;
+    write_input(&delta, KEYS / 4)?;
+
+    let estimate = varve::estimate_keyed_merge::<ResidentMergeUser, _>(
+        ResidentEstimateFormat::spec(),
+        base.as_path(),
+        &[delta.as_path()],
+    )?;
+
+    // The documented identity: the structural peak is exactly the sum of its
+    // four structural terms, and each byte term is a plain count model.
+    assert_eq!(
+        estimate.peak_resident_structural_bytes(),
+        estimate.max_state_bytes
+            + estimate.max_output_values_bytes
+            + estimate.largest_input_index_bytes
+            + estimate.largest_input_open_transient_bytes,
+        "the structural peak must be the documented sum"
+    );
+    assert!(
+        estimate.max_output_values_bytes > 0,
+        "the output vector is reserved while the map is alive and must be charged"
+    );
+    assert_eq!(
+        estimate.max_state_bytes % estimate.max_distinct_keys,
+        0,
+        "the state term is `keys * size_of::<entry>()`"
+    );
+    assert_eq!(
+        estimate.max_output_values_bytes % estimate.max_distinct_keys,
+        0,
+        "the output term is `keys * size_of::<entry>()`"
+    );
+    assert_eq!(
+        estimate.largest_input_open_transient_bytes,
+        KEYS * (size_of::<u64>() as u64),
+        "the open transient is one u64 per record of the largest input"
+    );
+
+    // The measured property: with heap-owning values the real peak exceeds the
+    // structural estimate, so it must never be published as a bound.
+    let (result, peak) = peak_allocations::measure(|| {
+        varve::merge_keyed_files::<ResidentMergeUser, _>(
+            ResidentEstimateFormat::spec(),
+            base.as_path(),
+            &[delta.as_path()],
+            merged.as_path(),
+        )
+    });
+    result?;
+
+    // Calibration: the allocator hook is wired and saw the merge.
+    assert!(
+        peak > (KEYS * NAME_BYTES as u64) / 2,
+        "the counting allocator must observe the retained values: {peak}"
+    );
+    assert!(
+        peak > estimate.peak_resident_structural_bytes(),
+        "the structural estimate is not an allocated upper bound for \
+         heap-owning values: measured peak {peak} must exceed estimate {}",
+        estimate.peak_resident_structural_bytes()
+    );
+
+    // The merge itself is unaffected by the accounting change.
+    let reopened = ResidentEstimateFormat::open(&merged)?;
+    assert_eq!(reopened.index_entries().len() as u64, KEYS);
+    Ok(())
+}
+
+/// API3-02: the resident keyed-tail cache is charged to
+/// `ReadLimits::max_keyed_tail_bytes` *before* it grows. Prior to this fix the
+/// cache was guarded by `try_reserve` only: an allocation the allocator would
+/// happily serve was accepted no matter how large the cache became, so no
+/// configured policy could refuse it. This test fails against that code -
+/// every push succeeds there.
+///
+/// The refusal must also be atomic: the charge precedes the append, so the
+/// refused record must not exist.
+#[test]
+fn resident_keyed_tail_growth_is_refused_by_the_configured_budget() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("resident-tail-budget.varve");
+
+    let mut file = ResidentTailBudgetFormat::create(&path)?;
+    // The charge is `(len + 1) * size_of::<(Vec<u8>, u64)>()` plus the key
+    // payload bytes the map owns; one internal key payload here is 20 bytes,
+    // so the charges are 52, 104 and 156 against a 120-byte budget: the first
+    // two distinct keys fit and the third cannot.
+    file.push_keyed(&Budgeted { id: 1, value: 1 })?;
+    file.push_keyed(&Budgeted { id: 2, value: 2 })?;
+    // Repeating an existing key overwrites its slot in place and is charged
+    // nothing, so it must still be accepted under the same budget.
+    file.push_keyed(&Budgeted { id: 1, value: 3 })?;
+
+    let error = file
+        .push_keyed(&Budgeted { id: 3, value: 4 })
+        .expect_err("a third distinct key must exceed the keyed-tail budget");
+    assert!(
+        matches!(
+            error,
+            Error::LimitExceeded {
+                resource: "keyed tail bytes",
+                ..
+            }
+        ),
+        "expected a typed keyed-tail budget rejection, got {error:?}"
+    );
+    file.flush()?;
+    drop(file);
+
+    // Atomicity: the refusal happened before the append, so exactly the three
+    // accepted records exist and none of them is the refused key.
+    let reopened = ResidentTailBudgetFormat::open(&path)?;
+    let records: Vec<Budgeted> = reopened
+        .blocks::<Budgeted>()?
+        .iter()
+        .collect::<varve::Result<_>>()?;
+    assert_eq!(
+        records,
+        vec![
+            Budgeted { id: 1, value: 1 },
+            Budgeted { id: 2, value: 2 },
+            Budgeted { id: 1, value: 3 },
+        ],
+        "the refused push must not have appended a record"
+    );
+    Ok(())
+}
+
+/// API3-02: the *generated* keyed writer grew its `HashMap<T::Key, u64>` tail
+/// map with a bare `HashMap::insert` after the append - no `try_reserve`, no
+/// charge, so an allocation the allocator refuses aborted the process and no
+/// configured limit could refuse the growth at all. It now reserves and
+/// charges the slot before the append. This test fails against that code.
+#[test]
+fn generated_keyed_writer_tail_growth_is_refused_by_the_configured_budget() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("generated-tail-budget.varve");
+
+    // `size_of::<(u64, u64)>()` is 16, so the charges are 16, 32 and 48
+    // against a 40-byte budget.
+    let mut writer = GeneratedTailBudgetFormat::create_writer(&path)?;
+    writer.push_tracked(&Tracked { id: 1, value: 1 })?;
+    writer.push_tracked(&Tracked { id: 2, value: 2 })?;
+    writer.push_tracked(&Tracked { id: 1, value: 3 })?;
+
+    let error = writer
+        .push_tracked(&Tracked { id: 3, value: 4 })
+        .expect_err("a third distinct key must exceed the keyed-tail budget");
+    assert!(
+        matches!(
+            error,
+            Error::LimitExceeded {
+                resource: "keyed tail bytes",
+                ..
+            }
+        ),
+        "expected a typed keyed-tail budget rejection, got {error:?}"
+    );
+    // The tombstone path is charged identically.
+    let error = writer
+        .delete_tracked(&4u64)
+        .expect_err("a tombstone for an absent key needs a slot and must be refused too");
+    assert!(
+        matches!(
+            error,
+            Error::LimitExceeded {
+                resource: "keyed tail bytes",
+                ..
+            }
+        ),
+        "expected a typed keyed-tail budget rejection, got {error:?}"
+    );
+    writer.flush()?;
+    drop(writer);
+
+    let reopened = GeneratedTailBudgetFormat::open(&path)?;
+    let records: Vec<Tracked> = reopened
+        .blocks::<Tracked>()?
+        .iter()
+        .collect::<varve::Result<_>>()?;
+    assert_eq!(
+        records,
+        vec![
+            Tracked { id: 1, value: 1 },
+            Tracked { id: 2, value: 2 },
+            Tracked { id: 1, value: 3 },
+        ],
+        "the refused push and delete must not have appended anything"
+    );
+    Ok(())
+}
+
+// API3-05: twins of the two budgeted formats above. They share their magic,
+// version, index policy and block layout but declare no keyed-tail ceiling, so
+// they can author a file holding more distinct keys than the budgeted format's
+// ceiling admits. Neither side declares `schema_hash: computed`, so the
+// budgeted format opens what its twin wrote.
+//
+// These exist because the round-6 tests only ever created a *fresh* file and
+// then grew the tail map incrementally, which cannot see the dominant
+// allocation: the map built from file content at writer construction
+// (`writer_tail_inits` -> `VarveFile::key_tail_offsets`) and at first resident
+// keyed use. That build was guarded by `try_reserve` alone, so a file with `N`
+// distinct keys forced an `N`-entry resident map whatever `keyed_tail` said and
+// the ceiling only refused further growth within the session.
+mod unlimited {
+    varve::varve_format! {
+        pub format GeneratedTailUnlimitedFormat {
+            magic: b"GENBGT";
+            version: 1;
+            index: keyed_offset_chain;
+            blocks {
+                variable Tracked(id = 41, key = [id]) {
+                    id: u64,
+                    value: u32,
+                }
+            }
+        }
+    }
+
+    varve::varve_format! {
+        pub format ResidentTailUnlimitedFormat {
+            magic: b"RESBGT";
+            version: 1;
+            index: keyed_offset_chain;
+            blocks {
+                variable Budgeted(id = 31, key = [id]) {
+                    id: u64,
+                    value: u32,
+                }
+            }
+        }
+    }
+}
+
+/// Number of distinct keys the unlimited twins author. Every budgeted format in
+/// this file has a ceiling far below what a map this size costs.
+const OVER_BUDGET_KEYS: u64 = 8;
+
+/// API3-05: opening the *generated* keyed writer on a file whose distinct key
+/// count exceeds `keyed_tail` must be refused at a typed boundary.
+///
+/// The generated writer's tail map is built at construction from file content
+/// by `VarveFile::key_tail_offsets`, which had no keyed-tail charge at all:
+/// this open used to be ACCEPTED, materialising an 8-entry map under a 40-byte
+/// ceiling, and only the 9th key was ever refused. This test fails against that
+/// code.
+#[test]
+fn generated_keyed_writer_refuses_to_open_a_file_over_the_tail_budget() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("generated-tail-build.varve");
+
+    {
+        let mut writer = unlimited::GeneratedTailUnlimitedFormat::create_writer(&path)?;
+        for id in 0..OVER_BUDGET_KEYS {
+            writer.push_tracked(&unlimited::Tracked {
+                id,
+                value: id as u32,
+            })?;
+        }
+        writer.flush()?;
+    }
+
+    let error = GeneratedTailBudgetFormat::open_writer(&path)
+        .expect_err("a tail map for 8 distinct keys must exceed the 40-byte keyed-tail budget");
+    assert!(
+        matches!(
+            error,
+            Error::LimitExceeded {
+                resource: "keyed tail bytes",
+                ..
+            }
+        ),
+        "expected a typed keyed-tail budget rejection at writer construction, got {error:?}"
+    );
+
+    // The refusal is a read-side refusal: it must not have disturbed the file.
+    let reopened = unlimited::GeneratedTailUnlimitedFormat::open(&path)?;
+    let records: Vec<unlimited::Tracked> = reopened
+        .blocks::<unlimited::Tracked>()?
+        .iter()
+        .collect::<varve::Result<_>>()?;
+    assert_eq!(
+        records.len() as u64,
+        OVER_BUDGET_KEYS,
+        "the refused writer open must not have changed the file"
+    );
+    Ok(())
+}
+
+/// API3-05: the resident path had the same hole in weaker form - it built the
+/// whole map through `key_tail_offsets` and only then charged the budget, so
+/// the charge gated *retention* rather than the peak allocation.
+///
+/// The refusal of the keyed mutation alone cannot tell the two apart: the
+/// post-build retention check refused it too. What distinguishes them is
+/// `VarveFile::key_tail_offsets` itself, the public entry point that performs
+/// the build - and that the generated writers call at construction. Pre-fix it
+/// returned `Ok` with an 8-entry map under a 120-byte ceiling; it must now
+/// refuse. That assertion is made first, and it is the one that fails against
+/// the old code.
+#[test]
+fn resident_keyed_tail_build_is_refused_for_a_file_over_the_tail_budget() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("resident-tail-build.varve");
+
+    {
+        let mut file = unlimited::ResidentTailUnlimitedFormat::create(&path)?;
+        for id in 0..OVER_BUDGET_KEYS {
+            file.push_keyed(&unlimited::Budgeted {
+                id,
+                value: id as u32,
+            })?;
+        }
+        file.flush()?;
+    }
+
+    let mut file = ResidentTailBudgetFormat::open(&path)?;
+    // The build itself is refused, not merely its result: this is the call the
+    // generated writers make at construction and the one the resident cache
+    // seeds from.
+    let error = file
+        .key_tail_offsets::<Budgeted>()
+        .expect_err("building the map at all must exceed the 120-byte budget");
+    assert!(
+        matches!(
+            error,
+            Error::LimitExceeded {
+                resource: "keyed tail bytes",
+                ..
+            }
+        ),
+        "expected a typed keyed-tail budget rejection during the build, got {error:?}"
+    );
+
+    let error = file
+        .push_keyed(&Budgeted {
+            id: 100,
+            value: 100,
+        })
+        .expect_err("building a tail map for 8 distinct keys must exceed the 120-byte budget");
+    assert!(
+        matches!(
+            error,
+            Error::LimitExceeded {
+                resource: "keyed tail bytes",
+                ..
+            }
+        ),
+        "expected a typed keyed-tail budget rejection during the build, got {error:?}"
+    );
+    file.flush()?;
+    drop(file);
+
+    // Atomicity: the charge precedes the append, so the refused record does not
+    // exist.
+    let reopened = unlimited::ResidentTailUnlimitedFormat::open(&path)?;
+    let records: Vec<unlimited::Budgeted> = reopened
+        .blocks::<unlimited::Budgeted>()?
+        .iter()
+        .collect::<varve::Result<_>>()?;
+    assert_eq!(
+        records.len() as u64,
+        OVER_BUDGET_KEYS,
+        "the refused push must not have appended a record"
+    );
+    assert!(
+        records.iter().all(|record| record.id != 100),
+        "the refused key must not be present"
+    );
+    Ok(())
+}
+
+/// API3-05: a file whose distinct key count fits the ceiling must still open
+/// and still work, and the ceiling must then govern further growth from the
+/// *built* size rather than from zero. This is the negative control: without it
+/// the two tests above would also pass if the charge simply refused everything.
+///
+/// The build peak is deliberately larger than the map it produces - the
+/// transient ordering map is alive while the returned map is reserved - so the
+/// arithmetic is spelled out here rather than assumed. With one pre-existing
+/// key the peak is `1 * size_of::<(u64, u64)>()` for the returned map plus
+/// `1 * size_of::<(Vec<u8>, u64)>()` for the transcoded map plus one 20-byte
+/// internal key payload: 68 bytes against the 120-byte ceiling.
+#[test]
+fn a_file_within_the_tail_budget_still_opens_and_then_binds_on_growth() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("resident-tail-within.varve");
+
+    {
+        let mut file = unlimited::ResidentTailUnlimitedFormat::create(&path)?;
+        file.push_keyed(&unlimited::Budgeted { id: 1, value: 1 })?;
+        file.flush()?;
+    }
+
+    let mut file = ResidentTailBudgetFormat::open(&path)?;
+    // A key already in the built map is charged nothing and must be accepted.
+    file.push_keyed(&Budgeted { id: 1, value: 2 })?;
+    // One further distinct key still fits: 2 * 32 + 2 * 20 = 104.
+    file.push_keyed(&Budgeted { id: 2, value: 3 })?;
+    // A third distinct key does not: 3 * 32 + 3 * 20 = 156.
+    let error = file
+        .push_keyed(&Budgeted { id: 3, value: 4 })
+        .expect_err("growth beyond the built map must still be refused");
+    assert!(
+        matches!(
+            error,
+            Error::LimitExceeded {
+                resource: "keyed tail bytes",
+                ..
+            }
+        ),
+        "expected a typed keyed-tail budget rejection on growth, got {error:?}"
+    );
+    file.flush()?;
+    drop(file);
+
+    let reopened = unlimited::ResidentTailUnlimitedFormat::open(&path)?;
+    let records: Vec<unlimited::Budgeted> = reopened
+        .blocks::<unlimited::Budgeted>()?
+        .iter()
+        .collect::<varve::Result<_>>()?;
+    assert_eq!(
+        records,
+        vec![
+            unlimited::Budgeted { id: 1, value: 1 },
+            unlimited::Budgeted { id: 1, value: 2 },
+            unlimited::Budgeted { id: 2, value: 3 },
+        ],
+        "the accepted repeat and second key must be present and the refused key must not be"
     );
     Ok(())
 }

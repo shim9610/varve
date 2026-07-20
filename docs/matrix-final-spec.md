@@ -8,25 +8,55 @@ wave.
 - Matrix storage is a second storage mode beside the existing append log.
 - Runtime dimensions are a P0 dependency and are persisted at create time.
 - Matrix files store a 24-byte `VMNC` creation-nonce region and then a `VMAT`
-  v3 layout region immediately after the normal Varve header. A `VMAT`
-  version 1 or 2 artifact is refused at open with
-  `Error::FormatVersionMismatch { expected: 3, actual: <1 or 2> }`; both are
-  stale and regenerable. The `MCRC` integrity table remains version 2.
-- `VMAT` v3 adds a persisted page-index region between the static aux regions
+  v4 layout region immediately after the normal Varve header. A `VMAT`
+  version 1, 2, or 3 artifact is refused at open with
+  `Error::FormatVersionMismatch { expected: 4, actual: <1, 2, or 3> }`; all
+  three are stale and regenerable. The `MCRC` integrity table remains version 2.
+- `VMAT` v3 added a persisted page-index region between the static aux regions
   and the `MCRC` region, described by header fields 13 and 14
   (`page_index_off`, `page_index_len`), which are appended after
   `append_log_start` so every earlier field keeps its index; the reserved tail
-  shrinks from 32 to 16 bytes. The index holds one 8-byte entry per published
-  bitmap page, stored as `page + 1` so a zero entry terminates the array and no
-  count field can tear. Entries precede the page and digest they describe, so a
-  torn append can only name a page that still reads as uninitialised zeros.
+  shrinks from 32 to 16 bytes. **`VMAT` v4 keeps the region and changes its
+  contents**, which is why a v3 array cannot be reinterpreted:
+  - the region is `(page_count + 1) * 8` bytes, not `page_count * 8`. Slot `0`
+    is an **occupancy header** and slots `1..=count` are entries;
+  - the header packs the entry count into its low 48 bits and a check value
+    derived from that count into its high 16 bits, so a torn or bit-flipped
+    header is detectable. `check(0) == 0`, so an all-zero region decodes as a
+    legitimately empty index and creation writes no header explicitly. The check
+    is a **redundancy code, not authentication**: it makes no claim against an
+    actor who can rewrite the file, exactly as the page-digest array does not;
+  - enumeration length comes from the header count. It is **never** derived by
+    scanning for a terminator. A zero or out-of-range entry inside the counted
+    prefix is therefore provable damage: it is reported as a `Fatal`
+    `MatrixCorruptionKind::CommitMap` finding and the scan **continues** past
+    it. Silent truncation is not a possible outcome (v3's terminator scan could
+    hide every page after a damaged entry);
+  - the array is the **live set**, not the publication history. A page's entry
+    is released in `O(1)` when its final set bit clears, by moving the last
+    entry into the vacated slot and decrementing the header. Resident and
+    persisted cost therefore track live pages, not pages ever published;
+  - ordering is crash-safe in the superset direction: the entry is written
+    before the header that admits it, and both before the bitmap byte. A crash
+    between them can only leave an entry naming a page whose bytes were never
+    written — one extra page read at open, since that page's digest still says
+    `INITIALIZED`/`crc(zeros)` and it answers identically. Dropping an entry for
+    a page that still holds bits is the direction that would hide data, and it
+    cannot occur;
+  - the page-index storage is charged to `ReadLimitKey::MatrixBitmapBytes`
+    together with the payload pages, before the allocation is taken and refunded
+    on reservation failure and on release, using a documented conservative
+    residency model rather than a measurement;
+  - a matrix with more than `2^48 - 1` pages (about 1 EiB of bitmap) is refused
+    at layout time with `InvalidMatrixLayout`, because the header cannot
+    represent the count.
 - Dense cells use deterministic addressing:
   `ordinal = scan * n_channels + ch` and
   `offset = slot_region_start + ordinal * slot_stride`.
 - Slot payloads are fixed-stride, bounded, canonical encoded values.
 - Commit bitmaps are the only normal read-time validity source.
 - Readers snapshot layout metadata and commit maps on open. Slot bytes remain
-  live in-place storage, so VMAT v3 does not promise immutable concurrent reads
+  live in-place storage, so VMAT v4 does not promise immutable concurrent reads
   across an overwrite of the same slot.
 - Same-size overwrite writes the existing slot range and must not change file
   length.
@@ -50,7 +80,7 @@ wave.
 - P0 includes storage primitives and generated helpers for cell-category bits,
   single global bits, and per-channel bits. Matrix cell reads use cell-category
   bits; singles/per-channel are status flags until a domain block binds them.
-- In VMAT v3 each matrix block owns one unique cell commit category. Sharing a
+- In VMAT v4 each matrix block owns one unique cell commit category. Sharing a
   cell category across multiple matrix blocks is rejected until multi-block
   category rebuild semantics are explicitly defined.
 - `commit_*` before a successful slot write is rejected with

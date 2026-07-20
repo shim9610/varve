@@ -160,12 +160,18 @@ gate, file data, environment, or library invariant issues. See
 
 ## Status
 
-Varve 0.3.0 is usable as an alpha library for experimentation and controlled
+Varve 0.4.0 is usable as an alpha library for experimentation and controlled
 deployments, at moderate scale through the generated APIs. It includes append-log blocks, keyed collections,
 transaction/footer commit policies, schema manifests, diagnostics, merge and
 compact helpers, variable-block compression, matrix storage, mmap, and opt-in
-zero-copy. Valid native 0.1 wire bytes remain readable in 0.3.0, but the Rust API
-is still pre-1.0 and may evolve through semver-signaled minor releases.
+zero-copy. Valid native 0.1 append-log wire bytes remain readable in 0.4.0, but
+the Rust API is still pre-1.0 and may evolve through semver-signaled minor
+releases. Two artifact classes are **not** covered by that statement in 0.4.0
+and are rejected with a typed stale-regenerable error rather than read: matrix
+sidecars written before VMAT layout v4, and stream/indexed primaries and disk
+sidecars written before the generation nonce. Both are regenerated from source
+data; see [CHANGELOG](CHANGELOG.md) and
+[Migration Guide](docs/migration-guide.md).
 The petabyte-scale stream/disk-index API remains behind
 `high-cardinality-dev`. Progress/cancellation, process-interruption recovery,
 and sidecar robustness gates are implemented and executed; the current Windows
@@ -197,7 +203,11 @@ compression), which the default and all-feature runs both compile out; a job
 pinned to the declared MSRV (1.95.0) that checks and tests against it and fails
 if the pin and the manifests disagree; a `package contents` job asserting that
 every published `.crate` file list contains `README.md`, `LICENSE-MIT`, and
-`LICENSE-APACHE`; a blocking `cargo deny` / `cargo audit` supply-chain job; a
+`LICENSE-APACHE`; a `package archives + staged consumer` job that builds and
+verifies the three real `.crate` archives and then compiles and runs a
+downstream consumer against the extracted archives; a `rustdoc (-D warnings)`
+job over the workspace's published documentation surface; a blocking
+`cargo deny` / `cargo audit` supply-chain job; a
 blocking locked fuzz-workspace job (`cargo metadata --locked`, `cargo check
 --locked --all-targets`, `cargo audit`, `cargo deny`, and a final
 `git diff --exit-code -- fuzz/Cargo.lock`, in that order, so no step can hide a
@@ -219,8 +229,23 @@ inside the workspace derived a block over the public surface the way a consumer
 does.
 
 Every CI action is pinned to a commit id and every installed cargo tool to an
-exact version, so a future run of the workflow evaluates the same gate code it
-evaluates today.
+exact version, so a future run of the workflow evaluates the same *gate code* it
+evaluates today. That is the whole of the claim: the runner images
+(`ubuntu-latest`, `windows-latest`) and the `stable` toolchain every job except
+`msrv (1.95.0)` requests are rolling by design, because catching a break on a
+newer compiler or image is exactly what they are for. A CI run is therefore
+**not** reproducible, and a red run on an unchanged commit is an expected
+outcome rather than a workflow defect. `msrv (1.95.0)` is the only job that
+evaluates a fixed toolchain.
+
+Publication is gated separately from merging. `package contents` proves the file
+list of each `.crate`; `package archives + staged consumer` builds the three
+`.crate` archives for real (`cargo package --locked`, verification enabled),
+extracts them, and rebuilds the public-API fixture's source against the
+extracted trees through `[patch.crates-io]`, so the bytes a crates.io user
+downloads are compiled and run before release rather than only listed.
+`rustdoc (-D warnings)` builds the published documentation surface for all three
+crates with warnings denied.
 
 Job results block merges only where branch protection lists them as required
 status checks; adding a job to the workflow does not by itself make it a gate.

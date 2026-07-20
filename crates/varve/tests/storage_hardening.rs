@@ -467,6 +467,13 @@ fn successful_keyed_compact_leaves_no_marker_for_its_internal_temp() -> varve::R
         "the fixture must start clean"
     );
 
+    // STO4-P2: this test publishes through the shared atomic-replacement
+    // path, whose indeterminate-failure injection counter is process-wide, so
+    // it holds the same gate as the fault-injection tests below rather than
+    // consuming a count they armed.
+    #[cfg(feature = "scalable-fault-injection")]
+    let _gate = fault_gate();
+
     varve::compact_keyed_file::<StorageKeyedValue, _>(
         StorageKeyedFormat::spec(),
         input.as_path(),
@@ -575,5 +582,120 @@ fn create_and_sync_reports_pathname_durability() -> varve::Result<()> {
     drop(writer);
 
     cleanup(&path);
+    Ok(())
+}
+
+// STO4-P2 (report finding, P2 rewrite-temp): `write_keyed_values_atomically`
+// created its rewrite temp and only afterwards entered the scope responsible
+// for deleting it, so a failure in between - the permission copy - returned
+// `Err` with an empty temp left in the output's directory. The temp is now
+// owned by an RAII guard from the moment it exists, and the guard is *disarmed*
+// only where retention is the deliberate contract: after a successful rename,
+// and after an indeterminate publication whose temp may be the only surviving
+// copy of the new generation.
+
+/// Serialises tests that depend on the process-wide replacement fault counter.
+#[cfg(feature = "scalable-fault-injection")]
+fn fault_gate() -> std::sync::MutexGuard<'static, ()> {
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(feature = "scalable-fault-injection")]
+fn write_keyed_merge_input(path: &std::path::Path, keys: u64) -> varve::Result<()> {
+    let mut file = StorageKeyedFormat::create(path)?;
+    for key in 0..keys {
+        file.push(&StorageKeyedValue {
+            key,
+            payload: format!("v-{key}"),
+        })?;
+    }
+    file.flush()?;
+    Ok(())
+}
+
+/// STO4-P2: a failure after the temp exists but before the publication scope
+/// must leave no rewrite artifact behind.
+#[cfg(feature = "scalable-fault-injection")]
+#[test]
+fn rewrite_temp_is_removed_when_preparation_fails_after_creation() -> varve::Result<()> {
+    let _gate = fault_gate();
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("raii-input.varve");
+    let output = directory.path().join("raii-output.varve");
+    write_keyed_merge_input(&input, 8)?;
+
+    assert!(
+        rewrite_leftovers(directory.path())?.is_empty(),
+        "the fixture must start clean"
+    );
+
+    varve::VarveFile::inject_rewrite_temp_preparation_failures(1);
+    let error = varve::compact_keyed_file::<StorageKeyedValue, _>(
+        StorageKeyedFormat::spec(),
+        input.as_path(),
+        output.as_path(),
+    )
+    .expect_err("the injected preparation failure must fail the compact");
+    varve::VarveFile::inject_rewrite_temp_preparation_failures(0);
+    assert!(
+        matches!(error, Error::Io(_)),
+        "expected the injected io failure, got {error:?}"
+    );
+
+    assert!(!output.exists(), "a failed compact must publish nothing");
+    let leftovers = rewrite_leftovers(directory.path())?;
+    assert!(
+        leftovers.is_empty(),
+        "a failure between temp creation and publication must leave no \
+         rewrite artifact: {leftovers:?}"
+    );
+
+    // The guard did not generalise into deleting a temp it should keep, and
+    // the next compact still works.
+    varve::compact_keyed_file::<StorageKeyedValue, _>(
+        StorageKeyedFormat::spec(),
+        input.as_path(),
+        output.as_path(),
+    )?;
+    assert!(
+        rewrite_leftovers(directory.path())?.is_empty(),
+        "a successful compact must still leave nothing behind"
+    );
+    let compacted = StorageKeyedFormat::open(&output)?;
+    assert_eq!(compacted.blocks::<StorageKeyedValue>()?.len(), 8);
+    Ok(())
+}
+
+/// STO4-P2: the guard must not touch the one temp whose retention is the
+/// documented contract (DUR2-01).
+#[cfg(feature = "scalable-fault-injection")]
+#[test]
+fn indeterminate_merge_publication_still_retains_its_rewrite_temp() -> varve::Result<()> {
+    let _gate = fault_gate();
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("indeterminate-input.varve");
+    let output = directory.path().join("indeterminate-output.varve");
+    write_keyed_merge_input(&input, 8)?;
+
+    varve::VarveFile::inject_replace_indeterminate_failures(1);
+    let error = varve::compact_keyed_file::<StorageKeyedValue, _>(
+        StorageKeyedFormat::spec(),
+        input.as_path(),
+        output.as_path(),
+    )
+    .expect_err("the injected indeterminate publication must fail the compact");
+    varve::VarveFile::inject_replace_indeterminate_failures(0);
+    assert!(
+        matches!(error, Error::ReplacePublicationIndeterminate { .. }),
+        "expected a typed indeterminate publication, got {error:?}"
+    );
+
+    let leftovers = rewrite_leftovers(directory.path())?;
+    assert!(
+        leftovers.iter().any(|name| !name.ends_with(".lock")),
+        "the temp may be the only surviving copy of the new generation and \
+         must be preserved for reconciliation: {leftovers:?}"
+    );
     Ok(())
 }

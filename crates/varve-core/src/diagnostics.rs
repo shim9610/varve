@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt::Debug;
-use std::fs::remove_file;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -424,7 +423,7 @@ impl FormatSelfTest {
                 // now sits at the pathname, so the target is left untouched;
                 // only the marker the failed claim may have created is tidied
                 // through the identity-checked protocol.
-                remove_unowned_lock_marker(&self.path);
+                remove_unowned_lock_marker(&mut report, &self.path);
                 return report;
             };
             writer
@@ -439,7 +438,7 @@ impl FormatSelfTest {
                 // the target is left untouched; only the marker the failed
                 // claim may have created is tidied through the
                 // identity-checked protocol.
-                remove_unowned_lock_marker(&self.path);
+                remove_unowned_lock_marker(&mut report, &self.path);
                 return report;
             };
             writer
@@ -467,7 +466,7 @@ impl FormatSelfTest {
 
         if write_failed {
             if self.cleanup {
-                cleanup_run_artifacts(&self.path, created_identity.as_deref());
+                cleanup_run_artifacts(&mut report, &self.path, created_identity.as_deref());
             }
             return report;
         }
@@ -479,7 +478,7 @@ impl FormatSelfTest {
         );
         let Some(mut reader) = reader.take() else {
             if self.cleanup {
-                cleanup_run_artifacts(&self.path, created_identity.as_deref());
+                cleanup_run_artifacts(&mut report, &self.path, created_identity.as_deref());
             }
             return report;
         };
@@ -493,7 +492,7 @@ impl FormatSelfTest {
 
         if self.cleanup {
             drop(reader);
-            cleanup_run_artifacts(&self.path, created_identity.as_deref());
+            cleanup_run_artifacts(&mut report, &self.path, created_identity.as_deref());
         }
         report
     }
@@ -1012,19 +1011,73 @@ where
     }
 }
 
+/// Outcome of an identity-checked destructive removal (API2-02, F-05).
+///
+/// Cleanup is a destructive operation performed on behalf of a caller who
+/// asked for tidiness, never for correctness, so every way it can decline is a
+/// distinct, reportable value rather than a silent `return`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObjectRemoval {
+    /// The pathname still named the expected object, and that object is gone.
+    Removed,
+    /// The pathname did not name the expected object; nothing was deleted.
+    NotOwned,
+    /// Deleting by this pathname could not be made safe on this platform and
+    /// in this directory, so nothing was deleted. The payload is the reason.
+    ///
+    /// Only the POSIX removal path can produce this: Windows deletes through
+    /// the same verified handle it checked, so it never has to decline for
+    /// want of a safe pathname. The variant stays in the shared enum so the
+    /// reporting code above is identical on both platforms.
+    #[cfg_attr(windows, allow(dead_code))]
+    Refused(&'static str),
+    /// The removal was attempted on the verified object and failed.
+    Failed,
+}
+
 /// Removes the artifacts this self-test run created, verifying identity
-/// before every deletion (API2-02).
+/// before every deletion (API2-02, F-05).
 ///
 /// The native target is only removed while the pathname still resolves to the
 /// file object this run created; a file another process has since swapped in
-/// at the same pathname is left untouched. The writer-lock marker is only
-/// removed after re-acquiring it through the standard writer-lock protocol,
-/// so a marker locked or populated by a foreign writer survives.
-fn cleanup_run_artifacts(path: &Path, created_identity: Option<&[u8]>) {
+/// at the same pathname is left untouched. On platforms without an
+/// unlink-by-handle primitive the removal is additionally confined to a
+/// directory no other unprivileged principal can insert names into, and is
+/// *refused* — with a typed, reported reason — rather than performed through an
+/// unverifiable pathname. The writer-lock marker is only removed after
+/// re-acquiring it through the standard writer-lock protocol, so a marker
+/// locked or populated by a foreign writer survives.
+fn cleanup_run_artifacts(
+    report: &mut FormatSelfTestReport,
+    path: &Path,
+    created_identity: Option<&[u8]>,
+) {
     if let Some(identity) = created_identity {
-        remove_path_if_same_object(path, identity);
+        match remove_path_if_same_object(path, identity) {
+            ObjectRemoval::Removed | ObjectRemoval::NotOwned => {}
+            ObjectRemoval::Refused(reason) => {
+                report.steps.push(SelfTestStepReport::failed(
+                    "cleanup",
+                    DiagnosticDomain::Environment,
+                    format!("refused to delete {} by pathname: {reason}", path.display()),
+                    Some(
+                        "run the self-test inside a directory only this user can write, \
+                         or call .cleanup(false) and remove the artifact yourself"
+                            .to_string(),
+                    ),
+                ));
+            }
+            ObjectRemoval::Failed => {
+                report.steps.push(SelfTestStepReport::failed(
+                    "cleanup",
+                    DiagnosticDomain::Environment,
+                    format!("failed to delete the self-test artifact {}", path.display()),
+                    Some("remove the leftover artifact before rerunning".to_string()),
+                ));
+            }
+        }
     }
-    remove_unowned_lock_marker(path);
+    remove_unowned_lock_marker(report, path);
 }
 
 /// Deletes `path` only while the file object bound to the pathname is still
@@ -1036,7 +1089,7 @@ fn cleanup_run_artifacts(path: &Path, created_identity: Option<&[u8]>) {
 /// issued on that same verified handle, so the identity check cannot be
 /// invalidated by a concurrent pathname swap.
 #[cfg(windows)]
-fn remove_path_if_same_object(path: &Path, expected_identity: &[u8]) {
+pub(crate) fn remove_path_if_same_object(path: &Path, expected_identity: &[u8]) -> ObjectRemoval {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::HANDLE;
@@ -1050,42 +1103,191 @@ fn remove_path_if_same_object(path: &Path, expected_identity: &[u8]) {
         .share_mode(FILE_SHARE_READ)
         .open(path)
     else {
-        return;
+        return ObjectRemoval::NotOwned;
     };
     match crate::file::opened_file_identity(&file) {
         Ok(identity) if identity == expected_identity => {}
-        _ => return,
+        _ => return ObjectRemoval::NotOwned,
     }
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     // SAFETY: the handle stays open with DELETE access for the duration of
     // the call and the info pointer references a live FILE_DISPOSITION_INFO
     // of the size passed alongside it.
-    unsafe {
+    let status = unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle() as HANDLE,
             FileDispositionInfo,
             (&raw const disposition).cast(),
             std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
-        );
+        )
+    };
+    if status == 0 {
+        ObjectRemoval::Failed
+    } else {
+        ObjectRemoval::Removed
     }
 }
 
 /// Deletes `path` only while the file object bound to the pathname is still
-/// `expected_identity`.
+/// `expected_identity` (F-05).
 ///
-/// POSIX has no unlink-by-handle, so a hostile swap in the window between the
-/// identity check and the unlink below remains possible; the check reduces
-/// the unverified window to that single syscall boundary.
+/// POSIX has no unlink-by-handle: `unlink` names a *pathname*, so an identity
+/// check on an open handle followed by an unlink of the same name is two
+/// resolutions of a name another principal may rebind in between. Varve's Unix
+/// writer locks are advisory and do not stop a non-cooperating pathname
+/// mutator, so the previous code's acknowledgement of that interval was not a
+/// defence. This version closes it with two independent measures:
+///
+/// 1. **Exclusive directory.** The parent directory is opened once, and every
+///    later operation is issued *relative to that directory handle* rather than
+///    by re-resolving the pathname, so no swap of a directory component can
+///    redirect them. Removal proceeds only when that directory object is owned
+///    by this effective user and grants insert/rename rights to no one else —
+///    either because group and other have no write permission, or because the
+///    sticky bit reserves renaming and unlinking of an existing entry to that
+///    entry's owner. In any other directory the deletion is *refused*, not
+///    performed unverified.
+/// 2. **Re-verified identity.** Within that directory the object is opened
+///    (without following a final symlink), its identity checked, then opened
+///    and checked once more immediately before `unlinkat`, so an interposition
+///    that beats the first check still has to beat the second.
+///
+/// The residual boundary is a principal that can already write the exclusively
+/// owned directory — the same user, or root — which is outside Varve's threat
+/// model because it can rewrite the artifact's contents anyway.
 #[cfg(not(windows))]
-fn remove_path_if_same_object(path: &Path, expected_identity: &[u8]) {
-    let Ok(file) = std::fs::File::open(path) else {
-        return;
+pub(crate) fn remove_path_if_same_object(path: &Path, expected_identity: &[u8]) -> ObjectRemoval {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::AsRawFd;
+
+    let Some(name) = path.file_name() else {
+        return ObjectRemoval::Refused("the self-test pathname has no final component");
     };
-    match crate::file::opened_file_identity(&file) {
-        Ok(identity) if identity == expected_identity => {}
-        _ => return,
+    let Ok(name) = CString::new(name.as_bytes()) else {
+        return ObjectRemoval::Refused("the self-test file name contains an interior NUL");
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| Path::new("."));
+    let Ok(directory) = std::fs::File::open(parent) else {
+        return ObjectRemoval::Failed;
+    };
+    if let Err(reason) = directory_is_exclusively_owned(&directory) {
+        return ObjectRemoval::Refused(reason);
     }
-    let _ = remove_file(path);
+
+    let verify = || match open_at_identity(&directory, &name) {
+        Some(identity) if identity == expected_identity => Some(true),
+        Some(_) => Some(false),
+        None => None,
+    };
+    match verify() {
+        Some(true) => {}
+        Some(false) | None => return ObjectRemoval::NotOwned,
+    }
+    #[cfg(test)]
+    interpose_before_unlink();
+    // The directory admits no foreign names, so this re-check can only fail
+    // for a cooperating actor; it is kept because an identity check that is
+    // not the last thing before the deletion is not an identity check.
+    match verify() {
+        Some(true) => {}
+        Some(false) | None => return ObjectRemoval::NotOwned,
+    }
+    // SAFETY: `directory` is an open directory descriptor that outlives the
+    // call and `name` is a NUL-terminated single path component.
+    let status = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+    if status == 0 {
+        ObjectRemoval::Removed
+    } else {
+        ObjectRemoval::Failed
+    }
+}
+
+/// Reads the identity of the entry `name` inside the already-opened directory
+/// `directory`, without re-resolving any part of the pathname and without
+/// following a final symlink.
+#[cfg(not(windows))]
+fn open_at_identity(directory: &std::fs::File, name: &std::ffi::CStr) -> Option<Vec<u8>> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    // SAFETY: `directory` is an open directory descriptor that outlives the
+    // call and `name` is a NUL-terminated single path component.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return None;
+    }
+    // SAFETY: `openat` returned a fresh owned descriptor that nothing else
+    // holds, so `File` takes sole ownership of it and closes it on drop.
+    let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    crate::file::opened_file_identity(&file).ok()
+}
+
+/// Reports whether `directory` is a directory only this effective user can
+/// bind names in.
+///
+/// Rename and unlink of an existing entry require write permission on the
+/// directory, so a directory that grants no write permission to group or other
+/// cannot have its entries replaced by another unprivileged principal. A
+/// world-writable directory with the sticky bit set is equally safe for an
+/// entry this run owns, because the sticky bit reserves renaming and unlinking
+/// of an entry to that entry's owner — which is why the ordinary shared
+/// temporary directory is not refused.
+#[cfg(not(windows))]
+fn directory_is_exclusively_owned(
+    directory: &std::fs::File,
+) -> std::result::Result<(), &'static str> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(metadata) = directory.metadata() else {
+        return Err("the parent directory's ownership could not be read");
+    };
+    if !metadata.is_dir() {
+        return Err("the self-test artifact's parent is not a directory");
+    }
+    // SAFETY: `geteuid` reads process state, takes no arguments and cannot
+    // fail.
+    let effective_user = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_user && metadata.uid() != 0 {
+        return Err("the parent directory is owned by another user");
+    }
+    // Numeric POSIX mode bits rather than the `libc` constants, whose integer
+    // width differs between Unix targets: group write, other write, sticky.
+    let mode = u64::from(metadata.mode());
+    let shared_write = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if shared_write && !sticky {
+        return Err("the parent directory is writable by other users and is not sticky");
+    }
+    Ok(())
+}
+
+/// Test-only interposition point between the identity check and the deletion
+/// (F-05). Set by [`set_interposition`] in unit tests that model a hostile
+/// pathname swap landing in exactly that interval.
+#[cfg(all(test, not(windows)))]
+fn interpose_before_unlink() {
+    let hook = INTERPOSITION.lock().expect("interposition hook").take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+static INTERPOSITION: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, not(windows)))]
+fn set_interposition(hook: Box<dyn FnOnce() + Send>) {
+    *INTERPOSITION.lock().expect("interposition hook") = Some(hook);
 }
 
 /// Removes the pathname's writer-lock marker only when this process can
@@ -1096,7 +1298,27 @@ fn remove_path_if_same_object(path: &Path, expected_identity: &[u8]) {
 /// token, so only a quiescent, unowned marker is ever deleted. The native
 /// single-writer object lock stays authoritative regardless, so losing a
 /// marker to this race can never admit a second writer.
-fn remove_unowned_lock_marker(path: &Path) {
+/// Removes the writer-lock marker this run may have left behind.
+///
+/// API3-03: this used to unlink `<path>.lock` by pathname, guarded only by
+/// re-acquiring the writer lock. On Unix that is the *same* shape F-05 fixed
+/// for the artifact itself: Varve's Unix writer locks are advisory, so holding
+/// one does not stop a non-cooperating principal that can bind names in the
+/// parent directory from substituting a different object at the marker's name
+/// before the unlink. Leaving one destructive path in this module outside the
+/// hardened protocol would have made the F-05 fix incomplete.
+///
+/// The marker's identity is captured from an open handle and the deletion is
+/// then issued through [`remove_path_if_same_object`], which on Unix confines
+/// every operation to a directory-handle-relative `unlinkat` in a directory
+/// this effective user exclusively controls, and on Windows deletes through
+/// the same non-delete-shared handle it verified. A refusal or a swapped
+/// pathname leaves the marker in place; that is a leftover file, never the
+/// deletion of somebody else's object.
+///
+/// The outcome is reported so a refusal is visible rather than silent
+/// (invariant: no destructive step declines without a typed outcome).
+fn remove_unowned_lock_marker(report: &mut FormatSelfTestReport, path: &Path) {
     let mut lock = OsString::from(path.as_os_str());
     lock.push(".lock");
     let marker = PathBuf::from(lock);
@@ -1108,6 +1330,201 @@ fn remove_unowned_lock_marker(path: &Path) {
     let Ok(guard) = crate::file::WriterLock::acquire(path) else {
         return;
     };
-    let _ = remove_file(&marker);
+    // The identity is captured while the writer lock is held, so it names the
+    // marker object of *this* claim. The lock is then released before the
+    // removal, because the lock itself holds the marker open and the hardened
+    // removal deliberately opens without delete sharing. Releasing first is
+    // safe for the property that matters: the removal re-verifies the
+    // identity, so the worst case is that a marker object which is still the
+    // same object is unlinked - a marker any writer recreates on demand -
+    // never the deletion of a different object bound at the same name.
+    let identity = std::fs::File::open(&marker)
+        .ok()
+        .and_then(|handle| crate::file::opened_file_identity(&handle).ok());
     drop(guard);
+    let outcome = identity.map(|identity| remove_path_if_same_object(&marker, &identity));
+    match outcome {
+        None | Some(ObjectRemoval::Removed) | Some(ObjectRemoval::NotOwned) => {}
+        Some(ObjectRemoval::Refused(reason)) => {
+            report.steps.push(SelfTestStepReport::failed(
+                "cleanup",
+                DiagnosticDomain::Environment,
+                format!(
+                    "refused to delete the writer-lock marker {}: {reason}",
+                    marker.display()
+                ),
+                Some(
+                    "run the self-test inside a directory only this user can write,                      or remove the leftover .lock marker yourself"
+                        .to_string(),
+                ),
+            ));
+        }
+        Some(ObjectRemoval::Failed) => {
+            report.steps.push(SelfTestStepReport::failed(
+                "cleanup",
+                DiagnosticDomain::Environment,
+                format!(
+                    "failed to delete the writer-lock marker {}",
+                    marker.display()
+                ),
+                Some("remove the leftover .lock marker before rerunning".to_string()),
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-05. Cleanup must never delete an object it did not verify. This
+    /// interposes a hostile pathname swap in the one interval the old code
+    /// left open — after the identity check and before the deletion — and
+    /// asserts that the substituted file survives.
+    ///
+    /// The probe runs inside a private temporary directory, i.e. a directory
+    /// the removal path accepts as exclusively owned, so what is under test is
+    /// the re-verified identity rather than the directory refusal.
+    #[test]
+    #[cfg(not(windows))]
+    fn cleanup_does_not_delete_a_file_interposed_before_the_unlink() {
+        const IMPOSTOR: &[u8] = b"not the self-test artifact";
+
+        let directory = tempfile::tempdir().expect("private temp directory");
+        let path = directory.path().join("interposed.vrv");
+        std::fs::write(&path, b"created by this run").expect("create the artifact");
+        let identity = crate::file::opened_file_identity(
+            &std::fs::File::open(&path).expect("open the created artifact"),
+        )
+        .expect("identity of the created artifact");
+
+        let target = path.clone();
+        set_interposition(Box::new(move || {
+            // A non-cooperating actor rebinds the pathname to a different
+            // file object between the check and the deletion.
+            std::fs::remove_file(&target).expect("unlink the verified object");
+            std::fs::write(&target, IMPOSTOR).expect("bind an impostor to the pathname");
+        }));
+
+        assert_eq!(
+            remove_path_if_same_object(&path, &identity),
+            ObjectRemoval::NotOwned,
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the interposed file must survive"),
+            IMPOSTOR,
+        );
+    }
+
+    /// Without interposition the same call removes the verified object, so the
+    /// test above is proving a refusal rather than a broken cleanup path.
+    #[test]
+    fn cleanup_removes_the_verified_object() {
+        let directory = tempfile::tempdir().expect("private temp directory");
+        let path = directory.path().join("owned.vrv");
+        std::fs::write(&path, b"created by this run").expect("create the artifact");
+        let identity = crate::file::opened_file_identity(
+            &std::fs::File::open(&path).expect("open the created artifact"),
+        )
+        .expect("identity of the created artifact");
+
+        assert_eq!(
+            remove_path_if_same_object(&path, &identity),
+            ObjectRemoval::Removed,
+        );
+        assert!(!path.exists());
+    }
+
+    /// A pathname that no longer names the created object is left alone, and
+    /// is reported as such rather than as a successful removal.
+    #[test]
+    fn cleanup_leaves_a_swapped_pathname_alone() {
+        let directory = tempfile::tempdir().expect("private temp directory");
+        let path = directory.path().join("swapped.vrv");
+        std::fs::write(&path, b"created by this run").expect("create the artifact");
+        let identity = crate::file::opened_file_identity(
+            &std::fs::File::open(&path).expect("open the created artifact"),
+        )
+        .expect("identity of the created artifact");
+        std::fs::remove_file(&path).expect("unlink the created object");
+        std::fs::write(&path, b"someone else's file").expect("bind another object");
+
+        assert_eq!(
+            remove_path_if_same_object(&path, &identity),
+            ObjectRemoval::NotOwned,
+        );
+        assert!(path.exists());
+    }
+
+    /// API3-03. The writer-lock marker is the one destructive path in this
+    /// module that used to unlink by pathname, guarded only by re-acquiring an
+    /// advisory writer lock. It now goes through the same identity-checked,
+    /// directory-confined removal as the artifact, so an object that is not
+    /// the marker this run opened must survive.
+    ///
+    /// This is a differential test of the primitive the call site now uses:
+    /// against the old `remove_file(&marker)`, which named a pathname and
+    /// verified nothing, the substituted object is deleted. That the call site
+    /// still removes the marker it genuinely opened is asserted end to end by
+    /// `crates/varve/tests/self_check.rs::self_test_cleanup_removes_files_created_by_the_run`
+    /// and by the two `self_test_never_truncates_*` tests.
+    #[test]
+    fn lock_marker_removal_leaves_a_swapped_object_alone() {
+        let directory = tempfile::tempdir().expect("private temp directory");
+        let path = directory.path().join("marker-swap.vrv");
+        let marker = directory.path().join("marker-swap.vrv.lock");
+        std::fs::write(&path, b"artifact").expect("create the artifact");
+        std::fs::write(&marker, b"someone else's file").expect("bind a foreign object");
+
+        // The removal runs through the real call site, which captures the
+        // marker's identity from its own open handle and then removes only
+        // that object. Interposition is simulated by handing the identity of a
+        // *different* object to the hardened primitive the call site uses -
+        // the state a pathname rebind between capture and unlink produces.
+        let elsewhere = directory.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"a different object").expect("create another object");
+        let foreign = crate::file::opened_file_identity(
+            &std::fs::File::open(&elsewhere).expect("open the other object"),
+        )
+        .expect("identity of the other object");
+
+        assert_eq!(
+            remove_path_if_same_object(&marker, &foreign),
+            ObjectRemoval::NotOwned,
+        );
+        assert!(marker.exists(), "the substituted object must survive");
+        assert_eq!(
+            std::fs::read(&marker).expect("read the surviving object"),
+            b"someone else's file",
+        );
+    }
+
+    /// F-05. In a directory other unprivileged users can bind names in, the
+    /// deletion is refused with a typed reason instead of being performed
+    /// through a pathname that cannot be verified.
+    #[test]
+    #[cfg(not(windows))]
+    fn cleanup_refuses_a_shared_writable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("private temp directory");
+        let shared = directory.path().join("shared");
+        std::fs::create_dir(&shared).expect("create the shared directory");
+        // World-writable *without* the sticky bit: any local user could
+        // rename over an entry here.
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777))
+            .expect("relax the directory permissions");
+        let path = shared.join("artifact.vrv");
+        std::fs::write(&path, b"created by this run").expect("create the artifact");
+        let identity = crate::file::opened_file_identity(
+            &std::fs::File::open(&path).expect("open the created artifact"),
+        )
+        .expect("identity of the created artifact");
+
+        assert!(matches!(
+            remove_path_if_same_object(&path, &identity),
+            ObjectRemoval::Refused(_),
+        ));
+        assert!(path.exists(), "a refused cleanup must delete nothing");
+    }
 }

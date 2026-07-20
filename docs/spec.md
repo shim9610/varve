@@ -62,7 +62,7 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Files whose static spec contains matrix blocks store a 24-byte `VMNC`
   creation-nonce region and then a `VMAT` layout region immediately after the
   normal Varve file header.
-- `VMAT` layout version 3 stores runtime dimensions, matrix block layout,
+- `VMAT` layout version 4 stores runtime dimensions, matrix block layout,
   commit bitmap offsets, slot region offsets, derived static aux region
   placement, optional offset-table metadata, region CRC metadata,
   `append_log_start`, and the persisted page-index region
@@ -89,7 +89,7 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Static matrix aux regions are declared in the format spec, preallocated after
   slot payloads, excluded from commit bitmap validity, and exposed through
   `matrix_aux_len`, `read_matrix_aux`, and writer-only `write_matrix_aux`.
-- With `integrity: crc32`, `VMAT` v3 includes an `MCRC` v2 table after the slot
+- With `integrity: crc32`, `VMAT` v4 includes an `MCRC` v2 table after the slot
   region, any static aux regions, and the page index. It stores a CRC32 over the metadata tables,
   an 8-byte digest (`crc32` plus a state word) per 4 KiB page of every commit
   map, and a CRC32 plus a validity bit per dense cell slot. A commit-bit
@@ -101,10 +101,11 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   extent, and those bitmaps are held sparsely in memory after open, so neither
   create-time metadata I/O nor post-open bitmap residency scales with cell
   count.
-- A `VMAT` layout version 1 or 2 artifact is refused at open with
-  `Error::FormatVersionMismatch { expected: 3, actual: <1 or 2> }`; it is stale
-  and regenerable, not migratable. Version 1 describes the pre-paging physical
-  representation and version 2 carries no page-index region. The `MCRC`
+- A `VMAT` layout version 1, 2, or 3 artifact is refused at open with
+  `Error::FormatVersionMismatch { expected: 4, actual: <1, 2, or 3> }`; it is
+  stale and regenerable, not migratable. Version 1 describes the pre-paging
+  physical representation, version 2 carries no page-index region, and version 3
+  carries the superseded terminator-scanned page-index encoding. The `MCRC`
   integrity table remains version 2.
 - P0 commit operations are logical visibility operations under the explicit
   `flush`/`sync` durability model, not implicit per-cell fsync operations.

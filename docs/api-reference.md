@@ -127,11 +127,40 @@ and materialization. Compatibility `*_with_limits` methods perform a meet, so
 `ReadLimits::UNTRUSTED` (`ReadLimits::untrusted()`) is the finite companion to
 `STANDARD` for input from untrusted sources. Every aggregate dimension that
 `STANDARD` leaves effectively unbounded is finite: `max_file_len` 16 GiB,
-`max_records` 16,000,000, `max_scan_bytes` 16 GiB, `max_index_bytes` 1 GiB, and
-`max_segments` 65,536, inheriting the `STANDARD` per-item caps for everything
-else. Use it when a resident open must not let a hostile file choose the reader's
+`max_records` 16,000,000, `max_scan_bytes` 16 GiB, `max_index_bytes` 1 GiB,
+`max_segments` 65,536, and `max_keyed_tail_bytes` 256 MiB, inheriting the
+`STANDARD` per-item caps for everything else. Use it when a resident open must not let a hostile file choose the reader's
 CPU, I/O, or memory; large trusted files should use the scalable APIs or explicit
 wider limits instead.
+
+`max_keyed_tail_bytes` (declared as `keyed_tail` in a `limits { ... }` block)
+bounds the resident keyed-tail cache: the per-block-id map that lets a keyed
+append resolve its predecessor in O(1) instead of rescanning the resident
+index. It is charged before the memory is taken, so the map's initial build and
+its later growth are both refused with
+`Error::LimitExceeded { resource: "keyed tail bytes", .. }` rather than merely
+attempted.
+
+Both halves matter, and the build is the larger one. The map is built from file
+content by `VarveFile::key_tail_offsets`, at generated-writer construction and
+at first resident keyed use, so a file with `N` distinct keys would otherwise
+force an `N`-entry resident map whatever the ceiling said, with the ceiling only
+refusing further growth within the session. The build is therefore charged as it
+proceeds. Its charge is the structural **peak**, which is larger than the map it
+produces: the build keeps a transient per-key ordering entry alive while the
+returned map is reserved, and the resident cache additionally transcodes into a
+canonical-payload map while the returned map is still alive. Opening a file
+consequently charges more than the steady-state map costs. This is deliberate
+and conservative - the charge models what is allocated, not what survives - but
+it means a ceiling sized from the steady-state map alone can refuse an open.
+
+The charged value is inline storage plus - on the resident
+`VarveFile`/`VarveWriter` paths, which hold canonical key payloads - the key
+payload bytes it owns; the generated keyed writers store `T::Key` directly and
+can only charge inline storage, so heap owned by a `T::Key` (a `String` key's
+buffer) is not charged on that path. It is checked per keyed block id, not
+summed across block ids, and it excludes `HashMap` control bytes and
+load-factor slack. `STANDARD` leaves it at `u64::MAX`.
 
 The allocation budget these limits drive is nominal accounting, not a hard peak
 RSS guarantee. It counts logical/nominal bytes and does not fully account for
@@ -448,11 +477,26 @@ Matrix slot types must have a width fixed by the type itself, because a slot
 needs a stride the compiler knows. Scalars and fixed arrays of them qualify.
 `PackedBitmap` does **not**: it owns a `Vec<u8>` and encodes a `bit_len` plus a
 variable byte string, so it is rejected as a matrix field — it remains a normal
-variable-field codec with a stable non-zero `SCHEMA_ID`. Classification does not
-rely on the source spelling: inline `SLOT_STRIDE` is generated from each
-element's `VarveEncode::WIRE_TYPE` rather than `size_of`, so a user type merely
-*named* `u32` or `PackedBitmap` cannot be laundered through the syntactic
-pre-filter — a wire type with no fixed width fails const evaluation.
+variable-field codec with a stable non-zero `SCHEMA_ID`.
+
+Classification is decided **entirely by the resolved type, never by the source
+spelling**. The generated `SLOT_STRIDE` folds each element's
+`VarveEncode::WIRE_TYPE` (not `size_of`), and a wire type with no fixed width
+fails const evaluation with `matrix fields must have a width fixed by their
+type; this codec does not`. Two consequences, both intended:
+
+- a **type alias** of a supported scalar works. `type Word = u32;` and
+  `window: [Word; 4]` are ordinary 4-byte and 16-byte slots, because the alias
+  resolves before `WIRE_TYPE` is read;
+- a user type merely *named* `u32` or `PackedBitmap` is **not** admitted. It has
+  no `VarveEncode` impl (or one without a fixed width), so it fails at the same
+  const check or at the trait bound.
+
+The macro's own syntactic check is deliberately permissive: it rejects only
+source shapes that can never denote a fixed-stride type at all — references, raw
+pointers, slices, tuples, trait objects, `impl Trait`, function pointers — and
+defers everything else to `SLOT_STRIDE`. It is a diagnostic aid, not the
+authority.
 
 Lower-level matrix calls use `MatrixKey { scan, ch }`. Generated format-first
 wrappers expose block-specific key structs such as `CellKey { scan, ch }` and
@@ -478,7 +522,7 @@ poisons the writer; successful replacement becomes readable only after a new
 commit. Matrix layout and commit maps are snapshotted on open, but slot bytes are
 in-place storage. Do not overlap a reader with writes to slots it may read.
 Immutable concurrent matrix snapshots require a future generation/version or
-read-lease design and are not promised by VMAT v3.
+read-lease design and are not promised by VMAT v4.
 
 When recovery finds a `Fatal` matrix finding (for example a metadata CRC
 mismatch), default matrix access is fail-closed: every default read, write, aux,
@@ -787,21 +831,43 @@ bounded-memory external merge or compact; the scalable stream and indexed
 writers cover bounded *ingest*, not bounded merge/compact.
 
 Callers whose key cardinality is not known to be resident-sized should either
-size the run first with `estimate_keyed_merge` - which reports
-`input_records`, `key_bearing_records`, `max_distinct_keys` (an upper bound on
-`K-ever`), `largest_input_index_bytes`, `largest_input_open_transient_bytes`,
-and `max_state_bytes` without decoding any value - or bound it with a `*_with_key_limit` entry point, which fails with
+size the run first with `estimate_keyed_merge` — or bound it with a
+`*_with_key_limit` entry point, which fails with
 `Error::LimitExceeded { resource: "merge distinct keys", .. }` at the key
 boundary and publishes no output. `estimate_keyed_merge` itself opens each
 input as a resident file, so it costs `O(largest input index)`; it reports that
-number but is not bounded below it.
+number but is not bounded below it. It decodes no value.
 
-`KeyedMergeEstimate::peak_resident_bytes()` is the recommended sizing entry
-point: it is the merge state plus the largest input's resident index plus the
-`8N` transient that input's open can hold alongside it. The transient is charged
-unconditionally because the sort is the guaranteed bound, so the value is a true
-upper bound that is loose by `8N` whenever the fast path applies — which is
-strictly preferable to an estimate that can understate a live allocation.
+`KeyedMergeEstimate` reports:
+
+| Field | Kind |
+| --- | --- |
+| `input_records` | exact count |
+| `key_bearing_records` | exact count |
+| `max_distinct_keys` | exact **upper bound** on `K-ever` |
+| `largest_input_index_bytes` | structural byte estimate |
+| `largest_input_open_transient_bytes` | structural byte estimate (the `8N` uniqueness temporary) |
+| `max_state_bytes` | structural byte estimate |
+| `max_output_values_bytes` | structural byte estimate |
+
+Only the three count fields are bounds. The byte fields are **structural
+estimates**: each is `count * size_of::<...>()` over inline storage.
+
+`KeyedMergeEstimate::peak_resident_structural_bytes()` is the sizing entry
+point. It is a **structural estimate, not an upper bound**: it sums the merge
+state, the output vector reserved while that state is still alive, the largest
+input's resident index, and the `8N` uniqueness transient that input's open can
+hold alongside it, counting `count * size_of::<...>()` inline storage only. It
+excludes the heap owned by individual `Key` and `T` values (unbounded for
+heap-owning types such as `String` or `Vec` fields), `HashMap` load-factor slack
+and control bytes, per-record decode scratch, and allocator metadata. Callers
+who need a hard ceiling must bound the run with a `*_with_key_limit` entry point
+rather than size it.
+
+> Renamed in 0.4.0. The method was `peak_resident_bytes()` and was documented as
+> a true upper bound. That was false for any heap-owning `Key` or `T`, by an
+> arbitrarily large margin. The rename is deliberate rather than a deprecating
+> alias, so that no caller keeps reading the old value as a guarantee.
 
 ## Migration API
 
@@ -881,7 +947,7 @@ document assumes.
 | `MatrixSidecarMismatch(reason)` | matrix sidecar rejected: wrong native identity, layout generation, creation nonce, or sidecar version; regenerate the sidecar |
 | `InvalidMatrixLayout` | matrix layout bytes are not valid for this build — including a matrix file created before the creation-nonce region existed; recreate the matrix file |
 | `MatrixSizeMismatch` | encoded matrix payload does not match slot stride |
-| `FormatVersionMismatch { expected, actual }` | container/layout version is not the one this build writes — including a `VMAT` layout version 1 or 2 matrix file (v3 is current; the `MCRC` integrity table is at v2); the artifact is stale and regenerable |
+| `FormatVersionMismatch { expected, actual }` | container/layout version is not the one this build writes — including a `VMAT` layout version 1, 2, or 3 matrix file (v4 is current; the `MCRC` integrity table is at v2); the artifact is stale and regenerable |
 | `KeyedChainRequiresKeyedApi { block_id }` | generic `push`/`push_info` cannot maintain the keyed offset chain; use `push_keyed`/`push_keyed_info` or the generated keyed writer |
 | `LimitExceeded { resource: "variable field ids" }` | decoding charged the materialization budget for distinct variable field ids above 63 and the budget ran out |
 | `LimitExceeded { resource: "merge distinct keys" }` | a `*_with_key_limit` merge/compact hit the caller's `K-ever` ceiling; nothing was published |

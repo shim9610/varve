@@ -247,12 +247,22 @@ fn merge_compact_bench(records: usize) -> varve::Result<()> {
         elapsed,
     );
 
-    let direct_file = BenchFormat::open_readonly(&direct)?;
-    assert_eq!(
-        direct_file.materialized_keyed_blocks::<BenchUser>()?.len(),
-        live_values,
-        "the reported live-value denominator must be the count actually emitted"
-    );
+    // BENCH-01: every line that prints a live-value denominator is checked
+    // against the file that line actually produced, not just the last one.
+    // `docs/performance.md` says the run asserts the emitted count for the
+    // merge and compact lines; asserting one of the three made that false.
+    for (label, path) in [
+        ("merge keyed files", &merged),
+        ("compact merged", &compacted),
+        ("compact base+deltas", &direct),
+    ] {
+        let file = BenchFormat::open_readonly(path)?;
+        let emitted = file.materialized_keyed_blocks::<BenchUser>()?.len();
+        assert_eq!(
+            emitted, live_values,
+            "{label}: the reported live-value denominator must be the count actually emitted"
+        );
+    }
 
     cleanup_many([&base, &delta, &merged, &compacted, &direct]);
     Ok(())

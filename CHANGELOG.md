@@ -4,10 +4,33 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
-## Unreleased
+## 0.4.0 - 2026-07-20
+
+Pre-1.0 minor release. The Rust API and several persisted layouts change
+incompatibly; every affected artifact is stale-regenerable and refused with a
+typed error rather than migrated in place. See **Breaking** below.
 
 ### Added
 
+- `ReadLimits::max_keyed_tail_bytes` (DSL key `keyed_tail`, builder
+  `with_max_keyed_tail_bytes`) and the `ReadLimitKey` resource
+  `"keyed tail bytes"` (API3-02). The resident keyed-tail cache - the
+  per-block-id map that lets a keyed append resolve its predecessor in O(1) -
+  was guarded by `try_reserve` alone on `VarveFile`/`VarveWriter` and by a bare
+  infallible `HashMap::insert` in every generated keyed writer, so a
+  large-but-satisfiable cache was refusable by no configured policy and, in the
+  generated writers, an allocation the allocator refused aborted the process
+  instead of returning a typed error. Both paths now reserve *and charge* the
+  slot before the append: growth is refused with
+  `Error::LimitExceeded { resource: "keyed tail bytes", .. }` before the record
+  becomes authoritative, and the post-append step stays infallible. `STANDARD`
+  leaves the ceiling at `u64::MAX`; `UNTRUSTED` sets it to 256 MiB. Repeating an
+  existing key is charged nothing.
+- `VarveWriter::reserve_keyed_tail_slot` (`#[doc(hidden)]`), the entry point the
+  generated keyed writers call for the charge above.
+- `docs/invariant-checklist.md`: the five invariants every structure this
+  project adds must satisfy, the inventory of everything added in the 0.3.0 and
+  0.4.0 stabilization rounds, and each entry's audited status.
 - Stable codec identities for the two built-in public value types (API-03,
   API-04). `ChunkedBytes` and `PackedBitmap` now declare a non-zero, structurally
   derived `SCHEMA_ID` on both `VarveEncode` and `VarveDecode`
@@ -29,20 +52,38 @@ increment the minor version.
   fixture`). This is the gate whose absence let the identity contract silently
   reject public API: nothing in the workspace derived a block over the public
   surface the way a consumer does.
-- `KeyedMergeEstimate::peak_resident_bytes()` and the new public field
-  `largest_input_open_transient_bytes` (PERF-05): the `8N` sequence-uniqueness
-  temporary an input's open can hold alongside its resident index was previously
-  omitted from the estimate, understating the peak. `KeyedMergeEstimate` is
-  `#[non_exhaustive]`, so the added field is not breaking.
+- `KeyedMergeEstimate::peak_resident_structural_bytes()` and the new public
+  fields `largest_input_open_transient_bytes` (PERF-05) and
+  `max_output_values_bytes` (F-04). The `8N` sequence-uniqueness temporary an
+  input's open can hold alongside its resident index, and the output `Vec`
+  reserved while the merge state is still alive, were both omitted from the
+  estimate. `KeyedMergeEstimate` is `#[non_exhaustive]`, so the added fields are
+  not breaking; the method rename is (see Breaking).
 - `VarveFile::block_tail_entries_moved()`, a `#[doc(hidden)]` fault-injection
   counter gated on `scalable-fault-injection`, mirroring
   `block_tail_index_touches`. It counts tuples *displaced* in the tail vector
   rather than index visits, which is the cost the old counter could not see.
-- A persisted per-page index region in the matrix layout (PERF-01): one 8-byte
-  entry per published bitmap page, stored as `page + 1` so a zero entry
-  terminates the array and no count field can tear. It sits between the static
-  aux regions and the `MCRC` region, and open builds its visit set from it
-  rather than from the logical page count. See Breaking for the layout version.
+- A persisted per-page index region in the matrix layout (PERF-01, F-03, F-06).
+  It sits between the static aux regions and the `MCRC` region, and open builds
+  its visit set from it rather than from the logical page count. The region is
+  `(page_count + 1) * 8` bytes: slot `0` is a self-checking occupancy header
+  (count in the low 48 bits, a derived check in the high 16) and slots
+  `1..=count` hold `page + 1`. Enumeration length comes from the header, never
+  from a terminator scan, so a zeroed or out-of-range counted entry is provable
+  damage and is reported as a `Fatal` `MatrixCorruptionKind::CommitMap` finding
+  while the scan continues past it. The array is the **live** set: a page's
+  entry is released in `O(1)` when its final set bit clears. Its resident cost
+  is charged to `ReadLimitKey::MatrixBitmapBytes` alongside the payload pages.
+  See Breaking for the layout version.
+- `MatrixRecoveryReport::matrix_sparse_zeroing_supported()`,
+  `::matrix_last_zero_range_streamed_bytes()`, and
+  `::matrix_total_zero_range_streamed_bytes()` (F-08). Whole-category clear
+  removes the byte range only where the platform supports it (Windows
+  `FSCTL_SET_ZERO_DATA`, Linux `FALLOC_FL_PUNCH_HOLE`); everywhere else, and on
+  any failed attempt, it streams `Theta(cells / 8)` zero bytes. The capability
+  accessor reports the compile-time platform capability and is **not** sufficient
+  on its own; the streamed-byte counters are the runtime proof of which path
+  ran. All three are always available, not feature-gated.
 - CI jobs: `public-api fixture` (above); `test (compression-without-integrity)`
   and `test (integrity-without-compression)`, which run the **test** suite for
   the two singleton feature configurations that own `cfg`-exclusive behaviour
@@ -271,8 +312,17 @@ increment the minor version.
   monotonically, so a file scanned in offset order is proven unique in one pass
   with no `Vec` and no sort, and only a reordered or hostile input pays the copy
   and sort. The estimate still charges the transient unconditionally, because the
-  sort is the guaranteed bound — `peak_resident_bytes()` is therefore a true
-  upper bound that is loose by `8N` in the common case.
+  sort is the guaranteed bound.
+
+  **Retraction (F-04):** an earlier draft of this entry called
+  `peak_resident_bytes()` "a true upper bound". It never was one. It counts
+  `count * size_of::<...>()` inline storage and cannot see the heap owned by
+  individual `Key`/`T` values, `HashMap` load-factor slack and control bytes,
+  per-record decode scratch, or allocator metadata, so for a heap-owning key or
+  value it could understate by an arbitrarily large margin. The method is
+  renamed to `peak_resident_structural_bytes()` and documented as a structural
+  estimate. Callers who need a hard ceiling must bound the run with a
+  `*_with_key_limit` entry point.
 - Keyed compact/merge removes its own internal rewrite-temp lock marker
   (STO-01). `write_keyed_values_atomically` unlinks `<temp>.lock` on every exit,
   after the temp's `VarveFile` (and therefore its `WriterLock`) is dropped and
@@ -335,15 +385,21 @@ increment the minor version.
   to prove never-published pages still read as zero, it takes that proof from
   the filesystem's allocated-range map
   (`FSCTL_QUERY_ALLOCATED_RANGES` on Windows, `SEEK_DATA`/`SEEK_HOLE`
-  elsewhere) and skips reported holes, so open costs `O(bytes actually
-  written)`. Detection strength is unchanged, because writing a stray byte into
-  an untouched page allocates that page and brings it back into the read set,
-  and a skipped page's digest is still read when the digest slot itself is
-  allocated. Where the platform or filesystem cannot answer, or the file is
-  fragmented past the tracked extent ceiling, every page is read exactly as
-  before. Clearing a whole commit category punches a hole over the map and its
-  digests instead of writing zeros, restoring the uninitialized encoding in
-  `O(1)` writes.
+  elsewhere) and skips reported holes. Detection strength is unchanged, because
+  writing a stray byte into an untouched page allocates that page and brings it
+  back into the read set, and a skipped page's digest is still read when the
+  digest slot itself is allocated. As shipped in this release, open enumerates
+  the union of the persisted page index and that map in `O(Q)` for `Q` candidate
+  pages; where the platform or filesystem cannot answer, or the file is
+  fragmented past the tracked extent ceiling, the page index alone drives
+  enumeration and open still costs `O(live pages)`. (The intermediate wording of
+  this entry stated open's cost in terms of the bytes the matrix had written, and
+  described the no-allocation-map case as reading every page; both were retracted
+  before release — see *Fixed* below.) Clearing a whole
+  commit category removes the byte ranges of the map and its digests instead of
+  writing zeros where the platform supports removal, restoring the uninitialized
+  encoding in `O(1)` writes, and streams `Theta(cells / 8)` zero bytes where it
+  does not.
 - The `matrix_bitmap` resource limit now charges the bitmap pages actually
   materialized, checked before each growth, instead of a dense cell-count-scaled
   worst case. It still fails closed, but a large matrix with few committed cells
@@ -515,15 +571,17 @@ increment the minor version.
 
 ### Breaking
 
-- **Wire-breaking, stale-regenerable:** the matrix layout is `VMAT` version 3.
-  Two header fields, `page_index_off` and `page_index_len`, are appended as
+- **Wire-breaking, stale-regenerable:** the persisted page-index region was
+  introduced here, at what was then `VMAT` version 3. The layout shipped in this
+  release is **version 4** (see the version-4 entry below, which supersedes the
+  version numbers and the file length stated in this entry). Two header fields, `page_index_off` and `page_index_len`, are appended as
   fields 13 and 14 — after `append_log_start`, so every previously defined field
   keeps its index — and the reserved tail shrinks from 32 to 16 bytes. The region
   order becomes `… | slot region | static aux | page index | MCRC | append log`,
   so `append_log_start` and the total matrix file length change. A version 2
-  artifact is refused at open with the typed
-  `Error::FormatVersionMismatch { expected: 3, actual: 2 }`, the same
-  stale-regenerable contract version 1 already had; recreate it.
+  artifact older than the shipped layout is refused at open with a typed
+  `Error::FormatVersionMismatch`, the same stale-regenerable contract version 1
+  already had; recreate it. The shipped expectation is `expected: 4`.
 - **Breaking (compile):** `PackedBitmap` is no longer accepted as a fixed-width
   matrix field. It owns a `Vec<u8>` and encodes a `bit_len` plus a variable byte
   string, so it has no encoded width fixed by its type and therefore no
@@ -556,11 +614,14 @@ increment the minor version.
   previously succeeded (SAFE-01). That is the fix: the old charge under-counted
   the allocation actually performed. The error variant and its
   `resource: "HashMap entries"` string are unchanged.
-- Wire-breaking, stale-regenerable: the matrix layout is `VMAT` version 2 with
-  an `MCRC` version 2 integrity region. Region lengths, `append_log_start`, and
-  total matrix file length all change. A version 1 artifact is refused at open
-  with the typed `Error::FormatVersionMismatch { expected: 2, actual: 1 }`
-  (previously the generic `InvalidMatrixLayout`); recreate it.
+- Wire-breaking, stale-regenerable: the matrix layout is `VMAT` **version 4**
+  with an `MCRC` version 2 integrity region. Within this release the layout
+  moved 1 -> 2 (integrity representation), 2 -> 3 (page-index region added), and
+  3 -> 4 (page-index occupancy header and live-set semantics); only the final
+  state ships. Region lengths, `append_log_start`, and total matrix file length
+  all change. A version 1, 2, or 3 artifact is refused at open with the typed
+  `Error::FormatVersionMismatch { expected: 4, actual: <1, 2, or 3> }`
+  (previously the generic `InvalidMatrixLayout` for v1); recreate it.
 - Wire-breaking, stale-regenerable: the disk-index sidecar metadata record is
   version 3 (length 260 -> 300, carrying the primary-generation witness) and the
   plan-digest domain was bumped. A version 2 sidecar is refused with
@@ -625,6 +686,258 @@ increment the minor version.
 - Under CRC policies, `rebuild_disk_index` no longer reads the payloads of
   records outside the index plan; a corrupt unindexed payload no longer fails
   a rebuild. `verify_all()` remains the whole-file integrity scan.
+- `KeyedMergeEstimate::peak_resident_bytes()` is **removed** and replaced by
+  `peak_resident_structural_bytes()` (F-04). There is deliberately no compiling
+  alias: the old name's documented contract was false, and a deprecation would
+  let callers keep reading the value as a guarantee. The new method's value also
+  includes the overlapping output-vector term. `max_state_bytes` keeps its name
+  and value; only its documentation changed.
+- `PackedBitmap::new`, `get`, `set`, and its `decode_varve` now return
+  `Error::InvalidCanonicalEncoding` / `Error::LengthOverflow` and a non-matrix
+  allocation resource instead of `Error::InvalidMatrixLayout`. It is an ordinary
+  variable-field codec and must not report matrix-shaped failures. Callers
+  matching on `InvalidMatrixLayout` for these cases must update.
+- A matrix whose bitmap page count would exceed `2^48 - 1` (about 1 EiB of
+  bitmap, ~10^18 cells) is refused at layout time with
+  `Error::InvalidMatrixLayout`, because the page-index occupancy header cannot
+  represent the count. Far above any realistic configuration.
+- A damaged matrix page-index entry is no longer silent (F-06). A file that
+  previously opened "clean" with a zeroed index entry — while hiding every page
+  after it — now reports a `Fatal` finding, and default matrix access is
+  fail-closed. This is the correct outcome, but it is a behaviour change for
+  already-damaged files.
+- Destructive `FormatSelfTest` cleanup is now **refused** on Unix in a directory
+  that is not exclusively owned (F-05), with a reported `Environment` step
+  failure naming the reason, rather than performed through an unverifiable
+  pathname. A self-test run with `.cleanup(true)` in a world- or group-writable
+  directory (`/tmp` without the sticky bit reserving entries to their owner)
+  therefore now leaves its artifact behind and says so. Use a directory only the
+  running user can write, or `.cleanup(false)` and remove the artifact yourself.
+
+### Fixed (invariant re-verification, round 7)
+
+- `max_keyed_tail_bytes` did not bound what it said it bounded (API3-05). Round 6
+  charged only the *incremental* growth of the keyed-tail maps. The dominant
+  allocation is the map built from file content by
+  `VarveFile::key_tail_offsets` — at generated-writer construction
+  (`writer_tail_inits`) and at first resident keyed use — and that build had no
+  charge at all. A file with `N` distinct keys therefore forced an `N`-entry
+  resident map whatever the configured ceiling said, including `UNTRUSTED`'s
+  256 MiB; the ceiling only refused *further* growth within the session. The
+  build is now charged as it proceeds, so an attacker-chosen key count is
+  refused with `Error::LimitExceeded { resource: "keyed tail bytes", .. }`
+  before the memory is taken. The resident path additionally charged its map
+  only *after* building it, so the charge gated retention rather than the peak;
+  that check now runs during the build.
+- Because the charge now models the build's structural **peak**, it is larger
+  than the map it produces: a transient per-key ordering entry is alive while
+  the returned map is reserved, and the resident cache transcodes into a
+  canonical-payload map while the returned map is still alive. Opening a file
+  charges more than the steady-state map costs. A ceiling sized from the
+  steady-state map alone can therefore now refuse an open that previously
+  succeeded. This is deliberate and is documented in `docs/api-reference.md`.
+- Two false documentation claims shipped by round 6 are retracted. The rustdoc
+  on `VarveWriter::reserve_keyed_tail_slot` said the growth is charged against
+  `ReadLimits::max_index_bytes`; the code checks `ReadLimitKey::KeyedTailBytes`,
+  i.e. `max_keyed_tail_bytes`. And `docs/api-reference.md` /
+  `docs/declaration-and-internals.md` promised a ceiling on the resident
+  keyed-tail cache that the generated writers did not have. Both are corrected
+  and both are now gated by `crates/varve/tests/doc_claims.rs`.
+- `docs/invariant-checklist.md` claimed more coverage than it had. Its header
+  advertised an inventory built from rounds 1-5 while covering essentially
+  rounds 3-5: `TailCache`/`SharedSidecar` (round 3), `AllocatedExtents`
+  (round 4) and the whole `28a1b68` module set were absent. The scope is now
+  stated at the top of the document, the two missing structures have rows with
+  their bounds stated, and the unwalked module set is a named open item. The
+  writer-lock marker row no longer claims an unqualified "identity-checked"
+  removal: the identity is captured from the same unverified pathname, which
+  closes the capture-to-unlink window but proves nothing about ownership, and
+  Windows has no directory confinement to fall back on.
+
+### Fixed (invariant audit, round 6)
+
+- `tools/rename-fixture` did not run at all. It declares
+  `index: [... keyed_offset_chain]` and a keyed `Item` block, then called the
+  generic `file.push(&Item { .. })`, which `push_info` refuses with
+  `Error::KeyedChainRequiresKeyedApi` (API2-05). The `renamed-dependency` CI job
+  the README lists as a release gate therefore failed on every commit since that
+  guard landed. It now calls `push_keyed`, which is also the API the fixture is
+  meant to exercise through the renamed facade, and asserts the keyed record
+  round-trips.
+- Self-test cleanup deleted the writer-lock marker `<path>.lock` by pathname,
+  guarded only by re-acquiring an *advisory* writer lock (API3-03). On Unix that
+  is the same shape F-05 fixed for the artifact itself, so one destructive path
+  in the module was still outside the hardened protocol. The marker's identity
+  is now captured from an open handle and the removal goes through
+  `remove_path_if_same_object`, which confines the deletion to a
+  directory-handle-relative `unlinkat` in an exclusively owned directory on Unix
+  and to the verified non-delete-shared handle on Windows. A refusal or failure
+  is reported as a failed `cleanup` step instead of being swallowed.
+- `BTreeMap` decode was charged `len * size_of::<(K, V)>()`, as if entries were
+  packed end to end (API3-04). A std B-tree node allocates a fixed-capacity
+  array of eleven entry slots whatever its fill, is only guaranteed to hold
+  five, and carries a header - and, for internal nodes, twelve child pointers -
+  on top. The materialization charge is now a documented over-estimate of that
+  real node cost rather than an under-estimate of it.
+
+### Fixed (release re-verification, round 5)
+
+Every item in this section is a defect in code this project added earlier in the
+same unreleased cycle while fixing an earlier finding, not a pre-existing Varve
+defect.
+
+- Generic keyed append and delete can no longer return `Err` after the record is
+  authoritative (F-01). `push_keyed_info` and `delete` appended first and then
+  grew the resident keyed-tail cache, whose byte arithmetic and `try_reserve`
+  are fallible, so an allocation failure returned an error for a record that
+  existed — and left the superseded predecessor cached, allowing a later keyed
+  mutation on the same writer to link around it. The cache slot is now reserved
+  *before* the append and the post-append commit step is infallible (it returns
+  `()`). A repeat-key append reserves nothing at all and is strictly cheaper
+  than before.
+- The `HashMap` reservation model no longer undercharges small tables
+  (F-02/SAFE2-01). The model charged one entry as two buckets, but hashbrown
+  applies small-table capacity classes with a hard floor: on Rust 1.95 x86-64,
+  `try_reserve(1)` on a `HashMap<(), ()>` yields capacity 14 — a 16-bucket
+  table — so 19 bytes were charged where control storage alone costs 32. The
+  source comment claiming small tables "only ever allocate less" was false and
+  has been corrected. The model now floors the bucket count at the assumed
+  control-group width, charges the control-array alignment as
+  `max(group, align_of::<T>())`, and assumes a 32-byte group — wider than the 8-
+  or 16-byte group any supported target uses — so it stays an over-estimate on
+  every capacity class and on a hypothetical future wider group.
+- Matrix page-index storage is charged to a runtime resource limit and tracks
+  live pages rather than publication history (F-03), and matrix open no longer
+  sorts (F-07): the index and allocation-map terms are merged in one linear pass
+  with a hash probe, `O(Q)` time and `Theta(Q)` temporary memory for `Q`
+  candidate pages, with no sort. The resulting list is deliberately unsorted;
+  page visits are independent and page loading is idempotent.
+- Sidecar publication re-verifies the primary after publishing (F-09). The
+  verified primary handle is now held open across publication so its identity
+  cannot be recycled, and the pathname is re-resolved once more afterwards. If a
+  non-cooperating writer replaced the primary in that interval, the just-published
+  sidecar is retired by an identity-checked, directory-confined removal and a
+  typed mismatch is returned, instead of leaving a stale sidecar that would
+  displace the replacement's own. This does not make publication atomic against
+  a writer that ignores `WriterLock` — nothing in userspace can — it bounds the
+  damage to a rebuild the caller repeats.
+- Matrix field eligibility is decided by the resolved type, not the source
+  spelling (F-10). The macro rejected a field when a whitelist of literal
+  primitive path names did not match, so `type Word = u32;` was refused before
+  the generated `SLOT_STRIDE` — which resolves `VarveEncode::WIRE_TYPE` — could
+  decide the real width, contradicting `docs/api-reference.md`. The syntactic
+  check is now permissive: it rejects only shapes that can never denote a
+  fixed-stride type (references, raw pointers, slices, tuples, trait objects,
+  `impl Trait`, function pointers) and defers everything else to the const
+  check. An ineligible named type still fails, with
+  `matrix fields must have a width fixed by their type; this codec does not` or
+  an unsatisfied `VarveEncode` bound. New trybuild coverage: an alias, an
+  alias-of-an-alias, a module-qualified alias, and an array of an alias all
+  compile; a tuple field still fails.
+- `write_keyed_values_atomically` owns its rewrite temp through an RAII guard,
+  so a permission-copy failure after temp creation can no longer leave an empty
+  temp behind. The guard closes the handle before unlinking (Windows cannot
+  rename or delete through a live handle), and the publication outcomes that
+  must preserve the temp — `ReplacePublicationIndeterminate`, `Durable`, and
+  `ParentSyncPending` — explicitly retain it.
+
+### Fixed (CI and packaging)
+
+- CI verifies publishable archives (F-11). `package contents` runs
+  `cargo package --no-verify --list`, which proves file *names* and nothing
+  else: it creates no `.crate` archive and compiles nothing from one, and every
+  other job built the checkout by path, so the bytes a crates.io user downloads
+  were never compiled anywhere. The new `package archives + staged consumer` job
+  runs `cargo package --locked` for all three crates **with verification
+  enabled**, then extracts the three archives and rebuilds the public-API
+  fixture's source against the extracted trees through `[patch.crates-io]`,
+  resolving `varve` by version as a downstream crate does, and runs it.
+- CI gates rustdoc warnings (F-12). The new `rustdoc (-D warnings)` job runs
+  `cargo doc --locked --workspace --all-features --no-deps` with
+  `RUSTDOCFLAGS: -D warnings`, so a broken intra-doc link fails the build
+  instead of silently rendering as plain text on docs.rs. The two proc-macro
+  entry-point examples (`VarveBlock`, `varve_format!`) were ```ignore, so they
+  compiled in no job at all; they are now `no_run` and are compiled by the
+  existing test jobs. Compiling them requires a path-only dev-dependency from
+  `varve-macros` on `varve` — a dev-dependency cycle, which cargo supports and
+  strips from the published manifest (proven by the archive verification above).
+
+### Fixed (documentation accuracy)
+
+- The benchmark example now asserts the emitted live-value count for **all
+  three** merge/compact lines against the file each one produced.
+  `docs/performance.md` claimed that already while `perf_bench.rs` checked only
+  the direct base+delta output.
+- README and the workflow comments no longer overstate CI reproducibility.
+  Actions and cargo tools are pinned; `ubuntu-latest`, `windows-latest`, and the
+  `stable` toolchain are rolling by design, so a CI run is not reproducible and
+  a red run on an unchanged commit is an expected outcome. `msrv (1.95.0)` is
+  the only job on a fixed toolchain.
+- The Clippy feature matrix is documented as the fixed list it is — no-default,
+  default, each optional feature alone, and all-features — not as every
+  combinatorial subset. A defect needing a specific pair or triple of features
+  is not covered, and the workflow now says so.
+- The stale intermediate statement in this changelog that named `VMAT` layout
+  version 2 as the shipped matrix layout is corrected to version 4, with the
+  within-release progression recorded.
+- `docs/performance.md` and `docs/matrix-storage-design.md` no longer describe
+  the pre-v3 full logical scan as the allocation-map fallback. When the
+  filesystem cannot answer an allocated-range query, enumeration falls back to
+  the persisted page index and still costs `O(live pages)`.
+
+### Fixed (documentation accuracy, re-verification pass)
+
+- The retracted bytes-written cost claim for matrix open, and the retracted
+  read-every-page description of the no-allocation-map case, are gone from the
+  two places the previous pass missed:
+  `docs/matrix-storage-design.md` and the `crates/varve-core/src/matrix.rs`
+  rustdoc that `cargo doc` publishes. Both now state the shipped contract —
+  `O(Q)` over the union of the page index and the allocation map, `O(live
+  pages)` with no allocation map, and no full logical scan since layout
+  version 3.
+- `VMAT` version drift in current-state text is corrected. The
+  `docs/matrix-storage-design.md` header section (heading, endianness sentence,
+  and the `layout_version u16` field in the diagram), `docs/spec.md`, and
+  `docs/migration-guide.md` said version 3 while the code writes and enforces
+  version 4; `docs/spec.md` also listed only versions 1 and 2 as refused. The
+  two contradictory statements inside this file's own 0.4.0 section — a
+  `VMAT` version 3 breaking entry, whose `FormatVersionMismatch` expectation was
+  the superseded version, alongside the correct version 4 entry — are retracted
+  in place rather than left to be read as current.
+- `crates/varve/tests/doc_claims.rs` now enforces all of the above as a test:
+  every retracted phrase is forbidden across the docs, the changelog, the README
+  and the crate sources, and the layout version stated in the documentation is
+  compared against `VMAT_VERSION` in the source. None of this was previously
+  caught by any test or CI gate, which is why the same false claims survived a
+  correction pass. The version check compares the *shape* of each current-state
+  claim rather than a list of superseded numerals, so documentation that runs
+  ahead of the code fails the same way documentation left behind by a bump does,
+  and a second uncorrected copy of a claim in an already-corrected file is
+  reported by path and line. A companion test forbids more than one published
+  `FormatVersionMismatch` contract for `VMAT`: in any prose paragraph that
+  discusses `VMAT`, every `expected: N` must be the version the code enforces,
+  and the rendered refusal list is generated from `VMAT_VERSION` rather than
+  written out by hand.
+- `docs/security-hardening-spec.md` and `docs/security-hardening-validation.md`
+  state their scope. Both are records of one completed pass at a pinned baseline
+  commit and describe `VMAT` v1 as current; each now says so at the top and
+  points at `docs/spec.md` for the shipped layout.
+
+### Fixed (matrix zeroing accounting)
+
+- A whole-category clear zeroes its page-digest array with an explicit per-page
+  loop rather than through `zero_range`, and that loop did not record the
+  streaming outcome. A clear whose digest array streamed but whose final range
+  was removed therefore reported zero streamed bytes. The digest path now
+  records both outcomes, so
+  `MatrixRecoveryReport::matrix_total_zero_range_streamed_bytes()` accounts for
+  every range a clear zeroes.
+- The zero-range accessors now document their exact scope: `..._last_...`
+  reports one range *request*, not one operation, and both counters are
+  thread-local. `docs/performance.md` carried the "nonzero exactly when the
+  streaming fallback ran" wording without either qualification; it now directs
+  callers to the before/after delta of the cumulative counter, sampled on the
+  thread that performed the operation.
 
 ## 0.3.0 - 2026-07-17
 

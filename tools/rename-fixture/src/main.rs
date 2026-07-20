@@ -77,7 +77,12 @@ fn main() {
         {
             let mut file = vv::VarveFile::create(spec, &path).unwrap();
             file.push(&Cell { a: 1, b: 2 }).unwrap();
-            file.push(&Item {
+            // API2-05: `Item` is keyed and this format enables
+            // `keyed_offset_chain`, so the generic `push` entry point refuses
+            // it (`Error::KeyedChainRequiresKeyedApi`). The keyed writer is
+            // also the API this fixture is meant to exercise through the
+            // renamed facade.
+            file.push_keyed(&Item {
                 id: 9,
                 name: "renamed".to_string(),
             })
@@ -88,6 +93,15 @@ fn main() {
         let cells = file.blocks::<Cell>().unwrap();
         let cells: Vec<Cell> = cells.iter().collect::<Result<_, _>>().unwrap();
         assert_eq!(cells, vec![Cell { a: 1, b: 2 }]);
+        let items = file.blocks::<Item>().unwrap();
+        let items: Vec<Item> = items.iter().collect::<Result<_, _>>().unwrap();
+        assert_eq!(
+            items,
+            vec![Item {
+                id: 9,
+                name: "renamed".to_string(),
+            }]
+        );
     });
     let cleanup = std::fs::remove_dir_all(&dir);
     if let Err(panic) = result {

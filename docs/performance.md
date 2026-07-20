@@ -30,9 +30,10 @@ Read the throughput column with its unit (BENCH-01). Codec, append, and
 open/scan lines are per **record**, and `records` really is their denominator.
 Merge and compact are per **input event**: their input is the base file plus
 every delta record — updates, deletes, and inserts — and their output is the set
-of surviving live values, which is smaller than both. Each of those lines also
-prints the live values emitted, and the run asserts that number against the file
-it actually produced. Reporting all three against the original base record count,
+of surviving live values, which is smaller than both. Each of those three lines
+also prints the live values emitted, and the run reopens the file that line
+produced and asserts the printed number against the blocks actually
+materialized in it. Reporting all three against the original base record count,
 as earlier revisions did, produced a rate that was neither the events consumed
 nor the values emitted; historical tables below predate the fix, so their
 merge/compact throughput figures should be read as elapsed time only.
@@ -152,8 +153,10 @@ The scalable family covers bounded *ingest and lookup*. It does not cover
 merge/compact: the keyed merge/compact family is resident-only and explicitly
 not PB-scale (see the entries below and `docs/api-reference.md`). Matrix storage
 is a third, separate mode: its integrity metadata is paged and sparse rather
-than resident-per-cell, and create, open, and whole-category clear are all
-bounded by the bytes actually written rather than by cell count.
+than resident-per-cell. Create and open are bounded by live state rather than by
+cell count; whole-category clear is bounded by live state **only where the
+platform supports range removal**, and streams `Theta(cells / 8)` zero bytes
+otherwise — see the two entries below for the exact conditions.
 
 ## Covered Paths
 
@@ -215,7 +218,9 @@ one is a regression even if wall time happens not to move on a small fixture.
 - Keyed merge/compact is resident: time
   `Theta(records + decoded bytes) + O(N log N) + O(K-live log K-live)` and memory
   `O(K-ever + largest input index + 8N uniqueness temporary + retained live
-  values)`. Size it with `KeyedMergeEstimate::peak_resident_bytes()`. The
+  values)`. Size it with `KeyedMergeEstimate::peak_resident_structural_bytes()`,
+  which is a structural estimate and not an upper bound (see the API
+  reference). The
   `O(N log N)` sort degrades to `Theta(N)` for a file whose sequences ascend with
   offset, which is what a Varve writer produces, but it is the guaranteed bound.
 - Typed block registration for an identity-bearing format takes no process-global
@@ -283,11 +288,39 @@ one is a regression even if wall time happens not to move on a small fixture.
   header; commit, CRC-valid, and current-write bitmaps are sparse and
   materialize a page only when it carries a set bit. Committed-cell counting
   must stay `O(1)` off the maintained set-bit totals rather than scanning.
-  Matrix open must cost `O(bytes actually written)`, not `O(cells/8)`: it proves
-  never-written pages read as zero from the filesystem's allocated-range map
-  rather than by reading them, falling back to reading every page only when the
-  platform or filesystem cannot answer. Clearing a whole commit category must
-  punch a hole rather than write zeros.
+
+  Matrix open enumerates the union of the persisted page index and the
+  filesystem allocation map in `O(Q)` time and `Theta(Q)` temporary memory,
+  where `Q` is the number of candidate pages — the pages currently holding state
+  plus any the allocation map reports as written. It is independent of the
+  logical matrix width and of the number of pages the matrix has published
+  historically. There is no sort. Any reintroduction of a sort, or of a scan
+  over `0..page_count`, is a blocking regression.
+
+  The persisted page index is the primary source and is authoritative on its own:
+  when the filesystem cannot answer an allocated-range query, enumeration still
+  costs `O(live pages)`. (Before `VMAT` v3 the fallback was a full logical scan
+  over every page of every map, `Theta(cells / 8)`; that behaviour is gone and
+  any documentation still describing it is stale.) A never-written page is
+  proved zero either by the index not naming it or by the allocation map, not by
+  reading it.
+
+  Whole-category clear removes the byte range where the platform supports it —
+  Windows via `FSCTL_SET_ZERO_DATA`, Linux via `fallocate`
+  `FALLOC_FL_PUNCH_HOLE` — in which case its cost is independent of the cell
+  count. On every other target, and whenever the call fails (for example on a
+  filesystem without sparse-file support), the range is streamed as zero bytes
+  and the cost is `Theta(cells / 8)`. Callers that depend on the cheap path must
+  prove it at runtime, and must respect the exact scope of the two counters that
+  let them: a clear issues several range requests (validity bitmap, page
+  indexes, page digests, commit map), and both counters are **thread-local**.
+  Take `MatrixRecoveryReport::matrix_total_zero_range_streamed_bytes()` before
+  and after the operation, on the thread performing it; a nonzero delta means
+  some range had to be streamed.
+  `MatrixRecoveryReport::matrix_last_zero_range_streamed_bytes()` reports only
+  the most recent single request, so `0` from it does not qualify a whole clear.
+  `MatrixRecoveryReport::matrix_sparse_zeroing_supported()` reports the
+  compile-time platform capability only and is **not** sufficient on its own.
 - Resident block-offset chaining must resolve the previous record of a block id
   from maintained sorted block tails in `O(log B)` with no resident-index reads,
   never by reverse-scanning the index (`O(N*B)`, quadratic when block ids are

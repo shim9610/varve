@@ -33,6 +33,15 @@ const SLOT_REGION_LEN: usize = 9;
 #[cfg(feature = "integrity")]
 const REGION_CRC_LEN: usize = 11;
 const APPEND_LOG_START: usize = 12;
+/// VMAT v4 page-index region extent, appended after `append_log_start`.
+/// Only the integrity-gated page-index damage tests read it.
+#[cfg(feature = "integrity")]
+const PAGE_INDEX_OFF: usize = 13;
+const PAGE_INDEX_LEN: usize = 14;
+/// One persisted page-index slot: slot 0 is the occupancy header, slot `k + 1`
+/// is entry `k`. Only the integrity-gated page-index damage tests read it.
+#[cfg(feature = "integrity")]
+const PAGE_INDEX_SLOT_LEN: u64 = 8;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -172,7 +181,7 @@ fn two_block_spec() -> FormatSpec {
 #[derive(Clone, Copy, Debug)]
 struct VmatHeader {
     offset: u64,
-    fields: [u64; 13],
+    fields: [u64; 15],
 }
 
 struct TempMatrix {
@@ -254,7 +263,7 @@ fn read_vmat_header(path: &Path, spec: FormatSpec) -> VmatHeader {
     let mut bytes = [0; VMAT_HEADER_LEN];
     file.read_exact(&mut bytes).expect("read matrix header");
 
-    let mut fields = [0; 13];
+    let mut fields = [0; 15];
     for (index, field) in fields.iter_mut().enumerate() {
         let start = 24 + index * 8;
         *field = u64::from_le_bytes(bytes[start..start + 8].try_into().expect("field"));
@@ -349,7 +358,7 @@ fn stored_commit_bit_counts_must_match_descriptor_keyspaces() {
 #[test]
 fn every_hostile_vmat_header_extent_fails_without_panicking() {
     let spec = matrix_spec(varve::IntegrityPolicy::None);
-    for index in 0..=APPEND_LOG_START {
+    for index in 0..=PAGE_INDEX_LEN {
         let fixture = TempMatrix::new("matrix_hardening_header_extent");
         create_empty(spec, fixture.path());
         let header = read_vmat_header(fixture.path(), spec);
@@ -850,4 +859,126 @@ fn valid_commit_visibility_and_wire_bytes_are_unchanged_by_open() {
         read(fixture.path()).expect("capture reopened bytes"),
         before
     );
+}
+
+/// A persisted page index whose occupancy header is damaged must produce a
+/// typed fatal finding.
+///
+/// The previous representation had no header at all: enumeration scanned for a
+/// zero terminator, so any zeroed prefix simply looked like an empty — and
+/// therefore perfectly healthy — index. Damage that removes state has to be
+/// reported, not read as an authoritative "nothing was ever published here".
+#[cfg(feature = "integrity")]
+#[test]
+fn damaged_page_index_occupancy_header_is_reported_fatal() {
+    let spec = matrix_spec(varve::IntegrityPolicy::Crc32);
+    let fixture = TempMatrix::new("matrix_hardening_page_index_header");
+    let key = MatrixKey::new(1, 1);
+    {
+        let dimensions = MatrixDimensions::from_pairs([("scan", 2), ("ch", 2)]);
+        let mut writer = spec
+            .create_writer_with_dims(fixture.path(), dimensions)
+            .expect("create matrix fixture");
+        writer
+            .write_matrix_cell(key, &PrimaryCell { value: 5 })
+            .expect("write cell");
+        writer
+            .commit_matrix_cell::<PrimaryCell>(key)
+            .expect("commit cell");
+        writer.flush().expect("flush fixture");
+    }
+
+    let header = read_vmat_header(fixture.path(), spec);
+    // A count with no matching check bits: exactly what a torn or flipped
+    // header slot leaves behind.
+    patch_u64(fixture.path(), header.fields[PAGE_INDEX_OFF], 1);
+
+    let reader = spec
+        .with_matrix_fatal_forensics()
+        .open_reader(fixture.path())
+        .expect("open with forensic access");
+    let report = reader.matrix_recovery_report();
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.kind == MatrixCorruptionKind::CommitMap
+                && finding.severity == MatrixCorruptionSeverity::Fatal),
+        "a damaged page-index header produced no fatal finding: {:?}",
+        report.findings
+    );
+}
+
+/// Fatal page-index damage is fail-closed by default: cell access is refused
+/// rather than answered from an index that is known to be incomplete.
+#[cfg(feature = "integrity")]
+#[test]
+fn damaged_page_index_blocks_cell_access_without_forensics() {
+    let spec = matrix_spec(varve::IntegrityPolicy::Crc32);
+    let fixture = TempMatrix::new("matrix_hardening_page_index_gate");
+    let key = MatrixKey::new(1, 1);
+    {
+        let dimensions = MatrixDimensions::from_pairs([("scan", 2), ("ch", 2)]);
+        let mut writer = spec
+            .create_writer_with_dims(fixture.path(), dimensions)
+            .expect("create matrix fixture");
+        writer
+            .write_matrix_cell(key, &PrimaryCell { value: 5 })
+            .expect("write cell");
+        writer
+            .commit_matrix_cell::<PrimaryCell>(key)
+            .expect("commit cell");
+        writer.flush().expect("flush fixture");
+    }
+
+    let header = read_vmat_header(fixture.path(), spec);
+    // The header states one entry; zero that entry inside the counted prefix.
+    patch_u64(
+        fixture.path(),
+        header.fields[PAGE_INDEX_OFF] + PAGE_INDEX_SLOT_LEN,
+        0,
+    );
+
+    let mut reader = spec
+        .open_reader(fixture.path())
+        .expect("open damaged matrix");
+    assert!(
+        reader
+            .matrix_recovery_report()
+            .findings
+            .iter()
+            .any(|finding| finding.severity == MatrixCorruptionSeverity::Fatal),
+        "a zeroed page-index entry inside the counted prefix went unreported"
+    );
+    assert!(matches!(
+        reader.read_matrix_cell::<PrimaryCell>(key),
+        Err(Error::MatrixFatalCorruption)
+    ));
+}
+
+/// The `PackedBitmap` codec is accepted in ordinary variable fields, so its
+/// malformed-input failures must be decode failures rather than matrix-layout
+/// failures for a matrix the caller may not even have.
+#[test]
+fn packed_bitmap_decode_failures_are_codec_errors() {
+    let mut bitmap = varve::PackedBitmap::new(10).expect("construct bitmap");
+    bitmap.set(3, true).expect("set bit");
+    assert!(matches!(
+        bitmap.set(10, true),
+        Err(Error::InvalidCanonicalEncoding(_))
+    ));
+    assert!(matches!(
+        bitmap.get(10),
+        Err(Error::InvalidCanonicalEncoding(_))
+    ));
+
+    // A bit length that does not match the payload length is malformed input.
+    let mut encoder = varve::Encoder::new(Endian::Little);
+    varve::VarveEncode::encode_varve(&99u64, &mut encoder).expect("encode bit length");
+    varve::VarveEncode::encode_varve(&vec![0u8, 0, 0], &mut encoder).expect("encode payload");
+    let encoded = encoder.into_inner();
+    assert!(matches!(
+        varve::decode_from_slice::<varve::PackedBitmap>(&encoded, Endian::Little),
+        Err(Error::InvalidCanonicalEncoding(_))
+    ));
 }

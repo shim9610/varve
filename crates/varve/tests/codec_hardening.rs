@@ -544,6 +544,144 @@ fn hash_map_budget_still_admits_honest_maps() {
     ));
 }
 
+/// The exact charge the decoder must apply to a `HashMap<(), ()>` at any
+/// declared count in the small-table classes (SAFE2-01/F-02).
+///
+/// 32 buckets (the modelled control-group floor) times one control byte per
+/// zero-sized entry, plus one trailing control group, plus the control-array
+/// alignment: `32 + 32 + 32`.
+const ZERO_SIZED_SMALL_TABLE_BYTES: u64 = 96;
+
+/// The same charge for a one-byte entry, whose buckets cost two bytes each:
+/// `32 * 2 + 32 + 32`.
+const ONE_BYTE_SMALL_TABLE_BYTES: u64 = 128;
+
+/// The declared counts hashbrown answers with a single small-table capacity
+/// class. On the review toolchain an empty map asked to reserve any of these
+/// reports capacity 14, i.e. a 16-bucket table.
+const SMALL_TABLE_CAPACITIES: std::ops::RangeInclusive<u64> = 1..=14;
+
+/// SAFE2-01/F-02. The old model charged one entry as two buckets, so
+/// `HashMap<(), ()>` cost 19 bytes at every count in `1..=14` while
+/// `HashMap::<(), ()>::try_reserve(1)` really allocates a 16-bucket table whose
+/// control storage alone is 32 bytes. The charge is now pinned exactly at every
+/// count in that range, from both sides: one byte below it the decode must be a
+/// typed budget rejection carrying the exact charge, and at it the budget must
+/// no longer be the reason the decode stops.
+///
+/// The inputs are counts with no entry bytes, which is legal for a zero-sized
+/// entry (`Unit` has a zero-byte minimum wire size), so the table charge is the
+/// only materialization the decode performs and the assertion is exact rather
+/// than an inequality.
+#[test]
+fn zero_sized_map_small_table_classes_are_charged_exactly() {
+    for len in SMALL_TABLE_CAPACITIES {
+        let encoded = len.to_le_bytes();
+        let charge = ZERO_SIZED_SMALL_TABLE_BYTES;
+
+        match Decoder::decode_from_slice_limited::<HashMap<(), ()>>(
+            &encoded,
+            Endian::Little,
+            charge - 1,
+        ) {
+            Err(Error::LimitExceeded {
+                resource,
+                actual,
+                limit,
+            }) => {
+                assert_eq!(resource, "HashMap entries");
+                assert_eq!(
+                    actual, charge,
+                    "count {len} must be charged the whole table"
+                );
+                assert_eq!(limit, charge - 1);
+            }
+            other => panic!("count {len} one byte under budget must be rejected, got {other:?}"),
+        }
+
+        // At exactly the charge the table is affordable. The decode may still
+        // fail for a *canonical* reason (two zero-sized keys are necessarily
+        // duplicates), which is precisely what must not be confused with a
+        // budget rejection.
+        let affordable =
+            Decoder::decode_from_slice_limited::<HashMap<(), ()>>(&encoded, Endian::Little, charge);
+        assert!(
+            !matches!(affordable, Err(Error::LimitExceeded { .. })),
+            "count {len} must be affordable at exactly {charge} bytes",
+        );
+    }
+}
+
+/// The one-byte-entry half of the same contract, with genuine entries so the
+/// affordable side is a real successful decode rather than an absence of a
+/// budget error. `HashMap<u8, ()>` entries are one wire byte and one in-memory
+/// byte, and the canonical encoding requires strictly increasing keys.
+#[test]
+fn one_byte_map_small_table_classes_are_charged_exactly() {
+    for len in SMALL_TABLE_CAPACITIES {
+        let mut encoded = len.to_le_bytes().to_vec();
+        encoded.extend(0..len as u8);
+        let charge = ONE_BYTE_SMALL_TABLE_BYTES;
+
+        match Decoder::decode_from_slice_limited::<HashMap<u8, ()>>(
+            &encoded,
+            Endian::Little,
+            charge - 1,
+        ) {
+            Err(Error::LimitExceeded {
+                resource,
+                actual,
+                limit,
+            }) => {
+                assert_eq!(resource, "HashMap entries");
+                assert_eq!(
+                    actual, charge,
+                    "count {len} must be charged the whole table"
+                );
+                assert_eq!(limit, charge - 1);
+            }
+            other => panic!("count {len} one byte under budget must be rejected, got {other:?}"),
+        }
+
+        let decoded =
+            Decoder::decode_from_slice_limited::<HashMap<u8, ()>>(&encoded, Endian::Little, charge)
+                .expect("an honest small map fits in exactly its modelled table");
+        assert_eq!(decoded.len(), len as usize);
+    }
+}
+
+/// The charge must never *fall* as the declared count rises, and the first
+/// count past the small-table classes must still be covered by the model: a
+/// guard that got cheaper at a larger count would be defeatable by inflating
+/// the count.
+#[test]
+fn hash_map_charges_never_fall_as_the_declared_count_rises() {
+    let mut previous = 0u64;
+    for len in 1..=4096u64 {
+        let encoded = len.to_le_bytes();
+        // The budget is the declared count itself: large enough to clear the
+        // "no bounded input can make progress" check that precedes the charge,
+        // and always smaller than a table with at least `len` buckets, so the
+        // rejection reports the modelled charge.
+        match Decoder::decode_from_slice_limited::<HashMap<(), ()>>(&encoded, Endian::Little, len) {
+            Err(Error::LimitExceeded { actual, .. }) => {
+                assert!(
+                    actual >= previous,
+                    "count {len} charged {actual}, less than the previous count",
+                );
+                assert!(actual >= ZERO_SIZED_SMALL_TABLE_BYTES);
+                previous = actual;
+            }
+            Err(Error::InvalidCanonicalEncoding(_)) => {
+                // A count that no bounded input can satisfy is a canonical
+                // fault, which is checked before the budget and is not a
+                // weaker outcome.
+            }
+            other => panic!("count {len} under a zero budget must be refused, got {other:?}"),
+        }
+    }
+}
+
 /// API-03. `ChunkedBytes` is a documented variable-field codec, so it must
 /// declare a stable non-zero identity (the derive rejects zero) that is
 /// distinct from the `Vec<u8>` codec whose bytes it rides on. The literals are
@@ -612,4 +750,60 @@ fn chunked_bytes_is_usable_as_a_derived_variable_field() -> varve::Result<()> {
     assert_eq!(decoded.blob.decode_to_vec()?, payload);
     assert_ne!(ChunkedVariable::SCHEMA_FINGERPRINT, 0);
     Ok(())
+}
+
+/// API3-04. `BTreeMap` was charged `len * size_of::<(K, V)>()`, as if entries
+/// were stored packed end to end. A std B-tree node instead allocates a
+/// fixed-capacity array of eleven entry slots whatever its fill, is only
+/// guaranteed to hold five of them, and carries a header (and, for internal
+/// nodes, twelve child pointers) on top. The real footprint is therefore
+/// several times the old model.
+///
+/// This asserts the charge is *strictly greater* than the discredited packed
+/// model at a count that is genuinely affordable under it. Against the old
+/// code the decode is admitted and the assertion that a budget equal to the
+/// packed size is refused fails.
+#[test]
+fn btree_map_entries_are_charged_their_real_node_cost() {
+    const DECLARED: usize = 64;
+    // The packed model's charge for `BTreeMap<u64, u64>`: 64 * 16.
+    const PACKED: u64 = (DECLARED * 16) as u64;
+
+    let mut encoded = (DECLARED as u64).to_le_bytes().to_vec();
+    for index in 0..DECLARED as u64 {
+        encoded.extend_from_slice(&index.to_le_bytes());
+        encoded.extend_from_slice(&index.to_le_bytes());
+    }
+
+    // A budget of exactly the packed size was accepted before; it must now be
+    // refused, because the packed size is not what a `BTreeMap` costs.
+    match Decoder::decode_from_slice_limited::<BTreeMap<u64, u64>>(&encoded, Endian::Little, PACKED)
+    {
+        Err(Error::LimitExceeded {
+            resource,
+            actual,
+            limit,
+        }) => {
+            assert_eq!(resource, "BTreeMap entries");
+            assert_eq!(limit, PACKED);
+            assert!(
+                actual > PACKED,
+                "charge {actual} must exceed the discredited packed model {PACKED}"
+            );
+        }
+        Err(error) => panic!("expected a budget rejection, got {error:?}"),
+        Ok(_) => panic!("the packed-model budget must no longer admit this map"),
+    }
+
+    // The model must stay usable: a budget that covers the real node cost
+    // still decodes the map, and decodes it correctly.
+    let generous = PACKED * 8;
+    let decoded = Decoder::decode_from_slice_limited::<BTreeMap<u64, u64>>(
+        &encoded,
+        Endian::Little,
+        generous,
+    )
+    .expect("an honestly sized budget must still admit the map");
+    assert_eq!(decoded.len(), DECLARED);
+    assert_eq!(decoded.get(&7), Some(&7));
 }

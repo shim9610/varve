@@ -484,13 +484,37 @@ impl<'a> Decoder<'a> {
 
     /// Preflight for a node-per-entry map (`BTreeMap`), whose storage really is
     /// driven by the entries it has already accepted.
+    ///
+    /// API3-04: the charge used to be `len * size_of::<(K, V)>()`, which
+    /// treats a `BTreeMap` as if it stored entries packed end to end. It does
+    /// not. A std B-tree node carries a fixed-capacity array - it allocates
+    /// room for `2B - 1 = 11` entries whatever its fill - behind a header
+    /// (parent pointer, parent index, length), and internal nodes additionally
+    /// carry `2B = 12` child pointers. A node is only guaranteed to hold
+    /// `B - 1 = 5` entries, so per *live* entry the array alone can cost
+    /// `11/5 = 2.2x` the naive model before any header is counted.
+    ///
+    /// The model below is deliberately an over-estimate, not a measurement:
+    /// [`BTREE_ENTRY_SLOT_FACTOR`] covers the fixed-capacity array at minimum
+    /// fill plus the internal-node fan-out, and [`BTREE_ENTRY_HEADER_BYTES`]
+    /// covers node headers and child pointers amortised over the same minimum
+    /// fill. `size_of::<(K, V)>()` is itself an upper bound on the two
+    /// separate `K` and `V` arrays a node really holds. This charge is smaller
+    /// than the hash-table charge in relative terms because a `BTreeMap` only
+    /// grows per *accepted* entry, so the input must already carry at least
+    /// one wire byte per entry.
     fn preflight_map_count<K: VarveDecode, V: VarveDecode>(
         &mut self,
         len: usize,
         resource: &'static str,
     ) -> Result<()> {
         self.screen_map_wire_length::<K, V>(len, resource)?;
-        self.preflight_count(len, 0, size_of::<(K, V)>(), resource)
+        let entry_bytes = size_of::<(K, V)>()
+            .max(1)
+            .checked_mul(BTREE_ENTRY_SLOT_FACTOR)
+            .and_then(|slots| slots.checked_add(BTREE_ENTRY_HEADER_BYTES))
+            .ok_or(Error::ResourceArithmeticOverflow { resource })?;
+        self.preflight_count(len, 0, entry_bytes, resource)
     }
 
     /// Preflight for an open-addressed hash table (`HashMap`), whose storage is
@@ -1130,9 +1154,49 @@ fn allocation_request<T>(len: usize) -> u64 {
     u64::try_from(len.saturating_mul(size_of::<T>())).unwrap_or(u64::MAX)
 }
 
-/// Trailing bytes a hashbrown table carries beyond `buckets * (size_of::<T>()
-/// + 1)`: one control group of duplicated control bytes.
-const HASH_TABLE_GROUP_BYTES: u64 = 16;
+/// Control-group width the reservation model assumes for hashbrown, in bytes.
+///
+/// This single constant governs three separate parts of the real allocation,
+/// all of which scale with `Group::WIDTH`:
+///
+/// * the trailing duplicated control group appended after the control array;
+/// * the minimum bucket count of a small table (SAFE2-01: hashbrown rounds a
+///   small table with a one-byte-or-smaller entry up to a whole group so the
+///   control array is never shorter than one SIMD load);
+/// * the control array's alignment, which is `max(Group::WIDTH, align_of::<T>())`
+///   and therefore bounds the padding inserted between the bucket array and the
+///   control array.
+///
+/// Shipping hashbrown uses a 16-byte SSE2 group on x86-64 and an 8-byte group
+/// on NEON and the generic fallback, so the true width on every target this
+/// project supports today is at most 16. The model deliberately assumes **32**
+/// instead: the value cannot be read from the standard library at compile time,
+/// a wider group is the only way this model can silently start undercharging,
+/// and one doubling buys immunity to a future 32-byte-group implementation at a
+/// cost of at most a few tens of bytes per map plus a bounded over-charge on
+/// tables of fewer than fifteen entries. Charging more than hashbrown allocates
+/// is always sound here; charging less is the defect this constant exists to
+/// prevent.
+/// Entry-slot multiplier for the `BTreeMap` materialization model (API3-04).
+///
+/// A std B-tree node allocates a fixed array of `2B - 1 = 11` entry slots
+/// whatever its fill, and is only guaranteed to hold `B - 1 = 5` of them, so
+/// the array costs up to `11/5 = 2.2` slots per live entry. Internal nodes add
+/// a further `1/(B - 1)` of the leaf population. Three is the next integer
+/// above that bound and is chosen so a future change of `B` in the standard
+/// library cannot silently turn the model into an under-charge.
+const BTREE_ENTRY_SLOT_FACTOR: usize = 3;
+
+/// Per-entry allowance for B-tree node headers and child pointers (API3-04).
+///
+/// A leaf node header is a parent pointer, a parent index and a length; an
+/// internal node adds `2B = 12` child pointers. Amortised over the guaranteed
+/// minimum fill of five entries that is under four bytes per entry for leaves
+/// and under twenty for internal nodes, of which there are at most a fifth as
+/// many. Sixteen bytes per entry covers both comfortably.
+const BTREE_ENTRY_HEADER_BYTES: usize = 16;
+
+const HASH_TABLE_GROUP_BYTES: u64 = 32;
 
 /// Entries a map codec reserves for before it has validated a single entry
 /// (SAFE-01).
@@ -1151,24 +1215,52 @@ const MAP_PREALLOCATION_ENTRIES: usize = 1024;
 /// Derivation, from what hashbrown actually allocates:
 ///
 /// * `try_reserve(len)` on an empty map requests a table with capacity `len`.
-/// * Entries live at a maximum 7/8 load factor, so the table needs at least
-///   `ceil(len * 8 / 7)` buckets.
+/// * Entries live at a maximum 7/8 load factor, so a large table needs at least
+///   `ceil(len * 8 / 7)` buckets (hashbrown itself floors that division; the
+///   ceiling used here can only round the model up).
 /// * The bucket count is rounded **up to a power of two**, which can almost
 ///   double that figure again.
-/// * Every bucket owns one `T` *and* one control byte — this is why the true
-///   floor is never one byte per entry, not even for a zero-sized `T`.
-/// * The allocation additionally carries one control group of trailing
-///   duplicated control bytes, plus up to `align_of::<T>()` bytes of padding
-///   placing the bucket array.
+/// * Below that, hashbrown does **not** allocate less: it applies *small-table
+///   capacity classes* with a hard floor. On the review toolchain (Rust 1.95,
+///   x86-64) an empty `HashMap` asked for any capacity in `1..=14` reports
+///   capacity 14, i.e. a **16-bucket** table, for a zero-sized or one-byte
+///   entry; larger entries floor at 4 or 8 buckets. This is why the previous
+///   comment here — that "small-table specializations only ever allocate less"
+///   — was false, and why the old two-bucket model undercharged
+///   `HashMap<(), ()>` by charging 19 bytes for a table that really costs 32
+///   bytes of control storage alone (SAFE2-01/F-02).
+/// * Every bucket owns one `T` *and* one control byte — the true floor is never
+///   one byte per entry, not even for a zero-sized `T`.
+/// * The allocation additionally carries one trailing duplicated control group,
+///   plus the padding that aligns the control array, which is bounded by
+///   `max(Group::WIDTH, align_of::<T>())` rather than by `align_of::<T>()`
+///   alone (the old model charged only the latter and could undercharge a
+///   low-alignment entry by up to a group).
 ///
 /// So the charge is
-/// `next_power_of_two(ceil(len * 8 / 7)) * (size_of::<T>() + 1) + 16 +
-/// align_of::<T>()`. It deliberately over-estimates: hashbrown's own
-/// small-table specializations only ever allocate less, and the guard must
-/// never charge less than the reservation it guards. `None` means the model
-/// overflowed `u64`, which the caller must report as a budget rejection rather
-/// than attempt.
-fn hash_table_reservation_bytes<T>(len: usize) -> Option<u64> {
+///
+/// ```text
+/// buckets = max(next_power_of_two(ceil(len * 8 / 7)), HASH_TABLE_GROUP_BYTES)
+/// bytes   = buckets * (size_of::<T>() + 1)
+///         + HASH_TABLE_GROUP_BYTES
+///         + max(HASH_TABLE_GROUP_BYTES, align_of::<T>())
+/// ```
+///
+/// The bucket floor is *not* a transcription of one observed capacity class: it
+/// is [`HASH_TABLE_GROUP_BYTES`], deliberately set to a wider control group
+/// (32) than any supported toolchain uses (8 or 16). Every small-table class
+/// hashbrown can pick is either a fixed small count (4 or 8 buckets) or one
+/// whole control group, so on any implementation whose group is at most 32 wide
+/// the class is at most 32 buckets and the floor dominates it — for `len <= 14`
+/// this is decided by that floor alone, without hard-coding what any one build
+/// was observed to do. From `len = 15` upwards the power-of-two term takes
+/// over, and it is already at least 32 there.
+///
+/// The result is therefore an over-estimate at every capacity, MSRV 1.95 and
+/// later stable toolchains alike, and the guard must never charge less than the
+/// reservation it guards. `None` means the model overflowed `u64`, which the
+/// caller must report as a budget rejection rather than attempt.
+pub(crate) fn hash_table_reservation_bytes<T>(len: usize) -> Option<u64> {
     if len == 0 {
         return Some(0);
     }
@@ -1177,11 +1269,12 @@ fn hash_table_reservation_bytes<T>(len: usize) -> Option<u64> {
         .checked_mul(8)?
         .checked_add(6)?
         .checked_div(7)?
-        .checked_next_power_of_two()?;
+        .checked_next_power_of_two()?
+        .max(HASH_TABLE_GROUP_BYTES);
     buckets
         .checked_mul((size_of::<T>() as u64).checked_add(1)?)?
         .checked_add(HASH_TABLE_GROUP_BYTES)?
-        .checked_add(align_of::<T>() as u64)
+        .checked_add(HASH_TABLE_GROUP_BYTES.max(align_of::<T>() as u64))
 }
 
 macro_rules! tuple_codec {
@@ -1272,5 +1365,87 @@ mod tests {
             .encode_nested_to_vec(&vec![4u8; 1024])
             .expect("unlimited nested encode");
         assert_eq!(payload.len(), 8 + 1024);
+    }
+
+    /// Smallest table the *running* standard library can be shown to allocate
+    /// for `try_reserve(len)` on an empty map, in bytes.
+    ///
+    /// The allocation size is not observable, so this reconstructs a lower
+    /// bound from the one number that is: the reported capacity. A hashbrown
+    /// table always has a power-of-two bucket count and always keeps at least
+    /// one bucket free, so `buckets >= next_power_of_two(capacity + 1)`. Each
+    /// bucket owns one `T` and one control byte, and the control array carries
+    /// one trailing duplicated group (16 bytes for the widest group any
+    /// currently supported target uses).
+    ///
+    /// This is deliberately a *lower* bound on the real allocation: the model
+    /// under test must dominate it at every capacity, and a toolchain whose
+    /// small-table classes grew past the model would fail this assertion
+    /// instead of silently undercharging.
+    fn observed_table_floor_bytes<K, V>(len: usize) -> u64
+    where
+        K: Hash + Eq,
+    {
+        let mut map: HashMap<K, V> = HashMap::new();
+        map.try_reserve(len).expect("probe reservation");
+        let buckets = (map.capacity() as u64 + 1).next_power_of_two();
+        buckets * (size_of::<(K, V)>() as u64 + 1) + 16
+    }
+
+    /// SAFE2-01/F-02. The reservation model must never charge less than the
+    /// table `try_reserve` really allocates, at *every* capacity — including
+    /// the small-table classes `1..=14`, where the previous two-bucket model
+    /// charged `HashMap<(), ()>` 19 bytes for a 16-bucket table.
+    #[test]
+    fn hash_table_model_dominates_the_real_reservation_at_every_capacity() {
+        macro_rules! check {
+            ($k:ty, $v:ty) => {
+                for len in 1..=64usize {
+                    let modelled =
+                        hash_table_reservation_bytes::<($k, $v)>(len).expect("model fits in u64");
+                    let observed = observed_table_floor_bytes::<$k, $v>(len);
+                    assert!(
+                        modelled >= observed,
+                        "{}/{} at len {len}: charged {modelled} < real floor {observed}",
+                        stringify!($k),
+                        stringify!($v),
+                    );
+                }
+            };
+        }
+
+        check!((), ());
+        check!(u8, ());
+        check!(u8, u8);
+        check!(u16, u32);
+        check!(u64, u64);
+        check!(String, Vec<u8>);
+        check!([u8; 96], [u8; 96]);
+    }
+
+    /// The model is monotonic in the declared count and never zero for a
+    /// non-empty map: a budget guard that could be made cheaper by declaring
+    /// *more* entries would be defeatable by inflating the count.
+    #[test]
+    fn hash_table_model_is_monotonic_and_never_free() {
+        let mut previous = 0u64;
+        for len in 1..=4096usize {
+            let charge = hash_table_reservation_bytes::<(u32, u32)>(len).expect("model fits");
+            assert!(charge > 0, "len {len} charged nothing");
+            assert!(
+                charge >= previous,
+                "len {len} charged less than len {}",
+                len - 1
+            );
+            previous = charge;
+        }
+        assert_eq!(hash_table_reservation_bytes::<((), ())>(0), Some(0));
+        // A count whose table cannot be represented is a rejection, never a
+        // wrap-around to a small charge. On targets where the arithmetic still
+        // fits, the charge must at least exceed the declared count.
+        match hash_table_reservation_bytes::<(u64, u64)>(usize::MAX) {
+            None => {}
+            Some(charge) => assert!(charge >= usize::MAX as u64),
+        }
     }
 }

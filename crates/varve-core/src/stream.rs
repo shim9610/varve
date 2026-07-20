@@ -123,6 +123,22 @@ pub struct StreamBootstrapReport {
     pub scanned_bytes: u64,
 }
 
+/// Scans a native stream file and publishes a clean state sidecar for it.
+///
+/// # Non-cooperating writers (F-09)
+///
+/// Cooperating writers are serialized by the writer lock this call holds. A
+/// process that replaces the primary *pathname* without taking that lock is
+/// outside the contract, and no userspace library can make publication atomic
+/// against it. This call bounds what such a writer can cause: the primary's
+/// identity is verified immediately before publication, the verified object is
+/// held open across it so its identity cannot be recycled behind an unlink, and
+/// the identity is re-checked once the sidecar is visible. If the replacement
+/// landed inside that interval the published sidecar is removed again and the
+/// call fails with `DiskIndexError::IdentityMismatch` — or, if the stale
+/// sidecar could not be removed, with a `DiskIndexError::CheckpointMismatch`
+/// naming what must be deleted. The residual cost is a bootstrap the caller
+/// must repeat, never a sidecar a consumer would accept for the wrong primary.
 pub fn bootstrap_stream_checkpoint(
     spec: FormatSpec,
     path: impl AsRef<Path>,
@@ -207,7 +223,14 @@ where
     // snapshot scanned. Re-resolve the pathname immediately before publishing
     // and refuse to publish for a swapped-in generation.
     let snapshot_identity = opened_file_identity(&reader.snapshot.try_clone_file()?)?;
-    let current_identity = opened_file_identity(&OpenOptions::new().read(true).open(&path)?)?;
+    // F-09: the verified handle is kept open across publication. Cooperating
+    // writers are already excluded by the `WriterLock` held above; against a
+    // pathname mutator that ignores that protocol, holding the object open is
+    // what stops the operating system from recycling its identity behind an
+    // unlink, so the post-publication re-check below cannot be satisfied by a
+    // different object wearing the same device/inode pair.
+    let verified = OpenOptions::new().read(true).open(&path)?;
+    let current_identity = opened_file_identity(&verified)?;
     if current_identity != snapshot_identity {
         return Err(state_error(
             crate::disk_index::DiskIndexError::IdentityMismatch,
@@ -219,6 +242,39 @@ where
         metadata,
         &checkpoint_disk_tails(&checkpoint),
     )?;
+    #[cfg(test)]
+    interpose_after_state_publication(&path);
+    // F-09: publication is not a single syscall with the check above, so
+    // re-resolve once more now that the sidecar is visible. If the primary was
+    // replaced in that interval the sidecar just published describes a file
+    // object that no longer holds the pathname, and leaving it there would
+    // displace whatever newer sidecar the replacement brought with it. Retire
+    // it and report a typed mismatch rather than return success or leave a
+    // stale sidecar behind silently.
+    //
+    // Neither step below may turn into a bare `Err` on its own: the sidecar is
+    // already published, so an unreadable pathname is resolved *against*
+    // publication (fail closed, retire the sidecar) rather than reported as a
+    // plain IO failure that would leave a caller unable to tell what is on
+    // disk.
+    let sidecar = state_sidecar_path(&path);
+    let published_identity = OpenOptions::new()
+        .read(true)
+        .open(&sidecar)
+        .ok()
+        .and_then(|file| opened_file_identity(&file).ok());
+    let republished_identity = OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .ok()
+        .and_then(|file| opened_file_identity(&file).ok());
+    if republished_identity.as_deref() != Some(snapshot_identity.as_slice()) {
+        return Err(state_error(retire_sidecar_for_replaced_primary(
+            &sidecar,
+            published_identity.as_deref(),
+        )));
+    }
+    drop(verified);
     Ok(StreamBootstrapReport {
         records: record_count,
         scanned_bytes: checkpoint.logical_eof.saturating_sub(header_eof),
@@ -1381,6 +1437,88 @@ fn state_chunk_records(spec: FormatSpec, batch: DiskIndexBatchOptions) -> usize 
     batch.max_records.min(batch.max_bytes / per_record).max(1)
 }
 
+/// Test-only interposition point between sidecar publication and the
+/// post-publication identity re-check (F-09), where a non-cooperating pathname
+/// mutator would have to land to make the published sidecar stale.
+///
+/// The armed hook is keyed by the primary it belongs to, so an unrelated test
+/// publishing a sidecar concurrently cannot consume another test's hook.
+#[cfg(test)]
+pub(crate) fn interpose_after_state_publication(primary: &Path) {
+    let mut armed = PUBLICATION_INTERPOSITION
+        .lock()
+        .expect("publication interposition");
+    let matches = armed
+        .as_ref()
+        .is_some_and(|(target, _)| target.as_path() == primary);
+    if !matches {
+        return;
+    }
+    let (_, hook) = armed.take().expect("the armed hook was just observed");
+    drop(armed);
+    hook();
+}
+
+#[cfg(test)]
+type PublicationInterposition = std::sync::Mutex<Option<(PathBuf, Box<dyn FnOnce() + Send>)>>;
+
+#[cfg(test)]
+static PUBLICATION_INTERPOSITION: PublicationInterposition = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_publication_interposition(primary: &Path, hook: Box<dyn FnOnce() + Send>) {
+    *PUBLICATION_INTERPOSITION
+        .lock()
+        .expect("publication interposition") = Some((primary.to_path_buf(), hook));
+}
+
+/// Retires a sidecar that was published for a primary the pathname stopped
+/// naming during publication, and reports which of the two outcomes happened
+/// (F-09).
+///
+/// The removal is identity-checked and directory-confined, exactly like the
+/// self-test's destructive cleanup, so this can never delete a sidecar some
+/// other party published at that pathname. Whether the stale sidecar was
+/// removed or had to be left in place changes what the caller must do next, so
+/// the two cases are different typed errors rather than one.
+///
+/// This does not make sidecar publication atomic with respect to a
+/// non-cooperating pathname mutator; nothing available to a userspace library
+/// can. It bounds the damage such a writer can do to a rebuild the caller must
+/// repeat, which is the documented non-cooperating-writer boundary: Varve
+/// serializes cooperating writers with [`crate::file::WriterLock`], and a
+/// process that replaces the primary without it is outside that contract.
+pub(crate) fn retire_sidecar_for_replaced_primary(
+    sidecar: &Path,
+    published_identity: Option<&[u8]>,
+) -> crate::disk_index::DiskIndexError {
+    let Some(published_identity) = published_identity else {
+        // The sidecar's own identity could not be captured, so removing it
+        // would be a deletion by unverified pathname — the very thing this
+        // helper exists to avoid. Report what the caller must clean up.
+        return crate::disk_index::DiskIndexError::CheckpointMismatch(
+            "the primary was replaced while its sidecar was published; the sidecar this call \
+             published is stale and could not be identified for removal, so delete it before \
+             reusing the file",
+        );
+    };
+    match crate::diagnostics::remove_path_if_same_object(sidecar, published_identity) {
+        // Removed, or already replaced by whoever else is writing this
+        // pathname: either way this call left no sidecar of its own behind.
+        crate::diagnostics::ObjectRemoval::Removed
+        | crate::diagnostics::ObjectRemoval::NotOwned => {
+            crate::disk_index::DiskIndexError::IdentityMismatch
+        }
+        crate::diagnostics::ObjectRemoval::Refused(_)
+        | crate::diagnostics::ObjectRemoval::Failed => {
+            crate::disk_index::DiskIndexError::CheckpointMismatch(
+                "the primary was replaced while its sidecar was published; the sidecar this call \
+                 published is stale and could not be removed, so delete it before reusing the file",
+            )
+        }
+    }
+}
+
 fn state_error(error: crate::disk_index::DiskIndexError) -> Error {
     match error {
         crate::disk_index::DiskIndexError::Busy => Error::IndexBusy,
@@ -2026,6 +2164,67 @@ mod tests {
         assert_eq!(
             store.read_metadata().map_err(state_error)?.state,
             crate::disk_index::DiskIndexState::Dirty
+        );
+        Ok(())
+    }
+
+    /// F-09. A pathname mutator that ignores `WriterLock` can replace the
+    /// primary after the pre-publication identity check and before the state
+    /// sidecar is visible. The published sidecar then describes a file object
+    /// the pathname no longer names, and leaving it there would displace the
+    /// replacement's own newer sidecar.
+    ///
+    /// The interposition lands in exactly that interval. Bootstrap must return
+    /// a typed mismatch rather than success, and must take the sidecar it
+    /// published back out again rather than leave an old-generation sidecar
+    /// standing.
+    #[test]
+    fn bootstrap_retires_a_sidecar_published_for_a_replaced_primary() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("replaced-bootstrap.varve");
+        let replacement = directory.path().join("replacement.varve");
+        let spec = spec(IndexPolicy::BlockOffsetChain, CommitPolicy::RecordFooter);
+        for (target, value) in [(&path, 1u64), (&replacement, 2)] {
+            let mut writer = VarveStreamWriter::create(spec, target, StreamOptions::default())?;
+            writer.push_info(&TestBlock(value))?;
+            writer.sync()?;
+        }
+        // Bootstrap promotes a native file that has no state sidecar yet.
+        fs::remove_file(state_sidecar_path(&path))?;
+        fs::remove_file(state_sidecar_path(&replacement))?;
+
+        let swapped = path.clone();
+        let source = replacement.clone();
+        let interposed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = std::sync::Arc::clone(&interposed);
+        set_publication_interposition(
+            &fs::canonicalize(&path)?,
+            Box::new(move || {
+                // The interval under test only exists once the sidecar is
+                // published, so the test is meaningless if this is not already
+                // true when the swap lands.
+                assert!(
+                    state_sidecar_path(&swapped).exists(),
+                    "the interposition must run after the sidecar is published",
+                );
+                fs::rename(&source, &swapped).expect("replace the primary during publication");
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+
+        let result = bootstrap_stream_checkpoint(spec, &path, StreamOptions::default());
+        match result {
+            Err(Error::DiskIndex(error))
+                if matches!(*error, crate::disk_index::DiskIndexError::IdentityMismatch) => {}
+            other => panic!("expected a typed identity mismatch, got {other:?}"),
+        }
+        assert!(
+            interposed.load(std::sync::atomic::Ordering::SeqCst),
+            "the swap never reached the publication interval under test",
+        );
+        assert!(
+            !state_sidecar_path(&path).exists(),
+            "a sidecar published for a replaced primary must not be left behind",
         );
         Ok(())
     }

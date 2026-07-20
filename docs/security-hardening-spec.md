@@ -1,5 +1,10 @@
 # Security And API Hardening Spec
 
+> **Scope.** This document is the record of one completed hardening pass, fixed
+> at the baseline commit named below. Every format version it states — including
+> `VMAT` v1 — is the version that was current *at that baseline*, not the version
+> this build writes. `docs/spec.md` is the authority for the shipped layout.
+
 ## Status
 
 - Baseline commit: `f7a9369` from `dev/main`.

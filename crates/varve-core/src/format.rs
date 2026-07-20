@@ -76,6 +76,14 @@ pub struct ReadLimits {
     pub max_matrix_slot_region_len: ReadLimit,
     pub max_sidecar_len: ReadLimit,
     pub max_mmap_len: ReadLimit,
+    /// Ceiling on the resident keyed-tail cache of a single keyed block id -
+    /// the map that lets a keyed append resolve its predecessor in O(1)
+    /// instead of rescanning the resident index (API3-02).
+    ///
+    /// The charged value is the map's inline storage plus the key payload
+    /// bytes it owns, checked before the memory is taken. It is checked per
+    /// keyed block id, not summed across block ids.
+    pub max_keyed_tail_bytes: ReadLimit,
     trusted_api: bool,
 }
 
@@ -110,6 +118,7 @@ impl ReadLimits {
         max_matrix_slot_region_len: ReadLimit::Finite(8 * 1024 * 1024 * 1024),
         max_sidecar_len: ReadLimit::Finite(256 * 1024 * 1024),
         max_mmap_len: ReadLimit::Finite(8 * 1024 * 1024 * 1024),
+        max_keyed_tail_bytes: ReadLimit::Finite(u64::MAX),
         trusted_api: false,
     };
     /// Finite companion to [`Self::STANDARD`] for input from untrusted
@@ -125,6 +134,7 @@ impl ReadLimits {
         max_index_bytes: ReadLimit::Finite(1024 * 1024 * 1024),
         max_scan_bytes: ReadLimit::Finite(16 * 1024 * 1024 * 1024),
         max_segments: ReadLimit::Finite(65_536),
+        max_keyed_tail_bytes: ReadLimit::Finite(256 * 1024 * 1024),
         ..Self::STANDARD
     };
 
@@ -146,6 +156,7 @@ impl ReadLimits {
             max_matrix_slot_region_len: value,
             max_sidecar_len: value,
             max_mmap_len: value,
+            max_keyed_tail_bytes: value,
             trusted_api: false,
         }
     }
@@ -187,6 +198,7 @@ impl ReadLimits {
         (with_max_matrix_slot_region_len, max_matrix_slot_region_len),
         (with_max_sidecar_len, max_sidecar_len),
         (with_max_mmap_len, max_mmap_len),
+        (with_max_keyed_tail_bytes, max_keyed_tail_bytes),
     }
 
     pub const fn tighten(self, runtime: Self) -> Self {
@@ -223,6 +235,9 @@ impl ReadLimits {
                 .tighten(runtime.max_matrix_slot_region_len),
             max_sidecar_len: self.max_sidecar_len.tighten(runtime.max_sidecar_len),
             max_mmap_len: self.max_mmap_len.tighten(runtime.max_mmap_len),
+            max_keyed_tail_bytes: self
+                .max_keyed_tail_bytes
+                .tighten(runtime.max_keyed_tail_bytes),
             trusted_api: false,
         }
     }
@@ -263,6 +278,9 @@ impl ReadLimits {
                 .overlay(runtime.max_matrix_slot_region_len),
             max_sidecar_len: self.max_sidecar_len.overlay(runtime.max_sidecar_len),
             max_mmap_len: self.max_mmap_len.overlay(runtime.max_mmap_len),
+            max_keyed_tail_bytes: self
+                .max_keyed_tail_bytes
+                .overlay(runtime.max_keyed_tail_bytes),
             trusted_api: false,
         }
     }
@@ -337,6 +355,7 @@ pub(crate) enum ReadLimitKey {
     MatrixMetadataBytes,
     MatrixSlotRegionLen,
     SidecarLen,
+    KeyedTailBytes,
     #[cfg(feature = "mmap")]
     MmapLen,
 }
@@ -359,6 +378,7 @@ impl ReadLimitKey {
             Self::MatrixMetadataBytes => "matrix metadata bytes",
             Self::MatrixSlotRegionLen => "matrix slot region length",
             Self::SidecarLen => "sidecar length",
+            Self::KeyedTailBytes => "keyed tail bytes",
             #[cfg(feature = "mmap")]
             Self::MmapLen => "mmap length",
         }
@@ -381,6 +401,7 @@ impl ReadLimitKey {
             Self::MatrixMetadataBytes => limits.max_matrix_metadata_bytes,
             Self::MatrixSlotRegionLen => limits.max_matrix_slot_region_len,
             Self::SidecarLen => limits.max_sidecar_len,
+            Self::KeyedTailBytes => limits.max_keyed_tail_bytes,
             #[cfg(feature = "mmap")]
             Self::MmapLen => limits.max_mmap_len,
         }

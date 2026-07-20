@@ -1,5 +1,10 @@
 # Security Hardening Validation
 
+> **Scope.** This is the validation record of one hardening pass at the baseline
+> commit below. Format versions stated here — including `VMAT` v1 — are those
+> current at that baseline. `docs/spec.md` is the authority for the shipped
+> layout.
+
 ## Baseline
 
 - Commit: `f7a9369`

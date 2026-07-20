@@ -128,7 +128,8 @@ let estimate = estimate_keyed_merge::<User, _>(
     &["delta-1.varve"],
 )?;
 // estimate.max_distinct_keys is an upper bound on K-ever;
-// estimate.max_state_bytes is the resident state that bound implies.
+// estimate.max_state_bytes is the structural size of the state that key count
+// implies; it is not a bound on the map.
 ```
 
 `estimate_keyed_merge` decodes no values, but it does open each input as a

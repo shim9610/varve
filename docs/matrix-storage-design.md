@@ -166,18 +166,18 @@ The matrix layout header stores:
   optional offset tables, slot regions, page index, region CRC table, and
   append-log start.
 
-All integers in `VMAT` metadata are little-endian in layout version 3. Matrix
+All integers in `VMAT` metadata are little-endian in layout version 4. Matrix
 slot payloads still use the block/format endian policy for canonical field
 encoding. The append-log scanner must start from `append_log_start`, never from
 the normal header length, when the static spec contains matrix blocks.
 
-## VMAT Version 3 Header
+## VMAT Version 4 Header
 
 The header is deliberately simple and dense-layout oriented:
 
 ```text
 magic                 [u8; 4] = b"VMAT"
-layout_version        u16 = 3
+layout_version        u16 = 4
 flags                 u16
 header_len            u32
 dimension_count       u32
@@ -218,36 +218,73 @@ table ranges that overlap incorrectly, point outside the file, or place
 P0 or `integrity: none` files set `region_crc_off = 0` and
 `region_crc_len = 0`. Static auxiliary regions, when declared by the format
 spec, are derived in declaration order immediately after the slot region. VMAT
-v3 does not store an auxiliary table; readers reconstruct aux offsets from the
+v4 does not store an auxiliary table; readers reconstruct aux offsets from the
 static `FormatSpec`, so changing aux names, byte lengths, or declaration order
 is a schema change.
 
 Layout version 2 replaced the version 1 integrity representation (see the next
-section), and layout version 3 added the page-index region. A version 1 or
-version 2 artifact is refused at open with the typed
-`Error::FormatVersionMismatch { expected: 3, actual: <1 or 2> }`, matching the
-container-version convention: such a file is stale and regenerable, never
+section), layout version 3 added the page-index region, and layout version 4
+replaced its encoding (see *Page Index* below). A version 1, 2, or 3 artifact is
+refused at open with the typed
+`Error::FormatVersionMismatch { expected: 4, actual: <1, 2, or 3> }`, matching
+the container-version convention: such a file is stale and regenerable, never
 migrated in place. The `MCRC` integrity table itself remains version 2.
 
 ### Page Index
 
 The page index is the bounded, persisted answer to "which bitmap pages does this
-file actually have data in". It holds one 8-byte entry per page that has been
-published with a set bit, appended the first time such a page is published, and
-encoded as `page + 1` so that a zero entry terminates the array. There is
-deliberately no count field: without one there is no torn-count failure mode, and
-the scan that reads it grows geometrically from a 64-byte request, so an empty
-index costs one small read no matter how wide the bitmap is.
+file have data in **right now**". The region is `(page_count + 1) * 8` bytes:
+slot `0` is an occupancy header, slots `1..=count` are entries, and each entry
+encodes `page + 1`.
 
-An entry is written *before* the page and digest it describes. A torn append can
-therefore leave an entry naming a page that still reads as uninitialised zeros —
-a state open already accepts — but never a written page with no entry.
+**Occupancy header, not a terminator.** Version 3 stored entries only and read
+them until it hit a zero or out-of-range value. That made damage and end-of-array
+indistinguishable: a single zeroed entry silently truncated enumeration and hid
+every page after it, with no finding produced, and cells in those pages read as
+`NotCommitted`. Version 4 derives the length from the header instead. The header
+packs the count into its low 48 bits and a value derived from that count into its
+high 16, so a torn or bit-flipped header is itself detected and reported. Because
+`check(0) == 0`, an all-zero region still decodes as a legitimately empty index,
+so creation writes no header and an empty index still costs one small read (the
+scan grows geometrically from a 64-byte request). A zero or out-of-range entry
+*inside* the counted prefix is now provable damage: it produces a `Fatal`
+`MatrixCorruptionKind::CommitMap` finding and the scan continues past it. Silence
+is not a possible outcome.
+
+This header is a redundancy code, not authentication. It detects accidental
+damage; it makes no claim against an actor who can rewrite the file, which is the
+same trust boundary the page-digest array records.
+
+**Live set, not history.** Version 3 never removed an entry, so both the array
+and its in-memory tracking grew with every page ever published and reopen visited
+all of them. Version 4 releases a page's entry when its final set bit clears, in
+`O(1)`: the vacated slot is overwritten with the array's last entry and the
+header count is decremented — two 8-byte writes, no scan. Resident and persisted
+cost therefore track live pages. The resident side is charged to
+`ReadLimitKey::MatrixBitmapBytes` alongside the payload pages, before the
+allocation is taken, under a documented conservative residency model.
+
+**Ordering.** An entry is written before the header that admits it, and both
+before the bitmap byte they describe. A torn write can therefore leave an entry
+naming a page that still reads as uninitialised zeros — a state open already
+accepts, costing one extra page read — but never a written page with no entry. A
+failed header write unwinds the in-memory mirror so the next attempt republishes
+the entry. Removal runs strictly *after* the bitmap byte that emptied the page is
+written, for the same reason: a superset is safe, a subset would hide data.
+
+**Cap.** The header can represent at most `2^48 - 1` entries, so a matrix whose
+page count would exceed that (about 1 EiB of bitmap) is refused at layout time
+with `InvalidMatrixLayout`.
 
 Open builds its visit set as the union of the index and, where the platform can
 answer, the pages the filesystem allocation map reports as written, enumerated by
 walking allocated *ranges* rather than pages. Neither term derives from the
 logical page count, and an unavailable or over-cap allocation map falls back to
-the index instead of treating every logical page as readable data. The page-digest
+the index instead of treating every logical page as readable data. The union is
+computed in one linear pass with a hash probe — `O(Q)` time and `Theta(Q)`
+temporary memory for `Q` candidates, with no sort — and the resulting list is
+deliberately unsorted, because page visits are independent and page loading is
+idempotent. The page-digest
 array is deliberately not mapped back into the visit set: one allocation granule
 spans thousands of 8-byte digest slots, which would reinstate a width-proportional
 count. The index covers torn commits instead.
@@ -346,17 +383,34 @@ allocated (`FSCTL_QUERY_ALLOCATED_RANGES` on Windows, `SEEK_DATA`/`SEEK_HOLE`
 elsewhere) and skips the ranges it reports as holes: a hole has never been
 written since creation, so it reads as zero and cannot hold stray bytes, and
 writing a stray byte into an untouched page necessarily allocates that page and
-brings it back into the read set. Detection strength is therefore unchanged
-while open costs `O(bytes actually written)`. The page digest of a skipped page
-is still read when the digest slot itself is allocated, so a digest recorded for
-a page whose bytes never reached disk stays detectable. Where the platform or
-filesystem cannot answer the query, or the file is fragmented past the tracked
-extent ceiling, every page is read exactly as before.
+brings it back into the read set. Detection strength is therefore unchanged.
+The page digest of a skipped page is still read when the digest slot itself is
+allocated, so a digest recorded for a page whose bytes never reached disk stays
+detectable.
 
-Clearing a whole commit category punches a hole over the map and its digests
-rather than writing zeros, so it restores the uninitialized encoding in `O(1)`
-writes, again falling back to explicit zeroing where hole punching is
-unavailable.
+The allocation map is a *secondary* source, and open's cost is not stated in
+terms of it. Open enumerates the union of the persisted page index and the
+allocation map in `O(Q)` time for `Q` candidate pages — the pages currently
+holding state plus any the map reports as written — independently of the logical
+matrix width and of how many pages the matrix has published historically. Where
+the platform or filesystem cannot answer the query, or the file is fragmented
+past the tracked extent ceiling, the allocation map is simply absent: the page
+index alone drives enumeration, which still costs `O(live pages)`, and the only
+loss is the ability to skip reading an indexed page the filesystem would have
+proved zero. Since layout version 3 there is no full-logical-scan fallback; any
+text describing one is stale.
+
+Clearing a whole commit category asks the filesystem to remove the byte ranges
+of the map, its page index, and its page digests rather than writing zeros, so
+where removal is available it restores the uninitialized encoding in `O(1)`
+writes. Removal is attempted on Windows (`FSCTL_SET_ZERO_DATA`) and Linux
+(`FALLOC_FL_PUNCH_HOLE`) only; on every other target, and whenever the call
+fails (for example on a filesystem without sparse-file support), the ranges are
+streamed as zero bytes and the clear costs `Theta(cells / 8)`. Every range
+request records its outcome, so a caller can prove which path it got by taking
+`MatrixRecoveryReport::matrix_total_zero_range_streamed_bytes()` before and
+after the clear, on the thread performing it: a nonzero delta means some range
+had to be streamed.
 
 One cost is deliberately unchanged: `rebuild_matrix_commit_from_crc` remains
 `O(cells)` with two reads per cell, which is inherent to rebuilding from
@@ -404,7 +458,7 @@ increasing `layout_version`; v2 keeps CRC offsets derived from table order.
 P0 includes dense matrix declarations, runtime dimensions, `VMAT` layout
 persistence, fixed-stride slots, direct addressing, commit maps, same-size
 overwrite, `NotCommitted`, and mixed matrix plus append-log scan behavior.
-In VMAT v3, a cell commit category belongs to exactly one matrix block.
+In VMAT v4, a cell commit category belongs to exactly one matrix block.
 
 P0 excludes recovery decisions, sidecars, compression, zero-copy, sparse or
 offset-table-backed matrices, declarative migration, and per-cell crash
@@ -540,7 +594,7 @@ Opening a matrix file creates a snapshot of layout metadata and commit maps.
 It does not copy the preallocated slot region. Applications must not overlap a
 reader with an in-place write to a slot that reader may access. True immutable
 concurrent snapshots require versioned slots/generations or a read-lease design
-outside VMAT v3.
+outside VMAT v4.
 Reading a cell:
 
 1. validates the key

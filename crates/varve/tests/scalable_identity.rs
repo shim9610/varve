@@ -318,6 +318,50 @@ fn stream_state_sidecar_refuses_a_rewritten_primary() -> Result<()> {
     Ok(())
 }
 
+/// F-09, consumer half. Sidecar publication cannot be made atomic against a
+/// process that replaces the primary *pathname* without taking the writer lock,
+/// so the library narrows the interval and retires a sidecar it published for a
+/// replaced primary. What keeps that a rebuild-cost problem rather than a
+/// wrong-data problem is this: a sidecar whose primary was swapped wholesale for
+/// a different file object is refused by consumers on identity, before any
+/// indexed lookup can be answered from it.
+///
+/// The existing rewrite tests replace a primary's *contents* in place, keeping
+/// the OS object. This one replaces the object itself, which is the shape a
+/// pathname mutator produces.
+#[test]
+fn stream_state_sidecar_refuses_a_wholesale_primary_replacement() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let first = directory.path().join("swap-first.varve");
+    let second = directory.path().join("swap-second.varve");
+    let options = varve::StreamOptions::default();
+
+    for (path, keys) in [(&first, [1u64, 2u64]), (&second, [3, 4])] {
+        let mut writer = VarveStreamWriter::create(stream_spec(), path, options)?;
+        for key in keys {
+            writer.push_info(&item(key, "fixed-width-value"))?;
+        }
+        writer.sync()?;
+    }
+
+    // The whole file object behind the pathname is replaced; the state sidecar
+    // published for the original object stays where it was.
+    fs::rename(&second, &first)?;
+
+    match VarveStreamWriter::open(stream_spec(), &first, options) {
+        Err(Error::DiskIndex(error)) => assert!(
+            matches!(*error, varve::DiskIndexError::IdentityMismatch)
+                || matches!(*error, varve::DiskIndexError::PrimaryGenerationMismatch),
+            "unexpected sidecar rejection: {error:?}"
+        ),
+        other => panic!(
+            "a sidecar for a replaced primary was accepted: {:?}",
+            other.err()
+        ),
+    }
+    Ok(())
+}
+
 /// The residual half of STO-01 an adversarial re-verification found: a
 /// generation witness computed over a bounded leading window only separates two
 /// primaries that diverge *inside* that window.

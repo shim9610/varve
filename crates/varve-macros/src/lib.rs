@@ -30,7 +30,7 @@ use syn::{
 /// wire identity that lets readers skip unknown fields. `fixed` blocks are
 /// positional and take no field ids.
 ///
-/// ```ignore
+/// ```no_run
 /// #[derive(Clone, Debug, PartialEq, varve::VarveBlock)]
 /// #[varve(id = 2, version = 1, kind = "variable", key = "id")]
 /// struct User {
@@ -83,12 +83,23 @@ pub fn derive_varve_block(input: TokenStream) -> TokenStream {
 /// the declaration is the single source of truth for the on-disk contract and
 /// for the Rust API that reads and writes it.
 ///
-/// ```ignore
+/// ```no_run
 /// varve::varve_format! {
 ///     pub format AppFormat {
 ///         magic: b"APPF";
 ///         version: 1;
-///         limits { /* file_len, records, record_payload, … */ }
+///         limits {
+///             file_len: 8_589_934_592;
+///             records: 4_000_000;
+///             index_bytes: 536_870_912;
+///             scan_bytes: 8_589_934_592;
+///             record_payload: 67_108_864;
+///             logical_payload: 268_435_456;
+///             materialized_bytes: 1_073_741_824;
+///             segments: 4_000_000;
+///             sidecar: 268_435_456;
+///             mmap: 8_589_934_592;
+///         }
 ///         endian: little;
 ///         schema_hash: computed;
 ///         extension: "appf";
@@ -98,6 +109,11 @@ pub fn derive_varve_block(input: TokenStream) -> TokenStream {
 ///         }
 ///     }
 /// }
+///
+/// # fn main() {
+/// let spec = AppFormat::spec();
+/// assert_eq!(spec.magic, *b"APPF");
+/// # }
 /// ```
 ///
 /// # Sections
@@ -1394,6 +1410,7 @@ const READ_LIMIT_KEYS: &[&str] = &[
     "matrix_slot_region",
     "sidecar",
     "mmap",
+    "keyed_tail",
 ];
 
 fn parse_read_limits(input: ParseStream<'_>) -> Result<Vec<LimitEntry>> {
@@ -2175,7 +2192,10 @@ fn validate_matrix_format(
             if !matrix_field_is_fixed_width(&field.ty) {
                 return Err(syn::Error::new_spanned(
                     &field.name,
-                    "P0 matrix fields must be fixed-width scalar or fixed-array types",
+                    "P0 matrix fields must be a named type (or an array of one) whose \
+                     codec has a fixed encoded width; references, raw pointers, slices, \
+                     tuples, trait objects, `impl Trait` and function pointers can never \
+                     occupy a matrix slot",
                 ));
             }
         }
@@ -2183,45 +2203,41 @@ fn validate_matrix_format(
     Ok(())
 }
 
-/// Syntactic pre-filter for matrix field types (API-04).
+/// Permissive syntactic shape check for matrix field types (API-04, F-10).
 ///
-/// A matrix slot needs a stride the compiler knows, so only types whose encoded
-/// width is fixed by the type itself can occupy one. This check exists to
-/// produce a readable diagnostic pointing at the offending field; it is *not*
-/// the authority on the classification, because a source identifier is not a
-/// type: a user type spelled `u32` reaches this list too. The authority is the
-/// generated `SLOT_STRIDE`, which resolves each element type's
-/// `VarveEncode::WIRE_TYPE` and fails to compile for anything without a fixed
-/// encoded width — see [`matrix_slot_stride_tokens`].
+/// A matrix slot needs a stride the compiler knows. Deciding *which* types have
+/// one is a question about types, and a proc macro sees only spellings, so this
+/// function deliberately does **not** answer it. It rejects exactly the source
+/// shapes that can never denote a `VarveEncode` type with a fixed encoded width
+/// no matter what they resolve to — references, raw pointers, slices, tuples,
+/// trait objects, `impl Trait`, function pointers, `dyn`/`!`/`_` and macro
+/// invocations — and admits every named path plus arrays of an admitted
+/// element.
 ///
-/// `PackedBitmap` is deliberately absent. The built-in owns a `Vec<u8>` and
-/// encodes a `bit_len` plus a variable byte string, so it has no fixed encoded
-/// width; the previous entry matched on the *spelling* alone, which both
-/// admitted the built-in with a stride taken from `size_of` (its Rust object
-/// size, not its encoded width) and silently admitted any user type that
-/// happened to share the name. It remains usable as an ordinary variable field,
-/// where it now carries a non-zero codec identity.
+/// The authority on the classification is the generated `SLOT_STRIDE`, which
+/// resolves each element type's `VarveEncode::WIRE_TYPE` and fails to compile
+/// for anything without a fixed encoded width — see
+/// [`matrix_slot_stride_tokens`].
+///
+/// The previous revision whitelisted the literal primitive spellings
+/// (`"u32"`, `"f64"`, …). That made a *spelling* authoritative over a *type*
+/// in both directions: `type Word = u32;` was rejected even though the alias
+/// resolves to a perfectly good 4-byte slot (contradicting
+/// `docs/api-reference.md`), while a user struct named `u32` in scope would
+/// have been waved through to the const check anyway. Only the const check can
+/// tell those apart, so only the const check decides. `PackedBitmap` — built-in
+/// or user-defined — now fails there rather than here: the built-in owns a
+/// `Vec<u8>` and encodes a `bit_len` plus a variable byte string, so it has no
+/// fixed encoded width, and a same-named user type has no `VarveEncode` impl at
+/// all. It remains usable as an ordinary variable field.
 fn matrix_field_is_fixed_width(ty: &Type) -> bool {
     match ty {
-        Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
-            matches!(
-                segment.ident.to_string().as_str(),
-                "bool"
-                    | "u8"
-                    | "i8"
-                    | "u16"
-                    | "i16"
-                    | "u32"
-                    | "i32"
-                    | "u64"
-                    | "i64"
-                    | "u128"
-                    | "i128"
-                    | "f32"
-                    | "f64"
-            )
-        }),
+        // A named path may be a primitive, an alias for one, or a user type
+        // with a fixed-width codec. `SLOT_STRIDE` decides.
+        Type::Path(_) => true,
         Type::Array(array) => matrix_field_is_fixed_width(&array.elem),
+        Type::Group(group) => matrix_field_is_fixed_width(&group.elem),
+        Type::Paren(paren) => matrix_field_is_fixed_width(&paren.elem),
         _ => false,
     }
 }
@@ -5683,6 +5699,10 @@ fn writer_methods(block: &InlineBlock) -> Vec<TokenStream2> {
                 ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
                     let key = <#ty as ::varve::__core::VarveKeyedBlock>::key(value);
                     let prev = self.#tails.get(&key).copied();
+                    // API3-01/API3-02: reserve and charge the tail slot before
+                    // the append, so the post-append insert cannot allocate
+                    // and cannot fail after the record is authoritative.
+                    self.inner.reserve_keyed_tail_slot(&mut self.#tails, &key)?;
                     let info = self.inner.push_with_prev_key_info(value, prev)?;
                     self.#tails.insert(key, info.record_offset);
                     ::core::result::Result::Ok(info)
@@ -5694,6 +5714,8 @@ fn writer_methods(block: &InlineBlock) -> Vec<TokenStream2> {
                     key: &<#ty as ::varve::__core::VarveKeyedBlock>::Key,
                 ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
                     let prev = self.#tails.get(key).copied();
+                    // API3-01/API3-02: see the push path.
+                    self.inner.reserve_keyed_tail_slot(&mut self.#tails, key)?;
                     let info = self.inner.delete_with_prev_key_info::<#ty>(key, prev)?;
                     self.#tails.insert(key.clone(), info.record_offset);
                     ::core::result::Result::Ok(info)
@@ -5781,6 +5803,10 @@ fn writer_trait_impl_methods(block: &InlineBlock) -> Vec<TokenStream2> {
                 ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
                     let key = <#ty as ::varve::__core::VarveKeyedBlock>::key(value);
                     let prev = self.#tails.get(&key).copied();
+                    // API3-01/API3-02: reserve and charge the tail slot before
+                    // the append, so the post-append insert cannot allocate
+                    // and cannot fail after the record is authoritative.
+                    self.inner.reserve_keyed_tail_slot(&mut self.#tails, &key)?;
                     let info = self.inner.push_with_prev_key_info(value, prev)?;
                     self.#tails.insert(key, info.record_offset);
                     ::core::result::Result::Ok(info)
@@ -5792,6 +5818,8 @@ fn writer_trait_impl_methods(block: &InlineBlock) -> Vec<TokenStream2> {
                     key: &<#ty as ::varve::__core::VarveKeyedBlock>::Key,
                 ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
                     let prev = self.#tails.get(key).copied();
+                    // API3-01/API3-02: see the push path.
+                    self.inner.reserve_keyed_tail_slot(&mut self.#tails, key)?;
                     let info = self.inner.delete_with_prev_key_info::<#ty>(key, prev)?;
                     self.#tails.insert(key.clone(), info.record_offset);
                     ::core::result::Result::Ok(info)
@@ -5910,6 +5938,7 @@ fn read_limits_tokens(choice: LimitsChoice) -> TokenStream2 {
                     "matrix_slot_region" => format_ident!("with_max_matrix_slot_region_len"),
                     "sidecar" => format_ident!("with_max_sidecar_len"),
                     "mmap" => format_ident!("with_max_mmap_len"),
+                    "keyed_tail" => format_ident!("with_max_keyed_tail_bytes"),
                     _ => unreachable!("read limit keys are validated while parsing"),
                 };
                 let value = entry.value;

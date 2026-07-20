@@ -73,6 +73,21 @@ impl DiskIndexRebuildReport {
 /// [`Error::PublishedButParentSyncPending`] means the rebuilt sidecar was
 /// already published at its pathname and only the parent-directory entry's
 /// durability is unconfirmed; the published sidecar is preserved.
+///
+/// # Non-cooperating writers (F-09)
+///
+/// Cooperating writers are serialized by the writer lock this call holds. A
+/// process that replaces the primary *pathname* without taking that lock is
+/// outside the contract, and no userspace library can make a rebuild atomic
+/// against it. The rebuild bounds what such a writer can cause: the primary's
+/// identity is verified immediately before publication, the verified object is
+/// held open across it so its identity cannot be recycled, and the identity is
+/// re-checked once the sidecar is visible. If the replacement landed inside
+/// that interval the rebuilt sidecar is removed again and the call fails with
+/// `DiskIndexError::IdentityMismatch` — or, if the stale sidecar could not be
+/// removed, with a `DiskIndexError::CheckpointMismatch` naming what must be
+/// deleted. The residual cost is a rebuild the caller must repeat, never a
+/// sidecar a consumer would accept for the wrong primary.
 pub fn rebuild_disk_index(
     spec: FormatSpec,
     path: impl AsRef<Path>,
@@ -1290,11 +1305,15 @@ where
     // while the rebuild scans its retained snapshot. Re-resolve the pathname
     // just before publication and refuse to publish a sidecar for a primary
     // object the scan never observed.
+    // F-09: the verified primary is held open across publication. It excludes
+    // nothing a `WriterLock` does not already exclude, but it does stop the
+    // operating system from handing the scanned object's identity to a
+    // different file while the sidecar is published, so the post-publication
+    // re-check below cannot be fooled by an identity that was recycled.
     let current = SnapshotFile::new(fs::File::open(native_path)?)?;
     if primary_identity(spec, &current)? != identity {
         return Err(index_error(DiskIndexError::IdentityMismatch));
     }
-    drop(current);
     // Drop the process-local shared-database entry for the file being
     // replaced so no later open can upgrade a database backed by the old
     // file object, even if the OS reuses its native identity.
@@ -1302,7 +1321,37 @@ where
     // DUR2-01: publication takes ownership of the temp guard so an
     // indeterminate outcome preserves the replacement for out-of-band
     // reconciliation instead of the guard blind-deleting it by pathname.
-    match publish_temp_path_atomically(temporary, &path)? {
+    let durability = publish_temp_path_atomically(temporary, &path)?;
+    #[cfg(test)]
+    crate::stream::interpose_after_state_publication(native_path);
+    // F-09: publication is not one syscall with the identity check above. If
+    // the primary was replaced in between, the sidecar now at `path` was built
+    // for a file object the pathname no longer names, and leaving it there
+    // would displace whatever newer sidecar arrived with the replacement.
+    // Retire it and report a typed mismatch.
+    //
+    // Neither step below may become a bare `Err` on its own: the sidecar is
+    // already published, so a primary that cannot be re-read is resolved
+    // *against* publication (fail closed, retire the sidecar) instead of
+    // surfacing as a plain IO error that leaves the caller unable to tell what
+    // is on disk.
+    let published_identity = fs::File::open(&path)
+        .ok()
+        .and_then(|file| crate::file::opened_file_identity(&file).ok());
+    let republished = fs::File::open(native_path)
+        .ok()
+        .and_then(|file| SnapshotFile::new(file).ok())
+        .and_then(|snapshot| primary_identity(spec, &snapshot).ok());
+    if republished.as_ref() != Some(&identity) {
+        return Err(index_error(
+            crate::stream::retire_sidecar_for_replaced_primary(
+                &path,
+                published_identity.as_deref(),
+            ),
+        ));
+    }
+    drop(current);
+    match durability {
         ReplaceDurability::Durable => {}
         ReplaceDurability::ParentSyncPending(sync_error) => {
             // The rebuilt sidecar is already visible at `path`; only the
@@ -1961,6 +2010,59 @@ mod tests {
         assert_eq!(
             store.read_metadata().map_err(index_error)?.state,
             DiskIndexState::Dirty
+        );
+        Ok(())
+    }
+
+    /// F-09, rebuild half. Same contract as the stream bootstrap test: a
+    /// primary replaced between the pre-publication identity check and the
+    /// sidecar becoming visible must produce a typed mismatch, and the sidecar
+    /// this call published must not be left standing in place of whatever
+    /// sidecar the replacement generation brought with it.
+    #[test]
+    fn rebuild_retires_a_sidecar_published_for_a_replaced_primary() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("replaced-rebuild.varve");
+        let replacement = directory.path().join("rebuild-replacement.varve");
+        let options = DiskIndexOptions::default();
+        for (target, key) in [(&path, 1u64), (&replacement, 2)] {
+            let mut writer = VarveIndexedWriter::create(spec(), target, options, index_plan())?;
+            writer.push_info(&Item {
+                key,
+                value: format!("value-{key}"),
+            })?;
+            writer.sync()?;
+        }
+        fs::remove_file(sidecar_path(&path))?;
+        fs::remove_file(sidecar_path(&replacement))?;
+
+        let swapped = path.clone();
+        let source = replacement.clone();
+        let interposed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = std::sync::Arc::clone(&interposed);
+        crate::stream::set_publication_interposition(
+            &fs::canonicalize(&path)?,
+            Box::new(move || {
+                assert!(
+                    sidecar_path(&swapped).exists(),
+                    "the interposition must run after the sidecar is published",
+                );
+                fs::rename(&source, &swapped).expect("replace the primary during publication");
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+
+        match rebuild_disk_index(spec(), &path, options, index_plan()) {
+            Err(Error::DiskIndex(error)) if matches!(*error, DiskIndexError::IdentityMismatch) => {}
+            other => panic!("expected a typed identity mismatch, got {other:?}"),
+        }
+        assert!(
+            interposed.load(std::sync::atomic::Ordering::SeqCst),
+            "the swap never reached the publication interval under test",
+        );
+        assert!(
+            !sidecar_path(&path).exists(),
+            "a sidecar published for a replaced primary must not be left behind",
         );
         Ok(())
     }
