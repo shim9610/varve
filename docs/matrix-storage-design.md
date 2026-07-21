@@ -255,6 +255,39 @@ This header is a redundancy code, not authentication. It detects accidental
 damage; it makes no claim against an actor who can rewrite the file, which is the
 same trust boundary the page-digest array records.
 
+**Whole-map republication publishes a generation, it does not edit one.** A
+commit-map rebuild (`rebuild_matrix_commit_from_crc`) replaces every entry in
+the region. Emptying it and refilling it in place would leave an interruption
+holding a *valid but short* occupancy count, which reads exactly like "those
+pages were never published": pages the rebuild had not reached would never be
+visited, their cells would reopen as `NotCommitted`, and no finding would be
+produced. So the rebuild instead
+
+1. writes the reserved value `u64::MAX` into the occupancy-header slot and
+   `sync_data`s that single slot **before** anything is destroyed;
+2. clears and refills only the *entry* region — the header goes on naming a
+   rebuild in progress for the whole of it;
+3. makes every entry, digest and page byte durable;
+4. writes the real occupancy count last. That write *is* the publication of the
+   new generation.
+
+An interruption anywhere in 1–4 therefore leaves the marker on disk, and open
+refuses it with a `Fatal` `MatrixCorruptionKind::CommitMap` finding whose
+recovery report recommends `RebuildCommitMap`: reopen fails closed and names
+its own way out, never reading a short index as authoritative.
+
+This needs **no layout-version bump**. `u64::MAX` is not a resting state and is
+provably not a representable occupancy count at any capacity, so a reader that
+predates the marker rejects it as a damaged header — also fail-closed. `VMAT`
+stays at version 4.
+
+Because the recommended recovery is reached through a fatal finding, and fatal
+findings are fail-closed by default, running it requires reopening with
+`FormatSpec::with_matrix_fatal_forensics()`. If the rebuild itself fails after
+step 1, the layout stays fail-closed for the rest of that session — the
+in-memory index mirror describes the old generation — and the recovery is to
+reopen with forensics and rebuild again.
+
 **Live set, not history.** Version 3 never removed an entry, so both the array
 and its in-memory tracking grew with every page ever published and reopen visited
 all of them. Version 4 releases a page's entry when its final set bit clears, in

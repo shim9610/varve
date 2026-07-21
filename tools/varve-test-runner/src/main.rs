@@ -56,11 +56,16 @@ fn run() -> io::Result<ExitCode> {
         eprintln!("Varve test artifact cleanup: verified empty");
         Ok(ExitCode::SUCCESS)
     } else {
-        let retained = session.preserve();
-        eprintln!(
-            "Varve test artifacts retained after failure: {}",
-            retained.display()
-        );
+        match session.preserve() {
+            Some(retained) => eprintln!(
+                "Varve test artifacts retained after failure: {}",
+                retained.display()
+            ),
+            None => eprintln!(
+                "Varve test artifact cleanup: the failed session produced no artifacts, \
+                 so nothing was retained"
+            ),
+        }
         Ok(ExitCode::from(
             status
                 .code()
@@ -173,19 +178,56 @@ impl TestSession {
         cleanup_owned_session(&root)
     }
 
-    fn preserve(mut self) -> PathBuf {
-        self.root.take().expect("active test session")
+    /// Gives up ownership of a failed session so it survives for diagnosis.
+    ///
+    /// F-10: retention exists to preserve *evidence*. A session that produced
+    /// no artifacts has none, so an empty one is removed and `None` is
+    /// returned rather than leaving an empty `varve-test-session-*` directory
+    /// in the user's temp directory forever. That residue was the only way the
+    /// documented "a successful test leaves no session path" policy failed to
+    /// be literally true: a failed or interrupted run, or a directly executed
+    /// test binary in this crate, deposited a zero-byte directory that no
+    /// later run ever collects.
+    ///
+    /// Removal is best effort. If it cannot be proved to have happened the
+    /// path is retained, because losing a directory that might hold evidence
+    /// is the worse error.
+    fn preserve(mut self) -> Option<PathBuf> {
+        let root = self.root.take().expect("active test session");
+        if is_empty_directory(&root) && cleanup_owned_session(&root).is_ok() {
+            return None;
+        }
+        Some(root)
     }
 }
 
 impl Drop for TestSession {
     fn drop(&mut self) {
-        if let Some(root) = &self.root {
-            eprintln!(
-                "Varve test artifacts retained because the runner did not complete: {}",
-                root.display()
-            );
+        let Some(root) = self.root.take() else {
+            return;
+        };
+        // F-10: the same rule as `preserve`, applied to every path that leaves
+        // this scope without calling either method - a `?` in `run`, a panic,
+        // or a failing assertion in this crate's own unit tests, which create
+        // real sessions in the real temp directory.
+        if is_empty_directory(&root) && cleanup_owned_session(&root).is_ok() {
+            return;
         }
+        eprintln!(
+            "Varve test artifacts retained because the runner did not complete: {}",
+            root.display()
+        );
+    }
+}
+
+/// Whether `root` is a directory that contains nothing at all.
+///
+/// A read error answers `false`: an unreadable directory is exactly the case
+/// where removing it is not justified.
+fn is_empty_directory(root: &Path) -> bool {
+    match fs::read_dir(root) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(_) => false,
     }
 }
 
@@ -260,9 +302,50 @@ mod tests {
     fn failed_session_can_be_preserved_for_diagnosis() -> io::Result<()> {
         let session = TestSession::create()?;
         fs::write(session.path().join("failure.bin"), b"evidence")?;
-        let retained = session.preserve();
+        let retained = session.preserve().expect("evidence must be retained");
         assert!(retained.join("failure.bin").is_file());
         cleanup_owned_session(&retained)
+    }
+
+    /// F-10: an empty session is not evidence, and leaving it behind is the
+    /// only way a run that touched nothing can violate the documented
+    /// "a successful test leaves no session path" policy.
+    #[test]
+    fn a_failed_session_that_produced_nothing_is_not_retained() -> io::Result<()> {
+        let session = TestSession::create()?;
+        let path = session.path().to_path_buf();
+        assert!(
+            session.preserve().is_none(),
+            "an empty session is not evidence"
+        );
+        assert!(!path.exists(), "the empty session path must be gone");
+        Ok(())
+    }
+
+    /// The same rule on the path that calls neither `cleanup` nor `preserve`:
+    /// an early `?`, a panic, or a directly executed test binary in this
+    /// crate.
+    #[test]
+    fn dropping_an_untouched_session_removes_it() -> io::Result<()> {
+        let session = TestSession::create()?;
+        let path = session.path().to_path_buf();
+        drop(session);
+        assert!(!path.exists(), "an empty dropped session must be removed");
+        Ok(())
+    }
+
+    /// ... but a drop must never destroy artifacts, however it was reached.
+    #[test]
+    fn dropping_a_session_with_artifacts_retains_it() -> io::Result<()> {
+        let session = TestSession::create()?;
+        let path = session.path().to_path_buf();
+        fs::write(path.join("evidence.bin"), b"evidence")?;
+        drop(session);
+        assert!(
+            path.join("evidence.bin").is_file(),
+            "drop must not destroy diagnostic artifacts"
+        );
+        cleanup_owned_session(&path)
     }
 
     #[test]

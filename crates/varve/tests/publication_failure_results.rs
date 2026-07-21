@@ -24,11 +24,12 @@ mod enabled {
     use std::sync::{Mutex, MutexGuard};
 
     use varve::{
-        BatchOptions, BlockDescriptor, BlockKind, Decoder, DiskIndexBatchOptions, DiskIndexOptions,
-        DiskIndexPlan, DiskIndexedBlock, Encoder, Endian, Error, FormatSpec, IndexPolicy,
-        IntegrityPolicy, ManifestPolicy, ReadLimits, RecoveryPolicy, Result, StreamOptions,
-        VarveBlock, VarveDecode, VarveEncode, VarveFile, VarveIndexedReader, VarveIndexedWriter,
-        VarveKeyedBlock, VarveStreamReader, VarveStreamWriter, WireType, disk_index_sidecar_path,
+        BatchOptions, BlockDescriptor, BlockKind, CommitPolicy, Decoder, DiskIndexBatchOptions,
+        DiskIndexOptions, DiskIndexPlan, DiskIndexedBlock, Encoder, Endian, Error, FormatSpec,
+        IndexPolicy, IntegrityPolicy, ManifestPolicy, ReadLimits, RecoveryPolicy, Result,
+        StreamOptions, TransactionMarkerMode, VarveBlock, VarveDecode, VarveEncode, VarveFile,
+        VarveIndexedReader, VarveIndexedWriter, VarveKeyedBlock, VarveStreamReader,
+        VarveStreamWriter, WireType, disk_index_sidecar_path,
     };
 
     /// The injected-failure counters are process-global, so any test in this
@@ -197,6 +198,63 @@ mod enabled {
             VarveStreamWriter::restore_checkpoint_and_open(stream_spec(), path, stream_options())?;
         drop(writer);
         read_stream(path)
+    }
+
+    /// A resident format whose commit marker is written only by an explicit
+    /// `commit_durable`, so the post-marker durability step is the only thing
+    /// under test.
+    fn durable_commit_spec() -> FormatSpec {
+        spec(b"VPFCMT", IndexPolicy::BlockOffsetChain).with_commit_policy(
+            CommitPolicy::TransactionMarker(TransactionMarkerMode::Explicit),
+        )
+    }
+
+    // --- round 10, invariant 3: the commit marker is the authoritative commit,
+    // so a durability failure *after* it must be a typed published outcome. A
+    // bare `Err` entitles the caller to believe nothing happened and re-run the
+    // transaction, appending a second marker for work already recorded.
+
+    #[test]
+    fn a_durability_failure_after_the_commit_marker_is_reported_as_published() -> Result<()> {
+        let _gate = fault_gate();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("commit-durability.varve");
+
+        let mut writer = VarveFile::create(durable_commit_spec(), &path)?;
+        writer.push_info(&FaultRecord::ok(7))?;
+
+        VarveFile::inject_commit_durability_failures(1);
+        let sequence = match writer.commit_durable() {
+            Err(Error::CommittedButDurabilityUnproven { sequence, .. }) => sequence,
+            other => panic!(
+                "expected CommittedButDurabilityUnproven, got {:?}",
+                other.map(|info| info.sequence)
+            ),
+        };
+        VarveFile::inject_commit_durability_failures(0);
+
+        // The claim the variant makes must be true: the marker is in the file.
+        // Retrying `sync` alone - the documented response - now succeeds, and
+        // no second marker is appended, because the transaction is already
+        // committed.
+        writer.sync()?;
+        let repeat = writer.commit_durable()?;
+        assert_eq!(
+            repeat.sequence, sequence,
+            "the marker was already committed, so a repeat commit must return the same record \
+             rather than appending a second marker"
+        );
+        drop(writer);
+
+        let reader = VarveFile::open(durable_commit_spec(), &path)?;
+        let committed = reader.blocks::<FaultRecord>()?;
+        assert_eq!(
+            committed.len(),
+            1,
+            "the committed record must be visible to a reader after a clean exit"
+        );
+        assert_eq!(committed.get(0)?, Some(FaultRecord::ok(7)));
+        Ok(())
     }
 
     // --- publication already happened: the caller must see the pending state.
@@ -405,6 +463,114 @@ mod enabled {
         assert_eq!(reader.get::<FaultRecord>(&0)?, Some(FaultRecord::ok(0)));
         assert_eq!(reader.get::<FaultRecord>(&1)?, Some(FaultRecord::ok(1)));
         assert_eq!(reader.get::<FaultRecord>(&3)?, None);
+        Ok(())
+    }
+
+    // --- round 11, invariant 3: the native chunk write is the authoritative
+    // commit for a prepared chunk, so *every* fallible sidecar step after it
+    // must be a typed published outcome. The primary-generation restamp inside
+    // the chunk commit used to return a bare `Err`, which entitles the caller
+    // to believe nothing happened and re-append the same records.
+
+    /// The single-record stream path: `push_info` -> `append_prepared_chunk`
+    /// -> `commit_state_chunk`. The restamp runs after the record is in the
+    /// file.
+    #[test]
+    fn a_restamp_failure_after_a_published_stream_chunk_is_reported_as_published() -> Result<()> {
+        let _gate = fault_gate();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("stream-restamp.varve");
+        let mut writer = VarveStreamWriter::create(stream_spec(), &path, stream_options())?;
+
+        // `disk_options` commits a sidecar chunk every four records, so the
+        // fourth append is the one that reaches the restamp.
+        let mut last = writer.push_info(&FaultRecord::ok(0))?;
+        for key in 1..3 {
+            last = writer.push_info(&FaultRecord::ok(key))?;
+        }
+        let published_len = std::fs::metadata(&path)?.len();
+
+        VarveStreamWriter::inject_generation_restamp_failures(1);
+        let error = writer
+            .push_info(&FaultRecord::ok(3))
+            .expect_err("the armed restamp failure must not be reported as success");
+        VarveStreamWriter::inject_generation_restamp_failures(0);
+
+        match error {
+            Error::PublishedButIndexStale { sequence, .. } => assert!(
+                sequence > last.sequence,
+                "the reported sequence must name the record this call published, got {sequence} \
+                 after {}",
+                last.sequence
+            ),
+            other => panic!(
+                "a sidecar failure after the record was published must be typed, got {other:?}"
+            ),
+        }
+
+        // The claim the variant makes must be true: the record really is in
+        // the native file, which is why the call is not retryable.
+        assert!(
+            std::fs::metadata(&path)?.len() > published_len,
+            "the record whose failure was reported as published must be in the file"
+        );
+        assert!(
+            matches!(writer.flush(), Err(Error::WriterPoisoned("stream"))),
+            "a published-but-unindexed record must poison the writer so the caller cannot \
+             silently append it twice"
+        );
+        assert!(matches!(
+            writer.push_info(&FaultRecord::ok(4)),
+            Err(Error::WriterPoisoned("stream"))
+        ));
+        Ok(())
+    }
+
+    /// The indexed batch path: `push_iter` -> `publish_prepared_chunk` ->
+    /// `commit_pending_batch`. The single-record indexed path already wrapped
+    /// this call; the batch path did not.
+    #[test]
+    fn a_restamp_failure_after_a_published_indexed_chunk_is_reported_as_published() -> Result<()> {
+        let _gate = fault_gate();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("indexed-restamp.varve");
+        let mut writer =
+            VarveIndexedWriter::create(indexed_spec(), &path, disk_options(), index_plan())?;
+        let published_len = std::fs::metadata(&path)?.len();
+
+        VarveStreamWriter::inject_generation_restamp_failures(1);
+        let error = writer
+            .push_iter::<FaultRecord, _>(
+                vec![FaultRecord::ok(0), FaultRecord::ok(1)],
+                one_record_chunks(),
+            )
+            .expect_err("the armed restamp failure must not be reported as success");
+        VarveStreamWriter::inject_generation_restamp_failures(0);
+
+        assert!(
+            matches!(error.source, Error::PublishedButIndexStale { .. }),
+            "a sidecar failure after the chunk was published must be typed, got {:?}",
+            error.source
+        );
+        // The summary is derived before the native write and assigned after
+        // it, so it reports the chunk that reached the file even on the
+        // failing path.
+        assert_eq!(
+            error.written.records, 1,
+            "the published chunk must be reported to the caller"
+        );
+        assert!(
+            std::fs::metadata(&path)?.len() > published_len,
+            "the chunk whose failure was reported as published must be in the file"
+        );
+        assert!(matches!(
+            writer.flush(),
+            Err(Error::WriterPoisoned("indexed"))
+        ));
+        assert!(matches!(
+            writer.push_info(&FaultRecord::ok(2)),
+            Err(Error::WriterPoisoned("indexed"))
+        ));
         Ok(())
     }
 

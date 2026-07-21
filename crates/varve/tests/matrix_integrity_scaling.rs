@@ -17,9 +17,10 @@ use std::path::Path;
 
 use varve::{
     BlockDescriptor, BlockKind, Endian, Error, FormatSpec, IndexPolicy, IntegrityPolicy,
-    MatrixBlockDescriptor, MatrixCommitDescriptor, MatrixCommitKind, MatrixCorruptionKind,
-    MatrixCorruptionSeverity, MatrixDimensionDescriptor, MatrixDimensions, MatrixKey,
-    MatrixRecoveryReport, ReadLimits, VarveBlock, VarveMatrixBlock,
+    MatrixBlockDescriptor, MatrixCellStatus, MatrixCommitDescriptor, MatrixCommitKind,
+    MatrixCorruptionKind, MatrixCorruptionSeverity, MatrixDimensionDescriptor, MatrixDimensions,
+    MatrixKey, MatrixRecoveryAction, MatrixRecoveryReport, ReadLimits, VarveBlock,
+    VarveMatrixBlock,
 };
 
 /// Commit-map page size used by the paged integrity representation.
@@ -1274,5 +1275,371 @@ fn version_three_page_index_artifact_is_rejected_typed() -> varve::Result<()> {
             actual: 3
         }) if expected == VMAT_VERSION
     ));
+    Ok(())
+}
+
+// F-02: interrupted whole-map page-index republication ----------------------
+
+/// 66_560 cells: a commit map of 8_320 bytes, i.e. exactly three 4 KiB pages,
+/// so a rebuild has three page-index entries to republish. Deliberately the
+/// smallest matrix that spans three pages: a CRC rebuild reads every cell, so a
+/// wider fixture buys nothing and costs a full extra scan per interruption.
+const REBUILD_SCANS: u64 = 520;
+
+/// Environment handshake for the child half of the process-interruption test.
+const REBUILD_CHILD_ENV: &str = "VARVE_MATRIX_REBUILD_CHILD";
+const REBUILD_STAGE_ENV: &str = "VARVE_MATRIX_REBUILD_STAGE";
+const REBUILD_PATH_ENV: &str = "VARVE_MATRIX_REBUILD_PATH";
+
+/// Creates a matrix holding one committed cell on each named commit-map page,
+/// so a rebuild has several page-index entries to republish.
+fn fill_pages(path: &Path, scans: u64, pages: &[u64]) -> varve::Result<()> {
+    let mut writer = spec().create_writer_with_dims(path, dims(scans))?;
+    for page in pages {
+        let ordinal = page * PAGE_BYTES * 8;
+        writer.write_matrix_cell(key(ordinal), &ScalingCell { value: 7 })?;
+        writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// The first byte of the commit map is nonzero once ordinal zero is committed,
+/// so clearing it makes the page disagree with its digest and quarantines the
+/// category: the state whose only recovery is a whole-map rebuild.
+fn quarantine_commit_map(path: &Path) {
+    patch_byte(path, commit_map_off(path), 0x00);
+}
+
+/// Asserts that reopening `path` refuses the persisted page index rather than
+/// reading a half-republished one as the authoritative published set.
+///
+/// Both halves matter. Forensic access must *report* the damage as fatal and
+/// name the rebuild that repairs it; ordinary access must refuse to answer at
+/// all. The failure this guards against is neither of those: a valid short
+/// occupancy count that answers `NotCommitted` for committed cells in silence.
+fn assert_page_index_fails_closed(path: &Path, context: &str) -> varve::Result<()> {
+    {
+        let reader = open_without_allocation_map(path, true)?;
+        let report = reader.matrix_recovery_report();
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == MatrixCorruptionKind::CommitMap
+                    && finding.severity == MatrixCorruptionSeverity::Fatal),
+            "{context}: an interrupted page-index republication produced no fatal finding: {:?}",
+            report.findings
+        );
+        assert!(
+            report
+                .recommended_actions
+                .contains(&MatrixRecoveryAction::RebuildCommitMap { category: None }),
+            "{context}: fatal page-index damage recommended no rebuild: {:?}",
+            report.recommended_actions
+        );
+    }
+    let reader = open_without_allocation_map(path, false)?;
+    assert!(
+        matches!(
+            reader.matrix_cell_status::<ScalingCell>(key(0)),
+            Err(Error::MatrixFatalCorruption)
+        ),
+        "{context}: cell access was answered from a page index known to be incomplete"
+    );
+    Ok(())
+}
+
+/// F-02: a rebuild whose page-index *entry* write fails after the index has
+/// been emptied must not leave a valid short index behind.
+///
+/// The allocation map is forced unavailable throughout the verification,
+/// because that is the configuration in which the persisted index is the only
+/// way to find a published page and a short index therefore hides committed
+/// cells with no finding at all.
+#[test]
+fn an_interrupted_rebuild_entry_write_fails_closed_and_rebuilds() -> varve::Result<()> {
+    let dir = temp_dir("rebuild-entry-fault");
+    let path = dir.path().join("matrix.varve");
+    fill_pages(&path, REBUILD_SCANS, &[0, 1, 2])?;
+    quarantine_commit_map(&path);
+
+    {
+        let mut writer = spec().open_writer(&path)?;
+        // The second entry write: the index region has been cleared and only
+        // partly refilled.
+        MatrixRecoveryReport::inject_matrix_page_index_entry_write_failure(2);
+        let outcome = writer.rebuild_matrix_commit_from_crc::<ScalingCell>();
+        MatrixRecoveryReport::inject_matrix_page_index_entry_write_failure(0);
+        assert!(
+            outcome.is_err(),
+            "the injected page-index entry write failure did not surface"
+        );
+        // The same session must refuse to keep mutating a map whose persisted
+        // index no longer matches its in-memory mirror.
+        assert!(matches!(
+            writer.matrix_cell_status::<ScalingCell>(key(0)),
+            Err(Error::MatrixFatalCorruption)
+        ));
+    }
+
+    assert_page_index_fails_closed(&path, "entry-write interruption")?;
+
+    // Recovery: reopen with forensic access and run the rebuild again.
+    {
+        let mut writer = spec().with_matrix_fatal_forensics().open_writer(&path)?;
+        assert_eq!(writer.rebuild_matrix_commit_from_crc::<ScalingCell>()?, 3);
+        writer.flush()?;
+    }
+    let reader = open_without_allocation_map(&path, false)?;
+    for page in [0u64, 1, 2] {
+        assert_eq!(
+            reader.matrix_cell_status::<ScalingCell>(key(page * PAGE_BYTES * 8))?,
+            MatrixCellStatus::Committed,
+            "page {page} did not survive the interrupted rebuild"
+        );
+    }
+    Ok(())
+}
+
+/// F-02: the same contract at the other end of the republication, the final
+/// occupancy-count write, which is the publication itself.
+#[test]
+fn an_interrupted_rebuild_header_write_fails_closed() -> varve::Result<()> {
+    let dir = temp_dir("rebuild-header-fault");
+    let path = dir.path().join("matrix.varve");
+    fill_pages(&path, REBUILD_SCANS, &[0, 1, 2])?;
+    quarantine_commit_map(&path);
+
+    {
+        let mut writer = spec().open_writer(&path)?;
+        // Header write 1 is the rebuild marker, write 2 the publication.
+        MatrixRecoveryReport::inject_matrix_page_index_header_write_failure(2);
+        let outcome = writer.rebuild_matrix_commit_from_crc::<ScalingCell>();
+        MatrixRecoveryReport::inject_matrix_page_index_header_write_failure(0);
+        assert!(outcome.is_err(), "the injected header write did not fail");
+    }
+
+    assert_page_index_fails_closed(&path, "header-write interruption")?;
+    Ok(())
+}
+
+/// F-02: failing the *marker* write destroys nothing, so the complete old index
+/// must still be there and the reopen must be exactly what it was before.
+///
+/// This is the other admissible outcome of an interrupted rebuild: either the
+/// complete old index, or a fail-closed one. Never a silently short one.
+#[test]
+fn a_rebuild_that_never_started_leaves_the_old_page_index_intact() -> varve::Result<()> {
+    let dir = temp_dir("rebuild-marker-fault");
+    let path = dir.path().join("matrix.varve");
+    fill_pages(&path, REBUILD_SCANS, &[0, 1, 2])?;
+    let index_base = page_index_off(&path);
+    let before: Vec<u64> = (0..4)
+        .map(|slot| read_u64_at(&path, index_base + slot * PAGE_INDEX_SLOT_LEN))
+        .collect();
+    quarantine_commit_map(&path);
+
+    {
+        let mut writer = spec().open_writer(&path)?;
+        MatrixRecoveryReport::inject_matrix_page_index_header_write_failure(1);
+        let outcome = writer.rebuild_matrix_commit_from_crc::<ScalingCell>();
+        MatrixRecoveryReport::inject_matrix_page_index_header_write_failure(0);
+        assert!(outcome.is_err(), "the injected marker write did not fail");
+        // Nothing was destroyed, so the session is not poisoned.
+        assert!(matches!(
+            writer.matrix_cell_status::<ScalingCell>(key(0)),
+            Err(Error::MatrixCommitQuarantined(name)) if name == ScalingCell::CATEGORY
+        ));
+    }
+
+    let after: Vec<u64> = (0..4)
+        .map(|slot| read_u64_at(&path, index_base + slot * PAGE_INDEX_SLOT_LEN))
+        .collect();
+    assert_eq!(
+        before, after,
+        "a rebuild that failed before its marker still altered the page index"
+    );
+    let reader = open_without_allocation_map(&path, true)?;
+    assert!(
+        !reader
+            .matrix_recovery_report()
+            .findings
+            .iter()
+            .any(|finding| finding.kind == MatrixCorruptionKind::CommitMap
+                && finding.severity == MatrixCorruptionSeverity::Fatal),
+        "a rebuild that never started was reported as an interrupted one"
+    );
+    Ok(())
+}
+
+/// Child half of [`an_interrupted_rebuild_process_fails_closed_at_every_stage`].
+///
+/// Ignored so it never runs as part of an ordinary suite; the parent invokes it
+/// by exact name with the handshake environment set.
+#[test]
+#[ignore = "child process driven by the rebuild interruption test"]
+fn matrix_rebuild_interruption_child() {
+    if std::env::var(REBUILD_CHILD_ENV).is_err() {
+        return;
+    }
+    let path =
+        std::path::PathBuf::from(std::env::var(REBUILD_PATH_ENV).expect("child fixture path"));
+    let stage = std::env::var(REBUILD_STAGE_ENV)
+        .expect("child stage")
+        .parse::<u64>()
+        .expect("child stage is a number");
+    let mut writer = spec().open_writer(&path).expect("child opens the fixture");
+    MatrixRecoveryReport::abort_process_at_matrix_rebuild_stage(stage);
+    let _ = writer.rebuild_matrix_commit_from_crc::<ScalingCell>();
+    // Unreachable: the armed stage aborts inside the republication.
+    std::process::exit(9);
+}
+
+fn run_rebuild_interruption_child(path: &Path, stage: u64) -> std::process::ExitStatus {
+    std::process::Command::new(std::env::current_exe().expect("locate the test executable"))
+        .args(["--ignored", "--exact", "matrix_rebuild_interruption_child"])
+        .env(REBUILD_CHILD_ENV, "1")
+        .env(REBUILD_PATH_ENV, path)
+        .env(REBUILD_STAGE_ENV, stage.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("run the rebuild interruption child")
+}
+
+/// F-02, process level: a rebuild killed at any point between marking the
+/// persisted page index and publishing its replacement must fail closed.
+///
+/// A returned error also unwinds in-memory state, so only killing the process
+/// reproduces what a power loss leaves on disk. Every stage is checked with the
+/// allocation map forced unavailable, which is the configuration in which the
+/// persisted index is the sole witness of a published page.
+#[test]
+fn an_interrupted_rebuild_process_fails_closed_at_every_stage() -> varve::Result<()> {
+    for stage in 1u64..=4 {
+        let dir = temp_dir(&format!("rebuild-abort-{stage}"));
+        let path = dir.path().join("matrix.varve");
+        fill_pages(&path, REBUILD_SCANS, &[0, 1, 2])?;
+        quarantine_commit_map(&path);
+
+        let status = run_rebuild_interruption_child(&path, stage);
+        assert!(
+            !status.success(),
+            "stage {stage} did not interrupt the rebuild: {status}"
+        );
+
+        assert_page_index_fails_closed(&path, &format!("process abort at stage {stage}"))?;
+    }
+    Ok(())
+}
+
+// F-03: allocation failure can no longer follow persistence -----------------
+
+/// F-03: a first-touch bitmap page allocation failure must be refused *before*
+/// anything reaches the file, so disk and memory can never disagree.
+///
+/// The failing allocation used to run after the page-index entry, the page
+/// digest and the bitmap byte were all durable. Disk then held the new bit
+/// while memory held the old byte, the writer was not poisoned, and the next
+/// mutation of the same byte derived its value and its checksum from stale
+/// memory, silently removing the committed bit behind a consistent digest.
+///
+/// Committing a cell on a fresh page performs two first-touch allocations, in
+/// order: the block validity bitmap and then the commit bitmap. Both are
+/// exercised, because both used to install memory after their own bitmap byte
+/// was durable (RULE B).
+///
+/// The assertions are exactly the reported sequence: the failure, a reopen
+/// proving disk agrees with memory, and a same-byte mutation followed by a
+/// final reopen proving no commit was removed.
+#[test]
+fn a_failed_page_allocation_cannot_leave_a_bit_on_disk() -> varve::Result<()> {
+    for (label, attempt) in [("validity bitmap", 1u64), ("commit bitmap", 2)] {
+        assert_failed_allocation_persists_nothing(label, attempt)?;
+    }
+    Ok(())
+}
+
+fn assert_failed_allocation_persists_nothing(label: &str, attempt: u64) -> varve::Result<()> {
+    const FIRST: u64 = 0;
+    const FAILING: u64 = PAGE_BYTES * 8;
+    const SAME_BYTE: u64 = FAILING + 1;
+
+    let dir = temp_dir(&format!("post-persistence-alloc-{attempt}"));
+    let path = dir.path().join("matrix.varve");
+    {
+        let mut writer = spec().create_writer_with_dims(&path, dims(REBUILD_SCANS))?;
+        writer.write_matrix_cell(key(FIRST), &ScalingCell { value: 1 })?;
+        writer.commit_matrix_cell::<ScalingCell>(key(FIRST))?;
+
+        // The payload write materialises the session write-tracking page for
+        // this ordinal, so it happens before the countdown is armed and only the
+        // commit path is under test.
+        writer.write_matrix_cell(key(FAILING), &ScalingCell { value: 2 })?;
+        MatrixRecoveryReport::inject_matrix_bitmap_page_allocation_failure(attempt);
+        let outcome = writer.commit_matrix_cell::<ScalingCell>(key(FAILING));
+        MatrixRecoveryReport::inject_matrix_bitmap_page_allocation_failure(0);
+        assert!(
+            matches!(outcome, Err(Error::AllocationFailed { .. })),
+            "{label}: expected the injected page allocation failure, got {outcome:?}"
+        );
+        // Memory must still say the cell is uncommitted.
+        assert_eq!(
+            writer.matrix_cell_status::<ScalingCell>(key(FAILING))?,
+            MatrixCellStatus::NotCommitted,
+            "{label}: memory recorded a commit the mutation refused"
+        );
+        writer.flush()?;
+    }
+
+    // Disk must agree with memory: nothing was persisted for the failed page.
+    let map_byte = FAILING / 8;
+    assert_eq!(
+        read_u64_at(&path, commit_map_off(&path) + map_byte) & 0xFF,
+        0,
+        "{label}: a failed page allocation left a commit bit on disk"
+    );
+    {
+        let reader = open_without_allocation_map(&path, false)?;
+        assert_eq!(
+            reader.matrix_cell_status::<ScalingCell>(key(FIRST))?,
+            MatrixCellStatus::Committed
+        );
+        assert_eq!(
+            reader.matrix_cell_status::<ScalingCell>(key(FAILING))?,
+            MatrixCellStatus::NotCommitted,
+            "{label}: disk held a commit bit the writer had refused"
+        );
+    }
+
+    // A later mutation of the *same byte* must not be derived from state that
+    // disagrees with the file.
+    {
+        let mut writer = spec().open_writer(&path)?;
+        writer.write_matrix_cell(key(SAME_BYTE), &ScalingCell { value: 3 })?;
+        writer.commit_matrix_cell::<ScalingCell>(key(SAME_BYTE))?;
+        writer.flush()?;
+    }
+
+    let reader = open_without_allocation_map(&path, true)?;
+    assert!(
+        !reader
+            .matrix_recovery_report()
+            .findings
+            .iter()
+            .any(|finding| finding.severity != MatrixCorruptionSeverity::Advisory),
+        "{label}: the same-byte mutation left the page disagreeing with its digest: {:?}",
+        reader.matrix_recovery_report().findings
+    );
+    assert_eq!(
+        reader.matrix_cell_status::<ScalingCell>(key(FIRST))?,
+        MatrixCellStatus::Committed,
+        "{label}: an unrelated committed cell was removed"
+    );
+    assert_eq!(
+        reader.matrix_cell_status::<ScalingCell>(key(SAME_BYTE))?,
+        MatrixCellStatus::Committed
+    );
     Ok(())
 }

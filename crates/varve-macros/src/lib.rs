@@ -4959,33 +4959,29 @@ fn typed_api_tokens(
         .filter(|block| !block.key_fields.is_empty())
         .copied()
         .collect();
-    let writer_tail_fields = keyed_blocks.iter().map(|block| {
-        let field = tail_map_ident(&block.name);
+    // F-01: the writer owns no keyed tail state of its own. Every keyed
+    // mutation routes through the byte-keyed resident cache inside
+    // `VarveFile`, so the only step after an authoritative append is an
+    // insert into a `HashMap<Vec<u8>, u64>` slot reserved before it - no
+    // user-defined `Hash`, `Eq` or `Clone` can run after publication, and no
+    // per-writer map has to be translated after a record replacement moves
+    // offsets (the file invalidates its own cache there).
+    //
+    // The map is still *built* at writer construction, which is where the
+    // keyed-tail budget has always been enforced for generated writers: a file
+    // whose distinct key count exceeds `keyed_tail` is refused by
+    // `open_writer`, not by a later append.
+    let writer_tail_primes = keyed_blocks.iter().map(|block| {
         let ty = &block.name;
-        quote! {
-            #field: ::std::collections::HashMap<
-                <#ty as ::varve::__core::VarveKeyedBlock>::Key,
-                u64,
-            >,
-        }
+        quote!(inner.prime_keyed_tails::<#ty>()?;)
     });
-    let writer_tail_inits = keyed_blocks.iter().map(|block| {
-        let field = tail_map_ident(&block.name);
-        let ty = &block.name;
-        quote!(let #field = inner.key_tail_offsets::<#ty>()?;)
-    });
-    let writer_tail_values = keyed_blocks.iter().map(|block| {
-        let field = tail_map_ident(&block.name);
-        quote!(#field,)
-    });
-    let translate_writer_tails = keyed_blocks.iter().map(|block| {
-        let field = tail_map_ident(&block.name);
-        quote! {
-            for offset in self.#field.values_mut() {
-                *offset = info.translate_record_offset(*offset)?;
-            }
-        }
-    });
+    // A format with no keyed block primes nothing, so the binding must not be
+    // `mut` there.
+    let writer_inner_binding = if keyed_blocks.is_empty() {
+        quote!(inner)
+    } else {
+        quote!(mut inner)
+    };
 
     let reader_inherent_methods = append_blocks.iter().flat_map(|block| reader_methods(block));
     let reader_trait_methods = append_blocks
@@ -5081,16 +5077,14 @@ fn typed_api_tokens(
         #[derive(Debug)]
         pub struct #writer_name {
             inner: ::varve::__core::VarveWriter,
-            #(#writer_tail_fields)*
         }
 
         impl #writer_name {
-            pub fn from_inner(inner: ::varve::__core::VarveWriter) -> ::varve::__core::Result<Self> {
-                #(#writer_tail_inits)*
-                ::core::result::Result::Ok(Self {
-                    inner,
-                    #(#writer_tail_values)*
-                })
+            pub fn from_inner(
+                #writer_inner_binding: ::varve::__core::VarveWriter,
+            ) -> ::varve::__core::Result<Self> {
+                #(#writer_tail_primes)*
+                ::core::result::Result::Ok(Self { inner })
             }
 
             pub fn into_inner(self) -> ::varve::__core::VarveWriter {
@@ -5119,14 +5113,6 @@ fn typed_api_tokens(
 
             pub fn sync(&mut self) -> ::varve::__core::Result<()> {
                 self.inner.sync()
-            }
-
-            fn __varve_translate_tail_offsets(
-                &mut self,
-                info: &::varve::__core::ReplacementInfo,
-            ) -> ::varve::__core::Result<()> {
-                #(#translate_writer_tails)*
-                ::core::result::Result::Ok(())
             }
 
             #(#writer_inherent_methods)*
@@ -5671,9 +5657,11 @@ fn writer_methods(block: &InlineBlock) -> Vec<TokenStream2> {
             index: usize,
             value: &#ty,
         ) -> ::varve::__core::Result<::varve::__core::ReplacementInfo> {
-            let info = self.inner.replace_block::<#ty>(index, value)?;
-            self.__varve_translate_tail_offsets(&info)?;
-            ::core::result::Result::Ok(info)
+            // F-01: a successful replacement republishes the file generation
+            // and moves record offsets, and the file invalidates its own
+            // keyed-tail cache when it rebinds. There is nothing left to
+            // translate here, so no fallible step follows the publication.
+            self.inner.replace_block::<#ty>(index, value)
         }
     };
     if block.key_fields.is_empty() {
@@ -5690,22 +5678,18 @@ fn writer_methods(block: &InlineBlock) -> Vec<TokenStream2> {
         ]
     } else {
         let delete = format_ident!("delete_{}", singular_method_name(ty));
-        let tails = tail_map_ident(ty);
         vec![
             quote! {
                 pub fn #push(
                     &mut self,
                     value: &#ty,
                 ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
-                    let key = <#ty as ::varve::__core::VarveKeyedBlock>::key(value);
-                    let prev = self.#tails.get(&key).copied();
-                    // API3-01/API3-02: reserve and charge the tail slot before
-                    // the append, so the post-append insert cannot allocate
-                    // and cannot fail after the record is authoritative.
-                    self.inner.reserve_keyed_tail_slot(&mut self.#tails, &key)?;
-                    let info = self.inner.push_with_prev_key_info(value, prev)?;
-                    self.#tails.insert(key, info.record_offset);
-                    ::core::result::Result::Ok(info)
+                    // F-01: the maintained keyed append. The predecessor comes
+                    // from - and the new tail goes into - the byte-keyed
+                    // resident cache, whose slot is charged and reserved
+                    // before the append and filled afterwards by an insert
+                    // that runs no user code and cannot allocate.
+                    self.inner.push_keyed_info(value)
                 }
             },
             quote! {
@@ -5713,18 +5697,12 @@ fn writer_methods(block: &InlineBlock) -> Vec<TokenStream2> {
                     &mut self,
                     key: &<#ty as ::varve::__core::VarveKeyedBlock>::Key,
                 ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
-                    let prev = self.#tails.get(key).copied();
-                    // API3-01/API3-02: see the push path.
-                    self.inner.reserve_keyed_tail_slot(&mut self.#tails, key)?;
-                    // F-03: the push path owns its key already; delete borrows
-                    // the caller's. Clone it *before* the tombstone becomes
-                    // authoritative, so a heap-owning or panicking `Clone`
-                    // cannot run after the mutation, and move the owned key
-                    // into the slot reserved above.
-                    let owned_key = ::core::clone::Clone::clone(key);
-                    let info = self.inner.delete_with_prev_key_info::<#ty>(key, prev)?;
-                    self.#tails.insert(owned_key, info.record_offset);
-                    ::core::result::Result::Ok(info)
+                    // F-01: see the push path. The key is encoded once, before
+                    // the tombstone, and those same canonical bytes are both
+                    // the record payload and the cache key, so nothing owned
+                    // by the caller's key type is cloned, hashed or compared
+                    // after publication.
+                    self.inner.delete_info::<#ty>(key)
                 }
             },
             replace_method,
@@ -5800,22 +5778,16 @@ fn writer_trait_impl_methods(block: &InlineBlock) -> Vec<TokenStream2> {
         ]
     } else {
         let delete = format_ident!("delete_{}", singular_method_name(ty));
-        let tails = tail_map_ident(ty);
         vec![
             quote! {
                 fn #push(
                     &mut self,
                     value: &#ty,
                 ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
-                    let key = <#ty as ::varve::__core::VarveKeyedBlock>::key(value);
-                    let prev = self.#tails.get(&key).copied();
-                    // API3-01/API3-02: reserve and charge the tail slot before
-                    // the append, so the post-append insert cannot allocate
-                    // and cannot fail after the record is authoritative.
-                    self.inner.reserve_keyed_tail_slot(&mut self.#tails, &key)?;
-                    let info = self.inner.push_with_prev_key_info(value, prev)?;
-                    self.#tails.insert(key, info.record_offset);
-                    ::core::result::Result::Ok(info)
+                    // F-01: the trait route carries its own copy of the body,
+                    // so it routes through the same single implementation as
+                    // the inherent method.
+                    self.inner.push_keyed_info(value)
                 }
             },
             quote! {
@@ -5823,24 +5795,13 @@ fn writer_trait_impl_methods(block: &InlineBlock) -> Vec<TokenStream2> {
                     &mut self,
                     key: &<#ty as ::varve::__core::VarveKeyedBlock>::Key,
                 ) -> ::varve::__core::Result<::varve::__core::AppendInfo> {
-                    let prev = self.#tails.get(key).copied();
-                    // API3-01/API3-02: see the push path.
-                    self.inner.reserve_keyed_tail_slot(&mut self.#tails, key)?;
-                    // F-03: clone the borrowed key before the authoritative
-                    // delete; see the inherent `delete` method.
-                    let owned_key = ::core::clone::Clone::clone(key);
-                    let info = self.inner.delete_with_prev_key_info::<#ty>(key, prev)?;
-                    self.#tails.insert(owned_key, info.record_offset);
-                    ::core::result::Result::Ok(info)
+                    // F-01: see the inherent `delete_<block>` method.
+                    self.inner.delete_info::<#ty>(key)
                 }
             },
             replace_method,
         ]
     }
-}
-
-fn tail_map_ident(name: &Ident) -> Ident {
-    format_ident!("__varve_{}_tails", singular_method_name(name))
 }
 
 fn plural_method_ident(name: &Ident) -> Ident {

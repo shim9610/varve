@@ -982,3 +982,142 @@ fn packed_bitmap_decode_failures_are_codec_errors() {
         Err(Error::InvalidCanonicalEncoding(_))
     ));
 }
+
+/// F-02: the interrupted-rebuild marker in a persisted page-index occupancy
+/// header must be refused, with a route out named.
+///
+/// A whole-map republication empties the persisted index and refills it. It
+/// used to do so with the header zeroed, i.e. as a *valid* empty index, so an
+/// interruption left a short-but-well-formed index that hid every page the
+/// rebuild had not reached. This checks the artifact contract at the byte level
+/// and without any fault injection: the marker is fatal, the report names the
+/// rebuild that repairs it, and ordinary access is refused rather than answered
+/// from an index known to be incomplete.
+#[cfg(feature = "integrity")]
+#[test]
+fn interrupted_rebuild_marker_is_reported_fatal_and_recommends_a_rebuild() {
+    let spec = matrix_spec(varve::IntegrityPolicy::Crc32);
+    let fixture = TempMatrix::new("matrix_hardening_rebuild_marker");
+    let key = MatrixKey::new(1, 1);
+    {
+        let dimensions = MatrixDimensions::from_pairs([("scan", 2), ("ch", 2)]);
+        let mut writer = spec
+            .create_writer_with_dims(fixture.path(), dimensions)
+            .expect("create matrix fixture");
+        writer
+            .write_matrix_cell(key, &PrimaryCell { value: 5 })
+            .expect("write cell");
+        writer
+            .commit_matrix_cell::<PrimaryCell>(key)
+            .expect("commit cell");
+        writer.flush().expect("flush fixture");
+    }
+
+    let header = read_vmat_header(fixture.path(), spec);
+    patch_u64(fixture.path(), header.fields[PAGE_INDEX_OFF], u64::MAX);
+
+    {
+        let reader = spec
+            .with_matrix_fatal_forensics()
+            .open_reader(fixture.path())
+            .expect("open with forensic access");
+        let report = reader.matrix_recovery_report();
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == MatrixCorruptionKind::CommitMap
+                    && finding.severity == MatrixCorruptionSeverity::Fatal),
+            "an interrupted-rebuild marker produced no fatal finding: {:?}",
+            report.findings
+        );
+        assert!(
+            report
+                .recommended_actions
+                .contains(&MatrixRecoveryAction::RebuildCommitMap { category: None }),
+            "an interrupted rebuild recommended no way out: {:?}",
+            report.recommended_actions
+        );
+    }
+
+    let mut reader = spec
+        .open_reader(fixture.path())
+        .expect("open marked matrix");
+    assert!(matches!(
+        reader.read_matrix_cell::<PrimaryCell>(key),
+        Err(Error::MatrixFatalCorruption)
+    ));
+}
+
+/// Invariant 3, RULE B: a cell write refused by the resident bitmap budget must
+/// be refused before anything reaches the file.
+///
+/// The session write-tracking bit used to be charged and materialised *after*
+/// the commit bit, the validity bit and the slot payload were all durable, so
+/// `write_matrix_cell` could return `LimitExceeded` — which entitles the caller
+/// to believe nothing happened — with the cell already written. The charge now
+/// happens first, so a refusal leaves the slot exactly as it was.
+#[test]
+fn a_cell_write_refused_by_the_bitmap_budget_leaves_the_slot_unwritten() {
+    // One 4 KiB page: enough for the first cell write to materialise its
+    // session write-tracking page, and not enough for a second page anywhere.
+    let spec = matrix_spec(varve::IntegrityPolicy::None)
+        .with_read_limits(ReadLimits::finite_all(u64::MAX).with_max_matrix_bitmap_bytes(4096));
+    let fixture = TempMatrix::new("matrix_hardening_write_bit_budget");
+    // 65_536 cells: ordinal 32_768 lives on bitmap page 1, so writing it needs a
+    // second resident page that the ceiling above refuses.
+    let dimensions = MatrixDimensions::from_pairs([("scan", 512), ("ch", 128)]);
+    let mut writer = spec
+        .create_writer_with_dims(fixture.path(), dimensions)
+        .expect("create matrix fixture");
+
+    let first = MatrixKey::new(0, 0);
+    writer
+        .write_matrix_cell(first, &PrimaryCell { value: 11 })
+        .expect("first cell fits the ceiling");
+
+    let refused = MatrixKey::new(256, 0);
+    let outcome = writer.write_matrix_cell(refused, &PrimaryCell { value: 22 });
+    assert!(
+        matches!(outcome, Err(Error::LimitExceeded { .. })),
+        "expected the bitmap ceiling to refuse the write, got {outcome:?}"
+    );
+    drop(writer);
+
+    // The discriminating assertion: the refused cell's slot bytes. The commit
+    // bit is cleared *before* the payload is written, so a payload that reached
+    // the file after a refusal is still reported as uncommitted — the durable
+    // side effect is only visible in the slot itself.
+    let header = read_vmat_header(fixture.path(), spec);
+    let refused_ordinal = 256u64 * 128;
+    let slot_offset = header.fields[SLOT_REGION_OFF]
+        + refused_ordinal * u64::from(u32::try_from(PrimaryCell::SLOT_STRIDE).expect("stride"));
+    let mut slot = [0u8; 4];
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(fixture.path())
+            .expect("open matrix to read the refused slot");
+        file.seek(SeekFrom::Start(slot_offset)).expect("seek slot");
+        file.read_exact(&mut slot).expect("read slot");
+    }
+    assert_eq!(
+        slot, [0u8; 4],
+        "a refused cell write still put its payload on disk"
+    );
+
+    // And it must be indistinguishable from one that was never written.
+    let mut reader = spec
+        .open_readonly(fixture.path())
+        .expect("reopen after the refused write");
+    assert_eq!(
+        reader
+            .matrix_cell_status::<PrimaryCell>(refused)
+            .expect("read refused cell status"),
+        MatrixCellStatus::NotCommitted
+    );
+    assert!(matches!(
+        reader.read_matrix_cell::<PrimaryCell>(refused),
+        Err(Error::MatrixNotCommitted)
+    ));
+}

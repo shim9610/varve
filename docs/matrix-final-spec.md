@@ -104,7 +104,12 @@ wave.
 Current implementation status:
 
 - Ordered durable write helper and post-commit hook event are available through
-  `write_matrix_cell_durable`.
+  `write_matrix_cell_durable`. A hook failure is a typed *published* outcome,
+  `Error::MatrixCommittedButHookFailed`, carrying the committed event. So is a
+  failure of the commit sync that precedes it, the only other step after the
+  commit: `Error::MatrixCommittedButDurabilityUnproven`, carrying the same
+  event (round 11). Every other error from that call — including a failure of
+  the pre-commit data sync — means the cell was not committed.
 - `write_matrix_cell_durable_with_barrier` accepts an injectable durability
   barrier so tests and policy adapters can verify `data sync -> commit sync ->
   hook` ordering without simulating a crash.

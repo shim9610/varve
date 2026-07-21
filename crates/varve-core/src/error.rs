@@ -193,6 +193,19 @@ pub enum Error {
     #[error("writer lock break was refused for {0}")]
     WriterLockBreakRefused(String),
 
+    /// The diagnostic `<target>.lock` marker path does not name a dedicated,
+    /// unaliased regular file, so Varve refuses to truncate or write it (F-07).
+    ///
+    /// The marker carries pid/timestamp diagnostics and the break-policy
+    /// machinery; acquiring it truncates and rewrites the object it names.
+    /// A pre-placed symbolic link, or a hard link from the marker path to an
+    /// unrelated empty file, would therefore route those writes at a foreign
+    /// object. Authoritative single-writer exclusion never depended on the
+    /// marker - it is held on the target file object itself - so refusing here
+    /// costs no exclusion strength.
+    #[error("writer lock marker at {path} is not a dedicated regular file ({reason})")]
+    WriterLockMarkerNotDedicated { path: String, reason: &'static str },
+
     #[error("append record sequence is exhausted")]
     SequenceExhausted,
 
@@ -249,6 +262,28 @@ pub enum Error {
         "replacement generation with sequence {sequence} was published, but the writer could not rebind: {source}"
     )]
     PublishedButRebindFailed {
+        sequence: u64,
+        #[source]
+        source: Box<Error>,
+    },
+
+    /// The commit marker was appended, but the durability request that follows
+    /// it failed (round 10, invariant 3).
+    ///
+    /// This is a *published* outcome in the same family as
+    /// [`Error::PublishedButRebindFailed`] and
+    /// [`Error::MatrixCommittedButHookFailed`]. A caller that receives it must
+    /// not treat the commit as not-performed: the marker bytes are in the file
+    /// and a reader that opens the file after a clean process exit sees the
+    /// transaction as committed. What is *not* established is that the bytes
+    /// survive a power loss. The correct response is to retry
+    /// [`crate::VarveFile::sync`], not to re-run the transaction — re-running
+    /// it appends a second marker for work that is already recorded.
+    #[error(
+        "commit marker with sequence {sequence} was appended, but durability could not be \
+         established: {source}"
+    )]
+    CommittedButDurabilityUnproven {
         sequence: u64,
         #[source]
         source: Box<Error>,
@@ -334,6 +369,64 @@ pub enum Error {
         "matrix recovery report contains fatal findings; default access is fail-closed, use FormatSpec::with_matrix_fatal_forensics for forensic access"
     )]
     MatrixFatalCorruption,
+
+    /// The durable matrix write completed and the cell is committed and synced;
+    /// only the caller's post-commit notification hook failed (F-04).
+    ///
+    /// This is a *published* outcome in the same family as
+    /// [`Error::PublishedButParentSyncPending`] and
+    /// [`Error::PublishedButRebindFailed`]: a caller that receives it must not
+    /// treat the write as not-performed. Re-running
+    /// [`crate::VarveFile::write_matrix_cell_durable`] would repeat the write
+    /// and re-run the hook, so external work driven by the hook can be
+    /// duplicated. The committed event is carried so the caller can retry the
+    /// notification alone.
+    #[error(
+        "matrix cell (scan {scan}, ch {ch}) for block {block_id} was committed and made durable, \
+         but the post-commit notification hook failed: {source}",
+        block_id = .event.block_id,
+        scan = .event.key.scan,
+        ch = .event.key.ch,
+    )]
+    MatrixCommittedButHookFailed {
+        // Boxed to keep `Error` (and every `Result` in the crate) inside the
+        // `clippy::result_large_err` budget; the inline event would add 40
+        // bytes to a type returned from every fallible function.
+        event: Box<crate::MatrixCommitEvent>,
+        #[source]
+        source: Box<Error>,
+    },
+
+    /// The matrix commit bit reached the file, but the durability request that
+    /// follows it failed (round 11, invariant 3).
+    ///
+    /// This is the matrix twin of [`Error::CommittedButDurabilityUnproven`] and
+    /// sits in the same published-outcome family as
+    /// [`Error::MatrixCommittedButHookFailed`]: the cell **is** committed, and
+    /// a reader that opens the file after a clean process exit sees it as
+    /// committed. What is *not* established is that the commit survives a power
+    /// loss. The post-commit hook was **not** run, so no notification was
+    /// emitted for this cell.
+    ///
+    /// The writer is poisoned when this is returned, because the failure is a
+    /// durability request the operating system refused mid-publication. Recover
+    /// by reopening the file and calling [`crate::VarveFile::sync`]; the cell
+    /// itself does not need to be rewritten, and the carried event is the one
+    /// the hook would have been given, so the notification can be issued once
+    /// durability is re-established.
+    #[error(
+        "matrix cell (scan {scan}, ch {ch}) for block {block_id} was committed, but the durability \
+         request after the commit failed: {source}",
+        block_id = .event.block_id,
+        scan = .event.key.scan,
+        ch = .event.key.ch,
+    )]
+    MatrixCommittedButDurabilityUnproven {
+        // Boxed for the same `clippy::result_large_err` reason as above.
+        event: Box<crate::MatrixCommitEvent>,
+        #[source]
+        source: Box<Error>,
+    },
 
     #[error("matrix key is out of bounds: scan {scan}, ch {ch}")]
     MatrixKeyOutOfBounds { scan: u64, ch: u64 },

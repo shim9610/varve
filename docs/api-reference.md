@@ -154,11 +154,11 @@ consequently charges more than the steady-state map costs. This is deliberate
 and conservative - the charge models what is allocated, not what survives - but
 it means a ceiling sized from the steady-state map alone can refuse an open.
 
-The charged value is inline storage plus - on the resident
-`VarveFile`/`VarveWriter` paths, which hold canonical key payloads - the key
-payload bytes it owns; the generated keyed writers store `T::Key` directly and
-can only charge inline storage, so heap owned by a `T::Key` (a `String` key's
-buffer) is not charged on that path. It is checked per keyed block id, not
+The charged value is inline storage plus the key payload bytes the map owns.
+Both routes charge the same way: the generated keyed writers no longer keep a
+`HashMap<T::Key, u64>` of their own and instead maintain the same byte-keyed
+resident cache the generic keyed API uses, so heap owned by a `String` key is
+charged on every path. It is checked per keyed block id, not
 summed across block ids, and it excludes `HashMap` control bytes and
 load-factor slack. `STANDARD` leaves it at `u64::MAX`.
 
@@ -471,7 +471,22 @@ typed wrappers.
 | `matrix_resume_signal(category)` | classify partial matrix progress |
 | `matrix_recovery_report()` | report matrix findings/actions |
 | `rebuild_matrix_commit_from_crc::<T>()` | rebuild commit map from slot CRC evidence |
-| `write_matrix_cell_durable` | write/commit with ordered durability barrier |
+| `write_matrix_cell_durable` | write/commit with ordered durability barrier, then a post-commit hook |
+
+The hook of `write_matrix_cell_durable` runs **after** the cell is committed
+and synced, so it cannot un-commit anything. A hook failure is reported as the
+typed published outcome `Error::MatrixCommittedButHookFailed { event, source }`
+(the event is boxed so `Error` stays small) rather than a bare error, so a caller can tell "not committed, retry the write"
+from "committed, retry only the notification"; the carried `MatrixCommitEvent`
+is the one the hook was given. Retrying the whole call after that error repeats
+the durable write and re-runs the hook.
+
+The commit sync is the only other step after the commit, and it is typed the
+same way: `Error::MatrixCommittedButDurabilityUnproven { event, source }` means
+the commit bit is in the file, the cell is readable after a clean exit, the
+hook did not run, and only power-loss durability is unproven. Those two are the
+call's only published outcomes; every other error means the cell was not
+committed.
 
 Matrix slot types must have a width fixed by the type itself, because a slot
 needs a stride the compiler knows. Scalars and fixed arrays of them qualify.
@@ -954,6 +969,10 @@ document assumes.
 | `BlockSchemaFingerprintMismatch` | a block impl disagrees with the format's declared identity for that block id, or two impls share an id with different `SCHEMA_FINGERPRINT` |
 | `BlockKeyednessMismatch` | two block impls share an id but disagree on keyedness |
 | `PublishedButParentSyncPending` | atomic replacement published, but parent-directory durability is unconfirmed; not a rollback. Also surfaced by redb sidecar create/bootstrap/rebuild |
+| `MatrixCommittedButHookFailed { event: Box<MatrixCommitEvent>, source }` | `write_matrix_cell_durable` committed and synced the cell, then the caller's post-commit hook failed. Not a rollback: retry the notification with the carried `MatrixCommitEvent`, not the whole call |
+| `MatrixCommittedButDurabilityUnproven { event: Box<MatrixCommitEvent>, source }` | `write_matrix_cell_durable` put the commit bit in the file and the durability request after it failed. Not a rollback: the cell is committed and readable after a clean exit, and the hook did **not** run. The writer is poisoned; reopen and `sync`, then issue the notification with the carried event |
+| `CommittedButDurabilityUnproven { sequence, source }` | `commit_durable` appended the transaction's commit marker and the `flush`/`sync_all` after it failed. Not a rollback: the transaction is committed and `sequence` names the marker. Retry `sync`, not the transaction — re-running it appends a second marker |
+| `WriterLockMarkerNotDedicated { path, reason }` | the `<target>.lock` marker path is a symlink/reparse point, a multi-link object, or not a regular file, so Varve refused to truncate and rewrite it. Remove or un-alias the marker path |
 | `PublishedButRebindFailed` | replacement published but the writer could not rebind and was poisoned |
 | `ReplacePublicationIndeterminate` | Windows `ReplaceFileW` 1176/1177 with unresolvable pathname state; temp preserved, writer poisoned, do not blindly retry |
 | `WriterLockHeld` | another writer or stale lock exists |

@@ -12,6 +12,14 @@ documentation = "https://docs.rs/varve-macros"
 # directory because `include` cannot reference paths outside the package.
 readme = "../../README.md"
 
+# F-06: see the note in `crates/varve-core/Cargo.toml`. This crate's only
+# optional feature changes what the macros GENERATE rather than what they
+# export, so the documented surface is the same either way; the setting is
+# declared anyway so all three published crates state their docs.rs surface
+# explicitly instead of two of them stating it and one inheriting a default.
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = []
 # The dev-dependency edge keeps the doctests consistent with the code this

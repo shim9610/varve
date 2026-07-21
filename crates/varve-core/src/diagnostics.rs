@@ -817,6 +817,12 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::WriteRollbackFailed { .. }
         | Error::PublishedButRebindFailed { .. }
         | Error::PublishedButParentSyncPending { .. }
+        // The commit marker is in the file; only the durability request the
+        // operating system was asked for failed.
+        | Error::CommittedButDurabilityUnproven { .. }
+        // The commit bit is in the file; only the durability request the
+        // operating system was asked for failed (round 11).
+        | Error::MatrixCommittedButDurabilityUnproven { .. }
         | Error::ReplacePublicationIndeterminate { .. } => DiagnosticDomain::Environment,
 
         #[cfg(feature = "high-cardinality-dev")]
@@ -872,6 +878,12 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         Error::DiskIndex(_) => DiagnosticDomain::FileData,
 
         Error::WriterLockBreakRefused(_) => DiagnosticDomain::CallerUsage,
+        // F-04: the durable write itself succeeded; the caller's own hook is
+        // what failed, so the fault is in caller-supplied code.
+        Error::MatrixCommittedButHookFailed { .. } => DiagnosticDomain::CallerUsage,
+        // F-07: the marker pathname is aliased or is not a regular file, which
+        // is a property of the environment the file lives in.
+        Error::WriterLockMarkerNotDedicated { .. } => DiagnosticDomain::Environment,
         Error::MatrixLayoutMissing => DiagnosticDomain::LibraryInvariant,
     }
 }

@@ -38,10 +38,32 @@ wildcards = "deny"
 # found" for any version the facade has not already published. The cycle is
 # only publishable while the edge stays path-only.
 #
-# This exception is narrow rather than a blanket allowance. cargo-deny still
-# denies every wildcard on a registry dependency, and still denies a wildcard
-# path dependency that is NOT a dev-dependency of a published crate - both were
-# verified against this file by temporarily introducing each shape.
+# F-09, invariant 4: this option is a CATEGORY allowance, not an allowance for
+# that one edge, and the previous comment here described it too narrowly. The
+# scope it actually has, re-derived against cargo-deny 0.19.9 by introducing
+# each shape and observing the result:
+#
+#   * published crate (`varve`, `varve-core`, `varve-macros`), path
+#     DEV-dependency, no version  -> ALLOWED. This is the edge above; cargo
+#     strips it from the published manifest, so it cannot reach crates.io.
+#   * published crate, path dependency that is NOT a dev-dependency
+#     -> DENIED ("allow-wildcard-paths is enabled, but does not apply to
+#     public crates as crates.io disallows path dependencies").
+#   * private crate (`publish = false`, i.e. `tools/varve-test-runner` and any
+#     future tool), path dependency of ANY kind including a normal one
+#     -> ALLOWED. Nothing about this workspace's current graph relies on that,
+#     but the option grants it, and this file should not pretend otherwise.
+#   * any crate, registry dependency with a wildcard requirement -> DENIED,
+#     dev-dependency or not.
+#
+# So the residual policy surface this buys is: unversioned path dependencies
+# from crates that are never published. That is acceptable because such crates
+# are built only from this repository, where the path is the source of truth
+# and a version requirement would add nothing. It is NOT the same statement as
+# "only the varve-macros dev edge is permitted".
+#
+# The `dependency-policy-fixture` job in `.github/workflows/ci.yml` asserts the
+# two DENIED shapes above still fail, so this allowance cannot silently widen.
 allow-wildcard-paths = true
 highlight = "all"
 workspace-default-features = "allow"

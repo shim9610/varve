@@ -27,11 +27,48 @@ use crate::{
 };
 
 const STREAM_WRITER_POISON_CONTEXT: &str = "stream";
+
 const INTERNAL_BLOCK_IDS: [u32; 3] = [
     MANIFEST_BLOCK_ID,
     TOMBSTONE_BLOCK_ID,
     CREATION_NONCE_BLOCK_ID,
 ];
+
+thread_local! {
+    /// Armed post-publication generation-restamp failures (round 11,
+    /// invariant 3).
+    static INJECTED_GENERATION_RESTAMP_FAILURES: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+/// Consumes one armed generation-restamp failure (round 11, invariant 3).
+///
+/// The restamp is the first fallible step of the sidecar commit that runs
+/// *after* a prepared chunk has been published natively, and it is not
+/// reachable from outside the crate on demand: it needs a fallible read of the
+/// primary's own leading bytes while the witness window is still filling.
+/// Inert without the `scalable-fault-injection` feature. Thread-local so
+/// concurrently running tests cannot arm each other's writers.
+#[inline]
+pub(crate) fn take_injected_generation_restamp_failure() -> Result<()> {
+    #[cfg(feature = "scalable-fault-injection")]
+    {
+        let armed = INJECTED_GENERATION_RESTAMP_FAILURES.with(|count| {
+            let current = count.get();
+            if current != 0 {
+                count.set(current - 1);
+            }
+            current != 0
+        });
+        if armed {
+            return Err(Error::Io(std::io::Error::other(
+                "injected post-publication generation restamp failure",
+            )));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamOptions {
@@ -1050,8 +1087,7 @@ impl VarveStreamWriter {
                     .checked_add(record.bytes.len())
                     .is_none_or(|len| len > options.max_bytes);
             if exceeds_records || exceeds_bytes {
-                self.append_prepared_chunk(&bytes, &records)?;
-                update_batch_summary(written, &records, self.snapshot.len())?;
+                self.append_prepared_chunk_summarized(&bytes, &records, written)?;
                 bytes.clear();
                 records.clear();
             }
@@ -1079,16 +1115,45 @@ impl VarveStreamWriter {
             records.push((T::ID, record.info));
 
             if bytes.len() >= options.max_bytes || records.len() >= max_records {
-                self.append_prepared_chunk(&bytes, &records)?;
-                update_batch_summary(written, &records, self.snapshot.len())?;
+                self.append_prepared_chunk_summarized(&bytes, &records, written)?;
                 bytes.clear();
                 records.clear();
             }
         }
         if !records.is_empty() {
-            self.append_prepared_chunk(&bytes, &records)?;
-            update_batch_summary(written, &records, self.snapshot.len())?;
+            self.append_prepared_chunk_summarized(&bytes, &records, written)?;
         }
+        Ok(())
+    }
+
+    /// Publishes a prepared chunk and folds it into `written`.
+    ///
+    /// The summary arithmetic runs *before* the native write and the only step
+    /// after publication is an infallible assignment, so `written` describes
+    /// every record that reached the file on every path out of this call.
+    pub(crate) fn append_prepared_chunk_summarized(
+        &mut self,
+        bytes: &[u8],
+        records: &[(u32, AppendInfo)],
+        written: &mut BatchAppendInfo,
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let byte_len =
+            u64::try_from(bytes.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+        // `append_prepared_chunk` requires the chunk to begin at the native
+        // EOF and lands it contiguously, so this is the post-write EOF.
+        let end_offset =
+            self.snapshot
+                .len()
+                .checked_add(byte_len)
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "file length",
+                })?;
+        let next = next_batch_summary(written, records, end_offset)?;
+        self.append_prepared_chunk(bytes, records)?;
+        *written = next;
         Ok(())
     }
 
@@ -1251,14 +1316,55 @@ impl VarveStreamWriter {
         Ok(())
     }
 
+    /// Commits the pending sidecar transaction, classifying *every* failure
+    /// against whether natively published records are staged in it.
+    ///
+    /// Invariant 3: once `batch_last_sequence` is `Some`, the records it names
+    /// are already in the native file, so no failure from here may be reported
+    /// as a bare `Err` - a caller entitled to read that as "nothing happened"
+    /// would retry and append the same records twice. The classification lives
+    /// here, around the whole body, rather than at individual steps, so a
+    /// fallible step added to this path later cannot reopen the defect.
     fn commit_state_chunk(&mut self) -> Result<()> {
+        let staged = self
+            .state
+            .as_ref()
+            .and_then(|state| state.batch_last_sequence);
+        match self.commit_state_chunk_inner() {
+            Ok(()) => Ok(()),
+            Err(error) => Err(self.published_sidecar_error(staged, error)),
+        }
+    }
+
+    /// Wraps `error` as a published outcome when `staged` names records that
+    /// are already in the native file, and poisons the writer.
+    fn published_sidecar_error(&mut self, staged: Option<u64>, error: Error) -> Error {
+        let Some(sequence) = staged else {
+            return error;
+        };
+        self.poisoned = true;
+        match error {
+            already @ Error::PublishedButIndexStale { .. } => already,
+            source => Error::PublishedButIndexStale {
+                sequence,
+                source: Box::new(source),
+            },
+        }
+    }
+
+    fn commit_state_chunk_inner(&mut self) -> Result<()> {
         // STO-01: re-stamp the generation witness while its window is still
         // filling. Once the window is full it is frozen for the file's life,
         // so steady-state appends pay nothing here.
         let pending = match self.state.as_ref().and_then(|state| state.batch.as_ref()) {
-            Some(batch) if batch.primary_generation().len < PRIMARY_GENERATION_WINDOW => Some(
-                primary_generation(self.spec, &self.snapshot, self.snapshot.len())?,
-            ),
+            Some(batch) if batch.primary_generation().len < PRIMARY_GENERATION_WINDOW => {
+                take_injected_generation_restamp_failure()?;
+                Some(primary_generation(
+                    self.spec,
+                    &self.snapshot,
+                    self.snapshot.len(),
+                )?)
+            }
             _ => None,
         };
         let Some(state) = self.state.as_mut() else {
@@ -1286,6 +1392,23 @@ impl VarveStreamWriter {
             };
         }
         Ok(())
+    }
+
+    /// Arms `count` injected post-publication generation-restamp failures
+    /// (round 11, invariant 3).
+    ///
+    /// Fault-testing hook only: each armed failure makes the next sidecar
+    /// chunk commit - on either the stream or the indexed writer - fail its
+    /// primary-generation restamp *after* the chunk's records have been
+    /// appended to the native file. The observable contract under this fault
+    /// is that the caller receives `Error::PublishedButIndexStale` and a
+    /// poisoned writer rather than a bare `Err`, because the records are in
+    /// the file and a caller entitled to read `Err` as "nothing happened"
+    /// would append them a second time. Thread-local.
+    #[cfg(feature = "scalable-fault-injection")]
+    #[doc(hidden)]
+    pub fn inject_generation_restamp_failures(count: u64) {
+        INJECTED_GENERATION_RESTAMP_FAILURES.with(|armed| armed.set(count));
     }
 
     fn ensure_writable(&self) -> Result<()> {
@@ -1339,16 +1462,27 @@ fn stream_spec(spec: FormatSpec, options: StreamOptions, create: bool) -> Result
     Ok(spec)
 }
 
-pub(crate) fn update_batch_summary(
-    summary: &mut BatchAppendInfo,
+/// Derives the batch summary that *will* describe `summary` once `records` are
+/// published, without touching `summary`.
+///
+/// This is deliberately a pure function rather than an in-place update: every
+/// fallible step (all of it checked arithmetic) has to run *before* the native
+/// write, so that the only thing left after publication is an infallible
+/// assignment. An in-place update run after the write could fail with the
+/// records already durable, and the caller would then be handed a summary that
+/// under-reports what is in the file - which is exactly what
+/// `BatchAppendError::written` is relied on to report accurately.
+pub(crate) fn next_batch_summary(
+    summary: &BatchAppendInfo,
     records: &[(u32, AppendInfo)],
     end_offset: u64,
-) -> Result<()> {
+) -> Result<BatchAppendInfo> {
     let first = records.first().expect("non-empty prepared chunk").1;
     let last = records.last().expect("non-empty prepared chunk").1;
-    summary.first_sequence.get_or_insert(first.sequence);
-    summary.last_sequence = Some(last.sequence);
-    summary.records = summary
+    let mut next = *summary;
+    next.first_sequence.get_or_insert(first.sequence);
+    next.last_sequence = Some(last.sequence);
+    next.records = next
         .records
         .checked_add(u64::try_from(records.len()).map_err(|_| {
             Error::ResourceArithmeticOverflow {
@@ -1358,15 +1492,14 @@ pub(crate) fn update_batch_summary(
         .ok_or(Error::ResourceArithmeticOverflow {
             resource: "batch record count",
         })?;
-    summary.end_offset = end_offset;
-    summary.write_calls =
-        summary
-            .write_calls
+    next.end_offset = end_offset;
+    next.write_calls =
+        next.write_calls
             .checked_add(1)
             .ok_or(Error::ResourceArithmeticOverflow {
                 resource: "batch write call count",
             })?;
-    Ok(())
+    Ok(next)
 }
 
 fn initial_block_tails(spec: FormatSpec) -> Vec<(u32, Option<StreamTail>)> {

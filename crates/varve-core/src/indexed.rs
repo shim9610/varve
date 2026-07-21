@@ -970,17 +970,50 @@ impl VarveIndexedWriter {
         records: &[(u32, AppendInfo)],
         written: &mut BatchAppendInfo,
     ) -> Result<()> {
-        self.stream.append_prepared_chunk(bytes, records)?;
-        crate::stream::update_batch_summary(written, records, self.stream.snapshot().len())?;
+        self.stream
+            .append_prepared_chunk_summarized(bytes, records, written)?;
         self.commit_pending_batch()
     }
 
+    /// Commits the pending sidecar transaction, classifying *every* failure
+    /// against whether natively published records are staged in it.
+    ///
+    /// Invariant 3: see `VarveStreamWriter::commit_state_chunk`. The
+    /// single-record path already wrapped this call (in `finish_record`) and
+    /// the batch path did not, so the wrapping now lives inside the function
+    /// that owns the post-publication work, where it covers both callers and
+    /// any future one.
     fn commit_pending_batch(&mut self) -> Result<()> {
+        let staged = self.batch_last_sequence;
+        match self.commit_pending_batch_inner() {
+            Ok(()) => Ok(()),
+            Err(error) => Err(self.published_index_error(staged, error)),
+        }
+    }
+
+    /// Wraps `error` as a published outcome when `staged` names records that
+    /// are already in the native file, and poisons the writer.
+    fn published_index_error(&mut self, staged: Option<u64>, error: Error) -> Error {
+        let Some(sequence) = staged else {
+            return error;
+        };
+        self.poisoned = true;
+        match error {
+            already @ Error::PublishedButIndexStale { .. } => already,
+            source => Error::PublishedButIndexStale {
+                sequence,
+                source: Box::new(source),
+            },
+        }
+    }
+
+    fn commit_pending_batch_inner(&mut self) -> Result<()> {
         // STO-01: see VarveStreamWriter::commit_state_chunk. The witness stops
         // being recomputed once its bounded window is full.
         if let Some(batch) = self.batch.as_ref()
             && batch.primary_generation().len < PRIMARY_GENERATION_WINDOW
         {
+            crate::stream::take_injected_generation_restamp_failure()?;
             let generation = primary_generation(
                 self.stream.spec(),
                 self.stream.snapshot(),
@@ -995,13 +1028,11 @@ impl VarveIndexedWriter {
         let Some(batch) = self.batch.take() else {
             return Ok(());
         };
-        let sequence = self.batch_last_sequence.unwrap_or(0);
         if let Err(error) = batch.commit() {
-            self.poisoned = true;
-            return Err(Error::PublishedButIndexStale {
-                sequence,
-                source: Box::new(index_error(error)),
-            });
+            // Classified by `commit_pending_batch`: with staged records this
+            // becomes `PublishedButIndexStale`; with none there is nothing
+            // published to report and the plain sidecar error is the truth.
+            return Err(index_error(error));
         }
         self.batch_records = 0;
         self.batch_last_sequence = None;

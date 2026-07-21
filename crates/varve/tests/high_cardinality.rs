@@ -27,6 +27,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        record_thread_delta(-(layout.size() as isize));
         unsafe { System.dealloc(pointer, layout) };
     }
 
@@ -37,6 +38,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
                 record_allocation(new_size - layout.size());
             } else {
                 LIVE_BYTES.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
+                record_thread_delta(-((layout.size() - new_size) as isize));
             }
         }
         replacement
@@ -46,7 +48,29 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
+std::thread_local! {
+    /// Live bytes attributable to *this* thread, for measurements that must
+    /// survive `cargo test`'s parallelism: the process-global counters above
+    /// see every other test binary thread's traffic as well.
+    ///
+    /// Memory allocated on one thread and released on another skews this, so
+    /// it is only meaningful across a window that allocates and frees on the
+    /// same thread - which is what a single-threaded append loop does.
+    static THREAD_LIVE_BYTES: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+/// Adds `delta` to this thread's live-byte counter, tolerating a thread whose
+/// TLS is already being destroyed.
+fn record_thread_delta(delta: isize) {
+    let _ = THREAD_LIVE_BYTES.try_with(|live| live.set(live.get() + delta));
+}
+
+fn thread_live_bytes() -> isize {
+    THREAD_LIVE_BYTES.with(std::cell::Cell::get)
+}
+
 fn record_allocation(size: usize) {
+    record_thread_delta(size as isize);
     let live = LIVE_BYTES.fetch_add(size, Ordering::Relaxed) + size;
     let mut peak = PEAK_BYTES.load(Ordering::Relaxed);
     while live > peak {
@@ -648,5 +672,228 @@ fn resident_single_input_compact_fails_typed_at_the_key_ceiling() -> varve::Resu
     )?;
     let unbounded = ResidentMergeFormat::open_readonly(&unbounded_output)?;
     assert_eq!(unbounded.keyed_blocks::<MergeUser>()?.len(), 150);
+    Ok(())
+}
+
+// F-01 (round 9): the generated keyed writers used to hold their own
+// `HashMap<T::Key, u64>` tail map. Two consequences of that design are asserted
+// here, both of which the byte-keyed resident cache changes.
+//
+// The first is a budget consequence. Charging a `HashMap<T::Key, u64>` can only
+// count inline `(T::Key, u64)` storage: for `T::Key = String` the charge was
+// 32 bytes per entry no matter how long the key was, so a file of long keys
+// allocated without limit while every configured ceiling reported room. The
+// cache is now keyed by the canonical internal key payload, and the charge adds
+// the payload bytes the map actually owns - which is what makes a long-key
+// format refusable at all.
+//
+// The second is an append-path consequence: the step that runs *after* the
+// authoritative append must allocate nothing, so a steady-state append over a
+// bounded key set must not grow resident memory.
+
+varve_format! {
+    pub format LongKeyBudgetFormat {
+        magic: b"LKEYBG";
+        version: 1;
+        limits {
+            keyed_tail: 200;
+        }
+        index: keyed_offset_chain;
+        blocks {
+            variable Labelled(id = 61, key = [label]) {
+                label: String,
+                value: u32,
+            }
+        }
+    }
+}
+
+/// A `String`-keyed generated writer is charged for the key bytes it retains.
+///
+/// One entry costs `size_of::<(Vec<u8>, u64)>()` (32) plus the internal key
+/// payload, which is a 12-byte envelope plus the encoded `String` (an 8-byte
+/// length plus its bytes). A 12-byte label therefore charges 64 and fits the
+/// 200-byte ceiling; a 200-byte label charges 252 and cannot. Against the old
+/// inline-only charge both were 32 bytes and both were admitted, so this test
+/// fails there.
+#[test]
+fn a_generated_keyed_writer_charges_the_key_bytes_it_retains() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("long-key-budget.varve");
+    let mut writer = LongKeyBudgetFormat::create_writer(&path)?;
+
+    writer.push_labelled(&Labelled {
+        label: "short-label".to_string(),
+        value: 1,
+    })?;
+    // Repeating a retained key overwrites its slot and is charged nothing.
+    writer.push_labelled(&Labelled {
+        label: "short-label".to_string(),
+        value: 2,
+    })?;
+
+    let long = "L".repeat(200);
+    let error = writer
+        .push_labelled(&Labelled {
+            label: long.clone(),
+            value: 3,
+        })
+        .expect_err("a 200-byte key cannot fit a 200-byte keyed-tail ceiling");
+    assert!(
+        matches!(
+            error,
+            varve::Error::LimitExceeded {
+                resource: "keyed tail bytes",
+                ..
+            }
+        ),
+        "expected a typed keyed-tail budget rejection, got {error:?}"
+    );
+    // The tombstone path is charged identically, and refuses before appending.
+    let error = writer
+        .delete_labelled(&long)
+        .expect_err("a tombstone for that key needs the same retained slot");
+    assert!(
+        matches!(
+            error,
+            varve::Error::LimitExceeded {
+                resource: "keyed tail bytes",
+                ..
+            }
+        ),
+        "expected a typed keyed-tail budget rejection, got {error:?}"
+    );
+    writer.flush()?;
+    drop(writer);
+
+    // Invariant 3: both refusals happened before the append, so neither the
+    // record nor the tombstone exists.
+    let reopened = LongKeyBudgetFormat::open(&path)?;
+    let records: Vec<Labelled> = reopened
+        .blocks::<Labelled>()?
+        .iter()
+        .collect::<varve::Result<_>>()?;
+    assert_eq!(
+        records,
+        vec![
+            Labelled {
+                label: "short-label".to_string(),
+                value: 1,
+            },
+            Labelled {
+                label: "short-label".to_string(),
+                value: 2,
+            },
+        ],
+        "the refused mutations must not have appended anything"
+    );
+    Ok(())
+}
+
+varve_format! {
+    pub format SteadyAppendFormat {
+        magic: b"STDYAP";
+        version: 1;
+        index: keyed_offset_chain;
+        blocks {
+            variable Sample(id = 62, key = [id]) {
+                id: u64,
+                value: u64,
+            }
+        }
+    }
+}
+
+varve_format! {
+    pub format SteadyAppendUnkeyedFormat {
+        magic: b"STDYAU";
+        version: 1;
+        // The same index policy, so records carry the same footer and the
+        // checkpoint cadence sees the same byte totals: the only difference
+        // between the two loops is that one maintains a keyed tail.
+        index: keyed_offset_chain;
+        blocks {
+            variable Plain(id = 62) {
+                id: u64,
+                value: u64,
+            }
+        }
+    }
+}
+
+/// The generated keyed append adds no resident memory of its own in the steady
+/// state.
+///
+/// Every key in the measured loop is already retained, so the tail cache
+/// neither grows nor reserves: the pre-append reservation short-circuits and
+/// the post-append commit overwrites a slot in place. Anything the append
+/// allocates transiently - the encoded record, the encoded key payload - is
+/// released before the call returns.
+///
+/// What an append *does* legitimately retain is one resident index entry, which
+/// has nothing to do with keying. The measurement is therefore differential:
+/// the same number of appends of the same shape through an unkeyed generated
+/// writer retains exactly that index, and the difference between the two is
+/// what the keyed machinery costs. It must be flat.
+///
+/// This is the measurement behind the claim that the post-publication step
+/// allocates nothing. A design that inserted an owned key after the append - or
+/// that grew the map there - would show a per-append residue here.
+#[test]
+fn steady_state_generated_keyed_appends_do_not_grow_resident_memory() -> varve::Result<()> {
+    const KEYS: u64 = 64;
+    const APPENDS: u64 = 20_000;
+
+    let directory = tempfile::tempdir()?;
+
+    let keyed_path = directory.path().join("steady-append-keyed.varve");
+    let mut keyed = SteadyAppendFormat::create_writer(&keyed_path)?;
+    // Retain every key first, so the measured loop only overwrites slots.
+    for id in 0..KEYS {
+        keyed.push_sample(&Sample { id, value: 0 })?;
+    }
+    let keyed_baseline = thread_live_bytes();
+    for round in 1..=APPENDS {
+        keyed.push_sample(&Sample {
+            id: round % KEYS,
+            value: round,
+        })?;
+    }
+    let keyed_growth = thread_live_bytes() - keyed_baseline;
+    keyed.flush()?;
+
+    let plain_path = directory.path().join("steady-append-plain.varve");
+    let mut plain = SteadyAppendUnkeyedFormat::create_writer(&plain_path)?;
+    for id in 0..KEYS {
+        plain.push_plain(&Plain { id, value: 0 })?;
+    }
+    let plain_baseline = thread_live_bytes();
+    for round in 1..=APPENDS {
+        plain.push_plain(&Plain {
+            id: round % KEYS,
+            value: round,
+        })?;
+    }
+    let plain_growth = thread_live_bytes() - plain_baseline;
+    plain.flush()?;
+
+    // Measured on the round-9 fix: exactly 0. The tolerance is there for
+    // allocator and checkpoint-cadence jitter on other hosts, and is still two
+    // orders of magnitude below the ~32-48 bytes per append that retaining one
+    // owned key payload per record would cost.
+    let keyed_overhead = keyed_growth - plain_growth;
+    assert!(
+        keyed_overhead < 4096,
+        "{APPENDS} steady-state keyed appends retained {keyed_overhead} bytes more than the          same unkeyed appends ({keyed_growth} vs {plain_growth}); the post-append tail          commit must not allocate and the cache must not grow",
+    );
+
+    drop(keyed);
+    drop(plain);
+    let reopened = SteadyAppendFormat::open(&keyed_path)?;
+    assert_eq!(
+        reopened.keyed_blocks::<Sample>()?.len(),
+        KEYS as usize,
+        "every key must still resolve after the steady-state run",
+    );
     Ok(())
 }

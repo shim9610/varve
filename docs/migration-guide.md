@@ -58,6 +58,17 @@ there is no automatic migration path for these surfaces:
   it is a `Fatal` `MatrixCorruptionKind::CommitMap` finding and enumeration
   continues past it. Files that previously opened "clean" with a damaged index
   will now report a fatal finding, which is the correct outcome.
+- An interrupted whole-map commit rebuild is now a fail-closed state instead of
+  a silent one. `rebuild_matrix_commit_from_crc` publishes `u64::MAX` into the
+  page-index occupancy header and syncs it before clearing the entry region,
+  and replaces it with the real count only once every entry, digest and page is
+  durable. A matrix left holding the marker opens with a `Fatal`
+  `MatrixCorruptionKind::CommitMap` finding recommending `RebuildCommitMap`,
+  never as a short index that silently hides committed pages. This needs no
+  layout-version bump — the marker is never a resting state, and a reader that
+  predates it rejects it as a damaged header, which is also fail-closed. Acting
+  on the recommendation requires `FormatSpec::with_matrix_fatal_forensics()`,
+  since fatal findings are fail-closed by default.
 - A matrix whose bitmap page count would exceed `2^48 - 1` (about 1 EiB of
   bitmap) is refused at layout time with `Error::InvalidMatrixLayout`. No
   realistic configuration reaches this.

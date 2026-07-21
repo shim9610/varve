@@ -28,6 +28,34 @@ Varve returns `PublishedButRebindFailed` and poisons that writer. This is not a
 publication rollback: callers must reopen and reconcile instead of blindly
 retrying the operation.
 
+## Commit Marker Versus Commit Durability
+
+`commit_durable` does two things in order: it appends the transaction's commit
+marker, and it then asks the operating system to make the file durable. The
+first is the authoritative commit — once the marker bytes are in the file, a
+reader that opens the file after a clean process exit sees the transaction as
+committed, whether or not the durability request that follows succeeded.
+
+Those two outcomes are therefore reported separately rather than collapsed into
+one `Err`:
+
+- a failure **before** the marker is appended returns an ordinary error and the
+  transaction is not committed. Re-running it is correct;
+- a failure of the `flush`/`sync_all` **after** the marker is appended returns
+  `Error::CommittedButDurabilityUnproven { sequence, source }`. The transaction
+  *is* committed and `sequence` names the marker record. What is unproven is
+  only that it survives a power loss. The correct response is to retry `sync`;
+  re-running the transaction appends a second marker for work that is already
+  recorded;
+- a failure of the created pathname's directory sync after the marker returns
+  `Error::PublishedButParentSyncPending`, described in the next section, and
+  leaves the request pending so a later `sync` retries it.
+
+This is the same published-outcome family as `PublishedButRebindFailed`,
+`MatrixCommittedButHookFailed` and `MatrixCommittedButDurabilityUnproven`: a
+caller that receives one of them must not treat the operation as
+not-performed.
+
 ## Created Pathname Durability
 
 Decision (DUR-01): `sync` and `commit_durable` establish the durability of a
@@ -214,6 +242,51 @@ network delivery, UI updates, or domain side effects.
 
 If the hook fails after durable commit, the data remains committed. The error is
 reported to the caller as a post-commit failure, not as a storage rollback.
+
+That distinction is now in the type, not only in this document (F-04). A hook
+failure returns
+`Error::MatrixCommittedButHookFailed { event: Box<MatrixCommitEvent>, source }`,
+the same shape as `PublishedButParentSyncPending` and
+`ReplacePublicationIndeterminate`. Retrying the whole call after this variant
+repeats the durable write and re-runs the hook, which is how a result-driven
+retry used to duplicate external work. The carried event is the one the hook
+was given; it is derived from layout geometry before the commit, so producing
+it can no longer fail for a cell that is already durable.
+
+The hook is not the only step after the commit. Walking forward from the
+authoritative commit — `commit_matrix_cell`, which puts the commit bit in the
+file — there are exactly two remaining steps, and *both* are published outcomes
+(round 11):
+
+1. the commit sync (`MatrixDurabilityBarrier::sync_matrix_commit`). Its failure
+   returns
+   `Error::MatrixCommittedButDurabilityUnproven { event: Box<MatrixCommitEvent>, source }`.
+   The cell **is** committed and a reader that opens the file after a clean
+   process exit sees it; what is unproven is only that the commit survives a
+   power loss. The hook does not run, so no notification was emitted. The
+   writer is poisoned, because a durability request was refused
+   mid-publication: recover by reopening the file and calling `sync`, then
+   issue the notification with the carried event. The cell does not need to be
+   rewritten. Until round 11 this returned a bare `Err`, which a caller could
+   not distinguish from "nothing happened" — the same defect as the hook one
+   step later, and the same shape as the `commit_durable` defect fixed in round
+   10;
+2. the hook, described above.
+
+The step *before* the commit — the data sync
+(`MatrixDurabilityBarrier::sync_matrix_data`) — is genuinely pre-publication:
+the slot bytes may be on disk but the commit bit is not, an uncommitted slot is
+invisible to readers, and its failure therefore stays a plain error. Both
+classifications are asserted by
+`crates/varve/tests/matrix.rs::a_commit_sync_failure_is_reported_as_published_and_a_data_sync_failure_is_not`,
+which also reads the cell back through a fresh reader to prove the published
+claim rather than only its shape.
+
+Those two variants are the only published outcomes of
+`write_matrix_cell_durable`. Every *other* error from it means the cell was not
+committed by that call, so a caller can decide between "nothing happened, retry
+the write", "committed, retry only the notification" and "committed,
+re-establish durability" from the result alone.
 
 ## Sync Granularity
 

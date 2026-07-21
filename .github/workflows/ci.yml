@@ -267,8 +267,18 @@ jobs:
   # `--document-private-items` is deliberately NOT used: the gate must evaluate
   # exactly the surface a user sees on docs.rs.
   #
-  # `--all-features` matches the docs.rs default for this project and is what
-  # makes feature-gated items (and the links into them) visible to the check.
+  # F-06: `--all-features` matches docs.rs *because the three publishable
+  # manifests say so*, not by coincidence. All three declare
+  # `[package.metadata.docs.rs] all-features = true`; without that declaration
+  # docs.rs would use its default selection, which for `default = []` is no
+  # optional feature at all, and every feature-gated public item would be
+  # absent from the published page while this job happily checked a surface no
+  # user sees. If that metadata is ever removed, this job stops gating docs.rs.
+  #
+  # The second step gates the *other* surface a user can compile: the crates
+  # with no optional feature enabled. It is not the docs.rs surface; it exists
+  # so a link that only resolves when some feature is on cannot break the
+  # minimal build.
   #
   # Rustdoc EXAMPLES are gated by the `test` jobs above, not here: the runner
   # forwards to plain `cargo test`, which compiles and runs doctests. That is
@@ -288,8 +298,10 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: rustdoc
-      - name: cargo doc
+      - name: cargo doc (docs.rs surface, all features)
         run: cargo doc --locked --workspace --all-features --no-deps
+      - name: cargo doc (minimal surface, no default features)
+        run: cargo doc --locked --workspace --no-default-features --no-deps
 
   # Release gate: audit/deny failures block the merge.
   supply-chain:
@@ -308,6 +320,52 @@ jobs:
         run: |
           cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION"
           cargo audit
+
+  # F-09 negative policy fixture. `deny.toml` enables `allow-wildcard-paths`,
+  # which is a CATEGORY allowance, not an allowance for the single
+  # `varve-macros` dev edge that motivated it. A passing `cargo deny check`
+  # proves the accepted shape is accepted; it proves nothing about what is
+  # still refused, so the two shapes the comment in `deny.toml` claims are
+  # DENIED are asserted here by introducing each one and requiring the gate to
+  # fail. Without this, silently widening the exception (or a cargo-deny
+  # behaviour change) would look exactly like a green build.
+  #
+  # Each mutation runs on a fresh checkout, so nothing is restored and no
+  # ordering between the two steps matters.
+  dependency-policy-fixture:
+    name: deny negative fixture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Introduce a registry wildcard in a published crate
+        run: |
+          set -euo pipefail
+          sed -i 's|^proptest\.workspace = true$|proptest = "*"|' crates/varve/Cargo.toml
+          grep -q 'proptest = "\*"' crates/varve/Cargo.toml
+      - id: registry-wildcard
+        continue-on-error: true
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check bans
+      - name: A registry wildcard must be denied
+        run: |
+          test "${{ steps.registry-wildcard.outcome }}" = "failure" \
+            || { echo "deny.toml accepted a registry wildcard"; exit 1; }
+      - name: Restore, then introduce a non-dev path wildcard in a published crate
+        run: |
+          set -euo pipefail
+          git checkout -- crates/varve/Cargo.toml
+          sed -i 's|^varve-core = { path = "\.\./varve-core", version = "[^"]*" }$|varve-core = { path = "../varve-core" }|' crates/varve/Cargo.toml
+          grep -q '^varve-core = { path = "\.\./varve-core" }$' crates/varve/Cargo.toml
+      - id: path-wildcard
+        continue-on-error: true
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check bans
+      - name: A non-dev path wildcard in a published crate must be denied
+        run: |
+          test "${{ steps.path-wildcard.outcome }}" = "failure" \
+            || { echo "deny.toml accepted a non-dev path wildcard from a published crate"; exit 1; }
 
   # REL-01 release gate: `fuzz/` is an independent workspace with its own
   # lockfile and its own license policy, so nothing in the root workspace jobs

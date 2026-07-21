@@ -850,6 +850,10 @@ std::thread_local! {
     static INJECTED_KEYED_TAIL_COMMIT_LOSSES: std::cell::Cell<u64> = const {
         std::cell::Cell::new(0)
     };
+    /// Armed post-commit-marker durability failures (round 10, invariant 3).
+    static INJECTED_COMMIT_DURABILITY_FAILURES: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 /// Consumes one armed keyed-tail reservation failure (API3-01).
@@ -901,6 +905,31 @@ fn take_injected_keyed_tail_commit_loss() -> bool {
     {
         false
     }
+}
+
+/// Consumes one armed post-commit-marker durability failure (round 10).
+///
+/// Models a `flush`/`fsync` that fails *after* the commit marker has been
+/// appended, which a real filesystem will not produce on demand. Inert without
+/// the `scalable-fault-injection` feature.
+#[inline]
+fn take_injected_commit_durability_failure() -> Result<()> {
+    #[cfg(feature = "scalable-fault-injection")]
+    {
+        let armed = INJECTED_COMMIT_DURABILITY_FAILURES.with(|count| {
+            let current = count.get();
+            if current != 0 {
+                count.set(current - 1);
+            }
+            current != 0
+        });
+        if armed {
+            return Err(Error::Io(std::io::Error::other(
+                "injected post-commit durability failure",
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1680,69 +1709,26 @@ impl VarveWriter {
         self.file.key_tail_offsets::<T>()
     }
 
-    /// Reserves - and charges - the caller-owned keyed-tail slot that the
-    /// append which follows will occupy (API3-02).
-    ///
-    /// This is the generated keyed writer's counterpart to
-    /// `VarveFile::reserve_keyed_tail_slot`. The generated writer owns a
-    /// `HashMap<T::Key, u64>` per keyed block and used to grow it with a bare
-    /// `HashMap::insert` *after* the append. That insert is infallible in
-    /// signature only: it can allocate, and an allocation the allocator
-    /// refuses aborts the process instead of returning a typed error, with no
-    /// configured limit able to refuse the growth first.
-    ///
-    /// Calling this before the append gives the growth both properties the
-    /// resident path already has:
-    ///
-    /// - it is **charged** against [`ReadLimits::max_keyed_tail_bytes`] (key
-    ///   [`ReadLimitKey::KeyedTailBytes`]) before the memory is taken, so
-    ///   policy - not just the allocator - can refuse it;
-    /// - it is **fallible before the record becomes authoritative**, so the
-    ///   post-append `insert` does not have to grow the map's own table and
-    ///   therefore cannot fail *for that reason* after the append it describes
-    ///   has succeeded (API3-01).
-    ///
-    /// F-03: that second property covers the map's inline table only. Because
-    /// this reservation cannot charge or reserve heap owned by `K` (see the
-    /// paragraph on inline storage below), a caller that has to *produce* the
-    /// owned key - `Clone`-ing a borrowed one, say - must do so **before** the
-    /// authoritative mutation and move the result in afterwards. A
-    /// heap-owning `K::Clone` can allocate, and a user-defined `Clone` can
-    /// panic; neither may run after the record is committed. The generated
-    /// keyed writers do exactly this in their `delete_*` methods.
-    ///
-    /// API3-05: this charges only the *incremental* growth. The map the
-    /// generated writer starts from is built at writer construction by
-    /// [`VarveFile::key_tail_offsets`], which charges its own peak against the
-    /// same key - so the ceiling bounds the whole map, not merely what the
-    /// session adds to it.
-    ///
-    /// A key already present in `tails` needs no capacity and is charged
-    /// nothing: its slot is overwritten in place. The charged value is the
-    /// inline storage `(len + 1) * size_of::<(K, u64)>()`. Unlike the resident
-    /// path it cannot observe heap owned by `K`, because the generated writer
-    /// stores `T::Key` rather than a canonical byte payload; the value is
-    /// therefore an inline-storage charge, not a whole-structure bound.
-    #[doc(hidden)]
-    pub fn reserve_keyed_tail_slot<K>(&self, tails: &mut HashMap<K, u64>, key: &K) -> Result<()>
-    where
-        K: Eq + Hash,
-    {
-        if tails.contains_key(key) {
-            return Ok(());
-        }
-        let requested =
-            allocation_bytes::<(K, u64)>(tails.len().saturating_add(1), "keyed tail offsets")?;
-        self.spec()
-            .read_limits
-            .check(ReadLimitKey::KeyedTailBytes, requested)?;
-        tails.try_reserve(1).map_err(|_| Error::AllocationFailed {
-            resource: "keyed tail offsets",
-            requested,
-        })?;
-        Ok(())
-    }
-
+    // F-01 (round 9): `VarveWriter::reserve_keyed_tail_slot` has been
+    // removed.
+    //
+    // It existed so a generated keyed writer could reserve a slot in its own
+    // `HashMap<T::Key, u64>` before the append that would fill it. That
+    // reserved the map's inline table, but it could not stop the *later*
+    // `HashMap::insert` from invoking the caller's `Hash` or `Eq` after the
+    // record was already authoritative - a stateful or panicking
+    // implementation could therefore fail after publication and leave the
+    // writer holding a stale predecessor, which makes the next same-key
+    // mutation link *around* the committed event.
+    //
+    // The generated writers no longer own a typed tail map at all. They route
+    // through `VarveWriter::push_keyed_info` and `VarveWriter::delete_info`,
+    // which maintain the same byte-keyed resident cache the generic keyed API
+    // uses (`VarveFile::push_keyed_info`): its keys are the canonical
+    // internal key payload, so the only step after the authoritative append is
+    // a `HashMap<Vec<u8>, u64>` insert into a slot reserved beforehand. No
+    // user-defined trait method can run there.
+    //
     pub fn push<T: VarveBlock>(&mut self, block: &T) -> Result<u64> {
         self.file.push(block)
     }
@@ -1786,6 +1772,29 @@ impl VarveWriter {
         T::Key: Eq + Hash,
     {
         self.file.delete::<T>(key)
+    }
+
+    /// Appends a tombstone through the maintained keyed path. See
+    /// [`VarveFile::delete_info`]. This is the entry point the generated
+    /// `delete_<block>` writer methods use.
+    pub fn delete_info<T>(&mut self, key: &T::Key) -> Result<AppendInfo>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
+    {
+        self.file.delete_info::<T>(key)
+    }
+
+    /// Builds `T`'s keyed tail map now. See [`VarveFile::prime_keyed_tails`].
+    /// The generated keyed writers call this once per keyed block at
+    /// construction.
+    #[doc(hidden)]
+    pub fn prime_keyed_tails<T>(&mut self) -> Result<()>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
+    {
+        self.file.prime_keyed_tails::<T>()
     }
 
     pub fn delete_with_prev_key_info<T>(
@@ -1922,6 +1931,22 @@ impl VarveWriter {
         self.file.commit_matrix_cell::<To>(key)
     }
 
+    /// Writes, syncs, commits, syncs the commit, then calls `hook`.
+    ///
+    /// The hook runs **after** the cell is committed and durable. If it
+    /// returns an error the write is *not* rolled back: the failure is
+    /// reported as [`Error::MatrixCommittedButHookFailed`], carrying the
+    /// [`MatrixCommitEvent`] the hook was given, so a caller can retry the
+    /// notification alone. Retrying the whole call instead repeats the durable
+    /// write and re-runs the hook.
+    ///
+    /// If the durability request that follows the commit fails, the cell is
+    /// still committed and the hook is not run; that is reported as
+    /// [`Error::MatrixCommittedButDurabilityUnproven`], also carrying the
+    /// event.
+    ///
+    /// Those two variants are the only published outcomes of this call. Every
+    /// other error variant means the cell was not committed by this call.
     pub fn write_matrix_cell_durable<T, F>(
         &mut self,
         key: MatrixKey,
@@ -1935,6 +1960,10 @@ impl VarveWriter {
         self.file.write_matrix_cell_durable(key, value, hook)
     }
 
+    /// [`Self::write_matrix_cell_durable`] with a caller-supplied durability
+    /// barrier; the same post-commit contract applies, including
+    /// [`Error::MatrixCommittedButHookFailed`] and
+    /// [`Error::MatrixCommittedButDurabilityUnproven`].
     pub fn write_matrix_cell_durable_with_barrier<T, B, F>(
         &mut self,
         key: MatrixKey,
@@ -2725,20 +2754,60 @@ impl VarveFile {
         T: VarveKeyedBlock,
         T::Key: Eq + Hash,
     {
+        Ok(self.delete_info::<T>(key)?.sequence)
+    }
+
+    /// Appends a tombstone for `key` and returns the full [`AppendInfo`].
+    ///
+    /// This is [`VarveFile::delete`] with the append description the generated
+    /// keyed writers return, and it is the single implementation both routes
+    /// use. Its ordering is the one property that matters: every fallible step
+    /// (the tail-map build, the key encoding, the slot charge and reservation)
+    /// happens strictly before the tombstone is appended, and the only step
+    /// after the authoritative mutation is the infallible, allocation-free,
+    /// user-code-free `VarveFile::commit_keyed_tail` (invariant 3).
+    pub fn delete_info<T>(&mut self, key: &T::Key) -> Result<AppendInfo>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
+    {
         let () = crate::traits::KeyedBlockContract::<T>::OK;
         if !self.spec.index_policy.keyed_offset_chain {
-            return Ok(self
-                .delete_with_prev_key_info_unlinked::<T>(key, None)?
-                .sequence);
+            return self.delete_with_prev_key_info_unlinked::<T>(key, None);
         }
         self.ensure_write()?;
+        // The tombstone payload *is* the canonical internal key payload, and
+        // it is also the tail map's key. Encoding it once here and handing the
+        // same bytes to both consumers keeps the delete path at one key
+        // encoding per record; it used to encode twice.
         let key_payload = encode_internal_key_payload::<T>(self.spec, key)?;
         // API3-01: reserve before the tombstone becomes authoritative; see
         // [`VarveFile::reserve_keyed_tail_slot`].
         let previous = self.reserve_keyed_tail_slot::<T>(&key_payload)?;
-        let info = self.delete_with_prev_key_info_unlinked::<T>(key, previous)?;
+        let info = self.write_tombstone_payload::<T>(&key_payload, previous)?;
         self.commit_keyed_tail(T::ID, key_payload, info.record_offset);
-        Ok(info.sequence)
+        Ok(info)
+    }
+
+    /// Builds the keyed tail map for `T` now rather than on first keyed
+    /// mutation (F-01).
+    ///
+    /// The generated keyed writers call this at construction, which is where
+    /// they have always paid for their tail map: a file whose distinct key
+    /// count exceeds [`crate::ReadLimits::max_keyed_tail_bytes`] is refused when the
+    /// writer opens, not on some later append. Formats without
+    /// `keyed_offset_chain` maintain no map at all, so this does nothing for
+    /// them and allocates nothing.
+    pub fn prime_keyed_tails<T>(&mut self) -> Result<()>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
+    {
+        if !self.spec.index_policy.keyed_offset_chain {
+            return Ok(());
+        }
+        self.keyed_tail_map::<T>()?;
+        Ok(())
     }
 
     pub fn delete_with_prev_key_info<T>(
@@ -2772,12 +2841,33 @@ impl VarveFile {
         self.ensure_user_block::<T>()?;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         let payload = encode_internal_key_payload::<T>(self.spec, key)?;
+        self.write_tombstone_payload::<T>(&payload, prev_same_key_offset)
+    }
+
+    /// Appends a tombstone whose canonical internal key payload is already
+    /// encoded.
+    ///
+    /// Split out of `delete_with_prev_key_info_unlinked` so the maintained
+    /// delete path can encode the key exactly once and use the same bytes for
+    /// the tail map and for the record.
+    fn write_tombstone_payload<T>(
+        &mut self,
+        payload: &[u8],
+        prev_same_key_offset: Option<u64>,
+    ) -> Result<AppendInfo>
+    where
+        T: VarveKeyedBlock,
+    {
+        let () = crate::traits::KeyedBlockContract::<T>::OK;
+        self.ensure_write()?;
+        self.ensure_user_block::<T>()?;
+        crate::collections::ensure_registered_block::<T>(self.spec)?;
         self.write_record_with_prev_key(
             TOMBSTONE_BLOCK_ID,
             1,
             RECORD_FLAG_INTERNAL,
             0,
-            &payload,
+            payload,
             prev_same_key_offset,
         )
     }
@@ -3491,10 +3581,37 @@ impl VarveFile {
         self.file.flush()?;
         self.file.sync_data()?;
         let info = self.write_commit_marker()?;
-        self.file.flush()?;
-        self.file.sync_all()?;
+        // INVARIANT 3: `write_commit_marker` is the authoritative commit. From
+        // here the marker record is in the file and a reader that opens it
+        // after a clean process exit sees the transaction as committed, so a
+        // failure of the durability request that follows must not be reported
+        // as a bare `Err` — that would entitle the caller to believe nothing
+        // happened and re-run the transaction, appending a second marker for
+        // work already recorded. Both remaining steps therefore report typed
+        // published outcomes: content durability as
+        // `CommittedButDurabilityUnproven`, and the created pathname's
+        // directory entry as `PublishedButParentSyncPending`, which
+        // `sync_created_pathname_once` already produces and which leaves the
+        // request pending so a later `sync` retries it.
+        if let Err(source) = self.flush_and_sync_all() {
+            return Err(Error::CommittedButDurabilityUnproven {
+                sequence: info.sequence,
+                source: Box::new(source),
+            });
+        }
         self.sync_created_pathname_once()?;
         Ok(info)
+    }
+
+    /// Flushes the buffered writer and syncs the file contents.
+    ///
+    /// Split out so the post-commit-marker durability request in
+    /// [`Self::commit_durable`] has exactly one failure point to classify.
+    fn flush_and_sync_all(&mut self) -> Result<()> {
+        take_injected_commit_durability_failure()?;
+        self.file.flush()?;
+        self.file.sync_all()?;
+        Ok(())
     }
 
     /// Requests durable persistence of everything written so far.
@@ -3710,9 +3827,10 @@ impl VarveFile {
     /// the configured ceiling bounds the **peak** of the build and not merely
     /// what is retained afterwards.
     ///
-    /// This is the entry point the generated keyed writers use to populate
-    /// their tail maps at construction (`writer_tail_inits`), and the one
-    /// `VarveFile::keyed_tail_map` uses to seed the resident cache. Before
+    /// This is the entry point `VarveFile::keyed_tail_map` uses to seed the
+    /// resident keyed-tail cache - the cache the generic keyed API maintains
+    /// and the one the generated keyed writers prime at construction through
+    /// [`VarveFile::prime_keyed_tails`] (F-01). Before
     /// this charge existed, both were guarded by `try_reserve` alone: a file
     /// with `N` distinct keys forced an `N`-entry resident map whatever the
     /// configured ceiling said, and `max_keyed_tail_bytes` - including
@@ -3729,9 +3847,11 @@ impl VarveFile {
     /// the steady-state map costs; the charge is a conservative model of what
     /// is actually allocated, not of what survives.
     ///
-    /// Like the incremental generated-writer charge it can only account for
-    /// inline storage, because the map holds `T::Key` rather than a canonical
-    /// byte payload; heap owned by a `T::Key` is not charged here.
+    /// This build can only account for inline storage, because the map it
+    /// returns holds `T::Key` rather than a canonical byte payload; heap owned
+    /// by a `T::Key` is not charged here. The *retained* cache this seeds is
+    /// byte-keyed, and its charge does include the key payload heap it owns
+    /// (see `KeyedTailMap::charge_for`).
     pub fn key_tail_offsets<T>(&self) -> Result<HashMap<T::Key, u64>>
     where
         T: VarveKeyedBlock,
@@ -3870,6 +3990,23 @@ impl VarveFile {
         self.commit_matrix_cell::<To>(key)
     }
 
+    /// Writes, syncs, commits, syncs the commit, then calls `hook`.
+    ///
+    /// The hook runs **after** the cell is committed and durable, so its
+    /// failure cannot un-commit the cell. It is therefore reported as the
+    /// typed published outcome [`Error::MatrixCommittedButHookFailed`],
+    /// carrying the [`MatrixCommitEvent`] the hook was given.
+    ///
+    /// The commit sync is the only other step after the commit, and it is
+    /// governed the same way (round 11): if it fails the cell is committed but
+    /// its durability is unproven and the hook has not run, which is reported
+    /// as [`Error::MatrixCommittedButDurabilityUnproven`], again carrying the
+    /// event.
+    ///
+    /// Every other error variant means the cell was not committed by this
+    /// call, so a result-driven retry can distinguish "nothing happened, retry
+    /// the write" from "committed, retry only the notification" and from
+    /// "committed, re-establish durability".
     pub fn write_matrix_cell_durable<T, F>(
         &mut self,
         key: MatrixKey,
@@ -3884,6 +4021,10 @@ impl VarveFile {
         self.write_matrix_cell_durable_with_barrier(key, value, &mut barrier, hook)
     }
 
+    /// [`Self::write_matrix_cell_durable`] with a caller-supplied durability
+    /// barrier; the same post-commit contract applies, including
+    /// [`Error::MatrixCommittedButHookFailed`] and
+    /// [`Error::MatrixCommittedButDurabilityUnproven`].
     pub fn write_matrix_cell_durable_with_barrier<T, B, F>(
         &mut self,
         key: MatrixKey,
@@ -3896,15 +4037,56 @@ impl VarveFile {
         B: MatrixDurabilityBarrier + ?Sized,
         F: FnOnce(MatrixCommitEvent) -> Result<()>,
     {
+        // INVARIANT 3 (F-04). The commit event is pure layout geometry - block
+        // index, ordinal, slot offset and stride - so it is derived *before*
+        // the authoritative commit rather than after it. Previously
+        // `commit_event` ran after the commit was durable and could return a
+        // bare `Err` (fatal-forensics gating, block lookup, ordinal
+        // arithmetic) for a cell that was already committed and synced.
+        let event = {
+            let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
+            crate::matrix::commit_event::<T>(self.spec, matrix, key)?
+        };
         self.write_matrix_cell(key, value)?;
+        // Pre-publication. Nothing is committed yet, so a failure here is a
+        // plain refusal: the slot bytes may be on disk but the commit bit is
+        // not, and an uncommitted slot is not visible to any reader.
         let sync_data = barrier.sync_matrix_data(&mut self.file);
         self.poison_after_started_matrix_error(sync_data)?;
+        // THE AUTHORITATIVE COMMIT. `commit_matrix_cell` puts the commit bit in
+        // the file; from this line on the cell is committed and a reader that
+        // opens the file after a clean process exit sees it. INVARIANT 3
+        // therefore governs *every* remaining step of this function, and there
+        // are exactly two: the commit sync and the hook. Both report typed
+        // published outcomes; nothing else follows them.
         self.commit_matrix_cell::<T>(key)?;
-        let sync_commit = barrier.sync_matrix_commit(&mut self.file);
-        self.poison_after_started_matrix_error(sync_commit)?;
-        let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
-        let event = crate::matrix::commit_event::<T>(self.spec, matrix, key)?;
-        hook(event)
+        // Step 1 of 2 after the commit (round 11). This used to return a bare
+        // `Err` (poison only), which is indistinguishable from "nothing
+        // happened" even though the cell is committed and readable - the same
+        // defect as F-04 one step earlier, and the same shape the round-10
+        // sweep fixed in `commit_durable`. It now reports the matrix twin of
+        // `CommittedButDurabilityUnproven`, carrying the committed event so
+        // the caller can issue the notification after re-establishing
+        // durability instead of repeating the write. Poisoning is retained: a
+        // refused durability request mid-publication leaves this handle unfit
+        // to continue, and the recovery is to reopen and `sync`.
+        if let Err(source) = barrier.sync_matrix_commit(&mut self.file) {
+            self.poisoned = true;
+            return Err(Error::MatrixCommittedButDurabilityUnproven {
+                event: Box::new(event),
+                source: Box::new(source),
+            });
+        }
+        // Step 2 of 2. The cell is committed and durable from here on. The hook is the
+        // documented post-publication notification step, so its failure is a
+        // *published* outcome, not a rollback: it is reported as
+        // `Error::MatrixCommittedButHookFailed` carrying the committed event,
+        // so a caller can retry the notification alone instead of repeating
+        // the durable write and duplicating the hook's external work.
+        hook(event.clone()).map_err(|source| Error::MatrixCommittedButHookFailed {
+            event: Box::new(event),
+            source: Box::new(source),
+        })
     }
 
     pub fn read_matrix_cell<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<T> {
@@ -4277,6 +4459,21 @@ impl VarveFile {
         INJECTED_KEYED_TAIL_COMMIT_LOSSES.with(|armed| armed.set(count));
     }
 
+    /// Arms `count` injected post-commit-marker durability failures (round 10).
+    ///
+    /// Fault-testing hook only: each armed failure makes the next
+    /// [`Self::commit_durable`] fail its `flush`/`sync_all` *after* the commit
+    /// marker has been appended. The observable contract under this fault is
+    /// that the caller receives [`Error::CommittedButDurabilityUnproven`]
+    /// rather than a bare `Err`, because the marker bytes are in the file and
+    /// re-running the transaction would append a second marker for work that
+    /// is already recorded. Thread-local.
+    #[cfg(feature = "scalable-fault-injection")]
+    #[doc(hidden)]
+    pub fn inject_commit_durability_failures(count: u64) {
+        INJECTED_COMMIT_DURABILITY_FAILURES.with(|armed| armed.set(count));
+    }
+
     /// Returns the cumulative number of resident index entries this thread's
     /// checkpoint flush-cadence machinery has examined (PERF2-02).
     ///
@@ -4618,6 +4815,36 @@ impl VarveFile {
         error
     }
 
+    /// Classifies the outcome of a matrix mutation and poisons the writer when
+    /// the failure could have left disk and memory disagreeing.
+    ///
+    /// INVARIANT 3. The narrow [`Error::Io`] predicate is **deliberate**, and
+    /// round 10 re-derived it rather than inheriting it. The review's F-03
+    /// offered two corrections — prepare the allocation before the disk write,
+    /// or poison on every error raised after on-disk mutation begins — and the
+    /// first was taken. That choice is what makes this predicate correct: every
+    /// disk write in `crate::matrix` is now paired with an *infallible*
+    /// in-memory install (`commit_byte_write`, `commit_current_write_bit`, the
+    /// page-index mirror resynchronisation), so a matrix mutation is a sequence
+    /// of individually atomic sub-steps. A typed refusal raised between two of
+    /// them — `LimitExceeded` from a later page charge, `AllocationFailed` from
+    /// a later first-touch page, `InvalidMatrixLayout` from later geometry —
+    /// leaves the file and memory agreeing on everything the earlier sub-steps
+    /// did, so the writer stays usable and the caller can retry. That contract
+    /// is asserted by
+    /// `matrix_integrity_scaling.rs::a_failed_page_allocation_cannot_leave_a_bit_on_disk`,
+    /// which injects exactly such a failure at both first-touch boundaries and
+    /// requires the same writer to keep working.
+    ///
+    /// Poisoning on *any* post-write error was implemented and rejected on that
+    /// evidence: it converts those clean refusals into an unusable writer.
+    /// `Error::Io` remains the right trigger because a failed write is the one
+    /// case where what reached the file is unknown.
+    ///
+    /// The obligation this leaves on future work is therefore not "widen the
+    /// predicate" but "keep the pairing": any new fallible step placed *between*
+    /// a matrix disk write and its in-memory twin reopens F-03, and must be
+    /// moved ahead of the write instead.
     fn finish_matrix_mutation<T>(&mut self, result: Result<T>) -> Result<T> {
         if matches!(&result, Err(Error::Io(_))) {
             self.poisoned = true;
@@ -4625,6 +4852,17 @@ impl VarveFile {
         result
     }
 
+    /// Poisons on *any* error from a durability barrier phase of a durable
+    /// matrix write.
+    ///
+    /// Stricter than [`Self::finish_matrix_mutation`] on purpose: these phases
+    /// bracket the authoritative commit, so an error means a durability request
+    /// was refused mid-publication and this handle is unfit to continue. Since
+    /// round 11 the only caller is the **pre**-commit data sync, whose failure
+    /// is a plain refusal (nothing is published yet). The post-commit sync
+    /// poisons at its own call site so it can return the typed published
+    /// outcome [`Error::MatrixCommittedButDurabilityUnproven`] instead of the
+    /// bare error this helper propagates; do not route it back through here.
     fn poison_after_started_matrix_error<T>(&mut self, result: Result<T>) -> Result<T> {
         if result.is_err() {
             self.poisoned = true;
@@ -9580,6 +9818,160 @@ fn crc32_record_bytes(_header: &[u8], _payload: &[u8], _footer: &[u8]) -> Result
     Err(Error::IntegrityFeatureDisabled)
 }
 
+/// Opens the diagnostic `<target>.lock` marker for mutation, refusing any
+/// object that is not a dedicated, unaliased regular file (F-07).
+///
+/// Acquiring the marker truncates it and writes pid/target metadata through
+/// the handle, and dropping the lock truncates it again. Those writes must
+/// never reach an object the marker path merely *points at*. Two aliasing
+/// shapes are refused, on both platforms:
+///
+/// * a final-component symbolic link / reparse point, which would redirect the
+///   writes to an arbitrary target. Unix refuses at `open` with `O_NOFOLLOW`;
+///   Windows opens the reparse point itself with `FILE_FLAG_OPEN_REPARSE_POINT`
+///   (so no write can reach the target) and then rejects it by attribute.
+/// * a hard link, i.e. a marker object with more than one name. The extra name
+///   is another path whose content this truncation would destroy.
+///
+/// Anything that is not a regular file (a directory, or on Unix a device or
+/// FIFO) is refused for the same reason.
+///
+/// This is hardening of a *diagnostic* object only. Authoritative
+/// single-writer exclusion is a native lock on the target file object
+/// ([`probe_native_target_lock`]) and never depended on the marker, so a
+/// refusal here removes no exclusion strength - it converts a silent foreign
+/// write into [`Error::WriterLockMarkerNotDedicated`].
+fn open_dedicated_lock_marker(path: &Path) -> Result<File> {
+    let file = open_lock_marker_without_following(path)?;
+    verify_dedicated_lock_marker(path, &file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_lock_marker_without_following(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        // `O_NOFOLLOW` on a symlinked final component reports ELOOP on Linux
+        // and EMLINK on some BSDs. Both mean the same thing here.
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK)) => {
+            Err(Error::WriterLockMarkerNotDedicated {
+                path: path.display().to_string(),
+                reason: "the final path component is a symbolic link",
+            })
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(windows)]
+fn open_lock_marker_without_following(path: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    // Opening the reparse point itself rather than its target guarantees that
+    // no write performed through this handle can reach the target, whatever
+    // `verify_dedicated_lock_marker` then decides. The flag is ignored for an
+    // ordinary file and for the creating case.
+    Ok(OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_lock_marker_without_following(path: &Path) -> Result<File> {
+    // INVARIANT 5: refuse explicitly rather than silently offering weaker
+    // protection on a platform where neither guarantee can be expressed.
+    let _ = path;
+    Err(Error::WriterLockMarkerNotDedicated {
+        path: path.display().to_string(),
+        reason: "this platform cannot open the marker without following links",
+    })
+}
+
+#[cfg(unix)]
+fn verify_dedicated_lock_marker(path: &Path, file: &File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::WriterLockMarkerNotDedicated {
+            path: path.display().to_string(),
+            reason: "the marker path does not name a regular file",
+        });
+    }
+    if metadata.nlink() != 1 {
+        return Err(Error::WriterLockMarkerNotDedicated {
+            path: path.display().to_string(),
+            reason: "the marker object has more than one hard link",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_dedicated_lock_marker(path: &Path, file: &File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        GetFileInformationByHandle,
+    };
+
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // The handle belongs to `file`, the output points to initialized writable
+    // storage, and the OS call does not outlive either value.
+    let ok =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, information.as_mut_ptr()) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // A successful call initializes every field of BY_HANDLE_FILE_INFORMATION.
+    let information = unsafe { information.assume_init() };
+    if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(Error::WriterLockMarkerNotDedicated {
+            path: path.display().to_string(),
+            reason: "the final path component is a reparse point",
+        });
+    }
+    if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        return Err(Error::WriterLockMarkerNotDedicated {
+            path: path.display().to_string(),
+            reason: "the marker path does not name a regular file",
+        });
+    }
+    // `nNumberOfLinks` is supported by NTFS and ReFS; filesystems that cannot
+    // report it (some network redirectors) return 1, which is the same answer
+    // an unaliased file gives, so this check never becomes stricter than the
+    // filesystem can substantiate.
+    if information.nNumberOfLinks != 1 {
+        return Err(Error::WriterLockMarkerNotDedicated {
+            path: path.display().to_string(),
+            reason: "the marker object has more than one hard link",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn verify_dedicated_lock_marker(path: &Path, _file: &File) -> Result<()> {
+    Err(Error::WriterLockMarkerNotDedicated {
+        path: path.display().to_string(),
+        reason: "this platform cannot prove the marker is a dedicated regular file",
+    })
+}
+
 #[derive(Debug)]
 pub(crate) struct WriterLock {
     file: File,
@@ -9601,12 +9993,9 @@ impl WriterLock {
         policy: WriterLockBreakPolicy,
     ) -> Result<Self> {
         let path = lock_path(target_path);
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        // F-07: acquisition truncates and rewrites this object, so it must be
+        // a dedicated, unaliased regular file before anything is mutated.
+        let mut file = open_dedicated_lock_marker(&path)?;
         match try_lock_writer_guard(&file) {
             Ok(()) => {}
             Err(WriterGuardLockError::WouldBlock) => {

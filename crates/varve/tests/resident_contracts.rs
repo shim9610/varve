@@ -39,15 +39,19 @@ varve_format! {
     }
 }
 
-// API3-02: the generated keyed writer stores `T::Key` rather than a canonical
-// byte payload, so its charge is inline storage only - a different (smaller)
-// per-entry cost that needs its own budget to sit on the same boundary.
+// API3-02, updated round 9 (F-01): the generated keyed writer no longer owns a
+// `HashMap<T::Key, u64>` of its own. It routes through the same byte-keyed
+// resident tail cache the generic keyed API uses, so its per-entry charge is
+// identical to `ResidentTailBudgetFormat`'s below - inline `(Vec<u8>, u64)`
+// storage plus the canonical key payload bytes the map owns. The budget here is
+// therefore the same 120 bytes, which admits the first two distinct `u64` keys
+// (52, then 104) and refuses the third (156).
 varve_format! {
     pub format GeneratedTailBudgetFormat {
         magic: b"GENBGT";
         version: 1;
         limits {
-            keyed_tail: 40;
+            keyed_tail: 120;
         }
         index: keyed_offset_chain;
         blocks {

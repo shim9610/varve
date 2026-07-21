@@ -53,6 +53,20 @@ On test or command failure the runner deliberately retains the session and
 prints its absolute path. This preserves the files needed for diagnosis. A
 later run never reuses that path.
 
+Retention preserves *evidence*, so a failed session that produced no files at
+all is removed instead of retained, and the runner says so rather than printing
+a path to an empty directory (F-10). The same rule applies on every path that
+leaves the runner without reaching either outcome — an early I/O error, a
+panic, or a directly executed test binary in `tools/varve-test-runner`, which
+creates real sessions in the real temp directory: dropping an untouched session
+removes it, dropping one that holds artifacts keeps it. Removal is best effort;
+if it cannot be proved to have happened, the path is retained and printed,
+because losing a directory that might hold evidence is the worse error.
+
+The policy this makes literally true is "a run that produced nothing leaves no
+session path". Before it, a failed or interrupted run could deposit a zero-byte
+`varve-test-session-*` directory that no later run ever collected.
+
 Process-interruption tests place child artifacts under the inherited session;
 the parent test owns their lifecycle.
 

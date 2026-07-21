@@ -26,8 +26,12 @@ typed error rather than migrated in place. See **Breaking** below.
   becomes authoritative, and the post-append step stays infallible. `STANDARD`
   leaves the ceiling at `u64::MAX`; `UNTRUSTED` sets it to 256 MiB. Repeating an
   existing key is charged nothing.
-- `VarveWriter::reserve_keyed_tail_slot` (`#[doc(hidden)]`), the entry point the
-  generated keyed writers call for the charge above.
+  Note the shape of that charge changed again in round 9 below: the generated
+  writers no longer keep their own typed map, so both routes charge inline
+  storage *plus* the key payload bytes retained. `reserve_keyed_tail_slot`,
+  added earlier in this release cycle as the generated writers' entry point for
+  the charge, does not ship — it was removed in round 9 with the typed map it
+  served.
 - `docs/invariant-checklist.md`: the five invariants every structure this
   project adds must satisfy, the inventory of everything added in the 0.3.0 and
   0.4.0 stabilization rounds, and each entry's audited status.
@@ -718,6 +722,167 @@ typed error rather than migrated in place. See **Breaking** below.
   directory (`/tmp` without the sticky bit reserving entries to their owner)
   therefore now leaves its artifact behind and says so. Use a directory only the
   running user can write, or `.cleanup(false)` and remove the artifact yourself.
+
+### Fixed (invariant re-verification, round 9)
+
+Round 9 answered the round-8 review
+(`docs/performance-stability-review-2026-07-21-8732e83-final.md`). All three of
+its release blockers were the same defect class — invariant 3, a fallible or
+user-code-invoking step placed after the authoritative commit it belongs to —
+so each was closed structurally rather than patched at the named line.
+
+- Generated keyed writers no longer own a `HashMap<T::Key, u64>` tail map
+  (F-01). Push and delete inserted into it *after* the record or tombstone was
+  authoritative, so the caller's `Hash`/`Eq` ran after publication and a
+  panicking implementation left a durable record with a stale tail map — the
+  next same-key mutation could then link *around* the committed event. The
+  generated writers now route through the same byte-keyed resident cache the
+  generic keyed API uses, so no user-defined trait executes after publication
+  on any keyed path, and the two routes can no longer drift apart. Side effects:
+  the generated writers now charge the key payload bytes they retain, not just
+  inline storage (closing the round-7 open item); key identity on the generated
+  path is canonical-encoding equality rather than the key type's `Eq`, which is
+  the semantics the generic path always had; a generated writer for a format
+  without `keyed_offset_chain` builds no tail map at all; and the delete path
+  encodes the key once instead of twice.
+  `VarveWriter::reserve_keyed_tail_slot` is **removed** — its own rustdoc
+  admitted it could not prevent a later `Hash`/`Eq`, which is exactly the
+  defect.
+- The matrix commit-map rebuild publishes a page-index *generation* instead of
+  editing one (F-02). It used to zero the persisted page index and refill it
+  entry by entry, so an interruption left a valid-looking short occupancy count
+  that is indistinguishable from "those pages were never published": committed
+  cells reopened as `NotCommitted` with no finding at all. The rebuild now
+  writes `u64::MAX` into the occupancy header and syncs that slot **before**
+  destroying anything, clears and refills only the entry region, makes every
+  entry, digest and page durable, and writes the real count last as the single
+  publishing write. A matrix left holding the marker opens with a `Fatal`
+  `MatrixCorruptionKind::CommitMap` finding whose report now recommends
+  `RebuildCommitMap`. **No wire-format or layout-version bump**: the marker is
+  never a resting state and is provably not a representable occupancy count at
+  any capacity, so a reader that predates it rejects it as a damaged header —
+  also fail-closed. `VMAT` stays at version 4 and no fixture changed.
+- Sparse-bitmap page allocation happens before the disk write, not after it
+  (F-03). `apply_commit_bit` wrote the bitmap byte to disk and only then called
+  `SparseBitmap::set_byte`, which for the first nonzero byte on a page still
+  performed fallible page allocation; an `AllocationFailed` there left disk
+  holding the new bit while memory held the old byte, on a writer that ordinary
+  matrix mutation handling does not poison (it poisons only for `Error::Io`).
+  `set_byte` is split into `prepare_byte_write` (every fallible and allocating
+  step, producing a detached page) and an infallible, allocation-free
+  `commit_byte_write`. The failure is removed rather than handled. The same
+  shape was found and fixed in `apply_cell_crc_valid` and in the session
+  write-tracking bit of `write_cell`/`write_cell_payload`, neither of which the
+  review named: a resident-bitmap budget refusal could previously return
+  `LimitExceeded` with the commit bit, validity bit and slot payload already
+  durable.
+- `write_matrix_cell_durable` reports a post-commit hook failure as the typed
+  published outcome `Error::MatrixCommittedButHookFailed { event, source }`
+  (F-04). The hook is documented as post-publication and the behaviour was
+  intentional, but a plain `Result<()>` could not distinguish "failed before
+  publication" from "published, hook failed", so a result-driven retry could
+  duplicate the hook's external work. The carried `MatrixCommitEvent` lets a
+  caller retry the notification alone. The event is also now derived from
+  layout geometry *before* the commit rather than after it, so `commit_event`
+  can no longer fail for a cell that is already durable.
+- `commit_durable` reports a durability failure that happens *after* the commit
+  marker is appended as the typed published outcome
+  `Error::CommittedButDurabilityUnproven { sequence, source }` (round 10,
+  invariant 3). `write_commit_marker` is the authoritative commit — once the
+  marker bytes are in the file a reader that opens it after a clean process
+  exit sees the transaction as committed — but the `flush`/`sync_all` that
+  follows returned a bare `Err`, which entitles a caller to believe nothing
+  happened and re-run the transaction, appending a second marker for work that
+  is already recorded. The correct response to the new variant is to retry
+  `sync` alone. The created-pathname sync after it already reported
+  `PublishedButParentSyncPending` and is unchanged. This was open item 9 in
+  `docs/invariant-checklist.md`.
+- `write_matrix_cell_durable` reports a failure of the durability request that
+  follows the commit as the typed published outcome
+  `Error::MatrixCommittedButDurabilityUnproven { event, source }` (round 11,
+  invariant 3). Round 9 typed the hook, which is the *last* step after the
+  commit; the step immediately before it —
+  `MatrixDurabilityBarrier::sync_matrix_commit` — still returned a bare `Err`
+  even though `commit_matrix_cell` had already put the commit bit in the file
+  and the cell was readable by a fresh reader after a clean exit. Those two are
+  now the call's only published outcomes and the forward walk from the commit
+  is complete; the pre-commit `sync_matrix_data` deliberately stays a plain
+  error because nothing is published when it runs. The variant carries the same
+  `MatrixCommitEvent`, the hook does not run, and the writer is poisoned, so
+  recovery is to reopen and `sync` rather than to rewrite the cell.
+  `docs/durability-model.md` previously claimed every error other than the hook
+  variant meant the cell was not committed; that claim was false for this step
+  and is corrected in the same pass.
+- Every fallible step of a stream/indexed sidecar chunk commit that runs after
+  the chunk's records are already in the native file now reports the typed
+  published outcome `Error::PublishedButIndexStale { sequence, source }` and
+  poisons the writer (round 11, invariant 3). Only the sidecar transaction's
+  own `commit()` did so before; the primary-generation restamp that precedes it
+  (`VarveStreamWriter::commit_state_chunk` and
+  `VarveIndexedWriter::commit_pending_batch`) returned a bare `Err`, and it runs
+  on ordinary chunk boundaries for the whole early life of a file — while the
+  generation witness window is still filling. A caller entitled to read `Err` as
+  "nothing happened" would retry and append the same records twice. The
+  classification now wraps the whole body of both functions rather than
+  individual steps, so a fallible step added to either path later is covered
+  without anyone remembering to wrap it. **Behavioural change:** a sidecar
+  failure on these paths that previously surfaced as `Error::Io` (or another
+  plain variant) is now the wrapper, with the original in `source`.
+- The batch summary a partially published `push_iter` hands back through
+  `BatchAppendError::written` is derived before the native write and assigned
+  after it (round 11, invariant 3). Its checked arithmetic used to run *after*
+  the chunk was published, at four call sites in `VarveStreamWriter` and
+  `VarveIndexedWriter`, and a failure there returned a bare `Err` with a summary
+  that under-reports what reached the file — the same value `push_iter` uses to
+  decide whether the writer must be poisoned.
+- The CRC rebuild charges its bitmap page before allocating it (F-05), so the
+  ceiling is a strict pre-allocation limit rather than a report issued once one
+  page is already resident.
+- All three publishable manifests declare
+  `[package.metadata.docs.rs] all-features = true` (F-06). They have
+  `default = []` and no docs.rs metadata, so docs.rs built the published
+  documentation with **no** optional feature enabled while the CI rustdoc job
+  claimed `--all-features` matched it; feature-gated public items could be
+  absent from the published pages. CI now also gates the no-default-feature
+  surface, and its comment states which gate covers which surface.
+- The diagnostic `<target>.lock` marker is verified to be a dedicated,
+  unaliased regular file before it is truncated or written (F-07). Acquisition
+  truncates and rewrites the object the marker path names, so a pre-placed hard
+  link — or a followed symbolic link — from that path to an unrelated empty
+  file caused transient writes and truncation of that foreign object. Unix
+  opens with `O_NOFOLLOW`, Windows opens the reparse point itself with
+  `FILE_FLAG_OPEN_REPARSE_POINT` and rejects it by attribute, and both then
+  refuse a multi-link or non-regular object with the new
+  `Error::WriterLockMarkerNotDedicated { path, reason }`. This never affected
+  authoritative single-writer exclusion, which is a native lock on the target
+  file object itself.
+- `deny.toml` describes the actual scope of `allow-wildcard-paths` (F-09). The
+  previous comment claimed it permitted only the one `varve-macros` path
+  dev-dependency edge; re-derived against cargo-deny 0.19.9, it also permits
+  path dependencies of *any* kind from crates with `publish = false`. Registry
+  wildcards and non-dev path wildcards from published crates remain denied, and
+  a new `dependency-policy-fixture` CI job asserts both refusals by introducing
+  each shape and requiring the gate to fail.
+- The test runner no longer retains an empty session directory (F-10).
+  Retention preserves evidence, and a failed or interrupted run that produced
+  no files has none; an empty `varve-test-session-*` directory is now removed,
+  on the failure path and on drop, so the documented "a run that produced
+  nothing leaves no session path" policy is literally true. A session holding
+  artifacts is never removed.
+
+### Documentation (round 9)
+
+- `docs/custom-codec-guide.md` states the allocation-charging obligation
+  (F-08): every owned allocation whose size comes from input must be charged
+  with `Decoder::charge_materialization` *before* it is reserved. `VarveDecode`
+  cannot enforce this, and custom codecs are trusted format-author code, so the
+  guide now carries a minimal compliant example and a negative self-test that
+  distinguishes a charged codec from an uncharged one — the two are
+  indistinguishable on well-formed input. The example is compiled and its
+  self-test run by `crates/varve/tests/storage_hardening.rs`.
+- `docs/api-reference.md` no longer says the generated keyed writers charge
+  inline storage only; both routes now charge inline storage plus the key
+  payload bytes the map owns.
 
 ### Fixed (invariant re-verification, round 7)
 

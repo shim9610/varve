@@ -742,15 +742,30 @@ fn matrix_p1_p2_extension_points_are_usable() -> varve::Result<()> {
                 Ok(())
             },
         )?;
+        // F-04: the hook runs after the cell is committed and synced, so a
+        // hook failure is a *published* outcome. It must not be reported as a
+        // bare `Err` that a caller can read as "nothing happened" - the cell
+        // below is verified as readable after this, and a result-driven retry
+        // of the whole call would re-run the hook and duplicate its external
+        // work. The typed variant carries the committed event so the caller
+        // can retry the notification alone.
         let failed = writer.write_matrix_cell_durable(
             MatrixKey::new(0, 1),
             &MatrixCell { value: 3 },
             |_event| Err(Error::InvalidFormatSpec("hook failed")),
         );
-        assert!(matches!(
-            failed,
-            Err(Error::InvalidFormatSpec("hook failed"))
-        ));
+        match failed {
+            Err(Error::MatrixCommittedButHookFailed { event, source }) => {
+                assert_eq!(event.block_id, MatrixCell::ID);
+                assert_eq!(event.key, MatrixKey::new(0, 1));
+                assert_eq!(event.slot_len, 4);
+                assert!(
+                    matches!(*source, Error::InvalidFormatSpec("hook failed")),
+                    "the caller's own error must be preserved as the source, got {source:?}"
+                );
+            }
+            other => panic!("expected MatrixCommittedButHookFailed, got {other:?}"),
+        }
         writer.write_matrix_cell(MatrixKey::new(0, 0), &MatrixCell { value: 1 })?;
         writer.commit_matrix_cell::<MatrixCell>(MatrixKey::new(0, 0))?;
         writer.flush()?;
@@ -851,6 +866,188 @@ fn matrix_durable_barrier_observes_data_then_commit_sync_then_hook() -> varve::R
         assert_eq!(
             reader.read_matrix_cell::<MatrixCell>(MatrixKey::new(0, 0))?,
             MatrixCell { value: 11 }
+        );
+    }
+
+    cleanup(&path);
+    Ok(())
+}
+
+/// Which of the two barrier phases the injected failure belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FailingBarrierPhase {
+    Data,
+    Commit,
+}
+
+/// A barrier that fails exactly one phase, and asserts the on-disk commit bit
+/// it observes when it does, so the test cannot pass because the failure was
+/// raised in the wrong place.
+struct FailingMatrixBarrier {
+    fail: FailingBarrierPhase,
+    commit_map_off: u64,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl FailingMatrixBarrier {
+    fn commit_byte(&self, file: &mut File) -> varve::Result<u8> {
+        let cursor = file.stream_position()?;
+        file.seek(SeekFrom::Start(self.commit_map_off))?;
+        let mut byte = [0; 1];
+        file.read_exact(&mut byte)?;
+        file.seek(SeekFrom::Start(cursor))?;
+        Ok(byte[0])
+    }
+}
+
+impl MatrixDurabilityBarrier for FailingMatrixBarrier {
+    fn sync_matrix_data(&mut self, file: &mut File) -> varve::Result<()> {
+        // Pre-publication: the commit bit must still be clear here.
+        assert_eq!(self.commit_byte(file)? & 0b0000_0001, 0);
+        self.events.lock().expect("event mutex").push("data_sync");
+        if self.fail == FailingBarrierPhase::Data {
+            return Err(Error::InvalidFormatSpec("injected data-sync failure"));
+        }
+        Ok(())
+    }
+
+    fn sync_matrix_commit(&mut self, file: &mut File) -> varve::Result<()> {
+        // Post-publication: the commit bit is already on disk at this point,
+        // which is precisely why a failure here is a published outcome.
+        assert_eq!(self.commit_byte(file)? & 0b0000_0001, 0b0000_0001);
+        self.events.lock().expect("event mutex").push("commit_sync");
+        if self.fail == FailingBarrierPhase::Commit {
+            return Err(Error::InvalidFormatSpec("injected commit-sync failure"));
+        }
+        Ok(())
+    }
+}
+
+/// INVARIANT 3, round 11. Walking forward from the authoritative commit in
+/// `write_matrix_cell_durable_with_barrier`, the commit sync is the step
+/// *before* the hook that F-04 typed. It used to return a bare `Err` although
+/// the commit bit was already on disk and the cell was readable after a clean
+/// exit, so "published, durability unproven" was indistinguishable from
+/// "nothing happened" - the same complaint as F-04, one step earlier.
+///
+/// The negative control in the same test is the data sync: it runs *before*
+/// the commit, so its failure is genuinely pre-publication and must stay a
+/// plain refusal with the cell left uncommitted. If the fix wrapped errors
+/// indiscriminately, that half fails.
+#[test]
+fn a_commit_sync_failure_is_reported_as_published_and_a_data_sync_failure_is_not()
+-> varve::Result<()> {
+    let path = temp_path("matrix_durable_commit_sync_failure");
+    cleanup(&path);
+    let spec = matrix_spec();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    // Ordinal 0, so the commit bit the barrier inspects is bit 0 of the first
+    // commit-map byte.
+    let key = MatrixKey::new(0, 0);
+
+    {
+        let dims = MatrixDimensions::from_pairs([("scan", 2), ("ch", 2)]);
+        let mut writer = spec.create_writer_with_dims(&path, dims)?;
+        let offsets = read_vmat_offsets(&path, spec)?;
+        let mut barrier = FailingMatrixBarrier {
+            fail: FailingBarrierPhase::Commit,
+            commit_map_off: offsets.commit_map_off,
+            events: Arc::clone(&events),
+        };
+        let hook_ran = Arc::new(Mutex::new(false));
+        let hook_flag = Arc::clone(&hook_ran);
+        let failed = writer.write_matrix_cell_durable_with_barrier(
+            key,
+            &MatrixCell { value: 7 },
+            &mut barrier,
+            move |_event| {
+                *hook_flag.lock().expect("hook mutex") = true;
+                Ok(())
+            },
+        );
+        match failed {
+            Err(Error::MatrixCommittedButDurabilityUnproven { event, source }) => {
+                assert_eq!(event.block_id, MatrixCell::ID);
+                assert_eq!(event.key, key);
+                assert_eq!(event.slot_len, 4);
+                assert!(
+                    matches!(
+                        *source,
+                        Error::InvalidFormatSpec("injected commit-sync failure")
+                    ),
+                    "the barrier's own error must be preserved as the source, got {source:?}"
+                );
+            }
+            other => panic!("expected MatrixCommittedButDurabilityUnproven, got {other:?}"),
+        }
+        assert!(
+            !*hook_ran.lock().expect("hook mutex"),
+            "the hook must not run when the commit sync failed"
+        );
+        assert_eq!(
+            events.lock().expect("event mutex").as_slice(),
+            &["data_sync", "commit_sync"]
+        );
+        // The documented consequence of the typed variant: the handle is
+        // poisoned, so recovery is to reopen and sync, not to keep writing.
+        assert!(matches!(
+            writer.write_matrix_cell(MatrixKey::new(1, 1), &MatrixCell { value: 1 }),
+            Err(Error::WriterPoisoned(_))
+        ));
+    }
+
+    // The claim the variant makes, verified rather than asserted by shape: the
+    // cell really is committed and readable after a clean process exit.
+    {
+        let mut reader = spec.open_reader(&path)?;
+        assert_eq!(
+            reader.matrix_cell_status::<MatrixCell>(key)?,
+            MatrixCellStatus::Committed
+        );
+        assert_eq!(
+            reader.read_matrix_cell::<MatrixCell>(key)?,
+            MatrixCell { value: 7 }
+        );
+    }
+    cleanup(&path);
+
+    // NEGATIVE CONTROL: the same injection one phase earlier is pre-commit.
+    let path = temp_path("matrix_durable_data_sync_failure");
+    cleanup(&path);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    {
+        let dims = MatrixDimensions::from_pairs([("scan", 2), ("ch", 2)]);
+        let mut writer = spec.create_writer_with_dims(&path, dims)?;
+        let offsets = read_vmat_offsets(&path, spec)?;
+        let mut barrier = FailingMatrixBarrier {
+            fail: FailingBarrierPhase::Data,
+            commit_map_off: offsets.commit_map_off,
+            events: Arc::clone(&events),
+        };
+        let failed = writer.write_matrix_cell_durable_with_barrier(
+            key,
+            &MatrixCell { value: 9 },
+            &mut barrier,
+            |_event| panic!("the hook must not run when the data sync failed"),
+        );
+        assert!(
+            matches!(
+                failed,
+                Err(Error::InvalidFormatSpec("injected data-sync failure"))
+            ),
+            "a pre-publication failure must stay a plain refusal, got {failed:?}"
+        );
+        assert_eq!(
+            events.lock().expect("event mutex").as_slice(),
+            &["data_sync"]
+        );
+    }
+    {
+        let reader = spec.open_reader(&path)?;
+        assert_ne!(
+            reader.matrix_cell_status::<MatrixCell>(key)?,
+            MatrixCellStatus::Committed,
+            "a data-sync failure precedes the commit, so nothing may be published"
         );
     }
 

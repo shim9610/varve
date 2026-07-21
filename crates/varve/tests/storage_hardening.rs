@@ -699,3 +699,260 @@ fn indeterminate_merge_publication_still_retains_its_rewrite_temp() -> varve::Re
     );
     Ok(())
 }
+
+// F-07: the diagnostic `<target>.lock` marker is truncated and rewritten on
+// acquisition and truncated again on drop. Those writes must never reach an
+// object the marker path merely aliases. Both aliasing shapes are refused
+// with `Error::WriterLockMarkerNotDedicated`, on both platforms, and the
+// foreign object must be observably untouched afterwards.
+
+/// The unaliased case still works: this is the negative control that proves
+/// the two tests below fail for the aliasing and not for the check itself.
+#[test]
+fn an_ordinary_lock_marker_is_still_accepted() -> varve::Result<()> {
+    let path = temp_path("marker_ordinary");
+    cleanup(&path);
+    {
+        let mut writer = StorageFormat::create(&path)?;
+        writer.push(&StorageValue { value: 1 })?;
+        writer.flush()?;
+    }
+    assert!(lock_marker(&path).is_file());
+    cleanup(&path);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hard_linked_lock_marker_is_refused_and_left_untouched() -> varve::Result<()> {
+    let path = temp_path("marker_hardlink");
+    cleanup(&path);
+    let directory = path.parent().expect("temp parent").to_path_buf();
+    let victim = directory.join("unrelated-empty-file");
+    std::fs::write(&victim, b"")?;
+    std::fs::hard_link(&victim, lock_marker(&path))?;
+
+    let error = StorageFormat::create(&path).expect_err("an aliased marker must be refused");
+    assert!(
+        matches!(
+            error,
+            Error::WriterLockMarkerNotDedicated {
+                reason: "the marker object has more than one hard link",
+                ..
+            }
+        ),
+        "expected a typed marker refusal, got {error:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&victim)?.len(),
+        0,
+        "the aliased object must not have been written through"
+    );
+    let _ = remove_file(lock_marker(&path));
+    cleanup(&path);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_lock_marker_is_refused_and_left_untouched() -> varve::Result<()> {
+    let path = temp_path("marker_symlink");
+    cleanup(&path);
+    let directory = path.parent().expect("temp parent").to_path_buf();
+    let victim = directory.join("unrelated-symlink-target");
+    std::fs::write(&victim, b"")?;
+    std::os::unix::fs::symlink(&victim, lock_marker(&path))?;
+
+    let error = StorageFormat::create(&path).expect_err("a symlinked marker must be refused");
+    assert!(
+        matches!(
+            error,
+            Error::WriterLockMarkerNotDedicated {
+                reason: "the final path component is a symbolic link",
+                ..
+            }
+        ),
+        "expected a typed marker refusal, got {error:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&victim)?.len(),
+        0,
+        "the symlink target must not have been written through"
+    );
+    let _ = remove_file(lock_marker(&path));
+    cleanup(&path);
+    Ok(())
+}
+
+/// Windows hard links need no privilege; symbolic links do, so the reparse
+/// case is covered by `a_reparse_point_lock_marker_is_refused` only when the
+/// host grants the privilege, and is skipped rather than failing otherwise.
+#[cfg(windows)]
+#[test]
+fn a_hard_linked_lock_marker_is_refused_and_left_untouched() -> varve::Result<()> {
+    let path = temp_path("marker_hardlink");
+    cleanup(&path);
+    let directory = path.parent().expect("temp parent").to_path_buf();
+    let victim = directory.join("unrelated-empty-file");
+    std::fs::write(&victim, b"")?;
+    std::fs::hard_link(&victim, lock_marker(&path))?;
+
+    let error = StorageFormat::create(&path).expect_err("an aliased marker must be refused");
+    assert!(
+        matches!(
+            error,
+            Error::WriterLockMarkerNotDedicated {
+                reason: "the marker object has more than one hard link",
+                ..
+            }
+        ),
+        "expected a typed marker refusal, got {error:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&victim)?.len(),
+        0,
+        "the aliased object must not have been written through"
+    );
+    let _ = remove_file(lock_marker(&path));
+    cleanup(&path);
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn a_reparse_point_lock_marker_is_refused_and_left_untouched() -> varve::Result<()> {
+    let path = temp_path("marker_reparse");
+    cleanup(&path);
+    let directory = path.parent().expect("temp parent").to_path_buf();
+    let victim = directory.join("unrelated-symlink-target");
+    std::fs::write(&victim, b"")?;
+    if std::os::windows::fs::symlink_file(&victim, lock_marker(&path)).is_err() {
+        // Creating a symbolic link needs SeCreateSymbolicLinkPrivilege or
+        // developer mode. Without it there is nothing to prove here; the hard
+        // link test above still covers the aliasing class on this platform.
+        // Announced rather than silently skipped, so a passing run is never
+        // mistaken for evidence the reparse branch was exercised.
+        eprintln!(
+            "SKIPPED a_reparse_point_lock_marker_is_refused_and_left_untouched: \
+             this host does not grant symbolic-link creation"
+        );
+        cleanup(&path);
+        return Ok(());
+    }
+
+    let error = StorageFormat::create(&path).expect_err("a reparse marker must be refused");
+    assert!(
+        matches!(
+            error,
+            Error::WriterLockMarkerNotDedicated {
+                reason: "the final path component is a reparse point",
+                ..
+            }
+        ),
+        "expected a typed marker refusal, got {error:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&victim)?.len(),
+        0,
+        "the reparse target must not have been written through"
+    );
+    let _ = remove_file(lock_marker(&path));
+    cleanup(&path);
+    Ok(())
+}
+
+/// F-08: `docs/custom-codec-guide.md` gained a mandatory
+/// "Charge Every Owned Allocation" section whose compliant example and
+/// negative self-test are the guide's whole answer to "how do I know my codec
+/// charges?". Markdown code blocks compile in no job, so a copy of that
+/// example lives here: if the guide's example stops compiling or its self-test
+/// stops proving what it claims, this fails. Keep the two in sync - the code
+/// below is the two `rust` blocks of that section, unchanged apart from the
+/// module indentation rustfmt requires here.
+mod custom_codec_guide_charging_example {
+    use std::mem::size_of;
+
+    use varve::{Decoder, Encoder, Error, VarveDecode, VarveEncode, WireType};
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Samples(Vec<f64>);
+
+    impl VarveEncode for Samples {
+        const WIRE_TYPE: WireType = WireType::Bytes;
+        const SCHEMA_ID: u64 = 0x53_41_4d_50_00_00_00_01; // "SAMP" v1
+
+        fn encode_varve(&self, encoder: &mut Encoder) -> varve::Result<()> {
+            encoder.write_u64(self.0.len() as u64);
+            for value in &self.0 {
+                encoder.write_u64(value.to_bits());
+            }
+            Ok(())
+        }
+    }
+
+    impl VarveDecode for Samples {
+        const WIRE_TYPE: WireType = WireType::Bytes;
+        const SCHEMA_ID: u64 = <Samples as VarveEncode>::SCHEMA_ID;
+
+        fn decode_varve(decoder: &mut Decoder<'_>) -> varve::Result<Self> {
+            // 1. The count is attacker-controlled input, so nothing is sized from
+            //    it until it has been validated.
+            let count = decoder.read_len()?;
+            // 2. A count the input cannot back is malformed, not an allocation
+            //    request. This check alone caps `count` at the payload length.
+            let wire_bytes = count
+                .checked_mul(8)
+                .ok_or(Error::LengthOverflow { value: u64::MAX })?;
+            if wire_bytes > decoder.remaining() {
+                return Err(Error::UnexpectedEof);
+            }
+            // 3. Charge the RESIDENT cost before taking it. A refusal here returns
+            //    `Error::LimitExceeded` with nothing allocated.
+            let owned_bytes = (count as u64).checked_mul(size_of::<f64>() as u64).ok_or(
+                Error::ResourceArithmeticOverflow {
+                    resource: "samples",
+                },
+            )?;
+            decoder.charge_materialization(owned_bytes, "samples")?;
+            // 4. Only now is the memory taken, and even then fallibly.
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(count)
+                .map_err(|_| Error::AllocationFailed {
+                    resource: "samples",
+                    requested: owned_bytes,
+                })?;
+            // 5. Fill.
+            for _ in 0..count {
+                values.push(f64::from_bits(decoder.read_u64()?));
+            }
+            Ok(Self(values))
+        }
+    }
+
+    #[test]
+    fn samples_refuse_to_materialize_past_the_budget() {
+        let bytes =
+            varve::encode_to_vec(&Samples(vec![1.0; 64]), varve::Endian::Little).expect("encode");
+
+        // 512 owned bytes are needed; 256 are offered.
+        let refused =
+            Decoder::decode_from_slice_limited::<Samples>(&bytes, varve::Endian::Little, 256);
+        assert!(
+            matches!(
+                refused,
+                Err(Error::LimitExceeded {
+                    resource: "samples",
+                    limit: 256,
+                    ..
+                })
+            ),
+            "an uncharged codec returns Ok here: {refused:?}"
+        );
+
+        // The control: the same input inside its budget must still decode, so the
+        // test cannot pass because the codec is simply broken.
+        Decoder::decode_from_slice_limited::<Samples>(&bytes, varve::Endian::Little, 512)
+            .expect("the value fits its own budget");
+    }
+}

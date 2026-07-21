@@ -146,6 +146,21 @@ committed all-zero payload from an untouched all-zero slot.
 Successful rebuild writes the new map and CRC before publishing it in memory,
 then removes the quarantine evidence for that category.
 
+The rebuild republishes the whole persisted page index, and it does so by
+publishing a new generation rather than editing the live one: a reserved marker
+goes into the occupancy header and is made durable before the entry region is
+cleared, and the real count is written last. An interruption therefore leaves a
+matrix that opens with a `Fatal` `MatrixCorruptionKind::CommitMap` finding whose
+report recommends `RebuildCommitMap` — never a short index that silently hides
+committed pages. See `docs/matrix-storage-design.md`.
+
+Because fatal findings are fail-closed by default, acting on a recommended
+`RebuildCommitMap` for a fatal finding requires reopening with
+`FormatSpec::with_matrix_fatal_forensics()`. If the rebuild itself fails after
+it has marked the index, the layout stays fail-closed for the rest of that
+session, since the in-memory index mirror describes the previous generation;
+reopen with forensics and rebuild again.
+
 If no per-entry CRC or equivalent evidence exists, Varve must not claim that a
 rebuilt bit proves the cell is valid. It may offer a weaker `ClearCategory`
 recommendation instead.

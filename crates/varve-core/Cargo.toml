@@ -15,6 +15,16 @@ documentation = "https://docs.rs/varve-core"
 # `cargo package --locked --offline --no-verify -p varve-core --list`.
 readme = "../../README.md"
 
+# F-06: `default = []`, so without this docs.rs would build the published page
+# with NO optional feature enabled and every feature-gated public item would be
+# missing from it - while the CI `rustdoc` job claimed `--all-features` was
+# "the docs.rs default for this project". The claim is now true because it is
+# declared here rather than assumed. `--cfg docsrs` is not set and no
+# `doc_cfg` attributes are used, so the pages carry no feature annotations;
+# the feature list stays the crate-level documentation's job.
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = []
 integrity = ["dep:crc32fast"]
