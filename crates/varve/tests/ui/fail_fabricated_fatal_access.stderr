@@ -1,0 +1,11 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/ui/fail_fabricated_fatal_access.rs:22:39
+   |
+22 |     let _forged: FatalAccessAllowed = FatalAccessAllowed(unreachable!());
+   |                                       ^^^^^^^^^^^^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> $WORKSPACE/crates/varve-core/src/matrix.rs
+   |
+   |     pub struct FatalAccessAllowed(());
+   |                                   ^^ private field

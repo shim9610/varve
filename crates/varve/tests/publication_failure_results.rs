@@ -574,6 +574,193 @@ mod enabled {
         Ok(())
     }
 
+    // --- round 12, F-05: when a native append fails and the truncate-or-seek
+    // that rolls it back fails too, the writer poisons itself and returns
+    // `WriteRollbackFailed`. The public contract is that *every* later
+    // mutation is refused. The defect was that the indexed writer kept a
+    // second poison flag, passed its own guard, and then called the stream's
+    // `append_prepared_chunk` directly - a method that consulted no flag at
+    // all - so a single-record put or delete was accepted after the rollback
+    // failure. The two flags are now one, and the stream's mutating entry
+    // points take a witness that only the check can produce.
+
+    #[test]
+    fn a_failed_append_rollback_poisons_every_later_stream_mutation() -> Result<()> {
+        let _gate = fault_gate();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("stream-rollback-failure.varve");
+        let mut writer = VarveStreamWriter::create(stream_spec(), &path, stream_options())?;
+        let durable = vec![FaultRecord::ok(0)];
+        writer.push_info(&FaultRecord::ok(0))?;
+        writer.sync()?;
+        let published_len = std::fs::metadata(&path)?.len();
+
+        VarveStreamWriter::inject_append_rollback_failures(1);
+        let error = writer
+            .push_info(&FaultRecord::ok(1))
+            .expect_err("an append whose rollback also failed must not report success");
+        VarveStreamWriter::inject_append_rollback_failures(0);
+        assert!(
+            matches!(error, Error::WriteRollbackFailed { .. }),
+            "a failed write plus a failed rollback must be typed, got {error:?}"
+        );
+
+        // Every later mutation, of every shape.
+        assert!(matches!(
+            writer.push_info(&FaultRecord::ok(2)),
+            Err(Error::WriterPoisoned("stream"))
+        ));
+        assert!(matches!(
+            writer.delete_with_prev_key_info::<FaultRecord>(&0, None),
+            Err(Error::WriterPoisoned("stream"))
+        ));
+        assert!(matches!(
+            writer
+                .push_iter::<FaultRecord, _>(vec![FaultRecord::ok(3)], one_record_chunks())
+                .map_err(|error| error.source),
+            Err(Error::WriterPoisoned("stream"))
+        ));
+        assert!(matches!(
+            writer.flush(),
+            Err(Error::WriterPoisoned("stream"))
+        ));
+        assert!(matches!(
+            writer.sync(),
+            Err(Error::WriterPoisoned("stream"))
+        ));
+        drop(writer);
+
+        // The refusals are not covering for a damaged file: the rolled-back
+        // append left the primary exactly as the last successful sync did.
+        assert_eq!(std::fs::metadata(&path)?.len(), published_len);
+        assert_eq!(read_stream_after_recovery(&path)?, durable);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_append_rollback_poisons_every_later_indexed_mutation() -> Result<()> {
+        let _gate = fault_gate();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("indexed-rollback-failure.varve");
+        let mut writer =
+            VarveIndexedWriter::create(indexed_spec(), &path, disk_options(), index_plan())?;
+        writer.push_info(&FaultRecord::ok(0))?;
+        writer.sync()?;
+        let published_len = std::fs::metadata(&path)?.len();
+
+        // The single-record indexed put is the exact path F-05 named: it
+        // passes the indexed guard and then calls the stream's internal
+        // append.
+        VarveStreamWriter::inject_append_rollback_failures(1);
+        let error = writer
+            .push_info(&FaultRecord::ok(1))
+            .expect_err("an append whose rollback also failed must not report success");
+        VarveStreamWriter::inject_append_rollback_failures(0);
+        assert!(
+            matches!(error, Error::WriteRollbackFailed { .. }),
+            "a failed write plus a failed rollback must be typed, got {error:?}"
+        );
+
+        // The three mutation shapes the report asks for, plus the unindexed
+        // append and the two durability entry points. Before the fix the first
+        // two of these succeeded, appending records through a stream that had
+        // already given up on keeping its own state consistent.
+        assert!(matches!(
+            writer.push_info(&FaultRecord::ok(2)),
+            Err(Error::WriterPoisoned("indexed"))
+        ));
+        assert!(matches!(
+            writer.delete_info::<FaultRecord>(&0),
+            Err(Error::WriterPoisoned("indexed"))
+        ));
+        assert!(matches!(
+            writer
+                .push_iter::<FaultRecord, _>(vec![FaultRecord::ok(3)], one_record_chunks())
+                .map_err(|error| error.source),
+            Err(Error::WriterPoisoned("indexed"))
+        ));
+        assert!(matches!(
+            writer.flush(),
+            Err(Error::WriterPoisoned("indexed"))
+        ));
+        assert!(matches!(
+            writer.sync(),
+            Err(Error::WriterPoisoned("indexed"))
+        ));
+        drop(writer);
+
+        // The refused mutations really are absent from the file, and the
+        // record that was synced before the fault is still readable.
+        assert_eq!(std::fs::metadata(&path)?.len(), published_len);
+        let recovered = VarveIndexedWriter::restore_checkpoint_and_open(
+            indexed_spec(),
+            &path,
+            disk_options(),
+            index_plan(),
+        )?;
+        drop(recovered);
+        let reader = VarveIndexedReader::open(indexed_spec(), &path, disk_options(), index_plan())?;
+        assert_eq!(reader.get::<FaultRecord>(&0)?, Some(FaultRecord::ok(0)));
+        for key in 1..=4 {
+            assert_eq!(
+                reader.get::<FaultRecord>(&key)?,
+                None,
+                "no mutation after the rollback failure may be in the file"
+            );
+        }
+        Ok(())
+    }
+
+    /// The single-record indexed *delete* is the second half of F-05: it takes
+    /// the same direct route into the stream, so a rollback failure raised by a
+    /// delete must refuse the next put just as a put refuses the next delete.
+    #[test]
+    fn a_failed_append_rollback_during_an_indexed_delete_poisons_the_writer() -> Result<()> {
+        let _gate = fault_gate();
+        let directory = tempfile::tempdir()?;
+        let path = directory
+            .path()
+            .join("indexed-delete-rollback-failure.varve");
+        let mut writer =
+            VarveIndexedWriter::create(indexed_spec(), &path, disk_options(), index_plan())?;
+        writer.push_info(&FaultRecord::ok(0))?;
+        writer.sync()?;
+
+        VarveStreamWriter::inject_append_rollback_failures(1);
+        let error = writer
+            .delete_info::<FaultRecord>(&0)
+            .expect_err("a delete whose rollback also failed must not report success");
+        VarveStreamWriter::inject_append_rollback_failures(0);
+        assert!(
+            matches!(error, Error::WriteRollbackFailed { .. }),
+            "a failed write plus a failed rollback must be typed, got {error:?}"
+        );
+
+        assert!(matches!(
+            writer.push_info(&FaultRecord::ok(1)),
+            Err(Error::WriterPoisoned("indexed"))
+        ));
+        assert!(matches!(
+            writer.delete_info::<FaultRecord>(&0),
+            Err(Error::WriterPoisoned("indexed"))
+        ));
+        drop(writer);
+
+        // The delete never reached the file, so the record is still there.
+        // The poisoned writer never synced, so the sidecar is restored from
+        // its last clean checkpoint first.
+        let recovered = VarveIndexedWriter::restore_checkpoint_and_open(
+            indexed_spec(),
+            &path,
+            disk_options(),
+            index_plan(),
+        )?;
+        drop(recovered);
+        let reader = VarveIndexedReader::open(indexed_spec(), &path, disk_options(), index_plan())?;
+        assert_eq!(reader.get::<FaultRecord>(&0)?, Some(FaultRecord::ok(0)));
+        Ok(())
+    }
+
     // --- control: without an armed fault the same calls must report success.
 
     #[test]

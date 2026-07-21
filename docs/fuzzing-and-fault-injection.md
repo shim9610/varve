@@ -51,8 +51,28 @@ Use one target while developing:
 
 The runner clamps each `sidecar_*` campaign to at least 120 seconds.
 
-A nonzero exit or a file under `fuzz/artifacts` is a failed gate. Preserve and
-promote any reproducer to a deterministic regression before fixing it.
+### The Artifact Gate
+
+A nonzero exit or a file under `fuzz/artifacts` is a failed gate, and the
+runner enforces both halves of that sentence rather than the exit code alone
+(F-09). The gate means **any** artifact, not only one this campaign produced:
+
+- before Cargo is invoked at all, the runner enumerates `fuzz/artifacts`
+  recursively. If any file is present it prints each path and exits `2` without
+  running. An unpromoted reproducer is unfinished work, and running a campaign
+  on top of one is how a stale artifact comes to look like a fresh pass;
+- after each target, and once more after the last one, it enumerates the
+  directory again. Any file present prints each path and exits `3`. This check
+  runs *before* the campaign's own exit code is acted on, so a crashing target
+  reports the reproducer it left as well as its status;
+- a nonzero exit from corpus generation or from a campaign exits with that
+  same code.
+
+The runner never deletes anything under `fuzz/artifacts`. A reproducer is the
+only copy of an input that reached a defect, so clearing the directory is an
+explicit operator action taken **after** the input has been promoted to a
+deterministic regression test. That promotion, not deletion, is how a campaign
+returns to a clean gate.
 
 Audit the independent fuzz dependency graph as well as the publishable
 workspace graph:
@@ -175,9 +195,14 @@ that callers do not need to import that trait.
 
 Fault planning also exposed an ambiguous post-publication state. Replacement
 can be atomically visible while reopening the path for the writer fails. The
-writer now returns `PublishedButRebindFailed { sequence, source }` and becomes
+writer now returns
+`PublishedButRebindFailed { sequence, source, parent_sync }` and becomes
 poisoned. The caller must discard it and reopen the path; blindly retrying the
-same logical update can duplicate the operation.
+same logical update can duplicate the operation. `parent_sync` is `Some(_)`
+only when the parent-directory sync for the published pathname failed in the
+same publication, which adds the second durability fact: the generation is
+visible at the pathname but the rename is not yet proved durable against power
+loss (F-07).
 
 ## Assurance Boundary
 

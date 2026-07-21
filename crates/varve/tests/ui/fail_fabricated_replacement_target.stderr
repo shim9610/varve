@@ -1,0 +1,5 @@
+error[E0451]: field `position` of struct `varve_core::enforcement_probe::ReplacementTarget` is private
+  --> tests/ui/fail_fabricated_replacement_target.rs:13:39
+   |
+13 |     let _forged = ReplacementTarget { position: 0 };
+   |                                       ^^^^^^^^ private field

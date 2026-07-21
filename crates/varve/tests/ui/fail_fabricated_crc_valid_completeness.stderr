@@ -1,0 +1,13 @@
+error[E0451]: field `bits` of struct `varve_core::enforcement_probe::CompleteCrcValidEvidence` is private
+  --> tests/ui/fail_fabricated_crc_valid_completeness.rs:21:9
+   |
+20 |     let _forged: CompleteCrcValidEvidence<'static> = CompleteCrcValidEvidence {
+   |                                                      ------------------------ in this type
+21 |         bits: unreachable!(),
+   |         ^^^^ private field
+
+error: type `varve_core::matrix::SparseBitmap` is private
+  --> tests/ui/fail_fabricated_crc_valid_completeness.rs:21:15
+   |
+21 |         bits: unreachable!(),
+   |               ^^^^^^^^^^^^^^ private type

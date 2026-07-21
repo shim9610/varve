@@ -715,6 +715,47 @@ fn temp_path(name: &str) -> TempPath {
     TempPath { path, _dir: dir }
 }
 
+/// F-08 regression. `remove_unowned_lock_marker` used to `return` silently
+/// when it could not re-acquire the writer-lock marker, so a self-test could
+/// report `passed = true` with zero cleanup failures while a live marker
+/// survived and refused the *next* run. The marker must still be preserved -
+/// failing to re-acquire it is exactly the evidence that it may not be ours to
+/// delete - but the run must stop claiming it left the directory clean.
+///
+/// The refusal is produced portably by binding a *directory* at the marker
+/// pathname: the writer-lock protocol opens that name as a file, which no
+/// platform allows.
+#[test]
+fn a_self_test_that_cannot_reacquire_its_lock_marker_reports_a_cleanup_failure() {
+    let path = temp_path("unreacquirable_marker");
+    cleanup(&path);
+    let marker = lock_marker(&path);
+    std::fs::create_dir(&marker).expect("bind a directory at the marker pathname");
+
+    let report = SelfCheckFormat::self_test(&path)
+        .with_block(Point { x: 1, y: 2 })
+        .cleanup(true)
+        .run();
+
+    assert!(!report.passed(), "{report:#?}");
+    let cleanup_failure = report
+        .failures()
+        .find(|step| step.name == "cleanup")
+        .expect("the unremovable marker must be reported as a cleanup failure");
+    assert_eq!(cleanup_failure.domain, Some(DiagnosticDomain::Environment));
+    assert!(
+        cleanup_failure.message.contains("writer-lock marker"),
+        "{cleanup_failure:#?}"
+    );
+    assert!(
+        marker.is_dir(),
+        "the marker must be preserved, not deleted, when it cannot be verified"
+    );
+
+    let _ = std::fs::remove_dir(&marker);
+    cleanup(&path);
+}
+
 fn lock_marker(path: &Path) -> PathBuf {
     let mut lock = path.as_os_str().to_os_string();
     lock.push(".lock");

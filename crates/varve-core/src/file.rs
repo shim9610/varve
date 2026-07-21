@@ -26,6 +26,7 @@ use crate::{
         read_native_file_header, read_native_record_header, write_native_file_header,
         write_native_record_header,
     },
+    writer_permit::{GuardedWriter, MutationPermit, PoisonFlag},
 };
 
 pub const TOMBSTONE_BLOCK_ID: u32 = 0xFFFF_FFFE;
@@ -253,6 +254,453 @@ pub enum OpenMode {
     ReadOnly,
     ReadWrite,
 }
+
+/// Mechanical enforcement for F-01: a replacement target cannot be addressed
+/// without having been version-checked.
+///
+/// Every replacement entry point selects its target by block id and then
+/// writes `T`'s payload into (or under) the stored record's header. Three of
+/// the four copied the stored `block_version` while substituting the new
+/// payload, which is a persistent type/version disagreement on disk whenever
+/// `schema_hash = 0` lets a differently-versioned program open the file. Two
+/// paths carried an ad-hoc check and two did not, and review alone had not
+/// caught that in seven rounds.
+///
+/// The check is therefore no longer a step a path can forget: it is a
+/// precondition of *writing* the target. [`ReplacementTarget`] has a private
+/// field, lives in its own module so nothing else can name that field, and has
+/// exactly one constructor - [`ReplacementTarget::resolve`], which performs
+/// both the selection and the version refusal.
+///
+/// **What is and is not enforced, stated precisely.** Reading `self.index` is
+/// not restricted: any code in this file may walk it and compute an ordinal,
+/// and round 12's first attempt claimed otherwise. What a caller cannot do is
+/// *act* on such an ordinal. The bytes of an already-indexed record are
+/// reachable only through [`RecordFile::overwrite_indexed_record`], which takes
+/// a [`RecordOverwrite`] by value; the only constructor of a [`RecordOverwrite`]
+/// is [`RecordOverwrite::prepare`], which takes a [`ReplacementTarget`] by
+/// value. So a replacement path added next month that resolves its own ordinal
+/// over `self.index` has nothing it can hand to the writer, and does not
+/// compile. See `mod record_file` for the other half (the raw handle is
+/// unreachable, so the seek/write pair cannot be duplicated either).
+///
+/// Proved by `crates/varve/tests/ui/fail_fabricated_replacement_target.rs` and
+/// `fail_fabricated_record_overwrite.rs` (compile-fail), and by
+/// `crates/varve/tests/enforcement_gates.rs`.
+pub(crate) mod replacement_target {
+    use super::{Error, KeyedTails, RecordIndexEntry, Result, VarveBlock};
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct ReplacementTarget {
+        position: usize,
+    }
+
+    impl ReplacementTarget {
+        /// Selects the `ordinal`-th record of `T::ID` and refuses a stored
+        /// `block_version` that is not `T::VERSION`.
+        ///
+        /// This is the only way to build a [`ReplacementTarget`].
+        pub(super) fn resolve<T: VarveBlock>(
+            index: &[RecordIndexEntry],
+            ordinal: usize,
+        ) -> Result<Self> {
+            let position = index
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.block_id == T::ID)
+                .nth(ordinal)
+                .map(|(position, _)| position)
+                .ok_or(Error::UnexpectedEof)?;
+            let actual = index[position].block_version;
+            if actual != T::VERSION {
+                return Err(Error::BlockVersionMismatch {
+                    block_id: T::ID,
+                    expected: T::VERSION,
+                    actual,
+                });
+            }
+            Ok(Self { position })
+        }
+
+        /// The resident-index position of the version-checked target.
+        pub(super) fn position(self) -> usize {
+            self.position
+        }
+    }
+
+    /// Mechanical enforcement for F-02: the permission to rewrite the bytes of
+    /// an already-indexed record, which cannot be obtained without dropping the
+    /// block's resident keyed-tail map first.
+    ///
+    /// The cache maps canonical key bytes to tail offsets and maintained keyed
+    /// appends read their predecessor from it, so a record whose stored bytes
+    /// change may no longer carry the key the cache filed it under. Round 12
+    /// put that invalidation inside the writing function, which made it a
+    /// property of *today's* single caller rather than of the operation: a new
+    /// seek/write pair elsewhere in the file skipped it and compiled.
+    ///
+    /// Now the invalidation happens in the constructor of the permission, and
+    /// the permission is consumed by value by the only function that can write
+    /// those bytes. It is infallible and allocation-free (a `HashMap::remove`),
+    /// so it adds no fallible step in either direction of invariant 3, and it
+    /// runs strictly before the first byte, so it also covers a half-completed
+    /// write, a poisoned writer inspected afterwards, and a caller that
+    /// violates the same-key contract of the `unsafe` in-place entry point.
+    #[derive(Debug)]
+    pub struct RecordOverwrite {
+        record_offset: u64,
+        payload_offset: u64,
+    }
+
+    impl RecordOverwrite {
+        /// Consumes a version-checked [`ReplacementTarget`], drops the target
+        /// block's keyed-tail map, and yields the write permission.
+        ///
+        /// This is the only way to build a [`RecordOverwrite`], and a
+        /// [`ReplacementTarget`] is the only way to call it.
+        pub(super) fn prepare(
+            target: ReplacementTarget,
+            index: &[RecordIndexEntry],
+            keyed_tails: &mut KeyedTails,
+        ) -> Self {
+            let entry = &index[target.position()];
+            keyed_tails.invalidate(entry.block_id);
+            Self {
+                record_offset: entry.record_offset,
+                payload_offset: entry.payload_offset,
+            }
+        }
+
+        pub(super) fn record_offset(&self) -> u64 {
+            self.record_offset
+        }
+
+        pub(super) fn payload_offset(&self) -> u64 {
+            self.payload_offset
+        }
+    }
+}
+
+use replacement_target::{RecordOverwrite, ReplacementTarget};
+
+/// Mechanical enforcement for shape A/B on the primary file handle: the record
+/// bytes of an open generation cannot be written except through one of two
+/// gated operations.
+///
+/// The round-12 review found that `overwrite_record_bytes_in_place` was "the
+/// only function in the crate that rewrites the bytes of an already-indexed
+/// record" — true of the code as written, and unenforced: a new
+/// `self.file.seek(..)` / `self.file.write_all(..)` pair anywhere in this
+/// ~12,000-line file compiled and skipped both the version refusal (F-01) and
+/// the keyed-tail invalidation (F-02). That is the same "correct today,
+/// described in prose" configuration that F-03 was in.
+///
+/// [`RecordFile`] owns the handle in a module that keeps the field unnameable,
+/// and exposes no general-purpose write. `Write`, `Seek` and `Read` are not
+/// implemented for it and it hands out no `&File` (`impl Write for &File` would
+/// make that equivalent to a mutable handle). The only two ways to put record
+/// bytes on disk are:
+///
+/// * [`RecordFile::append_record_at_end`], which seeks to the end itself and
+///   refuses if the resulting offset is not the one the caller budgeted for, so
+///   it structurally cannot land inside an existing record; and
+/// * [`RecordFile::overwrite_indexed_record`], which consumes a
+///   [`RecordOverwrite`] — see `mod replacement_target` for what producing one
+///   costs.
+///
+/// One deliberate exception, named here rather than left to be discovered:
+/// [`RecordFile::matrix_region`] hands `crate::matrix` the `&mut File` its
+/// functions take. The matrix region is disjoint from the record region and has
+/// its own shape-A gate (`matrix.rs`, `mod page_index`). The gate that keeps
+/// that exception honest is a source assertion, not the compiler:
+/// `crates/varve/tests/enforcement_gates.rs::the_primary_handle_escape_is_only_for_the_matrix_region`.
+mod record_file {
+    use super::{Error, RecordOverwrite, ReservedIndexSlot, Result, opened_file_identity};
+    use std::fs::{File, Metadata};
+    use std::io::{Seek, SeekFrom, Write};
+
+    #[derive(Debug)]
+    pub struct RecordFile {
+        file: File,
+    }
+
+    impl RecordFile {
+        pub(super) fn new(file: File) -> Self {
+            Self { file }
+        }
+
+        pub(super) fn metadata(&self) -> std::io::Result<Metadata> {
+            self.file.metadata()
+        }
+
+        pub(super) fn stream_position(&mut self) -> std::io::Result<u64> {
+            self.file.stream_position()
+        }
+
+        /// Moves the handle's cursor. Reads and cursor restoration only: this
+        /// type implements no write that follows the cursor.
+        pub(super) fn seek_to(&mut self, offset: u64) -> std::io::Result<u64> {
+            self.file.seek(SeekFrom::Start(offset))
+        }
+
+        pub(super) fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+            self.file.set_len(len)
+        }
+
+        pub(super) fn flush(&mut self) -> std::io::Result<()> {
+            self.file.flush()
+        }
+
+        pub(super) fn sync_all(&self) -> std::io::Result<()> {
+            self.file.sync_all()
+        }
+
+        pub(super) fn sync_data(&self) -> std::io::Result<()> {
+            self.file.sync_data()
+        }
+
+        /// OS-object identity bytes of the open handle.
+        ///
+        /// Returned as bytes rather than as a `&File` on purpose: `&File`
+        /// implements `Write`, so lending one out would reopen exactly the hole
+        /// this module closes.
+        pub(super) fn object_identity(&self) -> Result<Vec<u8>> {
+            opened_file_identity(&self.file)
+        }
+
+        /// The named exception: the handle `crate::matrix`'s functions take.
+        ///
+        /// The matrix region is disjoint from the record region; its own
+        /// shape-A enforcement is `matrix.rs`'s `mod page_index`. Every call
+        /// site of this accessor must be an argument to a `crate::matrix::`
+        /// call, which `enforcement_gates.rs` asserts.
+        pub(super) fn matrix_region(&mut self) -> &mut File {
+            &mut self.file
+        }
+
+        /// Appends one record at the current end of file.
+        ///
+        /// Seeks to the end itself and refuses if that is not `expected_offset`
+        /// — the offset the caller budgeted, checked against limits and
+        /// recorded in its rollback snapshot. A caller cannot use this to write
+        /// into an already-indexed record even by passing an arbitrary offset.
+        ///
+        /// # Why it takes the reservation token
+        ///
+        /// Shape A is *"authoritative disk write, then fallible mirror
+        /// update"*. Holding a [`ReservedIndexSlot`] is proof that the resident
+        /// index has already been charged against `ReadLimitKey::IndexBytes`
+        /// and `try_reserve`d for this record, so the only work left for the
+        /// mirror after this write is an infallible `push`. Demanding it here
+        /// is what makes the ordering a compile-time property: an append helper
+        /// written next month cannot reach this function at all until it has
+        /// done the fallible half, and the reservation therefore cannot be
+        /// moved below the write. The token is zero-sized and is borrowed, not
+        /// consumed, because the caller still needs it to install the entry
+        /// afterwards.
+        pub(super) fn append_record_at_end(
+            &mut self,
+            _reserved: &ReservedIndexSlot,
+            expected_offset: u64,
+            header_bytes: &[u8],
+            payload: &[u8],
+            footer: Option<&[u8]>,
+            after_header: impl FnOnce() -> Result<()>,
+        ) -> Result<()> {
+            let offset = self.file.seek(SeekFrom::End(0))?;
+            if offset != expected_offset {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "append offset is not the end of the file",
+                )));
+            }
+            self.file.write_all(header_bytes)?;
+            after_header()?;
+            self.file.write_all(payload)?;
+            if let Some(footer) = footer {
+                self.file.write_all(footer)?;
+            }
+            Ok(())
+        }
+
+        /// Rewrites an already-indexed record's header and payload in place.
+        ///
+        /// Takes the [`RecordOverwrite`] by value; producing one performs the
+        /// version refusal (F-01) and drops the block's keyed-tail map (F-02),
+        /// both strictly before the first byte reaches disk.
+        pub(super) fn overwrite_indexed_record(
+            &mut self,
+            write: RecordOverwrite,
+            header_bytes: &[u8],
+            payload: &[u8],
+        ) -> Result<()> {
+            self.file.seek(SeekFrom::Start(write.record_offset()))?;
+            self.file.write_all(header_bytes)?;
+            self.file.seek(SeekFrom::Start(write.payload_offset()))?;
+            self.file.write_all(payload)?;
+            self.file.flush()?;
+            Ok(())
+        }
+    }
+}
+
+use record_file::RecordFile;
+
+/// Mechanical enforcement for **shape A** on the resident record index: the
+/// mirror install that follows the authoritative append cannot be reached
+/// without its reservation.
+///
+/// `VarveFile::index` is the in-memory mirror of the records on disk. The
+/// append core reserves one slot for it, writes the record, and then pushes the
+/// entry — the reservation is roughly eighty lines above the push, and until
+/// round 12 the only thing keeping them in that order was a source comment.
+/// That is the exact configuration round 12's F-03 was in `matrix.rs`: a
+/// correct ordering, described in prose, in a function nobody was going to
+/// re-derive. An edit that moved the charge or the `try_reserve` below the
+/// write would leave an `AllocationFailed` with the record on disk, absent from
+/// the index, on a writer that is not poisoned.
+///
+/// [`ReservedIndexSlot`] removes the choice. It has a private field and lives
+/// in its own module, so it can only come from [`ResidentIndex::reserve`],
+/// which does the limit checks and the `try_reserve`; and
+/// [`ResidentIndex::install`] takes it **by value** and returns `()`, so
+/// the push is infallible, allocation-free, and unreachable without the
+/// reservation having already succeeded. Cost on the hot path: none — the
+/// token is zero-sized and the two functions hold exactly the code that was
+/// inline before.
+///
+/// # Why the mirror itself lives here too
+///
+/// Re-verification of the first cut showed that the token bound less than it
+/// claimed, because the mirror was still an ordinary `Vec` field of
+/// `VarveFile`. Both of these compiled inside `file.rs`:
+///
+/// ```text
+/// let mut mirror = core::mem::take(&mut self.index);   // grow around the token
+/// mirror.insert(0, entry);
+/// self.index = mirror;
+/// ```
+///
+/// and, worse for invariant 3,
+///
+/// ```text
+/// self.file.append_record_at_end(..)?;                 // authoritative write
+/// let slot = ReservedIndexSlot::reserve(&mut self.index, charge)?;  // fallible, AFTER it
+/// slot.install(&mut self.index, entry);
+/// ```
+///
+/// The token proved that a reservation *existed*, not that it *preceded* the
+/// write, and it did not stop a second route to the `Vec`. Two changes close
+/// both, and neither is a rule a later function can fail to repeat:
+///
+/// * the `Vec` is a private field of [`ResidentIndex`], declared in this
+///   module. Outside it the field cannot be named, so `mem::take`, `insert`,
+///   `push`, `append` and `extend` are unreachable; the only growth in the
+///   crate is [`ResidentIndex::install`], and the only way to call it is to
+///   hold the token.
+/// * the append itself demands the token: [`RecordFile::append_record_at_end`]
+///   takes `&ReservedIndexSlot`. A caller that has not already charged the
+///   limit and reserved the slot has nothing to write *with*, so the fallible
+///   mirror half cannot be moved below the authoritative write — that ordering
+///   is now a signature, not a comment.
+///
+/// What is deliberately *not* forbidden: reading the mirror (it derefs to a
+/// slice), mutating fields of an entry already in it
+/// ([`ResidentIndex::entry_mut`], used by the in-place replacement path to
+/// restamp a sequence and checksum), shrinking it
+/// ([`ResidentIndex::truncate`], the append rollback), and replacing a whole
+/// generation ([`ResidentIndex::adopt_generation`], the rewrite paths, which
+/// build their `Vec` with `try_reserve_exact` before the new file exists).
+/// None of those can add an entry the disk does not have.
+pub(crate) mod resident_index {
+    use super::{RecordIndexEntry, Result};
+    use core::ops::Deref;
+
+    /// Proof that the resident record index has spare capacity for one entry.
+    ///
+    /// Zero-sized, so demanding it costs nothing at run time; produced only by
+    /// `ResidentIndex::reserve`, so demanding it costs a fallible reservation
+    /// at compile time.
+    #[derive(Debug)]
+    #[must_use = "a reserved index slot is the proof that the mirror can accept \
+                  the entry; drop it only if the append is abandoned"]
+    pub struct ReservedIndexSlot(());
+
+    /// The in-memory mirror of the records on disk.
+    ///
+    /// The backing `Vec` is unnameable outside this module; see the module
+    /// documentation for what that forbids and what it deliberately allows.
+    #[derive(Debug)]
+    pub struct ResidentIndex {
+        entries: Vec<RecordIndexEntry>,
+    }
+
+    impl ResidentIndex {
+        /// Adopts the entries of a freshly built generation.
+        ///
+        /// Used at open time (the index scanned from the file) and by the
+        /// rewrite replacement paths (the index of the temporary generation
+        /// that has just become the file). Both hand over a `Vec` that already
+        /// describes records on disk, so this cannot introduce an entry the
+        /// disk does not have; and both build it with `try_reserve_exact`
+        /// before any byte is published, so no allocation is deferred past a
+        /// commit point.
+        pub(crate) fn adopt_generation(entries: Vec<RecordIndexEntry>) -> Self {
+            Self { entries }
+        }
+
+        /// Performs every fallible part of growing the mirror by one entry.
+        ///
+        /// `charge` is the caller's already-computed limit check; it runs here
+        /// so that the charge and the reservation cannot be separated either.
+        pub(crate) fn reserve(
+            &mut self,
+            charge: impl FnOnce() -> Result<u64>,
+        ) -> Result<ReservedIndexSlot> {
+            let index_bytes = charge()?;
+            self.entries
+                .try_reserve(1)
+                .map_err(|_| super::Error::AllocationFailed {
+                    resource: "record index",
+                    requested: index_bytes,
+                })?;
+            Ok(ReservedIndexSlot(()))
+        }
+
+        /// Installs the entry into capacity that is already reserved.
+        ///
+        /// Infallible and allocation-free by construction: this is the only
+        /// growth of the resident index in the crate.
+        pub(crate) fn install(&mut self, slot: ReservedIndexSlot, entry: RecordIndexEntry) {
+            let ReservedIndexSlot(()) = slot;
+            self.entries.push(entry);
+        }
+
+        /// Drops the tail beyond `len`, for the append rollback. Shrinking can
+        /// only make the mirror describe fewer records than the disk holds,
+        /// which is the direction rollback restores.
+        pub(crate) fn truncate(&mut self, len: usize) {
+            self.entries.truncate(len);
+        }
+
+        /// Mutable access to an entry that is already in the mirror, for the
+        /// in-place replacement path's sequence and checksum restamp. The
+        /// entry count cannot change through this handle.
+        pub(crate) fn entry_mut(&mut self, position: usize) -> &mut RecordIndexEntry {
+            &mut self.entries[position]
+        }
+    }
+
+    impl Deref for ResidentIndex {
+        type Target = [RecordIndexEntry];
+
+        fn deref(&self) -> &[RecordIndexEntry] {
+            &self.entries
+        }
+    }
+}
+
+use resident_index::{ReservedIndexSlot, ResidentIndex};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct RecordIndexEntry {
@@ -950,6 +1398,14 @@ enum WriteFault {
     AppendAfterHeaderWithRollbackFailure,
     RollbackFailure,
     RebindAfterPublish,
+    /// F-07 double fault: the parent-directory sync fails *and* the rebind
+    /// that follows the same publication fails.
+    ///
+    /// One arming produces both, because taking the parent-sync failure re-arms
+    /// the injector as [`WriteFault::RebindAfterPublish`]. That ordering is the
+    /// one the code under test sees: `replace_path_atomically` syncs the parent
+    /// directory before it returns, and the writer rebinds afterwards.
+    ParentSyncThenRebindAfterPublish,
 }
 
 #[cfg(test)]
@@ -985,6 +1441,22 @@ fn fail_rollback_if_requested() -> std::io::Result<()> {
         if fault.get() == WriteFault::RollbackFailure {
             fault.set(WriteFault::None);
             Err(std::io::Error::other("injected rollback failure"))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+/// F-07: injects a parent-directory sync failure and arms the rebind failure
+/// that must follow it in the same publication.
+#[cfg(test)]
+fn fail_parent_sync_if_requested() -> Result<()> {
+    WRITE_FAULT.with(|fault| {
+        if fault.get() == WriteFault::ParentSyncThenRebindAfterPublish {
+            fault.set(WriteFault::RebindAfterPublish);
+            Err(Error::Io(std::io::Error::other(
+                "injected parent-directory sync failure",
+            )))
         } else {
             Ok(())
         }
@@ -1368,10 +1840,14 @@ fn validate_mmap_index_entry(entry: &RecordIndexEntry, mapped_len: u64) -> Resul
 pub struct VarveFile {
     spec: FormatSpec,
     path: PathBuf,
-    file: File,
+    // Shape A/B, mechanical enforcement: the primary handle is not a `File`.
+    // See `mod record_file` for what that forbids.
+    file: RecordFile,
     snapshot: SnapshotFile,
     mode: OpenMode,
-    index: Vec<RecordIndexEntry>,
+    // Shape A, mechanical enforcement: the mirror is not a `Vec`.
+    // See `mod resident_index` for what that forbids.
+    index: ResidentIndex,
     matrix: Option<crate::matrix::MatrixLayout>,
     // Present exactly when `matrix` is present: read once at open/create time
     // so sidecar identity checks never touch the file per operation (DUR2-03).
@@ -1391,7 +1867,7 @@ pub struct VarveFile {
     // request, so the parent sync happens once per created file and never on
     // the append path (DUR3-01).
     pending_pathname_parent_sync: bool,
-    poisoned: bool,
+    poison: PoisonFlag,
     _lock: Option<WriterLock>,
 }
 
@@ -1855,7 +2331,17 @@ impl VarveWriter {
 
     /// Replaces a fixed record by mutating the backing object directly.
     ///
+    /// # Errors
+    ///
+    /// See [`VarveFile::replace_fixed_in_place_exclusive`]: a stored record
+    /// whose version differs from `T::VERSION` is refused with
+    /// [`Error::BlockVersionMismatch`] (F-01).
+    ///
     /// # Safety
+    ///
+    /// See [`VarveFile::replace_fixed_in_place_exclusive`] for the full
+    /// contract, including the requirement that a keyed record's key must not
+    /// change (F-02).
     ///
     /// The caller must exclude every reader, writer, mapping, raw reference,
     /// handle, thread, and process for this operation and for the lifetime of
@@ -1947,6 +2433,16 @@ impl VarveWriter {
     ///
     /// Those two variants are the only published outcomes of this call. Every
     /// other error variant means the cell was not committed by this call.
+    ///
+    /// That statement is about the value this call **returns** (F-06). Both
+    /// variants box their event and their source, so building either one
+    /// allocates after the cell is already authoritative; those allocations
+    /// are shape-sized rather than content-sized, and the crate allocates
+    /// shape-sized memory infallibly. If the allocator refuses one, the
+    /// process terminates rather than returning some other error, so no caller
+    /// observes a *different* outcome — the cell is committed, and a reader
+    /// that opens the file afterwards sees it. See "Allocator Failure And
+    /// Published Outcomes" in `docs/durability-model.md`.
     pub fn write_matrix_cell_durable<T, F>(
         &mut self,
         key: MatrixKey,
@@ -2122,6 +2618,16 @@ impl VarveWriter {
     }
 }
 
+/// The witness this file writer's disk-touching methods demand, typed by the
+/// writer it speaks for. See `crate::writer_permit`.
+pub(crate) type FileMutationPermit = MutationPermit<VarveFile>;
+
+impl GuardedWriter for VarveFile {
+    fn poison_flag(&self) -> &PoisonFlag {
+        &self.poison
+    }
+}
+
 impl VarveFile {
     pub fn create<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
         Self::create_impl(spec, path.as_ref(), false)
@@ -2166,10 +2672,10 @@ impl VarveFile {
         let mut file = Self {
             spec,
             path,
-            file,
+            file: RecordFile::new(file),
             snapshot,
             mode: OpenMode::ReadWrite,
-            index: Vec::new(),
+            index: ResidentIndex::adopt_generation(Vec::new()),
             matrix: None,
             matrix_creation_nonce: None,
             sequence_state: SequenceState::Available(0),
@@ -2180,7 +2686,7 @@ impl VarveFile {
             // directory entry is not durable until the first durability
             // request syncs the parent directory.
             pending_pathname_parent_sync: true,
-            poisoned: false,
+            poison: PoisonFlag::healthy(),
             _lock: Some(lock),
         };
         file.write_embedded_manifest_if_needed()?;
@@ -2251,10 +2757,10 @@ impl VarveFile {
         let mut file = Self {
             spec,
             path,
-            file,
+            file: RecordFile::new(file),
             snapshot,
             mode: OpenMode::ReadWrite,
-            index: Vec::new(),
+            index: ResidentIndex::adopt_generation(Vec::new()),
             matrix: Some(matrix),
             matrix_creation_nonce: Some(creation_nonce),
             sequence_state: SequenceState::Available(0),
@@ -2265,7 +2771,7 @@ impl VarveFile {
             // directory entry is not durable until the first durability
             // request syncs the parent directory.
             pending_pathname_parent_sync: true,
-            poisoned: false,
+            poison: PoisonFlag::healthy(),
             _lock: Some(lock),
         };
         file.write_embedded_manifest_if_needed()?;
@@ -2298,10 +2804,10 @@ impl VarveFile {
         Ok(Self {
             spec,
             path,
-            file,
+            file: RecordFile::new(file),
             snapshot,
             mode: OpenMode::ReadWrite,
-            index,
+            index: ResidentIndex::adopt_generation(index),
             matrix,
             matrix_creation_nonce,
             sequence_state,
@@ -2309,7 +2815,7 @@ impl VarveFile {
             block_tails,
             keyed_tails: KeyedTails::new_empty(),
             pending_pathname_parent_sync: false,
-            poisoned: false,
+            poison: PoisonFlag::healthy(),
             _lock: Some(lock),
         })
     }
@@ -2344,10 +2850,10 @@ impl VarveFile {
         Ok(Self {
             spec,
             path,
-            file,
+            file: RecordFile::new(file),
             snapshot,
             mode: OpenMode::ReadWrite,
-            index,
+            index: ResidentIndex::adopt_generation(index),
             matrix,
             matrix_creation_nonce,
             sequence_state,
@@ -2355,7 +2861,7 @@ impl VarveFile {
             block_tails,
             keyed_tails: KeyedTails::new_empty(),
             pending_pathname_parent_sync: false,
-            poisoned: false,
+            poison: PoisonFlag::healthy(),
             _lock: Some(lock),
         })
     }
@@ -2384,10 +2890,10 @@ impl VarveFile {
         Ok(Self {
             spec,
             path,
-            file,
+            file: RecordFile::new(file),
             snapshot,
             mode: OpenMode::ReadOnly,
-            index,
+            index: ResidentIndex::adopt_generation(index),
             matrix,
             matrix_creation_nonce,
             sequence_state,
@@ -2395,7 +2901,7 @@ impl VarveFile {
             block_tails,
             keyed_tails: KeyedTails::new_empty(),
             pending_pathname_parent_sync: false,
-            poisoned: false,
+            poison: PoisonFlag::healthy(),
             _lock: None,
         })
     }
@@ -2438,10 +2944,10 @@ impl VarveFile {
             Self {
                 spec,
                 path,
-                file,
+                file: RecordFile::new(file),
                 snapshot,
                 mode: OpenMode::ReadWrite,
-                index,
+                index: ResidentIndex::adopt_generation(index),
                 matrix,
                 matrix_creation_nonce,
                 sequence_state,
@@ -2449,7 +2955,7 @@ impl VarveFile {
                 block_tails,
                 keyed_tails: KeyedTails::new_empty(),
                 pending_pathname_parent_sync: false,
-                poisoned: false,
+                poison: PoisonFlag::healthy(),
                 _lock: Some(lock),
             },
             RecoveryReport {
@@ -2532,7 +3038,7 @@ impl VarveFile {
         if !self.spec.index_policy.keyed_offset_chain {
             return self.push_with_prev_key_info_unlinked(block, None);
         }
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         let key = encode_internal_key_payload::<T>(self.spec, &block.key())?;
         // API3-01: every fallible part of the tail-cache update happens here,
         // strictly before the append that the update describes. See
@@ -2729,7 +3235,7 @@ impl VarveFile {
         block: &T,
         prev_same_key_offset: Option<u64>,
     ) -> Result<AppendInfo> {
-        self.ensure_write()?;
+        let permit = self.ensure_write()?;
         self.ensure_user_block::<T>()?;
         if T::KIND == BlockKind::Matrix {
             return Err(Error::BlockKindMismatch {
@@ -2740,7 +3246,14 @@ impl VarveFile {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         let endian = T::ENDIAN.unwrap_or(self.spec.endian);
         let payload = encode_logical_payload_limited(self.spec, block, endian)?;
-        self.write_user_record(T::ID, T::VERSION, T::KIND, &payload, prev_same_key_offset)
+        self.write_user_record(
+            &permit,
+            T::ID,
+            T::VERSION,
+            T::KIND,
+            &payload,
+            prev_same_key_offset,
+        )
     }
 
     /// Appends a tombstone for `key`, linking it to the previous record with
@@ -2775,7 +3288,7 @@ impl VarveFile {
         if !self.spec.index_policy.keyed_offset_chain {
             return self.delete_with_prev_key_info_unlinked::<T>(key, None);
         }
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         // The tombstone payload *is* the canonical internal key payload, and
         // it is also the tail map's key. Encoding it once here and handing the
         // same bytes to both consumers keeps the delete path at one key
@@ -2837,7 +3350,7 @@ impl VarveFile {
         // stays as the runtime backstop. This terminal site also covers the
         // VarveFile::delete and VarveReader/VarveWriter delete wrappers.
         let () = crate::traits::KeyedBlockContract::<T>::OK;
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         self.ensure_user_block::<T>()?;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         let payload = encode_internal_key_payload::<T>(self.spec, key)?;
@@ -2859,10 +3372,11 @@ impl VarveFile {
         T: VarveKeyedBlock,
     {
         let () = crate::traits::KeyedBlockContract::<T>::OK;
-        self.ensure_write()?;
+        let permit = self.ensure_write()?;
         self.ensure_user_block::<T>()?;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         self.write_record_with_prev_key(
+            &permit,
             TOMBSTONE_BLOCK_ID,
             1,
             RECORD_FLAG_INTERNAL,
@@ -2876,7 +3390,7 @@ impl VarveFile {
     where
         T: VarveMerge,
     {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         self.ensure_user_block::<T>()?;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         let payload = encode_internal_op_payload::<T>(self.spec, key, op)?;
@@ -2886,7 +3400,7 @@ impl VarveFile {
     pub fn write_metadata(&mut self, key: &str, value: &[u8]) -> Result<u64> {
         // Encoded as (String, Vec<u8>): an 8-byte length prefix per part.
         const METADATA_ENVELOPE_LEN: u64 = 16;
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         // DEF-02: reject an oversized entry with the typed limit error before
         // the caller's key and value are cloned or encoded.
         let entry_len = (key.len() as u64)
@@ -2980,7 +3494,7 @@ impl VarveFile {
         index: usize,
         block: &T,
     ) -> Result<ReplacementInfo> {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         if !self.spec.layout.is_varve_native_default() {
             return Err(Error::InvalidFormatSpec(
                 "replacement is not supported for custom physical layouts",
@@ -2993,23 +3507,10 @@ impl VarveFile {
         }
         self.ensure_user_block::<T>()?;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
-        let target_position = self
-            .index
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.block_id == T::ID)
-            .nth(index)
-            .map(|(position, _)| position)
-            .ok_or(Error::UnexpectedEof)?;
+        // F-01: resolution and the target-version refusal are one step, and
+        // there is no other way to address the target. See `ReplacementTarget`.
+        let target_position = ReplacementTarget::resolve::<T>(&self.index, index)?.position();
         let target = &self.index[target_position];
-        if target.block_version != T::VERSION {
-            return Err(Error::BlockVersionMismatch {
-                block_id: T::ID,
-                expected: T::VERSION,
-                actual: target.block_version,
-            });
-        }
-
         let mut materialization = MaterializationBudget::new(self.spec);
         let old_logical_len = target.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
         materialization.consume(old_logical_len)?;
@@ -3121,11 +3622,18 @@ impl VarveFile {
             Ok(ReplaceDurability::ParentSyncPending(sync_error)) => {
                 // Publication already happened: the pathname resolves to the
                 // new generation, so the writer must move there regardless.
-                self.rebind_replacement_generation(info, new_index)?;
-                Err(Error::PublishedButParentSyncPending {
-                    path: self.path.display().to_string(),
-                    source: Box::new(sync_error),
-                })
+                //
+                // F-07: `?` here would drop `sync_error` if the rebind failed
+                // too, and `PublishedButRebindFailed` alone cannot say that
+                // the published pathname is not yet durable. Both facts are
+                // preserved instead.
+                match self.rebind_replacement_generation(info, new_index) {
+                    Ok(_) => Err(Error::PublishedButParentSyncPending {
+                        path: self.path.display().to_string(),
+                        source: Box::new(sync_error),
+                    }),
+                    Err(rebind_error) => Err(rebind_error.with_pending_parent_sync(sync_error)),
+                }
             }
             Err(error) => Err(self.fail_publication(&temp_path, error)),
         }
@@ -3143,7 +3651,7 @@ impl VarveFile {
     /// until the parent directory is synced (for example by a later successful
     /// publication or an explicit directory sync).
     pub fn replace_fixed<T: VarveBlock>(&mut self, index: usize, block: &T) -> Result<u64> {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         self.ensure_user_block::<T>()?;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         if T::KIND != BlockKind::Fixed {
@@ -3152,14 +3660,9 @@ impl VarveFile {
                 actual: T::KIND,
             });
         }
-        let target_position = self
-            .index
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.block_id == T::ID)
-            .nth(index)
-            .map(|(position, _)| position)
-            .ok_or(Error::UnexpectedEof)?;
+        // F-01: resolution and the target-version refusal are one step, and
+        // there is no other way to address the target. See `ReplacementTarget`.
+        let target_position = ReplacementTarget::resolve::<T>(&self.index, index)?.position();
 
         let endian = T::ENDIAN.unwrap_or(self.spec.endian);
         let payload = encode_logical_payload_limited(self.spec, block, endian)?;
@@ -3185,13 +3688,6 @@ impl VarveFile {
 
         let sequence = self.sequence_state.available()?;
         let entry = &self.index[target_position];
-        if entry.block_version != T::VERSION {
-            return Err(Error::BlockVersionMismatch {
-                block_id: T::ID,
-                expected: T::VERSION,
-                actual: entry.block_version,
-            });
-        }
         let mut footer_bytes = [0; RECORD_FOOTER_LEN as usize];
         let footer = if let Some(footer_offset) = entry.footer_offset {
             self.snapshot
@@ -3259,11 +3755,18 @@ impl VarveFile {
             Ok(ReplaceDurability::ParentSyncPending(sync_error)) => {
                 // Publication already happened: the pathname resolves to the
                 // new generation, so the writer must move there regardless.
-                self.rebind_published_generation(sequence, new_index)?;
-                Err(Error::PublishedButParentSyncPending {
-                    path: self.path.display().to_string(),
-                    source: Box::new(sync_error),
-                })
+                //
+                // F-07: `?` here would drop `sync_error` if the rebind failed
+                // too, and `PublishedButRebindFailed` alone cannot say that
+                // the published pathname is not yet durable. Both facts are
+                // preserved instead.
+                match self.rebind_published_generation(sequence, new_index) {
+                    Ok(_) => Err(Error::PublishedButParentSyncPending {
+                        path: self.path.display().to_string(),
+                        source: Box::new(sync_error),
+                    }),
+                    Err(rebind_error) => Err(rebind_error.with_pending_parent_sync(sync_error)),
+                }
             }
             Err(error) => Err(self.fail_publication(&temp_path, error)),
         }
@@ -3271,17 +3774,45 @@ impl VarveFile {
 
     /// Replaces a fixed record by mutating this file object directly.
     ///
+    /// # Errors
+    ///
+    /// F-01: the target is selected by block id, so a version mismatch between
+    /// `T` and the stored record is refused with
+    /// [`Error::BlockVersionMismatch`], exactly as [`VarveFile::replace_fixed`]
+    /// does. Otherwise `T`'s payload would be written under the stored
+    /// record's older version header. The refusal is not a step this function
+    /// performs; it is a precondition of resolving the target at all. See
+    /// `ReplacementTarget`.
+    ///
     /// # Safety
     ///
     /// The caller must exclude every reader, writer, mapping, raw reference,
     /// handle, thread, and process for this operation and for the lifetime of
     /// every view that could observe the affected object.
+    ///
+    /// For a keyed block in a format with `keyed_offset_chain`, the caller
+    /// must additionally **not change the record's key** (F-02). This entry
+    /// point takes `T: VarveBlock`, which exposes no key, so the requirement
+    /// cannot be checked here, and unlike the copy-on-write paths there is no
+    /// new generation in which the chain could be rebuilt: records appended
+    /// after this one already carry `prev_same_key_offset` pointers into it,
+    /// and rewriting its key in place would leave them linking a record that
+    /// now claims a different key. Ordinary keyed replacement enforces the
+    /// same-key contract through
+    /// [`crate::VarveReplaceBlock::validate_replacement`]; here it is part of
+    /// the unsafe contract.
+    ///
+    /// What this function *does* guarantee, whether or not the contract is
+    /// honoured, is that no resident keyed-tail cache survives the mutation:
+    /// the affected block's tail map is dropped **before** the first byte is
+    /// written, so a stale predecessor can never be read afterwards, not even
+    /// if the write fails part-way or the contract above is violated.
     pub unsafe fn replace_fixed_in_place_exclusive<T: VarveBlock>(
         &mut self,
         index: usize,
         block: &T,
     ) -> Result<u64> {
-        self.ensure_write()?;
+        let permit = self.ensure_write()?;
         self.ensure_user_block::<T>()?;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         if T::KIND != BlockKind::Fixed {
@@ -3290,14 +3821,10 @@ impl VarveFile {
                 actual: T::KIND,
             });
         }
-        let target_position = self
-            .index
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.block_id == T::ID)
-            .nth(index)
-            .map(|(position, _)| position)
-            .ok_or(Error::UnexpectedEof)?;
+        // F-01: resolution and the target-version refusal are one step, and
+        // there is no other way to address the target. See `ReplacementTarget`.
+        let target = ReplacementTarget::resolve::<T>(&self.index, index)?;
+        let target_position = target.position();
         let payload = encode_logical_payload_limited(
             self.spec,
             block,
@@ -3345,22 +3872,15 @@ impl VarveFile {
             entry.record_offset,
             record_footer_len(self.spec),
         )?;
-        let record_offset = entry.record_offset;
-        let payload_offset = entry.payload_offset;
-        let write_result = (|| -> Result<()> {
-            self.file.seek(SeekFrom::Start(record_offset))?;
-            self.file.write_all(&header_bytes)?;
-            self.file.seek(SeekFrom::Start(payload_offset))?;
-            self.file.write_all(&payload)?;
-            self.file.flush()?;
-            Ok(())
-        })();
+        let write_result =
+            self.overwrite_record_bytes_in_place(&permit, target, &header_bytes, &payload);
         if let Err(error) = write_result {
-            self.poisoned = true;
+            self.poison.poison();
             return Err(error);
         }
-        self.index[target_position].sequence = sequence;
-        self.index[target_position].checksum = checksum;
+        let entry = self.index.entry_mut(target_position);
+        entry.sequence = sequence;
+        entry.checksum = checksum;
         self.publish_sequence(sequence);
         Ok(sequence)
     }
@@ -3376,7 +3896,7 @@ impl VarveFile {
     /// until the parent directory is synced (for example by a later successful
     /// publication or an explicit directory sync).
     pub fn replace_rewrite<T: VarveBlock>(&mut self, index: usize, block: &T) -> Result<u64> {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         if self.spec.spec_needs_record_footer() {
             return Err(Error::InvalidFormatSpec(
                 "replace is not supported for record-footer formats",
@@ -3389,14 +3909,9 @@ impl VarveFile {
         }
         self.ensure_user_block::<T>()?;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
-        let target_position = self
-            .index
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.block_id == T::ID)
-            .nth(index)
-            .map(|(position, _)| position)
-            .ok_or(Error::UnexpectedEof)?;
+        // F-01: resolution and the target-version refusal are one step, and
+        // there is no other way to address the target. See `ReplacementTarget`.
+        let target_position = ReplacementTarget::resolve::<T>(&self.index, index)?.position();
         let sequence = self.sequence_state.available()?;
         let endian = T::ENDIAN.unwrap_or(self.spec.endian);
         let replacement = encode_logical_payload_limited(self.spec, block, endian)?;
@@ -3488,11 +4003,18 @@ impl VarveFile {
             Ok(ReplaceDurability::ParentSyncPending(sync_error)) => {
                 // Publication already happened: the pathname resolves to the
                 // new generation, so the writer must move there regardless.
-                self.rebind_published_generation(sequence, new_index)?;
-                Err(Error::PublishedButParentSyncPending {
-                    path: self.path.display().to_string(),
-                    source: Box::new(sync_error),
-                })
+                //
+                // F-07: `?` here would drop `sync_error` if the rebind failed
+                // too, and `PublishedButRebindFailed` alone cannot say that
+                // the published pathname is not yet durable. Both facts are
+                // preserved instead.
+                match self.rebind_published_generation(sequence, new_index) {
+                    Ok(_) => Err(Error::PublishedButParentSyncPending {
+                        path: self.path.display().to_string(),
+                        source: Box::new(sync_error),
+                    }),
+                    Err(rebind_error) => Err(rebind_error.with_pending_parent_sync(sync_error)),
+                }
             }
             Err(error) => Err(self.fail_publication(&temp_path, error)),
         }
@@ -3511,7 +4033,7 @@ impl VarveFile {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.ensure_not_poisoned()?;
+        let _permit = self.ensure_not_poisoned()?;
         self.write_embedded_manifest_if_needed()?;
         if self.mode == OpenMode::ReadWrite
             && self.spec.index_policy.checkpoint_on_flush
@@ -3530,7 +4052,7 @@ impl VarveFile {
     }
 
     pub fn commit(&mut self) -> Result<AppendInfo> {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         if !self.spec.commit_policy.is_transaction_marker() {
             return Err(Error::InvalidFormatSpec(
                 "commit markers require transaction_marker commit policy",
@@ -3553,7 +4075,7 @@ impl VarveFile {
     }
 
     pub fn commit_durable(&mut self) -> Result<AppendInfo> {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         if !self.spec.commit_policy.is_transaction_marker() {
             return Err(Error::InvalidFormatSpec(
                 "commit markers require transaction_marker commit policy",
@@ -3631,7 +4153,7 @@ impl VarveFile {
     /// unconfirmed - and leaves the request pending, so a later `sync` retries
     /// it.
     pub fn sync(&mut self) -> Result<()> {
-        self.ensure_not_poisoned()?;
+        let _permit = self.ensure_not_poisoned()?;
         self.file.sync_all()?;
         self.sync_created_pathname_once()
     }
@@ -3954,10 +4476,10 @@ impl VarveFile {
         key: MatrixKey,
         value: &T,
     ) -> Result<()> {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         let result = {
             let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-            crate::matrix::write_cell(self.spec, matrix, &mut self.file, key, value)
+            crate::matrix::write_cell(self.spec, matrix, self.file.matrix_region(), key, value)
         };
         self.finish_matrix_mutation(result)
     }
@@ -3967,10 +4489,16 @@ impl VarveFile {
         key: MatrixKey,
         payload: &[u8],
     ) -> Result<()> {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         let result = {
             let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-            crate::matrix::write_cell_payload::<T>(self.spec, matrix, &mut self.file, key, payload)
+            crate::matrix::write_cell_payload::<T>(
+                self.spec,
+                matrix,
+                self.file.matrix_region(),
+                key,
+                payload,
+            )
         };
         self.finish_matrix_mutation(result)
     }
@@ -4007,6 +4535,12 @@ impl VarveFile {
     /// call, so a result-driven retry can distinguish "nothing happened, retry
     /// the write" from "committed, retry only the notification" and from
     /// "committed, re-establish durability".
+    ///
+    /// The scope of that guarantee is a process that continues to run (F-06):
+    /// both variants allocate two boxes after the commit, and a refused
+    /// shape-sized allocation aborts rather than substituting another outcome.
+    /// See "Allocator Failure And Published Outcomes" in
+    /// `docs/durability-model.md`.
     pub fn write_matrix_cell_durable<T, F>(
         &mut self,
         key: MatrixKey,
@@ -4051,7 +4585,7 @@ impl VarveFile {
         // Pre-publication. Nothing is committed yet, so a failure here is a
         // plain refusal: the slot bytes may be on disk but the commit bit is
         // not, and an uncommitted slot is not visible to any reader.
-        let sync_data = barrier.sync_matrix_data(&mut self.file);
+        let sync_data = barrier.sync_matrix_data(self.file.matrix_region());
         self.poison_after_started_matrix_error(sync_data)?;
         // THE AUTHORITATIVE COMMIT. `commit_matrix_cell` puts the commit bit in
         // the file; from this line on the cell is committed and a reader that
@@ -4070,8 +4604,31 @@ impl VarveFile {
         // durability instead of repeating the write. Poisoning is retained: a
         // refused durability request mid-publication leaves this handle unfit
         // to continue, and the recovery is to reopen and `sync`.
-        if let Err(source) = barrier.sync_matrix_commit(&mut self.file) {
-            self.poisoned = true;
+        //
+        // F-06, and the crate's one policy on allocator failure. Both post-
+        // commit variants box their event and their source, so constructing
+        // either one allocates twice after the cell is authoritative, and a
+        // harness that failed the very next allocation terminated the process
+        // at exactly this line while the reopened file held the committed
+        // value. That is deliberate and is now stated rather than implied.
+        // These are *shape-sized* allocations - 56 bytes, fixed by the type,
+        // not by any file length or caller count - and the crate allocates
+        // those infallibly, matching Rust's abort-on-OOM default; only
+        // content-sized allocations are charged and `try_reserve`d into
+        // `Error::AllocationFailed`. The consequence is the one the docs now
+        // publish: an allocator refusal here ends the process instead of
+        // returning a *different* outcome, so no caller ever observes a wrong
+        // one, and the cell is committed on disk either way. Pre-staging the
+        // boxes before the commit was considered and rejected: it cannot
+        // remove `Box::new(source)` (the source is only produced by the
+        // failure, and `Error` is recursive so it cannot be carried inline),
+        // the caller must allocate to format or propagate the outcome anyway,
+        // and it would put two allocations on the success path of every
+        // durable cell write to serve a path that ends in `abort`. See
+        // "Allocator Failure And Published Outcomes" in
+        // `docs/durability-model.md`.
+        if let Err(source) = barrier.sync_matrix_commit(self.file.matrix_region()) {
+            self.poison.poison();
             return Err(Error::MatrixCommittedButDurabilityUnproven {
                 event: Box::new(event),
                 source: Box::new(source),
@@ -4091,12 +4648,12 @@ impl VarveFile {
 
     pub fn read_matrix_cell<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<T> {
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::read_cell(self.spec, matrix, &mut self.file, key)
+        crate::matrix::read_cell(self.spec, matrix, self.file.matrix_region(), key)
     }
 
     pub fn matrix_cell_payload<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<Vec<u8>> {
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::read_cell_payload::<T>(self.spec, matrix, &mut self.file, key)
+        crate::matrix::read_cell_payload::<T>(self.spec, matrix, self.file.matrix_region(), key)
     }
 
     pub fn matrix_aux_len(&self, name: &str) -> Result<u64> {
@@ -4108,7 +4665,7 @@ impl VarveFile {
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
         crate::matrix::read_aux_at_len(
             matrix,
-            &mut self.file,
+            self.file.matrix_region(),
             self.snapshot.len(),
             name,
             offset,
@@ -4117,12 +4674,12 @@ impl VarveFile {
     }
 
     pub fn write_matrix_aux(&mut self, name: &str, offset: u64, payload: &[u8]) -> Result<()> {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         let result = {
             let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
             crate::matrix::write_aux_at_len(
                 matrix,
-                &mut self.file,
+                self.file.matrix_region(),
                 self.snapshot.len(),
                 name,
                 offset,
@@ -4141,37 +4698,43 @@ impl VarveFile {
     }
 
     pub fn commit_matrix_cell<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<()> {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         let result = {
             let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-            crate::matrix::commit_cell::<T>(self.spec, matrix, &mut self.file, key)
+            crate::matrix::commit_cell::<T>(self.spec, matrix, self.file.matrix_region(), key)
         };
         self.finish_matrix_mutation(result)
     }
 
     pub fn clear_matrix_cell<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<()> {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         let result = {
             let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-            crate::matrix::clear_cell::<T>(self.spec, matrix, &mut self.file, key)
+            crate::matrix::clear_cell::<T>(self.spec, matrix, self.file.matrix_region(), key)
         };
         self.finish_matrix_mutation(result)
     }
 
     pub fn clear_matrix_cell_by_category(&mut self, category: &str, key: MatrixKey) -> Result<()> {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         let result = {
             let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-            crate::matrix::clear_cell_by_category(self.spec, matrix, &mut self.file, category, key)
+            crate::matrix::clear_cell_by_category(
+                self.spec,
+                matrix,
+                self.file.matrix_region(),
+                category,
+                key,
+            )
         };
         self.finish_matrix_mutation(result)
     }
 
     pub fn clear_matrix_category(&mut self, category: &str) -> Result<u64> {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         let result = {
             let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-            crate::matrix::clear_category(self.spec, matrix, &mut self.file, category)
+            crate::matrix::clear_category(self.spec, matrix, self.file.matrix_region(), category)
         };
         self.finish_matrix_mutation(result)
     }
@@ -4194,10 +4757,14 @@ impl VarveFile {
     }
 
     pub fn rebuild_matrix_commit_from_crc<T: VarveMatrixBlock>(&mut self) -> Result<u64> {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         let result = {
             let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-            crate::matrix::rebuild_commit_map_from_crc::<T>(self.spec, matrix, &mut self.file)
+            crate::matrix::rebuild_commit_map_from_crc::<T>(
+                self.spec,
+                matrix,
+                self.file.matrix_region(),
+            )
         };
         self.finish_matrix_mutation(result)
     }
@@ -4208,10 +4775,10 @@ impl VarveFile {
     }
 
     pub fn set_matrix_single_committed(&mut self, name: &str, value: bool) -> Result<()> {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         let result = {
             let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-            crate::matrix::set_single_committed(matrix, &mut self.file, name, value)
+            crate::matrix::set_single_committed(matrix, self.file.matrix_region(), name, value)
         };
         self.finish_matrix_mutation(result)
     }
@@ -4227,10 +4794,16 @@ impl VarveFile {
         channel: u64,
         value: bool,
     ) -> Result<()> {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         let result = {
             let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
-            crate::matrix::set_channel_committed(matrix, &mut self.file, name, channel, value)
+            crate::matrix::set_channel_committed(
+                matrix,
+                self.file.matrix_region(),
+                name,
+                channel,
+                value,
+            )
         };
         self.finish_matrix_mutation(result)
     }
@@ -4309,7 +4882,7 @@ impl VarveFile {
         generation: u64,
         payload: &[u8],
     ) -> Result<MatrixSidecarManifest> {
-        self.ensure_write()?;
+        let _permit = self.ensure_write()?;
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
         crate::matrix::resume_signal(matrix, category)?;
         let identity = self.matrix_native_identity()?;
@@ -4391,7 +4964,7 @@ impl VarveFile {
     /// refuse to delete a file that another process has since swapped in at
     /// the same pathname (API2-02).
     pub(crate) fn native_object_identity(&self) -> Result<Vec<u8>> {
-        opened_file_identity(&self.file)
+        self.file.object_identity()
     }
 
     /// Arms `count` injected post-publication parent-directory sync failures.
@@ -4559,7 +5132,7 @@ impl VarveFile {
                 len: mapped_len,
             });
         }
-        for entry in &self.index {
+        for entry in self.index.iter() {
             validate_mmap_index_entry(entry, current_len)?;
         }
         let map_len =
@@ -4567,7 +5140,7 @@ impl VarveFile {
         // SAFETY: The caller guarantees that the cloned backing object remains
         // immutable and valid for the mapping's entire lifetime.
         let mmap = unsafe { memmap2::MmapOptions::new().len(map_len).map(&file)? };
-        for entry in &self.index {
+        for entry in self.index.iter() {
             validate_mmap_index_entry(entry, mapped_len)?;
         }
         let mut index = Vec::new();
@@ -4678,15 +5251,58 @@ impl VarveFile {
         })
     }
 
-    fn ensure_write(&self) -> Result<()> {
-        self.ensure_not_poisoned()?;
+    /// The write-side guard: poison check plus open-mode check, returning the
+    /// witness the guarded operations demand. See [`Self::ensure_not_poisoned`].
+    fn ensure_write(&self) -> Result<FileMutationPermit> {
+        let permit = self.ensure_not_poisoned()?;
         match self.mode {
-            OpenMode::ReadWrite => Ok(()),
+            OpenMode::ReadWrite => Ok(permit),
             OpenMode::ReadOnly => Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "file was opened read-only",
             ))),
         }
+    }
+
+    /// Overwrites an already-indexed record's header and payload in place.
+    ///
+    /// F-01 and F-02, mechanical enforcement. This function holds no addressing
+    /// and no invalidation of its own: it takes a [`ReplacementTarget`], whose
+    /// only constructor performed the `T::VERSION` refusal, and turns it into a
+    /// [`RecordOverwrite`], whose only constructor drops the target block's
+    /// resident keyed-tail map. The write is then performed by
+    /// `RecordFile::overwrite_indexed_record`, which consumes the
+    /// [`RecordOverwrite`] by value and is the only route to those bytes,
+    /// because the raw handle is unnameable outside `mod record_file`.
+    ///
+    /// So the two properties below are not properties of this function that a
+    /// sibling could fail to repeat; they are properties of *addressing an
+    /// already-indexed record at all*:
+    ///
+    /// * The invalidation runs **before** the first byte reaches disk, so it
+    ///   also covers a write that fails half-way, a poisoned writer that is
+    ///   later inspected, and a caller that violates the same-key contract.
+    /// * It is infallible and allocation-free (a `HashMap::remove`), so it
+    ///   introduces no fallible step of its own, in either direction of
+    ///   invariant 3.
+    ///
+    /// Round 12 stated the same guarantee for a function that a new seek/write
+    /// pair elsewhere in this file could simply bypass, and re-verification
+    /// compiled exactly that bypass. The bypass no longer builds.
+    fn overwrite_record_bytes_in_place(
+        &mut self,
+        permit: &FileMutationPermit,
+        target: ReplacementTarget,
+        header_bytes: &[u8],
+        payload: &[u8],
+    ) -> Result<()> {
+        let _ = permit;
+        // Both preconditions are discharged by constructing the permission:
+        // the version refusal happened in `ReplacementTarget::resolve`, and
+        // `prepare` drops the keyed-tail map before the write below.
+        let write = RecordOverwrite::prepare(target, &self.index, &mut self.keyed_tails);
+        self.file
+            .overwrite_indexed_record(write, header_bytes, payload)
     }
 
     fn rebind_published_generation(
@@ -4709,9 +5325,9 @@ impl VarveFile {
 
         match rebind {
             Ok((file, snapshot)) => {
-                self.file = file;
+                self.file = RecordFile::new(file);
                 self.snapshot = snapshot;
-                self.index = new_index;
+                self.index = ResidentIndex::adopt_generation(new_index);
                 // The resident index was replaced wholesale; recover the O(1)
                 // flush-cadence state once for the new generation (PERF2-02)
                 // and the O(1) block tails with it (PERF2-05). Record offsets
@@ -4723,10 +5339,13 @@ impl VarveFile {
                 Ok(sequence)
             }
             Err(source) => {
-                self.poisoned = true;
+                self.poison.poison();
+                // F-07: the caller folds in a parent-directory sync failure it
+                // already observed, via `Error::with_pending_parent_sync`.
                 Err(Error::PublishedButRebindFailed {
                     sequence,
                     source: Box::new(source),
+                    parent_sync: None,
                 })
             }
         }
@@ -4752,9 +5371,9 @@ impl VarveFile {
 
         match rebind {
             Ok((file, snapshot)) => {
-                self.file = file;
+                self.file = RecordFile::new(file);
                 self.snapshot = snapshot;
-                self.index = new_index;
+                self.index = ResidentIndex::adopt_generation(new_index);
                 // The resident index was replaced wholesale; recover the O(1)
                 // flush-cadence state once for the new generation (PERF2-02)
                 // and the O(1) block tails with it (PERF2-05). Record offsets
@@ -4765,10 +5384,13 @@ impl VarveFile {
                 Ok(info)
             }
             Err(source) => {
-                self.poisoned = true;
+                self.poison.poison();
+                // F-07: the caller folds in a parent-directory sync failure it
+                // already observed, via `Error::with_pending_parent_sync`.
                 Err(Error::PublishedButRebindFailed {
                     sequence: info.sequence,
                     source: Box::new(source),
+                    parent_sync: None,
                 })
             }
         }
@@ -4790,12 +5412,18 @@ impl VarveFile {
         )
     }
 
-    fn ensure_not_poisoned(&self) -> Result<()> {
-        if self.poisoned {
-            Err(Error::WriterPoisoned(WRITER_POISON_CONTEXT))
-        } else {
-            Ok(())
-        }
+    /// The one poison check for this writer, and the only source of the
+    /// witness its guarded operations demand.
+    ///
+    /// Shape B, mechanical enforcement (round 12). `PoisonFlag` owns the state
+    /// and lives in `crate::writer_permit`, so nothing in this ~12000-line file
+    /// can read or assign it. Every function that puts bytes into an already
+    /// published generation — the append core, and the one in-place record
+    /// rewrite — takes the [`MutationPermit`] this returns, by reference, so a
+    /// mutating method written later cannot reach the disk without having asked
+    /// for one. See `crate::writer_permit` for what that makes impossible.
+    fn ensure_not_poisoned(&self) -> Result<FileMutationPermit> {
+        self.writer_permit(WRITER_POISON_CONTEXT)
     }
 
     /// Handles a failed atomic publication for a copy-on-write writer.
@@ -4808,7 +5436,7 @@ impl VarveFile {
     /// unknown generation (DUR2-01).
     fn fail_publication(&mut self, temp_path: &Path, error: Error) -> Error {
         if matches!(error, Error::ReplacePublicationIndeterminate { .. }) {
-            self.poisoned = true;
+            self.poison.poison();
         } else {
             let _ = remove_file(temp_path);
         }
@@ -4847,7 +5475,7 @@ impl VarveFile {
     /// moved ahead of the write instead.
     fn finish_matrix_mutation<T>(&mut self, result: Result<T>) -> Result<T> {
         if matches!(&result, Err(Error::Io(_))) {
-            self.poisoned = true;
+            self.poison.poison();
         }
         result
     }
@@ -4865,7 +5493,7 @@ impl VarveFile {
     /// bare error this helper propagates; do not route it back through here.
     fn poison_after_started_matrix_error<T>(&mut self, result: Result<T>) -> Result<T> {
         if result.is_err() {
-            self.poisoned = true;
+            self.poison.poison();
         }
         result
     }
@@ -4889,13 +5517,15 @@ impl VarveFile {
         flags: u16,
         payload: &[u8],
     ) -> Result<u64> {
+        let permit = self.ensure_write()?;
         Ok(self
-            .write_record_with_prev_key(block_id, block_version, flags, 0, payload, None)?
+            .write_record_with_prev_key(&permit, block_id, block_version, flags, 0, payload, None)?
             .sequence)
     }
 
     fn write_user_record(
         &mut self,
+        permit: &FileMutationPermit,
         block_id: u32,
         block_version: u16,
         kind: BlockKind,
@@ -4904,6 +5534,7 @@ impl VarveFile {
     ) -> Result<AppendInfo> {
         let payload = prepare_user_record_payload(self.spec, block_id, kind, payload)?;
         self.write_record_with_prev_key(
+            permit,
             block_id,
             block_version,
             payload.flags,
@@ -4913,8 +5544,21 @@ impl VarveFile {
         )
     }
 
+    /// The crate's single record-append core.
+    ///
+    /// Shape B, mechanical enforcement (round 12). It used to call
+    /// [`Self::ensure_write`] itself, which is a convention: a sibling append
+    /// helper written next month could seek and `write_all` without one, which
+    /// is precisely the defect F-05 was in `stream.rs`. It now demands the
+    /// [`MutationPermit`] instead, so the check is the caller's precondition
+    /// and the compiler enforces that every route to an append has made it.
+    // The permit is a zero-sized witness, not data: the argument count is one
+    // higher than clippy's default because the poison check became a
+    // compile-time precondition instead of a remembered first line.
+    #[allow(clippy::too_many_arguments)]
     fn write_record_with_prev_key(
         &mut self,
+        permit: &FileMutationPermit,
         block_id: u32,
         block_version: u16,
         flags: u16,
@@ -4922,7 +5566,7 @@ impl VarveFile {
         payload: &[u8],
         prev_same_key_offset: Option<u64>,
     ) -> Result<AppendInfo> {
-        self.ensure_write()?;
+        let _ = permit;
         let payload_len =
             u64::try_from(payload.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
         self.spec
@@ -4952,16 +5596,17 @@ impl VarveFile {
                 resource: "record count",
             })?,
         )?;
-        let index_bytes = index_bytes_for_count(record_count)?;
-        self.spec
-            .read_limits
-            .check(ReadLimitKey::IndexBytes, index_bytes)?;
-        self.index
-            .try_reserve(1)
-            .map_err(|_| Error::AllocationFailed {
-                resource: "record index",
-                requested: index_bytes,
-            })?;
+        // Shape A, mechanical enforcement (round 12). The limit charge and the
+        // mirror reservation are a precondition of the write below, and the
+        // token they produce is the only thing that can install the entry
+        // afterwards. See `mod reserved_index_slot`.
+        let spec = self.spec;
+        let index_slot = self.index.reserve(|| {
+            let index_bytes = index_bytes_for_count(record_count)?;
+            spec.read_limits
+                .check(ReadLimitKey::IndexBytes, index_bytes)?;
+            Ok(index_bytes)
+        })?;
 
         let sequence = self.sequence_state.available()?;
         let snapshot = AppendSnapshot {
@@ -5036,17 +5681,22 @@ impl VarveFile {
         } else {
             None
         };
-        let write_result = (|| -> Result<()> {
-            self.file.seek(SeekFrom::Start(record_offset))?;
-            self.file.write_all(&header_bytes)?;
-            #[cfg(test)]
-            fail_append_after_header_if_requested()?;
-            self.file.write_all(payload)?;
-            if let Some(footer) = &footer {
-                self.file.write_all(footer)?;
-            }
-            Ok(())
-        })();
+        // The append is the second and last route to record bytes on disk
+        // (`mod record_file`). It seeks to the end itself and refuses an
+        // offset that is not the one budgeted above, so this path cannot land
+        // inside an already-indexed record even if `record_offset` were wrong.
+        let write_result = self.file.append_record_at_end(
+            &index_slot,
+            record_offset,
+            &header_bytes,
+            payload,
+            footer.as_deref(),
+            || {
+                #[cfg(test)]
+                fail_append_after_header_if_requested()?;
+                Ok(())
+            },
+        );
         if let Err(error) = write_result {
             return Err(self.rollback_append(snapshot, error));
         }
@@ -5074,7 +5724,7 @@ impl VarveFile {
             committed,
         };
         let info = AppendInfo::from(&entry);
-        self.index.push(entry);
+        self.index.install(index_slot, entry);
         // Single index append site: keep the O(1) flush-cadence state in
         // lockstep with the resident index (PERF2-02), and the block tails
         // with it (PERF2-05). Both run only after the record is durable in the
@@ -5105,9 +5755,9 @@ impl VarveFile {
             fail_rollback_if_requested().and_then(|()| self.file.set_len(snapshot.eof));
         #[cfg(not(test))]
         let truncate_result = self.file.set_len(snapshot.eof);
-        let cursor_result = self.file.seek(SeekFrom::Start(snapshot.cursor)).map(|_| ());
+        let cursor_result = self.file.seek_to(snapshot.cursor).map(|_| ());
         if let Some(source) = truncate_result.err().or_else(|| cursor_result.err()) {
-            self.poisoned = true;
+            self.poison.poison();
             Error::WriteRollbackFailed {
                 operation: "append record",
                 source,
@@ -5153,7 +5803,7 @@ impl VarveFile {
         payload.extend_from_slice(&INDEX_CHECKPOINT_VERSION.to_le_bytes());
         payload.extend_from_slice(&covered_offset.to_le_bytes());
         payload.extend_from_slice(&entry_count.to_le_bytes());
-        for entry in &self.index {
+        for entry in self.index.iter() {
             payload.extend_from_slice(&entry.block_id.to_le_bytes());
             payload.extend_from_slice(&entry.block_version.to_le_bytes());
             payload.extend_from_slice(&entry.flags.to_le_bytes());
@@ -5191,7 +5841,9 @@ impl VarveFile {
     }
 
     fn write_commit_marker(&mut self) -> Result<AppendInfo> {
+        let permit = self.ensure_write()?;
         self.write_record_with_prev_key(
+            &permit,
             COMMIT_BLOCK_ID,
             1,
             RECORD_FLAG_INTERNAL,
@@ -9672,6 +10324,8 @@ fn path_resolves_to_object(path: &Path, identity: &[u8]) -> bool {
 fn sync_parent_directory(path: &Path) -> Result<()> {
     #[cfg(test)]
     record_parent_directory_sync();
+    #[cfg(test)]
+    fail_parent_sync_if_requested()?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     crate::scalable_fault_point("replace.parent_sync");
     #[cfg(feature = "scalable-fault-injection")]
@@ -9691,6 +10345,8 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
 
     #[cfg(test)]
     record_parent_directory_sync();
+    #[cfg(test)]
+    fail_parent_sync_if_requested()?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     // DUR2-02: FlushFileBuffers requires GENERIC_WRITE on the handle
     // (https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers),
@@ -10943,7 +11599,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("rollback.varve");
         let mut file = VarveFile::create(test_spec(), &path)?;
-        file.file.seek(SeekFrom::Start(0))?;
+        file.file.seek_to(0)?;
         let original_len = file.file.metadata()?.len();
         inject_write_fault(WriteFault::AppendAfterHeader);
 
@@ -10955,7 +11611,7 @@ mod tests {
         assert_eq!(file.file.stream_position()?, 0);
         assert!(file.index.is_empty());
         assert_eq!(file.sequence_state, SequenceState::Available(0));
-        assert!(!file.poisoned);
+        assert!(!file.poison.is_refusing());
         assert_eq!(
             file.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, b"ok")?,
             0
@@ -11069,9 +11725,16 @@ mod tests {
                 .expect_err("injected fixed rebind failure must be returned")
         };
         match error {
-            Error::PublishedButRebindFailed { sequence, source } => {
+            Error::PublishedButRebindFailed {
+                sequence,
+                source,
+                parent_sync,
+            } => {
                 assert_eq!(sequence, 1);
                 assert!(matches!(*source, Error::Io(_)));
+                // F-07: no parent-directory sync failure happened here, so the
+                // second durability fact is absent rather than fabricated.
+                assert!(parent_sync.is_none());
             }
             other => panic!("unexpected publication error: {other:?}"),
         }
@@ -11093,6 +11756,120 @@ mod tests {
         let mut reopened = VarveFile::open(spec, &path)?;
         assert_eq!(reopened.push(&ReplaceTestBlock { value: 3 })?, 2);
         Ok(())
+    }
+
+    /// F-07 double fault, one per replacement API.
+    ///
+    /// A replacement publication learns two independent durability facts in a
+    /// fixed order: whether the parent-directory sync succeeded, and whether
+    /// the writer could rebind to the published generation. Only the second
+    /// had a path out, so the pre-fix code called rebind with `?` and, when
+    /// both failed, returned `PublishedButRebindFailed` alone - silently
+    /// dropping the already-known fact that the published pathname may not
+    /// survive power loss. Both facts must now arrive together.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ReplacementApi {
+        Block,
+        Fixed,
+        Rewrite,
+    }
+
+    fn assert_double_publication_fault_reports_both_facts(api: ReplacementApi) -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join(match api {
+            ReplacementApi::Block => "double-block.varve",
+            ReplacementApi::Fixed => "double-fixed.varve",
+            ReplacementApi::Rewrite => "double-rewrite.varve",
+        });
+        let spec = replace_test_spec();
+        {
+            let mut initial = VarveFile::create(spec, &path)?;
+            initial.push(&ReplaceTestBlock { value: 1 })?;
+            initial.flush()?;
+        }
+
+        let mut writer = VarveFile::open(spec, &path)?;
+        // One arming produces both failures in the order the code sees them:
+        // the parent-directory sync inside `replace_path_atomically`, then the
+        // rebind that follows it.
+        inject_write_fault(WriteFault::ParentSyncThenRebindAfterPublish);
+        let error = match api {
+            ReplacementApi::Block => writer
+                .replace_block(0, &ReplaceTestBlock { value: 2 })
+                .map(|info| info.sequence)
+                .expect_err("injected double publication fault must be returned"),
+            ReplacementApi::Fixed => writer
+                .replace_fixed(0, &ReplaceTestBlock { value: 2 })
+                .expect_err("injected double publication fault must be returned"),
+            ReplacementApi::Rewrite => writer
+                .replace_rewrite(0, &ReplaceTestBlock { value: 2 })
+                .expect_err("injected double publication fault must be returned"),
+        };
+        inject_write_fault(WriteFault::None);
+
+        match error {
+            Error::PublishedButRebindFailed {
+                source,
+                parent_sync,
+                ..
+            } => {
+                assert!(matches!(*source, Error::Io(_)), "rebind fact: {source:?}");
+                let parent_sync = parent_sync.expect(
+                    "the parent-directory sync failure observed before the rebind must survive",
+                );
+                assert!(
+                    matches!(*parent_sync, Error::Io(_)),
+                    "parent-sync fact: {parent_sync:?}",
+                );
+                // The rendered message must carry both facts, because that is
+                // what an operator reads out of a log line.
+                let rendered = Error::PublishedButRebindFailed {
+                    sequence: 0,
+                    source,
+                    parent_sync: Some(parent_sync),
+                }
+                .to_string();
+                assert!(
+                    rendered.contains("could not rebind"),
+                    "message lost the rebind fact: {rendered}"
+                );
+                assert!(
+                    rendered.contains("parent-directory sync"),
+                    "message lost the parent-sync fact: {rendered}"
+                );
+            }
+            other => panic!("unexpected double-fault outcome: {other:?}"),
+        }
+
+        // Everything the single-fault contract already promised still holds:
+        // publication happened, and the writer is poisoned.
+        assert_eq!(
+            VarveFile::open_readonly(spec, &path)?
+                .blocks::<ReplaceTestBlock>()?
+                .get(0)?,
+            Some(ReplaceTestBlock { value: 2 })
+        );
+        assert!(matches!(
+            writer.push(&ReplaceTestBlock { value: 3 }),
+            Err(Error::WriterPoisoned("file"))
+        ));
+        assert_no_rewrite_temps(directory.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn block_replacement_double_publication_fault_reports_both_facts() -> Result<()> {
+        assert_double_publication_fault_reports_both_facts(ReplacementApi::Block)
+    }
+
+    #[test]
+    fn fixed_replacement_double_publication_fault_reports_both_facts() -> Result<()> {
+        assert_double_publication_fault_reports_both_facts(ReplacementApi::Fixed)
+    }
+
+    #[test]
+    fn rewrite_replacement_double_publication_fault_reports_both_facts() -> Result<()> {
+        assert_double_publication_fault_reports_both_facts(ReplacementApi::Rewrite)
     }
 
     #[cfg(windows)]

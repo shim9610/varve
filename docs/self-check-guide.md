@@ -82,6 +82,24 @@ the file object this run created, and the marker only after re-acquiring it
 through the standard writer-lock protocol. A file or marker swapped in by
 another process survives cleanup.
 
+Cleanup that cannot complete now says so (F-08). Removing the run's own
+`.lock` marker requires re-acquiring it through the writer-lock protocol and
+capturing its object identity; either can fail, and both used to return
+silently, so a run could report `passed = true` with zero cleanup failures
+while a live marker survived and the *next* run was refused by it. Each failure
+is now pushed as a failed `cleanup` step in the `Environment` domain, naming
+the marker path and advising that it be removed by hand. The marker itself is
+still deliberately preserved in both cases: being unable to prove the marker is
+ours is exactly the reason not to delete it. `ObjectRemoval::NotOwned` remains
+a clean outcome for the same reason — the name resolves to something this run
+did not create — so a marker replaced by another process still ends the run
+without a cleanup failure.
+
+`WriterLock::drop` still discards a marker-clear error, because `Drop` cannot
+report. The consequence is no longer invisible — the next run's re-acquisition
+fails loudly — but a caller that never runs the self-test still gets no signal
+from that path.
+
 ## Resource-Limit Failures
 
 Resource errors are policy results, not automatically library defects:

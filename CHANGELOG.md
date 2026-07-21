@@ -4,6 +4,381 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
+## Unreleased
+
+Round-12 adversarial review (`f661f65`,
+`docs/performance-stability-review-2026-07-21-f661f65-final.md`). Five
+correctness blockers, two medium post-publication result issues, one low
+diagnostic issue, one release-assurance gap, and one documentation-routing
+improvement. No wire-format change: `VMAT` stays at layout version 4, the
+page-index encoding is byte-identical, and no fixture needed regenerating.
+
+The theme is not the individual fixes. Rounds 5, 7 and 12 each found the *same*
+shape - a persisted structure mutated on disk before its in-memory mirror was
+updated by a step that can fail - and round 10's exhaustive enumeration of that
+class walked straight past the instance round 12 reported, in the file it had
+just rewritten. Reading does not close the class, so this round made the shape
+impossible to express instead. See "Mechanically enforced shapes" in
+`docs/invariant-checklist.md`.
+
+### Breaking
+
+- **`Error::PublishedButRebindFailed` gains a third field**,
+  `parent_sync: Option<Box<Error>>` (F-07). A replacement publication learns two
+  independent durability facts in a fixed order - whether the parent-directory
+  sync succeeded, and whether the writer could rebind to the published
+  generation - and only the second one ended the call, so a double fault
+  returned the rebind variant alone and silently discarded the sync failure.
+  `Some(_)` now means: the new generation is visible at the pathname, the writer
+  is unusable, **and** the rename is not yet proved durable against power loss.
+  `None` means only the first two. `Display` gains a trailing clause when the
+  field is present. `Error` is `#[non_exhaustive]` at the enum level but this
+  variant is not, so external code destructuring it with `{ sequence, source }`
+  must add `parent_sync` or `..`.
+- **`replace_rewrite` and `unsafe replace_fixed_in_place_exclusive` now refuse a
+  target whose stored `block_version` differs from `T::VERSION`** with
+  `Error::BlockVersionMismatch` (F-01). They selected their target by block id
+  alone and then wrote `T`'s payload under the stored record's older version
+  header - a persistent type/version disagreement on disk, reachable whenever
+  `schema_hash = 0` opts out of header-level schema locking. `replace_fixed` and
+  `replace_block` already made this refusal, but later in their sequence: the
+  check now precedes the size, limit and generation checks, so a call that is
+  wrong in two ways reports `BlockVersionMismatch` where it previously reported
+  `ReplaceSizeMismatch`. The check is no longer a step any path performs - it is
+  a precondition of resolving the target, enforced by a private-field
+  `ReplacementTarget` whose sole constructor performs it, so a fifth replacement
+  path cannot be written without it.
+- **`VarveWriter::rebuild_matrix_commit_from_crc` returns
+  `Err(Error::MatrixFatalCorruption)` instead of `Ok(count)` when the block's
+  CRC-validity page index could not be enumerated in full** (F-04), *including*
+  under `FormatSpec::with_matrix_fatal_forensics`. A rebuild sets a bit only
+  where slot-valid evidence says the CRC is meaningful, so pages missing from a
+  damaged validity index were published as uncommitted - erasing the previous
+  commit view using evidence that was never read. Forensic mode relaxes
+  *reading* fatal state, not a destructive republication. Repair or regenerate
+  the validity evidence first; there is deliberately no implicit way to discard
+  unverifiable visibility.
+- **The indexed writer no longer keeps its own poison flag** (F-05). It reads
+  and sets the stream writer's, so an indexed writer now refuses after *any*
+  stream poison, including one raised by work it did not itself perform. The
+  defect this closes: after a native append failed and its truncate-or-seek
+  rollback also failed, the stream poisoned itself while the indexed flag stayed
+  clear, so a later single-record put or delete passed the indexed guard and
+  called the stream's internal prepared append directly - a method that did not
+  consult the stream's flag either. The published contract said that mutation
+  was refused with `WriterPoisoned`; it was performed. The refusal still reports
+  `WriterPoisoned("indexed")` when reached through the indexed API.
+- **The unsafe contract of `replace_fixed_in_place_exclusive` is tightened**
+  (F-02): for a keyed block on a `keyed_offset_chain` format the caller must not
+  change the record's key. Records appended after the target already carry
+  `prev_same_key_offset` pointers into it, and this path publishes no new
+  generation in which the chain could be rebuilt. Behaviour for conforming
+  callers is unchanged; this is a documentation-level tightening of an existing
+  `unsafe` API.
+- **`scripts/run-security-fuzz.ps1` now enforces the artifact gate** and can
+  exit non-zero where it previously exited 0 (F-09): `2` when
+  `fuzz/artifacts` already holds a reproducer before the run starts, `3` when
+  any file is present after a target. It never deletes anything.
+- **A self-test with `cleanup(true)` can now report a failed step where it
+  previously reported a clean pass** (F-08): failure to re-acquire or to
+  identify the run's own `.lock` marker is reported as a `cleanup` step failure
+  in the `Environment` domain instead of returning silently.
+- **`DiskIndexError::BatchPoisoned` is removed** (round 12 enforcement pass).
+  `DiskIndexWriteBatch` carried a `poisoned` flag that no code path ever set,
+  so its guard could not fire and the variant was unreachable. The batch needs
+  no flag: every staging entry point validates in full before performing only
+  infallible in-memory inserts, and `commit` consumes the batch, so a
+  half-staged or twice-committed batch is not representable. `DiskIndexError`
+  is `#[non_exhaustive]`, so only code that named this variant is affected.
+
+### Fixed (invariant re-verification, round 12)
+
+- Matrix page-index mutation is prepare-then-commit behind a private module
+  (F-03, invariant 3). `compact_page_index` wrote its sorted entries to disk and
+  only then performed a fallible `try_reserve` for the in-memory mirror; on
+  `AllocationFailed` the writer was **not** poisoned - matrix mutation
+  deliberately poisons only on `Error::Io` - so the session continued with a
+  slot map that no longer described the array, and a later
+  `release_page_index_entry` could overwrite a live page's only entry and shorten
+  the array so that page was no longer in the counted prefix. All four
+  page-index mutation sites now route through prepared values whose construction
+  performs every fallible step - budget charge, mirror reservations, offset and
+  count arithmetic, and the encoding of every byte - while the commit writes
+  already-encoded bytes and installs the mirror into reserved capacity,
+  infallibly. The functions that write page-index bytes are private to that
+  module, so nothing else in `matrix.rs` can call them. `compact_page_index` no
+  longer exists; compaction is a phase of the append, which also made it one
+  sequential write instead of one per entry and removed an intermediate header
+  publication. Residual property, relied on by `finish_matrix_mutation`: after a
+  prepared page-index mutation begins writing, the only error it can return is
+  `Error::Io`.
+- Stream poison is enforced by a witness token rather than by a guard callers
+  must remember to call (F-05). `MutationPermit` has a private field and no
+  constructor other than the poison check, and every mutating entry point takes
+  one - by value where another module can reach it, so each such mutation gets
+  its own fresh check rather than one amortised over a loop. Batch publication
+  re-checks per chunk, because a chunk earlier in the same batch can poison the
+  writer.
+- The witness now names the writer it speaks for, and can only be minted from
+  that writer's own flag. The first cut let any holder of a `PoisonFlag` mint a
+  permit, so a throwaway `PoisonFlag::healthy()` could produce one and drive a
+  genuinely poisoned writer through its own guard - the token proved that *a*
+  flag had been checked, not that *this writer's* had. The constructor is now
+  private to `writer_permit`, reachable only through `GuardedWriter::writer_permit`
+  (which reads `&self`'s flag), and `MutationPermit` is generic in the writer
+  type, so a permit taken for one writer is not the same type as a permit for
+  another. Internal only; no public API or wire format changes.
+- Exclusive in-place replacement invalidates the affected block's resident
+  keyed-tail map **before** the first byte reaches disk (F-02). The seek/write
+  pair moved into a single `overwrite_record_bytes_in_place`, the only in-place
+  rewrite of an already-indexed record in the crate. The invalidation is
+  infallible and allocation-free, so it adds no fallible step in either
+  direction, and running it first means the cache cannot survive a half-completed
+  write, a poisoned writer, or a caller that violates the contract above.
+- The CRC rebuild no longer clones the previous commit bitmap through infallible
+  `Clone` (F-10). The clone is *removed* rather than made fallible: the rebuild
+  only reads the previous map's indexed-page keys and page count, so the map is
+  borrowed. `SparseBitmap: Clone` remains because `MatrixLayout: Clone` requires
+  it.
+- Post-publication allocator behaviour is stated instead of implied (F-06). Both
+  matrix post-commit outcome variants box their event and their source, so
+  constructing either allocates twice after the cell is authoritative; a
+  subprocess harness failed the very next allocation at each branch and both
+  children terminated on a 56-byte allocation while the reopened file contained
+  the committed values. The crate now publishes one policy: content-sized
+  allocations are charged to a `ReadLimits` ceiling and reserved fallibly into
+  `AllocationFailed`/`LimitExceeded`, while shape-sized allocations bounded by
+  the program's own compile-time shape use ordinary infallible allocation and
+  abort on refusal, as `Box::new` always does. The consequence for every
+  published-outcome contract, now written down: an allocator refusal after
+  publication terminates the process rather than substituting a different
+  outcome, so no caller observes a *wrong* outcome, and the on-disk state is the
+  published one. Pre-staging the boxes was rejected - it cannot remove
+  `Box::new(source)`, and it would put two allocations on the success path of
+  every durable cell write to serve a path that ends in `abort`. See "Allocator
+  Failure And Published Outcomes" in `docs/durability-model.md`.
+
+### Added
+
+- `MatrixRecoveryReport::inject_matrix_page_index_mirror_reservation_failure`,
+  compiled only under `feature = "scalable-fault-injection"`, alongside the
+  existing matrix injectors. The crate-private write-fault injector also gained
+  a combined parent-sync-then-rebind fault, present on **both** the unix and
+  windows `sync_parent_directory` branches so the F-07 double-fault regression
+  runs on either platform.
+- `docs/invariant-checklist.md` gained "Mechanically enforced shapes", the map
+  from each recurring defect shape to the type that now forbids it, and a
+  standing instruction to prefer that section to the site enumeration. The
+  enforcement pass added "What is mechanically enforced, and what is not",
+  which separates the properties the compiler refuses from the ones a source
+  gate checks from the ones that still rely on review.
+- `crates/varve-core/src/writer_permit.rs`: the crate's single implementation of
+  the shape-B witness token, promoted out of `stream.rs` so `file.rs` and
+  `layout.rs` hold the same type instead of three independent conventions. It
+  also models `layout.rs`'s *reversible* in-flight window (`MutationInFlight`),
+  which a one-way poison cannot express, without letting anyone assign the
+  boolean.
+- `ReservedIndexSlot` (`crates/varve-core/src/file.rs`): the shape-A token for
+  the resident record index, the mirror on the append path. The limit charge and
+  the `try_reserve` produce it; the post-append install consumes it and returns
+  `()`. Zero-sized, no hot-path cost.
+- `varve_core::enforcement_probe`, `#[doc(hidden)]` and gated on
+  `scalable-fault-injection`: re-exports (not copies) of the enforcement types
+  so that compile-fail fixtures in another crate can prove they bind.
+- Three `trybuild` compile-fail fixtures
+  (`crates/varve/tests/ui/fail_fabricated_mutation_permit.rs`,
+  `fail_unpermitted_mutation_window.rs`, `fail_fabricated_index_reservation.rs`)
+  driven by `compile.rs::mechanical_enforcement_contracts`, and three
+  source-level gates in `crates/varve/tests/enforcement_gates.rs`: the matrix
+  page-index writers stay unexported inside their module, no module declares its
+  own poison boolean, and the resident record index grows only through its
+  reservation.
+
+### Documentation (round 12)
+
+- `docs/durability-model.md`: the crate-wide allocator-failure policy; the
+  combined parent-sync/rebind outcome; the keyed same-key requirement on
+  exclusive in-place replacement and the cache invalidation that holds
+  regardless.
+- `docs/recovery-model.md`: the CRC rebuild's refusal on incomplete validity
+  evidence, and that forensic mode does not relax it.
+- `docs/matrix-storage-design.md`: the prepared page-index mutation gate, its one
+  deliberate exception, and the compaction ordering that replaced the separate
+  function.
+- `docs/api-reference.md`: the version refusal on every replacement path, the
+  three-field rebind variant, the single indexed/stream poison flag, the rebuild
+  refusal, the narrowed post-commit outcome family, and the resident-writer cost
+  model with its routing to the disk-indexed APIs.
+- `docs/self-check-guide.md`: cleanup failures are reported rather than silent,
+  and the marker is preserved when it cannot be proved to be ours.
+- `docs/fuzzing-and-fault-injection.md`: exactly what the artifact gate checks,
+  when, and with which exit codes.
+- Generated typed writers now carry rustdoc stating the `Theta(M*N)` priming
+  cost, the per-block-id retention bound, and the `key_index = disk` route a
+  high-cardinality format should take instead (P-01). Documentation only; no
+  generated logic changed.
+
+### Fixed (round 13, re-verification of round 12's F-01 and F-02)
+
+Re-verification judged both fixes partial. The refusals themselves held under an
+independent harness — every replacement entry point, at every ordinal, refused a
+cross-version target and left the file byte-identical; the keyed-tail cache was
+truthful in-session and after reopen — but the *enforcement* did not bind. Two
+probes were compiled against round 12's tree: a new replacement path that
+resolved its own ordinal over `self.index` and wrote through the in-place
+writer (reproducing F-01 end to end: a v2 payload under a retained v1 header,
+silently decoded by a v1 reader), and a new raw `seek`/`write_all` pair that
+skipped the writer and left the keyed-tail cache resident (F-02).
+
+- **The primary file handle is no longer a `File`.** `VarveFile::file` is a
+  `RecordFile`, declared in a private `mod record_file` that keeps the `File`
+  unnameable, implements neither `Write` nor `Seek`, and lends out no `&File`
+  (`&File` implements `Write`, so lending one is equivalent to lending a mutable
+  handle). Exactly two operations put record bytes on disk: `append_record_at_end`,
+  which seeks to the end itself and refuses any offset other than the one the
+  caller budgeted, so it cannot land inside an indexed record; and
+  `overwrite_indexed_record`, which consumes a `RecordOverwrite`. The second
+  probe no longer compiles (E0599: no `seek`, no `write_all`).
+- **The keyed-tail invalidation moved into the permission.**
+  `RecordOverwrite::prepare` consumes a version-checked `ReplacementTarget`,
+  drops the target block's resident keyed-tail map, and yields the only value
+  `overwrite_indexed_record` accepts. F-01's refusal and F-02's invalidation are
+  now preconditions of addressing the bytes rather than steps inside a function
+  a sibling path can bypass. The first probe no longer compiles either (E0451:
+  `ReplacementTarget`'s field is private even to the rest of `file.rs`).
+- **Two false published claims corrected** (invariant 4): `file.rs`'s statement
+  that a later path "cannot reach `self.index[..]` for a caller-chosen ordinal",
+  and `docs/invariant-checklist.md`'s "Enforced by the compiler" row "a
+  replacement target cannot be addressed without the version check". Reading the
+  index was never restricted and is not now; what is enforced is that an ordinal
+  cannot be *written through*. The checklist rows now say which round's claim was
+  false and what replaced it.
+- **Proofs added**: `crates/varve/tests/ui/fail_fabricated_replacement_target.rs`
+  and `fail_fabricated_record_overwrite.rs` (compile-fail, driven by
+  `compile.rs::mechanical_enforcement_contracts`, against the real types via
+  `varve_core::enforcement_probe`); three source gates in
+  `crates/varve/tests/enforcement_gates.rs` covering the wrapped handle, the one
+  named escape hatch (`matrix_region`, for `crate::matrix` and the public
+  `MatrixDurabilityBarrier`), and the single constructors; and
+  `replace_publication_state.rs::every_replacement_entry_point_refuses_a_cross_version_target_at_every_ordinal`,
+  which is the re-verification harness itself — all six entry points including
+  both `replace` strategy wrappers, both ordinals of a two-record file, the file
+  asserted byte-identical after each refusal, and an out-of-range ordinal still
+  failing as `UnexpectedEof` so the version refusal cannot mask resolution.
+
+No wire-format change, no public API change, no error-variant change.
+
+### Fixed (round 14, re-verification of round 12's F-04)
+
+- **A CRC-validity bit can no longer be read as evidence of absence without the
+  completeness proof.** Round 12 fixed F-04 — a commit-map rebuild that read
+  cells it never loaded as "CRC not meaningful" and republished them as
+  uncommitted — by tracking completeness in a `crc_valid_complete: bool` beside
+  a plain `SparseBitmap` and calling one checking function before the rebuild.
+  The behaviour was correct and re-verification confirmed it, but the check bound
+  nothing: a new consumer that wrote `block.crc_valid_bits.get(ordinal)?`
+  compiled cleanly, which is exactly the "the next function will simply fail to
+  repeat it" shape this series exists to eliminate, so the fix was judged
+  partial.
+
+  The capability is now gone rather than guarded. The bitmap and its
+  completeness are a single `CrcValidEvidence` inside the private
+  `mod crc_valid_evidence` (`crates/varve-core/src/matrix.rs`), and outside that
+  module **no operation on it returns a validity bit** except
+  `CompleteCrcValidEvidence::get`, whose witness has a private field and exactly
+  one constructor — `CrcValidEvidence::complete`, which *is* the
+  `Error::MatrixFatalCorruption` refusal, still unconditional and still not
+  relaxed by `with_matrix_fatal_forensics`. The one reader permitted on
+  incomplete evidence, `require_meaningful` (used by `verify_cell_crc`), returns
+  `Result<()>`: it hands back no bit, so an absent one can become a typed
+  checksum refusal but never published state.
+
+  No behaviour change for any caller: the same rebuilds are refused, with the
+  same error, and the fail-closed read still reports
+  `Error::MatrixChecksumMismatch`. Proofs:
+  `crates/varve/tests/ui/fail_fabricated_crc_valid_completeness.rs` (the witness
+  cannot be forged), the source gate
+  `enforcement_gates.rs::the_crc_validity_bitmap_is_only_read_through_its_evidence_type`
+  (the field keeps the evidence type and the module's two named escapes keep one
+  call site each), four unit tests in
+  `matrix.rs::crc_valid_evidence_tests`, and three added assertions in
+  `matrix_integrity_scaling.rs::crc_rebuild_refuses_an_incompletely_loaded_validity_index`:
+  a retried rebuild is refused again, a cell write does not launder incomplete
+  evidence into a licence to republish, and a cell whose validity page was never
+  loaded still fails closed on read. Negative controls: the round-12 bypass
+  consumer no longer compiles (`E0599`, no method `get`), deleting the refusal
+  makes the rebuild publish `Ok(1)` for a two-cell fixture, and stubbing the
+  fail-closed reader makes the unreadable cell read as valid data.
+
+### Fixed (round 14, re-verification of round 12's enforcement pass)
+
+- **The record append can no longer outrun the mirror reservation, and the
+  resident record index can no longer be grown around its token.** Round 12
+  added `ReservedIndexSlot` and recorded that "the fallible half cannot be moved
+  below the write". Re-verification disproved that by compilation: because
+  `reserve` was an ordinary `pub(crate)` function and `VarveFile::index` was an
+  ordinary `Vec` field, both of these built inside `file.rs` —
+
+  ```text
+  self.file.write_all(b"payload")?;                     // authoritative write
+  let slot = ReservedIndexSlot::reserve(&mut self.index, || Ok(64))?;  // AFTER it
+  slot.install(&mut self.index, entry);
+
+  let mut mirror = core::mem::take(&mut self.index);    // around the token
+  mirror.insert(0, entry);
+  self.index = mirror;
+  ```
+
+  The first is F-03's exact shape on the append path; the second bypasses the
+  token entirely. The mirror is now a `ResidentIndex` whose `Vec` is a private
+  field of `mod resident_index`, so the only growth in the crate is
+  `ResidentIndex::install`, which consumes the token; and
+  `RecordFile::append_record_at_end` **takes `&ReservedIndexSlot`**, so the
+  authoritative write cannot be reached until the `ReadLimitKey::IndexBytes`
+  charge and the `try_reserve` have succeeded. Reading, `entry_mut`, `truncate`
+  and `adopt_generation` remain available, and none of them can add an entry the
+  disk does not have. No behaviour change and no hot-path cost: the tokens are
+  zero-sized and the work per append is identical. Both bypasses were
+  re-checked against the new code and both now fail to compile (`E0061`, missing
+  `&ReservedIndexSlot`; `E0277`, `ResidentIndex: Default` not satisfied;
+  `E0599`, no method `insert`). Gated by
+  `enforcement_gates.rs::the_resident_record_index_cannot_be_grown_or_outrun`.
+
+- **Matrix state can no longer be addressed without the fail-closed
+  fatal-recovery check.** `MatrixLayout::fatal_access_blocked` was a `bool`
+  consulted by `ensure_fatal_access_allowed` at eleven call sites — a guard
+  every accessor had to remember, which is precisely the shape-B configuration
+  round 12's F-05 fix existed to eliminate. It was missing from that round's
+  shape-B inventory because the inventory was built by grepping the crate for
+  `poisoned`, and this flag has another name. The boolean now lives in
+  `mod fatal_access` as a private field of `FatalAccessGate`, whose only output
+  is the zero-sized `FatalAccessAllowed` witness produced by
+  `FatalAccessGate::allow` — which *is* the `Error::MatrixFatalCorruption`
+  refusal — and `MatrixLayout::block_index` / `commit_index`, the only two
+  routes from a block id or a commit category to a position in the layout's
+  state, demand it. A matrix accessor written later cannot address what it wants
+  to touch without the check. Behaviour is unchanged for every existing path
+  (the same operations refuse, with the same error); the refusal is now made
+  slightly earlier than the "wrong commit kind" check in
+  `is_single_committed` / `is_channel_committed` / `set_single_committed` /
+  `set_channel_committed`, which is only observable on a layout that is already
+  fatally blocked. Proofs:
+  `crates/varve/tests/ui/fail_fabricated_fatal_access.rs` and
+  `enforcement_gates.rs::matrix_state_is_only_addressed_through_the_fatal_access_witness`.
+
+- **The shape-B inventory is now taken by shape, not by name.**
+  `enforcement_gates.rs::no_guard_consults_a_bare_boolean_field` enumerates
+  every `.rs` file in `varve-core` — not a list of six — and fails when any
+  struct declares a `bool` field that an `fn ensure_*` guard refuses on. That is
+  the rule the previous gate approximated by matching the literal string
+  `poisoned: bool`, which by construction could not find `fatal_access_blocked`
+  or `crc_valid_complete`, the latter added by the very round that was closing
+  this class. The scan is bounded by each guard's own closing brace and requires
+  a refusal rather than a mere read, so bookkeeping flags
+  (`indexed.rs::ensure_batch` and its `dirty`) are not reported. Negative
+  control: dropping the pre-fix declaration into the crate as an undeclared
+  module makes the gate fail and name it.
+
 ## 0.4.0 - 2026-07-20
 
 Pre-1.0 minor release. The Rust API and several persisted layouts change

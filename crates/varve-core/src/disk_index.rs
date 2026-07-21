@@ -321,7 +321,6 @@ pub enum DiskIndexError {
         max_records: usize,
         max_bytes: usize,
     },
-    BatchPoisoned,
     KeyTableUnavailable,
     Busy,
     SavepointOperation {
@@ -484,7 +483,6 @@ impl fmt::Display for DiskIndexError {
                 f,
                 "disk index batch would reach {records} records/{bytes} bytes, exceeding {max_records} records/{max_bytes} bytes"
             ),
-            Self::BatchPoisoned => write!(f, "disk index batch is poisoned"),
             Self::KeyTableUnavailable => {
                 write!(f, "disk key lookup is unavailable in state-only mode")
             }
@@ -1946,7 +1944,6 @@ impl DiskIndexStore {
             options: self.options,
             records: 0,
             bytes: 0,
-            poisoned: false,
         })
     }
 
@@ -2148,7 +2145,6 @@ pub(crate) struct DiskIndexWriteBatch {
     options: DiskIndexOptions,
     records: usize,
     bytes: usize,
-    poisoned: bool,
 }
 
 impl DiskIndexWriteBatch {
@@ -2225,7 +2221,6 @@ impl DiskIndexWriteBatch {
         update: &DiskIndexUpdate,
         tail: Option<DiskIndexTail>,
     ) -> DiskIndexResult<DiskIndexMetadata> {
-        self.ensure_usable()?;
         if !matches!(self.metadata.mode, DiskIndexMode::DiskPlan(_)) {
             return Err(DiskIndexError::KeyTableUnavailable);
         }
@@ -2284,7 +2279,6 @@ impl DiskIndexWriteBatch {
         sequence: u64,
         tail: Option<DiskIndexTail>,
     ) -> DiskIndexResult<DiskIndexMetadata> {
-        self.ensure_usable()?;
         let next = self.next_frontier(expected_covered_eof, new_covered_eof, sequence)?;
         if let Some(tail) = tail {
             validate_tail(tail, next)?;
@@ -2311,7 +2305,6 @@ impl DiskIndexWriteBatch {
         &mut self,
         generation: DiskIndexPrimaryGeneration,
     ) -> DiskIndexResult<()> {
-        self.ensure_usable()?;
         self.metadata.primary_generation = generation;
         Ok(())
     }
@@ -2336,7 +2329,6 @@ impl DiskIndexWriteBatch {
     }
 
     pub(crate) fn commit(mut self) -> DiskIndexResult<()> {
-        self.ensure_usable()?;
         if self.records == 0 && self.changed_tails.is_empty() {
             debug_assert!(self.pending_latest.is_empty());
             // Nothing was staged: the map is still exactly the committed
@@ -2401,14 +2393,6 @@ impl DiskIndexWriteBatch {
         commit.map_err(storage)?;
         store_tail_cache(&self.tail_cache, digest, self.tails);
         Ok(())
-    }
-
-    fn ensure_usable(&self) -> DiskIndexResult<()> {
-        if self.poisoned {
-            Err(DiskIndexError::BatchPoisoned)
-        } else {
-            Ok(())
-        }
     }
 
     fn next_frontier(
@@ -2476,7 +2460,6 @@ impl DiskIndexWriteBatch {
     }
 
     fn can_accept_item(&self, item_bytes: usize) -> DiskIndexResult<bool> {
-        self.ensure_usable()?;
         let records = self.records.saturating_add(1);
         let bytes = self.bytes.saturating_add(item_bytes);
         Ok(records <= self.options.batch.max_records && bytes <= self.options.batch.max_bytes)

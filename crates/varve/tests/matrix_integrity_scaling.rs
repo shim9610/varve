@@ -1643,3 +1643,272 @@ fn assert_failed_allocation_persists_nothing(label: &str, attempt: u64) -> varve
     );
     Ok(())
 }
+
+// F-03: page-index mutation is prepared before it is persisted ---------------
+
+/// Cell count giving the commit map exactly three 4 KiB pages, which is the
+/// smallest width at which a compaction can reorder the *counted prefix* of the
+/// persisted array. `768 * 128 = 98_304` cells, i.e. `12_288` bitmap bytes.
+const THREE_PAGE_SCANS: u64 = 768;
+/// Ordinals landing in commit-map pages 0, 1 and 2 respectively.
+const PAGE_ORDINALS: [u64; 3] = [0, 32_768, 65_536];
+
+/// Reads the persisted page index's occupancy count and its first `entries`
+/// entries, as raw `page + 1` values.
+fn page_index_state(path: &Path, entries: u64) -> (u64, Vec<u64>) {
+    let base = page_index_off(path);
+    let header = read_u64_at(path, base) & ((1u64 << 48) - 1);
+    let values = (0..entries)
+        .map(|slot| read_u64_at(path, base + (slot + 1) * PAGE_INDEX_SLOT_LEN))
+        .collect();
+    (header, values)
+}
+
+/// F-03. Page-index compaction used to write the new sorted entry order to disk
+/// and only then perform the fallible `try_reserve` for the in-memory slot map
+/// that mirrors it. A typed `AllocationFailed` there returned an `Err` from a
+/// writer that ordinary matrix mutation handling does **not** poison — it
+/// poisons only `Error::Io` — so the session continued with a slot map that no
+/// longer described the array on disk, and the next removal overwrote a live
+/// page's only entry.
+///
+/// The fixture starts from the state that makes the divergence lethal: a
+/// duplicate-entry array left by a crash-interrupted removal, `[2, 1, 2]`, which
+/// is also full, so the next publication has to compact. Compaction sorts that
+/// to `[1, 2]`, moving page 1 into slot 0 — a slot the stale mirror still
+/// believes holds page 2. Releasing page 2 through the stale mirror then wrote
+/// page 2 over slot 0 and shortened the count to two, and the only entry naming
+/// page 1 was gone. With no allocation map there is no second way to find it.
+///
+/// Every fallible step of a page-index mutation is now a precondition of its
+/// first disk byte, so the refusal happens with the array byte-for-byte
+/// untouched and the mirror still describing it exactly.
+#[test]
+fn a_refused_page_index_compaction_leaves_disk_and_mirror_in_the_same_order() -> varve::Result<()> {
+    let dir = temp_dir("index-compaction-refusal");
+    let path = dir.path().join("matrix.varve");
+
+    // (1) Publish one page each into commit-map pages 0, 1 and 2. The array is
+    // then [0, 1, 2] with a count of three, which is its full capacity.
+    {
+        let mut writer = spec().create_writer_with_dims(&path, dims(THREE_PAGE_SCANS))?;
+        for ordinal in PAGE_ORDINALS {
+            writer.write_matrix_cell(key(ordinal), &ScalingCell { value: 7 })?;
+            writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
+        }
+        // (2) Empty page 0 with the removal's *header* write failing. The swap
+        // lands and the shorter count does not, which is exactly what a crash
+        // between the two leaves: entries [2, 1, 2] under a count of three.
+        MatrixRecoveryReport::inject_matrix_page_index_header_write_failure(1);
+        writer.clear_matrix_cell::<ScalingCell>(key(PAGE_ORDINALS[0]))?;
+        MatrixRecoveryReport::inject_matrix_page_index_header_write_failure(0);
+        writer.flush()?;
+    }
+    let duplicate_state = page_index_state(&path, 3);
+    assert_eq!(
+        duplicate_state,
+        (3, vec![3, 2, 3]),
+        "the fixture did not produce the interrupted-removal duplicate state"
+    );
+
+    // (3) Republishing page 0 has to compact first. Fail the mirror reservation
+    // that compaction needs.
+    {
+        let mut writer = spec().open_writer(&path)?;
+        writer.write_matrix_cell(key(PAGE_ORDINALS[0]), &ScalingCell { value: 9 })?;
+        // Committing publishes the validity bit before the commit bit, and the
+        // validity bitmap keeps its own page index, so the compaction this test
+        // is aiming at is the *second* mirror reservation of the call.
+        MatrixRecoveryReport::inject_matrix_page_index_mirror_reservation_failure(2);
+        let refused = writer.commit_matrix_cell::<ScalingCell>(key(PAGE_ORDINALS[0]));
+        MatrixRecoveryReport::inject_matrix_page_index_mirror_reservation_failure(0);
+        assert!(
+            matches!(refused, Err(Error::AllocationFailed { .. })),
+            "the injected mirror reservation failure did not surface as a typed \
+             allocation failure: {refused:?}"
+        );
+        writer.flush()?;
+        assert_eq!(
+            page_index_state(&path, 3),
+            duplicate_state,
+            "a refused page-index mutation rewrote the persisted array"
+        );
+
+        // (4) The divergence only becomes data loss at the *next* removal, and
+        // it has to happen in the *same* session: a reopen would rebuild the
+        // mirror from disk and hide the disagreement. Emptying page 2 releases
+        // its entry through whatever slot positions the mirror believes in.
+        writer.clear_matrix_cell::<ScalingCell>(key(PAGE_ORDINALS[2]))?;
+        writer.flush()?;
+    }
+    assert_eq!(
+        page_index_state(&path, 2).1[1],
+        2,
+        "a removal trusting a stale mirror overwrote the live page entry"
+    );
+
+    // (5) Reopen with the persisted index as the only way to find a page.
+    let reader = open_without_allocation_map(&path, false)?;
+    assert!(
+        !MatrixRecoveryReport::matrix_open_allocation_map_available(),
+        "the allocation map was not actually disabled for this fixture"
+    );
+    assert!(
+        !reader
+            .matrix_recovery_report()
+            .findings
+            .iter()
+            .any(|finding| finding.severity == MatrixCorruptionSeverity::Fatal),
+        "the surviving index was reported as fatally damaged: {:?}",
+        reader.matrix_recovery_report().findings
+    );
+    assert_eq!(
+        reader.matrix_cell_status::<ScalingCell>(key(PAGE_ORDINALS[1]))?,
+        MatrixCellStatus::Committed,
+        "the live page that compaction moved was lost from the persisted index"
+    );
+    assert_eq!(
+        reader.matrix_cell_status::<ScalingCell>(key(PAGE_ORDINALS[0]))?,
+        MatrixCellStatus::NotCommitted,
+        "the refused commit was published anyway"
+    );
+    assert_eq!(
+        reader.matrix_cell_status::<ScalingCell>(key(PAGE_ORDINALS[2]))?,
+        MatrixCellStatus::NotCommitted,
+        "the cleared cell is still committed"
+    );
+    Ok(())
+}
+
+// F-04: CRC rebuild refuses incomplete validity evidence ---------------------
+
+/// Base of a block's CRC-validity page-index array.
+///
+/// The page-index region holds one array per commit category, in category
+/// order, then one per matrix block. This format has a single category and a
+/// single block, so the block's array starts one whole commit array in.
+fn validity_page_index_off(path: &Path, scans: u64) -> u64 {
+    let bitmap_bytes = scans * CHANNELS / 8;
+    let pages = bitmap_bytes.div_ceil(PAGE_BYTES);
+    // One occupancy header slot plus one entry per page.
+    page_index_off(path) + (pages + 1) * PAGE_INDEX_SLOT_LEN
+}
+
+/// F-04. CRC commit-map rebuild derives every bit from the block's CRC-validity
+/// bitmap: a cell is committed only where the validity bit says the stored CRC
+/// is meaningful *and* the recomputed CRC matches. A damaged validity page index
+/// is reported as a fatal finding, but the pages it omits simply stay absent
+/// from the loaded bitmap, and every cell in them then reads as "not
+/// meaningful". Default open is fail-closed on the finding; explicit forensic
+/// mode removes that gate, and rebuild then published those absences as
+/// `NotCommitted` — erasing the previous commit view using evidence the file
+/// never supplied.
+///
+/// Completeness is now tracked per validity map and rebuild refuses when it is
+/// missing. Discarding unverifiable visibility on purpose has to be a different,
+/// explicitly named operation; it is not what recovery does by default.
+#[test]
+fn crc_rebuild_refuses_an_incompletely_loaded_validity_index() -> varve::Result<()> {
+    const FIRST: u64 = 0;
+    const SECOND: u64 = 32_768;
+    let dir = temp_dir("validity-evidence");
+    let path = dir.path().join("matrix.varve");
+    {
+        let mut writer = spec().create_writer_with_dims(&path, dims(LARGE_SCANS))?;
+        for ordinal in [FIRST, SECOND] {
+            writer.write_matrix_cell(key(ordinal), &ScalingCell { value: 5 })?;
+            writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
+        }
+        writer.flush()?;
+    }
+
+    let validity_base = validity_page_index_off(&path, LARGE_SCANS);
+    assert_eq!(
+        read_u64_at(&path, validity_base) & ((1u64 << 48) - 1),
+        2,
+        "the fixture did not publish exactly two validity-bitmap pages"
+    );
+    // Damage the entry naming the *second* validity page. Its cells' validity
+    // bits are then unreadable, not false.
+    patch_u64(&path, validity_base + 2 * PAGE_INDEX_SLOT_LEN, 0);
+
+    MatrixRecoveryReport::force_matrix_allocation_map_unavailable(true);
+    let opened = spec().with_matrix_fatal_forensics().open_writer(&path);
+    MatrixRecoveryReport::force_matrix_allocation_map_unavailable(false);
+    let mut writer = opened?;
+    assert!(
+        writer
+            .matrix_recovery_report()
+            .findings
+            .iter()
+            .any(|finding| finding.severity == MatrixCorruptionSeverity::Fatal),
+        "the damaged validity page index produced no fatal finding"
+    );
+
+    let refused = writer.rebuild_matrix_commit_from_crc::<ScalingCell>();
+    assert!(
+        matches!(refused, Err(Error::MatrixFatalCorruption)),
+        "rebuild published a commit map derived from evidence it never read: {refused:?}"
+    );
+
+    // Round 14, the enforcement half. The round-12 fix was a tracked boolean
+    // plus one added check, so the next function was free to skip it. The
+    // bitmap now lives behind `CrcValidEvidence`, whose only bit-returning
+    // operation demands the completeness witness, so the refusal is a property
+    // of the *type* and the three assertions below are its observable edges.
+    //
+    // (1) The refusal is not consumed by being reported once. A caller that
+    //     retries — the natural reaction to a fatal finding in forensic mode —
+    //     is refused again rather than succeeding on the second attempt.
+    let retried = writer.rebuild_matrix_commit_from_crc::<ScalingCell>();
+    assert!(
+        matches!(retried, Err(Error::MatrixFatalCorruption)),
+        "a retried rebuild published from the same incomplete evidence: {retried:?}"
+    );
+
+    // (2) Writing cells does not launder incomplete evidence into complete
+    //     evidence. A cell write sets a validity bit and publishes a
+    //     page-index entry, so afterwards the *persisted* index names more
+    //     pages than the loaded map did — but the loaded map is still a subset
+    //     of what the file once held, and nothing has re-enumerated it. The
+    //     completeness fact travels with the bitmap and stays false for the
+    //     life of the session, so rebuild keeps refusing.
+    writer.write_matrix_cell(key(FIRST), &ScalingCell { value: 9 })?;
+    writer.commit_matrix_cell::<ScalingCell>(key(FIRST))?;
+    let after_write = writer.rebuild_matrix_commit_from_crc::<ScalingCell>();
+    assert!(
+        matches!(after_write, Err(Error::MatrixFatalCorruption)),
+        "a cell write turned incomplete validity evidence into a licence to \
+         republish the commit map: {after_write:?}"
+    );
+    writer.flush()?;
+    drop(writer);
+
+    // (3) The other consumer of the validity bitmap still fails *closed*, and
+    //     does so without the completeness witness — which is why it is allowed
+    //     to read a bit at all. `verify_cell_crc` turns an absent validity bit
+    //     into a typed checksum refusal; it can never turn one into published
+    //     state, because the evidence type hands it no bit to publish.
+    let mut reader = open_without_allocation_map(&path, true)?;
+    let unreadable = reader.read_matrix_cell::<ScalingCell>(key(SECOND));
+    assert!(
+        matches!(unreadable, Err(Error::MatrixChecksumMismatch { .. })),
+        "a cell whose validity page was never loaded was read as if its stored \
+         checksum had been established: {unreadable:?}"
+    );
+    assert_eq!(
+        reader.read_matrix_cell::<ScalingCell>(key(FIRST))?,
+        ScalingCell { value: 9 },
+        "the fail-closed reader refused a cell whose validity page *was* loaded"
+    );
+
+    // The previous commit view is untouched: both cells are still committed.
+    for ordinal in [FIRST, SECOND] {
+        assert_eq!(
+            reader.matrix_cell_status::<ScalingCell>(key(ordinal))?,
+            MatrixCellStatus::Committed,
+            "rebuild refusal still erased the commit bit for ordinal {ordinal}"
+        );
+    }
+    Ok(())
+}

@@ -9,6 +9,56 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# F-09. The documented gate is "a nonzero exit **or** a file under
+# fuzz/artifacts is a failed gate", and this script used to check only the exit
+# codes: a harness dropped an existing reproducer under fuzz/artifacts, ran this
+# script with a successful Cargo stub, and the script exited 0 and left the
+# artifact there.
+#
+# The gate is enforced at both ends, and it means ANY artifact, not only a newly
+# produced one:
+#
+#   * before the campaign, an artifact that is already present fails the run
+#     (exit 2) without starting Cargo. A reproducer that has not been promoted
+#     to a deterministic regression is unfinished work, and letting a campaign
+#     run on top of it is how a stale artifact comes to look like a fresh one;
+#   * after each target, any artifact present fails the run (exit 3), naming the
+#     files.
+#
+# Nothing here deletes anything. A fuzzer reproducer is the only copy of an
+# input that reached a defect, so clearing the directory is the operator's
+# explicit act, after the artifact has been promoted.
+$artifactRoot = Join-Path $PSScriptRoot "..\fuzz\artifacts"
+
+function Get-FuzzArtifacts {
+    if (-not (Test-Path -LiteralPath $artifactRoot)) {
+        return @()
+    }
+    @(Get-ChildItem -LiteralPath $artifactRoot -Recurse -File -Force |
+        Sort-Object FullName |
+        ForEach-Object { $_.FullName })
+}
+
+$existingArtifacts = Get-FuzzArtifacts
+if ($existingArtifacts.Count -gt 0) {
+    Write-Host "Refusing to start: fuzz/artifacts already holds $($existingArtifacts.Count) reproducer(s):"
+    $existingArtifacts | ForEach-Object { Write-Host "  $_" }
+    Write-Host "Promote each one to a deterministic regression test and remove it, then rerun."
+    exit 2
+}
+
+function Assert-NoFuzzArtifacts {
+    param([string]$Stage)
+
+    $produced = Get-FuzzArtifacts
+    if ($produced.Count -gt 0) {
+        Write-Host "Gate failed after ${Stage}: $($produced.Count) reproducer(s) under fuzz/artifacts:"
+        $produced | ForEach-Object { Write-Host "  $_" }
+        Write-Host "Preserve and promote each reproducer to a deterministic regression before fixing it."
+        exit 3
+    }
+}
+
 $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path -LiteralPath $vswhere)) {
     throw "Visual Studio Installer (vswhere.exe) is required for MSVC AddressSanitizer."
@@ -52,7 +102,13 @@ foreach ($name in $targets) {
     )
     cargo +nightly fuzz run $name --fuzz-dir fuzz --target-dir target\fuzz-asan --jobs $Jobs -- `
         @fuzzerArgs
-    if ($LASTEXITCODE -ne 0) {
-        exit $LASTEXITCODE
+    $campaignExit = $LASTEXITCODE
+    # Checked before the exit code is acted on, so a crashing campaign still
+    # reports which reproducer it left behind rather than only its exit status.
+    Assert-NoFuzzArtifacts -Stage "target $name"
+    if ($campaignExit -ne 0) {
+        exit $campaignExit
     }
 }
+
+Assert-NoFuzzArtifacts -Stage "all targets"

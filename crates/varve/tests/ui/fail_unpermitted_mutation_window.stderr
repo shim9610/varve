@@ -1,0 +1,15 @@
+error[E0061]: this method takes 1 argument but 0 arguments were supplied
+  --> tests/ui/fail_unpermitted_mutation_window.rs:14:56
+   |
+14 |     let _window: MutationInFlight<LayoutWriter> = flag.begin_mutation();
+   |                                                        ^^^^^^^^^^^^^^-- argument #1 of type `varve_core::enforcement_probe::MutationPermit<LayoutWriter>` is missing
+   |
+note: method defined here
+  --> $WORKSPACE/crates/varve-core/src/writer_permit.rs
+   |
+   |     pub fn begin_mutation<W: ?Sized>(&mut self, permit: MutationPermit<W>) -> MutationInFlight<W> {
+   |            ^^^^^^^^^^^^^^
+help: provide the argument
+   |
+14 |     let _window: MutationInFlight<LayoutWriter> = flag.begin_mutation(/* varve_core::enforcement_probe::MutationPermit<LayoutWriter> */);
+   |                                                                       +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++

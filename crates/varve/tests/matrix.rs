@@ -1657,3 +1657,105 @@ fn cleanup(path: &PathBuf) {
         Err(error) => panic!("failed to remove {}: {error}", lock.display()),
     }
 }
+
+/// F-06: the post-commit outcome carries nothing that owns heap.
+///
+/// After `commit_matrix_cell` the cell is authoritative, and the two remaining
+/// steps build `Error::MatrixCommittedButDurabilityUnproven` or
+/// `Error::MatrixCommittedButHookFailed`. Both box their event and their
+/// source, so each construction allocates twice *after* publication; a review
+/// harness failed the very next allocation at each branch and both children
+/// terminated on a 56-byte allocation while the reopened file held the
+/// committed values. The crate's answer is a stated policy rather than a code
+/// change (see "Allocator Failure And Published Outcomes" in
+/// `docs/durability-model.md`): those are shape-sized allocations, fixed by the
+/// type and never by a file length or caller count, and shape-sized allocation
+/// is infallible and abort-on-refusal.
+///
+/// That policy is only true while the event stays shape-sized. `event.clone()`
+/// runs after the commit too, and a `String` or `Vec` field added to
+/// `MatrixCommitEvent` would make it a *content-sized* allocation on the
+/// post-publication path — the exact thing the policy says does not happen
+/// there. The destructuring below is exhaustive with no `..`, so adding a field
+/// fails to compile here, and the `Copy` bound then refuses a field that owns
+/// heap.
+#[test]
+fn the_post_commit_event_stays_shape_sized() {
+    fn assert_shape_sized<T: Copy>(_field: T) {}
+
+    let event = varve::MatrixCommitEvent {
+        block_id: MatrixCell::ID,
+        category: "cells",
+        key: MatrixKey::new(3, 5),
+        slot_offset: 4096,
+        slot_len: 4,
+    };
+    // Exhaustive on purpose: no `..` arm, so a new field breaks this test
+    // rather than the policy.
+    let varve::MatrixCommitEvent {
+        block_id,
+        category,
+        key,
+        slot_offset,
+        slot_len,
+    } = event.clone();
+    assert_shape_sized(block_id);
+    assert_shape_sized(category);
+    assert_shape_sized(key);
+    assert_shape_sized(slot_offset);
+    assert_shape_sized(slot_len);
+
+    assert_eq!(block_id, MatrixCell::ID);
+    assert_eq!(category, "cells");
+    assert_eq!(key, MatrixKey::new(3, 5));
+    assert_eq!(slot_offset, 4096);
+    assert_eq!(slot_len, 4);
+}
+
+/// F-06, invariant 4: the code's narrowing and the documents' narrowing agree.
+///
+/// The durability contract published an absolute structural claim — that the
+/// two typed variants are the only post-publication outcomes — and a harness
+/// disproved it by terminating the process between the commit and the
+/// construction of either variant. The claim is kept, because it is true of
+/// every value the call *returns*, and its scope is now published beside it.
+/// This test fails if one copy is corrected and another is not, which is the
+/// half-applied correction invariant 4 exists to catch.
+#[test]
+fn the_allocator_failure_narrowing_is_published_with_the_outcome_family() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("crates/varve has a workspace root two levels up");
+
+    let durability = std::fs::read_to_string(root.join("docs/durability-model.md"))
+        .expect("docs/durability-model.md is readable");
+    assert!(
+        durability.contains("## Allocator Failure And Published Outcomes"),
+        "the crate-wide allocator-failure policy must be published where the \
+         published-outcome family is defined"
+    );
+    for needle in ["shape-sized", "content-sized", "terminates the process"] {
+        assert!(
+            durability.contains(needle),
+            "docs/durability-model.md no longer states {needle:?}: the policy \
+             must name both allocation classes and say what a refusal does"
+        );
+    }
+
+    let api = std::fs::read_to_string(root.join("docs/api-reference.md"))
+        .expect("docs/api-reference.md is readable");
+    assert!(
+        api.contains("Allocator Failure And Published Outcomes"),
+        "docs/api-reference.md states the two-variant family, so it must route \
+         to the policy that scopes it"
+    );
+
+    let file_rs = std::fs::read_to_string(root.join("crates/varve-core/src/file.rs"))
+        .expect("crates/varve-core/src/file.rs is readable");
+    assert!(
+        file_rs.contains("Allocator Failure And Published Outcomes"),
+        "the rustdoc on write_matrix_cell_durable is the copy a user reads from \
+         `cargo doc`; it must carry the same scope as the documents"
+    );
+}

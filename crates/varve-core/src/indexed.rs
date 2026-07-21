@@ -18,7 +18,8 @@ use crate::file::{
 use crate::native_layout::{decode_native_record_footer, read_native_record_header};
 use crate::scalable_extent::UntrustedRecordPointer;
 use crate::stream::{
-    StreamCheckpoint, StreamTail, primary_generation, primary_identity, verify_primary_generation,
+    StreamCheckpoint, StreamMutationPermit, StreamTail, primary_generation, primary_identity,
+    verify_primary_generation,
 };
 use crate::traits::KeyedBlockContract;
 use crate::{
@@ -28,6 +29,11 @@ use crate::{
 };
 
 const INDEX_BATCH_RECORDS: usize = 16_384;
+
+/// The context this writer names when it refuses a mutation. The flag itself
+/// belongs to the stream writer underneath; see
+/// `VarveIndexedWriter::ensure_not_poisoned`.
+const INDEXED_WRITER_POISON_CONTEXT: &str = "indexed";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DiskIndexRebuildReport {
@@ -394,7 +400,6 @@ pub struct VarveIndexedWriter {
     batch_records: usize,
     batch_last_sequence: Option<u64>,
     dirty: bool,
-    poisoned: bool,
 }
 
 impl VarveIndexedWriter {
@@ -510,7 +515,6 @@ impl VarveIndexedWriter {
             batch_records: 0,
             batch_last_sequence: None,
             dirty: false,
-            poisoned: false,
         }
     }
 
@@ -521,7 +525,7 @@ impl VarveIndexedWriter {
     {
         // API2-03: compile-time keyedness contract at the public entry point.
         let () = KeyedBlockContract::<T>::OK;
-        self.ensure_writable::<T>()?;
+        let _permit = self.ensure_writable::<T>()?;
         let key = value.key();
         self.ensure_batch()?;
         let canonical_key =
@@ -563,8 +567,12 @@ impl VarveIndexedWriter {
         .map_err(index_error)?;
         let tail = record_tail(self.stream.spec(), T::ID, info);
         self.ensure_update_capacity(&update, tail.is_some())?;
+        // The permit is re-taken here rather than carried from the entry
+        // guard: `ensure_update_capacity` can commit a sidecar chunk, which is
+        // itself a step that can poison this writer.
+        let permit = self.ensure_not_poisoned()?;
         self.stream
-            .append_prepared_chunk(&record.bytes, &[(T::ID, info)])?;
+            .append_prepared_chunk(permit, &record.bytes, &[(T::ID, info)])?;
         self.publish_update(old_eof, info, update, tail)
     }
 
@@ -575,7 +583,7 @@ impl VarveIndexedWriter {
     {
         // API2-03: compile-time keyedness contract at the public entry point.
         let () = KeyedBlockContract::<T>::OK;
-        self.ensure_writable::<T>()?;
+        let _permit = self.ensure_writable::<T>()?;
         self.ensure_batch()?;
         let canonical_key =
             DiskIndexUpdate::encode_key(key, self.index.max_key_bytes()).map_err(index_error)?;
@@ -616,8 +624,9 @@ impl VarveIndexedWriter {
         .map_err(index_error)?;
         let tail = record_tail(self.stream.spec(), TOMBSTONE_BLOCK_ID, info);
         self.ensure_update_capacity(&update, tail.is_some())?;
+        let permit = self.ensure_not_poisoned()?;
         self.stream
-            .append_prepared_chunk(&record.bytes, &[(TOMBSTONE_BLOCK_ID, info)])?;
+            .append_prepared_chunk(permit, &record.bytes, &[(TOMBSTONE_BLOCK_ID, info)])?;
         self.publish_update(old_eof, info, update, tail)
     }
 
@@ -643,14 +652,14 @@ impl VarveIndexedWriter {
         let result = self.push_indexed_iter_inner::<T, I>(values, options, &mut written);
         if let Err(source) = result {
             self.batch.take();
-            self.poisoned = true;
+            self.stream.poison();
             return Err(BatchAppendError { written, source });
         }
         Ok(written)
     }
 
     pub fn push_unindexed_info<T: VarveBlock>(&mut self, value: &T) -> Result<AppendInfo> {
-        self.ensure_not_poisoned()?;
+        let _permit = self.ensure_not_poisoned()?;
         ensure_registered_block::<T>(self.stream.spec())?;
         if self.indexed_blocks.contains(&T::ID) {
             return Err(index_invariant(
@@ -683,7 +692,7 @@ impl VarveIndexedWriter {
         let result = self.push_unindexed_iter_inner::<T, I>(values, options, &mut written);
         if let Err(source) = result {
             self.batch.take();
-            self.poisoned = true;
+            self.stream.poison();
             return Err(BatchAppendError { written, source });
         }
         Ok(written)
@@ -695,7 +704,7 @@ impl VarveIndexedWriter {
     ) -> Result<AppendInfo> {
         // API2-03: compile-time keyedness contract at the public entry point.
         let () = KeyedBlockContract::<T>::OK;
-        self.ensure_not_poisoned()?;
+        let _permit = self.ensure_not_poisoned()?;
         ensure_registered_block::<T>(self.stream.spec())?;
         if self.indexed_blocks.contains(&T::ID) {
             return Err(index_invariant(
@@ -713,12 +722,12 @@ impl VarveIndexedWriter {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.ensure_not_poisoned()?;
+        let _permit = self.ensure_not_poisoned()?;
         self.stream.flush()
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        self.ensure_not_poisoned()?;
+        let _permit = self.ensure_not_poisoned()?;
         self.commit_pending_batch()?;
         self.stream.sync()?;
         if self.dirty {
@@ -757,7 +766,7 @@ impl VarveIndexedWriter {
         I::Item: Borrow<T>,
     {
         let options = options.validate()?;
-        self.ensure_writable::<T>()?;
+        let _permit = self.ensure_writable::<T>()?;
         self.commit_pending_batch()?;
 
         let max_records = options.max_records.min(INDEX_BATCH_RECORDS);
@@ -876,7 +885,7 @@ impl VarveIndexedWriter {
         I::Item: Borrow<T>,
     {
         let options = options.validate()?;
-        self.ensure_not_poisoned()?;
+        let _permit = self.ensure_not_poisoned()?;
         ensure_registered_block::<T>(self.stream.spec())?;
         if self.indexed_blocks.contains(&T::ID) {
             return Err(index_invariant(
@@ -970,8 +979,11 @@ impl VarveIndexedWriter {
         records: &[(u32, AppendInfo)],
         written: &mut BatchAppendInfo,
     ) -> Result<()> {
+        // One fresh poison check per published chunk, not one per batch: a
+        // chunk earlier in the same batch can have poisoned the writer.
+        let permit = self.ensure_not_poisoned()?;
         self.stream
-            .append_prepared_chunk_summarized(bytes, records, written)?;
+            .append_prepared_chunk_summarized(permit, bytes, records, written)?;
         self.commit_pending_batch()
     }
 
@@ -997,7 +1009,7 @@ impl VarveIndexedWriter {
         let Some(sequence) = staged else {
             return error;
         };
-        self.poisoned = true;
+        self.stream.poison();
         match error {
             already @ Error::PublishedButIndexStale { .. } => already,
             source => Error::PublishedButIndexStale {
@@ -1052,7 +1064,7 @@ impl VarveIndexedWriter {
             .expect("batch initialized")
             .apply_update_with_tail(old_eof, self.stream.snapshot().len(), &update, tail)
         {
-            self.poisoned = true;
+            self.stream.poison();
             return Err(Error::PublishedButIndexStale {
                 sequence: info.sequence,
                 source: Box::new(index_error(error)),
@@ -1082,7 +1094,7 @@ impl VarveIndexedWriter {
             .map(|_| ())
             .map_err(index_error);
         if let Err(error) = result {
-            self.poisoned = true;
+            self.stream.poison();
             return Err(Error::PublishedButIndexStale {
                 sequence: info.sequence,
                 source: Box::new(error),
@@ -1176,11 +1188,11 @@ impl VarveIndexedWriter {
         Ok(())
     }
 
-    fn ensure_writable<T: VarveKeyedBlock>(&self) -> Result<()> {
-        self.ensure_not_poisoned()?;
+    fn ensure_writable<T: VarveKeyedBlock>(&self) -> Result<StreamMutationPermit> {
+        let permit = self.ensure_not_poisoned()?;
         ensure_registered_block::<T>(self.stream.spec())?;
         if self.indexed_blocks.contains(&T::ID) {
-            Ok(())
+            Ok(permit)
         } else {
             Err(index_invariant(
                 "block is not declared with key_index = disk",
@@ -1188,12 +1200,22 @@ impl VarveIndexedWriter {
         }
     }
 
-    fn ensure_not_poisoned(&self) -> Result<()> {
-        if self.poisoned {
-            Err(Error::WriterPoisoned("indexed"))
-        } else {
-            Ok(())
-        }
+    /// The writer's poison guard, and the only source of the witness the
+    /// stream's mutating entry points demand.
+    ///
+    /// Round 12, F-05: this used to read a *second* poison flag owned by this
+    /// struct, which could and did disagree with the stream's own. When a
+    /// native append failed and its truncate-or-seek rollback failed too, the
+    /// stream poisoned itself and this flag stayed clear, so a later
+    /// single-record put or delete passed this guard and then called
+    /// `append_prepared_chunk` directly — a method that did not consult the
+    /// stream's flag either. The two flags are now one: this reads the
+    /// stream's flag, and every site in this file that used to set the local
+    /// one now calls `VarveStreamWriter::poison`. The indexed writer cannot
+    /// present itself as healthy after any stream error, and the stream cannot
+    /// present itself as healthy after any indexed error.
+    fn ensure_not_poisoned(&self) -> Result<StreamMutationPermit> {
+        self.stream.mutation_permit(INDEXED_WRITER_POISON_CONTEXT)
     }
 }
 

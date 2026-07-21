@@ -4934,6 +4934,83 @@ fn high_cardinality_api_tokens(
     )
 }
 
+/// Rustdoc for a generated typed writer (P-01).
+///
+/// The resident writer is the convenient default, and for a format whose
+/// distinct key count is large it is the wrong tool. The published pages are
+/// where a caller decides that, so the cost model and the alternative are
+/// stated on the type itself rather than only in `docs/performance.md`.
+fn generated_writer_doc(format_name: &Ident, keyed_blocks: &[&InlineBlock]) -> String {
+    if keyed_blocks.is_empty() {
+        return format!(
+            "Typed resident writer for the `{format_name}` format.\n\
+             \n\
+             This format declares no keyed block, so construction primes no \
+             keyed-tail cache. The writer holds the whole record index in \
+             memory, which is the resident (non-petabyte) path: for a file \
+             whose record count is chosen by an untrusted producer, bound it \
+             with `ReadLimits` or use the streaming/indexed APIs."
+        );
+    }
+    let names: Vec<String> = keyed_blocks
+        .iter()
+        .map(|block| format!("`{}`", block.name))
+        .collect();
+    let count = keyed_blocks.len();
+    format!(
+        "Typed resident writer for the `{format_name}` format.\n\
+         \n\
+         # Construction cost and cache size\n\
+         \n\
+         Constructing this writer primes one resident keyed-tail map per keyed \
+         block type. This format declares {count} ({names}), and each priming \
+         pass walks the resident record index, so construction costs \
+         `Theta(M*N)` for `M` keyed block types and `N` resident index \
+         entries.\n\
+         \n\
+         The retained cache is bounded per block id, not per file: \
+         `ReadLimits::max_keyed_tail_bytes` is checked against each block's own \
+         map, so the aggregate a single writer can retain is about `M` times \
+         that ceiling. Both facts are the documented behaviour of the resident \
+         path, not a limit violation.\n\
+         \n\
+         # High-cardinality formats should not use this writer\n\
+         \n\
+         If the number of distinct keys is large, unbounded, or chosen by an \
+         untrusted producer, declare `key_index = disk` on the keyed blocks and \
+         use the generated disk-indexed API (`{format_name}IndexedWriter` \
+         through `create_indexed_writer` / `open_indexed_writer`, and \
+         `{format_name}IndexedReader` through `open_indexed_reader`) instead. \
+         Those keep key state in the redb sidecar rather than in this process, \
+         they perform no per-construction index walk, and they are the APIs the \
+         petabyte-scale contract covers. The resident writer is explicitly not \
+         that path.",
+        names = names.join(", "),
+    )
+}
+
+/// Rustdoc for the generated writer's `from_inner` (P-01).
+fn generated_writer_construction_doc(keyed_blocks: &[&InlineBlock]) -> String {
+    if keyed_blocks.is_empty() {
+        return "Wraps an open `VarveWriter`. This format declares no keyed \
+                block, so nothing is primed and this cannot fail on cache \
+                budget."
+            .to_string();
+    }
+    format!(
+        "Wraps an open `VarveWriter`, priming the resident keyed-tail map of \
+         each of this format's {count} keyed block types.\n\
+         \n\
+         The priming is fallible and happens **before** any mutation: a file \
+         whose distinct key count exceeds `ReadLimits::max_keyed_tail_bytes` \
+         for one of those blocks is refused here, not at a later append. Each \
+         pass walks the resident record index, so this is the `Theta(M*N)` step \
+         described on the type; a format with high key cardinality should use \
+         the disk-indexed API instead.",
+        count = keyed_blocks.len(),
+    )
+}
+
 fn typed_api_tokens(
     format_name: &Ident,
     blocks: &[InlineBlock],
@@ -4982,6 +5059,15 @@ fn typed_api_tokens(
     } else {
         quote!(mut inner)
     };
+    // P-01, documentation only. Construction primes one keyed-tail map per
+    // keyed block type and each priming pass walks the whole resident index,
+    // so the cost is Theta(M*N) and the retained cache can reach roughly
+    // M * `keyed_tail` because that ceiling is per block id, not per file.
+    // That is the documented behaviour of the resident (non-PB) path rather
+    // than a contract violation, so the generated pages say it out loud and
+    // name the disk-indexed API a high-cardinality format should use instead.
+    let writer_doc = generated_writer_doc(format_name, &keyed_blocks);
+    let writer_construction_doc = generated_writer_construction_doc(&keyed_blocks);
 
     let reader_inherent_methods = append_blocks.iter().flat_map(|block| reader_methods(block));
     let reader_trait_methods = append_blocks
@@ -5074,12 +5160,14 @@ fn typed_api_tokens(
             #matrix_reader_aux_trait_impl_methods
         }
 
+        #[doc = #writer_doc]
         #[derive(Debug)]
         pub struct #writer_name {
             inner: ::varve::__core::VarveWriter,
         }
 
         impl #writer_name {
+            #[doc = #writer_construction_doc]
             pub fn from_inner(
                 #writer_inner_binding: ::varve::__core::VarveWriter,
             ) -> ::varve::__core::Result<Self> {

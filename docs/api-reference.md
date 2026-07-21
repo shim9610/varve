@@ -162,6 +162,20 @@ charged on every path. It is checked per keyed block id, not
 summed across block ids, and it excludes `HashMap` control bytes and
 load-factor slack. `STANDARD` leaves it at `u64::MAX`.
 
+Two consequences of "per block id" are worth stating outright, because they
+decide which API a format should use (P-01). A generated writer primes one such
+map per keyed block type at construction, and each priming pass walks the
+resident record index, so construction costs `Theta(M*N)` for `M` keyed block
+types and `N` resident index entries. And because the ceiling binds each map
+separately, the aggregate a single writer can retain is about `M` times
+`max_keyed_tail_bytes` rather than that value once. Both are the documented
+behaviour of the resident path, not limit violations — but they are the wrong
+shape for a high-cardinality format. Declare `key_index = disk` on the keyed
+blocks and use the generated disk-indexed writer/reader instead: that path
+keeps key state in the redb sidecar, does no per-construction index walk, and
+is the one the petabyte-scale contract covers. The generated rustdoc for each
+typed writer now says the same thing on the type itself.
+
 The allocation budget these limits drive is nominal accounting, not a hard peak
 RSS guarantee. It counts logical/nominal bytes and does not fully account for
 container bucket/node overhead, the extra `8 × N` for sequence-uniqueness
@@ -196,8 +210,30 @@ Common `VarveWriter` APIs:
 | `write_metadata(key, bytes)` | append internal metadata record |
 | `replace_block(index, &block)` | sequence-preserving copy-on-write replacement; encoded size may grow or shrink |
 | `replace_fixed(index, &block)` | same-size copy-on-write replacement; already-open readers keep their snapshot |
-| `unsafe replace_fixed_in_place_exclusive(index, &block)` | expert-only in-place replacement; caller must exclude readers and writers |
+| `unsafe replace_fixed_in_place_exclusive(index, &block)` | expert-only in-place replacement; caller must exclude readers and writers **and must not change a keyed record's key** |
 | `replace_rewrite(index, &block)` | rewrite whole file through temp file |
+
+All four replacement entry points select their target by block id and refuse a
+stored `block_version` that differs from `T::VERSION` with
+`Error::BlockVersionMismatch` (F-01). `replace_rewrite` and
+`unsafe replace_fixed_in_place_exclusive` previously did not: they copied the
+stored version while substituting the new payload, which is a persistent
+type/version disagreement on disk whenever `schema_hash = 0` opts out of
+header-level schema locking. The check is no longer a step a path performs — it
+is a precondition of resolving the target at all, so a replacement path added
+later inherits it. The refusal now also precedes the size, limit, and
+generation checks, so a call that is wrong in two ways reports
+`BlockVersionMismatch` where `replace_fixed` previously reported
+`ReplaceSizeMismatch`.
+
+`unsafe replace_fixed_in_place_exclusive` additionally requires, for a keyed
+block on a `keyed_offset_chain` format, that the replacement keep the record's
+key. Nothing can check that at a `T: VarveBlock` signature and there is no new
+generation in which the physical chain could be rebuilt, so it is part of the
+unsafe contract. What the method does guarantee unconditionally is that the
+affected block's resident keyed-tail map is dropped *before* the first byte is
+written (F-02), so no stale predecessor can be read afterwards even if the
+write fails half-way or the contract is violated.
 | `commit()` | write explicit transaction marker without an implied fsync |
 | `commit_durable()` | write an explicit transaction marker with ordered flush/sync barriers |
 | `flush()` | write buffered records/checkpoints/manifests/marker |
@@ -286,6 +322,34 @@ or scans. Missing, dirty, stale, and identity-mismatched sidecars are errors
 with explicit recovery operations. `sync()`, not `flush()`, publishes a clean
 generation that can be reopened normally.
 
+### One Poison Flag Per Writer
+
+A stream writer poisons itself when an append fails and the truncate-or-seek
+rollback that should undo it fails too: the file's tail is then in an unknown
+state and no further mutation is safe. The public contract has always been that
+every later mutation is refused with `Error::WriterPoisoned`.
+
+An indexed writer used to keep a *second* poison flag of its own, and the two
+could disagree (F-05). After the rollback failure above, the stream was
+poisoned and the indexed flag was clear, so a later single-record put or delete
+passed the indexed guard and then called the stream's internal prepared-append
+directly — a method that did not consult the stream's flag either. The
+contract said the mutation was refused; it was performed.
+
+The two flags are now one. The indexed writer reads the stream's flag and
+poisons the stream's flag, so it cannot present itself as healthy after any
+stream error, and the mutating entry points require a witness value that only
+the poison check produces — a caller that skips the check does not compile.
+Visible consequences:
+
+- an indexed writer refuses after *any* stream poison, including one raised by
+  a batch this writer did not itself perform;
+- the refusal reached through the indexed API still reports
+  `WriterPoisoned("indexed")`, and the one reached through the stream API still
+  reports the stream's own context, even though there is a single flag;
+- each published chunk of a batch takes its own fresh check, so a chunk that
+  poisons the writer stops the chunks after it in the same call.
+
 `Error::DiskIndex` contains the original boxed `DiskIndexError`; callers should
 match that source rather than parse display text. redb database lock contention
 maps to `Error::IndexBusy`. Bootstrap refuses an existing `.vks`, and rebuild
@@ -352,11 +416,16 @@ fails, the handle returns `WriteRollbackFailed`, becomes poisoned, and rejects
 later mutation, `flush`, and `sync` with `WriterPoisoned`.
 
 Copy-on-write replacement has distinct post-publication failure states.
-`PublishedButRebindFailed { sequence, source }` means the new generation was
-already atomically published, but the current writer could not reopen and bind
-to it. Discard the poisoned writer and reopen the path to inspect the published
-state. Do not blindly retry the same logical update: publication may already
-have applied it. On Windows, `ReplacePublicationIndeterminate` means
+`PublishedButRebindFailed { sequence, source, parent_sync }` means the new
+generation was already atomically published, but the current writer could not
+reopen and bind to it. Discard the poisoned writer and reopen the path to
+inspect the published state. Do not blindly retry the same logical update:
+publication may already have applied it. `parent_sync: Some(_)` adds the second
+durability fact for a double fault (F-07): the parent-directory sync for the
+published pathname failed too, so the rename is not yet proved durable against
+power loss. `None` means only the first two facts. Downstream code that
+destructured this variant with `{ sequence, source }` must add `parent_sync` or
+`..`. On Windows, `ReplacePublicationIndeterminate` means
 `ReplaceFileW` failed with error 1176/1177 and reconciliation could not prove
 the outcome: the pathname state is unknown, the replacement temp file is
 preserved, and the writer is poisoned. Inspect the pathname and the preserved
@@ -470,8 +539,20 @@ typed wrappers.
 | `read_matrix_aux(name, offset, len)` | read aux bytes |
 | `matrix_resume_signal(category)` | classify partial matrix progress |
 | `matrix_recovery_report()` | report matrix findings/actions |
-| `rebuild_matrix_commit_from_crc::<T>()` | rebuild commit map from slot CRC evidence |
+| `rebuild_matrix_commit_from_crc::<T>()` | rebuild commit map from slot CRC evidence; refuses when the CRC-validity evidence is incomplete |
 | `write_matrix_cell_durable` | write/commit with ordered durability barrier, then a post-commit hook |
+
+`rebuild_matrix_commit_from_crc::<T>()` now refuses, with
+`Error::MatrixFatalCorruption`, when the block's CRC-validity page index could
+not be enumerated in full (F-04). A rebuild sets a commit bit only where
+slot-valid evidence says the CRC is meaningful; pages missing from a damaged
+validity index read as absent, so rebuilding from them would publish those
+cells as *uncommitted* and erase the previous commit view using evidence that
+was never read. The refusal is unconditional: `with_matrix_fatal_forensics`
+relaxes *reading* fatal state, not a destructive republication, which is the
+same rule the interrupted-rebuild poison already followed. Repair or regenerate
+the validity evidence first. Varve deliberately offers no implicit way to
+discard unverifiable visibility.
 
 The hook of `write_matrix_cell_durable` runs **after** the cell is committed
 and synced, so it cannot un-commit anything. A hook failure is reported as the
@@ -487,6 +568,16 @@ the commit bit is in the file, the cell is readable after a clean exit, the
 hook did not run, and only power-loss durability is unproven. Those two are the
 call's only published outcomes; every other error means the cell was not
 committed.
+
+That family statement describes the value the call *returns* (F-06). Both
+variants box their event and their source, so building either one allocates
+after the cell is authoritative. Those are shape-sized allocations — fixed by
+the type, never by a file length or caller count — and Varve allocates
+shape-sized memory infallibly, so an allocator refusal terminates the process
+instead of returning a different outcome. No caller observes a wrong outcome;
+the cell is committed on disk, and reopening the file shows it. The crate-wide
+rule, and the alternatives that were rejected, are in
+`docs/durability-model.md` under "Allocator Failure And Published Outcomes".
 
 Matrix slot types must have a width fixed by the type itself, because a slot
 needs a stride the compiler knows. Scalars and fixed arrays of them qualify.
@@ -958,7 +1049,7 @@ document assumes.
 | `IntegrityFeatureDisabled` | enable `integrity` or disable CRC policy |
 | `MatrixDimensionsRequired` | matrix file creation needs runtime dimensions |
 | `MatrixNotCommitted` | slot bytes exist but commit bit is clear |
-| `MatrixFatalCorruption` | recovery found a fatal matrix finding; default access is fail-closed. Use `FormatSpec::with_matrix_fatal_forensics()` for forensic read-through |
+| `MatrixFatalCorruption` | recovery found a fatal matrix finding; default access is fail-closed. Use `FormatSpec::with_matrix_fatal_forensics()` for forensic read-through. Also returned by `rebuild_matrix_commit_from_crc` when the CRC-validity page index is incomplete — that refusal is **not** relaxed by forensic mode, because a rebuild publishes state rather than reading it |
 | `MatrixSidecarMismatch(reason)` | matrix sidecar rejected: wrong native identity, layout generation, creation nonce, or sidecar version; regenerate the sidecar |
 | `InvalidMatrixLayout` | matrix layout bytes are not valid for this build — including a matrix file created before the creation-nonce region existed; recreate the matrix file |
 | `MatrixSizeMismatch` | encoded matrix payload does not match slot stride |
@@ -973,7 +1064,7 @@ document assumes.
 | `MatrixCommittedButDurabilityUnproven { event: Box<MatrixCommitEvent>, source }` | `write_matrix_cell_durable` put the commit bit in the file and the durability request after it failed. Not a rollback: the cell is committed and readable after a clean exit, and the hook did **not** run. The writer is poisoned; reopen and `sync`, then issue the notification with the carried event |
 | `CommittedButDurabilityUnproven { sequence, source }` | `commit_durable` appended the transaction's commit marker and the `flush`/`sync_all` after it failed. Not a rollback: the transaction is committed and `sequence` names the marker. Retry `sync`, not the transaction — re-running it appends a second marker |
 | `WriterLockMarkerNotDedicated { path, reason }` | the `<target>.lock` marker path is a symlink/reparse point, a multi-link object, or not a regular file, so Varve refused to truncate and rewrite it. Remove or un-alias the marker path |
-| `PublishedButRebindFailed` | replacement published but the writer could not rebind and was poisoned |
+| `PublishedButRebindFailed { sequence, source, parent_sync }` | replacement published but the writer could not rebind and was poisoned. `parent_sync: Some(_)` additionally means the parent-directory sync for the published pathname failed in the same publication, so the rename is not yet proved durable against power loss |
 | `ReplacePublicationIndeterminate` | Windows `ReplaceFileW` 1176/1177 with unresolvable pathname state; temp preserved, writer poisoned, do not blindly retry |
 | `WriterLockHeld` | another writer or stale lock exists |
 | `WriterLockBreakRefused` | the explicit lock policy did not prove removal was allowed |

@@ -70,6 +70,52 @@ fn high_cardinality_compile_contracts() {
     tests.compile_fail("tests/ui/fail_keyed_contradiction_indexed_delete.rs");
 }
 
+/// Round 12's enforcement pass: the proof that the two recurring defect shapes
+/// are refused by the compiler rather than by review.
+///
+/// Every previous round closed one of these classes by *reading* — round 10
+/// rewrote 736 lines of `matrix.rs` under the banner of an exhaustive
+/// invariant-3 sweep and still shipped `compact_page_index`, which had the
+/// exact shape the sweep was hunting, in the file the sweep had rewritten.
+/// These fixtures are the part that does not decay: they keep holding for code
+/// nobody has written yet, and they fail loudly the day someone relaxes a
+/// private field to make an edit easier.
+///
+/// Gated on `scalable-fault-injection` because the enforcement types are
+/// crate-private and are exposed to an external crate only through the
+/// `#[doc(hidden)]` `varve_core::enforcement_probe`, which that test-only
+/// feature compiles.
+#[cfg(feature = "scalable-fault-injection")]
+#[test]
+fn mechanical_enforcement_contracts() {
+    let tests = trybuild::TestCases::new();
+    // SHAPE B: the poison-check witness cannot be forged.
+    tests.compile_fail("tests/ui/fail_fabricated_mutation_permit.rs");
+    // SHAPE B: a mutation window cannot be opened without the witness.
+    tests.compile_fail("tests/ui/fail_unpermitted_mutation_window.rs");
+    // SHAPE B (round 14): the witness names the writer it speaks for, so a
+    // permit taken from one writer cannot be spent on another. The in-crate
+    // half of the same fix — that a throwaway `PoisonFlag` cannot mint one at
+    // all — is gated by tests/enforcement_gates.rs.
+    tests.compile_fail("tests/ui/fail_cross_writer_mutation_permit.rs");
+    // SHAPE A: the post-append mirror install cannot be reached without its
+    // reservation.
+    tests.compile_fail("tests/ui/fail_fabricated_index_reservation.rs");
+    // F-01 (round 13): a replacement target cannot be addressed without the
+    // stored-version refusal that its only constructor performs.
+    tests.compile_fail("tests/ui/fail_fabricated_replacement_target.rs");
+    // F-02 (round 13): the permission to rewrite an already-indexed record
+    // cannot be obtained without dropping the block's keyed-tail map.
+    tests.compile_fail("tests/ui/fail_fabricated_record_overwrite.rs");
+    // F-04 (round 14): the CRC-validity bitmap cannot be read as evidence of
+    // absence without the completeness witness, and the witness cannot be
+    // forged.
+    tests.compile_fail("tests/ui/fail_fabricated_crc_valid_completeness.rs");
+    // SHAPE B (round 14): matrix state cannot be addressed without the
+    // fail-closed fatal-recovery witness, and the witness cannot be forged.
+    tests.compile_fail("tests/ui/fail_fabricated_fatal_access.rs");
+}
+
 #[cfg(feature = "mmap")]
 #[test]
 fn mmap_safety_contracts() {

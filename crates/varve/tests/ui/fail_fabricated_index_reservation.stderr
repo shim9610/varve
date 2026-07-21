@@ -1,0 +1,11 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/ui/fail_fabricated_index_reservation.rs:14:38
+   |
+14 |     let _forged: ReservedIndexSlot = ReservedIndexSlot(());
+   |                                      ^^^^^^^^^^^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> $WORKSPACE/crates/varve-core/src/file.rs
+   |
+   |     pub struct ReservedIndexSlot(());
+   |                                  ^^ private field

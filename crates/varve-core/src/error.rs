@@ -258,13 +258,39 @@ pub enum Error {
         source: io::Error,
     },
 
+    /// The replacement generation was published, but the writer could not
+    /// rebind to it and was poisoned.
+    ///
+    /// `parent_sync` carries the *second* durability fact when two independent
+    /// failures happen in the same publication (F-07). The parent-directory
+    /// sync runs first, immediately after the atomic rename; when it fails the
+    /// publication is still real, so the writer rebinds anyway and the caller
+    /// normally learns about the pending sync through
+    /// [`Error::PublishedButParentSyncPending`]. If the rebind then fails too,
+    /// that variant is never constructed, and this one is returned instead —
+    /// so without this field the already-known fact that the published
+    /// pathname is not yet proved durable against power loss would be dropped
+    /// on the floor. `Some(_)` therefore means: the new generation is visible
+    /// at the pathname, the writer is unusable, **and** the rename is not yet
+    /// guaranteed to survive power loss. `None` means only the first two.
     #[error(
-        "replacement generation with sequence {sequence} was published, but the writer could not rebind: {source}"
+        "replacement generation with sequence {sequence} was published, but the writer could not \
+         rebind: {source}{parent_sync_note}",
+        parent_sync_note = .parent_sync
+            .as_ref()
+            .map(|error| format!(
+                "; the parent-directory sync for the published pathname also failed, so the \
+                 publication is not yet known durable against power loss: {error}"
+            ))
+            .unwrap_or_default(),
     )]
     PublishedButRebindFailed {
         sequence: u64,
         #[source]
         source: Box<Error>,
+        /// The parent-directory sync failure that preceded the rebind failure,
+        /// when both happened in the same publication.
+        parent_sync: Option<Box<Error>>,
     },
 
     /// The commit marker was appended, but the durability request that follows
@@ -539,4 +565,36 @@ pub enum Error {
 
     #[error("adapter diagnostic: {0}")]
     AdapterDiagnostic(&'static str),
+}
+
+impl Error {
+    /// Folds an already-known parent-directory sync failure into a published
+    /// outcome that would otherwise drop it (F-07).
+    ///
+    /// A replacement publication learns two independent durability facts in a
+    /// fixed order: whether the parent-directory sync succeeded, and whether
+    /// the writer could rebind to the published generation. Only the second
+    /// one has a `?`-style path out, so a double fault used to return
+    /// [`Error::PublishedButRebindFailed`] alone and silently discard the
+    /// first. Applying this to the rebind error preserves both.
+    ///
+    /// Any other error is returned unchanged: the parent-sync fact is only
+    /// meaningful alongside an outcome that already says the publication
+    /// happened, and every other error from a replacement path means it did
+    /// not.
+    #[must_use]
+    pub(crate) fn with_pending_parent_sync(self, parent_sync: Error) -> Error {
+        match self {
+            Error::PublishedButRebindFailed {
+                sequence,
+                source,
+                parent_sync: None,
+            } => Error::PublishedButRebindFailed {
+                sequence,
+                source,
+                parent_sync: Some(Box::new(parent_sync)),
+            },
+            other => other,
+        }
+    }
 }

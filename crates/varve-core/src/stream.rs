@@ -28,6 +28,19 @@ use crate::{
 
 const STREAM_WRITER_POISON_CONTEXT: &str = "stream";
 
+// Mechanical enforcement of the writer poison check (round 12, F-05) lives in
+// `crate::writer_permit`, which round 12's enforcement pass promoted out of
+// this file so that `file.rs` and `layout.rs` hold the same type rather than
+// three independent hand-written conventions. See that module's documentation
+// for what the two tokens make impossible.
+pub(crate) use crate::writer_permit::MutationPermit;
+use crate::writer_permit::{GuardedWriter, PoisonFlag};
+
+/// The witness this writer's mutating entry points demand. Typed by the writer
+/// it speaks for, so a permit taken from some other writer — or, as round 12's
+/// re-verification showed, from a throwaway `PoisonFlag` — is not this type.
+pub(crate) type StreamMutationPermit = MutationPermit<VarveStreamWriter>;
+
 const INTERNAL_BLOCK_IDS: [u32; 3] = [
     MANIFEST_BLOCK_ID,
     TOMBSTONE_BLOCK_ID,
@@ -40,6 +53,46 @@ thread_local! {
     static INJECTED_GENERATION_RESTAMP_FAILURES: std::cell::Cell<u64> = const {
         std::cell::Cell::new(0)
     };
+
+    /// Armed native-append write failures whose rollback also fails (round 12,
+    /// F-05).
+    static INJECTED_APPEND_ROLLBACK_FAILURES: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+/// Consumes one armed write-plus-rollback append failure (round 12, F-05).
+///
+/// Returns `true` when the caller must behave as though the native chunk write
+/// failed *and* the truncate-or-seek rollback that follows it failed too. That
+/// is the pair F-05 names: it is the shortest route to
+/// `Error::WriteRollbackFailed`, and it is not reachable from outside the
+/// crate on demand, because it needs two consecutive I/O failures on the same
+/// open handle. (The snapshot-rebind failure further down the same function
+/// has its own identical rollback, which the existing process-abort hooks
+/// already cover.) Nothing is written and nothing is truncated when this
+/// fires, so the on-disk file is exactly what a real failed-then-rolled-back
+/// write leaves behind; only the writer's own state is driven onto the
+/// poisoned path.
+///
+/// Inert without the `scalable-fault-injection` feature. Thread-local so
+/// concurrently running tests cannot arm each other's writers.
+#[inline]
+fn take_injected_append_rollback_failure() -> bool {
+    #[cfg(feature = "scalable-fault-injection")]
+    {
+        let armed = INJECTED_APPEND_ROLLBACK_FAILURES.with(|count| {
+            let current = count.get();
+            if current != 0 {
+                count.set(current - 1);
+            }
+            current != 0
+        });
+        if armed {
+            return true;
+        }
+    }
+    false
 }
 
 /// Consumes one armed generation-restamp failure (round 11, invariant 3).
@@ -605,7 +658,7 @@ pub struct VarveStreamWriter {
     record_count: u64,
     block_tails: Vec<(u32, Option<StreamTail>)>,
     state: Option<StreamWriterState>,
-    poisoned: bool,
+    poison: PoisonFlag,
     _lock: WriterLock,
 }
 
@@ -636,6 +689,12 @@ impl Drop for StreamWriterState {
         // redb waits for active write transactions while closing the database.
         // Abort the bounded batch before field drop reaches the store owner.
         self.batch.take();
+    }
+}
+
+impl GuardedWriter for VarveStreamWriter {
+    fn poison_flag(&self) -> &PoisonFlag {
+        &self.poison
     }
 }
 
@@ -735,7 +794,7 @@ impl VarveStreamWriter {
             record_count: 0,
             block_tails: initial_block_tails(spec),
             state: None,
-            poisoned: false,
+            poison: PoisonFlag::healthy(),
             _lock: lock,
         };
         // STO-01: stamp the per-create nonce as the very first record of the
@@ -752,13 +811,15 @@ impl VarveStreamWriter {
                 sequence,
                 offset,
             )?;
-            writer.append_prepared(CREATION_NONCE_BLOCK_ID, record)?;
+            let permit = writer.ensure_writable()?;
+            writer.append_prepared(permit, CREATION_NONCE_BLOCK_ID, record)?;
         }
         if spec.manifest_policy == ManifestPolicy::Embedded {
             let sequence = writer.next_sequence()?;
             let offset = writer.snapshot.len();
             let record = prepare_stream_manifest_record(spec, sequence, offset)?;
-            writer.append_prepared(MANIFEST_BLOCK_ID, record)?;
+            let permit = writer.ensure_writable()?;
+            writer.append_prepared(permit, MANIFEST_BLOCK_ID, record)?;
         }
         Ok(writer)
     }
@@ -824,7 +885,7 @@ impl VarveStreamWriter {
                 record_count: checkpoint.record_count,
                 block_tails: block_tails_from_checkpoint(spec, &checkpoint.block_tails),
                 state: None,
-                poisoned: false,
+                poison: PoisonFlag::healthy(),
                 _lock: lock,
             },
             loaded,
@@ -883,7 +944,7 @@ impl VarveStreamWriter {
                 record_count: checkpoint.record_count,
                 block_tails: block_tails_from_checkpoint(spec, &checkpoint.block_tails),
                 state: None,
-                poisoned: false,
+                poison: PoisonFlag::healthy(),
                 _lock: lock,
             },
             store,
@@ -923,7 +984,7 @@ impl VarveStreamWriter {
         };
         if let Err(source) = self.push_iter_inner::<T, I>(values, options, &mut written) {
             if written.records != 0 {
-                self.poisoned = true;
+                self.poison.poison();
             }
             return Err(BatchAppendError { written, source });
         }
@@ -935,7 +996,7 @@ impl VarveStreamWriter {
         value: &T,
         previous: Option<u64>,
     ) -> Result<AppendInfo> {
-        self.ensure_writable()?;
+        let permit = self.ensure_writable()?;
         ensure_registered_block::<T>(self.spec)?;
         if self.spec.index_policy.keyed_offset_chain && T::IS_KEYED {
             return Err(Error::StreamingUnsupported);
@@ -957,7 +1018,7 @@ impl VarveStreamWriter {
             previous_block,
             previous,
         )?;
-        self.append_prepared(T::ID, record)
+        self.append_prepared(permit, T::ID, record)
     }
 
     pub fn delete_with_prev_key_info<T: VarveKeyedBlock>(
@@ -969,7 +1030,7 @@ impl VarveStreamWriter {
         // compile-time keyedness contract post-monomorphization; the
         // registration below stays as the runtime backstop.
         let () = KeyedBlockContract::<T>::OK;
-        self.ensure_writable()?;
+        let permit = self.ensure_writable()?;
         ensure_registered_block::<T>(self.spec)?;
         if self.spec.index_policy.keyed_offset_chain {
             return Err(Error::StreamingUnsupported);
@@ -984,19 +1045,19 @@ impl VarveStreamWriter {
             self.previous_block(TOMBSTONE_BLOCK_ID),
             previous,
         )?;
-        self.append_prepared(TOMBSTONE_BLOCK_ID, record)
+        self.append_prepared(permit, TOMBSTONE_BLOCK_ID, record)
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.ensure_writable()?;
-        self.commit_state_chunk()?;
+        let permit = self.ensure_writable()?;
+        self.commit_state_chunk(&permit)?;
         self.file.flush()?;
         Ok(())
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        self.ensure_writable()?;
-        self.commit_state_chunk()?;
+        let permit = self.ensure_writable()?;
+        self.commit_state_chunk(&permit)?;
         crate::scalable_fault_point("sync.native_sync");
         let sync = self.file.sync_all();
         crate::scalable_fault_point("sync.native_sync");
@@ -1006,7 +1067,7 @@ impl VarveStreamWriter {
             && state.dirty
         {
             if let Err(error) = state.store.publish_clean(frontier) {
-                self.poisoned = true;
+                self.poison.poison();
                 return Err(state_error(error));
             }
             state.dirty = false;
@@ -1050,7 +1111,7 @@ impl VarveStreamWriter {
         I: IntoIterator,
         I::Item: Borrow<T>,
     {
-        self.ensure_writable()?;
+        let _permit = self.ensure_writable()?;
         ensure_registered_block::<T>(self.spec)?;
         if T::ID >= 0xFFFF_FF00 {
             return Err(Error::ReservedBlockId(T::ID));
@@ -1087,7 +1148,8 @@ impl VarveStreamWriter {
                     .checked_add(record.bytes.len())
                     .is_none_or(|len| len > options.max_bytes);
             if exceeds_records || exceeds_bytes {
-                self.append_prepared_chunk_summarized(&bytes, &records, written)?;
+                let permit = self.ensure_writable()?;
+                self.append_prepared_chunk_summarized(permit, &bytes, &records, written)?;
                 bytes.clear();
                 records.clear();
             }
@@ -1115,13 +1177,15 @@ impl VarveStreamWriter {
             records.push((T::ID, record.info));
 
             if bytes.len() >= options.max_bytes || records.len() >= max_records {
-                self.append_prepared_chunk_summarized(&bytes, &records, written)?;
+                let permit = self.ensure_writable()?;
+                self.append_prepared_chunk_summarized(permit, &bytes, &records, written)?;
                 bytes.clear();
                 records.clear();
             }
         }
         if !records.is_empty() {
-            self.append_prepared_chunk_summarized(&bytes, &records, written)?;
+            let permit = self.ensure_writable()?;
+            self.append_prepared_chunk_summarized(permit, &bytes, &records, written)?;
         }
         Ok(())
     }
@@ -1131,8 +1195,13 @@ impl VarveStreamWriter {
     /// The summary arithmetic runs *before* the native write and the only step
     /// after publication is an infallible assignment, so `written` describes
     /// every record that reached the file on every path out of this call.
+    ///
+    /// `permit` is consumed: this is a mutating entry point reachable from
+    /// another module, so the poison check ran for *this* chunk. See
+    /// [`writer_permit`].
     pub(crate) fn append_prepared_chunk_summarized(
         &mut self,
+        permit: StreamMutationPermit,
         bytes: &[u8],
         records: &[(u32, AppendInfo)],
         written: &mut BatchAppendInfo,
@@ -1152,23 +1221,33 @@ impl VarveStreamWriter {
                     resource: "file length",
                 })?;
         let next = next_batch_summary(written, records, end_offset)?;
-        self.append_prepared_chunk(bytes, records)?;
+        self.append_prepared_chunk(permit, bytes, records)?;
         *written = next;
         Ok(())
     }
 
     fn append_prepared(
         &mut self,
+        permit: StreamMutationPermit,
         block_id: u32,
         record: PreparedStreamRecord,
     ) -> Result<AppendInfo> {
         let info = record.info;
-        self.append_prepared_chunk(&record.bytes, &[(block_id, info)])?;
+        self.append_prepared_chunk(permit, &record.bytes, &[(block_id, info)])?;
         Ok(info)
     }
 
+    /// Appends a prepared chunk at the native EOF, which is the authoritative
+    /// commit point for every record it names.
+    ///
+    /// `permit` is consumed rather than borrowed: this method is the mutating
+    /// entry point `indexed.rs` reaches for single-record puts and deletes, and
+    /// F-05 was that it performed the mutation without consulting the stream's
+    /// poison flag at all. The witness cannot be produced without that check.
+    /// See [`writer_permit`].
     pub(crate) fn append_prepared_chunk(
         &mut self,
+        permit: StreamMutationPermit,
         bytes: &[u8],
         records: &[(u32, AppendInfo)],
     ) -> Result<()> {
@@ -1197,18 +1276,40 @@ impl VarveStreamWriter {
             .ok_or(Error::ResourceArithmeticOverflow {
                 resource: "file length",
             })?;
-        self.reserve_state_chunk(records.len())?;
+        self.reserve_state_chunk(&permit, records.len())?;
         self.file.seek(SeekFrom::Start(eof))?;
-        crate::scalable_fault_point("append.native_chunk_write");
-        let write = self.file.write_all(bytes);
-        crate::scalable_fault_point("append.native_chunk_write");
+        // Round 12, F-05: an armed fault makes the write fail *and* its
+        // rollback fail, which is the pair that poisons the writer below.
+        // Nothing is written and nothing is truncated, so the file is exactly
+        // what a real rolled-back write leaves behind.
+        let injected_rollback_failure = take_injected_append_rollback_failure();
+        let write = if injected_rollback_failure {
+            Err(std::io::Error::other(
+                "injected native append chunk write failure",
+            ))
+        } else {
+            crate::scalable_fault_point("append.native_chunk_write");
+            let write = self.file.write_all(bytes);
+            crate::scalable_fault_point("append.native_chunk_write");
+            write
+        };
         if let Err(error) = write {
             // Nothing was staged for this chunk yet, so the pending sidecar
             // transaction still matches the rolled-back native EOF.
-            let truncate_result = self.file.set_len(eof);
-            let seek_result = self.file.seek(SeekFrom::Start(eof));
+            let (truncate_result, seek_result) = if injected_rollback_failure {
+                (
+                    Err(std::io::Error::other(
+                        "injected native append rollback truncate failure",
+                    )),
+                    Err(std::io::Error::other(
+                        "injected native append rollback seek failure",
+                    )),
+                )
+            } else {
+                (self.file.set_len(eof), self.file.seek(SeekFrom::Start(eof)))
+            };
             if let Some(source) = truncate_result.err().or_else(|| seek_result.err()) {
-                self.poisoned = true;
+                self.poison.poison();
                 return Err(Error::WriteRollbackFailed {
                     operation: "append stream record",
                     source,
@@ -1222,7 +1323,7 @@ impl VarveStreamWriter {
                 let truncate_result = self.file.set_len(eof);
                 let seek_result = self.file.seek(SeekFrom::Start(eof));
                 if let Some(source) = truncate_result.err().or_else(|| seek_result.err()) {
-                    self.poisoned = true;
+                    self.poison.poison();
                     return Err(Error::WriteRollbackFailed {
                         operation: "append stream record",
                         source,
@@ -1245,7 +1346,7 @@ impl VarveStreamWriter {
         // The records are published in the native file, so any sidecar failure
         // from here on must poison the writer.
         if let Err(error) = self.stage_state_records(records, new_eof) {
-            self.poisoned = true;
+            self.poison.poison();
             return Err(Error::PublishedButIndexStale {
                 sequence: last_sequence,
                 source: Box::new(error),
@@ -1256,7 +1357,7 @@ impl VarveStreamWriter {
             .as_ref()
             .is_some_and(|state| state.batch_records >= state.chunk_records)
         {
-            self.commit_state_chunk()?;
+            self.commit_state_chunk(&permit)?;
         }
         Ok(())
     }
@@ -1264,7 +1365,11 @@ impl VarveStreamWriter {
     /// Opens the writer's dirty generation and makes sure a pending sidecar
     /// transaction with room for `incoming` coverage items exists. Runs before
     /// the native write so setup failures leave the record unpublished.
-    fn reserve_state_chunk(&mut self, incoming: usize) -> Result<()> {
+    fn reserve_state_chunk(
+        &mut self,
+        permit: &StreamMutationPermit,
+        incoming: usize,
+    ) -> Result<()> {
         let Some(state) = self.state.as_mut() else {
             return Ok(());
         };
@@ -1275,7 +1380,7 @@ impl VarveStreamWriter {
         if state.batch.is_some()
             && state.batch_records.saturating_add(incoming) > state.chunk_records
         {
-            self.commit_state_chunk()?;
+            self.commit_state_chunk(permit)?;
         }
         if let Some(state) = self.state.as_mut()
             && state.batch.is_none()
@@ -1325,7 +1430,12 @@ impl VarveStreamWriter {
     /// would retry and append the same records twice. The classification lives
     /// here, around the whole body, rather than at individual steps, so a
     /// fallible step added to this path later cannot reopen the defect.
-    fn commit_state_chunk(&mut self) -> Result<()> {
+    fn commit_state_chunk(&mut self, permit: &StreamMutationPermit) -> Result<()> {
+        // Borrowed, not consumed: this runs *inside* a mutation whose permit
+        // was already taken, so demanding a fresh one would re-check a flag
+        // this very call may be about to set. Holding it is still what proves
+        // the check happened before the sidecar was touched.
+        let _ = permit;
         let staged = self
             .state
             .as_ref()
@@ -1342,7 +1452,7 @@ impl VarveStreamWriter {
         let Some(sequence) = staged else {
             return error;
         };
-        self.poisoned = true;
+        self.poison.poison();
         match error {
             already @ Error::PublishedButIndexStale { .. } => already,
             source => Error::PublishedButIndexStale {
@@ -1381,7 +1491,7 @@ impl VarveStreamWriter {
         let sequence = state.batch_last_sequence.take();
         state.batch_records = 0;
         if let Err(error) = batch.commit() {
-            self.poisoned = true;
+            self.poison.poison();
             return match sequence {
                 // The staged records were already published natively.
                 Some(sequence) => Err(Error::PublishedButIndexStale {
@@ -1411,12 +1521,52 @@ impl VarveStreamWriter {
         INJECTED_GENERATION_RESTAMP_FAILURES.with(|armed| armed.set(count));
     }
 
-    fn ensure_writable(&self) -> Result<()> {
-        if self.poisoned {
-            Err(Error::WriterPoisoned(STREAM_WRITER_POISON_CONTEXT))
-        } else {
-            Ok(())
-        }
+    /// Arms `count` injected native-append failures whose rollback also fails
+    /// (round 12, F-05).
+    ///
+    /// Fault-testing hook only. Each armed failure makes the next prepared
+    /// chunk append - on either the stream or the indexed writer - behave as
+    /// though the native write failed *and* the truncate-or-seek that rolls it
+    /// back failed too. That pair is the one path into
+    /// `Error::WriteRollbackFailed`, and it is what F-05 proved was not
+    /// enforced: the stream poisoned itself, the indexed writer kept a second
+    /// flag that stayed clear, and the next single-record put or delete was
+    /// accepted.
+    ///
+    /// The observable contract under this fault is that the call returns
+    /// `Error::WriteRollbackFailed` and that *every* later mutation of either
+    /// writer - single-record put, single-record delete, and batch - is
+    /// refused with `Error::WriterPoisoned`. Nothing is written and nothing is
+    /// truncated, so the file is left exactly as a real rolled-back write
+    /// leaves it. Thread-local.
+    #[cfg(feature = "scalable-fault-injection")]
+    #[doc(hidden)]
+    pub fn inject_append_rollback_failures(count: u64) {
+        INJECTED_APPEND_ROLLBACK_FAILURES.with(|armed| armed.set(count));
+    }
+
+    /// Checks the poison flag and issues the witness every mutating entry
+    /// point demands. See [`writer_permit`].
+    fn ensure_writable(&self) -> Result<StreamMutationPermit> {
+        self.writer_permit(STREAM_WRITER_POISON_CONTEXT)
+    }
+
+    /// The same check, reported under `context`.
+    ///
+    /// This is how a writer layered on this stream — today only
+    /// [`crate::VarveIndexedWriter`] — reaches the stream's mutating entry
+    /// points: it must observe the one authoritative poison flag to obtain a
+    /// permit, but names itself in the error so the caller is told which
+    /// writer refused. F-05 was exactly the absence of this: the layered
+    /// writer kept a *second* flag and the two could disagree.
+    pub(crate) fn mutation_permit(&self, context: &'static str) -> Result<StreamMutationPermit> {
+        self.writer_permit(context)
+    }
+
+    /// Refuses every future mutation of this writer and of anything layered on
+    /// it. Not reversible.
+    pub(crate) fn poison(&mut self) {
+        self.poison.poison();
     }
 
     pub(crate) fn next_sequence(&self) -> Result<u64> {

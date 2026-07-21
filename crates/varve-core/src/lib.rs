@@ -28,6 +28,34 @@ mod snapshot;
 #[cfg(feature = "high-cardinality-dev")]
 mod stream;
 mod traits;
+mod writer_permit;
+
+/// Test-only window onto the crate's mechanical-enforcement types.
+///
+/// Round 12's mandate was that the two recurring defect shapes be made
+/// impossible to express rather than enumerated again, and that the enforcement
+/// be *proved* to bind. A proof that the compiler rejects the mistake has to
+/// live in a crate that is not this one, because a compile-fail test cannot be
+/// written inside the crate under test — so the enforcement types are exposed
+/// here, unchanged and by re-export rather than by copy, for the `trybuild`
+/// fixtures in `crates/varve/tests/ui/`.
+///
+/// This is not API. It is `#[doc(hidden)]`, gated behind the same test-only
+/// feature as the fault injectors, and carries no method that can weaken an
+/// invariant: the constructors that matter (`PoisonFlag::issue`, which is
+/// private even to the rest of `varve-core`,
+/// `ReservedIndexSlot::reserve`, `ReplacementTarget::resolve` and
+/// `RecordOverwrite::prepare`) stay crate-private, which is precisely the
+/// property the fixtures assert.
+#[cfg(feature = "scalable-fault-injection")]
+#[doc(hidden)]
+pub mod enforcement_probe {
+    pub use crate::file::replacement_target::{RecordOverwrite, ReplacementTarget};
+    pub use crate::file::resident_index::{ReservedIndexSlot, ResidentIndex};
+    pub use crate::matrix::crc_valid_evidence::{CompleteCrcValidEvidence, CrcValidEvidence};
+    pub use crate::matrix::fatal_access::{FatalAccessAllowed, FatalAccessGate};
+    pub use crate::writer_permit::{MutationInFlight, MutationPermit, PoisonFlag};
+}
 
 pub use adapter::{
     AdapterCheckReport, AdapterCheckStatus, AdapterDiagnostic, AdapterDiagnosticDomain,

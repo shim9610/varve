@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/fail_cross_writer_mutation_permit.rs:29:29
+   |
+29 |     guarded_stream_mutation(some_other_writers_permit());
+   |     ----------------------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `MutationPermit<VarveStreamWriter>`, found `MutationPermit<VarveFile>`
+   |     |
+   |     arguments to this function are incorrect
+   |
+   = note: expected struct `varve_core::enforcement_probe::MutationPermit<VarveStreamWriter>`
+              found struct `varve_core::enforcement_probe::MutationPermit<VarveFile>`
+note: function defined here
+  --> tests/ui/fail_cross_writer_mutation_permit.rs:22:4
+   |
+22 | fn guarded_stream_mutation(_permit: MutationPermit<VarveStreamWriter>) {}
+   |    ^^^^^^^^^^^^^^^^^^^^^^^ ------------------------------------------

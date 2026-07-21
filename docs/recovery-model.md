@@ -143,6 +143,33 @@ slot CRC matches the stored per-cell CRC and the MCRC slot-valid bit says the
 slot was committed. The slot-valid evidence distinguishes a legitimate
 committed all-zero payload from an untouched all-zero slot.
 
+### Incomplete Evidence Refuses The Rebuild
+
+Because a bit is set only where slot-valid evidence says the CRC is meaningful,
+evidence that could not be read is *not* neutral: a validity page missing from
+a damaged page index reads as absent, and the rebuild would publish those cells
+as uncommitted. That is a destructive republication of the commit view derived
+from bytes nobody read, and until F-04 it was reachable.
+
+Each block's CRC-validity map now carries its own completeness status,
+separately from the "the bytes I loaded were authentic" statement, and
+`rebuild_matrix_commit_from_crc::<T>()` checks it first: if that block's
+validity page index could not be enumerated in full, the rebuild returns
+`Error::MatrixFatalCorruption` and writes nothing.
+
+The refusal is unconditional. `FormatSpec::with_matrix_fatal_forensics` relaxes
+*reading* fatal state so an operator can inspect a damaged file; it does not
+authorize publishing a new commit map from evidence the reader already flagged
+as unreadable, which is the same rule the interrupted-rebuild poison follows.
+Repair or regenerate the validity evidence and retry. There is deliberately no
+implicit path that discards unverifiable visibility; an operator who genuinely
+wants that outcome should clear the category explicitly, which says so in the
+operation's own name.
+
+The other consumer of the same evidence was checked and already fails closed:
+a committed cell read whose validity bit is absent returns
+`MatrixChecksumMismatch` rather than silently accepting the slot.
+
 Successful rebuild writes the new map and CRC before publishing it in memory,
 then removes the quarantine evidence for that category.
 

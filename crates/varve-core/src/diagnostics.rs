@@ -1339,8 +1339,31 @@ fn remove_unowned_lock_marker(report: &mut FormatSelfTestReport, path: &Path) {
         // would create one just to delete it again.
         return;
     }
-    let Ok(guard) = crate::file::WriterLock::acquire(path) else {
-        return;
+    // F-08: a failure to re-acquire the marker used to `return` silently, so a
+    // self-test could report `passed = true` with zero cleanup failures while a
+    // live 20-byte marker survived and the *next* run was refused by it. The
+    // marker is deliberately still preserved - re-acquisition failing is
+    // exactly the evidence that it may not be ours to delete - but the run no
+    // longer claims to have left the directory clean.
+    let guard = match crate::file::WriterLock::acquire(path) {
+        Ok(guard) => guard,
+        Err(error) => {
+            report.steps.push(SelfTestStepReport::failed(
+                "cleanup",
+                DiagnosticDomain::Environment,
+                format!(
+                    "could not re-acquire the writer-lock marker {} to remove it, so it was left \
+                     in place: {error}",
+                    marker.display()
+                ),
+                Some(
+                    "another writer may hold this path; remove the leftover .lock marker \
+                     yourself before rerunning"
+                        .to_string(),
+                ),
+            ));
+            return;
+        }
     };
     // The identity is captured while the writer lock is held, so it names the
     // marker object of *this* claim. The lock is then released before the
@@ -1356,7 +1379,21 @@ fn remove_unowned_lock_marker(report: &mut FormatSelfTestReport, path: &Path) {
     drop(guard);
     let outcome = identity.map(|identity| remove_path_if_same_object(&marker, &identity));
     match outcome {
-        None | Some(ObjectRemoval::Removed) | Some(ObjectRemoval::NotOwned) => {}
+        Some(ObjectRemoval::Removed) | Some(ObjectRemoval::NotOwned) => {}
+        // F-08: the identity could not be captured, so the marker was left
+        // untouched. Same rule as the acquisition failure above - preserve it,
+        // but do not report a clean run.
+        None => {
+            report.steps.push(SelfTestStepReport::failed(
+                "cleanup",
+                DiagnosticDomain::Environment,
+                format!(
+                    "could not identify the writer-lock marker {}, so it was left in place",
+                    marker.display()
+                ),
+                Some("remove the leftover .lock marker before rerunning".to_string()),
+            ));
+        }
         Some(ObjectRemoval::Refused(reason)) => {
             report.steps.push(SelfTestStepReport::failed(
                 "cleanup",

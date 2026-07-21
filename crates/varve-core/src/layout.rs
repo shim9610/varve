@@ -9,7 +9,11 @@ use crate::{
     ReadLimits, ResourceLimits, Result, SegmentDescriptor, SegmentRepeat,
     format::ReadLimitKey,
     snapshot::{SnapshotCursor, SnapshotFile},
+    writer_permit::{GuardedWriter, MutationInFlight, MutationPermit, PoisonFlag},
 };
+
+/// Names this writer in [`Error::WriterPoisoned`].
+const LAYOUT_WRITER_POISON_CONTEXT: &str = "layout";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayoutValue {
@@ -211,7 +215,7 @@ pub struct LayoutWriter {
     file: File,
     segment_counts: Vec<SegmentCount>,
     index_bytes: u64,
-    poisoned: bool,
+    poison: PoisonFlag,
     _lock: crate::file::WriterLock,
 }
 
@@ -689,6 +693,19 @@ fn inspect_layout_file_report_inner<P: AsRef<Path>>(
     })
 }
 
+/// The witness this writer's segment write demands, and the token that proves
+/// its in-flight window is open. Both are typed by the writer they speak for,
+/// so neither can be produced by some other writer's flag. See
+/// `crate::writer_permit`.
+pub(crate) type LayoutMutationPermit = MutationPermit<LayoutWriter>;
+pub(crate) type LayoutMutationInFlight = MutationInFlight<LayoutWriter>;
+
+impl GuardedWriter for LayoutWriter {
+    fn poison_flag(&self) -> &PoisonFlag {
+        &self.poison
+    }
+}
+
 impl LayoutWriter {
     pub fn create<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
         let spec = spec.resolve_entrypoint();
@@ -804,7 +821,7 @@ impl LayoutWriter {
             file,
             segment_counts: initial_segment_counts(spec)?,
             index_bytes,
-            poisoned: false,
+            poison: PoisonFlag::healthy(),
             _lock: lock,
         })
     }
@@ -858,7 +875,7 @@ impl LayoutWriter {
             file,
             segment_counts,
             index_bytes,
-            poisoned: false,
+            poison: PoisonFlag::healthy(),
             _lock: lock,
         })
     }
@@ -895,7 +912,7 @@ impl LayoutWriter {
         M: FnOnce(&mut dyn Write) -> Result<()>,
         R: FnOnce(&mut dyn Write) -> Result<()>,
     {
-        self.ensure_not_poisoned()?;
+        let permit = self.ensure_not_poisoned()?;
         let descriptor = segment_descriptor(self.spec, segment.name)?;
         self.ensure_segment_can_write(descriptor)?;
         let footer_fields = descriptor.footer.map(|footer| footer.fields).unwrap_or(&[]);
@@ -955,8 +972,15 @@ impl LayoutWriter {
         let (segment_count_index, original_segment_count, next_segment_count) =
             self.segment_count_checkpoint(descriptor.name)?;
 
-        self.poisoned = true;
-        let result = (|| {
+        // Shape B, mechanical enforcement (round 12). This writer's flag is not
+        // a one-way poison: it marks the segment write *in flight*, so a
+        // `LayoutWriter` observed part-way through a body refuses every
+        // operation, and only a failed rollback leaves it refusing for good.
+        // `begin_mutation` consumes the permit, so the window cannot be opened
+        // on a writer that is already refusing, and the body below cannot be
+        // entered without the witness that the window is open.
+        let in_flight = self.poison.begin_mutation(permit);
+        let result = (|_open_window: &LayoutMutationInFlight| {
             self.file.seek(SeekFrom::Start(original_eof))?;
             let segment_start = original_eof;
             let mut patches = Vec::new();
@@ -1066,13 +1090,13 @@ impl LayoutWriter {
                 footer_len,
                 segment_end,
             })
-        })();
+        })(&in_flight);
 
         match result {
             Ok(info) => {
                 self.segment_counts[segment_count_index].count = next_segment_count;
                 self.index_bytes = next_index_bytes;
-                self.poisoned = false;
+                self.poison.end_mutation(in_flight);
                 Ok(info)
             }
             Err(error) => {
@@ -1087,30 +1111,34 @@ impl LayoutWriter {
                         source,
                     });
                 }
-                self.poisoned = false;
+                self.poison.end_mutation(in_flight);
                 Err(error)
             }
         }
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.ensure_not_poisoned()?;
+        let _permit = self.ensure_not_poisoned()?;
         self.file.flush()?;
         Ok(())
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        self.ensure_not_poisoned()?;
+        let _permit = self.ensure_not_poisoned()?;
         self.file.sync_all()?;
         Ok(())
     }
 
-    fn ensure_not_poisoned(&self) -> Result<()> {
-        if self.poisoned {
-            Err(Error::WriterPoisoned("layout"))
-        } else {
-            Ok(())
-        }
+    /// The one poison check for this writer, and the only source of the
+    /// witness its guarded operations demand.
+    ///
+    /// Shape B, mechanical enforcement (round 12). `PoisonFlag` owns the state
+    /// and lives in `crate::writer_permit`, so nothing in this file can read or
+    /// assign it; the only way to reach [`Self::write_segment_body`] — which
+    /// holds every byte this writer puts on disk after creation — is to hold
+    /// the [`MutationPermit`] this returns.
+    fn ensure_not_poisoned(&self) -> Result<LayoutMutationPermit> {
+        self.writer_permit(LAYOUT_WRITER_POISON_CONTEXT)
     }
 
     fn ensure_segment_can_write(&self, descriptor: SegmentDescriptor) -> Result<()> {

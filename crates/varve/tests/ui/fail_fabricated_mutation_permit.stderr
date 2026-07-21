@@ -1,0 +1,11 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/ui/fail_fabricated_mutation_permit.rs:19:54
+   |
+19 |     let _forged: MutationPermit<VarveStreamWriter> = MutationPermit(PhantomData);
+   |                                                      ^^^^^^^^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> $WORKSPACE/crates/varve-core/src/writer_permit.rs
+   |
+   | pub struct MutationPermit<W: ?Sized>(PhantomData<fn() -> W>);
+   |                                      ^^^^^^^^^^^^^^^^^^^^^^ private field

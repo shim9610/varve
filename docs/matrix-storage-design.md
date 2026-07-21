@@ -305,6 +305,43 @@ failed header write unwinds the in-memory mirror so the next attempt republishes
 the entry. Removal runs strictly *after* the bitmap byte that emptied the page is
 written, for the same reason: a superset is safe, a subset would hide data.
 
+**Prepared mutation: the mirror is reserved before the first disk byte.** The
+entry array has an in-memory mirror (the slot list and the indexed-page map),
+and every round of this review that touched the matrix produced the same defect
+in a different function: the disk bytes were written first and the mirror was
+brought into agreement afterwards by a step that could fail or allocate. When
+that step returned `AllocationFailed` the writer was *not* poisoned — matrix
+mutation deliberately poisons only on `Error::Io` — so the session continued
+with a slot map that no longer described the array, and the next removal
+overwrote a live page's only entry.
+
+Reading for that shape did not work: an exhaustive enumeration pass walked past
+an instance in this very region that an earlier round had introduced. So the
+shape is now unrepresentable rather than merely absent. The functions that put
+page-index bytes on disk are private to a module inside `matrix.rs`, and the
+only way to reach them is to hold a *prepared* value. Producing one performs
+every fallible step of the mutation — the residency charge, the mirror
+reservations, all offset and count arithmetic, and the encoding of every byte
+that will be written. Committing consumes the prepared value, writes the
+already-encoded bytes, and then installs the mirror with clears, pushes and
+inserts into capacity that is already reserved: infallible and allocation-free.
+Code that skips the preparation has nothing to commit and does not compile.
+
+The property this buys, and the one the rest of the matrix machinery depends
+on: **after a prepared page-index mutation begins writing, the only error it
+can return is `Error::Io`** — which the writer does poison on. The single
+deliberate exception is the whole-region erase used by a category clear and by
+the rebuild's entry-region reset; neither is an entry or header write, and both
+are paired with an infallible mirror `clear()`.
+
+Compaction became a phase of the append rather than a separate operation, with
+two side effects worth recording: the compacted array is written as one
+sequential run instead of one write per entry, and the intermediate occupancy
+header it used to publish is gone. The final count admits both the compacted
+run and the appended entry, so an interruption leaves the old, larger count
+naming a superset of the live set — the same safe direction the ordering rule
+above relies on.
+
 **Cap.** The header can represent at most `2^48 - 1` entries, so a matrix whose
 page count would exceed that (about 1 EiB of bitmap) is refused at layout time
 with `InvalidMatrixLayout`.

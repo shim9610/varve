@@ -26,7 +26,9 @@ file object and captured logical EOF rather than reopening the pathname.
 If publication succeeds but the writer cannot reopen the published pathname,
 Varve returns `PublishedButRebindFailed` and poisons that writer. This is not a
 publication rollback: callers must reopen and reconcile instead of blindly
-retrying the operation.
+retrying the operation. When the parent-directory sync for that same
+publication also failed, the variant carries both facts — see "Two Durability
+Facts, One Result" below.
 
 ## Commit Marker Versus Commit Durability
 
@@ -124,6 +126,35 @@ outcomes explicitly rather than letting a late error escape before rebinding:
 - If the post-publication re-bind itself fails, the writer is poisoned and
   `PublishedButRebindFailed` is returned.
 
+### Two Durability Facts, One Result
+
+Those two outcomes are not exclusive. A replacement learns two independent
+facts in a fixed order — whether the parent-directory sync succeeded, and
+whether the writer could rebind to the published generation — and only the
+second one ends the call. When the sync fails, publication has already
+happened, so the writer rebinds anyway and the caller normally learns about the
+pending sync through `PublishedButParentSyncPending`. If the rebind then fails
+too, that variant is never constructed.
+
+Until F-07 the second failure simply discarded the first. The rebind variant is
+now `PublishedButRebindFailed { sequence, source, parent_sync }`, where
+`parent_sync: Option<Box<Error>>` carries the earlier sync failure, and its
+`Display` renders both clauses:
+
+- `parent_sync: None` — the new generation is visible at the pathname and the
+  writer is unusable. The rename's own durability was established.
+- `parent_sync: Some(_)` — the same two facts, **plus**: the rename is not yet
+  proved durable against power loss, so a crash before the parent directory is
+  flushed can leave the pathname naming the old generation. Reopen, reconcile,
+  and sync.
+
+The field is attached only to this variant, and only by the replacement paths
+that actually observed the sync failure. Every other error from a replacement
+path means publication did not happen, so a parent-sync fact would be
+meaningless there. This is a source-breaking change for downstream code that
+destructured the variant with `{ sequence, source }`; add `parent_sync` or
+`..`.
+
 On Windows, `ReplaceFileW` failures are classified per the documented OS
 contract (`classify_replace_publication_error`, pure and unit-testable on every
 platform):
@@ -170,6 +201,25 @@ initialized file inside the pre-bind window.
 The unsafe exclusive in-place replacement method does not provide that snapshot
 guarantee. Its safety contract requires process-wide and cross-process
 exclusion, including mmap and raw references.
+
+It carries a second requirement that F-02 made explicit: on a
+`keyed_offset_chain` format, the caller must **not change the record's key**.
+The entry point takes `T: VarveBlock`, which exposes no key, so this cannot be
+checked at that signature, and unlike the copy-on-write paths there is no new
+generation in which the chain could be rebuilt — records appended after the
+target already carry `prev_same_key_offset` pointers into it, and rewriting its
+key in place would leave them linking a record that now claims a different key.
+Ordinary keyed replacement enforces the same-key contract through
+`VarveReplaceBlock::validate_replacement`; here it is part of the unsafe
+contract.
+
+What the method guarantees regardless of whether that contract is honoured is
+that no resident keyed-tail cache survives the mutation. The affected block's
+tail map is dropped **before** the first byte is written, so a stale
+predecessor can never be read afterwards — not after a write that fails
+part-way, not through a poisoned writer that is later inspected, and not after
+a contract violation. The invalidation is infallible and allocation-free, so it
+adds no fallible step in either direction of the commit.
 
 Even under the default policy, readers trust only commit maps. A clear commit
 bit means `NotCommitted` regardless of slot bytes.
@@ -287,6 +337,62 @@ Those two variants are the only published outcomes of
 committed by that call, so a caller can decide between "nothing happened, retry
 the write", "committed, retry only the notification" and "committed,
 re-establish durability" from the result alone.
+
+## Allocator Failure And Published Outcomes
+
+The sentence above is a statement about the value a call **returns**, and F-06
+is the reason it now says so. Both post-commit variants box their event and
+their source to keep `Error` small, so constructing either one allocates twice
+*after* the cell is authoritative. A review harness failed the very next
+allocation at each branch: both children terminated on a 56-byte allocation
+while the reopened file contained the committed values.
+
+Varve has one policy on allocator failure, and it applies to every contract in
+this document, not only to the matrix ones:
+
+- **Content-sized allocations** — anything whose size is chosen by file bytes,
+  a caller-supplied count, or any other quantity a producer of the input can
+  influence — are charged against a `ReadLimits` ceiling *before* the memory is
+  taken and are then reserved fallibly. A refusal is the typed
+  `Error::AllocationFailed` or `Error::LimitExceeded { resource, .. }`, and the
+  operation reports it without mutating anything. This is the class that
+  hostile input can reach, and it is the class the limits exist for.
+- **Shape-sized allocations** — fixed-size allocations bounded by the program's
+  own compile-time shape, such as the two boxes a published-outcome variant
+  holds — use ordinary infallible allocation. `Box::new` has no fallible form,
+  and the Rust default is to abort the process when the allocator refuses.
+  Varve does not pretend otherwise.
+
+The division matters because only a content-sized allocation is one a producer
+of the input can steer, which is why that class carries the ceilings and the
+typed refusals and the other does not.
+
+The consequence for every published-outcome variant in this document is
+precise: a shape-sized allocation failure after publication
+**terminates the process** rather than substituting a different error. No caller ever observes a
+*wrong* outcome; a caller can observe *no* outcome, which is the same thing a
+`SIGKILL` or a power loss delivers at that instant. The on-disk state is the
+published state, so the correct recovery is the one this document already
+prescribes for a crash: reopen the file and read what is there. In the F-06
+harness the reopened file held the committed cell, which is exactly the claim
+the variant would have made.
+
+Three alternatives were considered and rejected for the post-commit path:
+
+- pre-staging the outcome boxes before the commit removes the event
+  allocation but not `Box::new(source)` — the source only exists once the step
+  has failed, and `Error` is recursive, so it cannot be carried inline. It also
+  puts two allocations on the success path of every durable cell write to serve
+  a path that ends in `abort`;
+- a non-recursive post-commit outcome type cannot carry the caller's own hook
+  error, which is an arbitrary `Error` and may itself own heap;
+- a fallible-allocation form of the whole error family would make every
+  `Result` in the crate depend on an allocator that has already failed.
+
+The same policy is why round 12's `SparseBitmap::clone` in the CRC rebuild was
+*removed* rather than made fallible: deleting a shape-sized allocation is worth
+doing where it is free, and dressing one up in a `Result` it cannot honour is
+not.
 
 ## Sync Granularity
 

@@ -1,0 +1,9 @@
+error[E0451]: fields `record_offset` and `payload_offset` of struct `varve_core::enforcement_probe::RecordOverwrite` are private
+  --> tests/ui/fail_fabricated_record_overwrite.rs:15:9
+   |
+14 |     let _forged = RecordOverwrite {
+   |                   --------------- in this type
+15 |         record_offset: 0,
+   |         ^^^^^^^^^^^^^ private field
+16 |         payload_offset: 0,
+   |         ^^^^^^^^^^^^^^ private field

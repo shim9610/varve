@@ -183,6 +183,20 @@ The caller must exclude every reader, writer, mmap, raw reference, handle,
 thread, and process for the operation and for every affected view's lifetime.
 It is deliberately not represented as a safe `ReplaceStrategy` variant.
 
+On a `keyed_offset_chain` format the caller must also keep the record's key
+unchanged (F-02). Records appended after the target already carry
+`prev_same_key_offset` pointers into it, and this path publishes no new
+generation in which the chain could be rebuilt, so a key change silently
+rewires the physical chains. The signature takes `T: VarveBlock` and cannot
+check it. What the call does guarantee either way is that the block's resident
+keyed-tail map is dropped before the first byte is written, so no later append
+can resolve a stale predecessor from it.
+
+Every replacement path — including this one and `replace_rewrite`, which
+previously did not check — refuses a stored `block_version` that differs from
+`T::VERSION` with `Error::BlockVersionMismatch` (F-01), before any byte is
+written.
+
 `replace_rewrite` and `ReplaceStrategy::RewriteFile` rewrite the file through a
 temporary file and atomically publish it. Prefer append plus compact for routine
 updates because replacement gives up the append-friendly history model.
@@ -193,6 +207,12 @@ succeeded and only the writer's post-publication reopen/rebind failed. That
 writer is poisoned. Drop it, reopen the pathname, and reconcile the published
 sequence before issuing another logical update; a blind retry can apply the
 operation twice.
+
+Its `parent_sync` field carries the second durability fact when the same
+publication also failed to sync the parent directory (F-07). `Some(_)` means
+the generation is visible at the pathname *and* the rename is not yet proved
+durable against power loss, so reconciliation should re-sync as well as
+re-read; `None` means only the rebind failed.
 
 ## Performance Check
 
