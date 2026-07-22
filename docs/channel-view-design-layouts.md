@@ -308,18 +308,22 @@ stream.** `max_matrix_cells` defaults to 16 M (`format.rs:114`) — at one sampl
 16 s of one 1 MS/s channel — and `max_matrix_slot_region_len` is 8 GiB (`format.rs:118`), so even
 making a cell a whole per-channel chunk caps the file at 8 GiB.
 
-Also: single-cell reads only, all `&mut self` (`read_matrix_cell`, `file.rs:4313`, because
-`matrix::read_cell` takes `&mut File` and does `seek`+`read_exact`, `matrix.rs:2727-2749`); no row,
-column, range or iterator API; open eagerly loads commit bitmaps (`matrix.rs:2518`) so `cell_status`
-never faults from disk and a reader can never observe a writer's later commits; and writing one scan
+Also: single-cell reads only (*correction, round 16:* they are no longer `&mut self` — every matrix
+read entry point takes `&self` and reads positionally through `MatrixRegionReader`); no row,
+column, range or iterator API; open eagerly loads commit bitmaps under the default
+`MatrixMetadataResidency::EagerVerified`, so `cell_status` never faults from disk and a reader
+cannot observe a writer's later commits (*correction, round 16:* `MatrixMetadataResidency::Lazy
+{ cache_bytes }` now makes open index-only and faults pages in on demand under an LRU ceiling —
+see `docs/api-reference.md`; the eager default is unchanged and is still what pins open-time
+corruption detection); and writing one scan
 of `N` channels costs `N` allocations and 3N–5N syscalls even though those `N` cells are one
 contiguous extent.
 
 **Verdict: D is out of scope for this stream.** The matrix is a preallocated analysis grid with an
-append log after it (`matrix.rs:2278-2284`), and it should stay that. Its `&mut self` and
-single-cell limits are worth fixing on their own merits — replacing `seek`+`read_exact` with
-`snapshot.read_exact_at` makes `read_matrix_cell` `&self` with no other change, the smallest
-high-value edit in the subsystem — but fixing them does not make the matrix a channel store for an
+append log after it (`matrix.rs:2278-2284`), and it should stay that. Its single-cell limit is
+worth fixing on its own merits (the `&mut self` half was fixed in round 16, exactly as predicted
+here: `seek`+`read_exact` became `read_exact_at` and `read_matrix_cell` became `&self` with no
+other change) — but fixing them does not make the matrix a channel store for an
 unbounded stream, because the fixed extent is the blocker and that is a different subsystem.
 
 ---

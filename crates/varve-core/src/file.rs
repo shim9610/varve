@@ -422,11 +422,19 @@ mod record_file {
     #[derive(Debug)]
     pub struct RecordFile {
         file: File,
+        /// Owner of this file's per-thread private read handles. Holds only an
+        /// id and a cold-path `Mutex<Vec<Arc<File>>>`, so `RecordFile` stays
+        /// `Sync` and the read path stays lock-free; see
+        /// `matrix.rs`'s `mod region_reader`.
+        matrix_read_pool: crate::matrix::MatrixReadPool,
     }
 
     impl RecordFile {
         pub(super) fn new(file: File) -> Self {
-            Self { file }
+            Self {
+                file,
+                matrix_read_pool: crate::matrix::MatrixReadPool::new(),
+            }
         }
 
         pub(super) fn metadata(&self) -> std::io::Result<Metadata> {
@@ -476,6 +484,26 @@ mod record_file {
         /// call, which `enforcement_gates.rs` asserts.
         pub(super) fn matrix_region(&mut self) -> &mut File {
             &mut self.file
+        }
+
+        /// The read-only half of the same exception, over a **shared** borrow.
+        ///
+        /// This is what lets every matrix read entry point take `&self`: the
+        /// returned value reads positionally (`pread`/`seek_read`) and moves no
+        /// cursor, so it needs no exclusive borrow and two threads may use two
+        /// of them against this handle at once. Unlike `matrix_region` it does
+        /// not lend out the `&File` — `MatrixRegionReader`'s field is private to
+        /// its own module, so the `impl Write for &File` route is unreachable
+        /// through it. It is therefore a strictly narrower escape than the one
+        /// above, and needs no source gate of its own.
+        ///
+        /// It also carries this file's [`crate::matrix::MatrixReadPool`], which
+        /// is what makes the shared borrow worth having on Windows: without it
+        /// N threads sharing one handle are measurably *slower* than one thread,
+        /// because `ReadFile` serialises on the file object. The pool hands each
+        /// reading thread its own file object derived from this handle.
+        pub(super) fn matrix_region_reader(&self) -> crate::matrix::MatrixRegionReader<'_> {
+            crate::matrix::MatrixRegionReader::with_pool(&self.file, &self.matrix_read_pool)
         }
 
         /// Appends one record at the current end of file.
@@ -611,7 +639,18 @@ use record_file::RecordFile;
 /// ([`ResidentIndex::truncate`], the append rollback), and replacing a whole
 /// generation ([`ResidentIndex::adopt_generation`], the rewrite paths, which
 /// build their `Vec` with `try_reserve_exact` before the new file exists).
-/// None of those can add an entry the disk does not have.
+/// **Correction, round 16.** The three above cannot add an entry the disk does
+/// not have; `adopt_generation` can. It adopts whatever `Vec` it is handed, and
+/// re-verification compiled and ran
+/// `ResidentIndex::adopt_generation(vec![RecordIndexEntry { committed: true, .. }])`
+/// to a mirror of length one for a record no disk holds. What holds it today is
+/// its eight call sites — open, and the rewrite paths that build the `Vec` from
+/// a generation they have just published — not a check. The cheap checked
+/// replacement (take the backing `&File` and run each entry through
+/// `RecordIndexEntry::validate_payload_extent`) was measured and rejected: a
+/// zero-length entry against a zero-length file passes it. Refusing that needs a
+/// header read per entry, i.e. O(records) I/O added to open for index policies
+/// that do not scan. Checklist open item 29.
 pub(crate) mod resident_index {
     use super::{RecordIndexEntry, Result};
     use core::ops::Deref;
@@ -1955,11 +1994,11 @@ impl VarveReader {
         self.file.key_tail_offsets::<T>()
     }
 
-    pub fn read_matrix_cell<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<T> {
+    pub fn read_matrix_cell<T: VarveMatrixBlock>(&self, key: MatrixKey) -> Result<T> {
         self.file.read_matrix_cell(key)
     }
 
-    pub fn matrix_cell_payload<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<Vec<u8>> {
+    pub fn matrix_cell_payload<T: VarveMatrixBlock>(&self, key: MatrixKey) -> Result<Vec<u8>> {
         self.file.matrix_cell_payload::<T>(key)
     }
 
@@ -1967,7 +2006,7 @@ impl VarveReader {
         self.file.matrix_aux_len(name)
     }
 
-    pub fn read_matrix_aux(&mut self, name: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+    pub fn read_matrix_aux(&self, name: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
         self.file.read_matrix_aux(name, offset, len)
     }
 
@@ -2402,9 +2441,15 @@ impl VarveWriter {
         self.file.write_matrix_cell(key, value)
     }
 
+    /// Copies one cell's bytes out of `source`.
+    ///
+    /// `source` is a **shared** borrow: the read side of a byte copy needs no
+    /// exclusive handle, so a copy may run while other threads are reading the
+    /// same source handle. Callers that were passing `&mut VarveReader` still
+    /// compile — `&mut T` coerces to `&T`.
     pub fn copy_matrix_cell_bytes_from<From, To>(
         &mut self,
-        source: &mut VarveReader,
+        source: &VarveReader,
         key: MatrixKey,
     ) -> Result<()>
     where
@@ -2476,11 +2521,11 @@ impl VarveWriter {
             .write_matrix_cell_durable_with_barrier(key, value, barrier, hook)
     }
 
-    pub fn read_matrix_cell<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<T> {
+    pub fn read_matrix_cell<T: VarveMatrixBlock>(&self, key: MatrixKey) -> Result<T> {
         self.file.read_matrix_cell(key)
     }
 
-    pub fn matrix_cell_payload<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<Vec<u8>> {
+    pub fn matrix_cell_payload<T: VarveMatrixBlock>(&self, key: MatrixKey) -> Result<Vec<u8>> {
         self.file.matrix_cell_payload::<T>(key)
     }
 
@@ -2488,7 +2533,7 @@ impl VarveWriter {
         self.file.matrix_aux_len(name)
     }
 
-    pub fn read_matrix_aux(&mut self, name: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+    pub fn read_matrix_aux(&self, name: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
         self.file.read_matrix_aux(name, offset, len)
     }
 
@@ -4503,9 +4548,12 @@ impl VarveFile {
         self.finish_matrix_mutation(result)
     }
 
+    /// Copies one cell's bytes out of `source`; see the note on
+    /// [`VarveWriter::copy_matrix_cell_bytes_from`] for why the source borrow is
+    /// shared.
     pub fn copy_matrix_cell_bytes_from<From, To>(
         &mut self,
-        source: &mut VarveFile,
+        source: &VarveFile,
         key: MatrixKey,
     ) -> Result<()>
     where
@@ -4646,14 +4694,19 @@ impl VarveFile {
         })
     }
 
-    pub fn read_matrix_cell<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<T> {
+    pub fn read_matrix_cell<T: VarveMatrixBlock>(&self, key: MatrixKey) -> Result<T> {
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::read_cell(self.spec, matrix, self.file.matrix_region(), key)
+        crate::matrix::read_cell(self.spec, matrix, self.file.matrix_region_reader(), key)
     }
 
-    pub fn matrix_cell_payload<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<Vec<u8>> {
+    pub fn matrix_cell_payload<T: VarveMatrixBlock>(&self, key: MatrixKey) -> Result<Vec<u8>> {
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
-        crate::matrix::read_cell_payload::<T>(self.spec, matrix, self.file.matrix_region(), key)
+        crate::matrix::read_cell_payload::<T>(
+            self.spec,
+            matrix,
+            self.file.matrix_region_reader(),
+            key,
+        )
     }
 
     pub fn matrix_aux_len(&self, name: &str) -> Result<u64> {
@@ -4661,11 +4714,11 @@ impl VarveFile {
         crate::matrix::aux_len(matrix, name)
     }
 
-    pub fn read_matrix_aux(&mut self, name: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+    pub fn read_matrix_aux(&self, name: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
         crate::matrix::read_aux_at_len(
             matrix,
-            self.file.matrix_region(),
+            self.file.matrix_region_reader(),
             self.snapshot.len(),
             name,
             offset,
@@ -11675,7 +11728,7 @@ mod tests {
         assert!(matches!(file.sync(), Err(Error::WriterPoisoned("file"))));
         drop(file);
 
-        let mut reopened = VarveFile::open_readonly(spec, &path)?;
+        let reopened = VarveFile::open_readonly(spec, &path)?;
         assert_eq!(
             reopened.matrix_cell_status::<MatrixTestCell>(key)?,
             MatrixCellStatus::NotCommitted
@@ -12290,5 +12343,105 @@ mod tests {
         assert_eq!(parent_directory_sync_calls(), 1);
         assert_eq!(std::fs::read(new_target)?, b"first");
         Ok(())
+    }
+}
+
+/// **The in-crate bypass catalogue for `file.rs`** (round 15).
+///
+/// The companion of `matrix.rs::bypass_catalogue`, and it exists for the same
+/// reason: the round-14 proofs were `trybuild` fixtures compiled from an
+/// outside crate, which say nothing about the file the defects live in. Every
+/// line below was compiled from this module — a sibling of `mod
+/// resident_index`, `mod replacement_target` and `mod record_file`, with every
+/// privilege a future defect in this file would have — and observed to fail
+/// with the quoted diagnostic.
+///
+/// ```text
+/// // (1) mint the append path's reservation token without reserving
+/// let _ = ReservedIndexSlot(());
+/// //  error[E0423]: cannot initialize a tuple struct which contains private
+/// //               fields  (`pub struct ReservedIndexSlot(());`)
+///
+/// // (2) grow the resident mirror around the token
+/// index.entries.push(entry);
+/// //  error[E0616]: field `entries` of struct `resident_index::ResidentIndex`
+/// //               is private
+///
+/// // (3) rebuild the mirror by literal to get at the `Vec`
+/// let _ = ResidentIndex { entries: Vec::new() };
+/// //  error[E0451]: field `entries` of struct `resident_index::ResidentIndex`
+/// //               is private
+///
+/// // (4) mint a version-checked replacement target without the version check
+/// let _ = ReplacementTarget { position: 0 };
+/// //  error[E0451]: field `position` of struct
+/// //               `replacement_target::ReplacementTarget` is private
+///
+/// // (5) mint the in-place write permission without dropping the keyed tails
+/// let _ = RecordOverwrite { record_offset: 0, payload_offset: 0 };
+/// //  error[E0451]: fields `record_offset` and `payload_offset` of struct
+/// //               `replacement_target::RecordOverwrite` are private
+///
+/// // (6) fabricate the poison-check witness
+/// let _: MutationPermit<VarveFile> = MutationPermit(PhantomData);
+/// //  error[E0603]: tuple struct constructor `MutationPermit` is private
+///
+/// // (7) launder one out of a throwaway flag (round 14's closed hole,
+/// //     re-checked here from a different module than the one that closed it)
+/// let _: MutationPermit<VarveFile> = PoisonFlag::healthy().issue("x")?;
+/// //  error[E0624]: method `issue` is private
+/// ```
+///
+/// Retained on purpose, with the reason at the declaration: `ResidentIndex::
+/// adopt_generation` (open and the rewrite paths hand over a `Vec` that already
+/// describes records on disk), `ResidentIndex::truncate` (the append rollback)
+/// and `ResidentIndex::entry_mut` (the in-place restamp). None of them can add
+/// an entry the disk does not have, which is the property the token protects.
+#[cfg(test)]
+mod bypass_catalogue {
+    use super::*;
+
+    /// The legitimate route still works, and still costs the reservation: the
+    /// only producer of the token is the fallible half of the append.
+    #[test]
+    fn the_checked_route_still_produces_the_reservation_it_should() {
+        let mut index = ResidentIndex::adopt_generation(Vec::new());
+        let slot = index.reserve(|| Ok(64)).expect("reservation");
+        index.install(slot, sample_index_entry());
+        assert_eq!(index.len(), 1);
+    }
+
+    /// And a charge that refuses yields no token at all, so the append that
+    /// would have followed it cannot be spelled.
+    #[test]
+    fn a_refused_charge_yields_no_reservation() {
+        let mut index = ResidentIndex::adopt_generation(Vec::new());
+        assert!(
+            index
+                .reserve(|| Err(Error::AllocationFailed {
+                    resource: "record index",
+                    requested: 1,
+                }))
+                .is_err()
+        );
+        assert!(index.is_empty());
+    }
+
+    fn sample_index_entry() -> RecordIndexEntry {
+        RecordIndexEntry {
+            block_id: 1,
+            block_version: 1,
+            flags: 0,
+            sequence: 1,
+            record_offset: 0,
+            payload_offset: 0,
+            payload_len: 0,
+            checksum: 0,
+            uncompressed_len_hint: 0,
+            footer_offset: None,
+            prev_same_block_offset: None,
+            prev_same_key_offset: None,
+            committed: true,
+        }
     }
 }

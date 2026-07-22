@@ -235,7 +235,7 @@ fn fresh_reader_rejects_uncommitted_matrix_overwrite() {
         .write_matrix_cell(key, &PrimaryCell { value: 22 })
         .expect("write uncommitted replacement");
 
-    let mut reader = spec
+    let reader = spec
         .open_readonly(fixture.path())
         .expect("open reader after overwrite");
     assert_eq!(
@@ -706,7 +706,7 @@ fn corrupt_commit_maps_are_quarantined_until_whole_category_recovery() {
     let corrupt_bytes = read(fixture.path()).expect("read corrupt evidence");
 
     {
-        let mut reader = spec
+        let reader = spec
             .open_reader(fixture.path())
             .expect("open corrupt matrix");
         assert!(matches!(
@@ -780,7 +780,7 @@ fn corrupt_commit_maps_are_quarantined_until_whole_category_recovery() {
     }
 
     {
-        let mut reader = spec
+        let reader = spec
             .open_reader(fixture.path())
             .expect("open recovered matrix");
         assert_eq!(
@@ -836,7 +836,7 @@ fn valid_commit_visibility_and_wire_bytes_are_unchanged_by_open() {
     let before = read(fixture.path()).expect("capture valid wire bytes");
 
     {
-        let mut reader = spec.open_reader(fixture.path()).expect("open valid matrix");
+        let reader = spec.open_reader(fixture.path()).expect("open valid matrix");
         assert_eq!(
             reader
                 .read_matrix_cell::<PrimaryCell>(key)
@@ -939,7 +939,7 @@ fn damaged_page_index_blocks_cell_access_without_forensics() {
         0,
     );
 
-    let mut reader = spec
+    let reader = spec
         .open_reader(fixture.path())
         .expect("open damaged matrix");
     assert!(
@@ -1040,7 +1040,7 @@ fn interrupted_rebuild_marker_is_reported_fatal_and_recommends_a_rebuild() {
         );
     }
 
-    let mut reader = spec
+    let reader = spec
         .open_reader(fixture.path())
         .expect("open marked matrix");
     assert!(matches!(
@@ -1107,7 +1107,7 @@ fn a_cell_write_refused_by_the_bitmap_budget_leaves_the_slot_unwritten() {
     );
 
     // And it must be indistinguishable from one that was never written.
-    let mut reader = spec
+    let reader = spec
         .open_readonly(fixture.path())
         .expect("reopen after the refused write");
     assert_eq!(

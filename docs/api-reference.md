@@ -133,6 +133,48 @@ and materialization. Compatibility `*_with_limits` methods perform a meet, so
 CPU, I/O, or memory; large trusted files should use the scalable APIs or explicit
 wider limits instead.
 
+### MatrixMetadataResidency
+
+`ReadLimits::matrix_metadata_residency` declares how much of a matrix's
+persisted commit metadata an open makes resident, and therefore when that
+metadata's integrity is checked. It is set with
+`ReadLimits::with_matrix_metadata_residency`, and it is a reader-side policy
+only: no on-disk byte depends on it, so one process may open a file eagerly
+while another opens the same file lazily.
+
+`MatrixMetadataResidency::EagerVerified` is the default and is inert — it is
+byte-for-byte the behaviour varve had before the option existed. Open reads,
+authenticates against its stored page digest, and materialises every commit-map
+page the matrix has published, plus every page the platform's allocation map
+reports as written. Corruption anywhere in that set is reported by `open`.
+`max_matrix_bitmap_bytes` acts as an *admission* limit under this policy: a
+matrix whose live page set exceeds it cannot be opened at all.
+
+`MatrixMetadataResidency::Lazy { cache_bytes }` reads the persisted page index
+at open and nothing else — no page payload, no page digest, and no allocation
+map query. A commit-map page is read, authenticated, and cached the first time a
+bit inside it is addressed, and the least recently used cached page is dropped
+when admitting another would exceed `cache_bytes` (rounded up to a whole 4096
+byte page, with a one page floor). `cache_bytes` is admitted against
+`max_matrix_bitmap_bytes` at open, so the option cannot be used to raise a
+declared ceiling; conversely a live set larger than that ceiling is now
+*openable* rather than refused.
+
+Three consequences are part of the declaration:
+
+* Detection moves to first touch. A page whose bytes disagree with its digest is
+  reported as `Error::MatrixFatalCorruption` by the read that touches it, not by
+  `open`. Pages never touched are never checked. Use `EagerVerified` where
+  `open` must be the detection point.
+* A page the persisted index does not name still reads as clear, and that is a
+  fact the file supplied rather than a guess: the index is loaded in full at
+  open under both policies and is authoritative for which pages hold state, so
+  "not cached" and "not published" stay distinct. An index that cannot be
+  enumerated in full is a fatal finding at open under both policies.
+* A page's contents are as of the first touch that faulted it in, not as of
+  open, so pages not yet faulted in have no snapshot pinned. Use `EagerVerified`
+  where a reader must see one consistent instant.
+
 `max_keyed_tail_bytes` (declared as `keyed_tail` in a `limits { ... }` block)
 bounds the resident keyed-tail cache: the per-block-id map that lets a keyed
 append resolve its predecessor in O(1) instead of rescanning the resident
@@ -198,6 +240,27 @@ bytes.
 | `VarveReader` | read-only snapshot wrapper |
 | `VarveWriter` | write-capable wrapper |
 | `VarveFile` | lower-level read/write type used by both wrappers |
+
+**This is the resident family, and it is not the petabyte-scale path.** Opening
+one of these handles scans the file and builds a **resident record index** that
+lives for the life of the handle: `Theta(records + decoded bytes)` plus an
+`O(N log N)` per-open sequence-uniqueness sort over `N` records (which degrades
+to `Theta(N)` for a file a Varve writer produced; the `N log N` bound is the
+guarantee for reordered or hostile input). `IndexPolicy::CheckpointOnFlush` lets
+an open start from a checkpoint instead of a full scan. The `scan_on_open` flag
+is **not** a behaviour switch — it is folded into the schema manifest and hash
+bytes and is consulted nowhere else in `varve-core`, so clearing it does not
+produce a non-scanning open.
+
+`ReadLimits::STANDARD` leaves `max_file_len`, `max_records`, `max_index_bytes`
+and `max_scan_bytes` at `u64::MAX`, so the default profile places no ceiling on
+resident index size; use `ReadLimits::UNTRUSTED` for input you did not produce.
+
+The petabyte-scale path is [Scalable Stream And Indexed
+Handles](#scalable-stream-and-indexed-handles) below, behind
+`high-cardinality-dev`. `VarveReader` is a snapshot as of its own open: records
+another handle appends afterwards are not visible without reopening. See
+[Known Limitations §2.1](known-limitations.md#21-varvefile-scans-the-whole-file-at-open-and-holds-a-record-index).
 
 Common `VarveWriter` APIs:
 
@@ -524,6 +587,53 @@ implementations must state `IS_KEYED` explicitly (no chain-unsafe default).
 
 Matrix API exists on `VarveFile`, `VarveReader`, `VarveWriter`, and generated
 typed wrappers.
+
+**Matrix reads take `&self`.** `read_matrix_cell`, `matrix_cell_payload`,
+`read_matrix_aux`, `matrix_aux_len` and `matrix_cell_status` all borrow the
+handle shared, on all three handle types. They read through positional I/O
+(`pread` / `seek_read`) over immutable state, so no cursor moves: several
+threads may read through **one** handle concurrently, and
+`VarveReader`, `VarveFile` and `VarveWriter` are `Sync` and `Send` by derivation
+— there is no `unsafe impl` for any of them. Existing callers holding a
+`let mut reader` keep compiling. Writes are unaffected and still take
+`&mut self`. `copy_matrix_cell_bytes_from` also takes its *source* handle by
+shared reference.
+
+Sharing a handle is also **faster** than not sharing it was, which is a separate
+claim from the type signature and is measured rather than argued. On Windows,
+`ReadFile` against a synchronous handle serialises on the kernel file object, so
+`&self` alone would give the *right* to share a handle and none of the
+throughput: four threads through one handle measured 0.27x of a single thread
+(91,137 vs 343,285 cell reads/s, `IntegrityPolicy::Crc32`). Varve therefore
+hands each reading thread its own file object, derived from the open handle with
+`ReOpenFile` — no path, so no re-resolution — the first time that thread reads
+that file. After it, the same measurement is 568,397 reads/s on four threads
+against 256,559 on one (2.2x), matching what four separately-opened readers
+achieve. The handles are read-only (`FILE_GENERIC_READ`), never escape the
+module that owns them, and are closed when the file handle is dropped. On Unix
+`pread` does not serialise, so no extra descriptor is opened at all.
+`crates/varve/tests/matrix_concurrent_reads.rs` asserts the scaling in wall
+clock, not by counting readers.
+
+**Every number above is a Windows number, and the private-handle pool is
+`#[cfg(windows)]`.** The Unix path — a shared handle plus `pread` — is reasoned
+about rather than measured: the two wall-clock scaling contracts have never been
+executed on Unix, because CI has never run on this code. See
+[Known Limitations §6.1](known-limitations.md#61-the-unix-code-paths-have-never-been-executed).
+
+There is one lock in the read path, stated because its absence used to be the
+claim: each commit bitmap holds a `Mutex` over its page map, so that a demand
+fault-in (see `MatrixMetadataResidency` above) can happen under `&self`. It is
+taken only for `O(1)` map operations and **never held across I/O** — a fault-in
+releases it for the read, so two threads faulting the same page duplicate a
+4 KiB read rather than queueing. Under the default `EagerVerified` policy
+nothing is ever faulted in and the lock only ever guards a hash lookup.
+
+Visibility under the default `EagerVerified` policy is unchanged: a reader sees
+the commit state as of its own open, because the commit bitmaps are snapshotted
+eagerly at open time. Under `Lazy` a page's contents are as of the first touch
+that faulted it in; that is declared on the enum, and is the reason the option
+exists rather than the behaviour simply changing.
 
 | API | Meaning |
 | --- | --- |

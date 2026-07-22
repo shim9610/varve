@@ -263,7 +263,7 @@ fn create_new_with_dims_is_exclusive_and_initializes_the_claimed_handle() -> var
 
     // The refused create left the existing matrix untouched.
     {
-        let mut reader = varve::VarveFile::open_readonly(spec, &path)?;
+        let reader = varve::VarveFile::open_readonly(spec, &path)?;
         assert_eq!(
             reader.read_matrix_cell::<IdentityCell>(MatrixKey::new(0, 0))?,
             IdentityCell { value: 7 }

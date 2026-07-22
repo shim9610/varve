@@ -840,12 +840,24 @@ Every retrieval-side property is wrong for this workload:
 - **Single cell only.** `read_matrix_cell` (file.rs:1958 on `VarveReader`, 2479 on the writer, 4649 on
   `VarveFile`) and `matrix_cell_payload` (file.rs:4654). *No row, no column, no range, no iterator exists anywhere
   in `matrix.rs`.* A row is physically contiguous and there is still no row API.
-- **`&mut self`**, purely because it threads `&mut self.file` into `matrix::read_cell`, which does
-  `file.seek(SeekFrom::Start(offset))?` then `file.read_exact(&mut payload)?` (matrix.rs:3013). Nothing is
-  logically mutating — `matrix_cell_status` beside it is already `&self` (file.rs:4692). Violates **C3**.
-- **Eager bitmap load at open.** `load_commit_bitmaps` (matrix.rs:6161) and `load_crc_valid_bits`
-  (matrix.rs:6237); `cell_status` (matrix.rs:3053) is then a pure in-memory `SparseBitmap::get` that never faults
-  a page. Bounded by written cells, not working set — violates **C2**.
+- ~~**`&mut self`**~~ **— FIXED, round 16. C3 is met.** It was `&mut self` purely because it threaded
+  `&mut self.file` into `matrix::read_cell`, which did `file.seek(SeekFrom::Start(offset))?` then
+  `file.read_exact(&mut payload)?`. That pair is now a single `MatrixRegionReader::read_exact_at`
+  (`pread` / `seek_read`), and every matrix read entry point on all three handle types takes
+  `&self`. No lock was introduced; `Sync` is derived. Pinned by
+  `crates/varve/tests/matrix_concurrent_reads.rs`.
+- ~~**Eager bitmap load at open.**~~ **— ADDRESSED BEHIND A DECLARED OPTION, round 16. C2 is met when
+  the option is declared, and only then.** The eager path described here
+  (`load_commit_bitmaps` / `load_crc_valid_bits`, with `cell_status` a pure in-memory
+  `SparseBitmap::get`) is still the **default**, because it is what makes commit-map corruption a
+  finding of `open` rather than of a later read, and that is behaviour, not performance.
+  `ReadLimits::with_matrix_metadata_residency(MatrixMetadataResidency::Lazy { cache_bytes })` now
+  selects the working-set-bounded path: open reads the persisted page index only (32 bytes for a
+  one-live-page matrix, measured), pages fault in through `MatrixRegionReader` on first touch, and
+  an LRU evicts at `cache_bytes` — so residency is bounded by the declared ceiling rather than by
+  the written-cell count. The two consequences are declared on the enum, not inherited from the
+  cache: detection moves to first touch, and a faulted-in page is as of that touch rather than as
+  of open. Measured in `crates/varve/tests/matrix_lazy_residency.rs`.
 - **Dimensions fixed at create.** `create_layout` (matrix.rs:2468) is create-only; open re-validates the persisted
   header against recomputed dimension-derived lengths‡. `max_matrix_cells` defaults to 16 M (format.rs:114‡),
   `max_matrix_slot_region_len` to 8 GiB (format.rs:118‡), and matrix data lives *before* `append_log_start`‡.

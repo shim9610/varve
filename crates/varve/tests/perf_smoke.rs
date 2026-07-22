@@ -989,7 +989,7 @@ fn matrix_direct_access_with_spec(
     let stable_len = metadata(&path)?.len();
 
     let elapsed = timed(|| {
-        let mut reader = spec.open_reader(&path)?;
+        let reader = spec.open_reader(&path)?;
         for index in 0..case.records {
             let key = MatrixKey::new((index / channels) as u64, (index % channels) as u64);
             let cell = reader.read_matrix_cell::<PerfMatrixCell>(key)?;

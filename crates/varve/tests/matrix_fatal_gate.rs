@@ -165,7 +165,7 @@ fn fatal_metadata_crc_blocks_default_reads_and_writes() {
     let corrupt_bytes = read(fixture.path()).expect("read corrupt evidence");
 
     {
-        let mut reader = spec
+        let reader = spec
             .open_reader(fixture.path())
             .expect("default open still surfaces the recovery report");
         assert!(matches!(
@@ -216,7 +216,7 @@ fn forensic_opt_in_reads_through_and_surfaces_fatal_finding() {
     corrupt_stored_metadata_crc(fixture.path(), spec);
 
     let forensic = spec.with_matrix_fatal_forensics();
-    let mut reader = forensic
+    let reader = forensic
         .open_reader(fixture.path())
         .expect("open forensic reader");
     assert_eq!(
@@ -238,7 +238,7 @@ fn uncorrupted_file_is_unaffected_by_the_fatal_gate() {
     let key = MatrixKey::new(1, 0);
     write_committed_cell(spec, fixture.path(), key, 11);
 
-    let mut reader = spec.open_reader(fixture.path()).expect("open clean reader");
+    let reader = spec.open_reader(fixture.path()).expect("open clean reader");
     assert_eq!(
         reader
             .read_matrix_cell::<GateCell>(key)

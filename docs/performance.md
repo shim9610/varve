@@ -4,6 +4,13 @@
 
 Performance checks are regression guards, not product benchmarks. Run them whenever a change touches indexing, scanning, codecs, compression, commit/offset-chain footers, replacement, recovery, merge, compact, mmap, or zero-copy paths.
 
+**These checks run in no CI job.** `crates/varve/tests/perf_smoke.rs` is entirely
+`#[ignore]`d, as is the million-key stress probe in `high_cardinality.rs`. Every
+number in this document comes from a manual run on a named date and host; nothing
+here is continuously enforced. The measurements dated 2026-07-22 in the Capability
+Boundary section below are the most recent, and cover only the matrix residency
+and concurrent-read contracts.
+
 ## Smoke Commands
 
 ```powershell
@@ -154,13 +161,49 @@ merge/compact: the keyed merge/compact family is resident-only and explicitly
 not PB-scale (see the entries below and `docs/api-reference.md`). Matrix storage
 is a third, separate mode: its integrity metadata is paged and sparse rather
 than resident-per-cell. Create is bounded by live state rather than by cell
-count. Open is bounded by **candidate pages**, not by live state: it visits the
-union of the `L` pages named by the persisted page index and the `A` pages the
-filesystem allocation map reports as written, costing `O(L + A)` time,
-`Theta(L + A)` temporary memory, and up to `O(4096U)` page-byte I/O for `U`
-distinct candidate pages. Tracking live state is the *sparse-allocation
-operating case*, not an unconditional bound: a densely allocated bitmap region
-makes `A` proportional to that region's page count even when few bits are live.
+count.
+
+**Matrix open cost depends on `ReadLimits::matrix_metadata_residency`, and under
+neither policy is it `O(1)`.**
+
+| | `EagerVerified` (default) | `Lazy { cache_bytes }` (opt-in) |
+| --- | --- | --- |
+| Open visits | union of the `L` pages named by the persisted page index and the `A` pages the filesystem allocation map reports as written | the persisted page index only |
+| Open cost | `O(L + A)` time, `Theta(L + A)` temporary memory, up to `O(4096U)` page-byte I/O for `U` distinct candidate pages | `O(L)` — 8 bytes per live page, no page payload, no digest, no allocation-map query |
+| Post-open residency | `O(L + A)`, fixed at open; does not track the working set; **no eviction** | 0 at open, then bounded by `cache_bytes` with LRU eviction |
+| `max_matrix_bitmap_bytes` behaves as | an **admission** limit — a live set above it makes open fail | a cache bound; `cache_bytes` above it is refused at open |
+| Corruption detected at | open | first touch of the damaged page |
+
+Tracking live state is the *sparse-allocation operating case*, not an
+unconditional bound: a densely allocated bitmap region makes `A` proportional to
+that region's page count even when few bits are live.
+
+**Measured absolutes** (Windows x86_64, 2026-07-22,
+`crates/varve/tests/matrix_lazy_residency.rs`). One commit-map page covers 32,768
+cells; residency is about 8,192 bytes per live page plus 48 bytes per page-index
+entry.
+
+| Fixture | Cells | File size | Live pages | Policy | Open bytes read | Pages visited | Resident bitmap bytes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| small | 2,097,152 | 17.3 MB | 1 | eager | 135,336 | 33 | 8,192 |
+| large | 8,388,608 | 69.2 MB | 1 | eager | 131,240 | 32 | 8,192 |
+| large | 8,388,608 | 69.2 MB | 64 | eager | 591,384 | — | 524,288 |
+| small | 2,097,152 | 17.3 MB | 1 | lazy | 32 | 0 | 0 |
+| large | 8,388,608 | 69.2 MB | 1 | lazy | 32 | 0 | 0 |
+| large | 8,388,608 | 69.2 MB | 64 | lazy | 1,040 | 0 | 0 |
+
+Three conclusions, none of which should be softened when this file is next
+edited:
+
+1. Open is **independent of file size** — a 4x cell-count and file-size ratio
+   produced a 0.97x read ratio under the eager policy.
+2. Open is **not `O(1)`** — one live page still costs 131,240 bytes and 32 pages
+   under the eager policy, because `A` follows NTFS's ~128 KiB allocation runs
+   rather than the live set. The gap to `O(1)` is roughly 32x in pages at the
+   smallest live set.
+3. Eager residency **does not track the working set in either direction** and is
+   never evicted; it is fixed at open by the candidate page set.
+
 Whole-category clear is bounded by live state **only where the platform supports
 range removal**, and streams `Theta(cells / 8)` zero bytes otherwise — see the
 two entries below for the exact conditions.
@@ -296,8 +339,16 @@ one is a regression even if wall time happens not to move on a small fixture.
   materialize a page only when it carries a set bit. Committed-cell counting
   must stay `O(1)` off the maintained set-bit totals rather than scanning.
 
-  Matrix open enumerates the union of the persisted page index and the
-  filesystem allocation map in `O(Q)` time and `Theta(Q)` temporary memory,
+  Not scaling with *cell count* is not the same as being small, and this contract
+  has never claimed the stronger property. Under `EagerVerified`, post-open
+  residency scales with the **live page count** and is never released while the
+  handle lives. Only `MatrixMetadataResidency::Lazy { cache_bytes }` bounds
+  residency by a declared ceiling; see the Capability Boundary table above for
+  the measured numbers.
+
+  Matrix open under `EagerVerified` enumerates the union of the persisted page
+  index and the filesystem allocation map in `O(Q)` time and `Theta(Q)` temporary
+  memory,
   where `Q` is the number of candidate pages — the `L` pages currently holding
   state plus the `A` pages the allocation map reports as written, so
   `Q <= L + A`. Reading those candidates costs up to `O(4096U)` page bytes for

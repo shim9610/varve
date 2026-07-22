@@ -494,7 +494,7 @@ fn matrix_impostor_same_stride_read_is_rejected() -> varve::Result<()> {
     cleanup(&path);
     create_matrix_fixture(&path)?;
 
-    let mut reader = InvariantMatrixFormat::spec().open_reader(&path)?;
+    let reader = InvariantMatrixFormat::spec().open_reader(&path)?;
     assert_eq!(
         reader.read_matrix_cell::<MatrixGenCell>(MatrixKey::new(0, 0))?,
         MatrixGenCell { value: 41 }

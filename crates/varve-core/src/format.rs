@@ -57,6 +57,73 @@ impl ReadLimit {
     }
 }
 
+/// How much of a matrix's persisted commit metadata an open makes resident,
+/// and therefore *when* that metadata's integrity is checked.
+///
+/// This is a declared option with an inert default: [`Self::EagerVerified`] is
+/// byte-for-byte the behaviour varve has always had, and nothing about a file
+/// changes when the option is set — it is purely a reader-side residency
+/// policy, so the same file can be opened eagerly by one process and lazily by
+/// another.
+///
+/// The option exists because demand loading is not only a performance
+/// decision. It moves commit-map corruption detection from `open` to the first
+/// access that touches the damaged page, and it decides what a lazily loaded
+/// page's *visibility* is. Both of those are observable behaviour, so they
+/// follow an option rather than falling out of a performance change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatrixMetadataResidency {
+    /// Default. Open reads, authenticates against its stored page digest, and
+    /// materialises every commit-map page the matrix has published, plus every
+    /// page the platform's allocation map reports as written. Corruption
+    /// anywhere in that set is reported by `open`, before any cell is read.
+    ///
+    /// Cost: `O(live pages + allocated pages)` bytes read at open and
+    /// `O(live pages)` resident bytes for the whole session.
+    EagerVerified,
+    /// Open reads the persisted page index and nothing else. A commit-map page
+    /// is read, authenticated against its stored page digest, and cached the
+    /// first time a bit inside it is addressed; the least recently used cached
+    /// page is dropped when admitting another would exceed `cache_bytes`.
+    ///
+    /// Cost: `O(live pages)` *index* bytes read at open — no page payload, no
+    /// allocation-map scan — and at most `cache_bytes` resident payload bytes
+    /// for the session, whatever the file's size or live page count.
+    ///
+    /// Three consequences are part of the declaration, not accidents:
+    ///
+    /// * **Detection moves to first touch.** A page whose bytes disagree with
+    ///   its stored digest is reported as [`crate::Error::MatrixFatalCorruption`]
+    ///   by the read that touches it, not by `open`. Pages never touched are
+    ///   never checked. Use [`Self::EagerVerified`] where open must be the
+    ///   detection point.
+    /// * **A page absent from the persisted index still reads as clear, and
+    ///   that is not a guess.** The index is loaded in full at open and is
+    ///   authoritative for which pages hold state; "not cached" and "not
+    ///   published" are distinct states and only the second answers zero. An
+    ///   index that could not be enumerated in full is already a fatal finding
+    ///   under both variants.
+    /// * **A page's contents are as of the first touch that faulted it in, not
+    ///   as of open.** Pages not yet faulted in therefore have no snapshot
+    ///   pinned. Where a reader must see one consistent instant, use
+    ///   [`Self::EagerVerified`].
+    Lazy {
+        /// Ceiling on the cached commit-map payload, in bytes. Rounded up to a
+        /// whole 4096-byte page internally, with a one-page floor, and refused
+        /// at open when it exceeds `max_matrix_bitmap_bytes`.
+        cache_bytes: u64,
+    },
+}
+
+impl MatrixMetadataResidency {
+    pub(crate) const fn cache_bytes(self) -> Option<u64> {
+        match self {
+            Self::EagerVerified => None,
+            Self::Lazy { cache_bytes } => Some(cache_bytes),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReadLimits {
@@ -84,6 +151,15 @@ pub struct ReadLimits {
     /// bytes it owns, checked before the memory is taken. It is checked per
     /// keyed block id, not summed across block ids.
     pub max_keyed_tail_bytes: ReadLimit,
+    /// Declared matrix commit-metadata residency policy.
+    ///
+    /// Inert by default ([`MatrixMetadataResidency::EagerVerified`]): every
+    /// file opens exactly as it did before this option existed. It lives on
+    /// `ReadLimits` rather than on `FormatSpec` because it decides *how*
+    /// `max_matrix_bitmap_bytes` is enforced — as an admission limit on the
+    /// whole live set, or as a bound on a demand-filled cache — and because it
+    /// is a property of one reader's open, not of the file's format.
+    pub matrix_metadata_residency: MatrixMetadataResidency,
     trusted_api: bool,
 }
 
@@ -119,6 +195,7 @@ impl ReadLimits {
         max_sidecar_len: ReadLimit::Finite(256 * 1024 * 1024),
         max_mmap_len: ReadLimit::Finite(8 * 1024 * 1024 * 1024),
         max_keyed_tail_bytes: ReadLimit::Finite(u64::MAX),
+        matrix_metadata_residency: MatrixMetadataResidency::EagerVerified,
         trusted_api: false,
     };
     /// Finite companion to [`Self::STANDARD`] for input from untrusted
@@ -157,8 +234,20 @@ impl ReadLimits {
             max_sidecar_len: value,
             max_mmap_len: value,
             max_keyed_tail_bytes: value,
+            matrix_metadata_residency: MatrixMetadataResidency::EagerVerified,
             trusted_api: false,
         }
+    }
+
+    /// Declares the matrix commit-metadata residency policy (see
+    /// [`MatrixMetadataResidency`]). Leaving it unset keeps the eager,
+    /// verified-at-open behaviour.
+    pub const fn with_matrix_metadata_residency(
+        mut self,
+        residency: MatrixMetadataResidency,
+    ) -> Self {
+        self.matrix_metadata_residency = residency;
+        self
     }
 
     pub const fn missing() -> Self {
@@ -203,6 +292,10 @@ impl ReadLimits {
 
     pub const fn tighten(self, runtime: Self) -> Self {
         Self {
+            // Not a limit: a residency policy is a declaration, not a ceiling,
+            // so a runtime overlay chooses it outright and `tighten` keeps the
+            // format's.
+            matrix_metadata_residency: self.matrix_metadata_residency,
             max_file_len: self.max_file_len.tighten(runtime.max_file_len),
             max_records: self.max_records.tighten(runtime.max_records),
             max_index_bytes: self.max_index_bytes.tighten(runtime.max_index_bytes),
@@ -246,6 +339,7 @@ impl ReadLimits {
     /// values as permanent format ceilings.
     pub const fn overlay(self, runtime: Self) -> Self {
         Self {
+            matrix_metadata_residency: runtime.matrix_metadata_residency,
             max_file_len: self.max_file_len.overlay(runtime.max_file_len),
             max_records: self.max_records.overlay(runtime.max_records),
             max_index_bytes: self.max_index_bytes.overlay(runtime.max_index_bytes),

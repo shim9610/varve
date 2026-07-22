@@ -227,8 +227,18 @@ bit means `NotCommitted` regardless of slot bytes.
 For overwrite, Varve clears the old commit and CRC-valid evidence before the
 first slot byte is changed. A partial slot write therefore remains hidden and
 poisons the writer. Matrix readers must still be coordinated with in-place
-writes: an already-open reader owns a commit-map snapshot but does not own a copy
-of the slot region.
+writes: under the default `MatrixMetadataResidency::EagerVerified` an
+already-open reader owns a commit-map snapshot but does not own a copy of the
+slot region.
+
+Under `MatrixMetadataResidency::Lazy { cache_bytes }` the reader owns **no
+commit-map snapshot at all**. Each commit-map page is read at the first touch
+that faults it in and may be evicted and re-read later, so different pages can
+reflect different instants and a page faulted in after a concurrent commit
+reflects that commit. A lazy reader is therefore not a fixed point in time to
+coordinate against; use `EagerVerified` where a pinned snapshot across all pages
+is required. See
+[Known Limitations §1.4](known-limitations.md#14-what-the-lazy-policy-does-and-does-not-fix).
 
 Append-log transaction markers follow the same explicit durability principle.
 `commit()` writes a logical visibility marker for

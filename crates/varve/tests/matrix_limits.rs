@@ -330,7 +330,7 @@ fn aux_reads_check_file_and_payload_limits_before_allocation() -> varve::Result<
     drop(spec.create_with_dims(fixture.path(), dimensions)?);
 
     let runtime = high_limits().with_max_record_payload_len(3);
-    let mut reader = spec.open_reader_with_limits(fixture.path(), runtime)?;
+    let reader = spec.open_reader_with_limits(fixture.path(), runtime)?;
     let error = reader
         .read_matrix_aux("thumbnail", 0, 4)
         .expect_err("oversized aux read must fail");
@@ -357,7 +357,7 @@ fn cell_reads_check_materialization_limit_before_allocating_slot_bytes() -> varv
     drop(writer);
 
     let runtime = high_limits().with_max_materialized_bytes(3);
-    let mut reader = spec.open_reader_with_limits(fixture.path(), runtime)?;
+    let reader = spec.open_reader_with_limits(fixture.path(), runtime)?;
     let error = reader
         .matrix_cell_payload::<LimitedCell>(key)
         .expect_err("slot payload must be rejected before its four-byte allocation");

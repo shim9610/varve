@@ -249,19 +249,19 @@ fn checked_snapshot_bounds(file: &File, len: u64) -> Result<SnapshotBounds> {
 }
 
 #[cfg(unix)]
-fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+pub(crate) fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
     use std::os::unix::fs::FileExt;
     file.read_at(buffer, offset)
 }
 
 #[cfg(windows)]
-fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+pub(crate) fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
     use std::os::windows::fs::FileExt;
     file.seek_read(buffer, offset)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+pub(crate) fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
     let mut file = file.try_clone()?;
     file.seek(SeekFrom::Start(offset))?;
     file.read(buffer)

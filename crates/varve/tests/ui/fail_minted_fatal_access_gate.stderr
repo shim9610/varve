@@ -1,0 +1,5 @@
+error[E0599]: no function or associated item named `new` found for struct `varve_core::enforcement_probe::FatalAccessGate` in the current scope
+  --> tests/ui/fail_minted_fatal_access_gate.rs:21:36
+   |
+21 |     let _minted = FatalAccessGate::new(false);
+   |                                    ^^^ function or associated item not found in `varve_core::enforcement_probe::FatalAccessGate`

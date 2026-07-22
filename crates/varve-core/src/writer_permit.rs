@@ -28,7 +28,8 @@
 //! # Which flag the witness speaks for
 //!
 //! The first cut of this module let *any* holder of a `PoisonFlag` mint a
-//! permit: `PoisonFlag::healthy()` is a `const fn` and `permit` was
+//! permit: `PoisonFlag::healthy()` was a `const fn` (round 15 made it a
+//! plain `fn`; see its documentation) and `permit` was
 //! `pub(crate)`, so three lines anywhere in the crate —
 //!
 //! ```text
@@ -171,7 +172,21 @@ pub struct PoisonFlag {
 
 impl PoisonFlag {
     /// A fresh, usable writer.
-    pub const fn healthy() -> Self {
+    ///
+    /// Deliberately **not** a `const fn` (round 15). `issue` being private
+    /// stops a decoy flag from minting a witness directly, but while this was
+    /// `const` a `static DECOY: PoisonFlag = PoisonFlag::healthy();` could be
+    /// declared anywhere in the crate and returned from a writer's own
+    /// `GuardedWriter::poison_flag`, at which point the default
+    /// `writer_permit` would read the decoy instead of the writer's flag and
+    /// every guarded operation would be permitted on a poisoned writer. That
+    /// spelling no longer compiles. It is a narrowing, not a closure: the
+    /// remaining route is a leaked heap allocation or a second flag field on
+    /// the writer, and both are caught by the source gate
+    /// `enforcement_gates.rs::a_writers_poison_flag_accessor_returns_its_own_field`
+    /// rather than by the compiler. Named here so a future round does not read
+    /// silence as coverage.
+    pub fn healthy() -> Self {
         Self {
             poisoned: false,
             in_flight: false,
@@ -283,12 +298,42 @@ mod tests {
         assert!(writer.writer_permit("test").is_err());
     }
 
-    /// The gap this round closed. A second, healthy `PoisonFlag` in scope — the
-    /// decoy that `PoisonFlag::healthy()` made a three-line affair — cannot
+    /// **The in-crate bypass catalogue for this module** (round 15).
+    ///
+    /// Compiled from `file.rs` — a different module, with the crate privileges
+    /// a real defect would have — and observed to fail:
+    ///
+    /// ```text
+    /// let _: MutationPermit<VarveFile> = MutationPermit(PhantomData);
+    /// //  error[E0603]: tuple struct constructor `MutationPermit` is private
+    ///
+    /// let _: MutationPermit<VarveFile> = PoisonFlag::healthy().issue("x")?;
+    /// //  error[E0624]: method `issue` is private
+    /// ```
+    ///
+    /// And from this module, the spelling that round 15 removed:
+    ///
+    /// ```text
+    /// static DECOY: PoisonFlag = PoisonFlag::healthy();
+    /// //  error[E0015]: cannot call non-const associated function
+    /// //               `PoisonFlag::healthy` in statics
+    /// ```
+    ///
+    /// The gap round 14 closed, re-asserted. A second, healthy `PoisonFlag` in
+    /// scope — the decoy that `PoisonFlag::healthy()` made a three-line affair — cannot
     /// produce a witness for a poisoned writer, because the only constructor
     /// reads the writer's own flag. Restoring a `pub(crate)` constructor on
     /// `PoisonFlag` is what would let this assertion be circumvented, and the
     /// source gate in `crates/varve/tests/enforcement_gates.rs` fails if it is.
+    #[test]
+    fn a_static_decoy_flag_cannot_be_declared() {
+        // `static DECOY: PoisonFlag = PoisonFlag::healthy();` is rejected —
+        // `healthy` is no longer a `const fn`. This is the runtime half: a
+        // decoy still exists as a local, and still cannot mint anything.
+        let decoy = PoisonFlag::healthy();
+        assert!(!decoy.is_refusing());
+    }
+
     #[test]
     fn a_second_healthy_flag_cannot_speak_for_a_poisoned_writer() {
         let mut writer = Writer::healthy();

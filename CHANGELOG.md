@@ -4,7 +4,158 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
-## Unreleased
+## 0.4.0 - 2026-07-22
+
+Pre-1.0 minor release. Versions 0.1 through 0.3 existed as source releases only;
+no Varve crate has previously been published to crates.io, so a consumer
+installing from the registry starts here. The Rust
+API and several persisted layouts change incompatibly from 0.3.0. Every affected
+persisted artifact is stale-regenerable and is refused with a typed error rather
+than migrated in place — nothing is silently misread.
+
+Two documents accompany this release and should be read before upgrading:
+
+- **[docs/api-changes.md](docs/api-changes.md)** — the migration document: new,
+  changed, removed, and changed-behaviour-at-an-unchanged-signature, with
+  before/after snippets and the exact typed error for every stale artifact class.
+- **[docs/known-limitations.md](docs/known-limitations.md)** — what this release
+  is and is not ready for, in terms of what a user hits, with measured numbers.
+
+### Breaking changes at a glance
+
+Each links to the section of the migration document that tells you what to edit.
+
+| Change | Migration |
+| --- | --- |
+| **Matrix files, matrix sidecars, disk-index sidecars, and files pinned with a computed schema hash must be regenerated.** Plain append-log files remain readable | [Read this first](docs/api-changes.md#read-this-first-files-written-by-an-older-version) |
+| The computed schema hash algorithm is now **version 3** (v1 → v2 → v3); every computed value changed twice | [§1.1](docs/api-changes.md#11-the-computed-schema-hash-changed-twice) |
+| `VarveBlock` gains required `IS_KEYED` and `SCHEMA_FINGERPRINT` — every **manual** `impl VarveBlock` stops compiling | [§3.1](docs/api-changes.md#31-varveblock-gains-two-required-associated-constants--every-manual-impl-stops-compiling) |
+| `FormatSpec` gains `block_identities` and `matrix_fatal_forensics` — exhaustive struct literals break | [§3.2](docs/api-changes.md#32-formatspec-gains-two-public-fields--exhaustive-struct-literals-break) |
+| `Error::PublishedButRebindFailed` gains `parent_sync` — destructuring breaks | [§3.3](docs/api-changes.md#33-errorpublishedbutrebindfailed-gains-a-third-field) |
+| `KeyedMergeEstimate::peak_resident_bytes()` removed, no alias; use `peak_resident_structural_bytes()` and stop treating it as an upper bound | [§2.1](docs/api-changes.md#21-keyedmergeestimatepeak_resident_bytes) |
+| `VarveWriter::reserve_keyed_tail_slot` and `DiskIndexError::BatchPoisoned` removed | [§2.2](docs/api-changes.md#22-varvewriterreserve_keyed_tail_slot), [§2.3](docs/api-changes.md#23-diskindexerrorbatchpoisoned) |
+| Generic `push` now refuses keyed blocks on `keyed_offset_chain` formats with `KeyedChainRequiresKeyedApi` | [§5.2](docs/api-changes.md#52-generic-push-refuses-keyed-blocks-on-keyed_offset_chain-formats) |
+| Replacement refuses a cross-version target with `BlockVersionMismatch` | [§5.1](docs/api-changes.md#51-replacement-refuses-a-cross-version-target) |
+| Five new post-publication durability outcomes replace a bare `Err`; the work is already in the file, so do not retry the transaction | [§5.3](docs/api-changes.md#53-new-durability-outcomes-where-a-bare-err-used-to-be-returned) |
+| Matrix access is fail-closed on a `Fatal` recovery finding | [§5.4](docs/api-changes.md#54-matrix-access-is-fail-closed-on-a-fatal-recovery-finding) |
+| `PackedBitmap` is no longer accepted as a fixed-width matrix field | [§3.6](docs/api-changes.md#36-packedbitmap-is-no-longer-accepted-as-a-fixed-width-matrix-field) |
+| Tighter limit charges (`HashMap` materialization, keyed-tail build peak) can refuse work that previously succeeded | [§5.6](docs/api-changes.md#56-tighter-and-more-accurate-limit-charges) |
+| `FormatSelfTest::run` is non-destructive; `cleanup(true)` can report a failed step where it reported a clean pass | [§5.8](docs/api-changes.md#58-formatselftestrun-is-non-destructive) |
+| `scripts/run-security-fuzz.ps1` can exit 2 or 3 where it exited 0 | [§5.10](docs/api-changes.md#510-scriptsrun-security-fuzzps1-exit-codes) |
+
+### Added (rounds 15-16)
+
+- **`MatrixMetadataResidency`** (`format::MatrixMetadataResidency`, exported from
+  the facade), the `ReadLimits::matrix_metadata_residency` public field, and the
+  `const fn ReadLimits::with_matrix_metadata_residency` builder. It declares how
+  much of a matrix's persisted commit metadata an open makes resident, and
+  therefore when that metadata's integrity is checked.
+
+  `EagerVerified` is the default and is **inert** — byte-for-byte the behaviour
+  varve had before the option existed. Open reads, authenticates and materialises
+  every commit-map page the matrix has published plus every page the platform's
+  allocation map reports as written; corruption anywhere in that set is reported
+  by `open`. Under this policy `max_matrix_bitmap_bytes` is an **admission**
+  limit, not a cache bound: a matrix whose live page set exceeds it cannot be
+  opened at all, and there is no eviction path.
+
+  `Lazy { cache_bytes }` reads the persisted page index at open and nothing else —
+  no page payload, no page digest, no allocation-map query. A page is read,
+  authenticated and cached the first time a bit inside it is addressed, and the
+  least recently used cached page is dropped when admitting another would exceed
+  `cache_bytes`. A live set larger than `max_matrix_bitmap_bytes` becomes
+  *openable* rather than refused; a `cache_bytes` above that ceiling is refused at
+  open, so the option cannot raise a declared limit.
+
+  Three consequences are part of the declaration, not accidents: corruption
+  detection moves from `open` to first touch and untouched pages are never
+  checked; a page absent from the persisted index still reads as clear (the index
+  is loaded in full under both policies, so "not cached" and "not published" stay
+  distinct); and a page's contents are as of the first touch that faulted it in,
+  so a lazy reader does not see one consistent instant.
+
+  Measured on the fixtures in `crates/varve/tests/matrix_lazy_residency.rs`
+  (Windows x86_64, 2026-07-22): for a 69.2 MB / 8,388,608-cell matrix with one
+  live page, eager open reads 131,240 bytes over 32 pages and leaves 8,192
+  resident; lazy open reads 32 bytes, visits 0 pages and leaves 0 resident. At 64
+  live pages, eager reads 591,384 bytes and leaves 524,288 resident; lazy reads
+  1,040 bytes. **Open is independent of file size under both policies but is not
+  `O(1)` under either** — see
+  [docs/known-limitations.md §1](docs/known-limitations.md#1-matrix-opening-a-matrix-is-not-o1-and-its-metadata-residency-is-not-a-cache).
+
+- `MatrixRecoveryReport` counters, gated on `scalable-fault-injection`:
+  `matrix_lazy_cached_bitmap_bytes`, `matrix_lazy_fault_bytes_read`, and
+  `reset_matrix_lazy_counters`.
+
+- Two new integration suites: `crates/varve/tests/matrix_lazy_residency.rs` (10
+  tests, every assertion an absolute number rather than a ratio between two runs)
+  and `crates/varve/tests/matrix_concurrent_reads.rs` (4 tests, including a
+  compile-time assertion that the reader handle is `Send + Sync`).
+
+- Two `tests/ui` compile-fail fixtures, `fail_minted_crc_valid_completeness` and
+  `fail_minted_fatal_access_gate`, making the disk-before-memory and guard-bypass
+  shapes compile-time errors rather than review findings.
+
+### Changed (rounds 15-16)
+
+- **Matrix reads take `&self` instead of `&mut self`.** `read_matrix_cell::<T>`
+  and `matrix_cell_status::<T>` on `VarveReader`, `VarveWriter` and `VarveFile`
+  all relax their receiver; `matrix_resume_signal` was already `&self`. This is
+  source-compatible — an existing call through a `&mut` binding still compiles —
+  and what it enables is one handle serving concurrent readers.
+
+  Reads go through positional I/O (`pread` on Unix, `seek_read` on Windows). On
+  **Windows** each reading thread additionally gets a private file object derived
+  with `ReOpenFile` (`MatrixReadPool`), because `ReadFile` serialises on the
+  kernel file object: without it, four threads measured **1.54x slower** than one.
+  With it, 24,000 reads through one handle measured 0.138s on 1 thread and 0.046s
+  on 4 (**0.33x**), and 40,960 lazy fault-in reads measured 3.814s versus 1.667s
+  (**0.44x**); both are contract-asserted at `<= 1.0x`. The private-handle pool is
+  `#[cfg(windows)]`, and **the concurrent-read scaling contracts have never been
+  executed on Unix** — see
+  [docs/known-limitations.md §6.1](docs/known-limitations.md#61-the-unix-code-paths-have-never-been-executed).
+
+- One lock now exists in the matrix read path: `SparseBitmap` holds a
+  `Mutex<PageStore>` so a demand fault-in can happen under `&self`. It is taken
+  only for `O(1)` map operations, is released across the fault-in read, and is
+  never taken on the write path. Under `EagerVerified` nothing is ever faulted in.
+
+- `PoisonFlag::healthy()` is no longer a `const fn`, so the `static DECOY`
+  spelling of the guard bypass no longer compiles (E0015).
+
+### Documentation (rounds 15-16)
+
+- New: `docs/known-limitations.md` and `docs/api-changes.md`.
+- `docs/performance.md`, `docs/api-reference.md`, `docs/scalable-io.md`,
+  `docs/durability-model.md` and `README.md` corrected against the measured
+  behaviour of this tree.
+- The changelog's earlier claim that the computed schema hash algorithm is
+  version 2 is corrected: the shipping value is **3**
+  (`FormatSpec::SCHEMA_HASH_ALGORITHM_VERSION`), and both bumps are described in
+  [docs/api-changes.md §1.1](docs/api-changes.md#11-the-computed-schema-hash-changed-twice).
+
+### Assurance limits of this release
+
+Stated here rather than left to be discovered:
+
+- **CI has never run on this code**, on either operating system. The Unix
+  `openat`/`unlinkat` and `O_NOFOLLOW` paths are compile-verified only, and
+  `cargo clippy --target x86_64-unknown-linux-gnu --no-default-features` currently
+  fails with a `dead_code` lint on the Windows-only `MatrixReadPool::handles`
+  field.
+- **No fuzz campaign, Miri run or ASan run has been performed against this
+  release's code.** The recorded fuzz evidence predates rounds 12-16, and an
+  unpromoted libFuzzer OOM reproducer for `codec_arbitrary` exists in the working
+  tree. This release makes no fuzz-pass claim.
+- The 1 PiB and 1 TiB positional-I/O probes are `#[ignore]`d and have never run.
+  The performance smoke suite and the one-million-key stress probe run in no job.
+- The `high-cardinality-dev` scalable module set has not been walked against the
+  project's internal invariants.
+
+Full detail in
+[docs/known-limitations.md §6](docs/known-limitations.md#6-not-verified).
+
+### Rounds 12-14
 
 Round-12 adversarial review (`f661f65`,
 `docs/performance-stability-review-2026-07-21-f661f65-final.md`). Five
@@ -21,7 +172,7 @@ just rewritten. Reading does not close the class, so this round made the shape
 impossible to express instead. See "Mechanically enforced shapes" in
 `docs/invariant-checklist.md`.
 
-### Breaking
+### Breaking (rounds 12-14)
 
 - **`Error::PublishedButRebindFailed` gains a third field**,
   `parent_sync: Option<Box<Error>>` (F-07). A replacement publication learns two
@@ -158,7 +309,7 @@ impossible to express instead. See "Mechanically enforced shapes" in
   every durable cell write to serve a path that ends in `abort`. See "Allocator
   Failure And Published Outcomes" in `docs/durability-model.md`.
 
-### Added
+### Added (round 12)
 
 - `MatrixRecoveryReport::inject_matrix_page_index_mirror_reservation_failure`,
   compiled only under `feature = "scalable-fault-injection"`, alongside the
@@ -379,13 +530,15 @@ No wire-format change, no public API change, no error-variant change.
   control: dropping the pre-fix declaration into the crate as an undeclared
   module makes the gate fail and name it.
 
-## 0.4.0 - 2026-07-20
+### Earlier rounds in this release (rounds 1-11, logged 2026-07-20)
 
-Pre-1.0 minor release. The Rust API and several persisted layouts change
+The first eleven review rounds of 0.4.0, kept as a development log. 0.4.0 was
+never released, so these entries are part of the single release above rather
+than a separate one. The Rust API and several persisted layouts change
 incompatibly; every affected artifact is stale-regenerable and refused with a
-typed error rather than migrated in place. See **Breaking** below.
+typed error rather than migrated in place.
 
-### Added
+#### Added
 
 - `ReadLimits::max_keyed_tail_bytes` (DSL key `keyed_tail`, builder
   `with_max_keyed_tail_bytes`) and the `ReadLimitKey` resource
@@ -614,7 +767,7 @@ typed error rather than migrated in place. See **Breaking** below.
   unpacks `git archive HEAD` and runs `cargo metadata`/`cargo check --locked`
   so an uncommitted workspace member can never pass CI again.
 
-### Changed
+#### Changed
 
 - `HashMap` decoding charges the hash table it actually allocates (SAFE-01).
   Decoding used the shared per-entry map model, whose floor of one byte for a
@@ -953,7 +1106,7 @@ typed error rather than migrated in place. See **Breaking** below.
   Windows recovery distinguishes a signaled terminated process object from a
   live process even while another handle temporarily keeps that object open.
 
-### Breaking
+#### Breaking
 
 - **Wire-breaking, stale-regenerable:** the persisted page-index region was
   introduced here, at what was then `VMAT` version 3. The layout shipped in this
@@ -1041,8 +1194,10 @@ typed error rather than migrated in place. See **Breaking** below.
 - Matrix access is fail-closed when recovery records a `Fatal` finding; readers
   that relied on reading through fatal-state files must opt in with
   `FormatSpec::with_matrix_fatal_forensics()`.
-- The computed schema hash algorithm is version 2
-  (`FormatSpec::SCHEMA_HASH_ALGORITHM_VERSION`): fields are hashed in
+- The computed schema hash algorithm moved to version 2 at this point
+  (`FormatSpec::SCHEMA_HASH_ALGORITHM_VERSION`; it was later moved again to
+  version 3 — see the `VarveEncode::SCHEMA_ID` entry above, which is the value
+  0.4.0 ships): fields are hashed in
   declaration order with their encoding ordinal and a field-count frame, and
   per-block endian overrides, keyedness, and generated codec fingerprints are
   folded in via `FormatSpec::block_identities`. This closes the hole where two
@@ -1098,7 +1253,7 @@ typed error rather than migrated in place. See **Breaking** below.
   therefore now leaves its artifact behind and says so. Use a directory only the
   running user can write, or `.cleanup(false)` and remove the artifact yourself.
 
-### Fixed (invariant re-verification, round 9)
+#### Fixed (invariant re-verification, round 9)
 
 Round 9 answered the round-8 review
 (`docs/performance-stability-review-2026-07-21-8732e83-final.md`). All three of
@@ -1245,7 +1400,7 @@ so each was closed structurally rather than patched at the named line.
   nothing leaves no session path" policy is literally true. A session holding
   artifacts is never removed.
 
-### Documentation (round 9)
+#### Documentation (round 9)
 
 - `docs/custom-codec-guide.md` states the allocation-charging obligation
   (F-08): every owned allocation whose size comes from input must be charged
@@ -1259,7 +1414,7 @@ so each was closed structurally rather than patched at the named line.
   inline storage only; both routes now charge inline storage plus the key
   payload bytes the map owns.
 
-### Fixed (invariant re-verification, round 7)
+#### Fixed (invariant re-verification, round 7)
 
 - `max_keyed_tail_bytes` did not bound what it said it bounded (API3-05). Round 6
   charged only the *incremental* growth of the keyed-tail maps. The dominant
@@ -1299,7 +1454,7 @@ so each was closed structurally rather than patched at the named line.
   closes the capture-to-unlink window but proves nothing about ownership, and
   Windows has no directory confinement to fall back on.
 
-### Fixed (invariant audit, round 6)
+#### Fixed (invariant audit, round 6)
 
 - `tools/rename-fixture` did not run at all. It declares
   `index: [... keyed_offset_chain]` and a keyed `Item` block, then called the
@@ -1325,7 +1480,7 @@ so each was closed structurally rather than patched at the named line.
   on top. The materialization charge is now a documented over-estimate of that
   real node cost rather than an under-estimate of it.
 
-### Fixed (release re-verification, round 5)
+#### Fixed (release re-verification, round 5)
 
 Every item in this section is a defect in code this project added earlier in the
 same unreleased cycle while fixing an earlier finding, not a pre-existing Varve
@@ -1386,7 +1541,7 @@ defect.
   must preserve the temp — `ReplacePublicationIndeterminate`, `Durable`, and
   `ParentSyncPending` — explicitly retain it.
 
-### Fixed (CI and packaging)
+#### Fixed (CI and packaging)
 
 - CI verifies publishable archives (F-11). `package contents` runs
   `cargo package --no-verify --list`, which proves file *names* and nothing
@@ -1407,7 +1562,7 @@ defect.
   `varve-macros` on `varve` — a dev-dependency cycle, which cargo supports and
   strips from the published manifest (proven by the archive verification above).
 
-### Fixed (documentation accuracy)
+#### Fixed (documentation accuracy)
 
 - The benchmark example now asserts the emitted live-value count for **all
   three** merge/compact lines against the file each one produced.
@@ -1430,7 +1585,7 @@ defect.
   filesystem cannot answer an allocated-range query, enumeration falls back to
   the persisted page index and still costs `O(live pages)`.
 
-### Fixed (documentation accuracy, re-verification pass)
+#### Fixed (documentation accuracy, re-verification pass)
 
 - The retracted bytes-written cost claim for matrix open, and the retracted
   read-every-page description of the no-allocation-map case, are gone from the
@@ -1468,7 +1623,7 @@ defect.
   commit and describe `VMAT` v1 as current; each now says so at the top and
   points at `docs/spec.md` for the shipped layout.
 
-### Fixed (matrix zeroing accounting)
+#### Fixed (matrix zeroing accounting)
 
 - A whole-category clear zeroes its page-digest array with an explicit per-page
   loop rather than through `zero_range`, and that loop did not record the

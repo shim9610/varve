@@ -474,6 +474,20 @@ fn open_stays_bounded_without_an_allocation_map() -> varve::Result<()> {
         large_bytes < large_dense,
         "open read {large_bytes} bytes, not meaningfully below the dense cost {large_dense}"
     );
+    // The absolute companion, added because the two equalities above are
+    // satisfied by *any* constant, however large — the shape that let criterion
+    // (A)'s absolute half stay unmet for eight rounds while its scaling half
+    // passed. All 64 committed cells live in page 0, so the visit set with no
+    // allocation map is the persisted page index alone: one page for the commit
+    // map and one for the validity bitmap.
+    println!(
+        "(no-alloc-map) pages_visited={large} bytes_read={large_bytes} \
+         for 1 live page per bitmap"
+    );
+    assert!(
+        large <= 4 && large_bytes <= 4 * PAGE_BYTES + 1024,
+        "open visited {large} pages / read {large_bytes} bytes for one live page per bitmap"
+    );
     Ok(())
 }
 
@@ -1222,7 +1236,7 @@ fn slot_corruption_still_rejects_a_committed_cell_read() -> varve::Result<()> {
     let slot_region_off = header_u64(&path, 8);
     patch_byte(&path, slot_region_off, 0xEE);
 
-    let mut reader = spec().open_reader(&path)?;
+    let reader = spec().open_reader(&path)?;
     assert!(matches!(
         reader.read_matrix_cell::<ScalingCell>(key(0)),
         Err(Error::MatrixChecksumMismatch { .. })
@@ -1889,7 +1903,7 @@ fn crc_rebuild_refuses_an_incompletely_loaded_validity_index() -> varve::Result<
     //     to read a bit at all. `verify_cell_crc` turns an absent validity bit
     //     into a typed checksum refusal; it can never turn one into published
     //     state, because the evidence type hands it no bit to publish.
-    let mut reader = open_without_allocation_map(&path, true)?;
+    let reader = open_without_allocation_map(&path, true)?;
     let unreadable = reader.read_matrix_cell::<ScalingCell>(key(SECOND));
     assert!(
         matches!(unreadable, Err(Error::MatrixChecksumMismatch { .. })),
@@ -1910,5 +1924,233 @@ fn crc_rebuild_refuses_an_incompletely_loaded_validity_index() -> varve::Result<
             "rebuild refusal still erased the commit bit for ordinal {ordinal}"
         );
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The matrix access model: measured criteria (A) and (B).
+//
+// These tests are not new contracts so much as *instruments*. The two criteria
+// below were asserted in earlier rounds but never reported as numbers, and the
+// recurring failure of this repo has been closing a finding while the actual
+// requirement stayed unmet. Each of these prints the number it measured so a
+// reviewer reads the value rather than a boolean.
+// ---------------------------------------------------------------------------
+
+/// Criterion (A): **open is O(1) in file size** — measured, and *not met*.
+///
+/// The criterion asks for the bytes read and pages visited at open, for two
+/// matrices differing 4x in cell count with identical live state: they must be
+/// "equal and small". Two independent halves hide behind that phrase and this
+/// test separates them, because only one of them holds.
+///
+/// **Equal — holds.** The 4x cell-count ratio does not appear in either number.
+/// That is what the paged representation of round 3 bought.
+///
+/// **Small — does not hold.** Both fixtures hold 64 committed cells, which live
+/// in a *single* commit-map page. Open nevertheless reads roughly 128 KiB over
+/// roughly 32 pages of each map. The cause is the second term of
+/// `pages_to_visit`: the visit set is the persisted page index *union the pages
+/// the filesystem allocation map reports as written*, and a filesystem
+/// allocates in runs, so one written 4 KiB page inside a 128 KiB run puts the
+/// whole run into the visit set. That term exists to catch stray bytes written
+/// into a page the index does not name (`stray_bytes_in_a_skipped_region_are_
+/// still_detected`), so it is an *integrity scan*, not something a read needs.
+///
+/// Why this had to be measured rather than trusted: the round-3 test
+/// `open_bitmap_bytes_read_do_not_scale_with_cell_count` passes today, and it
+/// asserts `large <= small + allowance` — a relation a 128 KiB *constant*
+/// satisfies perfectly. A ratio assertion cannot see an absolute cost, so the
+/// scaling contract was met and the criterion was not.
+///
+/// The assertions below pin the state that *is* true plus the size of the gap,
+/// so making open genuinely O(1) breaks this test loudly instead of leaving a
+/// stale claim in the tree.
+#[test]
+fn measured_open_cost_is_scale_free_in_cells_but_not_yet_small() -> varve::Result<()> {
+    const CELLS: u64 = 64;
+    let dir = temp_dir("measure-open-cost");
+
+    let mut rows = Vec::new();
+    for (name, scans) in [("small", SMALL_WIDE_SCANS), ("large", LARGE_WIDE_SCANS)] {
+        let path = dir.path().join(format!("{name}.varve"));
+        fill(&path, scans, CELLS)?;
+        MatrixRecoveryReport::reset_matrix_integrity_counters();
+        drop(spec().open_readonly(&path)?);
+        rows.push((
+            name,
+            scans * CHANNELS,
+            MatrixRecoveryReport::matrix_open_bitmap_bytes_read(),
+            MatrixRecoveryReport::matrix_open_bitmap_pages_visited(),
+        ));
+    }
+
+    for (name, cells, bytes, pages) in &rows {
+        println!("(A) {name}: cells={cells} open_bytes_read={bytes} open_pages_visited={pages}");
+    }
+    let (_, small_cells, small_bytes, small_pages) = rows[0];
+    let (_, large_cells, large_bytes, large_pages) = rows[1];
+    assert_eq!(large_cells / small_cells, 4, "fixtures must differ 4x");
+
+    // The half that holds: no 4x ratio in either number. Stated as a ratio
+    // bound rather than exact equality because the visit set includes whole
+    // filesystem allocation runs, whose boundaries the test does not control.
+    assert!(
+        large_pages * 2 < small_pages * 4 && large_bytes * 2 < small_bytes * 4,
+        "(A) open cost picked up the 4x cell-count ratio: {small_pages}p/{small_bytes}B \
+         vs {large_pages}p/{large_bytes}B"
+    );
+
+    // The half that does not: the live state is one page and open reads tens of
+    // pages. Both bounds are deliberately generous; the point is that the gap
+    // is two orders of magnitude, not that it is exactly 32 pages.
+    let live_pages = 1u64;
+    assert!(
+        large_pages >= 4 * live_pages && large_bytes >= 16 * PAGE_BYTES,
+        "(A) the DEFAULT policy's open is now small ({large_pages} pages / {large_bytes} bytes \
+         for {live_pages} live page). Demand loading has landed as \
+         `MatrixMetadataResidency::Lazy` and is measured in `matrix_lazy_residency.rs`; this \
+         test pins what the inert default `EagerVerified` costs, so a change here means the \
+         option stopped being inert."
+    );
+    Ok(())
+}
+
+/// The **outstanding** term of criterion (A), measured rather than glossed.
+///
+/// Open is O(1) in file size, but it is still `O(live pages)`: every page the
+/// persisted index names is read, digest-checked, and made resident before open
+/// returns. This test holds the cell count and the file size fixed and varies
+/// only how many pages hold live state, so the number it prints is exactly the
+/// term a lazy design would remove.
+///
+/// It asserts the growth it *currently* has, so that landing demand loading
+/// makes this test fail loudly instead of leaving a stale claim behind.
+#[test]
+fn open_cost_still_follows_the_live_page_count() -> varve::Result<()> {
+    let dir = temp_dir("measure-live-pages");
+
+    let mut rows = Vec::new();
+    for pages in [1u64, 4] {
+        let path = dir.path().join(format!("live-{pages}.varve"));
+        // One cell in each of `pages` distinct commit-map pages of the same
+        // fixture: cell count and file size are identical across the two runs.
+        let live: Vec<u64> = (0..pages).collect();
+        fill_pages(&path, LARGE_WIDE_SCANS, &live)?;
+        MatrixRecoveryReport::reset_matrix_integrity_counters();
+        drop(spec().open_readonly(&path)?);
+        rows.push((
+            pages,
+            MatrixRecoveryReport::matrix_open_bitmap_bytes_read(),
+            MatrixRecoveryReport::matrix_open_bitmap_pages_visited(),
+            MatrixRecoveryReport::matrix_open_resident_bitmap_bytes(),
+            MatrixRecoveryReport::matrix_resident_page_index_bytes(),
+        ));
+    }
+
+    for (pages, bytes, visited, resident, index) in &rows {
+        println!(
+            "(A-residual) live_pages={pages} open_bytes_read={bytes} pages_visited={visited} \
+             resident_bitmap={resident} resident_page_index={index}"
+        );
+    }
+    let (_, one_bytes, _, one_resident, one_index) = rows[0];
+    let (_, four_bytes, _, four_resident, four_index) = rows[1];
+    assert!(
+        four_bytes > one_bytes,
+        "the DEFAULT policy no longer reads per live page ({one_bytes} -> {four_bytes}); \
+         demand loading is `MatrixMetadataResidency::Lazy`, measured in \
+         `matrix_lazy_residency.rs`, and must not change what `EagerVerified` does"
+    );
+    assert!(
+        four_resident > one_resident && four_index > one_index,
+        "residency no longer follows the live page count ({one_resident}/{one_index} -> \
+         {four_resident}/{four_index}); rewrite this test against the new design"
+    );
+    Ok(())
+}
+
+/// Criterion (B): **memory is bounded by the working set.**
+///
+/// Measured on a matrix whose live page set is far wider than the configured
+/// `max_matrix_bitmap_bytes` ceiling. The three numbers the criterion asks for
+/// are resident bytes after open, after touching K pages, and after touching
+/// 4K pages.
+///
+/// What this measures today is that the ceiling is **not** a cache bound: it is
+/// a hard admission limit checked at open, so a matrix whose live pages exceed
+/// it does not open with a bounded cache — it refuses to open at all. That is
+/// the honest state of criterion (B), and the numbers are printed rather than
+/// described.
+#[test]
+fn measured_resident_bitmap_bytes_against_the_ceiling() -> varve::Result<()> {
+    let dir = temp_dir("measure-ceiling");
+    let path = dir.path().join("wide.varve");
+
+    // Sixteen live commit-map pages, one committed cell in each.
+    const LIVE_PAGES: u64 = 16;
+    let live: Vec<u64> = (0..LIVE_PAGES).collect();
+    fill_pages(&path, LARGE_WIDE_SCANS, &live)?;
+
+    MatrixRecoveryReport::reset_matrix_integrity_counters();
+    let reader = spec().open_readonly(&path)?;
+    let after_open = MatrixRecoveryReport::matrix_open_resident_bitmap_bytes();
+    let index_after_open = MatrixRecoveryReport::matrix_resident_page_index_bytes();
+    println!(
+        "(B) live_pages={LIVE_PAGES} resident_after_open={after_open} \
+         resident_page_index_after_open={index_after_open}"
+    );
+
+    // Touch K = 1 page, then 4K = 4 pages, through `&self` reads.
+    let touch = |count: u64| -> varve::Result<u64> {
+        for page in 0..count {
+            let ordinal = page * PAGE_BYTES * 8;
+            assert_eq!(
+                reader.matrix_cell_status::<ScalingCell>(key(ordinal))?,
+                MatrixCellStatus::Committed
+            );
+            let _cell = reader.read_matrix_cell::<ScalingCell>(key(ordinal))?;
+        }
+        Ok(MatrixRecoveryReport::matrix_open_resident_bitmap_bytes())
+    };
+    let after_k = touch(1)?;
+    let after_4k = touch(4)?;
+    println!("(B) resident_after_touching_K=1_pages={after_k}");
+    println!("(B) resident_after_touching_4K=4_pages={after_4k}");
+
+    // The state this measurement records: residency is fixed at open by the
+    // live page count and does not move with the working set at all. Touching
+    // pages neither grows nor shrinks it, because every live page was already
+    // made resident before open returned.
+    assert_eq!(
+        after_open, after_k,
+        "(B) residency moved when the working set did; if demand loading has \
+         landed this test states a stale fact and must be rewritten"
+    );
+    assert_eq!(after_k, after_4k);
+    assert!(
+        after_open >= LIVE_PAGES * PAGE_BYTES,
+        "(B) resident bytes {after_open} are below one page per live page, which \
+         would mean demand loading has landed"
+    );
+    drop(reader);
+
+    // And the ceiling is an admission limit, not a cache bound: a limit below
+    // the live page set refuses the open outright rather than evicting.
+    let ceiling = LIVE_PAGES * PAGE_BYTES / 2;
+    let tight = spec().with_read_limits(ReadLimits::STANDARD.with_max_matrix_bitmap_bytes(ceiling));
+    let refused = tight.open_readonly(&path);
+    println!("(B) open with max_matrix_bitmap_bytes={ceiling}: {refused:?}");
+    assert!(
+        matches!(
+            refused,
+            Err(Error::LimitExceeded {
+                resource: "matrix bitmap bytes",
+                ..
+            })
+        ),
+        "(B) the bitmap ceiling behaved as a cache bound rather than an \
+         admission limit; rewrite this test against the new design: {refused:?}"
+    );
     Ok(())
 }

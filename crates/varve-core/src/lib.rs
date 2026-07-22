@@ -106,9 +106,9 @@ pub use format::{
     LayoutPlanLen, LayoutPlanPartDescriptor, LayoutPlanPartKind, LayoutPlanRegion,
     LayoutPlanRegionSource, LayoutPlanSegment, LayoutPreset, LayoutSpec, LeadInDescriptor,
     ManifestPolicy, MatrixAuxDescriptor, MatrixBlockDescriptor, MatrixCommitDescriptor,
-    MatrixCommitKind, MatrixDimensionDescriptor, MetadataDescriptor, RawRegionDescriptor,
-    ReadLimit, ReadLimits, RecoveryPolicy, ResourceLimits, SegmentDescriptor, SegmentRepeat,
-    TransactionMarkerMode, VariableCompression,
+    MatrixCommitKind, MatrixDimensionDescriptor, MatrixMetadataResidency, MetadataDescriptor,
+    RawRegionDescriptor, ReadLimit, ReadLimits, RecoveryPolicy, ResourceLimits, SegmentDescriptor,
+    SegmentRepeat, TransactionMarkerMode, VariableCompression,
 };
 #[cfg(feature = "high-cardinality-dev")]
 pub use indexed::{

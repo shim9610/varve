@@ -5,8 +5,19 @@ Varve path intended for very large append logs. Its normal open and append
 costs do not grow with native file size or record count.
 
 The resident `create_writer`, `open_reader`, `blocks`, and `keyed_blocks`
-APIs remain useful for bounded files. They may scan or retain indexes and are
-not the petabyte-scale path.
+APIs remain useful for bounded files. They scan the file and retain a record
+index at open, and are not the petabyte-scale path.
+
+> **Status.** This family has never shipped in a released version, its wire
+> artifacts (`.vks`, `.vki`) are at their first public versions, and the feature
+> name still says `dev`. It also covers **ingest and point lookup only** — keyed
+> merge and compact are resident-only and Varve exports no bounded-memory
+> external merge or compact. The scale gates behind the cost model
+> (`pib_probe`'s 1 PiB and 1 TiB positional-I/O probes) are `#[ignore]`d and have
+> never been executed, and this module set has not been walked against the
+> project's internal invariants. See
+> [Known Limitations §3](known-limitations.md#3-the-scalable-family-is-behind-a-feature-flag-named-dev)
+> and [§6](known-limitations.md#6-not-verified).
 
 ## Declare The Policy
 

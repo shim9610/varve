@@ -11,6 +11,47 @@ The workspace contains:
 - `varve-core`: runtime, codecs, file I/O, diagnostics
 - `varve-macros`: `varve_format!` and derive support
 
+## What This Is And Is Not Ready For
+
+Read this before adopting. The detail behind every line is in
+**[Known Limitations](docs/known-limitations.md)**; upgrading from 0.3.0 is
+covered in **[API Changes](docs/api-changes.md)**.
+
+**Ready for:**
+
+- Declaring a custom binary format and getting typed readers and writers for it.
+- Append-log files whose record count and distinct-key count fit comfortably in
+  RAM alongside the application. This is the default path.
+- Bounded-memory ingest and point lookup over data far larger than RAM — behind
+  the `high-cardinality-dev` feature, which has never shipped in a released
+  version and whose API may still change.
+- Preallocated matrix storage with **fixed dimensions** and a live set whose
+  commit-map page count fits the process memory budget.
+- Reading a file with hostile-input ceilings applied (`ReadLimits::UNTRUSTED`).
+
+**Not ready for:**
+
+- **Matrices that grow.** Dimensions are fixed at create time and there is no
+  grow path, so a matrix cannot represent an indefinitely growing stream. Use the
+  stream/indexed APIs for that.
+- **Frequent matrix opens.** Opening a matrix is not `O(1)`. It is independent of
+  file size, but proportional to the candidate page set: a matrix with **one live
+  page** still reads about **131 KB over 32 pages**. Resident commit metadata is
+  fixed at open, does not track the working set, and is never evicted under the
+  default policy.
+- **Matrices under a tight `max_matrix_bitmap_bytes`.** That ceiling is an
+  *admission* limit, not a cache bound. A matrix whose committed state exceeds it
+  **cannot be opened at all**.
+- **Petabyte-scale merge or compact.** Keyed merge and compact are resident-only.
+  Varve exports no bounded-memory external merge or compact.
+- **Channel-selective reads.** `docs/channel-view-design.md` is a design
+  document, not a feature; nothing in it is callable.
+- **Live views of a file another handle is writing.** Resident readers and eager
+  matrix readers are snapshots as of open.
+- **Anything depending on a fuzz, Miri or ASan pass on this release**, or on the
+  Unix code paths having been executed. Neither has happened; see
+  [Known Limitations §6](docs/known-limitations.md#6-not-verified).
+
 ## What Varve Provides
 
 - Compile-time format declarations with generated typed reader and writer APIs.
@@ -43,9 +84,28 @@ spills to disk. Use `estimate_keyed_merge` to size a run in advance, or the
 ceiling instead of exhausting memory.
 
 Matrix (preallocated) storage is a third mode. Its integrity metadata is paged
-and sparse, so create-time metadata I/O, per-mutation integrity cost, post-open
-bitmap residency, and open-time reads are all bounded by the cells actually
-used rather than by the declared cell count.
+and sparse, so create-time metadata I/O and per-mutation integrity cost are
+bounded by the cells actually used rather than by the declared cell count.
+
+**Open-time reads and post-open bitmap residency are bounded by the live
+*page* count, not by the working set, and open is not `O(1)`.** Under the
+default `MatrixMetadataResidency::EagerVerified` policy, open reads the union of
+the pages named by the persisted page index and the pages the platform's
+allocation map reports as written; a matrix with one live page measured 131,240
+bytes over 32 pages, and one with 64 live pages measured 591,384 bytes and
+524,288 resident. Residency does not change as the caller touches cells and is
+never evicted. `max_matrix_bitmap_bytes` is an admission limit under this policy:
+a matrix whose live set exceeds it cannot be opened. The opt-in
+`MatrixMetadataResidency::Lazy { cache_bytes }` policy bounds residency by a
+declared ceiling with LRU eviction and reads only the persisted page index at
+open, at the cost of moving corruption detection to first touch and giving up a
+consistent snapshot across pages.
+
+Matrix dimensions are fixed at create time; there is no grow path.
+
+Full numbers, arithmetic you can apply to your own cell count, and the trade-offs
+of each policy are in
+[Known Limitations §1](docs/known-limitations.md#1-matrix-opening-a-matrix-is-not-o1-and-its-metadata-residency-is-not-a-cache).
 
 Varve should own the reusable binary-format mechanics. Application-specific
 meaning, domain transforms, and compatibility with an external specification
@@ -56,6 +116,8 @@ remain caller code.
 | Document | Use it for |
 | --- | --- |
 | [Quickstart](docs/quickstart.md) | shortest path from format declaration to write/read |
+| [Known Limitations](docs/known-limitations.md) | what a user actually hits: matrix open cost and residency, resident-API scale, unimplemented features, and what is not verified |
+| [API Changes](docs/api-changes.md) | migrating from 0.3.0: new/changed/removed items, behaviour changes at unchanged signatures, and what happens to existing files |
 | [Changelog](CHANGELOG.md) | release changes and source-compatibility notes |
 | [Declaration And Internals](docs/declaration-and-internals.md) | how the DSL maps to generated Rust API, native bytes, records, fields, indexes, commits, and custom physical layouts |
 | [How Varve Works](docs/how-it-works.md) | mental model of generated code, append logs, matrix storage, durability |
@@ -173,10 +235,17 @@ sidecars written before the generation nonce. Both are regenerated from source
 data; see [CHANGELOG](CHANGELOG.md) and
 [Migration Guide](docs/migration-guide.md).
 The petabyte-scale stream/disk-index API remains behind
-`high-cardinality-dev`. Progress/cancellation, process-interruption recovery,
-and sidecar robustness gates are implemented and executed; the current Windows
-NTFS host cannot execute the required real 1 PiB sparse-offset probe, so that
-platform gate remains open rather than being reported as passed.
+`high-cardinality-dev` and has never shipped in a released version.
+Progress/cancellation, process-interruption recovery, and sidecar robustness
+gates are implemented and executed. The scale gates are not: both positional-I/O
+probes (`real_file_positional_io_at_one_pib` and its 1 TiB smoke sibling) are
+`#[ignore]`d and have never been executed on any host, and the 1 TiB probe has no
+required-mode escape at all. Varve's petabyte-scale claims rest on the cost model
+and on tests at far smaller scales, not on a demonstration at that scale.
+
+For the full assurance picture — including that CI has never run on this code and
+that no fuzz, Miri or ASan run covers it — see
+[Known Limitations §6](docs/known-limitations.md#6-not-verified).
 
 ## Local Verification
 

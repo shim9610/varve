@@ -507,7 +507,7 @@ fn matrix_random_order_write_read_commit_and_append_log_coexist() -> varve::Resu
 
     let file_len = metadata(&path)?.len();
     {
-        let mut reader = spec.open_reader(&path)?;
+        let reader = spec.open_reader(&path)?;
         assert_eq!(
             reader.matrix_cell_status::<MatrixCell>(MatrixKey::new(2, 1))?,
             MatrixCellStatus::Committed
@@ -560,7 +560,7 @@ fn matrix_random_order_write_read_commit_and_append_log_coexist() -> varve::Resu
     }
 
     {
-        let mut reader = spec.open_reader(&path)?;
+        let reader = spec.open_reader(&path)?;
         assert_eq!(
             reader.read_matrix_cell::<MatrixCell>(MatrixKey::new(2, 1))?,
             MatrixCell { value: 22 }
@@ -604,7 +604,7 @@ fn matrix_write_cell_bounds_hostile_encode_at_the_slot_stride() -> varve::Result
     writer.flush()?;
     drop(writer);
 
-    let mut reader = spec.open_reader(&path)?;
+    let reader = spec.open_reader(&path)?;
     assert_eq!(
         reader.read_matrix_cell::<MatrixCell>(MatrixKey::new(0, 0))?,
         MatrixCell { value: 5 }
@@ -777,7 +777,7 @@ fn matrix_p1_p2_extension_points_are_usable() -> varve::Result<()> {
     );
 
     {
-        let mut reader = spec.open_reader(&path)?;
+        let reader = spec.open_reader(&path)?;
         assert_eq!(
             reader.matrix_resume_signal("analysis")?,
             MatrixResumeSignal::Partial {
@@ -858,7 +858,7 @@ fn matrix_durable_barrier_observes_data_then_commit_sync_then_hook() -> varve::R
     );
 
     {
-        let mut reader = spec.open_reader(&path)?;
+        let reader = spec.open_reader(&path)?;
         assert_eq!(
             reader.matrix_cell_status::<MatrixCell>(MatrixKey::new(0, 0))?,
             MatrixCellStatus::Committed
@@ -999,7 +999,7 @@ fn a_commit_sync_failure_is_reported_as_published_and_a_data_sync_failure_is_not
     // The claim the variant makes, verified rather than asserted by shape: the
     // cell really is committed and readable after a clean process exit.
     {
-        let mut reader = spec.open_reader(&path)?;
+        let reader = spec.open_reader(&path)?;
         assert_eq!(
             reader.matrix_cell_status::<MatrixCell>(key)?,
             MatrixCellStatus::Committed
@@ -1087,7 +1087,7 @@ fn matrix_aux_region_is_preallocated_noncommit_storage() -> varve::Result<()> {
     }
 
     {
-        let mut reader = spec.open_reader(&path)?;
+        let reader = spec.open_reader(&path)?;
         assert_eq!(reader.matrix_aux_len("thumbnail")?, 16);
         assert_eq!(reader.read_matrix_aux("thumbnail", 4, 4)?, vec![1, 2, 3, 4]);
         assert!(matches!(
@@ -1164,14 +1164,16 @@ fn matrix_byte_copy_migration_scaffold_copies_compatible_committed_slot() -> var
     }
 
     {
-        let mut reader = source_spec.open_reader(&source_path)?;
+        // Shared borrow: the read side of a byte copy no longer needs an
+        // exclusive handle, so a copy may run beside other readers.
+        let reader = source_spec.open_reader(&source_path)?;
         let mut writer = target_spec.create_writer_with_dims(&target_path, dims)?;
-        writer.copy_matrix_cell_bytes_from::<MatrixCell, OtherMatrixCell>(&mut reader, key)?;
+        writer.copy_matrix_cell_bytes_from::<MatrixCell, OtherMatrixCell>(&reader, key)?;
         writer.flush()?;
     }
 
     {
-        let mut reader = target_spec.open_reader(&target_path)?;
+        let reader = target_spec.open_reader(&target_path)?;
         assert_eq!(
             reader.read_matrix_cell::<OtherMatrixCell>(key)?,
             OtherMatrixCell { value: 123 }
@@ -1476,7 +1478,7 @@ fn matrix_commit_map_crc_corruption_reports_recoverable_region_and_rebuilds() ->
     }
 
     {
-        let mut reader = spec.open_reader(&path)?;
+        let reader = spec.open_reader(&path)?;
         assert_eq!(
             reader.matrix_cell_status::<MatrixCell>(MatrixKey::new(1, 0))?,
             MatrixCellStatus::Committed
@@ -1521,7 +1523,7 @@ fn matrix_slot_crc_corruption_rejects_committed_cell_read() -> varve::Result<()>
     }
 
     {
-        let mut reader = spec.open_reader(&path)?;
+        let reader = spec.open_reader(&path)?;
         assert!(matches!(
             reader.read_matrix_cell::<MatrixCell>(MatrixKey::new(1, 1)),
             Err(Error::MatrixChecksumMismatch { .. })
@@ -1577,7 +1579,7 @@ fn matrix_crc_rebuild_preserves_committed_zero_payloads() -> varve::Result<()> {
     }
 
     {
-        let mut reader = spec.open_reader(&path)?;
+        let reader = spec.open_reader(&path)?;
         assert_eq!(
             reader.read_matrix_cell::<MatrixCell>(zero_key)?,
             MatrixCell { value: 0 }

@@ -1,0 +1,5 @@
+error[E0599]: no function or associated item named `new` found for struct `varve_core::enforcement_probe::CrcValidEvidence` in the current scope
+  --> tests/ui/fail_minted_crc_valid_completeness.rs:16:37
+   |
+16 |     let _minted = CrcValidEvidence::new(unreachable!(), true);
+   |                                     ^^^ function or associated item not found in `varve_core::enforcement_probe::CrcValidEvidence`

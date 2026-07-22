@@ -279,7 +279,10 @@ good at: one pread of the whole payload, one decode.
 - L2: `C` preads across `C` records, likely non-adjacent → **L2 is the layout that penalises
   the row read**, by `C`× the syscalls and up to `C`× the seek distance.
 - Matrix: contiguous (`ordinal = scan·dim1 + ch`), 1 pread of `n_ch·slot_stride` — but there is
-  **no row API**; only `read_matrix_cell` (`&mut self`), so today it is `C` seek+read pairs.
+  **no row API**; only `read_matrix_cell`, so today it is `C` positional reads.
+  (*Correction, round 16:* this line originally said `&mut self` and "seek+read pairs". Both are
+  now false — `read_matrix_cell` takes `&self` and goes through `MatrixRegionReader::read_exact_at`.
+  The absence of a row API is unchanged, so the `C`-syscall verdict below still stands.)
 
 **Target:** 1 pread, `P` bytes, 0 or 1 allocation.
 **Verdict:** serve. Note explicitly in the design that L1 preserves this case and L2 damages it.
@@ -506,12 +509,22 @@ splitting CH1's range across 4 threads.
 
 **What blocks it:**
 
-1. **Matrix reads are `&mut self` for no logical reason.** `read_matrix_cell` (`file.rs:4313`)
-   threads `&mut self.file` into `matrix::read_cell` (`matrix.rs:2727`, signature
-   `file: &mut File`) which does `seek` + `read_exact` (`matrix.rs:2747-2749`). Replacing that
-   pair with `snapshot.read_exact_at(offset, &mut buf)` makes it `&self` with no other change —
-   `matrix_cell_status` right beside it is already `&self` (`file.rs:1648`). **Smallest edit in
-   the repo that unlocks concurrent matrix reads.**
+1. ~~**Matrix reads are `&mut self` for no logical reason.**~~ **LANDED, round 16 — this no longer
+   blocks anything.** It was true when this document was written: `read_matrix_cell` threaded
+   `&mut self.file` into `matrix::read_cell` (signature `file: &mut File`), which did `seek` +
+   `read_exact`. It now takes `&self` on all three handle types (`VarveFile`, `VarveReader`,
+   `VarveWriter`), as do `matrix_cell_payload`, `read_matrix_aux`, `matrix_aux_len` and
+   `matrix_cell_status`. The seek/read pair is replaced by `MatrixRegionReader::read_exact_at`
+   (`matrix.rs`, `mod region_reader`), a `pread`/`seek_read` over an immutable snapshot; there is
+   one per-bitmap `Mutex` in the matrix read path, taken only for `O(1)` map operations and never
+   held across a read (it exists so a demand fault-in can happen under `&self`), and `Sync` is
+   *derived* from the fields rather than asserted. On Windows each reading thread also gets its
+   own `ReOpenFile`-derived handle, because `ReadFile` serialises on the kernel file object. Pinned by `crates/varve/tests/matrix_concurrent_reads.rs`
+   (`every_matrix_read_entry_point_takes_a_shared_borrow` fails the build if any of them takes
+   `&mut self` again; `one_shared_handle_does_not_serialise_concurrent_readers` fails if a convoy
+   is reintroduced). Point 2 below — the Windows cursor hazard — was confirmed and is the reason
+   the escape hatch is `RecordFile::matrix_region_reader(&self)`, whose `&File` is private to its
+   module, rather than a cloned handle.
 2. **Windows cursor hazard — this is a correctness bug waiting, and the design must forbid the
    pattern.** `read_exact_at` on Windows uses `std::os::windows::fs::FileExt::seek_read`
    (`snapshot.rs:257-261`), which reads at an explicit offset **but also moves the handle's file
