@@ -248,9 +248,11 @@ fn merge_compact_bench(records: usize) -> varve::Result<()> {
     );
 
     // BENCH-01: every line that prints a live-value denominator is checked
-    // against the file that line actually produced, not just the last one.
-    // `docs/performance.md` says the run asserts the emitted count for the
-    // merge and compact lines; asserting one of the three made that false.
+    // against the file that line actually produced, not just the last one. The
+    // contract this loop upholds: for each of the three merge and compact lines,
+    // the run reopens the file that line produced and asserts the live-value
+    // count it printed against the blocks actually materialized in that file.
+    // Checking only one of the three left the other two unverified.
     for (label, path) in [
         ("merge keyed files", &merged),
         ("compact merged", &compacted),

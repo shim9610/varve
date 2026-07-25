@@ -19,8 +19,8 @@ use varve::{
     BlockDescriptor, BlockKind, Endian, Error, FormatSpec, IndexPolicy, IntegrityPolicy,
     MatrixBlockDescriptor, MatrixCellStatus, MatrixCommitDescriptor, MatrixCommitKind,
     MatrixCorruptionKind, MatrixCorruptionSeverity, MatrixDimensionDescriptor, MatrixDimensions,
-    MatrixKey, MatrixRecoveryAction, MatrixRecoveryReport, ReadLimits, VarveBlock,
-    VarveMatrixBlock,
+    MatrixKey, MatrixMetadataVerification, MatrixRecoveryAction, MatrixRecoveryReport, ReadLimits,
+    VarveBlock, VarveMatrixBlock,
 };
 
 /// Commit-map page size used by the paged integrity representation.
@@ -303,9 +303,16 @@ fn resident_bitmap_bytes_after_open_do_not_scale_with_cell_count() -> varve::Res
         small, large,
         "resident bitmap bytes scaled with cell count: {small} vs {large}"
     );
-    // One commit-map page plus one checksum-validity page; the never-touched
-    // pages of the large matrix cost nothing.
-    assert_eq!(small, 2 * PAGE_BYTES);
+    // Zero, not "one commit-map page plus one checksum-validity page" as it was
+    // before 0.5.0. Residency is demand-filled: an open materialises no bitmap
+    // payload at all, so the scale-free half of this contract now holds for the
+    // strongest possible reason. The absolute number is asserted because the
+    // equality above is satisfied by any constant — the shape that let "open is
+    // O(1)" stand while open read 128 KiB.
+    assert_eq!(
+        small, 0,
+        "an open materialised {small} bitmap payload bytes; demand residency takes none"
+    );
     Ok(())
 }
 
@@ -1937,37 +1944,42 @@ fn crc_rebuild_refuses_an_incompletely_loaded_validity_index() -> varve::Result<
 // reviewer reads the value rather than a boolean.
 // ---------------------------------------------------------------------------
 
-/// Criterion (A): **open is O(1) in file size** — measured, and *not met*.
+/// Criterion (A): **open is O(1) in file size**, and where the remaining cost of
+/// the default open goes.
 ///
 /// The criterion asks for the bytes read and pages visited at open, for two
 /// matrices differing 4x in cell count with identical live state: they must be
 /// "equal and small". Two independent halves hide behind that phrase and this
-/// test separates them, because only one of them holds.
+/// test separates them, because the two answers have different causes.
 ///
-/// **Equal — holds.** The 4x cell-count ratio does not appear in either number.
+/// **Equal - holds.** The 4x cell-count ratio does not appear in either number.
 /// That is what the paged representation of round 3 bought.
 ///
-/// **Small — does not hold.** Both fixtures hold 64 committed cells, which live
-/// in a *single* commit-map page. Open nevertheless reads roughly 128 KiB over
-/// roughly 32 pages of each map. The cause is the second term of
-/// `pages_to_visit`: the visit set is the persisted page index *union the pages
-/// the filesystem allocation map reports as written*, and a filesystem
-/// allocates in runs, so one written 4 KiB page inside a 128 KiB run puts the
-/// whole run into the visit set. That term exists to catch stray bytes written
-/// into a page the index does not name (`stray_bytes_in_a_skipped_region_are_
-/// still_detected`), so it is an *integrity scan*, not something a read needs.
+/// **Small - holds exactly where verification is not asked for.** Both fixtures
+/// hold 64 committed cells, living in a *single* commit-map page. The default
+/// open still reads tens of KiB over tens of pages of each map, and this test's
+/// predecessor recorded that as an unmet criterion. Its diagnosis was right and
+/// has become the design: the cost is the second term of the verification
+/// candidate set - the persisted page index *union the pages the filesystem
+/// allocation map reports as written* - and a filesystem allocates in runs, so
+/// one written 4 KiB page inside a 128 KiB run puts the whole run into the set.
+/// That term exists to catch stray bytes written into a page the index does not
+/// name (`stray_bytes_in_a_skipped_region_are_still_detected`), so it is an
+/// *integrity scan*, not something a read needs - and since 0.5.0 it is not part
+/// of residency at all. It is `MatrixMetadataVerification::AtOpen`, it retains
+/// one 4096-byte buffer, and declaring `OnDemand` removes it from open.
+///
+/// So the third measurement below is the same open with `OnDemand`: same file,
+/// same residency, no verification pass. The gap between it and the first two is
+/// the price of detecting commit-map damage at open, in bytes, printed rather
+/// than described.
 ///
 /// Why this had to be measured rather than trusted: the round-3 test
-/// `open_bitmap_bytes_read_do_not_scale_with_cell_count` passes today, and it
-/// asserts `large <= small + allowance` — a relation a 128 KiB *constant*
-/// satisfies perfectly. A ratio assertion cannot see an absolute cost, so the
-/// scaling contract was met and the criterion was not.
-///
-/// The assertions below pin the state that *is* true plus the size of the gap,
-/// so making open genuinely O(1) breaks this test loudly instead of leaving a
-/// stale claim in the tree.
+/// `open_bitmap_bytes_read_do_not_scale_with_cell_count` passes, and it asserts
+/// `large <= small + allowance` - a relation a 128 KiB *constant* satisfies
+/// perfectly. A ratio assertion cannot see an absolute cost.
 #[test]
-fn measured_open_cost_is_scale_free_in_cells_but_not_yet_small() -> varve::Result<()> {
+fn measured_open_cost_is_scale_free_and_its_size_is_verification() -> varve::Result<()> {
     const CELLS: u64 = 64;
     let dir = temp_dir("measure-open-cost");
 
@@ -2001,33 +2013,70 @@ fn measured_open_cost_is_scale_free_in_cells_but_not_yet_small() -> varve::Resul
          vs {large_pages}p/{large_bytes}B"
     );
 
-    // The half that does not: the live state is one page and open reads tens of
-    // pages. Both bounds are deliberately generous; the point is that the gap
-    // is two orders of magnitude, not that it is exactly 32 pages.
+    // What the default's remaining cost is: the live state is one page and the
+    // verification pass visits tens of pages. Both bounds are deliberately
+    // generous; the point is that the gap is two orders of magnitude.
     let live_pages = 1u64;
     assert!(
         large_pages >= 4 * live_pages && large_bytes >= 16 * PAGE_BYTES,
-        "(A) the DEFAULT policy's open is now small ({large_pages} pages / {large_bytes} bytes \
-         for {live_pages} live page). Demand loading has landed as \
-         `MatrixMetadataResidency::Lazy` and is measured in `matrix_lazy_residency.rs`; this \
-         test pins what the inert default `EagerVerified` costs, so a change here means the \
-         option stopped being inert."
+        "(A) the default open stopped scanning ({large_pages} pages / {large_bytes} bytes \
+         for {live_pages} live page); stray bytes in a page nothing published would then \
+         never be examined - see `stray_bytes_in_a_skipped_region_are_still_detected`."
+    );
+
+    // And where that cost lives. Same fixture, same residency, verification moved
+    // off the open: what is left is the persisted page index, 8 bytes per live
+    // page instead of 4096.
+    let path = dir.path().join("large.varve");
+    MatrixRecoveryReport::reset_matrix_integrity_counters();
+    drop(
+        spec()
+            .with_read_limits(
+                ReadLimits::STANDARD
+                    .with_matrix_metadata_verification(MatrixMetadataVerification::OnDemand),
+            )
+            .open_readonly(&path)?,
+    );
+    let bare_bytes = MatrixRecoveryReport::matrix_open_bitmap_bytes_read();
+    let bare_pages = MatrixRecoveryReport::matrix_open_bitmap_pages_visited();
+    let map_queried = MatrixRecoveryReport::matrix_open_allocation_map_available();
+    println!(
+        "(A) verification at open: {large_bytes} bytes / {large_pages} pages | on demand: \
+         {bare_bytes} bytes / {bare_pages} pages (allocation map queried: {map_queried})"
+    );
+    assert_eq!(
+        bare_pages, 0,
+        "(A) an open that does not verify visited {bare_pages} commit-map pages"
+    );
+    assert!(
+        bare_bytes * 16 < large_bytes,
+        "(A) moving verification off the open saved almost nothing: {large_bytes} -> {bare_bytes}"
+    );
+    assert!(
+        !map_queried,
+        "(A) an open that does not verify queried the allocation map, whose only reader \
+         is the verification candidate set"
     );
     Ok(())
 }
 
-/// The **outstanding** term of criterion (A), measured rather than glossed.
+/// The term criterion (A) still has, and the term it no longer has.
 ///
-/// Open is O(1) in file size, but it is still `O(live pages)`: every page the
-/// persisted index names is read, digest-checked, and made resident before open
-/// returns. This test holds the cell count and the file size fixed and varies
-/// only how many pages hold live state, so the number it prints is exactly the
-/// term a lazy design would remove.
+/// Successor to `open_cost_still_follows_the_live_page_count`, whose subject was
+/// that every page the persisted index named was read, digest-checked **and made
+/// resident** before open returned. Two of those three still happen and one does
+/// not, so the test now separates them. Cell count and file size are held fixed
+/// and only the number of pages holding live state varies.
 ///
-/// It asserts the growth it *currently* has, so that landing demand loading
-/// makes this test fail loudly instead of leaving a stale claim behind.
+/// * **Bytes read still follow live pages.** The persisted index costs 8 bytes
+///   per live page, and the verification pass reads each candidate page. That is
+///   `O(live pages)` of I/O and is what verification is.
+/// * **Residency does not follow them at all.** No payload page is materialised,
+///   at any live-page count. What an open still holds is the page-index mirror,
+///   which is what makes "not published" answerable without I/O; it is
+///   `O(live pages)` and is measured here so it cannot grow silently.
 #[test]
-fn open_cost_still_follows_the_live_page_count() -> varve::Result<()> {
+fn open_reads_follow_live_pages_but_residency_does_not() -> varve::Result<()> {
     let dir = temp_dir("measure-live-pages");
 
     let mut rows = Vec::new();
@@ -2058,14 +2107,26 @@ fn open_cost_still_follows_the_live_page_count() -> varve::Result<()> {
     let (_, four_bytes, _, four_resident, four_index) = rows[1];
     assert!(
         four_bytes > one_bytes,
-        "the DEFAULT policy no longer reads per live page ({one_bytes} -> {four_bytes}); \
-         demand loading is `MatrixMetadataResidency::Lazy`, measured in \
-         `matrix_lazy_residency.rs`, and must not change what `EagerVerified` does"
+        "the default open no longer reads per live page ({one_bytes} -> {four_bytes}); the \
+         verification pass reads every candidate page and the index costs 8 bytes per live page"
+    );
+    // The term that was removed, asserted as an absolute rather than a ratio.
+    assert_eq!(
+        (one_resident, four_resident),
+        (0, 0),
+        "an open materialised bitmap payload ({one_resident} -> {four_resident}); residency is \
+         demand-filled and materialises none"
+    );
+    // The term that remains, and must stay proportional to live state rather than
+    // to the file.
+    assert!(
+        four_index > one_index,
+        "the page-index mirror stopped tracking live pages ({one_index} -> {four_index}); it \
+         is what makes an unpublished page answerable without I/O"
     );
     assert!(
-        four_resident > one_resident && four_index > one_index,
-        "residency no longer follows the live page count ({one_resident}/{one_index} -> \
-         {four_resident}/{four_index}); rewrite this test against the new design"
+        four_index <= 4 * one_index,
+        "the page-index mirror grew faster than the live set ({one_index} -> {four_index})"
     );
     Ok(())
 }
@@ -2073,15 +2134,16 @@ fn open_cost_still_follows_the_live_page_count() -> varve::Result<()> {
 /// Criterion (B): **memory is bounded by the working set.**
 ///
 /// Measured on a matrix whose live page set is far wider than the configured
-/// `max_matrix_bitmap_bytes` ceiling. The three numbers the criterion asks for
-/// are resident bytes after open, after touching K pages, and after touching
-/// 4K pages.
+/// `max_matrix_bitmap_bytes` ceiling. The criterion asks for three numbers -
+/// resident bytes after open, after touching K pages, and after touching 4K -
+/// and this prints them.
 ///
-/// What this measures today is that the ceiling is **not** a cache bound: it is
-/// a hard admission limit checked at open, so a matrix whose live pages exceed
-/// it does not open with a bounded cache — it refuses to open at all. That is
-/// the honest state of criterion (B), and the numbers are printed rather than
-/// described.
+/// Its predecessor recorded the opposite of the criterion: residency was fixed at
+/// open by the live page count, touching pages moved it neither way, and a
+/// ceiling below the live set refused the open outright instead of bounding
+/// anything. All three are now the other way round, and the third is the one that
+/// mattered most - the ceiling was an availability limit that could leave a
+/// matrix unopenable (`docs/known-limitations.md` section 1.3).
 #[test]
 fn measured_resident_bitmap_bytes_against_the_ceiling() -> varve::Result<()> {
     let dir = temp_dir("measure-ceiling");
@@ -2094,11 +2156,12 @@ fn measured_resident_bitmap_bytes_against_the_ceiling() -> varve::Result<()> {
 
     MatrixRecoveryReport::reset_matrix_integrity_counters();
     let reader = spec().open_readonly(&path)?;
-    let after_open = MatrixRecoveryReport::matrix_open_resident_bitmap_bytes();
+    let after_open = MatrixRecoveryReport::matrix_lazy_cached_bitmap_bytes();
+    let charged_after_open = MatrixRecoveryReport::matrix_open_resident_bitmap_bytes();
     let index_after_open = MatrixRecoveryReport::matrix_resident_page_index_bytes();
     println!(
-        "(B) live_pages={LIVE_PAGES} resident_after_open={after_open} \
-         resident_page_index_after_open={index_after_open}"
+        "(B) live_pages={LIVE_PAGES} cached_after_open={after_open} \
+         charged_after_open={charged_after_open} resident_page_index={index_after_open}"
     );
 
     // Touch K = 1 page, then 4K = 4 pages, through `&self` reads.
@@ -2111,46 +2174,46 @@ fn measured_resident_bitmap_bytes_against_the_ceiling() -> varve::Result<()> {
             );
             let _cell = reader.read_matrix_cell::<ScalingCell>(key(ordinal))?;
         }
-        Ok(MatrixRecoveryReport::matrix_open_resident_bitmap_bytes())
+        Ok(MatrixRecoveryReport::matrix_lazy_cached_bitmap_bytes())
     };
     let after_k = touch(1)?;
     let after_4k = touch(4)?;
     println!("(B) resident_after_touching_K=1_pages={after_k}");
     println!("(B) resident_after_touching_4K=4_pages={after_4k}");
 
-    // The state this measurement records: residency is fixed at open by the
-    // live page count and does not move with the working set at all. Touching
-    // pages neither grows nor shrinks it, because every live page was already
-    // made resident before open returned.
+    // Residency starts at nothing and then follows the working set, one page per
+    // distinct commit-map page addressed. The open charged nothing to the budget
+    // either: a demand-cached page is bounded by the cache rather than admitted
+    // through the budget.
+    assert_eq!(after_open, 0, "(B) the open cached {after_open} bytes");
+    assert_eq!(charged_after_open, 0);
+    assert_eq!(after_k, PAGE_BYTES, "(B) K=1 page must cost one page");
     assert_eq!(
-        after_open, after_k,
-        "(B) residency moved when the working set did; if demand loading has \
-         landed this test states a stale fact and must be rewritten"
-    );
-    assert_eq!(after_k, after_4k);
-    assert!(
-        after_open >= LIVE_PAGES * PAGE_BYTES,
-        "(B) resident bytes {after_open} are below one page per live page, which \
-         would mean demand loading has landed"
+        after_4k,
+        4 * PAGE_BYTES,
+        "(B) 4K pages must cost four pages"
     );
     drop(reader);
 
-    // And the ceiling is an admission limit, not a cache bound: a limit below
-    // the live page set refuses the open outright rather than evicting.
+    // And the ceiling is a cache bound, not an admission limit: a limit below the
+    // live page set opens, serves every live page, and stays inside the bound. The
+    // matrix that could not be opened at all is openable.
     let ceiling = LIVE_PAGES * PAGE_BYTES / 2;
     let tight = spec().with_read_limits(ReadLimits::STANDARD.with_max_matrix_bitmap_bytes(ceiling));
-    let refused = tight.open_readonly(&path);
-    println!("(B) open with max_matrix_bitmap_bytes={ceiling}: {refused:?}");
+    MatrixRecoveryReport::reset_matrix_integrity_counters();
+    let bounded = tight.open_readonly(&path)?;
+    for page in 0..LIVE_PAGES {
+        assert_eq!(
+            bounded.matrix_cell_status::<ScalingCell>(key(page * PAGE_BYTES * 8))?,
+            MatrixCellStatus::Committed,
+            "(B) page {page} of a matrix whose live set exceeds the ceiling"
+        );
+    }
+    let cached = MatrixRecoveryReport::matrix_lazy_cached_bitmap_bytes();
+    println!("(B) open with max_matrix_bitmap_bytes={ceiling}: cached={cached}");
     assert!(
-        matches!(
-            refused,
-            Err(Error::LimitExceeded {
-                resource: "matrix bitmap bytes",
-                ..
-            })
-        ),
-        "(B) the bitmap ceiling behaved as a cache bound rather than an \
-         admission limit; rewrite this test against the new design: {refused:?}"
+        cached <= ceiling,
+        "(B) residency {cached} exceeded the ceiling {ceiling} it is derived from"
     );
     Ok(())
 }

@@ -227,18 +227,19 @@ bit means `NotCommitted` regardless of slot bytes.
 For overwrite, Varve clears the old commit and CRC-valid evidence before the
 first slot byte is changed. A partial slot write therefore remains hidden and
 poisons the writer. Matrix readers must still be coordinated with in-place
-writes: under the default `MatrixMetadataResidency::EagerVerified` an
-already-open reader owns a commit-map snapshot but does not own a copy of the
-slot region.
+writes, and since 0.5.0 the coordination is entirely the caller's: a reader owns
+**no commit-map snapshot at all**.
 
-Under `MatrixMetadataResidency::Lazy { cache_bytes }` the reader owns **no
-commit-map snapshot at all**. Each commit-map page is read at the first touch
-that faults it in and may be evicted and re-read later, so different pages can
-reflect different instants and a page faulted in after a concurrent commit
-reflects that commit. A lazy reader is therefore not a fixed point in time to
-coordinate against; use `EagerVerified` where a pinned snapshot across all pages
-is required. See
-[Known Limitations §1.4](known-limitations.md#14-what-the-lazy-policy-does-and-does-not-fix).
+`MatrixMetadataResidency` is always the bounded demand cache, so each commit-map
+page is read at the first touch that faults it in and may be evicted and re-read
+later. Different pages can therefore reflect different instants, and a page
+faulted in after a concurrent commit reflects that commit. A reader is not a fixed
+point in time to coordinate against. The removed `EagerVerified` policy was the
+only mechanism that pinned a whole-map snapshot, and it did so by holding the
+entire live set resident for the session; there is no replacement, and a reader
+that needs one instant must coordinate it. See
+[Known Limitations §1.4](known-limitations.md#14-lazy-is-the-default-verification-is-what-still-happens-at-open)
+and [API Changes §A.3](api-changes.md#a3-matrixmetadataresidencyeagerverified-is-removed-and-default-is-now-lazy).
 
 Append-log transaction markers follow the same explicit durability principle.
 `commit()` writes a logical visibility marker for

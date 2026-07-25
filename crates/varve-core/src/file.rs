@@ -2083,6 +2083,15 @@ impl VarveReader {
         self.file.matrix_recovery_report()
     }
 
+    /// Verifies this matrix's commit metadata now, and reports what was found.
+    ///
+    /// See [`VarveFile::verify_matrix_metadata`]: the same pass a
+    /// `MatrixMetadataVerification::AtOpen` open runs, on demand, retaining one
+    /// page buffer. It reports; it does not arm the quarantine.
+    pub fn verify_matrix_metadata(&self) -> Result<MatrixRecoveryReport> {
+        self.file.verify_matrix_metadata()
+    }
+
     #[cfg(feature = "mmap")]
     /// Maps the file's indexed record payloads as a read-only snapshot.
     ///
@@ -2660,6 +2669,15 @@ impl VarveWriter {
 
     pub fn matrix_recovery_report(&self) -> MatrixRecoveryReport {
         self.file.matrix_recovery_report()
+    }
+
+    /// Verifies this matrix's commit metadata now, and reports what was found.
+    ///
+    /// See [`VarveFile::verify_matrix_metadata`]: the same pass a
+    /// `MatrixMetadataVerification::AtOpen` open runs, on demand, retaining one
+    /// page buffer. It reports; it does not arm the quarantine.
+    pub fn verify_matrix_metadata(&self) -> Result<MatrixRecoveryReport> {
+        self.file.verify_matrix_metadata()
     }
 }
 
@@ -5005,6 +5023,37 @@ impl VarveFile {
                 recommended_actions: Vec::new(),
             },
         }
+    }
+
+    /// Verifies this matrix's commit metadata now, and reports what was found.
+    ///
+    /// The on-demand half of `MatrixMetadataVerification`. A matrix opened under
+    /// `MatrixMetadataVerification::AtOpen` — the default — has already had this
+    /// pass run, and its findings are in `matrix_recovery_report`; one opened
+    /// under `OnDemand` has not, and this is how a caller asks. Running it twice
+    /// is allowed and answers the same thing.
+    ///
+    /// What it does: reads every page of every commit map named by the persisted
+    /// page index **unioned with** the platform allocation map — the second term
+    /// is what sees stray bytes in a page nothing ever published — authenticates
+    /// each against its stored digest, and reports the `Recoverable` commit-map
+    /// findings and the `RebuildCommitMap` / `ClearCategory` recommendations that
+    /// follow. Cost: `O(live pages + allocated pages)` bytes read, one 4096-byte
+    /// buffer retained, no matter the matrix's size.
+    ///
+    /// What it does **not** do: arm the quarantine
+    /// (`Error::MatrixCommitQuarantined`) or gate a writer. That gate is derived
+    /// once, at open, from the findings the layout is assembled with; a caller who
+    /// needs a damaged category failed closed reopens with `AtOpen`.
+    ///
+    /// `Err(Error::MatrixLayoutMissing)` when this file has no matrix.
+    pub fn verify_matrix_metadata(&self) -> Result<MatrixRecoveryReport> {
+        let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
+        // A private duplicate of the descriptor, so the pass needs no borrow of
+        // the handle a writer holds and can run under `&self` like every other
+        // matrix read.
+        let mut file = self.snapshot.try_clone_file()?;
+        crate::matrix::verify_matrix_metadata(matrix, &mut file)
     }
 
     pub fn inspect_writer_lock<P: AsRef<Path>>(path: P) -> Result<Option<WriterLockInfo>> {

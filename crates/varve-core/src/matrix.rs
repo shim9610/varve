@@ -569,9 +569,10 @@ const MAX_TRACKED_EXTENTS: usize = 8192;
 /// visibility, not a path that accepts unchecked bytes. Every persisted-index
 /// page is verified on every platform.
 ///
-/// This map is a *secondary* source. Open enumerates the union of it and the
-/// persisted page index in `O(Q)` for `Q` candidate pages (see
-/// [`pages_to_visit`]), never `O(cell_count)`.
+/// This map is a *secondary* source. A verifying open *streams* the union of it
+/// and the persisted page index in `O(Q)` for `Q` candidate pages (see
+/// [`for_each_candidate_page`]), never `O(cell_count)`, and materialises no list
+/// of them.
 ///
 /// `None` means "unknown": the platform or filesystem cannot answer, or the
 /// file is fragmented past [`MAX_TRACKED_EXTENTS`]. Enumeration then comes from
@@ -627,21 +628,24 @@ impl AllocatedExtents {
         matches!(self.ranges.get(index), Some((start, _)) if *start < end)
     }
 
-    /// Appends every `unit`-sized slot of `[base, base + len)` that overlaps an
+    /// Visits every `unit`-sized slot of `[base, base + len)` that overlaps an
     /// allocated range, in ascending order.
     ///
     /// PERF-01: the walk is over ranges, not over slots, so its cost is
     /// proportional to the *allocated* part of the region and never to the
-    /// region's logical size. This is what lets open enumerate the pages that
-    /// may hold bytes without a `0..page_count` loop.
-    fn allocated_units(
+    /// region's logical size. This is what lets verification enumerate the pages
+    /// that may hold bytes without a `0..page_count` loop.
+    ///
+    /// A callback rather than an `out: &mut Vec<u64>` (0.5.0): the collected form
+    /// was `Theta(A)` retained memory in a pass whose whole contract is that it
+    /// retains one page buffer, and nothing needs the units twice.
+    fn for_each_allocated_unit(
         &self,
         base: u64,
         len: u64,
         unit: u64,
         unit_count: u64,
-        out: &mut Vec<u64>,
-        resource: &'static str,
+        visit: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<()> {
         if len == 0 || unit == 0 || unit_count == 0 {
             return Ok(());
@@ -664,14 +668,8 @@ impl AllocatedExtents {
             if first > last {
                 continue;
             }
-            let count = last - first + 1;
-            try_reserve_vec(
-                out,
-                usize::try_from(count).map_err(|_| Error::InvalidMatrixLayout)?,
-                resource,
-            )?;
             for unit_index in first..=last {
-                out.push(unit_index);
+                visit(unit_index)?;
             }
         }
         Ok(())
@@ -1167,14 +1165,7 @@ fn record_open_resident_bitmap_bytes(layout: &MatrixLayout) {
     let commits: u64 = layout
         .commits
         .iter()
-        .map(|commit| {
-            commit.bits.resident_bytes()
-                + commit
-                    .quarantined_raw_bits
-                    .as_ref()
-                    .map(SparseBitmap::resident_bytes)
-                    .unwrap_or(0)
-        })
+        .map(|commit| commit.bits.resident_bytes())
         .sum();
     let blocks: u64 = layout
         .blocks
@@ -2051,21 +2042,16 @@ impl SparseBitmap {
         let mut bytes = filled_bytes_for(len, 0, ReadLimitKey::MatrixBitmapBytes.resource())?;
         reader.read_exact_at(offset, &mut bytes)?;
         count_lazy_fault_bytes_read(len);
-        // The digest check that `EagerVerified` performs at open happens here
-        // instead, on the page that is about to be believed. This is the
-        // declared consequence of the option, not an omission: a page never
-        // touched is never checked, and a page that is touched is checked
-        // before a single bit of it is reported.
+        // The page about to be believed is authenticated here, through the same
+        // decision the streaming verification pass uses
+        // ([`page_bytes_are_authentic`]). A verification pass is a verdict on the
+        // whole map; this is the guarantee that no *read* ever answers from
+        // unverified bytes, and it holds whether or not that pass ran.
         if let Some(base) = backing.digest_base {
             let digest_offset = page_digest_offset(base, page)?;
             let (stored, state) = read_page_digest_at(reader, digest_offset)?;
             count_lazy_fault_bytes_read(PAGE_DIGEST_LEN);
-            let ok = match state {
-                PAGE_STATE_UNINITIALIZED => stored == 0 && bytes.iter().all(|byte| *byte == 0),
-                PAGE_STATE_INITIALIZED => crc32_bytes(&bytes)? == stored,
-                _ => false,
-            };
-            if !ok {
+            if !page_bytes_are_authentic(&bytes, stored, state)? {
                 return Err(Error::MatrixFatalCorruption);
             }
         }
@@ -2499,49 +2485,6 @@ impl SparseBitmap {
         self.set_byte(index, next)
     }
 
-    // Loading never materialises an all-zero page, so residency after open is
-    // proportional to the pages that carry state rather than to the cell count.
-    fn insert_loaded_page(&mut self, page: u64, bytes: Vec<u8>) -> Result<u64> {
-        let page_len = self.page_len(page)?;
-        if usize_to_u64(bytes.len())? != page_len {
-            return Err(Error::InvalidMatrixLayout);
-        }
-        // A page index recovered from a crash-interrupted append may name the
-        // same page twice; loading it twice must not double-count its bits.
-        if self.store_mut().pages.contains_key(&page) {
-            return Ok(0);
-        }
-        let ones = bytes
-            .iter()
-            .try_fold(0u64, |acc, byte| {
-                acc.checked_add(u64::from(byte.count_ones()))
-            })
-            .ok_or(Error::InvalidMatrixLayout)?;
-        if ones == 0 {
-            return Ok(0);
-        }
-        let store = self.store_mut();
-        try_reserve_map(
-            &mut store.pages,
-            1,
-            ReadLimitKey::MatrixBitmapBytes.resource(),
-        )?;
-        store.pages.insert(
-            page,
-            BitmapPage {
-                bytes: Arc::new(bytes),
-                ones,
-                cached: false,
-            },
-        );
-        store.charged_bytes = store.charged_bytes.saturating_add(page_len);
-        store.ones = store
-            .ones
-            .checked_add(ones)
-            .ok_or(Error::InvalidMatrixLayout)?;
-        Ok(page_len)
-    }
-
     /// Drops every page *and* the persisted-index tracking, which is what a
     /// whole-map clear or rebuild does on disk as well.
     fn clear(&mut self) {
@@ -2567,17 +2510,25 @@ impl SparseBitmap {
 
     /// Set bits held by the whole map, whatever the cache currently holds.
     ///
-    /// Eager maps answer from the maintained counter. A lazily backed map
-    /// reads each published page it is not holding and counts it *without*
-    /// caching it, so an aggregate query costs `O(live pages)` of I/O and
-    /// leaves residency where it found it rather than pulling the whole live
-    /// set into memory.
+    /// A session-only map (no backing) answers from the maintained counter. A
+    /// backed map reads each published page it is not holding and counts it
+    /// *without* caching it, so an aggregate query costs `O(live pages)` of I/O,
+    /// retains one page buffer, and leaves residency where it found it rather
+    /// than pulling the whole live set into memory.
+    ///
+    /// Every page it reads is authenticated, through the same
+    /// [`page_bytes_are_authentic`] decision the fault-in and the verification
+    /// pass use. Without that this was the one place a *count* could be derived
+    /// from bytes nothing had checked — an aggregate is an answer like any other,
+    /// and a damaged page must refuse rather than contribute a number.
     fn ones_total(&self) -> Result<u64> {
         let Some(backing) = self.backing.as_ref() else {
             return Ok(self.ones());
         };
         let store = self.store();
+        let reader = MatrixRegionReader::new(backing.file.as_ref());
         let mut total = 0u64;
+        let mut buffer: Option<PageVerifyBuffer> = None;
         for page in self.indexed_pages.keys().copied() {
             if let Some(held) = store.pages.get(&page) {
                 total = total.saturating_add(held.ones);
@@ -2588,10 +2539,20 @@ impl SparseBitmap {
                 .checked_mul(BITMAP_PAGE_BYTES)
                 .and_then(|delta| backing.base_offset.checked_add(delta))
                 .ok_or(Error::InvalidMatrixLayout)?;
-            let mut bytes = filled_bytes_for(len, 0, ReadLimitKey::MatrixBitmapBytes.resource())?;
-            MatrixRegionReader::new(backing.file.as_ref()).read_exact_at(offset, &mut bytes)?;
+            let buffer = match buffer.as_mut() {
+                Some(buffer) => buffer,
+                None => buffer.insert(PageVerifyBuffer::new()?),
+            };
+            let bytes = buffer.read(reader, offset, len)?;
             count_lazy_fault_bytes_read(len);
-            for byte in &bytes {
+            if let Some(base) = backing.digest_base {
+                let (stored, state) = read_page_digest_at(reader, page_digest_offset(base, page)?)?;
+                count_lazy_fault_bytes_read(PAGE_DIGEST_LEN);
+                if !page_bytes_are_authentic(bytes, stored, state)? {
+                    return Err(Error::MatrixFatalCorruption);
+                }
+            }
+            for byte in bytes {
                 total = total.saturating_add(u64::from(byte.count_ones()));
             }
         }
@@ -3364,21 +3325,16 @@ fn page_digest_offset(base: u64, page: u64) -> Result<u64> {
         .ok_or(Error::InvalidMatrixLayout)
 }
 
-/// Positional companion to [`read_page_digest`], for the demand fault-in path,
-/// which has a shared borrow of the file and no cursor to move.
+/// Reads one page-digest slot: `(checksum, state)`.
+///
+/// The only reader of that slot. It was one of two — the other seeked a
+/// `&mut File` cursor and served the eager load — and the pair went with the
+/// eager load in 0.5.0: both the streaming verification pass and the demand
+/// fault-in hold a shared borrow and address the slot positionally, so there is
+/// one reader and no cursor to move.
 fn read_page_digest_at(reader: MatrixRegionReader<'_>, offset: u64) -> Result<(u32, u32)> {
     let mut bytes = [0; PAGE_DIGEST_LEN as usize];
     reader.read_exact_at(offset, &mut bytes)?;
-    Ok((
-        u32::from_le_bytes(bytes[0..4].try_into().expect("slice")),
-        u32::from_le_bytes(bytes[4..8].try_into().expect("slice")),
-    ))
-}
-
-fn read_page_digest(file: &mut File, offset: u64) -> Result<(u32, u32)> {
-    file.seek(SeekFrom::Start(offset))?;
-    let mut bytes = [0; PAGE_DIGEST_LEN as usize];
-    file.read_exact(&mut bytes)?;
     Ok((
         u32::from_le_bytes(bytes[0..4].try_into().expect("slice")),
         u32::from_le_bytes(bytes[4..8].try_into().expect("slice")),
@@ -3498,7 +3454,17 @@ struct MatrixCommitLayout {
     bit_count: u64,
     map_offset: u64,
     bits: SparseBitmap,
-    quarantined_raw_bits: Option<SparseBitmap>,
+    /// The category's quarantine, and the *only* representation of it.
+    ///
+    /// Until 0.5.0 quarantine was represented twice: this finding, plus a
+    /// `quarantined_raw_bits: Option<SparseBitmap>` that held the damaged map the
+    /// eager load had already retained, with an empty replacement installed in
+    /// `bits`. Every gate then asked the *copy* whether the category was
+    /// quarantined. With verification streaming and retaining nothing there is no
+    /// copy to ask, so the finding is the flag: `Some` means every access to this
+    /// category fails closed with [`Error::MatrixCommitQuarantined`], and the two
+    /// recovery paths that clear it — `clear_matrix_category` and
+    /// `rebuild_commit_map_from_crc` — clear this one field.
     quarantine_finding: Option<MatrixRecoveryFinding>,
     digest_offset: Option<u64>,
     /// Base offset of this category's persisted page index (PERF-01).
@@ -4018,26 +3984,29 @@ pub(crate) fn read_layout_at_len(
         &[&dimension_table, &block_table, &category_table],
         commit_plans.len(),
     )?;
-    // PERF-01/PERF-02: the persisted page index names the pages this matrix has
-    // ever published, and one allocation-map query names the pages the
-    // filesystem says hold bytes. Open visits their union, so it never loops
-    // over logical pages and never degrades to full logical bitmap I/O when the
-    // platform cannot answer.
-    //
-    // Under `MatrixMetadataResidency::Lazy` neither term is used: open reads
-    // the page index and stops, so it asks the filesystem nothing. That is the
-    // whole of criterion (A)'s remaining gap — the allocation term is what
-    // dragged a ~128 KiB NTFS run into an open with one live page — and it is
-    // removed by not asking, not by filtering the answer.
-    let lazy = LazyResidency::declared(spec.read_limits, file)?;
-    let extents = match lazy {
-        Some(_) => None,
-        None => AllocatedExtents::query(file),
+    // Residency first, and unconditionally: every bitmap this open produces is
+    // demand-filled and bounded by the declared cache, so open reads the
+    // persisted page index and retains no payload page.
+    let residency = LazyResidency::declared(spec.read_limits, file)?;
+    // Then verification, which is a separate decision and the only reader of the
+    // allocation map. PERF-01/PERF-02: the persisted page index names the pages
+    // this matrix has ever published, and one allocation-map query names the
+    // pages the filesystem says hold bytes; the pass visits their union, so it
+    // never loops over logical pages and never degrades to full logical bitmap
+    // I/O when the platform cannot answer. Where verification is
+    // `OnDemand` the map is not queried at all — the query costs a syscall and
+    // drags a ~128 KiB NTFS run into an open with one live page, and nothing
+    // would read the answer.
+    let verify = spec.read_limits.admit_matrix_metadata_verification();
+    let extents = match verify {
+        true => AllocatedExtents::query(file),
+        false => None,
     };
     record_open_allocation_map(extents.as_ref());
     let sources = PageSources {
         extents: extents.as_ref(),
-        lazy: lazy.as_ref(),
+        residency: &residency,
+        verify,
     };
     let mut budget = ResidentBitmapBudget::new(spec.read_limits);
     let commit_bits = load_commit_bitmaps(
@@ -4366,7 +4335,17 @@ pub(crate) fn clear_category(
 ) -> Result<u64> {
     let allowed = layout.ensure_fatal_access_allowed()?;
     let commit_index = layout.commit_index(&allowed, category)?;
-    let cleared = count_committed(&layout.commits[commit_index])?;
+    // A whole-category clear is the *recovery* for a quarantined category, so it
+    // deliberately does not go through the quarantine refusal. What it cannot do
+    // is count the bits it is discarding: they are the damaged ones, and
+    // `count_committed` authenticates what it reads. It reported zero before
+    // 0.5.0 as well — quarantine installed an empty replacement map and the count
+    // came from that — so this states what was previously emergent instead of
+    // failing the one recovery path the report recommends.
+    let cleared = match layout.commits[commit_index].quarantine_finding.is_some() {
+        true => 0,
+        false => count_committed(&layout.commits[commit_index])?,
+    };
     let commit_kind = layout.commits[commit_index].kind;
     let map_offset = layout.commits[commit_index].map_offset;
     let digest_offset = layout.commits[commit_index].digest_offset;
@@ -4383,37 +4362,20 @@ pub(crate) fn clear_category(
     };
 
     // Everything the category held becomes non-resident again: the commit
-    // bitmap's payload pages, the quarantined copy of that map, the validity
-    // bitmap this clear drops with them, and the page-index tracking of all
-    // three. F-01: both budget terms are totalled *before* anything is cleared,
-    // because `SparseBitmap::clear` drops the pages and the index mirror the
-    // totals are derived from, and refunding only the payload term left the
-    // page-index charge — and the validity bitmap's payload charge — standing
-    // for memory that had already been released. Repeated populate/clear cycles
-    // then accumulated phantom residency until the budget refused a matrix that
-    // held nothing.
-    let mut released_pages = layout.commits[commit_index]
-        .bits
-        .resident_bytes()
-        .checked_add(
-            layout.commits[commit_index]
-                .quarantined_raw_bits
-                .as_ref()
-                .map(SparseBitmap::resident_bytes)
-                .unwrap_or(0),
-        )
-        .ok_or(Error::InvalidMatrixLayout)?;
-    let mut released_index = layout.commits[commit_index]
-        .bits
-        .resident_index_bytes()
-        .checked_add(
-            layout.commits[commit_index]
-                .quarantined_raw_bits
-                .as_ref()
-                .map(SparseBitmap::resident_index_bytes)
-                .unwrap_or(0),
-        )
-        .ok_or(Error::InvalidMatrixLayout)?;
+    // bitmap's payload pages, the validity bitmap this clear drops with them, and
+    // the page-index tracking of both. F-01: both budget terms are totalled
+    // *before* anything is cleared, because `SparseBitmap::clear` drops the pages
+    // and the index mirror the totals are derived from, and refunding only the
+    // payload term left the page-index charge — and the validity bitmap's payload
+    // charge — standing for memory that had already been released. Repeated
+    // populate/clear cycles then accumulated phantom residency until the budget
+    // refused a matrix that held nothing.
+    //
+    // A quarantined category used to add a third term here, the retained copy of
+    // the damaged map. Verification retains nothing, so there is no copy and no
+    // term (0.5.0).
+    let mut released_pages = layout.commits[commit_index].bits.resident_bytes();
+    let mut released_index = layout.commits[commit_index].bits.resident_index_bytes();
     if let Some((block_index, _)) = cleared_valid {
         released_pages = released_pages
             .checked_add(layout.blocks[block_index].crc_valid_bits.resident_bytes())
@@ -4504,7 +4466,8 @@ pub(crate) fn clear_category(
     {
         let commit = &mut layout.commits[commit_index];
         commit.bits.clear();
-        commit.quarantined_raw_bits = None;
+        // Lifting the quarantine is one assignment, because the quarantine is one
+        // field.
         commit.quarantine_finding = None;
     }
     layout.resident_bitmap_bytes = next_resident_pages;
@@ -4660,7 +4623,12 @@ pub(crate) fn verify_payload_crc_bytes(
 }
 
 pub(crate) fn resume_signal(layout: &MatrixLayout, category: &str) -> Result<MatrixResumeSignal> {
-    let allowed = layout.ensure_fatal_access_allowed()?;
+    // A progress figure is an answer like any other, so a quarantined category
+    // refuses it. Before 0.5.0 quarantine answered here from the empty
+    // replacement map it installed, i.e. it reported `Clean` — "nothing in
+    // progress" — for a category whose commit map is known to be damaged. There
+    // is no map left to answer from and no honest answer to give.
+    let allowed = ensure_commit_publishable(layout, category)?;
     let commit = &layout.commits[layout.commit_index(&allowed, category)?];
     let committed = count_committed(commit)?;
     if committed == 0 || committed == commit.bit_count {
@@ -4678,7 +4646,8 @@ pub(crate) fn sidecar_resume_signal(
     category: &str,
     sidecar_exists: bool,
 ) -> Result<MatrixResumeSignal> {
-    let allowed = layout.ensure_fatal_access_allowed()?;
+    // Quarantined refuses, for the reason given on `resume_signal`.
+    let allowed = ensure_commit_publishable(layout, category)?;
     layout.read_limits.check(ReadLimitKey::SidecarLen, 0)?;
     let commit = &layout.commits[layout.commit_index(&allowed, category)?];
     let committed = count_committed(commit)?;
@@ -4787,6 +4756,94 @@ pub(crate) fn matrix_sidecar_read_plan(
 }
 
 pub(crate) fn recovery_report(layout: &MatrixLayout) -> MatrixRecoveryReport {
+    report_from(layout, None)
+}
+
+/// The finding a failed verification raises for one commit category.
+///
+/// One spelling, because the open-time pass and the on-demand pass must report
+/// the same damage with the same words; a caller matching on the message of one
+/// would otherwise miss the other.
+fn commit_map_finding(name: &str) -> MatrixRecoveryFinding {
+    MatrixRecoveryFinding {
+        kind: MatrixCorruptionKind::CommitMap,
+        severity: MatrixCorruptionSeverity::Recoverable,
+        message: format!("matrix commit map page crc mismatch for {name}"),
+    }
+}
+
+/// Runs the streaming verification pass now, and reports what it found.
+///
+/// The on-demand half of [`crate::MatrixMetadataVerification`]: the same pass an
+/// [`crate::MatrixMetadataVerification::AtOpen`] open runs, over the same
+/// candidate set — the persisted page index each map already holds, unioned with
+/// a fresh allocation-map query — through the same
+/// [`verify_paged_bitmap`], authenticating with the same
+/// [`page_bytes_are_authentic`]. Peak retention is one 4096-byte buffer, so the
+/// call is `O(1)` in memory for any matrix.
+///
+/// # It reports; it does not quarantine
+///
+/// A finding it produces does **not** arm [`Error::MatrixCommitQuarantined`] and
+/// does not gate a writer, because the fail-closed gate is derived once, from the
+/// findings the layout is assembled with, and nothing outside
+/// `mod fatal_access` may install one afterwards — that is the round-16 rule this
+/// call is not permitted to launder. A caller that wants the gate reopens with
+/// `AtOpen`; a caller that wants to know reads this report. `&MatrixLayout` in the
+/// signature is the mechanical half of that promise: this function cannot mutate
+/// the layout's state at all.
+pub(crate) fn verify_matrix_metadata(
+    layout: &MatrixLayout,
+    file: &mut File,
+) -> Result<MatrixRecoveryReport> {
+    let extents = AllocatedExtents::query(file);
+    let mut buffer = PageVerifyBuffer::new()?;
+    let mut fresh = HashMap::new();
+    try_reserve_map(
+        &mut fresh,
+        layout.commits.len(),
+        ReadLimitKey::MatrixBitmapBytes.resource(),
+    )?;
+    for commit in &layout.commits {
+        let Some(digest_base) = commit.digest_offset else {
+            // No digest array: the region is unauthenticated by design (integrity
+            // disabled), so there is nothing to verify and nothing to report.
+            continue;
+        };
+        let intact = verify_paged_bitmap(
+            MatrixRegionReader::new(&*file),
+            extents.as_ref(),
+            &commit.bits,
+            commit.map_offset,
+            digest_base,
+            &mut buffer,
+        )?;
+        if !intact {
+            fresh.insert(commit.name.clone(), commit_map_finding(&commit.name));
+        }
+    }
+    Ok(report_from(layout, Some(&fresh)))
+}
+
+/// Assembles the report from this layout's findings, optionally adding a freshly
+/// computed set of per-category commit-map findings.
+///
+/// One assembly implementation, two callers: [`recovery_report`] passes `None`
+/// and reports the quarantine state the open established, while
+/// [`verify_matrix_metadata`] passes the findings its streaming pass just
+/// produced. A second copy of this walk would be a second answer to "what does
+/// this matrix recommend", which is precisely the class of defect the
+/// residency/verification split was made to remove.
+///
+/// A fresh finding *adds to* the stored one rather than replacing it: a category
+/// quarantined at open stays in the report even if a later pass over the same
+/// bytes were to disagree, because the fail-closed gate that quarantine armed is
+/// still refusing every access to it. A report that contradicted the gate would
+/// be worse than a stale one.
+fn report_from(
+    layout: &MatrixLayout,
+    fresh: Option<&HashMap<String, MatrixRecoveryFinding>>,
+) -> MatrixRecoveryReport {
     let mut findings = layout.crc_findings.clone();
     let mut recommended_actions = findings
         .iter()
@@ -4809,7 +4866,13 @@ pub(crate) fn recovery_report(layout: &MatrixLayout) -> MatrixRecoveryReport {
         recommended_actions.push(MatrixRecoveryAction::RebuildCommitMap { category: None });
     }
     for commit in &layout.commits {
-        if let Some(finding) = &commit.quarantine_finding {
+        let quarantine = match fresh {
+            Some(fresh) => fresh
+                .get(&commit.name)
+                .or(commit.quarantine_finding.as_ref()),
+            None => commit.quarantine_finding.as_ref(),
+        };
+        if let Some(finding) = quarantine {
             findings.push(finding.clone());
             recommended_actions.push(match commit.kind {
                 MatrixCommitKind::Cell => MatrixRecoveryAction::RebuildCommitMap {
@@ -4941,17 +5004,7 @@ pub(crate) fn rebuild_commit_map_from_crc<T: VarveMatrixBlock>(
     // the first destructive write rather than after it. `write_commit_map_pages`
     // moves only the index term of the budget, so the payload total computed
     // here stays correct across it.
-    let released = commit
-        .bits
-        .resident_bytes()
-        .checked_add(
-            commit
-                .quarantined_raw_bits
-                .as_ref()
-                .map(SparseBitmap::resident_bytes)
-                .unwrap_or(0),
-        )
-        .ok_or(Error::InvalidMatrixLayout)?;
+    let released = commit.bits.resident_bytes();
     let next_resident_pages = budget
         .pages
         .checked_sub(released)
@@ -4984,15 +5037,8 @@ pub(crate) fn rebuild_commit_map_from_crc<T: VarveMatrixBlock>(
     }
     let commit = &mut layout.commits[commit_index];
     // The replaced map's own page-index tracking goes with it.
-    let released_index = commit.bits.resident_index_bytes().saturating_add(
-        commit
-            .quarantined_raw_bits
-            .as_ref()
-            .map(SparseBitmap::resident_index_bytes)
-            .unwrap_or(0),
-    );
+    let released_index = commit.bits.resident_index_bytes();
     commit.bits = rebuilt;
-    commit.quarantined_raw_bits = None;
     commit.quarantine_finding = None;
     budget.pages = next_resident_pages;
     budget.release_index(released_index);
@@ -5110,7 +5156,7 @@ fn block_index_for_category(
 fn ensure_commit_publishable(layout: &MatrixLayout, category: &str) -> Result<FatalAccessAllowed> {
     let allowed = layout.ensure_fatal_access_allowed()?;
     let commit = &layout.commits[layout.commit_index(&allowed, category)?];
-    if commit.quarantined_raw_bits.is_some() {
+    if commit.quarantine_finding.is_some() {
         return Err(Error::MatrixCommitQuarantined(category.to_string()));
     }
     Ok(allowed)
@@ -5213,7 +5259,7 @@ fn prepare_commit_bit(
 ) -> Result<CommitBitUpdate> {
     layout.ensure_fatal_access_allowed()?;
     let commit = &layout.commits[commit_index];
-    if commit.quarantined_raw_bits.is_some() {
+    if commit.quarantine_finding.is_some() {
         return Err(Error::MatrixCommitQuarantined(commit.name.clone()));
     }
     let bitmap = prepare_bitmap_update(
@@ -6720,31 +6766,22 @@ fn layout_from_parts(
         if raw_bits.byte_len != map_len {
             return Err(Error::InvalidMatrixLayout);
         }
+        // The quarantine is the finding, and nothing else (0.5.0). It used to be
+        // the finding *plus* the damaged map, retained beside an empty
+        // replacement installed in `bits` — a second representation that existed
+        // only because the eager load had the map in hand anyway. Verification
+        // streams and keeps nothing, so `bits` stays the ordinary demand-backed
+        // map and the finding alone fails every access to this category closed:
+        // `ensure_commit_publishable` and `prepare_commit_bit` refuse before any
+        // bit is addressed, and `count_committed` refuses on the damaged page
+        // itself, because `ones_total` authenticates what it reads.
         let quarantine_finding = commit_findings.remove(name);
-        // Quarantine retains the raw map that the load already charged and
-        // installs an empty replacement beside it, so it takes no further
-        // resident bytes. The charge that admits it happened page by page as
-        // the map was read.
-        let (bits, quarantined_raw_bits) = if quarantine_finding.is_some() {
-            spec.read_limits.check(
-                ReadLimitKey::MatrixBitmapBytes,
-                resident_bitmap_bytes
-                    .checked_add(resident_page_index_bytes)
-                    .ok_or(Error::ResourceArithmeticOverflow {
-                        resource: ReadLimitKey::MatrixBitmapBytes.resource(),
-                    })?,
-            )?;
-            (SparseBitmap::new(*bit_count)?, Some(raw_bits))
-        } else {
-            (raw_bits, None)
-        };
         commits.push(MatrixCommitLayout {
             name: name.clone(),
             kind: *kind,
             bit_count: *bit_count,
             map_offset,
-            bits,
-            quarantined_raw_bits,
+            bits: raw_bits,
             quarantine_finding,
             digest_offset: crc
                 .as_ref()
@@ -7136,31 +7173,42 @@ fn verify_crc_header(
     Ok(verification)
 }
 
-/// Where one paged bitmap and its authentication metadata live on disk.
+/// Where one paged bitmap and its authentication metadata live on disk, plus the
+/// two things every load of one needs: the allocation map its verification pass
+/// unions in, and the residency policy its pages will be demand-filled under.
 #[derive(Clone, Copy)]
 struct PagedBitmapSource<'a> {
     base_offset: u64,
     digest_base: Option<u64>,
     index_base: u64,
     extents: Option<&'a AllocatedExtents>,
+    residency: &'a LazyResidency,
 }
 
 /// Where an open is allowed to look for bitmap pages, as one value.
 ///
-/// The two terms are alternatives, not companions: `lazy` being `Some` means
-/// the allocation map was never queried, so `extents` is `None`. Carrying them
-/// together keeps that pairing in one place instead of at every call site.
+/// The two terms answer different questions and are independent (0.5.0).
+/// `residency` is the demand cache every loaded bitmap is backed by; `extents`
+/// is the allocation map, which exists only for the *verification* pass — it is
+/// the second term of that pass's candidate set, and it is `None` when nothing
+/// is going to read it, because the query itself costs a syscall and a
+/// ~128 KiB NTFS run's worth of candidate pages.
 #[derive(Clone, Copy)]
 struct PageSources<'a> {
     extents: Option<&'a AllocatedExtents>,
-    lazy: Option<&'a LazyResidency>,
+    residency: &'a LazyResidency,
+    /// Whether this open runs the streaming verification pass
+    /// ([`crate::MatrixMetadataVerification::AtOpen`]). Resolved once, in
+    /// `ReadLimits::admit_matrix_metadata_verification`.
+    verify: bool,
 }
 
-/// The declared lazy residency policy, resolved once per open.
+/// The residency policy, resolved once per open.
 ///
-/// `None` for [`MatrixMetadataResidency::EagerVerified`], which is what makes
-/// the option inert: every code path below asks `Option::is_none()` and takes
-/// the byte-identical route it took before this type existed.
+/// Not optional any more (0.5.0): residency is always demand-filled and bounded,
+/// so there is one page-loading path in this file rather than an eager one and a
+/// lazy one. What the caller declares is the bound; what it used to declare —
+/// "check the whole map at open" — is [`crate::MatrixMetadataVerification`].
 #[derive(Clone, Debug)]
 struct LazyResidency {
     /// A second descriptor for the same file, duplicated once here so a
@@ -7180,24 +7228,23 @@ struct LazyResidency {
 }
 
 impl LazyResidency {
-    fn declared(limits: ReadLimits, file: &File) -> Result<Option<Self>> {
-        let Some(cache_bytes) = limits.matrix_metadata_residency.cache_bytes() else {
-            return Ok(None);
-        };
+    fn declared(limits: ReadLimits, file: &File) -> Result<Self> {
         // The cache is the whole of this reader's matrix bitmap payload
-        // footprint, so it is admitted against the same ceiling the eager path
-        // charges its live set against. A cache larger than the ceiling would
-        // make the option a way to raise a declared limit.
-        limits.check(ReadLimitKey::MatrixBitmapBytes, cache_bytes)?;
+        // footprint, so a *declared* one is admitted against
+        // `max_matrix_bitmap_bytes` — a cache larger than the ceiling would make
+        // the option a way to raise a declared limit. The cache derived for an
+        // undeclared policy is clamped to that ceiling instead; both decisions
+        // live in `admit_matrix_metadata_residency`.
+        let cache_bytes = limits.admit_matrix_metadata_residency()?;
         let pages = cache_bytes.div_ceil(BITMAP_PAGE_BYTES).max(1);
         let cache_limit = pages
             .checked_mul(BITMAP_PAGE_BYTES)
             .ok_or(Error::InvalidMatrixLayout)?;
-        Ok(Some(Self {
+        Ok(Self {
             file: Arc::new(file.try_clone()?),
             pool: Arc::new(MatrixReadPool::new()),
             cache_limit,
-        }))
+        })
     }
 
     fn backing(&self, source: &PagedBitmapSource<'_>) -> LazyBacking {
@@ -7392,31 +7439,36 @@ pub(crate) mod page_index_enumeration {
     }
 }
 
-/// The deduplicated set of pages open has to look at.
+/// Visits the deduplicated set of pages verification has to look at, without
+/// materialising it.
 ///
 /// PERF-01: it is the union of the persisted page index — the pages this matrix
 /// currently holds state in — and, where the platform can answer, the pages the
-/// allocation map reports as holding bytes. The first term keeps open bounded
+/// allocation map reports as holding bytes. The first term keeps the pass bounded
 /// when no allocation map exists; the second is what makes a stray byte written
 /// into a page the matrix never published detectable, and it exists only where
 /// the platform supplies a usable map (F-06). Neither term is derived from the
-/// logical page count.
+/// logical page count. **Preserving the union is not optional**: without its
+/// second term a page nothing ever published is never examined at all, rather
+/// than examined late.
 ///
-/// F-07: the result is a *candidate* set, not a live-state set. For `L` indexed
-/// pages and `A` allocation-derived candidates the union costs `O(L + A)` time
-/// and `Theta(L + A)` temporary memory, and the caller reads up to `4096` bytes
-/// per distinct candidate. `A` follows how densely the file is allocated, so a
-/// dense bitmap extent yields candidates proportional to the region even when
-/// few bits are live. Sparse allocation — the operating case this design targets
-/// — is what makes the union track live state.
+/// F-07: the set is a *candidate* set, not a live-state set. For `L` indexed
+/// pages and `A` allocation-derived candidates the walk costs `O(L + A)` time and
+/// the caller reads up to `4096` bytes per distinct candidate. `A` follows how
+/// densely the file is allocated, so a dense bitmap extent yields candidates
+/// proportional to the region even when few bits are live. Sparse allocation —
+/// the operating case this design targets — is what makes the union track live
+/// state.
 ///
-/// F-07: building the union is `O(Q)` in the candidate entries, not
-/// `O(Q log Q)`. The index term is already distinct, because it is materialised
-/// through a page-to-slot map, and the allocation term arrives in ascending
-/// order, so cross-duplicates are removed with a hash probe and neighbour
-/// comparison in a single linear pass instead of a sort. The result is not
-/// sorted: the loader visits pages independently, and `insert_loaded_page` is
-/// idempotent, so ordering buys nothing that would justify the extra `log Q`.
+/// **Memory is `O(1)`.** This used to return a `Vec<u64>` of the whole union,
+/// which was `Theta(L + A)` retained for the length of the load; the pass it
+/// feeds now retains one page buffer and nothing else, so materialising the
+/// candidate list would have been the largest thing verification held. The walk
+/// is still `O(Q)` and still not `O(Q log Q)`: the index term is distinct
+/// already, because it is a page-to-slot map, and the allocation term arrives in
+/// ascending order, so its repeats at extent boundaries are dropped by comparing
+/// with the previous unit and its overlap with the index by one hash probe. No
+/// sort, and no ordering guarantee — each page is examined independently.
 ///
 /// The page-digest array is deliberately *not* mapped back into this set. A
 /// digest written without its page is a torn commit, but the index entry for
@@ -7424,151 +7476,204 @@ pub(crate) mod page_index_enumeration {
 /// an allocation granule spans thousands of 8-byte digest slots, so deriving
 /// pages from that array would reintroduce a visit count proportional to the
 /// map width.
-fn pages_to_visit(
-    source: &PagedBitmapSource<'_>,
+fn for_each_candidate_page(
+    extents: Option<&AllocatedExtents>,
+    base_offset: u64,
     bits: &SparseBitmap,
-    resource: &'static str,
-) -> Result<Vec<u64>> {
-    let mut pages = Vec::new();
-    try_reserve_vec(&mut pages, bits.indexed_pages.len(), resource)?;
-    pages.extend(bits.indexed_pages.keys().copied());
-    let Some(extents) = source.extents else {
-        return Ok(pages);
+    mut visit: impl FnMut(u64) -> Result<()>,
+) -> Result<()> {
+    for page in bits.indexed_pages.keys().copied() {
+        visit(page)?;
+    }
+    let Some(extents) = extents else {
+        return Ok(());
     };
-    let boundary = pages.len();
-    extents.allocated_units(
-        source.base_offset,
+    let mut previous: Option<u64> = None;
+    extents.for_each_allocated_unit(
+        base_offset,
         bits.byte_len,
         BITMAP_PAGE_BYTES,
         bits.page_count,
-        &mut pages,
-        resource,
-    )?;
-    // The allocation term is non-decreasing across extents, so one pass drops
-    // both its own repeats at extent boundaries and anything the index already
-    // named.
-    let mut write = boundary;
-    let mut previous: Option<u64> = None;
-    for read in boundary..pages.len() {
-        let page = pages[read];
-        if previous == Some(page) || bits.indexed_pages.contains_key(&page) {
-            continue;
-        }
-        previous = Some(page);
-        pages[write] = page;
-        write += 1;
-    }
-    pages.truncate(write);
-    Ok(pages)
+        &mut |page| {
+            if previous == Some(page) || bits.indexed_pages.contains_key(&page) {
+                return Ok(());
+            }
+            previous = Some(page);
+            visit(page)
+        },
+    )
 }
 
-/// Loads the pages of a bitmap region that can hold state, materialising only
-/// the ones that carry a set bit.
+/// One reusable 4096-byte page buffer: the whole of what a verification pass
+/// retains.
 ///
-/// With `digest_base`, each visited page is authenticated against its stored
-/// digest: `PAGE_STATE_UNINITIALIZED` asserts the page was never published and
-/// must still read as zero, while `PAGE_STATE_INITIALIZED` asserts the recorded
-/// checksum. The two states are distinct on disk, so a page that was written
-/// with zeros is never confused with one that was never written. Without a
-/// digest base the region is unauthenticated, exactly as before this format
-/// version, and the load only decides residency.
-///
-/// PERF-01: the loop runs over [`pages_to_visit`], not over `0..page_count`, so
-/// its length is the pages this matrix has published or the filesystem reports
-/// as written — never the logical page count, and never the whole logical
-/// bitmap merely because no allocation map could be obtained.
-///
-/// PERF-02: a visited page is still skipped without any I/O when the filesystem
-/// proves that neither the page nor its digest slot has ever been written. Such
-/// a page is `PAGE_STATE_UNINITIALIZED` holding zeros, which is precisely what
-/// reading it would have established, so skipping changes neither residency nor
-/// the set of reported findings — a stray byte written into an untouched page
-/// allocates it and is therefore still visited, still read, and still reported.
-/// That last sentence is about the skip, and it presupposes the allocation map
-/// that produced the skip; where no map is available there is nothing to skip
-/// and never-indexed pages are not visited at all (F-06).
-fn load_paged_bitmap(
-    file: &mut File,
-    source: PagedBitmapSource<'_>,
-    bit_count: u64,
-    lazy: Option<&LazyResidency>,
-    sink: &mut PagedBitmapSink<'_>,
-    resource: &'static str,
-    label: &str,
-) -> Result<LoadedPagedBitmap> {
-    let base_offset = source.base_offset;
-    let digest_base = source.digest_base;
-    let extents = source.extents;
-    let mut bits = SparseBitmap::new(bit_count)?;
-    let index_complete =
-        page_index_enumeration::load_page_index(file, &source, &mut bits, sink, resource, label)?;
-    if let Some(lazy) = lazy {
-        // Criterion (A)/(B): the index is loaded — it is what makes "not
-        // published" answerable without I/O, and it is `O(live pages)` in
-        // *entries*, not in file size — and nothing else is read. No page, no
-        // digest, no allocation map. Residency after this returns is zero
-        // payload bytes; the first bit addressed inside a page pays for that
-        // page and nothing more.
-        bits.backing = Some(lazy.backing(&source));
-        count_open_bitmap_pages_visited(0);
-        return Ok(LoadedPagedBitmap {
-            bits,
-            intact: true,
-            index_complete,
-        });
+/// Stated as a type because the bound is the contract. Verification reads every
+/// candidate page — `O(live pages + allocated pages)` of them — through this one
+/// allocation, so its peak is `BITMAP_PAGE_BYTES` whatever the cell count, the
+/// live-page count, the number of bitmaps, or the file size. Nothing it reads is
+/// installed anywhere: the demand cache is filled by reads that need a page, not
+/// by the pass that checks one.
+struct PageVerifyBuffer {
+    bytes: Vec<u8>,
+}
+
+impl PageVerifyBuffer {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            bytes: filled_bytes_for(
+                BITMAP_PAGE_BYTES,
+                0,
+                ReadLimitKey::MatrixBitmapBytes.resource(),
+            )?,
+        })
     }
-    let pages = pages_to_visit(&source, &bits, resource)?;
-    count_open_bitmap_pages_visited(usize_to_u64(pages.len())?);
+
+    /// Fills the first `len` bytes from `offset` and hands them back.
+    fn read(&mut self, reader: MatrixRegionReader<'_>, offset: u64, len: u64) -> Result<&[u8]> {
+        let len = usize::try_from(len).map_err(|_| Error::InvalidMatrixLayout)?;
+        if len > self.bytes.len() {
+            // A page is `BITMAP_PAGE_BYTES` at most by construction; a longer
+            // one is a layout that cannot be trusted rather than a buffer to
+            // grow, because growing it is exactly the unbounded retention this
+            // type exists to refuse.
+            return Err(Error::InvalidMatrixLayout);
+        }
+        let slice = &mut self.bytes[..len];
+        reader.read_exact_at(offset, slice)?;
+        Ok(&self.bytes[..len])
+    }
+}
+
+/// The one implementation of "do these page bytes agree with what was published
+/// for them".
+///
+/// `PAGE_STATE_UNINITIALIZED` asserts the page was never published and must still
+/// read as zero; `PAGE_STATE_INITIALIZED` asserts the recorded checksum. The two
+/// states are distinct on disk, so a page written with zeros is never confused
+/// with one that was never written, and any other state is damage.
+///
+/// Every route that believes a commit-map page goes through here: the streaming
+/// verification pass ([`verify_paged_bitmap`]), the demand fault-in
+/// ([`SparseBitmap::load_page`]), and the whole-map aggregate
+/// ([`SparseBitmap::ones_total`]). Two copies of this decision that could
+/// disagree would be a worse defect than the one the 0.5.0 split fixed.
+fn page_bytes_are_authentic(bytes: &[u8], stored: u32, state: u32) -> Result<bool> {
+    Ok(match state {
+        PAGE_STATE_UNINITIALIZED => stored == 0 && bytes.iter().all(|byte| *byte == 0),
+        PAGE_STATE_INITIALIZED => crc32_bytes(bytes)? == stored,
+        _ => false,
+    })
+}
+
+/// Authenticates every candidate page of one digest-backed bitmap, retaining
+/// nothing but `buffer`.
+///
+/// This is the verification the eager residency policy used to perform as a side
+/// effect of loading. It is the same candidate set, the same per-page decision,
+/// and the same `intact` answer feeding the same `Recoverable` commit-map
+/// finding; what it no longer does is keep the pages.
+///
+/// PERF-02: a candidate page is still skipped without I/O when the filesystem
+/// proves that neither the page nor its digest slot has ever been written. Such a
+/// page is `PAGE_STATE_UNINITIALIZED` holding zeros, which is exactly what
+/// reading it would have established, so skipping changes neither the answer nor
+/// the findings — a stray byte written into an untouched page allocates it, so it
+/// is still a candidate, still read, and still reported. That is about the skip
+/// and presupposes the allocation map that produced it; where no map is available
+/// there is nothing to skip and never-indexed pages are not candidates at all
+/// (F-06).
+fn verify_paged_bitmap(
+    reader: MatrixRegionReader<'_>,
+    extents: Option<&AllocatedExtents>,
+    bits: &SparseBitmap,
+    base_offset: u64,
+    digest_base: u64,
+    buffer: &mut PageVerifyBuffer,
+) -> Result<bool> {
     let mut intact = true;
-    for page in pages {
+    let mut visited = 0u64;
+    for_each_candidate_page(extents, base_offset, bits, |page| {
+        visited = visited.saturating_add(1);
         let len = bits.page_len(page)?;
         let offset = page
             .checked_mul(BITMAP_PAGE_BYTES)
             .and_then(|delta| base_offset.checked_add(delta))
             .ok_or(Error::InvalidMatrixLayout)?;
-        let digest_offset = digest_base
-            .map(|base| page_digest_offset(base, page))
-            .transpose()?;
+        let digest_offset = page_digest_offset(digest_base, page)?;
         if !range_may_hold_data(extents, offset, len) {
             // The page is a hole, so it reads as zero without being read. Its
             // digest still has to agree, because a digest recorded for a page
             // whose bytes never reached the disk is a torn commit and must stay
             // detectable. Where the digest slot is itself a hole the page costs
             // no I/O at all.
-            let Some(digest_offset) = digest_offset else {
-                continue;
-            };
             if !range_may_hold_data(extents, digest_offset, PAGE_DIGEST_LEN) {
-                continue;
+                return Ok(());
             }
             let zeros =
                 &ZERO_PAGE[..usize::try_from(len).map_err(|_| Error::InvalidMatrixLayout)?];
-            let (stored, state) = read_page_digest(file, digest_offset)?;
+            let (stored, state) = read_page_digest_at(reader, digest_offset)?;
             count_open_bitmap_bytes_read(PAGE_DIGEST_LEN);
-            intact &= match state {
-                PAGE_STATE_UNINITIALIZED => stored == 0,
-                PAGE_STATE_INITIALIZED => crc32_bytes(zeros)? == stored,
-                _ => false,
-            };
-            continue;
+            intact &= page_bytes_are_authentic(zeros, stored, state)?;
+            return Ok(());
         }
-        let bytes = read_range(file, offset, len, resource)?;
+        let bytes = buffer.read(reader, offset, len)?;
         count_open_bitmap_bytes_read(len);
-        if let Some(digest_offset) = digest_offset {
-            let (stored, state) = read_page_digest(file, digest_offset)?;
-            count_open_bitmap_bytes_read(PAGE_DIGEST_LEN);
-            let page_ok = match state {
-                PAGE_STATE_UNINITIALIZED => stored == 0 && bytes.iter().all(|byte| *byte == 0),
-                PAGE_STATE_INITIALIZED => crc32_bytes(&bytes)? == stored,
-                _ => false,
-            };
-            intact &= page_ok;
+        let (stored, state) = read_page_digest_at(reader, digest_offset)?;
+        count_open_bitmap_bytes_read(PAGE_DIGEST_LEN);
+        intact &= page_bytes_are_authentic(bytes, stored, state)?;
+        Ok(())
+    })?;
+    count_open_bitmap_pages_visited(visited);
+    Ok(intact)
+}
+
+/// Attaches one bitmap region to the demand cache, and — where this open
+/// verifies — authenticates every candidate page of it first.
+///
+/// Two independent things happen here, and 0.5.0 separated them:
+///
+/// * **Residency.** The persisted page index is read in full, because it is what
+///   makes "not published" answerable without I/O and it is `O(live pages)` in
+///   *entries* rather than in file size. Then the map is given its backing, and
+///   nothing else is retained: the first bit addressed inside a page pays for
+///   that page and nothing more.
+/// * **Verification.** Where `source.verify` is set and the region carries a
+///   digest array, [`verify_paged_bitmap`] streams the candidate set — the index
+///   unioned with the allocation map — and authenticates every page in it
+///   through one reusable buffer. `intact` is that verdict; it is what raises the
+///   `Recoverable` commit-map finding and therefore the category quarantine.
+///
+/// A region with no digest array (a checksum-validity bitmap) is unauthenticated
+/// by design, exactly as before this format version, so there is nothing for
+/// verification to check and it is skipped — its persisted index is still
+/// enumerated, and a damaged one is still a fatal finding.
+fn load_paged_bitmap(
+    file: &mut File,
+    source: PagedBitmapSource<'_>,
+    bit_count: u64,
+    verifier: Option<&mut PageVerifyBuffer>,
+    sink: &mut PagedBitmapSink<'_>,
+    resource: &'static str,
+    label: &str,
+) -> Result<LoadedPagedBitmap> {
+    let mut bits = SparseBitmap::new(bit_count)?;
+    let index_complete =
+        page_index_enumeration::load_page_index(file, &source, &mut bits, sink, resource, label)?;
+    let intact = match (verifier, source.digest_base) {
+        (Some(buffer), Some(digest_base)) => verify_paged_bitmap(
+            MatrixRegionReader::new(&*file),
+            source.extents,
+            &bits,
+            source.base_offset,
+            digest_base,
+            buffer,
+        )?,
+        _ => {
+            count_open_bitmap_pages_visited(0);
+            true
         }
-        if bytes.iter().any(|byte| *byte != 0) {
-            sink.budget.charge(len)?;
-        }
-        bits.insert_loaded_page(page, bytes)?;
-    }
+    };
+    bits.backing = Some(source.residency.backing(&source));
     Ok(LoadedPagedBitmap {
         bits,
         intact,
@@ -7607,6 +7712,13 @@ fn load_commit_bitmaps(
         commits.len(),
         ReadLimitKey::MatrixBitmapBytes.resource(),
     )?;
+    // One buffer for the whole open, not one per category: the bound is
+    // `BITMAP_PAGE_BYTES`, full stop, and a format declaring twenty commit
+    // categories must not multiply it by twenty.
+    let mut verifier = match sources.verify {
+        true => Some(PageVerifyBuffer::new()?),
+        false => None,
+    };
     for (index, (name, _, bit_count, map_offset, map_len)) in commits.iter().enumerate() {
         if bit_bytes(*bit_count)? != *map_len {
             return Err(Error::InvalidMatrixLayout);
@@ -7631,9 +7743,10 @@ fn load_commit_bitmaps(
                 digest_base,
                 index_base,
                 extents: sources.extents,
+                residency: sources.residency,
             },
             *bit_count,
-            sources.lazy,
+            verifier.as_mut(),
             &mut PagedBitmapSink {
                 budget,
                 findings: &mut verification.findings,
@@ -7642,14 +7755,9 @@ fn load_commit_bitmaps(
             &format!("commit category {name}"),
         )?;
         if !intact {
-            verification.commit_findings.insert(
-                name.clone(),
-                MatrixRecoveryFinding {
-                    kind: MatrixCorruptionKind::CommitMap,
-                    severity: MatrixCorruptionSeverity::Recoverable,
-                    message: format!("matrix commit map page crc mismatch for {name}"),
-                },
-            );
+            verification
+                .commit_findings
+                .insert(name.clone(), commit_map_finding(name));
         }
         bitmaps.push(bits);
     }
@@ -7708,9 +7816,12 @@ fn load_crc_valid_bits(
                 digest_base: None,
                 index_base,
                 extents: sources.extents,
+                residency: sources.residency,
             },
             cell_count,
-            sources.lazy,
+            // No digest array, so there is nothing to authenticate and no
+            // buffer to hand over; see `load_paged_bitmap`.
+            None,
             sink,
             ReadLimitKey::MatrixCrcBytes.resource(),
             &format!("block {} validity bitmap", block.block_id),
@@ -8529,6 +8640,45 @@ mod allocated_extents_tests {
     fn a_length_that_overflows_is_treated_as_unproven() {
         assert!(extents(&[]).may_hold_data(u64::MAX, 2));
     }
+
+    /// The candidate-set engine, which the streaming verification pass walks
+    /// instead of collecting: units must arrive in ascending order (that is what
+    /// lets the caller drop cross-extent repeats by comparing with the previous
+    /// one) and must never exceed the bitmap's page count.
+    #[test]
+    fn the_unit_walk_is_ascending_bounded_and_allocation_driven() {
+        // Two allocated runs inside a region of 8 pages, the second run
+        // deliberately straddling a page boundary.
+        let map = extents(&[(4096, 8192), (12_000, 16_500)]);
+        let mut units = Vec::new();
+        map.for_each_allocated_unit(0, 8 * 4096, 4096, 8, &mut |unit| {
+            units.push(unit);
+            Ok(())
+        })
+        .expect("walk");
+        assert_eq!(units, vec![1, 2, 3, 4]);
+        assert!(units.windows(2).all(|pair| pair[0] < pair[1]));
+
+        // The unit count is a hard clamp: a run past the logical end of the
+        // bitmap must not yield a page the bitmap does not have.
+        let mut units = Vec::new();
+        map.for_each_allocated_unit(0, 8 * 4096, 4096, 2, &mut |unit| {
+            units.push(unit);
+            Ok(())
+        })
+        .expect("walk");
+        assert!(units.iter().all(|unit| *unit < 2), "{units:?}");
+
+        // A region the map proves to be a hole yields nothing at all.
+        let mut visited = 0;
+        extents(&[])
+            .for_each_allocated_unit(0, 8 * 4096, 4096, 8, &mut |_| {
+                visited += 1;
+                Ok(())
+            })
+            .expect("walk");
+        assert_eq!(visited, 0);
+    }
 }
 
 #[cfg(test)]
@@ -8551,6 +8701,23 @@ mod sparse_bitmap_tests {
         assert_eq!(map.ones(), 1);
         assert!(map.get(bits - 1).expect("get"));
         assert!(!map.get(0).expect("get"));
+    }
+
+    /// The whole of what a verification pass retains, pinned as a number.
+    ///
+    /// The pass visits `O(live pages + allocated pages)` candidate pages and reads
+    /// every one of them through this single buffer, so its peak is independent of
+    /// cell count, live-page count, bitmap count and file size. The refusal is the
+    /// load-bearing half: a buffer that grew to fit an unexpected page length
+    /// would turn the bound into a suggestion.
+    #[test]
+    fn the_verification_buffer_is_one_page_and_never_grows() {
+        let buffer = PageVerifyBuffer::new().expect("buffer");
+        assert_eq!(
+            usize_to_u64(buffer.bytes.len()).expect("len"),
+            BITMAP_PAGE_BYTES
+        );
+        assert_eq!(buffer.bytes.capacity(), buffer.bytes.len());
     }
 
     #[test]
@@ -8632,21 +8799,69 @@ mod sparse_bitmap_tests {
         assert_eq!(map.ones(), 0);
     }
 
+    /// Successor to `loading_an_all_zero_page_leaves_it_unmaterialized`, whose
+    /// subject — `SparseBitmap::insert_loaded_page`, the eager loader's
+    /// installer — no longer exists: 0.5.0 made residency demand-filled, so the
+    /// only route from disk bytes to a resident page is
+    /// `load_page` + `install_faulted_page`, and `load_page` answers `Ok(None)`
+    /// for an all-zero page so that nothing is installed for it. That path needs
+    /// a real file and is measured end to end by
+    /// `matrix_lazy_residency.rs::b_resident_bytes_track_the_working_set_and_stop_at_the_ceiling`
+    /// (residency rises by exactly one page per *live* page addressed).
+    ///
+    /// What is unit-testable here, and is now the more load-bearing half, is the
+    /// decision both that path and the streaming verification pass share.
     #[test]
-    fn loading_an_all_zero_page_leaves_it_unmaterialized() {
-        let mut map = SparseBitmap::new(BITMAP_PAGE_BYTES * 8).expect("bitmap");
-        map.insert_loaded_page(0, vec![0; BITMAP_PAGE_BYTES as usize])
-            .expect("load zero page");
-        assert_eq!(map.resident_bytes(), 0);
-        assert_eq!(map.ones(), 0);
+    fn one_authentication_decision_serves_the_fault_in_and_the_verification_pass() {
+        let live = {
+            let mut bytes = vec![0; BITMAP_PAGE_BYTES as usize];
+            bytes[7] = 0b0000_0101;
+            bytes
+        };
+        let zeros = vec![0; BITMAP_PAGE_BYTES as usize];
 
-        let mut bytes = vec![0; BITMAP_PAGE_BYTES as usize];
-        bytes[7] = 0b0000_0101;
-        map.insert_loaded_page(0, bytes).expect("load live page");
-        assert_eq!(map.resident_bytes(), BITMAP_PAGE_BYTES);
-        assert_eq!(map.ones(), 2);
-        assert!(map.get(56).expect("get"));
-        assert!(map.get(58).expect("get"));
+        // The half that needs no digest, and therefore holds under every feature
+        // configuration. "Never published" is a distinct state from "published
+        // holding zeros", and both are authentic; a page claiming the first while
+        // holding bytes is not.
+        assert!(page_bytes_are_authentic(&zeros, 0, PAGE_STATE_UNINITIALIZED).expect("zero page"));
+        assert!(
+            !page_bytes_are_authentic(&live, 0, PAGE_STATE_UNINITIALIZED).expect("stray bytes")
+        );
+        assert!(
+            !page_bytes_are_authentic(&zeros, 1, PAGE_STATE_UNINITIALIZED).expect("torn digest")
+        );
+        // Any other state is damage rather than a state to interpret, decided
+        // before any digest is computed.
+        assert!(!page_bytes_are_authentic(&live, 0, 2).expect("unknown state"));
+
+        // The digest half. `PAGE_STATE_INITIALIZED` is the only arm that consults
+        // a checksum, and `crc32_bytes` refuses with
+        // `Error::IntegrityFeatureDisabled` when the `integrity` feature is off —
+        // which is also why no digest-backed bitmap exists in that build, so this
+        // arm is unreachable there rather than merely untested.
+        #[cfg(feature = "integrity")]
+        {
+            let live_crc = crc32_bytes(&live).expect("crc");
+            // A published page must match its recorded checksum.
+            assert!(
+                page_bytes_are_authentic(&live, live_crc, PAGE_STATE_INITIALIZED)
+                    .expect("authenticate")
+            );
+            assert!(
+                !page_bytes_are_authentic(&live, live_crc ^ 1, PAGE_STATE_INITIALIZED)
+                    .expect("authenticate")
+            );
+            assert!(
+                page_bytes_are_authentic(
+                    &zeros,
+                    crc32_bytes(&zeros).expect("crc"),
+                    PAGE_STATE_INITIALIZED
+                )
+                .expect("zero page")
+            );
+            assert!(!page_bytes_are_authentic(&live, live_crc, 2).expect("unknown state"));
+        }
     }
 }
 

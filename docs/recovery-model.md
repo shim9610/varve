@@ -112,14 +112,27 @@ failures. Committed cell reads verify the corresponding per-cell slot CRC and
 return `MatrixChecksumMismatch` if slot bytes no longer match the committed CRC
 evidence.
 
-A commit-map CRC mismatch never leaves the unverified bits reader-visible. Open
-preserves the raw map bytes as quarantined recovery evidence and substitutes an
-all-clear internal map. Status and value reads return
-`MatrixCommitQuarantined(category)` rather than `NotCommitted`; commits and
-per-cell clear operations also reject the category until an explicit
-whole-category recovery action is applied. Cell categories may use typed CRC
-rebuild; single and per-channel categories have no per-entry reconstruction
-evidence and therefore recommend `ClearCategory`.
+A commit-map CRC mismatch never leaves the unverified bits reader-visible. The
+verification pass that finds it (`MatrixMetadataVerification::AtOpen`, the
+default) produces a `Recoverable` `CommitMap` finding, and the presence of that
+finding **is** the quarantine: the category is failed closed as a whole. Status
+and value reads return `MatrixCommitQuarantined(category)` rather than
+`NotCommitted`; commits and per-cell clear operations reject the category; and
+`matrix_resume_signal` / `matrix_sidecar_resume_signal` refuse it too, because a
+progress figure is an answer like any other. Only an explicit whole-category
+recovery action lifts it. Cell categories may use typed CRC rebuild; single and
+per-channel categories have no per-entry reconstruction evidence and therefore
+recommend `ClearCategory`.
+
+> **Changed in 0.5.0, and it is why the resume signals refuse.** Quarantine used
+> to retain the damaged map as "recovery evidence" and substitute an all-clear
+> internal map, and a few answers came from that substitute — a resume query on a
+> quarantined category reported `Clean`, i.e. "nothing in progress" for a map known
+> to be damaged. Verification retains nothing now, so there is no map to answer
+> from. `clear_matrix_category` remains the recovery path and still does not refuse;
+> it reports 0 cells cleared, because it cannot count bits it is discarding when
+> every count authenticates what it reads. See
+> [API Changes §A.5](api-changes.md#a5-changed-behaviour-at-an-unchanged-signature-in-050).
 
 ## Rebuild Commit Map
 
@@ -171,7 +184,7 @@ a committed cell read whose validity bit is absent returns
 `MatrixChecksumMismatch` rather than silently accepting the slot.
 
 Successful rebuild writes the new map and CRC before publishing it in memory,
-then removes the quarantine evidence for that category.
+then clears the quarantine finding for that category.
 
 The rebuild republishes the whole persisted page index, and it does so by
 publishing a new generation rather than editing the live one: a reserved marker
@@ -179,7 +192,11 @@ goes into the occupancy header and is made durable before the entry region is
 cleared, and the real count is written last. An interruption therefore leaves a
 matrix that opens with a `Fatal` `MatrixCorruptionKind::CommitMap` finding whose
 report recommends `RebuildCommitMap` — never a short index that silently hides
-committed pages. See `docs/matrix-storage-design.md`.
+committed pages. The reserved marker is `u64::MAX` in the occupancy-header slot,
+which is not a representable occupancy count at any capacity, so a reader that
+predates the marker also rejects it as a damaged header rather than reading a
+partial rebuild as authoritative. The scheme needs no layout-version bump; `VMAT`
+stays at version 4.
 
 Because fatal findings are fail-closed by default, acting on a recommended
 `RebuildCommitMap` for a fatal finding requires reopening with

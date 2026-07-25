@@ -4,6 +4,201 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
+## 0.5.0 - 2026-07-25
+
+**This was scoped as a `0.4.1` hotfix and is released as `0.5.0`, because the
+version number has to describe what changed rather than how urgently it shipped.**
+It removes a public enum variant, changes the value every `ReadLimits` constructor
+puts in a public field, adds a second public policy enum, and changes how two
+composition functions behave. Under the
+policy stated three lines above this section, an incompatible Rust API change
+increments the minor version below 1.0. Nothing here is a wire-format change: no
+encoder, decoder, header field or version constant is touched, and a 0.4.0 file
+reads unchanged.
+
+The release fixes **both** defects it was opened for: `*_with_resource_limits`
+no longer discards a declared residency policy, and an undeclared matrix open is
+no longer eager. The second one took a design change rather than a constant flip —
+residency and verification were one option and are now two — and the section
+"Residency and verification are now separate policies" below is the whole of it.
+
+### Breaking changes at a glance
+
+| Change | Migration |
+| --- | --- |
+| `MatrixMetadataResidency` gains a `Missing` variant and becomes `#[non_exhaustive]` — exhaustive `match`es break | [§A.1](docs/api-changes.md#a1-matrixmetadataresidency-gains-a-missing-state-and-becomes-non_exhaustive) |
+| Every `ReadLimits` constructor now puts `Missing` in `matrix_metadata_residency` where it put `EagerVerified` — code comparing that field to a variant now sees `Missing` | [§A.1](docs/api-changes.md#a1-matrixmetadataresidency-gains-a-missing-state-and-becomes-non_exhaustive) |
+| **`MatrixMetadataResidency::EagerVerified` is removed**, and `DEFAULT` is now `Lazy { DEFAULT_CACHE_BYTES }`. Code naming the variant stops compiling; an undeclared open retains no commit-map payload and can no longer be refused because its live set exceeds `max_matrix_bitmap_bytes` | [§A.3](docs/api-changes.md#a3-matrixmetadataresidencyeagerverified-is-removed-and-default-is-now-lazy) |
+| A reader no longer owns a whole-map commit snapshot as of its open — that was a property of eager residency and has no replacement | [§A.3](docs/api-changes.md#a3-matrixmetadataresidencyeagerverified-is-removed-and-default-is-now-lazy) |
+| `*_with_resource_limits` no longer discards a spec-declared residency policy — the behaviour §5.12 of the 0.4.0 migration document told you to work around is **gone**, and the workaround is now a no-op rather than a requirement | [§A.2](docs/api-changes.md#a2-_with_resource_limits-composes-a-declared-residency-policy-instead-of-replacing-it) |
+| `*_with_limits` / `tighten` now honours a runtime-declared residency policy where the format declared none (it previously dropped it unconditionally) | [§A.2](docs/api-changes.md#a2-_with_resource_limits-composes-a-declared-residency-policy-instead-of-replacing-it) |
+| **At an unchanged signature:** `matrix_resume_signal` and `matrix_sidecar_resume_signal` on a **quarantined** category now return `Err(Error::MatrixCommitQuarantined)` where they returned `Ok(MatrixResumeSignal::Clean)`. The old answer came from the empty replacement map quarantine used to install; nothing is retained now, so there is no map to answer from | [§A.5.1](docs/api-changes.md#a51-matrix_resume_signal--matrix_sidecar_resume_signal-refuse-a-quarantined-category) |
+
+### Residency and verification are now separate policies
+
+**The defect.** An undeclared matrix open was `EagerVerified`: it materialised
+every published commit-map page for the whole session, which made open cost scale
+with the file rather than the working set and made `max_matrix_bitmap_bytes` an
+*admission* limit — a matrix whose live set exceeded it could not be opened at all.
+That violates the project's standing policy that open reads a header and pages
+fault in on demand.
+
+**Why flipping one constant was not the fix.** The complete
+`MatrixRecoveryReport` was a **side effect** of the eager page load. A bare flip
+would have silently removed the `Recoverable` `MatrixCorruptionKind::CommitMap`
+finding, the whole-category quarantine behind `Error::MatrixCommitQuarantined`, the
+`RebuildCommitMap` / `ClearCategory` recommendations, and the
+`RecoveryPolicy::Strict` writer gate — and, worse than deferring them, would have
+stopped examining damage in pages the persisted index does not name at all, because
+the eager visit set was the index *unioned with* the platform's allocation map.
+Eight behavioural contracts across `matrix.rs`, `matrix_hardening.rs` and
+`matrix_integrity_scaling.rs` depended on it.
+
+**The fix.** Residency (how much stays in memory) and verification (whether pages
+are checked) were conflated and are now two options:
+
+- **Residency is always demand-filled and bounded.** `EagerVerified` is removed;
+  `MatrixMetadataResidency::DEFAULT` is `Lazy { DEFAULT_CACHE_BYTES }`, clamped to
+  whatever `max_matrix_bitmap_bytes` is in force. There is one page-loading path in
+  the crate, not two.
+- **Verification is `MatrixMetadataVerification`, and it defaults to `AtOpen`.**
+  It streams the same candidate set the eager load visited — index unioned with
+  allocation map — authenticates each page against its stored digest through one
+  reusable 4096-byte buffer, and produces the whole report. It retains nothing
+  proportional to the candidate set, so detection at open no longer costs memory.
+  `OnDemand` moves the pass off the open; `verify_matrix_metadata()` runs it later.
+
+All eight contracts pass unchanged, because verification still runs by default and
+still produces every finding.
+
+**Measured on this host** (`matrix_lazy_residency.rs`, `matrix_integrity_scaling.rs`):
+
+| | before (`EagerVerified`) | after, undeclared (`Lazy` + `AtOpen`) | after, `Lazy` + `OnDemand` |
+| --- | --- | --- | --- |
+| Open bytes read, 1 live page | 131,240 | 69,800 | **32** |
+| Commit-map pages *retained* at open, 1 live page | 1 (4,096 B) | **0** | **0** |
+| Open bytes read, 64 live pages | 591,384 | 267,800 | **1,040** |
+| Commit-map pages *retained* at open, 64 live pages | 64 (262,144 B) | **0** | **0** |
+| Resident after touching 4 distinct live pages | unchanged | 16,384 | 16,384 |
+| Peak buffer held by verification | n/a (whole live set retained) | **4,096 B** | **4,096 B** |
+| A live set over `max_matrix_bitmap_bytes` | **refused** | opens | opens |
+
+### Changed behaviour at an unchanged signature
+
+The dangerous class: code that still compiles and now behaves differently. All of
+it follows from quarantine no longer retaining the damaged map — it used to install
+an empty replacement bitmap over it, and some answers came from that replacement.
+
+- **`matrix_resume_signal` / `matrix_sidecar_resume_signal` refuse a quarantined
+  category** with `Error::MatrixCommitQuarantined` where they answered
+  `Ok(MatrixResumeSignal::Clean)`. Reporting "nothing in progress" for a category
+  whose commit map is known damaged was an artifact of the replacement map, not a
+  verdict. An unaffected category is unchanged. All three receivers
+  (`VarveReader`, `VarveWriter`, `VarveFile`).
+- **`clear_matrix_category` reports `Ok(0)` cleared on a quarantined category**,
+  and now says so in the code rather than emerging from the replacement map. It
+  still does not refuse — it is the recovery path the report recommends — but it
+  cannot count bits it is discarding, because every count authenticates what it
+  reads.
+- **An undeclared matrix open** retains no commit-map payload and can no longer be
+  refused because a live set is wider than `max_matrix_bitmap_bytes`. See
+  "Residency and verification are now separate policies" above.
+
+Full before/after snippets in
+[§A.5](docs/api-changes.md#a5-changed-behaviour-at-an-unchanged-signature-in-050).
+
+### Fixed
+
+- **`*_with_resource_limits` silently discarded a declared
+  `matrix_metadata_residency`.** `MatrixMetadataResidency` had no unset state, so
+  `ReadLimits::STANDARD` carried a *real* eager declaration and
+  `ReadLimits::overlay` — which takes the runtime value outright — could not tell
+  "the caller wants eager" from "the caller never mentioned residency". Raising an
+  unrelated ceiling therefore reverted a format's declared
+  `Lazy { cache_bytes }` to the eager policy, silently discarding the only bound on
+  matrix metadata memory, and could then fail the open on the very admission limit
+  the caller was raising:
+
+  ```text
+  Error::LimitExceeded { resource: "matrix bitmap bytes", actual: 33536, limit: 32768 }
+  ```
+
+  That error is the measured pre-fix result of an
+  `open_reader_with_resource_limits` call whose only content was a *larger*
+  bitmap ceiling. `matrix_metadata_residency` now has a `Missing` state and
+  composes like every ceiling above it: a runtime `ReadLimits` that never called
+  `with_matrix_metadata_residency` leaves a format-declared policy alone, one
+  that did wins. `matrix_metadata_verification` composes identically.
+
+- **`tighten` had the same bug class in the other direction** and is fixed with
+  it. A format's declaration still wins, but a runtime declaration is now taken
+  where the format made none, instead of being dropped unconditionally.
+
+- **An undeclared matrix open was eager.** See "Residency and verification are now
+  separate policies" above.
+
+- **A whole-map aggregate could be counted from unauthenticated bytes.**
+  `matrix_resume_signal` and the recovery report's partial-progress advisory read
+  the pages a demand cache does not hold, and did so without checking their
+  digests. They now use the same authentication every other read uses, so a
+  damaged page refuses instead of contributing a number.
+
+### Added
+
+- `MatrixMetadataVerification` — `Missing` | `AtOpen` | `OnDemand`,
+  `#[non_exhaustive]`, with `DEFAULT = AtOpen`. The `ReadLimits` field
+  `matrix_metadata_verification`, the `const fn with_matrix_metadata_verification`
+  builder, and `effective_matrix_metadata_verification()` follow the residency
+  policy's idiom exactly: one unset state, one resolution point, one admission
+  point.
+- `VarveReader::verify_matrix_metadata()`, and the same method on `VarveWriter`
+  and `VarveFile` — runs the verification pass on demand and returns a
+  `MatrixRecoveryReport`. It reports; it does not arm the quarantine, because the
+  fail-closed gate is derived once at open from the findings the layout is
+  assembled with.
+- `MatrixMetadataResidency::Missing` — the unset state, following the
+  `ReadLimit::Missing` idiom exactly. It is what `all()`, `STANDARD`,
+  `UNTRUSTED`, `MISSING`, `TRUSTED_UNBOUNDED`, `finite_all()`, `default()` and
+  `FormatSpec::new` now carry, and `ReadLimits::resolve` is idempotent over it.
+- `MatrixMetadataResidency::DEFAULT` — the single place the default policy lives
+  and the single line that changes it. It is `Lazy { DEFAULT_CACHE_BYTES }`.
+- `MatrixMetadataResidency::DEFAULT_CACHE_BYTES` — 2 MiB, *derived* rather than
+  chosen: `ReadLimits::STANDARD.max_matrix_bitmap_bytes / 32`, computed in a
+  `const` expression. Two `const` assertions fail the build if `DEFAULT` stops
+  naming a real policy, or if the cache stops covering the whole commit map of
+  the largest matrix `STANDARD` will admit (16,000,000 cells = 1,953,125 bytes =
+  477 pages, against 512 cached pages).
+- `ReadLimits::effective_matrix_metadata_residency()` — resolves `Missing` to
+  `DEFAULT`. **Read this instead of the `matrix_metadata_residency` field**; it
+  never yields `Missing`. This is the only place the default is resolved.
+- `ReadLimits::default_matrix_metadata_cache_bytes()` — `DEFAULT_CACHE_BYTES`
+  clamped down to `max_matrix_bitmap_bytes`. A cache the caller *declared* above
+  the ceiling is still refused, because that contradiction is theirs to resolve;
+  a cache varve *derived* is clamped instead, because tightening a memory ceiling
+  must not mean "no matrix opens".
+
+### Removed
+
+- `MatrixMetadataResidency::EagerVerified`. Nothing replaced it as a residency
+  mode and no alias was left behind: what callers wanted from it is
+  `MatrixMetadataVerification::AtOpen`, which is the default, and a name promising
+  eager session-long residency for a bounded demand cache would be worse than a
+  compile error. See [§A.3](docs/api-changes.md#a3-matrixmetadataresidencyeagerverified-is-removed-and-default-is-now-lazy)
+  for the three things it was used for and what to do about each.
+
+### Still not `O(1)`
+
+An open under the default still reads `O(live pages + allocated pages)` bytes,
+because it verifies: 69,800 bytes for a matrix with one live page on NTFS, where
+the allocation map reports the bitmap region in ~128 KiB runs. That is now a
+declared cost with an off switch (`OnDemand`, 32 bytes) rather than a property of
+how much is kept resident. A non-verifying open still reads the persisted page
+index in full — 8 bytes per live page — and holds ~96 bytes per live page of index
+mirror, which is what makes "this page was never published" answerable without
+I/O. Both are documented with numbers in
+[Known Limitations §1.1](docs/known-limitations.md#11-open-cost-is-proportional-to-candidate-pages-not-to-the-working-set)
+and [§1.2](docs/known-limitations.md#12-what-residency-still-costs-the-page-index-mirror-and-a-per-bitmap-cache-bound).
+
 ## 0.4.0 - 2026-07-22
 
 Pre-1.0 minor release. Versions 0.1 through 0.3 existed as source releases only;
@@ -43,7 +238,7 @@ Each links to the section of the migration document that tells you what to edit.
 | `FormatSelfTest::run` is non-destructive; `cleanup(true)` can report a failed step where it reported a clean pass | [§5.8](docs/api-changes.md#58-formatselftestrun-is-non-destructive) |
 | `scripts/run-security-fuzz.ps1` can exit 2 or 3 where it exited 0 | [§5.10](docs/api-changes.md#510-scriptsrun-security-fuzzps1-exit-codes) |
 | `delete` now maintains the keyed offset chain where it previously truncated it — same signature, different on-disk chain shape | [§5.11](docs/api-changes.md#511-delete-now-maintains-the-keyed-offset-chain-instead-of-truncating-it) |
-| `*_with_resource_limits` **replaces** a spec-declared `matrix_metadata_residency` rather than composing it, silently | [§5.12](docs/api-changes.md#512-_with_resource_limits-replaces-a-spec-declared-matrix-residency-policy) |
+| `*_with_resource_limits` **replaces** a spec-declared `matrix_metadata_residency` rather than composing it, silently. **Fixed in 0.5.0 — do not write the workaround this row describes** | [§5.12](docs/api-changes.md#512-_with_resource_limits-replaces-a-spec-declared-matrix-residency-policy) |
 
 ### Added (rounds 15-16)
 
@@ -54,7 +249,12 @@ Each links to the section of the migration document that tells you what to edit.
   therefore when that metadata's integrity is checked.
 
   `EagerVerified` is the default and is **inert** — byte-for-byte the behaviour
-  varve had before the option existed. Open **reads and authenticates** every
+  varve had before the option existed. (**0.5.0 removed this variant and made
+  `Lazy` the default; everything this entry says about `EagerVerified` describes
+  0.4.0 only.** The verification half of it survives as
+  `MatrixMetadataVerification::AtOpen`, which is the default and retains nothing.
+  Read the policy through `ReadLimits::effective_matrix_metadata_residency()`.)
+  Open **reads and authenticates** every
   commit-map page the matrix has published plus every page the platform's
   allocation map reports as written, and makes resident only those holding a set
   bit; corruption anywhere in the read set is reported by `open`. Under this policy
@@ -85,7 +285,7 @@ Each links to the section of the migration document that tells you what to edit.
   live pages, eager reads 591,384 bytes and leaves 524,288 resident; lazy reads
   1,040 bytes. **Open is independent of file size under both policies but is not
   `O(1)` under either** — see
-  [docs/known-limitations.md §1](docs/known-limitations.md#1-matrix-opening-a-matrix-is-not-o1-and-its-metadata-residency-is-not-a-cache).
+  [docs/known-limitations.md §1](docs/known-limitations.md#1-matrix-opening-a-matrix-is-not-o1-because-opening-it-verifies-it).
 
 - `MatrixRecoveryReport` counters, gated on `scalable-fault-injection`:
   `matrix_lazy_cached_bitmap_bytes`, `matrix_lazy_fault_bytes_read`, and
@@ -128,6 +328,8 @@ Each links to the section of the migration document that tells you what to edit.
   `Mutex<PageStore>` so a demand fault-in can happen under `&self`. It is taken
   only for `O(1)` map operations, is released across the fault-in read, and is
   never taken on the write path. Under `EagerVerified` nothing is ever faulted in.
+  (**0.5.0**: that variant is gone, so every persisted map is demand-filled and
+  this lock is on every category read.)
 
 - `PoisonFlag::healthy()` is no longer a `const fn`, so the `static DECOY`
   spelling of the guard bypass no longer compiles (E0015).
@@ -135,8 +337,8 @@ Each links to the section of the migration document that tells you what to edit.
 ### Documentation (rounds 15-16)
 
 - New: `docs/known-limitations.md` and `docs/api-changes.md`.
-- `docs/performance.md`, `docs/api-reference.md`, `docs/scalable-io.md`,
-  `docs/durability-model.md` and `README.md` corrected against the measured
+- `docs/api-reference.md`, `docs/scalable-io.md`, `docs/durability-model.md`,
+  `README.md` and the internal performance notes corrected against the measured
   behaviour of this tree.
 - The changelog's earlier claim that the computed schema hash algorithm is
   version 2 is corrected: the shipping value is **3**
@@ -168,8 +370,7 @@ Full detail in
 
 ### Rounds 12-14
 
-Round-12 adversarial review (`f661f65`,
-`docs/performance-stability-review-2026-07-21-f661f65-final.md`). Five
+Round-12 adversarial review (`f661f65`, 2026-07-21). Five
 correctness blockers, two medium post-publication result issues, one low
 diagnostic issue, one release-assurance gap, and one documentation-routing
 improvement. No wire-format change: `VMAT` stays at layout version 4, the
@@ -180,8 +381,8 @@ shape - a persisted structure mutated on disk before its in-memory mirror was
 updated by a step that can fail - and round 10's exhaustive enumeration of that
 class walked straight past the instance round 12 reported, in the file it had
 just rewritten. Reading does not close the class, so this round made the shape
-impossible to express instead. See "Mechanically enforced shapes" in
-`docs/invariant-checklist.md`.
+impossible to express instead: each recurring shape now maps to a type that
+forbids it, and those types are listed under Added below.
 
 ### Breaking (rounds 12-14)
 
@@ -328,9 +529,10 @@ impossible to express instead. See "Mechanically enforced shapes" in
   a combined parent-sync-then-rebind fault, present on **both** the unix and
   windows `sync_parent_directory` branches so the F-07 double-fault regression
   runs on either platform.
-- `docs/invariant-checklist.md` gained "Mechanically enforced shapes", the map
-  from each recurring defect shape to the type that now forbids it, and a
-  standing instruction to prefer that section to the site enumeration. The
+- The contributor invariant checklist (an internal working document, not part of
+  the published `docs/` set) gained "Mechanically enforced shapes", the map from
+  each recurring defect shape to the type that now forbids it, and a standing
+  instruction to prefer that section to the site enumeration. The
   enforcement pass added "What is mechanically enforced, and what is not",
   which separates the properties the compiler refuses from the ones a source
   gate checks from the ones that still rely on review.
@@ -364,17 +566,17 @@ impossible to express instead. See "Mechanically enforced shapes" in
   regardless.
 - `docs/recovery-model.md`: the CRC rebuild's refusal on incomplete validity
   evidence, and that forensic mode does not relax it.
-- `docs/matrix-storage-design.md`: the prepared page-index mutation gate, its one
-  deliberate exception, and the compaction ordering that replaced the separate
-  function.
+- The internal matrix storage design notes: the prepared page-index mutation gate,
+  its one deliberate exception, and the compaction ordering that replaced the
+  separate function.
 - `docs/api-reference.md`: the version refusal on every replacement path, the
   three-field rebind variant, the single indexed/stream poison flag, the rebuild
   refusal, the narrowed post-commit outcome family, and the resident-writer cost
   model with its routing to the disk-indexed APIs.
 - `docs/self-check-guide.md`: cleanup failures are reported rather than silent,
   and the marker is preserved when it cannot be proved to be ours.
-- `docs/fuzzing-and-fault-injection.md`: exactly what the artifact gate checks,
-  when, and with which exit codes.
+- The internal fuzzing and fault-injection record: exactly what the artifact gate
+  checks, when, and with which exit codes.
 - Generated typed writers now carry rustdoc stating the `Theta(M*N)` priming
   cost, the per-block-id retention bound, and the `key_index = disk` route a
   high-cardinality format should take instead (P-01). Documentation only; no
@@ -410,7 +612,7 @@ skipped the writer and left the keyed-tail cache resident (F-02).
   `ReplacementTarget`'s field is private even to the rest of `file.rs`).
 - **Two false published claims corrected** (invariant 4): `file.rs`'s statement
   that a later path "cannot reach `self.index[..]` for a caller-chosen ordinal",
-  and `docs/invariant-checklist.md`'s "Enforced by the compiler" row "a
+  and the invariant checklist's "Enforced by the compiler" row "a
   replacement target cannot be addressed without the version check". Reading the
   index was never restricted and is not now; what is enforced is that an ordinal
   cannot be *written through*. The checklist rows now say which round's claim was
@@ -571,9 +773,10 @@ typed error rather than migrated in place.
   added earlier in this release cycle as the generated writers' entry point for
   the charge, does not ship — it was removed in round 9 with the typed map it
   served.
-- `docs/invariant-checklist.md`: the five invariants every structure this
-  project adds must satisfy, the inventory of everything added in the 0.3.0 and
-  0.4.0 stabilization rounds, and each entry's audited status.
+- A contributor invariant checklist, kept as an internal working document rather
+  than published: the five invariants every structure this project adds must
+  satisfy, the inventory of everything added in the 0.3.0 and 0.4.0
+  stabilization rounds, and each entry's audited status.
 - Stable codec identities for the two built-in public value types (API-03,
   API-04). `ChunkedBytes` and `PackedBitmap` now declare a non-zero, structurally
   derived `SCHEMA_ID` on both `VarveEncode` and `VarveDecode`
@@ -1069,7 +1272,10 @@ typed error rather than migrated in place.
 - Integration tests own per-test temporary directories (`tempfile::tempdir()`
   guards), so native files, sidecars, and `.lock` markers are collected on
   drop even under plain `cargo test`, on panic, or early return; nothing is
-  left in the system temp root. See `docs/test-artifact-hygiene.md`.
+  left in the system temp root. The project's test-artifact rule is that a test
+  command is not successful merely because its assertions pass: its temporary
+  session must also be removed and verified absent, with the root preserved on
+  failure and cargo build caches exempt.
 - Matrix `Fatal` recovery findings fail-close every default read/write/aux/
   resume/rebuild accessor with `Error::MatrixFatalCorruption` via an `O(1)` flag
   precomputed at open; `matrix_recovery_report()` stays readable.
@@ -1266,8 +1472,7 @@ typed error rather than migrated in place.
 
 #### Fixed (invariant re-verification, round 9)
 
-Round 9 answered the round-8 review
-(`docs/performance-stability-review-2026-07-21-8732e83-final.md`). All three of
+Round 9 answered the round-8 review (`8732e83`, 2026-07-21). All three of
 its release blockers were the same defect class — invariant 3, a fallible or
 user-code-invoking step placed after the authoritative commit it belongs to —
 so each was closed structurally rather than patched at the named line.
@@ -1336,8 +1541,8 @@ so each was closed structurally rather than patched at the named line.
   happened and re-run the transaction, appending a second marker for work that
   is already recorded. The correct response to the new variant is to retry
   `sync` alone. The created-pathname sync after it already reported
-  `PublishedButParentSyncPending` and is unchanged. This was open item 9 in
-  `docs/invariant-checklist.md`.
+  `PublishedButParentSyncPending` and is unchanged. This was open item 9 in the
+  invariant checklist, closed here.
 - `write_matrix_cell_durable` reports a failure of the durability request that
   follows the commit as the typed published outcome
   `Error::MatrixCommittedButDurabilityUnproven { event, source }` (round 11,
@@ -1450,11 +1655,11 @@ so each was closed structurally rather than patched at the named line.
 - Two false documentation claims shipped by round 6 are retracted. The rustdoc
   on `VarveWriter::reserve_keyed_tail_slot` said the growth is charged against
   `ReadLimits::max_index_bytes`; the code checks `ReadLimitKey::KeyedTailBytes`,
-  i.e. `max_keyed_tail_bytes`. And `docs/api-reference.md` /
-  `docs/declaration-and-internals.md` promised a ceiling on the resident
-  keyed-tail cache that the generated writers did not have. Both are corrected
+  i.e. `max_keyed_tail_bytes`. And `docs/api-reference.md`, together with the
+  internal notes on the declaration and its internals, promised a ceiling on the
+  resident keyed-tail cache that the generated writers did not have. Both are corrected
   and both are now gated by `crates/varve/tests/doc_claims.rs`.
-- `docs/invariant-checklist.md` claimed more coverage than it had. Its header
+- The invariant checklist claimed more coverage than it had. Its header
   advertised an inventory built from rounds 1-5 while covering essentially
   rounds 3-5: `TailCache`/`SharedSidecar` (round 3), `AllocatedExtents`
   (round 4) and the whole `28a1b68` module set were absent. The scope is now
@@ -1577,8 +1782,8 @@ defect.
 
 - The benchmark example now asserts the emitted live-value count for **all
   three** merge/compact lines against the file each one produced.
-  `docs/performance.md` claimed that already while `perf_bench.rs` checked only
-  the direct base+delta output.
+  The internal performance notes claimed that already while `perf_bench.rs`
+  checked only the direct base+delta output.
 - README and the workflow comments no longer overstate CI reproducibility.
   Actions and cargo tools are pinned; `ubuntu-latest`, `windows-latest`, and the
   `stable` toolchain are rolling by design, so a CI run is not reproducible and
@@ -1591,7 +1796,7 @@ defect.
 - The stale intermediate statement in this changelog that named `VMAT` layout
   version 2 as the shipped matrix layout is corrected to version 4, with the
   within-release progression recorded.
-- `docs/performance.md` and `docs/matrix-storage-design.md` no longer describe
+- The internal performance and matrix storage design notes no longer describe
   the pre-v3 full logical scan as the allocation-map fallback. When the
   filesystem cannot answer an allocated-range query, enumeration falls back to
   the persisted page index and still costs `O(live pages)`.
@@ -1600,14 +1805,14 @@ defect.
 
 - The retracted bytes-written cost claim for matrix open, and the retracted
   read-every-page description of the no-allocation-map case, are gone from the
-  two places the previous pass missed:
-  `docs/matrix-storage-design.md` and the `crates/varve-core/src/matrix.rs`
+  two places the previous pass missed: the internal matrix storage design notes
+  and the `crates/varve-core/src/matrix.rs`
   rustdoc that `cargo doc` publishes. Both now state the shipped contract —
   `O(Q)` over the union of the page index and the allocation map, `O(live
   pages)` with no allocation map, and no full logical scan since layout
   version 3.
-- `VMAT` version drift in current-state text is corrected. The
-  `docs/matrix-storage-design.md` header section (heading, endianness sentence,
+- `VMAT` version drift in current-state text is corrected. The internal matrix
+  storage design notes' header section (heading, endianness sentence,
   and the `layout_version u16` field in the diagram), `docs/spec.md`, and
   `docs/migration-guide.md` said version 3 while the code writes and enforces
   version 4; `docs/spec.md` also listed only versions 1 and 2 as refused. The
@@ -1629,10 +1834,10 @@ defect.
   discusses `VMAT`, every `expected: N` must be the version the code enforces,
   and the rendered refusal list is generated from `VMAT_VERSION` rather than
   written out by hand.
-- `docs/security-hardening-spec.md` and `docs/security-hardening-validation.md`
-  state their scope. Both are records of one completed pass at a pinned baseline
-  commit and describe `VMAT` v1 as current; each now says so at the top and
-  points at `docs/spec.md` for the shipped layout.
+- The security-hardening spec and its companion validation record state their
+  scope. Both are records of one completed pass at a pinned baseline commit and
+  describe `VMAT` v1 as current; each now says so at the top and points at
+  `docs/spec.md` for the shipped layout.
 
 #### Fixed (matrix zeroing accounting)
 
@@ -1645,8 +1850,8 @@ defect.
   every range a clear zeroes.
 - The zero-range accessors now document their exact scope: `..._last_...`
   reports one range *request*, not one operation, and both counters are
-  thread-local. `docs/performance.md` carried the "nonzero exactly when the
-  streaming fallback ran" wording without either qualification; it now directs
+  thread-local. The internal performance notes carried the "nonzero exactly when
+  the streaming fallback ran" wording without either qualification; they now direct
   callers to the before/after delta of the cumulative counter, sampled on the
   thread that performed the operation.
 

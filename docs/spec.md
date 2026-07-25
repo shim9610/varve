@@ -72,14 +72,27 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   reserved tail shrank from 32 to 16 bytes. The region order is
   `VMAT header | dimension table | block table | commit categories | commit maps
   | slot region | static aux | page index | MCRC | append log`.
-- The page index holds one 8-byte entry per bitmap page that has been published
-  with a set bit, encoded as `page + 1` so a zero entry terminates the array;
-  there is no count field, so a torn append cannot produce a torn count. Entries
-  are written before the page and digest they describe, so the worst a torn
-  append can do is name a page that still reads as uninitialised zeros, which
-  open already accepts. Open derives the pages it visits from this index unioned
-  with the allocated ranges the platform reports, never from the logical page
-  count.
+- The page index is an array of little-endian `u64` slots, each 8 bytes. Slot `0`
+  is an occupancy header: the live entry count in the low 48 bits and a check
+  value derived from it in the high 16, so the header carries its own redundancy
+  and a torn or corrupted count is detectable rather than believed. A matrix
+  whose page count would exceed `2^48 - 1` is refused at layout time instead of
+  being written with an unrepresentable header. Slots `1..=count` are the
+  entries, each holding `page + 1`, so a zero entry *inside* the counted prefix
+  is provably damage rather than an ambiguous end-of-array — that distinction is
+  the whole reason the count exists. `u64::MAX` in the header is the
+  rebuild-in-progress marker; it is not a representable valid header at any
+  capacity, so a reader that encounters it fails closed rather than reading a
+  half-rebuilt index as authoritative. Entries are written before the page and
+  digest they describe, so the worst a torn append can do is name a page that
+  still reads as uninitialised zeros, which open already accepts. Open derives
+  the pages it visits from this index unioned with the allocated ranges the
+  platform reports, never from the logical page count.
+
+  Layout version 3 used a terminator-scanned array with no count field, which is
+  why a v3 artifact is refused rather than migrated (see the version contract
+  below): under that encoding a damaged entry was indistinguishable from the end
+  of the array, so damage silently hid every later page.
 - The append-log scanner starts at `append_log_start` for matrix files and at the
   normal header length for non-matrix files.
 - Matrix slot payloads are fixed-stride, bounded, and addressed directly by
@@ -142,7 +155,7 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - `IndexPolicy` is a bitset-style policy with `scan_on_open`, `checkpoint_on_flush`, `block_offset_chain`, and `keyed_offset_chain`. Offset-chain policies are written automatically in `VARVE3` footers.
 - `CommitPolicy::RecordFooter` treats valid record footers as the commit flag for each record.
 - `CommitPolicy::TransactionMarker(on_flush|explicit)` appends internal `COMMIT_BLOCK_ID` marker records. Readers expose the latest marker-covered snapshot; writer open truncates uncommitted tail after the latest marker.
-- `IndexPolicy::CheckpointOnFlush` writes an internal checkpoint record, spaced geometrically so cumulative checkpoint bytes stay bounded. **Checkpoint-seeded open is specified but not implemented**: as of 0.4.0 every open scans the full record region (`load_index` -> `scan_records_from`), validates any checkpoint it meets, and discards the checkpoint's decoded entries. See the design target below and `docs/known-limitations.md` §2.1.
+- `IndexPolicy::CheckpointOnFlush` writes an internal checkpoint record, spaced geometrically so cumulative checkpoint bytes stay bounded. **Checkpoint-seeded open is specified but not implemented**: as of 0.5.0 every open scans the full record region (`load_index` -> `scan_records_from`), validates any checkpoint it meets, and discards the checkpoint's decoded entries. See the design target below and `docs/known-limitations.md` §2.1.
 - `CompressionPolicy::VariableBlocks` and block-specific compression descriptors are feature-gated by the selected backend. The first backend is optional `compression-zstd`; compressed records are rejected when the backend is not enabled.
 
 ## Update And Merge
@@ -331,8 +344,17 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   that uses the generated layout reader plus caller-owned TDMS metadata/raw
   logic. It then appends one segment with Varve and verifies the result with
   both npTDMS and Varve.
-- `docs/nptdms-adapter-boundary.md` records the boundary between Varve generic
-  API obligations and external TDMS adapter obligations.
+- The boundary between Varve generic API obligations and external TDMS adapter
+  obligations is fixed as follows. Varve owns physical-layout declaration and
+  validation, segment framing and appends, and the exposure of offsets, lengths,
+  field values, metadata and raw byte ranges, and tolerant scan reports. The
+  adapter owns TDMS object paths, raw-data-index grammar, property typing,
+  timestamp and waveform conversion, scaling, DAQmx raw scalers, sidecar policy,
+  and export. If strict layout open succeeds and the adapter can read the
+  required ranges, an object-assembly, typing, scaling, timestamp or export
+  failure is an adapter issue; if a valid external file cannot be expressed with
+  Varve layout declarations, or Varve rejects a file before the adapter can
+  report a documented physical status, that is a Varve generic API issue.
 - The BMP/Pillow harness verifies a non-TDMS custom physical layout in both
   directions: Varve writes a 24-bit BMP opened by Pillow, and Pillow writes a
   BMP whose header fields, row-level chunk index, and pixel payload are decoded
@@ -414,7 +436,7 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
   - entries are ordered by record offset and end no later than the covered offset,
   - no entry points to the checkpoint record itself,
   - CRC validation passes for the checkpoint payload when integrity is enabled.
-- For `IndexPolicy::CheckpointOnFlush`, open should scan from the header until the latest valid checkpoint, then rebuild the index from the checkpoint and scan only records after the covered offset. **Not implemented as of 0.4.0** — this is a design target. The checkpoint is validated on the way past and its entries are discarded; open scans the whole region.
+- For `IndexPolicy::CheckpointOnFlush`, open should scan from the header until the latest valid checkpoint, then rebuild the index from the checkpoint and scan only records after the covered offset. **Not implemented as of 0.5.0** — this is a design target. The checkpoint is validated on the way past and its entries are discarded; open scans the whole region.
 - Structurally corrupt checkpoints are ignored and full scan fallback is allowed.
 - CRC mismatch remains fatal and must not be hidden by checkpoint fallback.
 - Recovery open may truncate only incomplete header/payload tails after the checkpoint; it must not truncate complete-but-corrupt records.
@@ -562,5 +584,9 @@ CRC integrity is a corruption-detection aid, not an authenticity or tamper-proof
   reports, cursor parse errors, chunk-bound checks, reducer status, and sidecar
   status so users can decide whether a failure belongs to Varve mechanics,
   adapter declarations, user domain code, or damaged file bytes.
-- See `docs/adapter-toolkit-design.md` for the detailed design and the example
-  of TDMS as one possible instantiation.
+- The layer model is fixed: external file bytes, then the Varve physical layout,
+  then the adapter toolkit primitives above, then user-defined domain semantics,
+  then the public adapter API. Varve declares and verifies reusable binary
+  mechanics; the adapter author defines domain meaning wherever the format
+  requires it. TDMS is one branch produced by these generic pieces, not a
+  hardcoded Varve feature.

@@ -8,6 +8,12 @@ use varve::{
     MatrixBlockDescriptor, MatrixCommitDescriptor, MatrixCommitKind, MatrixDimensionDescriptor,
     MatrixDimensions, MatrixKey, ReadLimits, VarveBlock, VarveMatrixBlock,
 };
+// No helper names a residency policy any more: 0.5.0 removed
+// `MatrixMetadataResidency::EagerVerified`, so residency is always the bounded
+// demand cache and `max_matrix_bitmap_bytes` bounds *that* plus the persisted
+// page-index mirror. The opens below therefore assert the admission limit on the
+// term that is still resident at open — the mirror — and the payload term is
+// asserted where payload residency is actually taken, on the write path.
 
 const VMAT_HEADER_LEN: u64 = 160;
 #[cfg(feature = "integrity")]
@@ -29,11 +35,19 @@ const TEST_PAGE_INDEX_ENTRY_BYTES: u64 = 48;
 /// tracks residency, not the reserved on-disk extents.
 #[cfg(feature = "integrity")]
 const TEST_BITMAP_BYTES: u64 = 6 + 2 * TEST_PAGE_INDEX_ENTRY_BYTES;
-/// Residency of the same fixture after a reopen: the persisted commit-map and
-/// checksum-validity pages and their page-index tracking only. The
-/// current-write map is session state and starts empty at every open.
+/// Residency of the same fixture after a reopen: the page-index tracking of the
+/// two persisted maps, and nothing else.
+///
+/// The payload term this constant used to carry (`4 +`, the commit-map and
+/// checksum-validity pages) is gone because 0.5.0 made residency demand-filled:
+/// an open materialises no bitmap payload at all, whatever the file holds. What
+/// an open still charges against `max_matrix_bitmap_bytes` is the persisted
+/// page-index mirror, which is `O(live pages)` and is what makes "not published"
+/// answerable without I/O — so that is the term whose ceiling the reopen tests
+/// below exercise. The current-write map is session state and starts empty at
+/// every open.
 #[cfg(feature = "integrity")]
-const TEST_REOPEN_BITMAP_BYTES: u64 = 4 + 2 * TEST_PAGE_INDEX_ENTRY_BYTES;
+const TEST_REOPEN_BITMAP_BYTES: u64 = 2 * TEST_PAGE_INDEX_ENTRY_BYTES;
 /// Residency of a single materialised commit-map page of the same fixture.
 #[cfg(feature = "integrity")]
 const TEST_COMMIT_PAGE_BYTES: u64 = 2;
@@ -393,7 +407,7 @@ fn nonzero_vmat_flags_are_rejected_as_noncanonical() -> varve::Result<()> {
 
 #[cfg(feature = "integrity")]
 #[test]
-fn quarantined_commit_map_is_charged_to_the_resident_budget_as_it_is_read() -> varve::Result<()> {
+fn a_quarantined_commit_map_is_reported_without_being_retained() -> varve::Result<()> {
     let fixture = TempMatrix::new("quarantine-bitmap-limit");
     let spec = matrix_spec(high_limits(), varve::IntegrityPolicy::Crc32);
     let dimensions = MatrixDimensions::from_pairs([("scan", 4), ("ch", 4)]);
@@ -414,22 +428,36 @@ fn quarantined_commit_map_is_charged_to_the_resident_budget_as_it_is_read() -> v
     file.write_all(&[1])?;
     drop(file);
 
-    // The corrupted byte makes the first commit-map page carry state, so the
-    // page is materialised and charged as it is read, before the quarantined
-    // map is retained. A budget below one page must refuse the open.
-    let error = match matrix_spec(
+    // The corrupted byte is in a page the matrix never published, which is
+    // exactly the class of damage only the allocation-map term of the
+    // verification candidate set can see. Verification reads it, fails it against
+    // its `PAGE_STATE_UNINITIALIZED` digest, and quarantines the category — while
+    // retaining nothing, so the open is admitted by a budget far below one page
+    // and the reader still refuses the category.
+    let reader = matrix_spec(
         high_limits().with_max_matrix_bitmap_bytes(TEST_COMMIT_PAGE_BYTES - 1),
         varve::IntegrityPolicy::Crc32,
     )
-    .open_readonly(fixture.path())
-    {
-        Ok(_) => panic!("quarantined bitmap unexpectedly fit the resident budget"),
-        Err(error) => error,
-    };
-    expect_limit(error, "matrix bitmap bytes", TEST_COMMIT_PAGE_BYTES - 1);
+    .open_readonly(fixture.path())?;
+    assert!(
+        matches!(
+            reader.matrix_cell_status::<LimitedCell>(MatrixKey::new(0, 0)),
+            Err(Error::MatrixCommitQuarantined(name)) if name == "analysis"
+        ),
+        "a damaged commit map was not quarantined"
+    );
+    assert!(
+        reader
+            .matrix_recovery_report()
+            .findings
+            .iter()
+            .any(|finding| finding.kind == varve::MatrixCorruptionKind::CommitMap),
+        "the quarantine produced no commit-map finding"
+    );
+    drop(reader);
 
-    // A budget that does cover the page admits the same file, so the refusal
-    // above is the budget and not the corruption.
+    // A budget that would have covered the page admits the same file and reports
+    // the same damage, so nothing above depended on the ceiling.
     drop(
         matrix_spec(
             high_limits().with_max_matrix_bitmap_bytes(TEST_COMMIT_PAGE_BYTES),
@@ -478,7 +506,11 @@ fn resident_bitmap_budget_is_charged_as_pages_are_materialized() -> varve::Resul
     drop(writer);
     drop(spec.open_readonly(roomy.path())?);
 
-    // One byte less than the persisted pages actually hold refuses the reopen.
+    // One byte less than the page-index mirror the reopen builds refuses the
+    // reopen. Since 0.5.0 the mirror is the whole of what an open makes resident
+    // — no payload page is materialised — so this is the admission limit acting
+    // on the term that is still there, and it is the term that scales with live
+    // pages.
     let error = match matrix_spec(
         high_limits().with_max_matrix_bitmap_bytes(TEST_REOPEN_BITMAP_BYTES - 1),
         varve::IntegrityPolicy::Crc32,

@@ -127,7 +127,11 @@ pub trait GuardedWriter: Sized {
 /// The permit deliberately carries no lifetime tied to the flag: binding one
 /// would make staleness unrepresentable but conflicts with `&mut self` methods
 /// without splitting every writer's fields into a borrow-disjoint inner
-/// struct. See the open item in `docs/invariant-checklist.md`.
+/// struct. The consequence is that a permit binds the writer's *type*, not its
+/// instance: it cannot be spent on a different kind of writer, but nothing in
+/// the type system stops one taken from writer A being spent on writer B of the
+/// same type, so the guarded methods take `&mut self` and a caller cannot hold
+/// two writers of one type open across a single permit.
 ///
 /// `W` names the writer the witness speaks for. It is phantom — the permit is
 /// still zero-sized — but it means a permit taken from one kind of writer

@@ -142,8 +142,8 @@ pub fn derive_varve_block(input: TokenStream) -> TokenStream {
 /// when the dependency is renamed (`vv = { package = "varve", … }`), so no
 /// `extern crate` alias is needed downstream.
 ///
-/// See `docs/declaration-and-internals.md` and `docs/format-author-guide.md`
-/// for the full grammar.
+/// See `docs/spec.md` ("Macro Contract") for the normative grammar and
+/// `docs/format-author-guide.md` for a clause-by-clause walkthrough of it.
 #[proc_macro]
 pub fn varve_format(input: TokenStream) -> TokenStream {
     match syn::parse::<FormatInput>(input) {
@@ -4939,7 +4939,8 @@ fn high_cardinality_api_tokens(
 /// The resident writer is the convenient default, and for a format whose
 /// distinct key count is large it is the wrong tool. The published pages are
 /// where a caller decides that, so the cost model and the alternative are
-/// stated on the type itself rather than only in `docs/performance.md`.
+/// stated on the type itself rather than only in `docs/known-limitations.md`
+/// (§2.2) and `docs/api-reference.md`.
 fn generated_writer_doc(format_name: &Ident, keyed_blocks: &[&InlineBlock]) -> String {
     if keyed_blocks.is_empty() {
         return format!(

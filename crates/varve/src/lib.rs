@@ -110,13 +110,15 @@
 //! | Guide | Covers |
 //! | --- | --- |
 //! | `quickstart.md` | shortest path from declaration to a file |
-//! | `declaration-and-internals.md` | the full `varve_format!` grammar and what it generates |
+//! | `format-author-guide.md` | declaring a format clause by clause, and what each clause generates |
+//! | `spec.md` | the normative wire contract, the `varve_format!` macro contract, and the `VMAT` matrix layout |
+//! | `how-it-works.md` | what the generated code does at run time, region by region, including the preallocated matrix storage mode |
 //! | `api-reference.md` | the complete public surface, feature by feature |
 //! | `custom-codec-guide.md` | writing a codec, and the mandatory `SCHEMA_ID` identity contract |
 //! | `durability-model.md` | what `flush`, `sync`, and `commit_durable` promise |
 //! | `recovery-model.md` | how damaged files are classified and what may be rebuilt |
-//! | `matrix-final-spec.md` | the preallocated matrix storage mode |
-//! | `performance.md` | the scale contracts and their measured bounds |
+//! | `scalable-io.md` | the `high-cardinality-dev` streaming and disk-index path |
+//! | `known-limitations.md` | the scale contracts, their measured bounds, and what is not verified |
 //! | `migration-guide.md` | version-to-version behaviour changes |
 //!
 //! [`ChunkedBytes`]: crate::ChunkedBytes

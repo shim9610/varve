@@ -23,11 +23,13 @@
 //! * `docs/custom-codec-guide.md`: "scalars, `bool`, `String`, `Vec<u8>`,
 //!   selected typed vectors, fixed arrays, tuples, `Option`, `BTreeMap`, and
 //!   `HashMap`".
-//! * `docs/spec.md`: `ChunkedBytes` "can be used inside variable fields".
-//! * `docs/matrix-final-spec.md`: `PackedBitmap` "provides the LSB-first packed
-//!   bitmap primitive" — a documented public value type, so it must work as an
-//!   ordinary derived *variable* field.
-//! * `docs/declaration-and-internals.md` / `docs/api-reference.md`: fixed,
+//! * `docs/spec.md`: `ChunkedBytes` "can be used inside variable fields", and
+//!   `ChunkedBytes` and `PackedBitmap` are "both usable as ordinary derived
+//!   variable fields". `PackedBitmap` is the LSB-first packed bitmap primitive
+//!   and a documented public value type, so it must work as an ordinary derived
+//!   *variable* field even though it is deliberately **not** a fixed-width
+//!   matrix field.
+//! * `docs/spec.md` ("Macro Contract") / `docs/api-reference.md`: fixed,
 //!   variable, and matrix block kinds, and the matrix rule that slots are
 //!   fixed-width scalar or fixed-array types.
 //!
@@ -87,9 +89,9 @@ where
 // Derived blocks over the documented field types.
 // ---------------------------------------------------------------------------
 
-/// Fixed blocks are positional and every field is required
-/// (`docs/declaration-and-internals.md`). Scalars and fixed arrays are the
-/// documented shapes for them.
+/// Fixed blocks are positional canonical payloads and cannot omit fields, so
+/// every field is required (`docs/spec.md`, "Macro Contract"). Scalars and fixed
+/// arrays are the documented shapes for them.
 #[derive(Clone, Debug, PartialEq, VarveBlock)]
 #[varve(id = 1, version = 1, kind = "fixed")]
 struct FixedScalars {

@@ -1,9 +1,15 @@
 name: CI
 
+# GitHub-hosted runners are free for public repositories, which this one is, so
+# the automatic triggers are on. `workflow_dispatch` is kept alongside them so a
+# run can also be started by hand from the Actions tab or with
+# `gh workflow run ci.yml`. If this repository is ever made private, minutes are
+# metered against the account and these two triggers are the thing to remove.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,6 +48,12 @@ env:
 
 jobs:
   fmt:
+    # CI runs on the public repository only. `varve-dev` is private, so runner
+    # minutes there are metered against the account; this guard means the
+    # workflow file can live in a tree that is pushed to both remotes without
+    # ever spending a paid minute. Every job carries it because GitHub has no
+    # workflow-level `if`.
+    if: github.repository == 'shim9610/varve'
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
@@ -65,6 +77,12 @@ jobs:
   # rustc wrapper, so `-p varve` also lints `varve-core` and `varve-macros`
   # under the exact feature set the umbrella crate enables.
   feature-matrix:
+    # CI runs on the public repository only. `varve-dev` is private, so runner
+    # minutes there are metered against the account; this guard means the
+    # workflow file can live in a tree that is pushed to both remotes without
+    # ever spending a paid minute. Every job carries it because GitHub has no
+    # workflow-level `if`.
+    if: github.repository == 'shim9610/varve'
     name: clippy (${{ matrix.features.name }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -114,9 +132,15 @@ jobs:
   # Full test runs on both platforms stay limited to the default and all-feature
   # sets; the feature matrix above type-checks and lints every other
   # combination, and `feature-tests` below runs the configurations that have
-  # behaviour no other job can reach. Tests go through the hygiene runner so
-  # leaked temp artifacts fail CI (docs/test-artifact-hygiene.md).
+  # behaviour no other job can reach. Tests go through the hygiene runner
+  # (`tools/varve-test-runner`) so leaked temp artifacts fail CI.
   test:
+    # CI runs on the public repository only. `varve-dev` is private, so runner
+    # minutes there are metered against the account; this guard means the
+    # workflow file can live in a tree that is pushed to both remotes without
+    # ever spending a paid minute. Every job carries it because GitHub has no
+    # workflow-level `if`.
+    if: github.repository == 'shim9610/varve'
     name: test (${{ matrix.features.name }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -149,6 +173,12 @@ jobs:
   # suite under each singleton — would multiply CI time for combinations the two
   # jobs above already cover, without reaching any additional assertion.
   feature-tests:
+    # CI runs on the public repository only. `varve-dev` is private, so runner
+    # minutes there are metered against the account; this guard means the
+    # workflow file can live in a tree that is pushed to both remotes without
+    # ever spending a paid minute. Every job carries it because GitHub has no
+    # workflow-level `if`.
+    if: github.repository == 'shim9610/varve'
     name: test (${{ matrix.features.name }}, ubuntu-latest)
     runs-on: ubuntu-latest
     strategy:
@@ -180,6 +210,12 @@ jobs:
   # and tests against it, which is what makes the manifest claim true rather
   # than aspirational.
   msrv:
+    # CI runs on the public repository only. `varve-dev` is private, so runner
+    # minutes there are metered against the account; this guard means the
+    # workflow file can live in a tree that is pushed to both remotes without
+    # ever spending a paid minute. Every job carries it because GitHub has no
+    # workflow-level `if`.
+    if: github.repository == 'shim9610/varve'
     # Literal, not `${{ env.MSRV }}`: the `env` context is not available in
     # `jobs.<id>.name`. The value is asserted against the manifests below.
     name: msrv (1.95.0)
@@ -218,6 +254,12 @@ jobs:
   # helper demonstrably missed the `IDENT: ::varve::…` expansion shape that
   # only a real downstream build exercises.
   renamed-dependency:
+    # CI runs on the public repository only. `varve-dev` is private, so runner
+    # minutes there are metered against the account; this guard means the
+    # workflow file can live in a tree that is pushed to both remotes without
+    # ever spending a paid minute. Every job carries it because GitHub has no
+    # workflow-level `if`.
+    if: github.repository == 'shim9610/varve'
     name: renamed-dependency fixture
     runs-on: ubuntu-latest
     steps:
@@ -243,6 +285,12 @@ jobs:
   # consumer does. This crate is outside the workspace for the same reason
   # `rename-fixture` is: it must resolve `varve` through its own manifest.
   public-api:
+    # CI runs on the public repository only. `varve-dev` is private, so runner
+    # minutes there are metered against the account; this guard means the
+    # workflow file can live in a tree that is pushed to both remotes without
+    # ever spending a paid minute. Every job carries it because GitHub has no
+    # workflow-level `if`.
+    if: github.repository == 'shim9610/varve'
     name: public-api fixture
     runs-on: ubuntu-latest
     steps:
@@ -286,6 +334,12 @@ jobs:
   # longer ```ignore — while they were, they compiled in no job at all and were
   # free to drift from the macros they document.
   rustdoc:
+    # CI runs on the public repository only. `varve-dev` is private, so runner
+    # minutes there are metered against the account; this guard means the
+    # workflow file can live in a tree that is pushed to both remotes without
+    # ever spending a paid minute. Every job carries it because GitHub has no
+    # workflow-level `if`.
+    if: github.repository == 'shim9610/varve'
     name: rustdoc (-D warnings)
     runs-on: ubuntu-latest
     env:
@@ -305,6 +359,12 @@ jobs:
 
   # Release gate: audit/deny failures block the merge.
   supply-chain:
+    # CI runs on the public repository only. `varve-dev` is private, so runner
+    # minutes there are metered against the account; this guard means the
+    # workflow file can live in a tree that is pushed to both remotes without
+    # ever spending a paid minute. Every job carries it because GitHub has no
+    # workflow-level `if`.
+    if: github.repository == 'shim9610/varve'
     name: deny + audit
     runs-on: ubuntu-latest
     steps:
@@ -333,6 +393,12 @@ jobs:
   # Each mutation runs on a fresh checkout, so nothing is restored and no
   # ordering between the two steps matters.
   dependency-policy-fixture:
+    # CI runs on the public repository only. `varve-dev` is private, so runner
+    # minutes there are metered against the account; this guard means the
+    # workflow file can live in a tree that is pushed to both remotes without
+    # ever spending a paid minute. Every job carries it because GitHub has no
+    # workflow-level `if`.
+    if: github.repository == 'shim9610/varve'
     name: deny negative fixture
     runs-on: ubuntu-latest
     steps:
@@ -375,6 +441,12 @@ jobs:
   # (an unlocked cargo-deny metadata resolution is exactly how the staleness
   # was masked locally).
   fuzz-supply-chain:
+    # CI runs on the public repository only. `varve-dev` is private, so runner
+    # minutes there are metered against the account; this guard means the
+    # workflow file can live in a tree that is pushed to both remotes without
+    # ever spending a paid minute. Every job carries it because GitHub has no
+    # workflow-level `if`.
+    if: github.repository == 'shim9610/varve'
     name: fuzz workspace (locked)
     runs-on: ubuntu-latest
     steps:
@@ -419,6 +491,12 @@ jobs:
   # archive is created and nothing is compiled, so it cannot detect an archive
   # that does not build. `package-archives` below is the job that does that.
   package-contents:
+    # CI runs on the public repository only. `varve-dev` is private, so runner
+    # minutes there are metered against the account; this guard means the
+    # workflow file can live in a tree that is pushed to both remotes without
+    # ever spending a paid minute. Every job carries it because GitHub has no
+    # workflow-level `if`.
+    if: github.repository == 'shim9610/varve'
     name: package contents
     runs-on: ubuntu-latest
     steps:
@@ -469,6 +547,12 @@ jobs:
   # The extracted `varve` requires `varve-core`/`varve-macros` by VERSION, so
   # all three patch entries are required and all three are exercised.
   package-archives:
+    # CI runs on the public repository only. `varve-dev` is private, so runner
+    # minutes there are metered against the account; this guard means the
+    # workflow file can live in a tree that is pushed to both remotes without
+    # ever spending a paid minute. Every job carries it because GitHub has no
+    # workflow-level `if`.
+    if: github.repository == 'shim9610/varve'
     name: package archives + staged consumer
     runs-on: ubuntu-latest
     steps:
@@ -528,6 +612,12 @@ jobs:
   # fixture that exists locally but was never committed fails here
   # (REL-01 regression guard).
   clean-archive:
+    # CI runs on the public repository only. `varve-dev` is private, so runner
+    # minutes there are metered against the account; this guard means the
+    # workflow file can live in a tree that is pushed to both remotes without
+    # ever spending a paid minute. Every job carries it because GitHub has no
+    # workflow-level `if`.
+    if: github.repository == 'shim9610/varve'
     name: clean source archive
     runs-on: ubuntu-latest
     steps:

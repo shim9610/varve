@@ -14,8 +14,8 @@ The workspace contains:
 ## What This Is And Is Not Ready For
 
 Read this before adopting. The detail behind every line is in
-**[Known Limitations](docs/known-limitations.md)**; upgrading from 0.3.0 is
-covered in **[API Changes](docs/api-changes.md)**.
+**[Known Limitations](docs/known-limitations.md)**; upgrading from 0.4.0 or 0.3.0
+is covered in **[API Changes](docs/api-changes.md)**.
 
 **Ready for:**
 
@@ -32,12 +32,21 @@ covered in **[API Changes](docs/api-changes.md)**.
   project's five internal invariants**, while the matrix and resident paths have.
   The only path offered for the larger-than-RAM workload is the least-audited code
   in the tree.
-- Preallocated matrix storage with **fixed dimensions**, a live set whose
-  commit-map page count fits the process memory budget, at most 16,000,000 cells
-  unless you raise `max_matrix_cells` explicitly, on a sparse-capable filesystem.
+- Preallocated matrix storage with **fixed dimensions**, a live page count whose
+  page-index mirror (~96 bytes per live page) fits the process memory budget — the
+  commit-map payload itself is demand-cached and bounded, so it does not have to —
+  at most 16,000,000 cells unless you raise `max_matrix_cells` explicitly, on a
+  sparse-capable filesystem.
 - Reading a file with hostile-input ceilings applied (`ReadLimits::UNTRUSTED`).
-  The typed refusals and bounded allocations are real and tested — but read the
-  fuzz/Miri/ASan line below before treating this as a hardened surface.
+  The typed refusals and bounded allocations are real and tested: no production
+  read path uses an unknown length as a framing primitive. Lengths, counts and
+  offsets are decoded with checked arithmetic, validated in full against the
+  captured file snapshot or the enclosing slice, charged against the resolved
+  runtime limit for that resource, and only then converted, reserved fallibly,
+  and read as exactly that range. **EOF is not a framing mechanism** — append
+  logs stop at the captured snapshot length and sidecars must match their declared
+  total length exactly. Read the fuzz/Miri/ASan line below before treating this as
+  a hardened surface.
 
 **Not ready for:**
 
@@ -58,21 +67,35 @@ covered in **[API Changes](docs/api-changes.md)**.
 - **Matrices that grow.** Dimensions are fixed at create time and there is no
   grow path, so a matrix cannot represent an indefinitely growing stream. Use the
   stream/indexed APIs for that.
-- **Frequent matrix opens.** Opening a matrix is not `O(1)`. It is independent of
-  file size, but proportional to the candidate page set: a matrix with **one live
-  page** still reads about **131 KB over 32 pages** (Windows/NTFS). Resident commit
-  metadata is fixed at open by the live page count, does not track the working set,
-  and under the default policy is released only when a *mutation* clears a page's
-  last set bit — a reader can never release anything.
-- **Matrices under a tight `max_matrix_bitmap_bytes`.** That ceiling is an
-  *admission* limit, not a cache bound. A matrix whose committed state exceeds it
-  **cannot be opened at all**.
+- **Frequent matrix opens.** Opening a matrix is not `O(1)`, because by default
+  opening it *verifies* it. Open is independent of file size but proportional to
+  the candidate page set: a matrix with **one live page** still reads about
+  **70 KB over 17 pages** (Windows/NTFS). Declaring
+  `MatrixMetadataVerification::OnDemand` takes that to **32 bytes over 0 pages**,
+  and what you give up is the matrix announcing commit-map damage at open — see
+  the [Capability Boundary](#capability-boundary) below for the exact trade.
+  Residency is no longer part of this problem: an open retains **no** commit-map
+  payload. What no declaration removes is the persisted page index, read in full
+  at open — 8 bytes read and ~96 bytes resident per live page — so open is
+  `O(live pages)` and never `O(1)`. At a million live pages that is 8 MB read and
+  ~96 MB resident before a cell is addressed.
+- **Matrices whose live page count is large against a tightened
+  `max_matrix_bitmap_bytes`.** That ceiling now bounds the demand cache, so a
+  matrix whose live set is wider than it **opens and is served**. What can still
+  refuse an open is the page-index mirror above: it is charged against the same
+  ceiling and is not evictable.
 - **Petabyte-scale merge or compact.** Keyed merge and compact are resident-only.
   Varve exports no bounded-memory external merge or compact.
-- **Channel-selective reads.** `docs/channel-view-design.md` is a design
-  document, not a feature; nothing in it is callable.
-- **Live views of a file another handle is writing.** Resident readers and eager
-  matrix readers are snapshots as of open.
+- **Channel-selective reads.** Reading a subset of channels without paying full
+  block I/O has been designed but not implemented: there is no `channel_view`
+  type, no DSL key, and no generated method anywhere in the workspace. Nothing
+  about it is callable. One conclusion from that design holds regardless, because
+  it is a property of the current on-disk layout: an interleaved payload cannot be
+  read channel-selectively below full block I/O without re-emitting the payload.
+- **Live views of a file another handle is writing.** Resident readers are
+  snapshots as of open. Matrix readers are not snapshots at all: each commit-map
+  page is as of the first read that faulted it in, and since 0.5.0 no policy pins
+  a whole-map instant. A reader that needs one must coordinate it.
 - **Anything depending on a fuzz, Miri or ASan pass on this release**, or on the
   Unix code paths having been executed. Neither has happened; see
   [Known Limitations §6](docs/known-limitations.md#6-not-verified).
@@ -125,22 +148,41 @@ across every matrix block in the format. Larger matrices need
 declaration, or create fails with
 `LimitExceeded { resource: "matrix cells" }`.
 
-**Open-time reads and post-open bitmap residency are bounded by the live
-*page* count, not by the working set, and open is not `O(1)`.** Under the
-default `MatrixMetadataResidency::EagerVerified` policy, open reads the union of
-the pages named by the persisted page index and the pages the platform's
-allocation map reports as written; a matrix with one live page measured 131,240
-bytes over 32 pages, and one with 64 live pages measured 591,384 bytes and
-524,288 resident. Of the pages it reads, open retains only those holding a set
-bit, which is why the 1-live-page case reads 131 KB but holds 8 KB. Residency
-does not change as the caller touches cells, and nothing on the read path
-releases it; a mutation that clears a page's last set bit does refund that page.
-`max_matrix_bitmap_bytes` is an admission limit under this policy:
-a matrix whose live set exceeds it cannot be opened. The opt-in
-`MatrixMetadataResidency::Lazy { cache_bytes }` policy bounds residency by a
-declared ceiling with LRU eviction and reads only the persisted page index at
-open, at the cost of moving corruption detection to first touch and giving up a
-consistent snapshot across pages.
+**Open-time reads are bounded by the candidate *page* count, not by the working
+set, so open is not `O(1)` — but residency is.** An undeclared open resolves to
+`MatrixMetadataResidency::Lazy { DEFAULT_CACHE_BYTES }` plus
+`MatrixMetadataVerification::AtOpen`: it retains **no** commit-map payload, and
+then verifies, which reads the union of the pages named by the persisted page index
+and the pages the platform's allocation map reports as written. Measured: a matrix
+with one live page reads 69,800 bytes over 17 pages, one with 64 live pages reads
+267,800 bytes over 65 pages, and **both hold 0 resident bitmap bytes**. Residency
+afterwards follows the working set exactly — one 4096-byte page per distinct
+commit-map page addressed, evicted LRU at the declared bound — so
+`max_matrix_bitmap_bytes` bounds a cache and a live set wider than it opens
+normally. Declaring `MatrixMetadataVerification::OnDemand` takes the same opens
+down to 32 and 1,040 bytes and 0 pages; what you give up is the matrix announcing
+commit-map damage at open, the whole-category quarantine, and the strict-recovery
+writer gate. What remains unavoidable is the persisted page index: 8 bytes read and
+~96 bytes resident per live page.
+
+**What `OnDemand` actually costs you, since it is the one knob here worth
+understanding.** The commit-map half of `MatrixRecoveryReport` is produced by the
+verification pass and by nothing else. With verification off, the `Recoverable`
+`MatrixCorruptionKind::CommitMap` finding is not produced, a damaged category is
+not failed closed **as a whole** (`Error::MatrixCommitQuarantined` does not fire,
+so only the pages a read touches refuse), the `RebuildCommitMap` / `ClearCategory`
+recommendations are absent, and a `RecoveryPolicy::Strict` writer is not stopped
+from mutating a category whose commit map holds a damaged page. One class is worse
+than deferred rather than merely later: the candidate set is the persisted page
+index **unioned with** the platform's allocation map, and that second term is the
+only thing that ever examines a page the matrix never published, so **stray bytes
+there are never looked at at all**. `verify_matrix_metadata()` on a reader, writer
+or `VarveFile` runs the same pass on demand and recovers the findings and the
+recommendations — but not the quarantine and not the writer gate, which are derived
+once, at open. No read answers from unverified bytes under any policy: every page
+faulted in is authenticated against its stored digest first, so this is a choice
+about *when damage is announced*, not about whether bytes are checked. Full table
+in [Known Limitations §1.4](docs/known-limitations.md#14-lazy-is-the-default-verification-is-what-still-happens-at-open).
 
 Matrix dimensions are fixed at create time; there is no grow path.
 
@@ -155,7 +197,7 @@ confidence in it:**
 
 Full numbers, arithmetic you can apply to your own cell count, and the trade-offs
 of each policy are in
-[Known Limitations §1](docs/known-limitations.md#1-matrix-opening-a-matrix-is-not-o1-and-its-metadata-residency-is-not-a-cache).
+[Known Limitations §1](docs/known-limitations.md#1-matrix-opening-a-matrix-is-not-o1-because-opening-it-verifies-it).
 
 Varve should own the reusable binary-format mechanics. Application-specific
 meaning, domain transforms, and compatibility with an external specification
@@ -167,25 +209,29 @@ remain caller code.
 | --- | --- |
 | [Quickstart](docs/quickstart.md) | shortest path from format declaration to write/read |
 | [Known Limitations](docs/known-limitations.md) | what a user actually hits: matrix open cost and residency, resident-API scale, unimplemented features, and what is not verified |
-| [API Changes](docs/api-changes.md) | migrating from 0.3.0: new/changed/removed items, behaviour changes at unchanged signatures, and what happens to existing files |
-| [Changelog](CHANGELOG.md) | release changes and source-compatibility notes |
-| [Declaration And Internals](docs/declaration-and-internals.md) | how the DSL maps to generated Rust API, native bytes, records, fields, indexes, commits, and custom physical layouts |
-| [How Varve Works](docs/how-it-works.md) | mental model of generated code, append logs, matrix storage, durability |
-| [API Reference](docs/api-reference.md) | practical public API map |
+| [How Varve Works](docs/how-it-works.md) | mental model of the declaration, the generated code, append logs, matrix storage, and durability |
+| [API Reference](docs/api-reference.md) | practical public API map, including the resource-limit surface and the generic adapter toolkit |
 | [Format Author Guide](docs/format-author-guide.md) | policy choices, compression, commit modes, matrix blocks |
-| [Self-Check Guide](docs/self-check-guide.md) | deciding whether a failure is format, caller, data, feature, environment, or library |
-| [Security Review](docs/adversarial-security-review-2026-07-10.md) | hostile-input threat model, remediated findings, and residual caller obligations |
-| [Security Validation](docs/security-remediation-validation.md) | exact verification commands, compatibility evidence, and assurance limits |
-| [Read And Allocation Safety](docs/read-allocation-safety.md) | invariant and coverage for length validation, bounded allocation, exact reads, and snapshot extents |
-| [Fuzzing And Fault Injection](docs/fuzzing-and-fault-injection.md) | ASan fuzz targets, Miri checks, Windows race tests, and reproducible commands |
-| [Performance](docs/performance.md) | repeatable regression protocol, benchmark paths, and integration gate |
-| [Scalable I/O](docs/scalable-io.md) | petabyte-scale stream/indexed APIs, batching, sidecars, recovery, and exact cost model |
-| [Test Artifact Hygiene](docs/test-artifact-hygiene.md) | fresh test-file creation, success cleanup, failure retention, and build-cache policy |
+| [Custom Codec Guide](docs/custom-codec-guide.md) | writing `VarveEncode`/`VarveDecode` for a field type with its own stable wire meaning |
+| [Update And Compact Guide](docs/update-compact-guide.md) | keyed put/op/tombstone/compact workflows, and when direct replacement is the right tool instead |
+| [Scalable I/O](docs/scalable-io.md) | the experimental `high-cardinality-dev` stream/indexed APIs, batching, sidecars, recovery, and exact cost model |
 | [Durability Model](docs/durability-model.md) | flush, sync, transaction-marker, matrix, and replacement ordering |
-| [Architecture](docs/architecture.md) | current architectural outline and implementation status |
-| [Requirements Boundary](docs/requirements-boundary.md) | what Varve owns versus what callers should implement |
-| [Adapter Toolkit Design](docs/adapter-toolkit-design.md) | generic adapter primitives for external binary formats |
-| [npTDMS Adapter Boundary](docs/nptdms-adapter-boundary.md) | how npTDMS-documented behavior maps to Varve generic APIs versus external adapter code |
+| [Recovery Model](docs/recovery-model.md) | matrix corruption classification, findings, and the primitive recovery actions a caller may apply |
+| [Self-Check Guide](docs/self-check-guide.md) | deciding whether a failure is format, caller, data, feature, environment, or library |
+| [API Changes](docs/api-changes.md) | migrating from 0.3.0: new/changed/removed items, behaviour changes at unchanged signatures, and what happens to existing files |
+| [Migration Guide](docs/migration-guide.md) | explicit block-version migration, and the wire changes that have no automatic path |
+| [Format Spec](docs/spec.md) | the implementation contract: wire layout, versions, adapter boundary, and the obligations each surface carries |
+| [Changelog](CHANGELOG.md) | release changes and source-compatibility notes |
+
+That table is the whole published set. The project also keeps internal working
+notes — adversarial review reports, architecture and design studies, a
+contributor invariant checklist, performance and fuzz records, and the routing
+artifacts of each hardening round. Those are development process material and are
+not published. Nothing in the documents above depends on reading them: where a
+published document used to cite one, it now states the substance directly, and
+the assurance those notes record — together with its limits — is summarised under
+[Status](#status) below and in
+[Known Limitations §6](docs/known-limitations.md#6-not-verified).
 
 ## Minimal Shape
 
@@ -234,15 +280,20 @@ legacy `*_with_limits` methods when only fieldwise tightening is desired. An
 optional, partial `limits { ... }` declaration can provide format defaults but
 never becomes a permanent wire-format ceiling.
 
-One field on `ReadLimits` does not compose like a limit: `matrix_metadata_residency`
-is a *declaration*, not a ceiling, so a `*_with_resource_limits` call **replaces**
-whatever residency policy the spec declared instead of combining with it. Raising
-`max_matrix_bitmap_bytes` through that entry point therefore reverts a declared
-`Lazy { cache_bytes }` to `EagerVerified` — silently discarding the only bound on
-matrix metadata memory, and possibly failing the open on the very admission limit
-you were raising. Carry the policy in the same `ReadLimits` value
-(`with_matrix_metadata_residency`), or use `*_with_limits`, which keeps it. See
-[Known Limitations §1.6](docs/known-limitations.md#16-_with_resource_limits-silently-discards-a-declared-residency-policy).
+Two fields on `ReadLimits` are *declarations* rather than ceilings:
+`matrix_metadata_residency` and `matrix_metadata_verification`. Neither has a
+"tighter" direction to meet, so both compose by precedence instead — and, as of
+0.5.0, a **silence never overwrites a declaration**. A `*_with_resource_limits`
+call that does not mention a policy leaves the spec's alone; one that does mention
+it wins. `*_with_limits` keeps the spec's and now also takes a runtime one where
+the spec declared none. Through 0.4.0 this was broken in both directions: raising
+`max_matrix_bitmap_bytes` alone silently reverted a declared
+`Lazy { cache_bytes }` to the eager policy, discarding the only bound on matrix
+metadata memory and often failing the open on the very admission limit you were
+raising. **If you wrote a workaround for that, it is no longer needed.** There is
+still no `varve_format!` DSL key for either policy; declare them on the spec with
+`FormatSpec::with_read_limits` or pass them in a `ReadLimits` value. See
+[Known Limitations §1.6](docs/known-limitations.md#16-the-matrix-residency-and-verification-policies-have-no-varve_format-dsl-key).
 
 ## Examples
 
@@ -263,6 +314,18 @@ TDMS-specific behavior into the library. It also acts as a regression harness so
 combined changes do not silently break segment appends, metadata reuse, scalar
 types, or cross-tool compatibility.
 
+The boundary it demonstrates is the general one for external formats. Varve owns
+the reusable mechanics: declaring and validating file headers, segment lead-ins,
+metadata and raw regions and footers, finalized offsets and segment bounds;
+appending complete segments; and exposing offsets, lengths, field values, byte
+ranges and tolerant scan reports. Above that sit generic adapter primitives —
+tagged-value codecs, chunk index builders over raw regions, segment reducers, and
+adapter self-checks. The adapter author owns the domain meaning: for TDMS that
+means object paths, raw-data-index grammar, property typing, timestamp and
+waveform conversion, scaling, DAQmx raw scalers, interleaving, sidecar policy and
+export. **Varve provides no TDMS reader or writer**; the files under
+`crates/varve/examples/` are adapter proofs, not a supported TDMS API.
+
 ## Self-Check
 
 Generated formats expose diagnostics and end-to-end self-test helpers:
@@ -282,7 +345,7 @@ gate, file data, environment, or library invariant issues. See
 
 ## Status
 
-Varve 0.4.0 is usable as an alpha library for experimentation and controlled
+Varve 0.5.0 is usable as an alpha library for experimentation and controlled
 deployments. Through the **stable, released** APIs that means moderate scale —
 files whose record and key counts fit in RAM. The larger-than-RAM path exists but
 is behind `high-cardinality-dev`, has never shipped, and is the least audited code
@@ -290,11 +353,11 @@ in the tree; "far larger than RAM" in the capability table above describes that
 feature-gated family, not the default one. It includes append-log blocks, keyed
 collections, transaction/footer commit policies, schema manifests, diagnostics,
 merge and compact helpers, variable-block compression, matrix storage, mmap, and
-opt-in zero-copy. Valid native 0.1 append-log wire bytes remain readable in 0.4.0,
+opt-in zero-copy. Valid native 0.1 append-log wire bytes remain readable in 0.5.0,
 but the Rust API is still pre-1.0 and may evolve through semver-signaled minor
 releases.
 
-**Four artifact classes are not covered by that statement in 0.4.0.** They are
+**Four artifact classes are not covered by that statement in 0.5.0.** They are
 rejected with a typed error rather than misread, but two of them hold data and two
 are regenerable, and the difference is what it costs you:
 
@@ -323,6 +386,26 @@ probes (`real_file_positional_io_at_one_pib` and its 1 TiB smoke sibling) are
 `#[ignore]`d and have never been executed on any host, and the 1 TiB probe has no
 required-mode escape at all. Varve's petabyte-scale claims rest on the cost model
 and on tests at far smaller scales, not on a demonstration at that scale.
+
+The performance checks are in the same position. They are regression guards
+rather than product benchmarks, and **they run in no job**:
+`crates/varve/tests/perf_smoke.rs` is entirely `#[ignore]`d, as is the
+one-million-key RSS/allocator stress probe in
+`crates/varve/tests/high_cardinality.rs`. Every performance number in this
+documentation therefore comes from a manual run on a named date and host, on
+Windows x86_64; none of it is continuously enforced.
+
+On security assurance specifically: an adversarial hostile-input review was
+performed on 2026-07-10 against the pre-0.2 hardening implementation. It treated
+file bytes, matrix metadata, sidecars, file paths and concurrent external
+filesystem activity as untrusted, and the format declaration, generated code and
+custom codec implementations as trusted. Its findings were remediated for 0.2.0
+and the remediation was verified on 2026-07-10 and 2026-07-11 across fail-closed
+resource limits, open-object snapshots, strict recovery classification,
+copy-on-write fixed replacement, canonical decoding, native and matrix structural
+validation, sidecar and lock bounds, and generated API trust boundaries. **That
+review predates 0.4.0 and every hardening round recorded in the changelog, and it
+is not a substitute for the fuzz, Miri and ASan runs that have not happened.**
 
 For the full assurance picture — including that CI has never run on this code and
 that no fuzz, Miri or ASan run covers it — see

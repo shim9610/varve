@@ -187,8 +187,9 @@ fn assert_present(claims: &[(String, String)], path_suffix: &str, needle: &str, 
 /// Open enumerates the union of the persisted page index and the filesystem
 /// allocation map in `O(Q)` over candidate pages. Stating the cost in terms of
 /// the bytes the matrix has written is the claim that was found too strong, and
-/// it survived a correction pass in `docs/matrix-storage-design.md` and in the
-/// `matrix.rs` rustdoc after being removed from `docs/performance.md`.
+/// deleting it from the first document that carried it left it standing verbatim
+/// in the matrix design notes and in the `matrix.rs` rustdoc — which is why this
+/// gate sweeps every normative file instead of the one that was corrected.
 #[test]
 fn the_retracted_matrix_open_cost_claim_is_not_published_anywhere() {
     let files = normative_files();
@@ -205,10 +206,10 @@ fn the_retracted_matrix_open_cost_claim_is_not_published_anywhere() {
 
 /// The pre-v3 full-logical-scan fallback, which no longer exists.
 ///
-/// `pages_to_visit` returns only the persisted index pages when the allocation
-/// map is absent, so no full scan occurs. Text describing one is not merely
-/// stale, it is false: it tells a reader that a missing allocation map costs
-/// `Theta(cells / 8)` at open.
+/// `for_each_candidate_page` streams only the persisted index pages when the
+/// allocation map is absent, so no full scan occurs. Text describing one is not
+/// merely stale, it is false: it tells a reader that a missing allocation map
+/// costs `Theta(cells / 8)` at open.
 #[test]
 fn the_deleted_full_scan_fallback_is_not_described_anywhere() {
     let files = normative_files();
@@ -254,6 +255,7 @@ fn documented_vmat_layout_version_matches_the_shipped_constant() {
         ("little-endian in layout version ", ""),
         ("`VMAT` layout version ", " stores"),
         ("matrix layout is `VMAT` version ", ""),
+        ("| Matrix layout | `VMAT_VERSION` | **", "**"),
     ] {
         for (path, line, version) in published_version_claims(&files, prefix, suffix) {
             if version != shipped {
@@ -271,22 +273,20 @@ fn documented_vmat_layout_version_matches_the_shipped_constant() {
 
     let why = "The shipped VMAT layout version changed; update the current-state \
                documentation to match crates/varve-core/src/matrix.rs.";
+    // Two shapes swept above are, for now, pinned by nothing, because no
+    // published file carries them: the byte-level `VMAT` version N header
+    // diagram (the `layout_version        u16 = N` field and the field order and
+    // widths around it) and the statement that all integers in `VMAT` metadata
+    // are little-endian in layout version N. Both lived only in the matrix
+    // storage design notes, which are no longer published. They belong in
+    // docs/spec.md under "Preallocated Matrix Wire Contract", which today states
+    // the header's field *set* and the field-13/14 ordering but neither the
+    // widths nor the metadata endianness. Their prefixes stay in the sweep so a
+    // stale numeral is caught the moment they land there.
     assert_present(
         &files,
-        "docs/matrix-storage-design.md",
-        &format!("## VMAT Version {shipped} Header"),
-        why,
-    );
-    assert_present(
-        &files,
-        "docs/matrix-storage-design.md",
-        &format!("layout_version        u16 = {shipped}"),
-        why,
-    );
-    assert_present(
-        &files,
-        "docs/matrix-storage-design.md",
-        &format!("little-endian in layout version {shipped}"),
+        "docs/api-changes.md",
+        &format!("| Matrix layout | `VMAT_VERSION` | **{shipped}** |"),
         why,
     );
     assert_present(
@@ -365,13 +365,12 @@ fn only_the_shipped_vmat_version_mismatch_contract_is_published() {
     let why = "The refusal contract is generated from VMAT_VERSION: every \
                version below it is refused as stale-regenerable. Update the \
                rendered contract wherever it is published.";
-    for document in [
-        "docs/spec.md",
-        "docs/matrix-final-spec.md",
-        "docs/matrix-storage-design.md",
-        "docs/migration-guide.md",
-        "CHANGELOG.md",
-    ] {
+    // These are every published normative file that renders the contract in
+    // full. The matrix design and matrix final-spec notes rendered it too and
+    // were checked here; they are no longer published, and the contract they
+    // carried is unchanged and still pinned by the three below.
+    // docs/api-reference.md renders it in table form and is checked after this.
+    for document in ["docs/spec.md", "docs/migration-guide.md", "CHANGELOG.md"] {
         assert_present(&prose, document, &canonical, why);
     }
     assert_present(
@@ -388,14 +387,17 @@ fn only_the_shipped_vmat_version_mismatch_contract_is_published() {
 #[test]
 fn the_zero_range_counter_qualifications_are_documented() {
     let files = normative_files();
+    // The scale-contract notes that carried these qualifications are no longer
+    // published; docs/known-limitations.md §1.7 is their published home and
+    // states both scope rules in place.
     for needle in [
         "matrix_total_zero_range_streamed_bytes",
         "thread-local",
-        "most recent single request",
+        "does not qualify the whole clear",
     ] {
         assert_present(
             &files,
-            "docs/performance.md",
+            "docs/known-limitations.md",
             needle,
             "F-08's runtime proof must document that the counters are \
              thread-local and that the whole-operation proof is the before/after \
@@ -414,8 +416,9 @@ fn the_zero_range_counter_qualifications_are_documented() {
 ///    `ReadLimitKey::KeyedTailBytes`, i.e. `max_keyed_tail_bytes`. Naming the
 ///    wrong limit is worse than naming none: a caller raises a ceiling that
 ///    cannot bind and believes the growth is now admitted.
-/// 2. `docs/api-reference.md` and `docs/declaration-and-internals.md` said the
-///    limit "bounds the resident keyed-tail cache" while the generated writers
+/// 2. `docs/api-reference.md`, and the `limits { }` key table that documented
+///    the same ceiling, said the limit
+///    "bounds the resident keyed-tail cache" while the generated writers
 ///    built their whole tail map from file content, at construction, with no
 ///    charge at all. The ceiling - including `UNTRUSTED`'s 256 MiB - therefore
 ///    did not bound what an attacker-chosen key count made a writer allocate.
@@ -450,11 +453,17 @@ fn the_keyed_tail_charge_is_documented_against_its_own_limit_and_its_build() {
         );
     }
 
+    // The `limits { }` key table that also carried this row is no longer
+    // published, so docs/api-reference.md is its only published home. It states
+    // the same thing in prose, and this pins the half the table made explicit:
+    // the charge covers the build, not only the growth.
     assert_present(
         &files,
-        "docs/declaration-and-internals.md",
-        "initial build from file content",
-        "The limits table must say the keyed-tail charge covers the build, not \
-         only the growth.",
+        "docs/api-reference.md",
+        "its later growth are both refused",
+        "The keyed-tail charge covers the map's initial build from file content \
+         as well as its later growth. Both halves must be published, or a caller \
+         sizes the ceiling for the growth alone and an open it expects to \
+         succeed is refused.",
     );
 }

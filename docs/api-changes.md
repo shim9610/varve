@@ -1,7 +1,316 @@
-# API Changes — 0.3.0 to 0.4.0
+# API Changes — 0.3.0 to 0.4.0, and 0.4.0 to 0.5.0
 
-Migration document for 0.4.0. Companion to [Known Limitations](known-limitations.md)
+Migration document. Companion to [Known Limitations](known-limitations.md)
 and the [Changelog](../CHANGELOG.md).
+
+Section **A** is the 0.4.0 → 0.5.0 migration: four changes, all about matrix
+commit-metadata residency and verification. Everything numbered 1 through 5 is the
+0.3.0 → 0.4.0 migration and is unchanged except where a section says 0.5.0
+corrected it — §5.12 in particular now describes a bug that **no longer exists**,
+and says so in place.
+
+No on-disk byte changes in 0.5.0. A 0.4.0 file reads unchanged; no encoder,
+decoder, header field or version constant was touched. If you are coming from
+0.3.0 or earlier, read "Read this first" below — that guidance is unchanged.
+
+---
+
+## A. From 0.4.0 to 0.5.0
+
+Five changes. §A.1 and §A.2 are representation and composition; **§A.3 and §A.4
+are the substantive ones**: residency and verification, which one option used to
+conflate, are now two options, and the residency default changed. §A.5 lists what
+changed behaviour at an **unchanged signature** — read it even if everything still
+compiles.
+
+**What an undeclared open does now.** It reads a header and 8 bytes per live
+commit-map page, retains **no** commit-map payload, and can no longer be refused
+because a matrix's live set is wider than `max_matrix_bitmap_bytes`. It still
+authenticates the whole commit map and still reports commit-map damage at open,
+because that work became `MatrixMetadataVerification`, which defaults to running
+at open and retains one 4096-byte buffer. Measured on a matrix with one live page:
+32 bytes read and 0 pages visited without verification, 69,800 bytes over 17 pages
+with it, and 0 resident bitmap bytes either way (was 131,240 bytes read and one
+page per live page resident for the session).
+
+### A.1 `MatrixMetadataResidency` gains a `Missing` state and becomes `#[non_exhaustive]`
+
+`MatrixMetadataResidency` had no way to say "nobody declared a policy". That is
+the root cause of §A.2, so the fix is a representation change:
+
+```rust
+// Before (0.4.0)
+pub enum MatrixMetadataResidency {
+    EagerVerified,
+    Lazy { cache_bytes: u64 },
+}
+
+// After (0.5.0)
+#[non_exhaustive]
+pub enum MatrixMetadataResidency {
+    Missing,                      // new, and declared first
+    Lazy { cache_bytes: u64 },    // EagerVerified was removed; see A.3
+}
+```
+
+`Missing` is the `ReadLimit::Missing` idiom, not a second convention: it is the
+state an unset field starts in, it never overwrites a policy someone else
+declared, and it resolves to varve's own choice.
+
+**Two things break.**
+
+1. **Exhaustive `match`es.** Both the new variant and `#[non_exhaustive]` require
+   a wildcard arm. The attribute went on in the same release deliberately —
+   adding the variant already broke every exhaustive match, so paying for
+   `#[non_exhaustive]` now costs nothing and prevents a second break on the next
+   variant. Nothing is on crates.io, so this is the cheap moment.
+
+   ```rust
+   // Before (0.4.0)
+   match limits.matrix_metadata_residency {
+       MatrixMetadataResidency::EagerVerified => eager(),
+       MatrixMetadataResidency::Lazy { cache_bytes } => lazy(cache_bytes),
+   }
+
+   // After (0.5.0) — match what you care about, wildcard the rest
+   match limits.effective_matrix_metadata_residency() {
+       MatrixMetadataResidency::Lazy { cache_bytes } => bounded(cache_bytes),
+       _ => unreachable_today(),
+   }
+   ```
+
+2. **The value in the public field changed.** `ReadLimits::STANDARD`,
+   `UNTRUSTED`, `MISSING`, `TRUSTED_UNBOUNDED`, `all()`, `finite_all()`,
+   `default()` and `FormatSpec::new` now all carry `Missing` where they carried
+   `EagerVerified`. This is source-compatible — no signature changed — but any
+   code that *compares* the field to `EagerVerified` now sees `Missing` and takes
+   the other branch:
+
+   ```rust
+   // Before (0.4.0): true
+   // After  (0.5.0): FALSE — the field is Missing until someone declares a policy
+   limits.matrix_metadata_residency == MatrixMetadataResidency::EagerVerified
+
+   // The fix: resolve the unset state. Never yields Missing.
+   limits.effective_matrix_metadata_residency()
+   ```
+
+   The representation change of this section is behaviour-preserving on its own;
+   what the resolved value *is* changed in §A.3.
+
+**New items, all `const fn` or `const`:**
+
+| Item | What it is |
+| --- | --- |
+| `MatrixMetadataResidency::DEFAULT` | the one place the default policy lives; `Lazy { DEFAULT_CACHE_BYTES }` since §A.3 |
+| `MatrixMetadataResidency::DEFAULT_CACHE_BYTES` | 2 MiB, derived as `ReadLimits::STANDARD.max_matrix_bitmap_bytes / 32`, guarded by two `const` assertions |
+| `ReadLimits::effective_matrix_metadata_residency()` | resolves `Missing`; **read this, not the field** |
+| `ReadLimits::default_matrix_metadata_cache_bytes()` | `DEFAULT_CACHE_BYTES` clamped down to `max_matrix_bitmap_bytes` |
+
+`pub(crate) MatrixMetadataResidency::cache_bytes()` was removed. It was never
+public; the two methods above take its role.
+
+### A.2 `*_with_resource_limits` composes a declared residency policy instead of replacing it
+
+**This is the defect fix, and the only intended user-visible behaviour change in
+0.5.0.** [§5.12](#512-_with_resource_limits-replaces-a-spec-declared-matrix-residency-policy)
+described this as designed behaviour with a mandatory workaround. It was a bug,
+caused by the missing unset state of §A.1, and it is gone.
+
+This is the call that used to lose the policy — note that its only content is a
+*larger* bitmap ceiling, and residency is never mentioned:
+
+```rust
+// The spec declares Lazy { cache_bytes: 16_384 } and a 16,384-byte bitmap ceiling.
+let reader = AppFormat::open_reader_with_resource_limits(
+    path,
+    ReadLimits::STANDARD.with_max_matrix_bitmap_bytes(32_768),
+)?;
+```
+
+| | 0.4.0 | 0.5.0 |
+| --- | --- | --- |
+| Spec's `Lazy { 16_384 }` | **discarded**, reverted to the eager policy | **kept** |
+| Result of the call above, 16 live pages | `Err(LimitExceeded { resource: "matrix bitmap bytes", actual: 33536, limit: 32768 })` | `Ok` — 272 bytes read, 0 commit-map pages visited, 16,384 bytes cached |
+
+In 0.4.0 the call was refused **by the very ceiling it was raising**: dropping
+`Lazy` reverted the handle to the eager policy, under which
+`max_matrix_bitmap_bytes` is an admission limit
+([§1.3](known-limitations.md#13-max_matrix_bitmap_bytes-bounds-a-cache-and-the-residual-admission-limit-is-the-index-mirror)).
+Nothing reported the discard.
+
+`matrix_metadata_residency` now composes exactly like every ceiling beside it:
+
+| Entry-point family | Format declared a policy, caller silent | Caller declared a policy, format silent | Both declared |
+| --- | --- | --- | --- |
+| `*_with_resource_limits` (`overlay`) | **format's policy kept** (was: discarded) | caller's policy taken | caller wins |
+| `*_with_limits` (`tighten`) | format's policy kept | **caller's policy taken** (was: discarded) | format wins |
+| plain `open` / `create` | kept | — | — |
+
+Both changed cells are the same bug class: a silence was being treated as a
+declaration. `tighten` keeps the rule that a format's declaration outranks a
+runtime one — a policy has no "tighter" direction to meet — but a silence no
+longer outranks anything.
+
+**What to do.** If you wrote the §5.12 workaround — carrying
+`with_matrix_metadata_residency` in the same `ReadLimits` value you pass to the
+entry point — it still works and is still the way to *override* a format's policy.
+It is no longer *required* to preserve one. If you avoided
+`*_with_resource_limits` because of this bug, you no longer need to.
+
+**No DSL change.** `varve_format!`'s `limits { }` grammar is
+`key: <integer literal>;` over a fixed key list, so a policy with a variant
+cannot be expressed there and no key was added. Macro-declared formats now emit
+`ReadLimits::missing()`, so they carry `Missing` and pick up whatever `DEFAULT`
+says. A format author who wants to declare a policy today does it through
+`FormatSpec::with_read_limits` / `with_resource_defaults`, which now compose
+correctly.
+
+### A.3 `MatrixMetadataResidency::EagerVerified` is removed, and `DEFAULT` is now `Lazy`
+
+**Breaking, deliberate, and the reason §A.4 exists.** The variant is gone from the
+enum:
+
+```rust
+// Before (0.5.0-dev)
+ReadLimits::STANDARD.with_matrix_metadata_residency(MatrixMetadataResidency::EagerVerified)
+// After: does not compile. There is no eager residency mode.
+```
+
+`EagerVerified` materialised every published commit-map page for the whole session.
+That made `max_matrix_bitmap_bytes` an *admission* limit — a matrix whose live set
+exceeded it could not be opened at all
+([§1.3](known-limitations.md#13-max_matrix_bitmap_bytes-bounds-a-cache-and-the-residual-admission-limit-is-the-index-mirror))
+— and it made open cost scale with the file rather than the working set. What kept
+it was not its cost: the complete `MatrixRecoveryReport` was a **side effect** of
+that load, so removing it would have silently removed the `Recoverable`
+commit-map finding, the category quarantine, the recovery recommendations, and the
+`RecoveryPolicy::Strict` writer gate.
+
+§A.4 separates those two things, so nothing is left that eager residency provides.
+It was **removed rather than kept as an alias** for the bounded cache: a name
+promising eager, verified, session-long residency for something that is none of
+those is worse than a compile error, and an alias would also have been a second
+name for one code path. There is exactly one page-loading path now.
+
+`MatrixMetadataResidency::DEFAULT` is therefore `Lazy { cache_bytes: DEFAULT_CACHE_BYTES }`,
+clamped to `max_matrix_bitmap_bytes` by
+`ReadLimits::default_matrix_metadata_cache_bytes()`.
+
+**Migration.**
+
+| You had | Do this |
+| --- | --- |
+| `with_matrix_metadata_residency(EagerVerified)` for **detection at open** | delete it. Verification at open is the default (§A.4) |
+| `with_matrix_metadata_residency(EagerVerified)` for a **pinned snapshot** across a whole map | no replacement; coordinate it yourself. Whole-live-set residency was the only mechanism and it is gone |
+| `with_matrix_metadata_residency(EagerVerified)` to make `max_matrix_bitmap_bytes` refuse a large open | no replacement. The ceiling now bounds a cache; use `max_matrix_cells` to refuse a large matrix |
+| `with_matrix_metadata_residency(Lazy { .. })` | unchanged |
+| nothing | you get the bounded cache, and verification still runs at open |
+
+### A.4 New: `MatrixMetadataVerification`, and `verify_matrix_metadata()`
+
+Verification is now its own declared policy, in the same idiom as the residency
+one — an unset `Missing` state, composed by `overlay`/`tighten`, resolved in
+exactly one place, admitted in exactly one place:
+
+```rust
+pub enum MatrixMetadataVerification { Missing, AtOpen, OnDemand }  // #[non_exhaustive]
+```
+
+| New item | What it is |
+| --- | --- |
+| `ReadLimits::matrix_metadata_verification` | the declared policy; `Missing` until someone declares one |
+| `ReadLimits::with_matrix_metadata_verification()` | declares it (`const fn`) |
+| `ReadLimits::effective_matrix_metadata_verification()` | resolves `Missing`; **read this, not the field** |
+| `MatrixMetadataVerification::DEFAULT` | `AtOpen` — one constant, one line to change |
+| `VarveReader/VarveWriter/VarveFile::verify_matrix_metadata()` | runs the pass on demand, returns a `MatrixRecoveryReport` |
+
+The pass reads every page of every commit map named by the persisted page index
+**unioned with** the platform's allocation map and authenticates each against its
+stored digest. That union is what detects stray bytes in a page the matrix never
+published. It retains **one reusable 4096-byte page buffer** — nothing it reads
+becomes resident — so the behaviour that used to require whole-live-set residency
+now costs `O(1)` memory.
+
+`AtOpen` is the default, so **an undeclared format behaves as it did before**: a
+damaged matrix announces itself at open, the category is quarantined, the
+recommendations are produced, and a strict-recovery writer is refused.
+`OnDemand` moves the pass off the open (and skips the allocation-map query
+entirely, since nothing would read it); a page faulted in by a read is still
+authenticated against its digest under every policy, which is why there is no
+`Never`.
+
+`verify_matrix_metadata()` **reports; it does not quarantine.** The fail-closed
+gate is derived once, at open, from the findings the layout is assembled with;
+nothing may install one afterwards. A caller that needs a damaged category failed
+closed reopens with `AtOpen`.
+
+**No DSL change for this either**, for the reason §A.2 gives plus one more: the
+policy is reader-side, and a runtime `ReadLimits` passed to
+`*_with_resource_limits` now survives composition (§A.2), so a caller of a
+macro-declared format can declare `OnDemand` at open without the format
+mentioning it.
+
+### A.5 Changed behaviour at an unchanged signature, in 0.5.0
+
+[§5](#5-changed-behaviour-at-an-unchanged-signature) is that section for the
+0.3.0-to-0.4.0 step. These are the 0.5.0 entries of the same class: **code that
+still compiles and now behaves differently.**
+
+#### A.5.1 `matrix_resume_signal` / `matrix_sidecar_resume_signal` refuse a quarantined category
+
+```rust
+// Before (0.4.0): a category whose commit map holds a damaged page
+reader.matrix_resume_signal("analysis")?;         // Ok(MatrixResumeSignal::Clean)
+
+// After (0.5.0)
+reader.matrix_resume_signal("analysis")?;         // Err(Error::MatrixCommitQuarantined("analysis"))
+```
+
+Same change on `matrix_sidecar_resume_signal`, on all three receivers
+(`VarveReader`, `VarveWriter`, `VarveFile`). An **unaffected** category is
+unchanged.
+
+The old answer was an artifact, not a verdict. Quarantine used to be two things:
+the recovery finding, **and** an empty replacement bitmap installed over the
+damaged map — so a progress query answered "nothing in progress" for a category
+known to be damaged. Nothing is retained now, so there is no map to answer from and
+no honest answer to give. A progress figure is an answer like any other and a
+quarantined category refuses it.
+
+**What to do:** treat `Error::MatrixCommitQuarantined` from these two calls the way
+you already treat it from `matrix_cell_status` — as "this category needs recovery
+first". The recovery path is unchanged: `rebuild_matrix_commit_from_crc` or
+`clear_matrix_category`, exactly as `MatrixRecoveryReport::recommended_actions`
+says.
+
+#### A.5.2 `clear_matrix_category` reports 0 cleared on a quarantined category
+
+`clear_matrix_category` is the *recovery* path for a quarantined category, so it
+deliberately does **not** refuse. What it cannot do is count the bits it discards:
+those are the damaged ones, and every count now authenticates what it reads. It
+returns `Ok(0)`.
+
+This is not a change in the value returned — the empty replacement map made it
+report zero before 0.5.0 too — but it was emergent then and is stated in the code
+now. It is listed because the *reason* changed, and because a caller who reasoned
+about it from the old mechanism was reasoning from something that no longer exists.
+
+#### A.5.3 A whole-map aggregate no longer counts unauthenticated bytes
+
+`matrix_resume_signal` and the recovery report's partial-progress advisory read
+pages a demand cache does not hold, and previously did so **without** checking their
+stored digests. They now use the same per-page authentication every other read uses,
+so a damaged page refuses instead of contributing a number. A caller can therefore
+see an error from a progress query where a (wrong) number came back before.
+
+#### A.5.4 An undeclared matrix open behaves differently
+
+Covered above rather than repeated: §A.3 for residency and what an open retains,
+§A.4 for verification. **No wire format changed** — no encoder, decoder, header
+field or version constant was touched — so a file written by any 0.4.0 or 0.5.0
+build reads under either policy, and switching policies is purely a reader-side
+decision about when work happens and how much memory it uses.
 
 ---
 
@@ -296,7 +605,8 @@ using variable field ids **above 63**, must add 8 bytes per such distinct id.
 
 | Item | Notes |
 | --- | --- |
-| `format::MatrixMetadataResidency` | `EagerVerified` (default) \| `Lazy { cache_bytes: u64 }` |
+| `format::MatrixMetadataResidency` | `Lazy { cache_bytes: u64 }`. **0.5.0 adds `Missing`** (the unset state) and `#[non_exhaustive]`, and **removes `EagerVerified`**; `Missing` resolves to `DEFAULT`, now `Lazy { DEFAULT_CACHE_BYTES }`. See [§A.1](#a1-matrixmetadataresidency-gains-a-missing-state-and-becomes-non_exhaustive) and [§A.3](#a3-matrixmetadataresidencyeagerverified-is-removed-and-default-is-now-lazy) |
+| `format::MatrixMetadataVerification` | **new in 0.5.0.** `Missing` \| `AtOpen` \| `OnDemand`, `#[non_exhaustive]`; `Missing` resolves to `DEFAULT` = `AtOpen`. See [§A.4](#a4-new-matrixmetadataverification-and-verify_matrix_metadata) |
 | `ReadLimits::matrix_metadata_residency` + `with_matrix_metadata_residency` | reader-side policy; no on-disk byte depends on it |
 | `ReadLimits::max_keyed_tail_bytes` + `with_max_keyed_tail_bytes` (DSL key `keyed_tail`) | resource name `"keyed tail bytes"` |
 | `FormatSpec::block_identities` / `with_block_identities` | per-block identity table folded into the computed schema hash |
@@ -336,6 +646,12 @@ Sixteen variants were added and none removed (94 → 110). `Error` is
 
 **This is the dangerous group: code that still compiles and now behaves
 differently.** Read all of it.
+
+> **§5 covers the 0.3.0-to-0.4.0 step only.** The 0.5.0 entries of this same class
+> are in [§A.5](#a5-changed-behaviour-at-an-unchanged-signature-in-050) — chiefly
+> `matrix_resume_signal` / `matrix_sidecar_resume_signal` returning
+> `Err(MatrixCommitQuarantined)` where they returned `Ok(Clean)`. If you are
+> upgrading from 0.4.0, read that section as well as this one.
 
 ### 5.1 Replacement refuses a cross-version target
 
@@ -478,6 +794,17 @@ data. It is disclosed because §5 is the section for exactly this class.
 
 ### 5.12 `*_with_resource_limits` replaces a spec-declared matrix residency policy
 
+> **Fixed in 0.5.0. Do not implement the workaround below as a requirement.**
+> This section describes 0.4.0 behaviour and is kept because 0.4.0 shipped it and
+> the CHANGELOG links here. It was a bug, not a design, and
+> [§A.2](#a2-_with_resource_limits-composes-a-declared-residency-policy-instead-of-replacing-it)
+> is the current behaviour: a caller who does not mention residency no longer
+> discards the format's policy. Three claims below are now false — the sentence
+> beginning "We do not think this is wrong as designed", the table row
+> "**replaced** by the passed value, always", and every mention of
+> `EagerVerified`, which [§A.3](#a3-matrixmetadataresidencyeagerverified-is-removed-and-default-is-now-lazy)
+> removed. Everything else, including the absence of a DSL key, still holds.
+
 New in 0.4.0 and easy to miss because the signature did not change:
 `ReadLimits` now carries `matrix_metadata_residency`, which is a **declaration,
 not a ceiling**. `ReadLimits::overlay` therefore takes the runtime value
@@ -515,7 +842,7 @@ let limits = ReadLimits::STANDARD
 There is no `varve_format!` DSL key for residency (`limits { }` takes
 `key_index`, `disk_index_plan` and `keyed_tail`), so this is the only route to
 `Lazy` at an entry point that also takes limits. See
-[Known Limitations §1.6](known-limitations.md#16-_with_resource_limits-silently-discards-a-declared-residency-policy).
+[Known Limitations §1.6](known-limitations.md#16-the-matrix-residency-and-verification-policies-have-no-varve_format-dsl-key).
 
 ---
 
@@ -552,11 +879,25 @@ no downstream crate can have depended on them. See
 8. Re-check `max_keyed_tail_bytes` and any tightened materialization limit
    against the new charge points. (§5.6)
 9. If you pass `ReadLimits` to a `*_with_resource_limits` entry point, put the
-   matrix residency policy in that same value or lose it. (§5.12)
-10. Read [Known Limitations §1](known-limitations.md#1-matrix-opening-a-matrix-is-not-o1-and-its-metadata-residency-is-not-a-cache)
+   matrix residency policy in that same value or lose it. (§5.12 — **no longer
+   required as of 0.5.0**, see §A.2)
+10. Read [Known Limitations §1](known-limitations.md#1-matrix-opening-a-matrix-is-not-o1-because-opening-it-verifies-it)
     before sizing a matrix workload — in particular §1.5, since
     `max_matrix_cells` defaults to 16,000,000 and a larger matrix fails at
     **create** until you raise it.
+
+Coming from 0.4.0, four more:
+
+11. Delete every mention of `MatrixMetadataResidency::EagerVerified`; add a `_ =>`
+    arm to any `match` on `MatrixMetadataResidency`, and read
+    `effective_matrix_metadata_residency()` rather than the field. (§A.1, §A.3)
+12. Decide whether you want verification at open. The default (`AtOpen`) is what
+    0.4.0 did; `OnDemand` plus `verify_matrix_metadata()` is the cheap open, and
+    §A.4 states what it does not give you. (§A.4)
+13. Handle `Err(Error::MatrixCommitQuarantined)` from `matrix_resume_signal` and
+    `matrix_sidecar_resume_signal`. (§A.5.1)
+14. If you relied on an eager reader being a pinned whole-map snapshot, coordinate
+    that yourself — there is no replacement mechanism. (§A.3)
 
 Nothing in §2 is a checklist item: every removed name either never shipped or was
 already gone at 0.3.0. §2 explains why.

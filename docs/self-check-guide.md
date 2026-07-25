@@ -143,9 +143,15 @@ them correctly through its normal `ChannelObject` writer path. The BMP harness
 checks a non-TDMS layout in both directions with Pillow.
 
 For TDMS-style work, remember that the repository contains adapter proofs, not
-a Varve-provided TDMS reader/writer. Use `docs/nptdms-adapter-boundary.md` to
-decide whether a failure belongs to Varve's generic API or to caller-owned TDMS
-semantics. A quick rule:
+a Varve-provided TDMS reader/writer. Varve owns the generic physical-layout
+capabilities — declaring headers, lead-ins, metadata and raw regions and footers,
+validating literal and caller fields, finalized offsets and segment bounds,
+appending complete segments, and exposing offsets, lengths, byte ranges and
+tolerant scan reports. An external TDMS adapter owns TDMS semantics: object
+paths, raw-data-index grammar, property typing, timestamp conversion, waveform
+time tracks, scaling, DAQmx raw scalers, interleaving, and any export. Use that
+split to decide whether a failure belongs to Varve's generic API or to
+caller-owned TDMS semantics. A quick rule:
 
 - If strict layout open succeeds, `inspect_layout_file_report` is complete, and
   the adapter can read the required metadata/raw byte ranges, failures in TDMS

@@ -136,45 +136,111 @@ wider limits instead.
 ### MatrixMetadataResidency
 
 `ReadLimits::matrix_metadata_residency` declares how much of a matrix's
-persisted commit metadata an open makes resident, and therefore when that
-metadata's integrity is checked. It is set with
+persisted commit metadata a reader keeps resident. It is set with
 `ReadLimits::with_matrix_metadata_residency`, and it is a reader-side policy
-only: no on-disk byte depends on it, so one process may open a file eagerly
-while another opens the same file lazily.
+only: no on-disk byte depends on it, so two processes may open the same file with
+different bounds.
 
-`MatrixMetadataResidency::EagerVerified` is the default and is inert — it is
-byte-for-byte the behaviour varve had before the option existed. Open **reads and
-authenticates** every commit-map page the matrix has published, plus every page the
-platform's allocation map reports as written, each against its stored page digest;
-of those it makes resident **only the pages holding at least one set bit**.
-Corruption anywhere in the read set is reported by `open`.
-`max_matrix_bitmap_bytes` acts as an *admission* limit under this policy: a
-matrix whose live page set exceeds it cannot be opened at all.
+Residency is **always demand-filled and bounded**; the only thing left to declare
+is the bound. `MatrixMetadataResidency::Lazy { cache_bytes }` reads the persisted
+page index at open and nothing else — no page payload and no page digest. A
+commit-map page is read, authenticated against its stored digest, and cached the
+first time a bit inside it is addressed, and the least recently used cached page
+is dropped when admitting another would exceed `cache_bytes` (rounded up to a
+whole 4096-byte page, with a one-page floor).
 
-`MatrixMetadataResidency::Lazy { cache_bytes }` reads the persisted page index
-at open and nothing else — no page payload, no page digest, and no allocation
-map query. A commit-map page is read, authenticated, and cached the first time a
-bit inside it is addressed, and the least recently used cached page is dropped
-when admitting another would exceed `cache_bytes` (rounded up to a whole 4096
-byte page, with a one page floor). `cache_bytes` is admitted against
-`max_matrix_bitmap_bytes` at open, so the option cannot be used to raise a
-declared ceiling; conversely a live set larger than that ceiling is now
-*openable* rather than refused.
+The field's **unset** state is `MatrixMetadataResidency::Missing`, which is what
+every `ReadLimits` constructor carries until someone declares a policy. It resolves
+to `MatrixMetadataResidency::DEFAULT` via
+`ReadLimits::effective_matrix_metadata_residency()` — read that rather than the
+field, because it never yields `Missing`. `DEFAULT` is `Lazy` with
+`DEFAULT_CACHE_BYTES` (2 MiB = 512 commit-map pages, derived as
+`ReadLimits::STANDARD.max_matrix_bitmap_bytes / 32`), clamped down to whatever
+`max_matrix_bitmap_bytes` is in force.
 
-Three consequences are part of the declaration:
+A **declared** `cache_bytes` is admitted against `max_matrix_bitmap_bytes` at
+open, so the option cannot be used to raise a declared ceiling; the **derived**
+default is clamped to that ceiling instead, so a default can never be the reason
+an open fails. A live set larger than the ceiling is therefore *openable* rather
+than refused — the ceiling bounds a cache, not an admission.
 
-* Detection moves to first touch. A page whose bytes disagree with its digest is
-  reported as `Error::MatrixFatalCorruption` by the read that touches it, not by
-  `open`. Pages never touched are never checked. Use `EagerVerified` where
-  `open` must be the detection point.
+`cache_bytes` bounds **each bitmap, not each reader**: every commit category and
+every block validity map owns a cache of its own, so a format with `n`
+demand-loaded maps bounds itself at `n * cache_bytes`. The bound is still
+independent of the file's size.
+
+**0.5.0 removed `MatrixMetadataResidency::EagerVerified`.** It materialised every
+published page for the whole session and made `max_matrix_bitmap_bytes` an
+availability limit. What callers actually wanted from it — authenticating the
+whole commit map, and the complete `MatrixRecoveryReport` that follows — was a
+*side effect* of that load and is now its own policy,
+[`MatrixMetadataVerification`](#matrixmetadataverification), which retains one
+4096-byte buffer and is on by default. Nothing was left behind as an alias,
+because a name promising eager residency for a demand-filled cache would be worse
+than a compile error.
+
+Three consequences are part of the residency declaration:
+
+* A page is authenticated when it is faulted in: a page whose bytes disagree with
+  its digest is reported as `Error::MatrixFatalCorruption` by the read that
+  touches it, so no read ever answers from unverified bytes. Whether the *map as a
+  whole* is checked, and when, is `MatrixMetadataVerification`.
 * A page the persisted index does not name still reads as clear, and that is a
   fact the file supplied rather than a guess: the index is loaded in full at
-  open under both policies and is authoritative for which pages hold state, so
-  "not cached" and "not published" stay distinct. An index that cannot be
-  enumerated in full is a fatal finding at open under both policies.
+  open and is authoritative for which pages hold state, so "not cached" and "not
+  published" stay distinct. An index that cannot be enumerated in full is a fatal
+  finding at open.
 * A page's contents are as of the first touch that faulted it in, not as of
-  open, so pages not yet faulted in have no snapshot pinned. Use `EagerVerified`
-  where a reader must see one consistent instant.
+  open, so pages not yet faulted in have no snapshot pinned. A reader that needs
+  one consistent instant across a whole map must coordinate that itself; no
+  residency bound provides it, because one that pinned the whole live set would be
+  the eager load this design removed.
+
+### MatrixMetadataVerification
+
+`ReadLimits::matrix_metadata_verification` declares **when** a matrix's commit
+metadata is authenticated as a whole. It is set with
+`ReadLimits::with_matrix_metadata_verification`, composes through
+`overlay`/`tighten` exactly as the residency policy does, and resolves through
+`ReadLimits::effective_matrix_metadata_verification()`.
+
+The pass reads every page of every commit map named by the persisted page index
+**unioned with** the platform's allocation map, authenticates each against its
+stored digest, and folds the outcome into `MatrixRecoveryReport`. The union's
+second term is what detects stray bytes in a page the matrix never published; the
+first keeps the pass bounded where no allocation map is available. Cost:
+`O(live pages + allocated pages)` bytes read, and one reusable 4096-byte page
+buffer retained — nothing it reads becomes resident, at any matrix size.
+
+What only verification produces:
+
+* the `Recoverable` `MatrixCorruptionKind::CommitMap` finding for a category whose
+  map disagrees with its digests;
+* the whole-category quarantine behind `Error::MatrixCommitQuarantined`, which
+  fails every access to that category closed — including a
+  `RecoveryPolicy::Strict` writer — instead of refusing only the pages a reader
+  happens to touch;
+* the `RebuildCommitMap` / `ClearCategory` recommendations that make the
+  documented recovery path reachable;
+* **any examination at all of a page the persisted index does not name.** Nothing
+  else ever reads such a page: a demand fault-in only reads pages the index names.
+  With verification off, stray bytes written out of band into a page the matrix
+  never published are not detected later — they are not looked at.
+
+| Variant | Meaning |
+| --- | --- |
+| `Missing` | Unset. Resolves to `DEFAULT`. |
+| `AtOpen` | Verify while opening. **`DEFAULT`.** A damaged matrix announces itself at open and a writer is refused before it can mutate a damaged category. |
+| `OnDemand` | Do not verify while opening; verify when asked, with `verify_matrix_metadata()`. Open reads the persisted page index only and does not query the allocation map. |
+
+`verify_matrix_metadata()` on a reader, writer, or `VarveFile` runs the same pass
+on demand and returns the same report. It **reports; it does not quarantine**: the
+fail-closed gate is derived once, at open, from the findings the layout is
+assembled with, so a caller who needs a damaged category failed closed reopens
+with `AtOpen`. Under `OnDemand` and without such a call, per-page authentication
+at fault-in is the only verification that happens — which is why there is no
+`Never` variant: turning verification off removes the verdict, never the check on
+bytes a read actually answers from.
 
 `max_keyed_tail_bytes` (declared as `keyed_tail` in a `limits { ... }` block)
 bounds the resident keyed-tail cache: the per-block-id map that lets a keyed
@@ -637,14 +703,16 @@ claim: each commit bitmap holds a `Mutex` over its page map, so that a demand
 fault-in (see `MatrixMetadataResidency` above) can happen under `&self`. It is
 taken only for `O(1)` map operations and **never held across I/O** — a fault-in
 releases it for the read, so two threads faulting the same page duplicate a
-4 KiB read rather than queueing. Under the default `EagerVerified` policy
-nothing is ever faulted in and the lock only ever guards a hash lookup.
+4 KiB read rather than queueing. Session-only maps (a writer's current-write map,
+a rebuilt map) have no backing to fault from, so there the lock only ever guards a
+hash lookup.
 
-Visibility under the default `EagerVerified` policy is unchanged: a reader sees
-the commit state as of its own open, because the commit bitmaps are snapshotted
-eagerly at open time. Under `Lazy` a page's contents are as of the first touch
-that faulted it in; that is declared on the enum, and is the reason the option
-exists rather than the behaviour simply changing.
+Visibility follows the demand path: a page's contents are as of the first touch
+that faulted it in, not as of open. Before 0.5.0 the `EagerVerified` residency
+policy snapshotted every published page at open and a reader saw the commit state
+as of its own open; that policy is gone, and with it that guarantee — a reader
+needing one consistent instant across a whole map must coordinate it, because the
+only mechanism that provided it was whole-live-set residency.
 
 | API | Meaning |
 | --- | --- |
@@ -658,8 +726,9 @@ exists rather than the behaviour simply changing.
 | `matrix_cell_payload::<T>(key)` | checked raw payload bytes for a committed cell |
 | `write_matrix_aux(name, offset, bytes)` | write preallocated noncommit aux bytes |
 | `read_matrix_aux(name, offset, len)` | read aux bytes |
-| `matrix_resume_signal(category)` | classify partial matrix progress |
+| `matrix_resume_signal(category)` | classify partial matrix progress; refuses a quarantined category with `MatrixCommitQuarantined` |
 | `matrix_recovery_report()` | report matrix findings/actions |
+| `verify_matrix_metadata()` | run the commit-metadata verification pass now; returns the same report |
 | `rebuild_matrix_commit_from_crc::<T>()` | rebuild commit map from slot CRC evidence; refuses when the CRC-validity evidence is incomplete |
 | `write_matrix_cell_durable` | write/commit with ordered durability barrier, then a post-commit hook |
 
@@ -736,18 +805,22 @@ different `SCHEMA_FINGERPRINT` or keyedness is rejected with
 `BlockSchemaFingerprintMismatch` / `BlockKeyednessMismatch` instead of
 decoding foreign cells.
 
-When integrity verification finds a damaged commit map, open preserves the raw
-bytes as recovery evidence but quarantines them from visibility. Cell categories
-can be rebuilt from per-slot CRC evidence; single/per-channel categories must be
-explicitly cleared. Status and value reads return
-`MatrixCommitQuarantined(category)` instead of conflating unavailable evidence
-with `NotCommitted`; writes reject the category until recovery.
+When the verification pass finds a damaged commit map, the whole category is
+failed closed: the `Recoverable` `CommitMap` finding is the quarantine flag, and
+no map bytes are retained (0.5.0 removed the retained "recovery evidence" copy and
+the empty replacement map that stood in for it). Cell categories can be rebuilt
+from per-slot CRC evidence; single/per-channel categories must be explicitly
+cleared. Status and value reads return `MatrixCommitQuarantined(category)` instead
+of conflating unavailable evidence with `NotCommitted`; writes reject the category
+until recovery; and `matrix_resume_signal` / `matrix_sidecar_resume_signal` refuse
+it as well, where before 0.5.0 they answered `Clean` from the replacement map.
 
 An overwrite withdraws the old commit and CRC-valid evidence before touching
 slot bytes. A partial I/O failure therefore leaves the slot uncommitted and
 poisons the writer; successful replacement becomes readable only after a new
-commit. Matrix layout and commit maps are snapshotted on open, but slot bytes are
-in-place storage. Do not overlap a reader with writes to slots it may read.
+commit. The matrix *layout* is snapshotted on open; commit maps are **not** — since
+0.5.0 each commit-map page is as of the first read that faulted it in — and slot
+bytes are in-place storage. Do not overlap a reader with writes to slots it may read.
 Immutable concurrent matrix snapshots require a future generation/version or
 read-lease design and are not promised by VMAT v4.
 
@@ -958,8 +1031,11 @@ formats provide their own domain codecs and models.
 | `AdapterInputFile::from_bytes(ext, bytes)` | create an exclusive temporary input; clones keep it alive until the last drop |
 
 The toolkit deliberately does not define TDMS object paths, scaling, DAQmx,
-DataFrame/HDF export, or other domain semantics. See
-`docs/adapter-toolkit-design.md`.
+DataFrame/HDF export, or other domain semantics. It sits above the physical
+layout layer and supplies reusable mechanics only — tagged-value codecs, chunk
+index builders, segment reducers and adapter self-checks — while the adapter
+author supplies the domain meaning as ordinary Rust types. TDMS is one
+instantiation of those pieces, not a Varve feature.
 
 ## Mmap And Zero-Copy
 

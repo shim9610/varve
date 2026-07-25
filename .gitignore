@@ -8,3 +8,10 @@ __pycache__/
 *.tmp
 *.bak
 .DS_Store
+
+# Internal working documents: adversarial review reports, per-worker notes, and
+# the routing/draft/validation artifacts of the hardening rounds. These are
+# development process material, not part of what the project publishes, and they
+# name weaknesses in current code. They live here so they stay out of every
+# remote; see docs/ for the published set.
+/.internal-docs/
