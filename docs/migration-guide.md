@@ -111,9 +111,13 @@ there is no automatic migration path for these surfaces:
   tests or tools that assert absolute counts on a freshly created stream or
   indexed file must account for it.
 - The disk-index sidecar metadata record is version 3 and the plan digest
-  domain was bumped. A version 2 sidecar is refused with
-  `DiskIndexError::MetadataVersion`, and a sidecar published against an older
-  plan digest is refused as stale. Both recover with `rebuild_disk_index`.
+  domain was bumped. A version 2 sidecar is refused as
+  `DiskIndexError::MetadataLength` rather than `MetadataVersion`, because
+  `decode_metadata` checks the record length before magic and version and the
+  record grew from 260 to 300 bytes; a sidecar published against an older plan
+  digest is refused as stale. Both recover with `rebuild_disk_index`. This is
+  hypothetical: `disk_index.rs` is new in 0.4.0, so no released version wrote a
+  v2 sidecar.
 - Decoding now charges the materialization budget 8 bytes for each distinct
   variable field id above 63. A caller that sized a materialization budget to
   the exact payload byte count *and* uses field ids above 63 must add that

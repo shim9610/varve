@@ -217,6 +217,13 @@ mod region_reader {
     #[derive(Debug)]
     pub struct MatrixReadPool {
         id: u64,
+        /// Only Windows hands out private handles: `pread` on Unix does not
+        /// serialise on the file object, so `reopen` is `#[cfg(windows)]` and
+        /// this stays empty everywhere else. The field is still declared
+        /// unconditionally so the type is one type on every target; without
+        /// the allow, a non-Windows build with the test accessor compiled out
+        /// reports it as never read.
+        #[cfg_attr(not(any(windows, test)), allow(dead_code))]
         handles: Mutex<Vec<Arc<File>>>,
     }
 

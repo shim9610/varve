@@ -170,7 +170,7 @@ neither policy is it `O(1)`.**
 | --- | --- | --- |
 | Open visits | union of the `L` pages named by the persisted page index and the `A` pages the filesystem allocation map reports as written | the persisted page index only |
 | Open cost | `O(L + A)` time, `Theta(L + A)` temporary memory, up to `O(4096U)` page-byte I/O for `U` distinct candidate pages | `O(L)` — 8 bytes per live page, no page payload, no digest, no allocation-map query |
-| Post-open residency | `O(L + A)`, fixed at open; does not track the working set; **no eviction** | 0 at open, then bounded by `cache_bytes` with LRU eviction |
+| Post-open residency | `O(L)` — only pages holding a set bit are retained, so the `A` term is I/O but not memory; fixed at open; does not track the working set; **no read-driven eviction** (a mutation clearing a page's last bit does refund it) | 0 at open, then bounded by `cache_bytes` with LRU eviction |
 | `max_matrix_bitmap_bytes` behaves as | an **admission** limit — a live set above it makes open fail | a cache bound; `cache_bytes` above it is refused at open |
 | Corruption detected at | open | first touch of the damaged page |
 
@@ -178,10 +178,12 @@ Tracking live state is the *sparse-allocation operating case*, not an
 unconditional bound: a densely allocated bitmap region makes `A` proportional to
 that region's page count even when few bits are live.
 
-**Measured absolutes** (Windows x86_64, 2026-07-22,
+**Measured absolutes** (Windows x86_64, 2026-07-22, reproduced 2026-07-25,
 `crates/varve/tests/matrix_lazy_residency.rs`). One commit-map page covers 32,768
-cells; residency is about 8,192 bytes per live page plus 48 bytes per page-index
-entry.
+cells; residency is about 8,192 bytes per live page (one commit page and one
+CRC-validity page) plus **96** bytes of page-index overhead per live page — 48 per
+entry in each of the two bitmaps, measured as 1,536 bytes at 16 live pages. With
+`IntegrityPolicy::None` there is no validity bitmap and both figures roughly halve.
 
 | Fixture | Cells | File size | Live pages | Policy | Open bytes read | Pages visited | Resident bitmap bytes |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -200,9 +202,15 @@ edited:
 2. Open is **not `O(1)`** — one live page still costs 131,240 bytes and 32 pages
    under the eager policy, because `A` follows NTFS's ~128 KiB allocation runs
    rather than the live set. The gap to `O(1)` is roughly 32x in pages at the
-   smallest live set.
-3. Eager residency **does not track the working set in either direction** and is
-   never evicted; it is fixed at open by the candidate page set.
+   smallest live set. **These are NTFS numbers**: `A` is filesystem-defined, is
+   absent entirely on targets with no allocation map (open then visits `L` pages
+   only), and becomes the whole bitmap region on a non-sparse volume, where eager
+   open degrades to `Theta(declared cells / 8)`.
+3. Eager residency **does not track the working set in either direction**; it is
+   fixed at open by the **live** page count (measured 131,072 bytes at 16 live
+   pages, unchanged after touching 1 page and after touching 4). Nothing on the
+   read path releases it. A mutation that clears a page's last set bit does refund
+   that page (PERF-02).
 
 Whole-category clear is bounded by live state **only where the platform supports
 range removal**, and streams `Theta(cells / 8)` zero bytes otherwise — see the

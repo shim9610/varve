@@ -1,9 +1,24 @@
 # Known Limitations
 
-Status as of 0.4.0 (2026-07-22). Every entry below was checked against the code
-in this repository, and every number was measured on the host that produced this
-document. Where an earlier document and the code disagreed, the code won and the
-document was corrected.
+Status as of 0.4.0. Numbers measured 2026-07-22 and re-measured 2026-07-25; every
+entry was checked against the code in this repository. Where an earlier document
+and the code disagreed, the code won and the document was corrected.
+
+Corrections made on 2026-07-25, listed because a reader who saw the earlier
+version was told six things that were wrong: open **reads** every candidate page
+but retains only pages holding a set bit (§1.1), residency *is* refunded when a
+mutation clears a page's last bit (§1.2), the page-index term is 96 bytes per live
+page rather than 48 (§1.3), `IndexPolicy::CheckpointOnFlush` does **not** let
+an open start from a checkpoint (§2.1 — that was the only mitigation previously
+offered for resident open cost, and it does not exist), the `max_matrix_crc_bytes`
+resource string is `"matrix checksum bytes"` rather than `"matrix CRC bytes"`
+(§1.5), and `matrix_cell_status` was **not** relaxed to `&self` by this release —
+it was already `&self` in 0.3.0, so three matrix read entry points changed
+receiver, not four (§4.1). Five things were missing
+entirely and are now §1.5 (the default 16,000,000-cell ceiling), §1.6 (a residency
+policy silently discarded by `*_with_resource_limits`), §1.7 (hole-punch
+dependence), §2.4 (uncommitted-tail truncation) and §6.7/§6.8 (no old artifact is
+tested; platform support).
 
 This file is organised by what a **user** runs into, not by internal structure.
 Each entry states what it is, who it affects, the workaround if one exists, and
@@ -30,13 +45,19 @@ wrong by a large factor.
 
 **What it is.** A matrix's commit metadata is stored as 4096-byte bitmap pages,
 each page covering 32,768 cells of one category. Under the default
-`MatrixMetadataResidency::EagerVerified` policy, `open` reads, authenticates and
-materialises every page in the *candidate set*: the union of the pages named by
-the persisted page index (`L`, the pages actually holding state) and the pages
+`MatrixMetadataResidency::EagerVerified` policy, `open` **reads and
+authenticates** every page in the *candidate set*: the union of the pages named
+by the persisted page index (`L`, the pages actually holding state) and the pages
 the platform's allocation map reports as written (`A`). Cost is `O(L + A)`.
 
+Reading is not the same as retaining. Of the pages it reads, open makes resident
+**only those holding at least one set bit** (`matrix.rs`'s `insert_loaded_page`
+returns early for an all-zero page). So the I/O is `O(L + A)` and the residency
+is `O(L)`. This is why the 1-live-page fixture below reads 131,240 bytes but
+holds only 8,192 resident — do not size resident metadata from the bytes read.
+
 `O(L + A)` is not `O(1)`, and neither `L` nor `A` is the working set. A reader
-that intends to touch one cell pays for the whole candidate set.
+that intends to touch one cell pays for the whole candidate set in I/O.
 
 **Measured on this host, 2026-07-22** (`crates/varve/tests/matrix_lazy_residency.rs`,
 all 10 tests passing):
@@ -51,7 +72,8 @@ Read those three rows in this order:
 
 1. **Open is independent of file size.** Two matrices differing 4x in cell count
    and 4x in file size, with the same one-page live set, both read about 131 KB.
-   The ratio is 0.97x. This part of the design goal is met.
+   The ratio is 0.97x. This part of the design goal is met — **on a sparse
+   NTFS volume.** See the platform precondition below, which is not a footnote.
 2. **Open is not O(1).** A matrix with **one live page** still reads
    **131,240 bytes** and visits **32 pages**. On NTFS the allocation map reports
    the bitmap region in ~128 KiB runs, so `A` is 32 pages even when `L` is 1.
@@ -64,6 +86,37 @@ Read those three rows in this order:
 The gap to an O(1) open is about **32x in pages** at the smallest live set, and
 grows linearly with the live set from there.
 
+#### The numbers above are Windows/NTFS numbers, and `A` is filesystem-defined
+
+This matters enough to state before the mitigations, because on two of the three
+cases below the headline result is *different*, not merely less precise.
+
+- **Windows and Linux, sparse volume (measured case).** `A` comes from
+  `FSCTL_QUERY_ALLOCATED_RANGES` / `SEEK_HOLE`. On NTFS the ~128 KiB run
+  granularity gives `A = 32` pages around a single live page, which is where the
+  131 KB floor and the "~32x gap" come from. Linux extent granularity differs, so
+  the constant differs; the shape does not.
+- **Every other target.** `query_allocated_extents` returns `None`
+  (`matrix.rs`, `#[cfg(not(any(windows, target_os = "linux")))]`), so the
+  candidate set has **no `A` term at all** and open visits `L` pages only. Open is
+  *cheaper* there than the table above shows, and the "32-page floor" does not
+  describe those platforms. This is untested — see §6.1.
+- **A volume that is not sparse.** Sparseness is requested best-effort. On
+  Windows the file must carry the sparse attribute *before* it is extended, and
+  `mark_file_sparse` **ignores failure** by design ("the matrix is then simply
+  dense, which costs performance and nothing else"). On exFAT/FAT32, some
+  network and virtual volumes, or after a copy by a tool that expands holes, the
+  declared extent is genuinely allocated — the allocation map then reports the
+  **whole** bitmap region as data, `pages_to_visit` returns every page, and eager
+  open degrades to `Theta(declared cells / 8)`. **On a non-sparse volume, open
+  cost is proportional to the declared cell count, not to live state, and the
+  "independent of file size" result in point 1 does not hold.** There is no error
+  and no warning; the only signal is that open is slow and reads a lot.
+
+The same precondition governs the create-time claim: metadata I/O at create is
+bounded by live state because the unwritten extent is a hole. Where it is not a
+hole, `set_len` allocates what it reserves.
+
 **Who it affects.** Anyone who opens matrix files frequently — short-lived
 processes, request handlers, CLI invocations, per-file workers — or who opens
 many matrices in one process. A long-running process that opens one matrix and
@@ -73,38 +126,54 @@ keeps it open pays this once and does not care.
 
 - Keep the handle open. Matrix reads take `&self` (§4), so one handle can serve
   the whole process, including concurrent threads.
-- Opt into `MatrixMetadataResidency::Lazy { cache_bytes }` (see §1.3), which
+- Opt into `MatrixMetadataResidency::Lazy { cache_bytes }` (see §1.4), which
   brings open down to 32 bytes read and 0 pages visited for the same fixtures —
   but has its own consequences, and is still `O(live pages)` in the page index.
 
 **Planned.** Recorded as open item 30 in `docs/invariant-checklist.md`. Not
 scheduled.
 
-### 1.2 Resident metadata does not track the working set and is never evicted
+### 1.2 Resident metadata does not track the working set, and reading never releases it
 
 **What it is.** Under the default `EagerVerified` policy, the bytes a matrix
-holds resident after open are fixed by the candidate page set at open time.
-Touching cells does not raise residency and not touching them does not lower it.
-There is **no eviction path** under this policy: nothing that was materialised at
-open is ever released while the handle lives.
+holds resident after open are fixed by the live pages in the candidate set at open
+time. **Reading does not change residency in either direction:** touching cells
+does not raise it and not touching them does not lower it.
+
+There is **no read-driven eviction**. Residency does fall on one path, and only
+one: when a **mutation** clears a page's last set bit, that page is released and
+its bytes are refunded (`release_resident_bitmap` / `settle_page_delta`; PERF-02,
+asserted over four set/clear cycles in
+`crates/varve/tests/matrix_integrity_scaling.rs`). So a writer that clears state
+gets the memory back; a reader has no way to release anything, and a page whose
+bits are still set is never dropped while the handle lives.
 
 Measured: 8,192 resident bitmap bytes for a 1-live-page matrix and 524,288 for a
 64-live-page matrix, in both cases unchanged by which cells the caller
-subsequently reads. Residency is roughly **8,192 bytes per live commit-map page**
-(one commit page and one CRC-validity page, 4096 bytes each), plus 48 bytes per
-page-index entry.
+subsequently reads. And measured on the *working-set* question directly, at 16
+live pages: `resident_after_open = 131,072`, after touching 1 page `131,072`,
+after touching 4 pages `131,072`. **Residency tracks live pages, not the working
+set.**
+
+Residency is roughly **8,192 bytes per live commit-map page** (one commit page and
+one CRC-validity page, 4096 bytes each), plus **96 bytes** per live page of
+page-index overhead — see the arithmetic in §1.3, and note that the 8,192 assumes
+checksums are on.
 
 **Who it affects.** Anyone whose live page count is large relative to their
 process memory budget, and anyone who assumed `max_matrix_bitmap_bytes` would
 cap a cache. It does not.
 
-**Workaround.** `MatrixMetadataResidency::Lazy { cache_bytes }` (§1.3) is the
+**Workaround.** `MatrixMetadataResidency::Lazy { cache_bytes }` (§1.4) is the
 only path that bounds residency by a declared ceiling and evicts LRU. Under the
-default there is nothing to tune.
+default there is nothing to tune. Note the trap in §1.6: passing a `ReadLimits`
+value to a `*_with_resource_limits` entry point **silently reverts** a
+spec-declared `Lazy` back to `EagerVerified`.
 
-**Planned.** No eviction is planned for `EagerVerified`; eager verification and
-eviction are contradictory by construction — a page dropped after verification
-would have to be re-verified, which is what `Lazy` does.
+**Planned.** No read-driven eviction is planned for `EagerVerified`; eager
+verification and read-driven eviction are contradictory by construction — a page
+dropped after verification would have to be re-verified, which is what `Lazy`
+does.
 
 ### 1.3 `max_matrix_bitmap_bytes` is an admission limit, so a matrix can become unopenable
 
@@ -137,16 +206,33 @@ Two details that will otherwise cost debugging time:
 ```text
 cells_per_page = 32,768
 live_pages     = number of distinct 32,768-cell windows containing >= 1 committed cell
-budget_bytes  ~= 8,192 * live_pages + 48 * live_pages
-              ~= 8,240 * live_pages
+budget_bytes  ~= 8,192 * live_pages   # one commit page + one CRC-validity page
+               +   96 * live_pages    # page-index overhead, in *two* bitmaps
+              ~= 8,288 * live_pages
 ```
+
+The 96 is not a typo for 48. Each live page carries a page-index entry in **both**
+the commit map and the CRC-validity map, and each entry is modelled at 48 bytes
+(`PAGE_INDEX_SLOT_RESIDENT_BYTES` 16 + `PAGE_INDEX_MAP_RESIDENT_BYTES` 32).
+Measured `matrix_resident_page_index_bytes()`: **1,536 bytes at 16 live pages** =
+96 per page. The correction is 0.6% of the total, so it will not change a sizing
+decision — it is corrected because this section invites you to compute a ceiling
+with it.
+
+**Both terms assume `IntegrityPolicy::Crc32`.** With checksums off there is no
+validity bitmap, so there is one page rather than two and one page index rather
+than two: both the open bytes and the residency roughly **halve**, to about
+`4,144 * live_pages`.
 
 `live_pages` is driven by **scatter, not by cell count**. A dense matrix is cheap:
 16,000,000 cells fully committed is 489 live pages, about 4 MB — comfortably
-inside the 64 MiB default. A scattered matrix is expensive: 8,192 committed cells
-that happen to land one per page is also 8,192 live pages, about 67 MB, and
-**exceeds the default ceiling with 8,192 committed cells in the file**. If your
-write pattern scatters, size the ceiling from the page count, not the cell count.
+inside the 64 MiB default. (16,000,000 is also exactly the default
+`max_matrix_cells` ceiling; see §1.5. It is used here as the largest matrix the
+defaults admit, not as an arbitrary large number.) A scattered matrix is
+expensive: 8,192 committed cells that happen to land one per page is also 8,192
+live pages, about 68 MB, and **exceeds the default ceiling with 8,192 committed
+cells in the file**. If your write pattern scatters, size the ceiling from the
+page count, not the cell count.
 
 The candidate set at open also includes the allocation-map term `A`, which is a
 property of how the filesystem allocated the file rather than of your data. Treat
@@ -178,8 +264,8 @@ It has never shipped in a released version. Measured on the same fixtures:
 | Resident after touching 1 page | unchanged | 4,096 |
 | Resident after touching 4 pages | unchanged | 16,384 (the declared ceiling) |
 | Resident after touching all 64 live pages | unchanged | 16,384 (still the ceiling) |
-| Eviction | none | LRU, to the declared ceiling |
-| Allocation-map query | yes | never |
+| Eviction | none on the read path (a mutation that clears a page's last bit does refund it) | LRU, to the declared ceiling |
+| Allocation-map query | yes (where the platform has one) | never |
 | Corruption detected at | open | first touch of the damaged page |
 
 **What `Lazy` does not fix.** Open still reads the **persisted page index in
@@ -204,7 +290,160 @@ a lazy open reads 8 MB before returning.
 `cache_bytes` above `max_matrix_bitmap_bytes` is refused at open, so the option
 cannot be used to raise a declared ceiling.
 
-### 1.5 Matrix dimensions are fixed at create time, with no grow path
+### 1.5 The default limits cap a matrix at 16,000,000 cells — create fails above it
+
+**What it is.** This is the first thing a multi-GB-matrix workload hits, and it
+hits it at *create*, before any of the open-cost discussion above applies.
+
+`ReadLimits::STANDARD` — the profile an ordinary `create`/`open` resolves to when
+a format declares no `limits { }` block — sets:
+
+| Limit | Default | Resource string in the error |
+| --- | --- | --- |
+| `max_matrix_cells` | **16,000,000** | `"matrix cells"` |
+| `max_matrix_dimension` | **16,000,000** | `"matrix dimension"` |
+| `max_matrix_slot_region_len` | 8 GiB | `"matrix slot region length"` |
+| `max_matrix_bitmap_bytes` | 64 MiB | `"matrix bitmap bytes"` (§1.3) |
+| `max_matrix_crc_bytes` | 128 MiB | `"matrix checksum bytes"` |
+| `max_matrix_metadata_bytes` | 256 MiB | `"matrix metadata bytes"` |
+
+A 4096 x 4096 matrix (16,777,216 cells) is therefore **refused by default** with
+`Error::LimitExceeded { resource: "matrix cells", .. }`.
+
+**The cell count is checked twice: per matrix block, and as a running aggregate
+across every matrix block in the format.** A format with four 5,000,000-cell
+matrix blocks fails on the aggregate even though no single block exceeds the
+ceiling. Splitting one large matrix into several smaller ones does not evade the
+limit.
+
+`max_matrix_slot_region_len` is the second ceiling, and it aggregates the same
+way: it binds on the **sum** of `cells * slot_stride` over every matrix block.
+At the 8 GiB default a single 16,000,000-cell block is capped at a 536-byte slot
+stride, and two such blocks at 268 bytes each.
+
+**Who it affects.** Everyone declaring a matrix larger than about 4000 x 4000,
+which is most of the workloads a preallocated matrix is attractive for. The
+limits are runtime policy rather than a wire-format ceiling, so the file itself
+imposes nothing.
+
+**Workaround.** Raise them explicitly. They are not a safety property of the
+format — `UNTRUSTED` inherits the same matrix values — so raising them for data
+you produced is the intended use:
+
+```rust
+// per handle
+let limits = ReadLimits::STANDARD
+    .with_max_matrix_cells(4_000_000_000)
+    .with_max_matrix_dimension(2_000_000);
+let writer = AppFormat::create_writer_with_resource_limits(path, limits)?;
+```
+
+or as a format default in the declaration:
+
+```text
+limits {
+    matrix_cells: 4_000_000_000;
+    matrix_dimension: 2_000_000;
+}
+```
+
+Read §1.6 before choosing the `*_with_resource_limits` form.
+
+**Planned.** No change. A default that admits an unbounded declared extent is not
+wanted; the defaults are documented here instead.
+
+### 1.6 `*_with_resource_limits` silently discards a declared residency policy
+
+**What it is.** `MatrixMetadataResidency` travels inside `ReadLimits`, but it is
+not a *limit* — it is a declaration, and `ReadLimits::overlay` takes the
+runtime value **unconditionally** rather than combining it. `with_resource_limits`
+is `resolve().overlay(limits)`. So:
+
+```rust
+// The format declares Lazy { cache_bytes: 1 << 20 } as its default.
+// This call reverts it to EagerVerified, because ReadLimits::STANDARD
+// carries EagerVerified and overlay takes the runtime value outright.
+let reader = AppFormat::open_reader_with_resource_limits(
+    path,
+    ReadLimits::STANDARD.with_max_matrix_bitmap_bytes(n),
+)?;
+```
+
+The caller raising a bitmap ceiling loses the only mechanism that bounds matrix
+metadata memory (§1.4), and can then be refused at open by the very admission
+limit they were raising (§1.3). Nothing reports this.
+
+The two entry-point families differ, deliberately and asymmetrically:
+
+| Entry point | What happens to the format's residency policy |
+| --- | --- |
+| `*_with_resource_limits` (`overlay`) | **replaced** by the value in the passed `ReadLimits`, always |
+| `*_with_limits` (`tighten`, the legacy fieldwise form) | **kept** |
+| plain `open`/`create` | kept |
+
+**We do not think this is wrong as designed** — a residency policy has no
+"tighter" direction to compose, so a runtime overlay has to choose one outright,
+and `tighten`'s own source comment says so. It is listed as a limitation because
+it is undiscoverable: the signature does not change, the failure is silent, and
+the field the caller never mentioned is the one that moves.
+
+There is also **no `varve_format!` DSL key for residency.** `limits { }` accepts
+`key_index`, `disk_index_plan` and `keyed_tail`, but not
+`matrix_metadata_residency`. `Lazy` is reachable only by passing it in the same
+`ReadLimits` value you hand to the entry point:
+
+```rust
+let limits = ReadLimits::STANDARD
+    .with_matrix_metadata_residency(MatrixMetadataResidency::Lazy { cache_bytes: 1 << 20 })
+    .with_max_matrix_bitmap_bytes(n);   // both in one value, or the first is lost
+```
+
+**Who it affects.** Anyone who declares a residency policy on the spec *and*
+passes resource limits at an entry point. This is also a behaviour change at an
+unchanged signature for anyone who declared limits on a spec before 0.4.0, since
+the field did not exist then; see [API Changes §5](api-changes.md).
+
+### 1.7 Clearing a category costs `Theta(cells / 8)` unless the platform can punch holes
+
+**What it is.** `clear_category` and a whole-map page-index rebuild remove the
+byte range rather than writing it, which is `O(1)` in the range length — but only
+where the platform supports it. `punch_zero_range_native` is implemented for
+Windows (`FSCTL_SET_ZERO_DATA`) and Linux (`FALLOC_FL_PUNCH_HOLE`) and returns
+`false` on **every other target**. Every failed attempt, and every unsupported
+target, streams `len` zero bytes instead — for a whole-category clear that is
+`Theta(declared cells / 8)` bytes written.
+
+On macOS, and on any Windows/Linux filesystem without sparse support, clearing a
+16,000,000-cell category writes 2 MB where the supported path writes nothing.
+Scale that to the cell counts §1.5 lets you raise the ceiling to and it is the
+difference between an instant operation and a multi-gigabyte write.
+
+**Who it affects.** Anyone calling `clear_category`, or triggering a whole-map
+page-index rebuild, on a non-Windows/Linux target or a non-sparse volume.
+
+**Workaround.** There is no fallback that avoids the write. There *is* detection:
+the outcome is recorded unconditionally and neither counter is feature-gated. Two
+scope rules decide whether a reading means anything, and both will otherwise be
+read as a clean bill of health:
+
+- **A clear issues several range requests** (validity bitmap, page indexes, page
+  digests, commit map), and
+  `MatrixRecoveryReport::matrix_last_zero_range_streamed_bytes` reports only the
+  last of them, so `0` from it does not qualify the whole clear. Take
+  `matrix_total_zero_range_streamed_bytes` before and after instead; a nonzero
+  delta is exact proof that some range streamed.
+- **Both counters are thread-local.** Sample them on the thread that ran the
+  clear. A clear performed on a worker thread reads as `0` from anywhere else.
+
+`matrix_sparse_zeroing_supported()` reports the compile-time platform capability
+only and is not sufficient on its own. Check the counters rather than inferring
+from the target triple.
+
+**Planned.** No additional platform is scheduled. The cost model is stated in
+[Performance](performance.md) as well; it is repeated here because this file is
+the one organised by what a user hits.
+
+### 1.8 Matrix dimensions are fixed at create time, with no grow path
 
 **What it is.** A matrix's dimensions are supplied to
 `create_with_dims` / `create_new_with_dims` and are part of the created layout.
@@ -223,10 +462,16 @@ created. **A matrix cannot represent an indefinitely growing stream.**
   and their readers, for bounded-memory ingest and point lookup over data far
   larger than RAM. See [Scalable I/O](scalable-io.md).
 
-Over-provisioning the matrix at create time is possible — create cost is bounded
-by live state rather than by declared cell count — but be aware that the
-allocation-map term in §1.1 and the scatter arithmetic in §1.3 both respond to a
-larger declared extent.
+Over-provisioning the matrix at create time is possible, but three things bound
+how far:
+
+- Create cost is bounded by live state rather than by declared cell count **only
+  on a filesystem that gives you holes** — see the precondition in §1.1. Where it
+  does not, `set_len` allocates the whole declared extent.
+- `max_matrix_cells` defaults to 16,000,000 and is checked per block *and*
+  aggregated across blocks (§1.5), so over-provisioning needs an explicit raise.
+- The allocation-map term in §1.1 and the scatter arithmetic in §1.3 both respond
+  to a larger declared extent.
 
 **Planned.** No grow path is planned. Growth is what the stream/indexed family is
 for.
@@ -245,10 +490,38 @@ Varve writer produced, the sort degrades to `Theta(N)`; `O(N log N)` is the
 guaranteed bound for a reordered or hostile input.) The whole index stays in
 memory for the life of the handle.
 
-`IndexPolicy::CheckpointOnFlush` lets an open start from a checkpoint instead of
-a full scan. Note that the `scan_on_open` flag is **not a behaviour switch**: it
-is folded into the schema manifest and hash bytes and is consulted nowhere else
-in `varve-core`. Clearing it does not produce a non-scanning open.
+**Every open scans the whole record region, and no policy changes that.** This
+correction matters because the previous version of this document offered a
+mitigation that does not exist:
+
+- `IndexPolicy::CheckpointOnFlush` does **not** seed an open from a checkpoint.
+  Every open path calls `load_index`, which calls `scan_records_from`, which walks
+  from `header_len` to `file_len` unconditionally. A checkpoint met during that
+  walk is *validated* (`inspect_index_checkpoint`) and its decoded entries are
+  discarded. There is no public checkpoint-seeded open. What the policy actually
+  bounds is the writer side: it spaces full index checkpoints geometrically, which
+  bounds cumulative checkpoint **bytes written**, not open cost.
+  `docs/spec.md` describes the checkpoint-seeded open as a design target; it is
+  not implemented.
+- The `scan_on_open` flag is **not a behaviour switch** either: it is folded into
+  the schema manifest and hash bytes and is consulted nowhere else in
+  `varve-core`. Clearing it does not produce a non-scanning open.
+
+**How much RAM an open takes, so you can answer this before running it.** The
+resident index is a `Vec<RecordIndexEntry>`, and `index_bytes_for_count` — the
+same function that charges `max_index_bytes` — computes
+`count * size_of::<RecordIndexEntry>()`. On a 64-bit target that is **104 bytes
+per record**:
+
+```text
+resident_index_bytes ~= 104 * records
+```
+
+So 10,000,000 records is about 1.04 GB of index before any decoded payload, and a
+log with 400,000,000 records needs about 41.6 GB. Add transient growth slack: the
+`Vec` is grown incrementally, so the peak can be up to twice the resting size
+during the scan. That figure, not the file size, is what decides whether a
+resident open fits.
 
 `ReadLimits::STANDARD` leaves `max_file_len`, `max_records`, `max_index_bytes`
 and `max_scan_bytes` at `u64::MAX`, so the **default profile places no ceiling on
@@ -266,7 +539,10 @@ bootstrap, repair, rebuild, verify, truncate or scan on a normal open.
 not fit comfortably in RAM alongside the application, and anyone opening a large
 file in a latency-sensitive path.
 
-**Workaround.** Use the scalable family. Note the caveats in §2.3 before doing so.
+**Workaround.** Use the scalable family (§3) — and read §3 first: it is behind a
+`dev` feature flag, has never shipped, and its four modules are the least audited
+code in the tree. There is no third option. Keeping the handle open is the other
+half of the answer, since the scan is per open, not per read.
 
 **Planned.** The resident family is intentionally resident. No change planned.
 
@@ -316,12 +592,49 @@ keys are still charged.
 `KeyedMergeEstimate::peak_resident_structural_bytes()` is a **structural
 estimate, not an upper bound**. It excludes heap owned by `Key` and `T` values,
 `HashMap` load-factor slack and control bytes, decode scratch, and allocator
-metadata. The previous method name, `peak_resident_bytes()`, was removed rather
-than deprecated because its documented "upper bound" contract was false by an
-arbitrarily large margin for any heap-owning key or value type.
+metadata.
+
+It is named that way because the earlier spelling, `peak_resident_bytes()`,
+documented an "upper bound" contract that was false by an arbitrarily large
+margin for any heap-owning key or value type. **Both the type and the earlier
+name were introduced and renamed inside the 0.4.0 development cycle — no released
+version ever exposed `peak_resident_bytes()`,** so there is nothing to migrate.
+The history is recorded so the rationale for the longer name is not lost.
 
 **Planned.** An external, bounded-memory merge is not implemented and is not
 scheduled.
+
+### 2.4 Under a transaction-marker commit policy, reopening for write discards the uncommitted tail
+
+**What it is.** With `CommitPolicy::TransactionMarker`, records are visible only
+behind a commit marker. Two consequences that surprise a first-week user, both
+deliberate and both silent:
+
+- **Opening for write truncates.** `truncate_uncommitted_tail_if_needed` sets the
+  file length back to the end of the last commit marker. Records appended after
+  the last `flush()`/`commit()` in a previous session are **deleted from the file
+  on the next write open**, not merely hidden.
+- **A file with no marker at all reads as empty.** `scan_records_from` returns an
+  empty index when it finds no marker, whatever the file contains. A process that
+  appended 10,000 records and exited without flushing reopens to zero records, and
+  a write open then truncates them away.
+
+There is no error, no warning and no diagnostic on either path — the index is
+simply short. This is the correct behaviour for the policy (an uncommitted tail
+must not become committed by a later append landing next to it), but it is a
+data-loss shape if you assumed `push` was durable.
+
+**Who it affects.** Anyone on a `transaction_marker` format who appends without
+flushing, and anyone who treats process exit as a checkpoint. `on_flush` markers
+make every `flush()` a commit point, which is why that is the common declaration.
+
+**Workaround.** `flush()` (or `commit()` under `transaction_marker(explicit)`)
+before you rely on anything being in the file, and treat an unflushed tail as
+lost. For the exact ordering guarantees see [Durability Model](durability-model.md)
+and [Recovery Model](recovery-model.md).
+
+**Planned.** No change. The alternative — retaining an uncommitted tail across a
+write open — is the defect this prevents.
 
 ---
 
@@ -362,22 +675,56 @@ Operational notes for users who enable it anyway:
 
 ### 4.1 What takes `&self` today
 
+**Every matrix read entry point takes `&self`.** All six of them, on all three
+handle types — that is the complete inventory, not a sample:
+
+| Matrix read entry point | 0.3.0 | 0.4.0 |
+| --- | --- | --- |
+| `read_matrix_cell::<T>` | `&mut self` | `&self` |
+| `matrix_cell_payload::<T>` | `&mut self` | `&self` |
+| `read_matrix_aux` | `&mut self` | `&self` |
+| `matrix_cell_status::<T>` | `&self` | `&self` (unchanged) |
+| `matrix_aux_len` | `&self` | `&self` (unchanged) |
+| `matrix_resume_signal` | `&self` | `&self` (unchanged) |
+
+Each exists on `VarveReader`, `VarveWriter` and `VarveFile`, so 18 signatures.
+`crates/varve/tests/matrix_concurrent_reads.rs` pins 15 of them ("5 entry points
+x 3 handle types") by holding two shared borrows of a non-`mut` handle;
+`matrix_resume_signal` is the sixth and was already `&self`.
+
+**Three entry points relaxed, not four.** Payload and aux reads are named
+explicitly because an earlier version of this table listed only three entry
+points and omitted them, which read as though `matrix_cell_payload` and
+`read_matrix_aux` still needed exclusive access. They do not. In the same
+correction, `matrix_cell_status` moves out of the relaxed group: it was `&self`
+on all three handle types in **0.3.0** and at every commit of the 0.4.0 cycle
+(checked against the `varve-core 0.3.0` source package and against the parent of
+the round-15/16 commit), so listing it as a relaxation overstated what this
+release changed. What is true either way is the conclusion: all six are
+concurrently issuable through a shared handle.
+
 | Subsystem | Reads take | One handle, many threads |
 | --- | --- | --- |
-| Matrix (`read_matrix_cell`, `matrix_cell_status`, `matrix_resume_signal`) on `VarveReader`, `VarveWriter`, `VarveFile` | `&self` | yes — the reader handle is `Send + Sync` |
+| Matrix — all six read entry points above, on `VarveReader`, `VarveWriter`, `VarveFile` | `&self` | yes — the handle is `Send + Sync` |
 | Resident record reads (`blocks`, `keyed_blocks`, `materialized_keyed_blocks`, `scan`, `index_entries`, `metadata`) on `VarveReader` | `&self` | yes |
 | All mutation (`push*`, `delete*`, `replace_*`, `write_matrix_cell*`, `commit_matrix_cell`, `clear_matrix_*`, `flush`, `commit`, `sync`) | `&mut self` | no |
 
-Matrix reads changed from `&mut self` to `&self` in this release. That is
-source-compatible — an existing call through a `&mut` binding still compiles —
-but it is what makes shared-handle concurrent reading possible.
+The three relaxations are source-compatible — an existing call through a `&mut`
+binding still compiles — but they are what makes shared-handle concurrent reading
+possible.
 
-**Measured concurrent matrix read scaling** (wall clock, lower is better; both
-contract-asserted at `<= 1.0x`):
+**Measured concurrent matrix read scaling** (wall clock, lower is better; the
+contract asserted in the tests is only `<= 1.0x`, i.e. "does not serialise"):
 
-- 24,000 reads through one handle: 1 thread 0.138s vs 4 threads 0.046s — **0.33x**.
-- Hostile lazy configuration (1-page cache, 32 live pages, 40,960 fault-in
-  reads): 1 thread 3.814s vs 4 threads 1.667s — **0.44x**.
+| Scenario | Run A | Run B (independent) |
+| --- | --- | --- |
+| 24,000 reads, one shared handle, 1 vs 4 threads | 0.138s vs 0.046s — **0.33x** | 0.076s vs 0.032s — **0.42x** |
+| Hostile lazy config (1-page cache, 32 live pages, 40,960 fault-in reads) | 3.814s vs 1.667s — **0.44x** | 2.135s vs 0.746s — **0.35x** |
+
+Two runs are shown because these are wall-clock numbers on a shared desktop and
+they move by tens of percent between runs. **Treat the absolute times as
+illustrative and only the "well under 1.0x" conclusion as the result.** Anything
+sized on the exact ratio is sized on noise.
 
 **These numbers are Windows numbers, and the mechanism behind them is
 Windows-only.** Windows `ReadFile` serialises on the kernel file object, so each
@@ -495,9 +842,14 @@ file.
 
 ## 6. Not verified
 
-Everything in this section is a statement about **assurance**, not about a known
-defect. It is here because a user is entitled to know which claims rest on
+Almost everything in this section is a statement about **assurance** rather than a
+known defect: it is here because a user is entitled to know which claims rest on
 executed tests and which rest on inspection.
+
+Two exceptions, both defects in the project's own gates rather than in the
+library: the Linux Clippy lint failure in §6.1, and the default-feature test
+failure in §6.6. Neither changes any library behaviour, and both are named rather
+than omitted.
 
 ### 6.1 The Unix code paths have never been executed
 
@@ -514,13 +866,16 @@ These are **compile-verified only** (open item 8). Cross-compilation to
 Linux C toolchain that was not available on the host that produced this document —
 so the zstd path on Unix is not even cross-compile-verified.
 
-Additionally, `cargo clippy --target x86_64-unknown-linux-gnu -p varve
---no-default-features --lib -- -D warnings` currently **fails** with
-`field 'handles' is never read` at `crates/varve-core/src/matrix.rs:220`, because
-`MatrixReadPool::reopen` is `#[cfg(windows)]`-only and the field's other readers
-are `#[cfg(test)]`. The same invocation passes on Windows. This is a lint failure,
-not a behaviour defect, but it means the Linux build has not passed the project's
-own gate.
+`cargo clippy --target x86_64-unknown-linux-gnu -p varve --no-default-features
+--lib -- -D warnings` previously failed with `field 'handles' is never read` at
+`crates/varve-core/src/matrix.rs`, because `MatrixReadPool::reopen` is
+`#[cfg(windows)]`-only and the field's other readers are `#[cfg(test)]`. The
+field is an ownership anchor rather than dead weight — it holds the `Arc<File>`s
+whose `Weak`s live in the thread-local cache — so it now carries
+`#[cfg_attr(not(any(windows, test)), allow(dead_code))]` with that reason
+recorded at the declaration. The invocation passes on both targets as of
+2026-07-25. That is a cross-compiled lint pass, not an executed Linux test: the
+paths listed above are still compile-verified only.
 
 ### 6.2 The petabyte-scale positional-I/O probe has never run
 
@@ -552,11 +907,30 @@ on tests at far smaller scales, not on a demonstration at one petabyte.
 - **No fuzz campaign, no Miri run and no ASan run has been performed against this
   release's code.**
 - An unpromoted libFuzzer OOM reproducer exists in the working tree at
-  `fuzz/artifacts/codec_arbitrary/` from 2026-07-20. It is gitignored and will not
-  be published, but it means an OOM in `codec_arbitrary` was found and has not
-  been turned into a deterministic regression, and that
-  `scripts/run-security-fuzz.ps1` refuses to start (exit 2) while it is present.
-  **This release makes no fuzz-pass claim.**
+  `fuzz/artifacts/codec_arbitrary/oom-53bc…` from 2026-07-20. It is gitignored
+  and will not be published, and `scripts/run-security-fuzz.ps1` refuses to start
+  (exit 2) while it is present.
+
+  **It has now been triaged, and it does not reproduce against this release's
+  code.** The 11 bytes select `decode_from_slice::<HashMap<(), ()>>` (selector
+  105, `105 % 12 = 9`) with a declared entry count of 587,203,068. Replayed
+  through that public entry point today, every outcome is a typed error returned
+  in microseconds:
+
+  | Declared count | Outcome | Time |
+  | --- | --- | --- |
+  | 587,203,068 (the reproducer) | `LimitExceeded { resource: "HashMap entries", actual: 1073741888, limit: 1073741824 }` | 7.5 µs |
+  | 293,601,534 (largest the 1 GiB ceiling admits) | `InvalidCanonicalEncoding("duplicate HashMap key")` | 6.5 µs |
+  | `u64::MAX` | `InvalidCanonicalEncoding("collection count cannot make bounded input progress")` | 0.1 µs |
+
+  No admitted count can produce a large allocation on this path: the map reserves
+  `min(count, MAP_PREALLOCATION_ENTRIES = 1024)` entries before a single entry has
+  been proven decodable (SAFE-01), so the real allocation is bounded by 1024
+  regardless of what the file claims. The remaining gap is **test hygiene, not an
+  unbounded allocation**: the reproducer was never promoted to a deterministic
+  regression test, so nothing in the suite pins the behaviour that fixed it.
+  **This release still makes no fuzz-pass claim** — one triaged reproducer is not
+  a campaign.
 
 ### 6.5 Tests that can pass without proving anything
 
@@ -570,18 +944,94 @@ Named here so that a green run is not over-read:
   `matrix_lazy_residency.rs` are skipped, with an announcement, on a single-core
   host.
 
-### 6.6 What was verified
+### 6.6 What was verified, and the one gate that is red
 
-On Windows x86_64 MSVC, rustc 1.95.0, on 2026-07-22:
+Full gate run on Windows x86_64 MSVC, 2026-07-25. Everything below was executed;
+numbers are from that run.
 
-- `cargo test --workspace --all-features`: all green, ~490 tests across 42 test
-  binaries plus 3 doctests.
-- `cargo clippy --locked --all-targets --workspace --all-features -- -D warnings`:
-  clean.
-- The 10 `matrix_lazy_residency` tests and the 4 `matrix_concurrent_reads` tests,
-  producing the numbers quoted in §1 and §4.
+| Gate | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | clean |
+| `cargo check --workspace --all-features --all-targets --locked` | clean |
+| Clippy `-D warnings`, 9 configurations (all-features, default, no-default-features, and each of the 6 optional features alone) | clean, 9/9 |
+| `cargo doc`/`rustdoc -D warnings`, 3 crates x {all-features, no-default-features} | clean, 6/6 |
+| `varve-test-runner test --workspace --all-features` | **648 passed, 0 failed, 8 ignored** across 49 binaries; artifact cleanup verified empty |
+| `varve-test-runner test --workspace` (default features) | **168 passed, 1 FAILED, 1 ignored** — see below |
+| `cargo test -p varve-core --all-features --lib`, five consecutive runs | 139 passed each time, 0 failed; no flake |
+| `rename-fixture` and `public-api-fixture`, built and run | both OK |
+| `cargo deny check` + `cargo audit`, root and fuzz workspace; fuzz `cargo metadata --locked`, `cargo check --locked --all-targets`, lockfile drift | all clean; 79 and 50 crate dependencies scanned |
+| `cargo package --locked` for all three crates, verification enabled | all three archives built and **verified**; each contains `README.md`, `LICENSE-MIT`, `LICENSE-APACHE` |
+| Consumer compiled and run against the extracted `.crate` archives | OK |
+| Clean-tree copy (no `target/`, no VCS), `cargo metadata --locked` + `cargo check --workspace --all-features --all-targets --locked` | clean |
 
-### 6.7 CI reproducibility is bounded
+**The red one, and its fix.** In the run tabulated above, under the **default**
+feature set,
+`crates/varve/tests/matrix_concurrent_reads.rs::threads_sharing_one_handle_read_every_cell_correctly`
+failed with `Error::IntegrityFeatureDisabled`: the test looped over
+`[IntegrityPolicy::None, IntegrityPolicy::Crc32]` unconditionally, and `Crc32` is
+refused when the `integrity` feature is off. It was a **defect in the test, not in
+the library** — no library behaviour was wrong, and the same test passed under
+`--all-features`. The loop is now gated on `cfg!(feature = "integrity")`, so the
+default run covers `None` only. Re-measured 2026-07-25: the binary passes 4/4
+under default features and 4/4 under `--all-features`.
+
+Both gates that were red are now green — this one and the Linux Clippy lint in
+§6.1 — but note what that does and does not mean. Each was re-measured
+individually on this Windows host after its fix, not as part of a fresh full run
+of the table above, and the Linux result is a cross-compiled lint rather than an
+executed Linux test. The table's remaining rows are from the 2026-07-25 run and
+have not been re-executed since. They are stated this precisely because "all
+green" was the shape of every previous over-claim in this project's history.
+
+Also verified in this run, and quoted in §1 and §4: the 10 `matrix_lazy_residency`
+tests, the 4 `matrix_concurrent_reads` tests, and
+`matrix_integrity_scaling::measured_resident_bitmap_bytes_against_the_ceiling`.
+
+### 6.7 The backward-compatibility table: what is now executed, and what still is not
+
+**No test in the suite opens an artifact written by an older version.** The
+repository stores none: there is no tracked `.varve`, `.vks` or `.vki` file
+anywhere and no fixtures directory, so every row of the compatibility table in
+[API Changes](api-changes.md) is *derived from the current source*.
+
+Three of those rows were checked by hand on 2026-07-25 against files produced by
+genuinely older builds, and all three behaved as documented:
+
+| Claim | How it was checked | Result |
+| --- | --- | --- |
+| A plain native append-log file written by **0.1.0** opens normally | a producer built against the real `varve-core 0.1.0` source package wrote an 8-record fixed-block file; a 0.4.0 consumer opened it | **opens; all 8 records and every field byte-for-byte correct** |
+| The same, written by **0.3.0** | producer built against the real `varve 0.3.0` / `varve-core 0.3.0` / `varve-macros 0.3.0` source packages | **opens; all 8 records and every field correct** |
+| A file pinned with a **computed schema hash** from 0.3.0 is refused | the same declaration compiled under 0.3.0 (hash `0xbaf33c482858b060`) and under 0.4.0 (hash `0x4bf7fa8d7d7e9e4f`) | **refused with `Error::SchemaHashMismatch`**, carrying the 0.4.0 value as the wanted hash and 0.3.0's as the stored one |
+
+That is a **manual, out-of-tree check, not a regression test.** It was run once, on
+one host, over one small format with two `u32` fields. It does not cover variable
+blocks, compression, keyed collections, matrices or sidecars, and nothing prevents
+a future change from breaking it silently — there is still no committed fixture and
+no test.
+
+The rows that remain unexecuted:
+
+| Row | Evidence | What it does not cover |
+| --- | --- | --- |
+| Matrix `VMAT` v1/v2/v3 refused | `matrix_integrity_scaling.rs` writes a current file and **patches its version field** | that a genuinely old matrix file's other regions also refuse rather than misparse |
+| Pre-nonce matrix refused at the nonce region | **no test, no manual check** | the whole row |
+| Matrix and disk-index sidecar version refusals | source inspection only | the whole rows |
+
+The positive claim is also sound in code: `read_file_header`,
+`file_header_extensions`, `write_record_header` and `encode_record_footer` are
+byte-identical to v0.1.2 and the record-footer constants match. The correct summary
+is: **the append-log compatibility claim now has one executed demonstration behind
+it; the matrix and sidecar refusal claims still rest on inspection.**
+
+### 6.8 Platform support, stated once
+
+| Target | Status |
+| --- | --- |
+| Windows x86_64 MSVC | the only platform on which anything in this release has been executed. Every number in this document is from here. |
+| Unix (Linux) | **compile-verified only** (§6.1). Cross-compilation succeeds except `compression-zstd`. No test, gate or measurement has run. |
+| macOS / other targets | compile paths exist, nothing executed. Two behaviours differ by construction rather than by accident: no allocation map (§1.1) and no hole punch (§1.7). |
+
+### 6.9 CI reproducibility is bounded
 
 Actions and cargo tools are pinned. `ubuntu-latest`, `windows-latest` and
 `stable` are rolling by design; `msrv (1.95.0)` is the only fixed-toolchain job.
@@ -706,8 +1156,13 @@ Other contributor-facing items, each confirmed present in code:
 - `matrix.rs`'s prepared page-index values have no `tests/ui` proof (open item
   22), deliberately: exposing them to prove them would destroy the module privacy
   that *is* the enforcement.
-- `SparseBitmap: Clone` still exists (open item 19), retained only because
-  `MatrixLayout` derives `Clone`.
+- `SparseBitmap: Clone` still exists (open item 19). The hand-written
+  `impl Clone for SparseBitmap` is retained because **`MatrixCommitLayout`
+  derives `Clone`** and holds a `SparseBitmap` field. It is *not* retained for
+  `MatrixLayout`, which was deliberately stripped of its `Clone` derive in round
+  16 (a clonable layout made `FatalAccessGate` clonable, and a clonable gate is an
+  installable gate); the comment above `struct MatrixLayout` records that. The
+  item is live, the reason previously given for it was stale.
 - `diagnostics.rs::classify_error` is an exhaustive match over `Error` (open item
   11), so every new error variant forces an edit to a file the fixing round does
   not otherwise own. Kept on purpose as a forcing function.

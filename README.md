@@ -21,24 +21,49 @@ covered in **[API Changes](docs/api-changes.md)**.
 
 - Declaring a custom binary format and getting typed readers and writers for it.
 - Append-log files whose record count and distinct-key count fit comfortably in
-  RAM alongside the application. This is the default path.
-- Bounded-memory ingest and point lookup over data far larger than RAM — behind
-  the `high-cardinality-dev` feature, which has never shipped in a released
-  version and whose API may still change.
-- Preallocated matrix storage with **fixed dimensions** and a live set whose
-  commit-map page count fits the process memory budget.
+  RAM alongside the application. This is the default path, and the only part of
+  the library with an executed test history behind it. Budget about **104 bytes of
+  resident index per record**; open scans the whole file.
+- Bounded-memory ingest and point lookup over data far larger than RAM — with two
+  caveats that a reader should weigh before choosing Varve for this workload.
+  It is behind the `high-cardinality-dev` feature, has never shipped in a released
+  version, and its API may still change. **And its four modules (`disk_index.rs`,
+  `stream.rs`, `indexed.rs`, `scan_control.rs`) have not been walked against the
+  project's five internal invariants**, while the matrix and resident paths have.
+  The only path offered for the larger-than-RAM workload is the least-audited code
+  in the tree.
+- Preallocated matrix storage with **fixed dimensions**, a live set whose
+  commit-map page count fits the process memory budget, at most 16,000,000 cells
+  unless you raise `max_matrix_cells` explicitly, on a sparse-capable filesystem.
 - Reading a file with hostile-input ceilings applied (`ReadLimits::UNTRUSTED`).
+  The typed refusals and bounded allocations are real and tested — but read the
+  fuzz/Miri/ASan line below before treating this as a hardened surface.
 
 **Not ready for:**
+
+- **Windows-only assurance.** Every number in the documentation, and every
+  executed test, comes from Windows x86_64. Unix is compile-verified only; other
+  targets additionally lose the allocation map and hole punching by construction.
+  CI has never run on this code.
+- **Matrices larger than 16,000,000 cells out of the box.** That is the default
+  `max_matrix_cells`, checked per matrix block **and** as a running aggregate
+  across all of them, so a 4096 x 4096 matrix fails at *create* with
+  `LimitExceeded { resource: "matrix cells" }` until the ceiling is raised.
+- **Matrices on a filesystem that cannot represent holes.** Sparseness is
+  requested best-effort and failure is ignored. On a non-sparse volume the
+  declared extent is really allocated, create cost and open cost become
+  proportional to the *declared* cell count, and `clear_category` writes
+  `cells / 8` bytes instead of punching a hole. There is no error — only slowness.
 
 - **Matrices that grow.** Dimensions are fixed at create time and there is no
   grow path, so a matrix cannot represent an indefinitely growing stream. Use the
   stream/indexed APIs for that.
 - **Frequent matrix opens.** Opening a matrix is not `O(1)`. It is independent of
   file size, but proportional to the candidate page set: a matrix with **one live
-  page** still reads about **131 KB over 32 pages**. Resident commit metadata is
-  fixed at open, does not track the working set, and is never evicted under the
-  default policy.
+  page** still reads about **131 KB over 32 pages** (Windows/NTFS). Resident commit
+  metadata is fixed at open by the live page count, does not track the working set,
+  and under the default policy is released only when a *mutation* clears a page's
+  last set bit — a reader can never release anything.
 - **Matrices under a tight `max_matrix_bitmap_bytes`.** That ceiling is an
   *admission* limit, not a cache bound. A matrix whose committed state exceeds it
   **cannot be opened at all**.
@@ -85,7 +110,20 @@ ceiling instead of exhausting memory.
 
 Matrix (preallocated) storage is a third mode. Its integrity metadata is paged
 and sparse, so create-time metadata I/O and per-mutation integrity cost are
-bounded by the cells actually used rather than by the declared cell count.
+bounded by the cells actually used rather than by the declared cell count —
+**provided the filesystem represents the unwritten extent as holes.** That is
+requested best-effort at create and the failure is ignored, so on exFAT/FAT32,
+some network and virtual volumes, or after a copy by a tool that expands holes,
+the declared extent is genuinely allocated and both the create-time and the
+open-time cost become proportional to the declared cell count instead. Nothing
+reports this; the symptom is slowness.
+
+By default a matrix is capped at **16,000,000 cells and 16,000,000 per dimension**
+(`ReadLimits::STANDARD`), checked per matrix block and as a running aggregate
+across every matrix block in the format. Larger matrices need
+`with_max_matrix_cells` / `with_max_matrix_dimension` or a `limits { }`
+declaration, or create fails with
+`LimitExceeded { resource: "matrix cells" }`.
 
 **Open-time reads and post-open bitmap residency are bounded by the live
 *page* count, not by the working set, and open is not `O(1)`.** Under the
@@ -93,8 +131,11 @@ default `MatrixMetadataResidency::EagerVerified` policy, open reads the union of
 the pages named by the persisted page index and the pages the platform's
 allocation map reports as written; a matrix with one live page measured 131,240
 bytes over 32 pages, and one with 64 live pages measured 591,384 bytes and
-524,288 resident. Residency does not change as the caller touches cells and is
-never evicted. `max_matrix_bitmap_bytes` is an admission limit under this policy:
+524,288 resident. Of the pages it reads, open retains only those holding a set
+bit, which is why the 1-live-page case reads 131 KB but holds 8 KB. Residency
+does not change as the caller touches cells, and nothing on the read path
+releases it; a mutation that clears a page's last set bit does refund that page.
+`max_matrix_bitmap_bytes` is an admission limit under this policy:
 a matrix whose live set exceeds it cannot be opened. The opt-in
 `MatrixMetadataResidency::Lazy { cache_bytes }` policy bounds residency by a
 declared ceiling with LRU eviction and reads only the persisted page index at
@@ -102,6 +143,15 @@ open, at the cost of moving corruption detection to first touch and giving up a
 consistent snapshot across pages.
 
 Matrix dimensions are fixed at create time; there is no grow path.
+
+**Platform support, since it changes the matrix cost model rather than only the
+confidence in it:**
+
+| Target | Status |
+| --- | --- |
+| Windows x86_64 MSVC | the only executed platform. Every measured number in these documents comes from here. |
+| Linux | compile-verified only. Has an allocation map and hole punching, so the same cost model applies with different constants; no test has run. |
+| macOS and other targets | no allocation map (matrix open visits only pages the index names) and no hole punch (`clear_category` writes `cells / 8` bytes). Compile paths exist; nothing executed. |
 
 Full numbers, arithmetic you can apply to your own cell count, and the trade-offs
 of each policy are in
@@ -184,6 +234,16 @@ legacy `*_with_limits` methods when only fieldwise tightening is desired. An
 optional, partial `limits { ... }` declaration can provide format defaults but
 never becomes a permanent wire-format ceiling.
 
+One field on `ReadLimits` does not compose like a limit: `matrix_metadata_residency`
+is a *declaration*, not a ceiling, so a `*_with_resource_limits` call **replaces**
+whatever residency policy the spec declared instead of combining with it. Raising
+`max_matrix_bitmap_bytes` through that entry point therefore reverts a declared
+`Lazy { cache_bytes }` to `EagerVerified` — silently discarding the only bound on
+matrix metadata memory, and possibly failing the open on the very admission limit
+you were raising. Carry the policy in the same `ReadLimits` value
+(`with_matrix_metadata_residency`), or use `*_with_limits`, which keeps it. See
+[Known Limitations §1.6](docs/known-limitations.md#16-_with_resource_limits-silently-discards-a-declared-residency-policy).
+
 ## Examples
 
 | Example | Role |
@@ -223,17 +283,38 @@ gate, file data, environment, or library invariant issues. See
 ## Status
 
 Varve 0.4.0 is usable as an alpha library for experimentation and controlled
-deployments, at moderate scale through the generated APIs. It includes append-log blocks, keyed collections,
-transaction/footer commit policies, schema manifests, diagnostics, merge and
-compact helpers, variable-block compression, matrix storage, mmap, and opt-in
-zero-copy. Valid native 0.1 append-log wire bytes remain readable in 0.4.0, but
-the Rust API is still pre-1.0 and may evolve through semver-signaled minor
-releases. Two artifact classes are **not** covered by that statement in 0.4.0
-and are rejected with a typed stale-regenerable error rather than read: matrix
-sidecars written before VMAT layout v4, and stream/indexed primaries and disk
-sidecars written before the generation nonce. Both are regenerated from source
-data; see [CHANGELOG](CHANGELOG.md) and
-[Migration Guide](docs/migration-guide.md).
+deployments. Through the **stable, released** APIs that means moderate scale —
+files whose record and key counts fit in RAM. The larger-than-RAM path exists but
+is behind `high-cardinality-dev`, has never shipped, and is the least audited code
+in the tree; "far larger than RAM" in the capability table above describes that
+feature-gated family, not the default one. It includes append-log blocks, keyed
+collections, transaction/footer commit policies, schema manifests, diagnostics,
+merge and compact helpers, variable-block compression, matrix storage, mmap, and
+opt-in zero-copy. Valid native 0.1 append-log wire bytes remain readable in 0.4.0,
+but the Rust API is still pre-1.0 and may evolve through semver-signaled minor
+releases.
+
+**Four artifact classes are not covered by that statement in 0.4.0.** They are
+rejected with a typed error rather than misread, but two of them hold data and two
+are regenerable, and the difference is what it costs you:
+
+| Class | Outcome | Cost to you |
+| --- | --- | --- |
+| **Matrix native file** (`VMAT` v1/v2/v3) | `Error::FormatVersionMismatch { expected: 4, .. }` | **recreate the matrix and copy its contents yourself** — Varve has no migration tool |
+| **Native file pinned with a computed schema hash** from 0.3.0 or earlier | `Error::SchemaHashMismatch` | **recreate the file, or re-derive the pinned literal** — the hash algorithm changed twice |
+| Matrix sidecar written before sidecar v3 | `Error::MatrixSidecarMismatch("sidecar version")` | regenerate; sidecars are resume state, not data |
+| Stream/indexed primaries and disk sidecars written before the generation nonce | typed refusal; `rebuild_disk_index` for the sidecar | regenerate. Hypothetical in practice — this family never shipped |
+
+See [API Changes](docs/api-changes.md#read-this-first-files-written-by-an-older-version),
+[CHANGELOG](CHANGELOG.md) and [Migration Guide](docs/migration-guide.md).
+
+On the evidence behind that table: **no test in the suite opens a file written by an
+older version.** The append-log claim was checked by hand on 2026-07-25 — files
+written by the real 0.1.0 and 0.3.0 builds opened under 0.4.0 with every field
+intact, and a 0.3.0 computed-hash-pinned file was refused as documented — but that
+was a single manual run over a two-field format, and the matrix and sidecar refusal
+rows rest on source inspection alone. See
+[Known Limitations §6.7](docs/known-limitations.md#67-the-backward-compatibility-table-what-is-now-executed-and-what-still-is-not).
 The petabyte-scale stream/disk-index API remains behind
 `high-cardinality-dev` and has never shipped in a released version.
 Progress/cancellation, process-interruption recovery, and sidecar robustness

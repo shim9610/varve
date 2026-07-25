@@ -142,7 +142,7 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - `IndexPolicy` is a bitset-style policy with `scan_on_open`, `checkpoint_on_flush`, `block_offset_chain`, and `keyed_offset_chain`. Offset-chain policies are written automatically in `VARVE3` footers.
 - `CommitPolicy::RecordFooter` treats valid record footers as the commit flag for each record.
 - `CommitPolicy::TransactionMarker(on_flush|explicit)` appends internal `COMMIT_BLOCK_ID` marker records. Readers expose the latest marker-covered snapshot; writer open truncates uncommitted tail after the latest marker.
-- `IndexPolicy::CheckpointOnFlush` writes an internal checkpoint record. Open uses the latest valid checkpoint and scans forward from its covered offset, with full-scan fallback for structurally invalid checkpoints. Transaction-marker formats currently prefer a full scan to preserve marker visibility semantics.
+- `IndexPolicy::CheckpointOnFlush` writes an internal checkpoint record, spaced geometrically so cumulative checkpoint bytes stay bounded. **Checkpoint-seeded open is specified but not implemented**: as of 0.4.0 every open scans the full record region (`load_index` -> `scan_records_from`), validates any checkpoint it meets, and discards the checkpoint's decoded entries. See the design target below and `docs/known-limitations.md` §2.1.
 - `CompressionPolicy::VariableBlocks` and block-specific compression descriptors are feature-gated by the selected backend. The first backend is optional `compression-zstd`; compressed records are rejected when the backend is not enabled.
 
 ## Update And Merge
@@ -414,7 +414,7 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
   - entries are ordered by record offset and end no later than the covered offset,
   - no entry points to the checkpoint record itself,
   - CRC validation passes for the checkpoint payload when integrity is enabled.
-- For `IndexPolicy::CheckpointOnFlush`, open should scan from the header until the latest valid checkpoint, then rebuild the index from the checkpoint and scan only records after the covered offset.
+- For `IndexPolicy::CheckpointOnFlush`, open should scan from the header until the latest valid checkpoint, then rebuild the index from the checkpoint and scan only records after the covered offset. **Not implemented as of 0.4.0** — this is a design target. The checkpoint is validated on the way past and its entries are discarded; open scans the whole region.
 - Structurally corrupt checkpoints are ignored and full scan fallback is allowed.
 - CRC mismatch remains fatal and must not be hidden by checkpoint fallback.
 - Recovery open may truncate only incomplete header/payload tails after the checkpoint; it must not truncate complete-but-corrupt records.

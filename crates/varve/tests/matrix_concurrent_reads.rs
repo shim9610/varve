@@ -180,7 +180,7 @@ fn the_reader_handle_is_sync_and_send() {
 ///
 /// This would not compile at all before this round. It is written as a
 /// free-standing function taking `&VarveReader` precisely so that reintroducing
-/// `&mut self` on any of these four entry points is a build failure, not a
+/// `&mut self` on any of these entry points is a build failure, not a
 /// silently-accepted regression.
 fn read_everything(reader: &varve::VarveReader, key: MatrixKey) -> varve::Result<u32> {
     let typed = reader.read_matrix_cell::<SharedCell>(key)?;
@@ -271,7 +271,15 @@ fn every_matrix_read_entry_point_takes_a_shared_borrow() -> varve::Result<()> {
 /// one cursor read each other's slots.
 #[test]
 fn threads_sharing_one_handle_read_every_cell_correctly() -> varve::Result<()> {
-    for integrity in [varve::IntegrityPolicy::None, varve::IntegrityPolicy::Crc32] {
+    // `Crc32` is only constructible into a working spec when the `integrity`
+    // feature is on; without it every checksummed read fails closed with
+    // `IntegrityFeatureDisabled`, so the default-feature run covers `None` only.
+    let policies: &[varve::IntegrityPolicy] = if cfg!(feature = "integrity") {
+        &[varve::IntegrityPolicy::None, varve::IntegrityPolicy::Crc32]
+    } else {
+        &[varve::IntegrityPolicy::None]
+    };
+    for &integrity in policies {
         let fixture = TempMatrix::new("concurrent-cells");
         let spec = populated(&fixture, integrity)?;
         let reader = spec.open_reader(fixture.path())?;

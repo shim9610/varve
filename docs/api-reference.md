@@ -143,10 +143,11 @@ only: no on-disk byte depends on it, so one process may open a file eagerly
 while another opens the same file lazily.
 
 `MatrixMetadataResidency::EagerVerified` is the default and is inert — it is
-byte-for-byte the behaviour varve had before the option existed. Open reads,
-authenticates against its stored page digest, and materialises every commit-map
-page the matrix has published, plus every page the platform's allocation map
-reports as written. Corruption anywhere in that set is reported by `open`.
+byte-for-byte the behaviour varve had before the option existed. Open **reads and
+authenticates** every commit-map page the matrix has published, plus every page the
+platform's allocation map reports as written, each against its stored page digest;
+of those it makes resident **only the pages holding at least one set bit**.
+Corruption anywhere in the read set is reported by `open`.
 `max_matrix_bitmap_bytes` acts as an *admission* limit under this policy: a
 matrix whose live page set exceeds it cannot be opened at all.
 
@@ -246,11 +247,21 @@ one of these handles scans the file and builds a **resident record index** that
 lives for the life of the handle: `Theta(records + decoded bytes)` plus an
 `O(N log N)` per-open sequence-uniqueness sort over `N` records (which degrades
 to `Theta(N)` for a file a Varve writer produced; the `N log N` bound is the
-guarantee for reordered or hostile input). `IndexPolicy::CheckpointOnFlush` lets
-an open start from a checkpoint instead of a full scan. The `scan_on_open` flag
-is **not** a behaviour switch — it is folded into the schema manifest and hash
-bytes and is consulted nowhere else in `varve-core`, so clearing it does not
-produce a non-scanning open.
+guarantee for reordered or hostile input). Budget about **104 bytes of resident
+index per record** (`size_of::<RecordIndexEntry>()`).
+
+**Every open scans the whole record region, and no policy avoids it.** Two
+policies look as though they might, and neither does:
+
+- `IndexPolicy::CheckpointOnFlush` does **not** seed an open from a checkpoint.
+  Every open calls `load_index` → `scan_records_from`, which walks from the header
+  to the file length; a checkpoint met on the way is validated and its decoded
+  entries are discarded. What the policy bounds is writer-side checkpoint bytes
+  (it spaces full checkpoints geometrically), not open cost. `docs/spec.md`
+  describes a checkpoint-seeded open as a design target; it is not implemented.
+- The `scan_on_open` flag is **not** a behaviour switch — it is folded into the
+  schema manifest and hash bytes and is consulted nowhere else in `varve-core`, so
+  clearing it does not produce a non-scanning open.
 
 `ReadLimits::STANDARD` leaves `max_file_len`, `max_records`, `max_index_bytes`
 and `max_scan_bytes` at `u64::MAX`, so the default profile places no ceiling on

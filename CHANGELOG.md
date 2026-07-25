@@ -32,8 +32,8 @@ Each links to the section of the migration document that tells you what to edit.
 | `VarveBlock` gains required `IS_KEYED` and `SCHEMA_FINGERPRINT` — every **manual** `impl VarveBlock` stops compiling | [§3.1](docs/api-changes.md#31-varveblock-gains-two-required-associated-constants--every-manual-impl-stops-compiling) |
 | `FormatSpec` gains `block_identities` and `matrix_fatal_forensics` — exhaustive struct literals break | [§3.2](docs/api-changes.md#32-formatspec-gains-two-public-fields--exhaustive-struct-literals-break) |
 | `Error::PublishedButRebindFailed` gains `parent_sync` — destructuring breaks | [§3.3](docs/api-changes.md#33-errorpublishedbutrebindfailed-gains-a-third-field) |
-| `KeyedMergeEstimate::peak_resident_bytes()` removed, no alias; use `peak_resident_structural_bytes()` and stop treating it as an upper bound | [§2.1](docs/api-changes.md#21-keyedmergeestimatepeak_resident_bytes) |
-| `VarveWriter::reserve_keyed_tail_slot` and `DiskIndexError::BatchPoisoned` removed | [§2.2](docs/api-changes.md#22-varvewriterreserve_keyed_tail_slot), [§2.3](docs/api-changes.md#23-diskindexerrorbatchpoisoned) |
+| `KeyedMergeEstimate::peak_resident_structural_bytes()` — added and renamed inside this cycle (no released version exposed `peak_resident_bytes()`); it is a structural estimate, not an upper bound | [§2.1](docs/api-changes.md#21-keyedmergeestimatepeak_resident_bytes--peak_resident_structural_bytes) |
+| `VarveWriter::reserve_keyed_tail_slot` and `DiskIndexError::BatchPoisoned` removed — **neither ever shipped**; both were added and removed inside this cycle, so neither is a migration step | [§2.2](docs/api-changes.md#22-varvewriterreserve_keyed_tail_slot--never-shipped), [§2.3](docs/api-changes.md#23-diskindexerrorbatchpoisoned--never-shipped-and-never-reachable) |
 | Generic `push` now refuses keyed blocks on `keyed_offset_chain` formats with `KeyedChainRequiresKeyedApi` | [§5.2](docs/api-changes.md#52-generic-push-refuses-keyed-blocks-on-keyed_offset_chain-formats) |
 | Replacement refuses a cross-version target with `BlockVersionMismatch` | [§5.1](docs/api-changes.md#51-replacement-refuses-a-cross-version-target) |
 | Five new post-publication durability outcomes replace a bare `Err`; the work is already in the file, so do not retry the transaction | [§5.3](docs/api-changes.md#53-new-durability-outcomes-where-a-bare-err-used-to-be-returned) |
@@ -42,6 +42,8 @@ Each links to the section of the migration document that tells you what to edit.
 | Tighter limit charges (`HashMap` materialization, keyed-tail build peak) can refuse work that previously succeeded | [§5.6](docs/api-changes.md#56-tighter-and-more-accurate-limit-charges) |
 | `FormatSelfTest::run` is non-destructive; `cleanup(true)` can report a failed step where it reported a clean pass | [§5.8](docs/api-changes.md#58-formatselftestrun-is-non-destructive) |
 | `scripts/run-security-fuzz.ps1` can exit 2 or 3 where it exited 0 | [§5.10](docs/api-changes.md#510-scriptsrun-security-fuzzps1-exit-codes) |
+| `delete` now maintains the keyed offset chain where it previously truncated it — same signature, different on-disk chain shape | [§5.11](docs/api-changes.md#511-delete-now-maintains-the-keyed-offset-chain-instead-of-truncating-it) |
+| `*_with_resource_limits` **replaces** a spec-declared `matrix_metadata_residency` rather than composing it, silently | [§5.12](docs/api-changes.md#512-_with_resource_limits-replaces-a-spec-declared-matrix-residency-policy) |
 
 ### Added (rounds 15-16)
 
@@ -52,12 +54,14 @@ Each links to the section of the migration document that tells you what to edit.
   therefore when that metadata's integrity is checked.
 
   `EagerVerified` is the default and is **inert** — byte-for-byte the behaviour
-  varve had before the option existed. Open reads, authenticates and materialises
-  every commit-map page the matrix has published plus every page the platform's
-  allocation map reports as written; corruption anywhere in that set is reported
-  by `open`. Under this policy `max_matrix_bitmap_bytes` is an **admission**
-  limit, not a cache bound: a matrix whose live page set exceeds it cannot be
-  opened at all, and there is no eviction path.
+  varve had before the option existed. Open **reads and authenticates** every
+  commit-map page the matrix has published plus every page the platform's
+  allocation map reports as written, and makes resident only those holding a set
+  bit; corruption anywhere in the read set is reported by `open`. Under this policy
+  `max_matrix_bitmap_bytes` is an **admission** limit, not a cache bound: a matrix
+  whose live page set exceeds it cannot be opened at all, and there is **no
+  read-driven eviction** — residency falls only when a mutation clears a page's
+  last set bit (PERF-02).
 
   `Lazy { cache_bytes }` reads the persisted page index at open and nothing else —
   no page payload, no page digest, no allocation-map query. A page is read,
@@ -98,11 +102,16 @@ Each links to the section of the migration document that tells you what to edit.
 
 ### Changed (rounds 15-16)
 
-- **Matrix reads take `&self` instead of `&mut self`.** `read_matrix_cell::<T>`
-  and `matrix_cell_status::<T>` on `VarveReader`, `VarveWriter` and `VarveFile`
-  all relax their receiver; `matrix_resume_signal` was already `&self`. This is
-  source-compatible — an existing call through a `&mut` binding still compiles —
-  and what it enables is one handle serving concurrent readers.
+- **Matrix reads take `&self` instead of `&mut self`.** `read_matrix_cell::<T>`,
+  `matrix_cell_payload::<T>` and `read_matrix_aux` relax their receiver on
+  `VarveReader`, `VarveWriter` and `VarveFile`. The other three read entry points
+  — `matrix_cell_status::<T>`, `matrix_aux_len` and `matrix_resume_signal` — were
+  already `&self` in 0.3.0 and are unchanged. So three methods changed, and the
+  result is that the complete six-entry-point matrix read surface takes a shared
+  borrow on all three handle types (18 signatures). This is source-compatible —
+  an existing call through a `&mut` binding still compiles — and what it enables
+  is one handle serving concurrent readers. Full table in
+  [docs/api-changes.md §3.4](docs/api-changes.md#34-matrix-reads-relax-from-mut-self-to-self--source-compatible).
 
   Reads go through positional I/O (`pread` on Unix, `seek_read` on Windows). On
   **Windows** each reading thread additionally gets a private file object derived
@@ -139,10 +148,12 @@ Each links to the section of the migration document that tells you what to edit.
 Stated here rather than left to be discovered:
 
 - **CI has never run on this code**, on either operating system. The Unix
-  `openat`/`unlinkat` and `O_NOFOLLOW` paths are compile-verified only, and
-  `cargo clippy --target x86_64-unknown-linux-gnu --no-default-features` currently
-  fails with a `dead_code` lint on the Windows-only `MatrixReadPool::handles`
-  field.
+  `openat`/`unlinkat` and `O_NOFOLLOW` paths are compile-verified only. The two
+  gates that were red when this release was assembled — the Linux `dead_code`
+  lint on the Windows-only `MatrixReadPool::handles` field, and the
+  default-feature failure in `matrix_concurrent_reads` — are fixed and were
+  re-measured individually on Windows; the Linux one is a cross-compiled lint
+  pass, not an executed Linux test.
 - **No fuzz campaign, Miri run or ASan run has been performed against this
   release's code.** The recorded fuzz evidence predates rounds 12-16, and an
   unpromoted libFuzzer OOM reproducer for `codec_arbitrary` exists in the working
