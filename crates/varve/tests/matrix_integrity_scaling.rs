@@ -2013,15 +2013,36 @@ fn measured_open_cost_is_scale_free_and_its_size_is_verification() -> varve::Res
          vs {large_pages}p/{large_bytes}B"
     );
 
-    // What the default's remaining cost is: the live state is one page and the
-    // verification pass visits tens of pages. Both bounds are deliberately
-    // generous; the point is that the gap is two orders of magnitude.
-    let live_pages = 1u64;
+    // What the default's remaining cost is: verification. Asserted by comparing
+    // the two policies on the same fixture rather than against an absolute page
+    // count, because the candidate set is the persisted index unioned with the
+    // platform's allocation map and that second term is filesystem-defined. On
+    // NTFS the ~128 KiB run granularity makes it tens of pages; a filesystem
+    // that reports extents precisely makes it barely more than the live set, and
+    // that is *better* coverage, not a stopped scan — a stray byte written into
+    // a hole allocates its page, so a precise map reports it. Hard-coding NTFS's
+    // constant here failed on Linux at 2 pages / 8,240 bytes while
+    // `stray_bytes_in_a_skipped_region_are_still_detected` passed on the same
+    // run, which is the direct evidence that the coverage held.
+    let path = dir.path().join("verification-off.varve");
+    fill(&path, LARGE_WIDE_SCANS, CELLS)?;
+    MatrixRecoveryReport::reset_matrix_integrity_counters();
+    drop(
+        spec()
+            .with_read_limits(
+                ReadLimits::STANDARD
+                    .with_matrix_metadata_verification(MatrixMetadataVerification::OnDemand),
+            )
+            .open_readonly(&path)?,
+    );
+    let quiet_bytes = MatrixRecoveryReport::matrix_open_bitmap_bytes_read();
+    let quiet_pages = MatrixRecoveryReport::matrix_open_bitmap_pages_visited();
+    println!("(A) verification off: open_bytes_read={quiet_bytes} pages_visited={quiet_pages}");
     assert!(
-        large_pages >= 4 * live_pages && large_bytes >= 16 * PAGE_BYTES,
-        "(A) the default open stopped scanning ({large_pages} pages / {large_bytes} bytes \
-         for {live_pages} live page); stray bytes in a page nothing published would then \
-         never be examined - see `stray_bytes_in_a_skipped_region_are_still_detected`."
+        quiet_pages == 0 && large_pages > quiet_pages && large_bytes > quiet_bytes,
+        "(A) the default open is supposed to cost more than one with verification \
+         declared off, because the difference *is* the verification pass: \
+         default {large_pages}p/{large_bytes}B vs off {quiet_pages}p/{quiet_bytes}B"
     );
 
     // And where that cost lives. Same fixture, same residency, verification moved
