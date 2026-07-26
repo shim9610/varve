@@ -1,5 +1,45 @@
+/// Whether the caller has asked for the `.stderr`-comparing cases to be skipped.
+///
+/// A `compile_fail` case compares rustc's *diagnostic prose* against a checked-in
+/// snapshot, so a snapshot can only ever match one compiler. rustc renamed one
+/// `E0599` phrase — "no function or associated item named" became "no associated
+/// function or constant named" — and that alone turned two enforcement fixtures
+/// red on CI's moving `stable` while they passed on the pinned MSRV that the
+/// snapshots were taken against and that the local gate uses. Blessing the newer
+/// wording would simply move the failure onto every developer machine.
+///
+/// So the snapshots are owned by ONE toolchain: the declared MSRV. The pinned
+/// `msrv` CI job runs the whole suite and is where these cases are gated; the
+/// moving-`stable` job sets `VARVE_SKIP_UI_SNAPSHOTS=1` and skips them, because
+/// what it exists to catch is a break on a newer compiler, not a reworded
+/// diagnostic. Unset by default, so a plain `cargo test` still runs them.
+///
+/// `pass` cases are unaffected — they assert compilation succeeds and compare no
+/// text — but they live in the same `TestCases` batch as the `compile_fail` ones,
+/// so a skipped test function skips both. The `msrv` job covers them.
+fn ui_snapshots_skipped() -> bool {
+    match std::env::var("VARVE_SKIP_UI_SNAPSHOTS") {
+        Ok(value) => !value.is_empty() && value != "0",
+        Err(_) => false,
+    }
+}
+
+/// Prints why a UI test function returned without asserting anything, so a green
+/// run that skipped them cannot be mistaken for a green run that checked them.
+fn note_ui_snapshots_skipped(which: &str) {
+    println!(
+        "{which}: skipped because VARVE_SKIP_UI_SNAPSHOTS is set. These cases \
+         compare rustc diagnostic text against snapshots taken on the declared \
+         MSRV; the pinned `msrv` CI job is where they are gated."
+    );
+}
+
 #[test]
 fn macro_compile_contracts() {
+    if ui_snapshots_skipped() {
+        note_ui_snapshots_skipped("macro_compile_contracts");
+        return;
+    }
     let tests = trybuild::TestCases::new();
     tests.pass("tests/ui/pass_basic.rs");
     tests.pass("tests/ui/pass_policies.rs");
@@ -57,6 +97,10 @@ fn macro_compile_contracts() {
 #[cfg(feature = "high-cardinality-dev")]
 #[test]
 fn high_cardinality_compile_contracts() {
+    if ui_snapshots_skipped() {
+        note_ui_snapshots_skipped("high_cardinality_compile_contracts");
+        return;
+    }
     let tests = trybuild::TestCases::new();
     tests.pass("tests/ui/pass_high_cardinality_macro.rs");
     tests.pass("tests/ui/pass_petabyte_plan_batch.rs");
@@ -88,6 +132,10 @@ fn high_cardinality_compile_contracts() {
 #[cfg(feature = "scalable-fault-injection")]
 #[test]
 fn mechanical_enforcement_contracts() {
+    if ui_snapshots_skipped() {
+        note_ui_snapshots_skipped("mechanical_enforcement_contracts");
+        return;
+    }
     let tests = trybuild::TestCases::new();
     // SHAPE B: the poison-check witness cannot be forged.
     tests.compile_fail("tests/ui/fail_fabricated_mutation_permit.rs");
@@ -129,6 +177,10 @@ fn mechanical_enforcement_contracts() {
 #[cfg(feature = "mmap")]
 #[test]
 fn mmap_safety_contracts() {
+    if ui_snapshots_skipped() {
+        note_ui_snapshots_skipped("mmap_safety_contracts");
+        return;
+    }
     let tests = trybuild::TestCases::new();
     tests.pass("tests/ui/pass_mmap_unsafe.rs");
     tests.compile_fail("tests/ui/fail_mmap_requires_unsafe.rs");

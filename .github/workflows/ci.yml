@@ -159,6 +159,14 @@ jobs:
         with:
           key: test-${{ matrix.features.name }}
       - name: Test
+        env:
+          # The trybuild UI cases compare rustc diagnostic prose against snapshots
+          # taken on the declared MSRV, so they can only match one compiler. rustc
+          # reworded one E0599 phrase and turned two enforcement fixtures red here
+          # while they passed on the pinned floor. This job exists to catch a break
+          # on a newer compiler, not a reworded diagnostic, so it skips them; the
+          # pinned `msrv` job below runs the same suite with them enabled.
+          VARVE_SKIP_UI_SNAPSHOTS: 1
         run: cargo run --locked -p varve-test-runner -- test --locked ${{ matrix.features.flags }}
 
   # CI-01: the two configurations below own tests that run in NO other job.
@@ -202,6 +210,14 @@ jobs:
         with:
           key: test-${{ matrix.features.name }}
       - name: Test
+        env:
+          # The trybuild UI cases compare rustc diagnostic prose against snapshots
+          # taken on the declared MSRV, so they can only match one compiler. rustc
+          # reworded one E0599 phrase and turned two enforcement fixtures red here
+          # while they passed on the pinned floor. This job exists to catch a break
+          # on a newer compiler, not a reworded diagnostic, so it skips them; the
+          # pinned `msrv` job below runs the same suite with them enabled.
+          VARVE_SKIP_UI_SNAPSHOTS: 1
         run: cargo run --locked -p varve-test-runner -- test --locked ${{ matrix.features.flags }}
 
   # CI-02: the packages declare `rust-version = 1.95`. Every other job installs
