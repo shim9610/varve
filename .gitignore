@@ -15,3 +15,12 @@ __pycache__/
 # name weaknesses in current code. They live here so they stay out of every
 # remote; see docs/ for the published set.
 /.internal-docs/
+
+# The working instructions are process material by the same rule: the push
+# manual, the local gate, the standing design policies, and notes about this
+# machine. They are not explanation or usage, so they do not belong in the
+# published tree. The file stays in the working tree -- it has to, that is how
+# it is read -- and is tracked on the internal-docs branch only, the same way
+# /.internal-docs/ is. Untracked here with `git rm --cached`, because adding a
+# line to this file does not untrack something git already tracks.
+/CLAUDE.md
