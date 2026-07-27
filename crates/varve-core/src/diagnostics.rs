@@ -447,7 +447,24 @@ impl FormatSelfTest {
         // refuse to delete a file another process has since swapped in at the
         // same pathname. If the identity cannot be captured, cleanup skips
         // the native file rather than guessing.
-        let created_identity = writer.native_object_identity().ok();
+        //
+        // Remembering the identity *bytes* is not enough: they are an inode
+        // number on Unix, and an inode number freed by an interposing unlink is
+        // handed straight back to the impostor's create, so cleanup's check
+        // would compare equal against a file this run never made. The run
+        // therefore holds a read-only handle on the created object from here
+        // until cleanup, which pins the identity to it. Opening that handle
+        // here is race-free because `writer` still holds the object open, so
+        // the identity it reports cannot yet have been recycled: if the
+        // pathname already names something else, `open_verified` refuses and
+        // cleanup skips the native file exactly as an uncapturable identity
+        // makes it skip.
+        let created = writer
+            .native_object_identity()
+            .ok()
+            .and_then(|identity| {
+                crate::file::PinnedObject::open_verified(&self.path, &identity).ok()
+            });
 
         let mut write_failed = false;
         for case in &self.cases {
@@ -466,7 +483,7 @@ impl FormatSelfTest {
 
         if write_failed {
             if self.cleanup {
-                cleanup_run_artifacts(&mut report, &self.path, created_identity.as_deref());
+                cleanup_run_artifacts(&mut report, &self.path, created);
             }
             return report;
         }
@@ -478,7 +495,7 @@ impl FormatSelfTest {
         );
         let Some(mut reader) = reader.take() else {
             if self.cleanup {
-                cleanup_run_artifacts(&mut report, &self.path, created_identity.as_deref());
+                cleanup_run_artifacts(&mut report, &self.path, created);
             }
             return report;
         };
@@ -492,7 +509,7 @@ impl FormatSelfTest {
 
         if self.cleanup {
             drop(reader);
-            cleanup_run_artifacts(&mut report, &self.path, created_identity.as_deref());
+            cleanup_run_artifacts(&mut report, &self.path, created);
         }
         report
     }
@@ -1059,13 +1076,18 @@ pub(crate) enum ObjectRemoval {
 /// unverifiable pathname. The writer-lock marker is only removed after
 /// re-acquiring it through the standard writer-lock protocol, so a marker
 /// locked or populated by a foreign writer survives.
+///
+/// `created` is taken **by value** so the pin is released here rather than at
+/// the end of the run: on Windows a delete disposition set while another handle
+/// is open leaves the object delete-pending, and the marker cleanup below opens
+/// paths beside it.
 fn cleanup_run_artifacts(
     report: &mut FormatSelfTestReport,
     path: &Path,
-    created_identity: Option<&[u8]>,
+    created: Option<crate::file::PinnedObject>,
 ) {
-    if let Some(identity) = created_identity {
-        match remove_path_if_same_object(path, identity) {
+    if let Some(pinned) = created {
+        match remove_path_if_same_object(path, &pinned) {
             ObjectRemoval::Removed | ObjectRemoval::NotOwned => {}
             ObjectRemoval::Refused(reason) => {
                 report.steps.push(SelfTestStepReport::failed(
@@ -1088,20 +1110,31 @@ fn cleanup_run_artifacts(
                 ));
             }
         }
+        // Release the pin before the marker cleanup: on Windows the object is
+        // only unlinked once every handle on it closes.
+        drop(pinned);
     }
     remove_unowned_lock_marker(report, path);
 }
 
 /// Deletes `path` only while the file object bound to the pathname is still
-/// `expected_identity`.
+/// the one `pinned` holds open.
 ///
 /// The handle is opened without delete or write sharing, which pins the
 /// pathname for the whole check-and-delete: no other process can delete or
 /// rename over the name while the handle is open, and the deletion itself is
 /// issued on that same verified handle, so the identity check cannot be
 /// invalidated by a concurrent pathname swap.
+///
+/// `pinned` is what makes the identity *bytes* meaningful rather than merely
+/// making the deletion handle-scoped: see [`crate::file::PinnedObject`]. Its
+/// handle is read-only and shares deletion, so it neither blocks the `DELETE`
+/// open below nor blocks the disposition that follows.
 #[cfg(windows)]
-pub(crate) fn remove_path_if_same_object(path: &Path, expected_identity: &[u8]) -> ObjectRemoval {
+pub(crate) fn remove_path_if_same_object(
+    path: &Path,
+    pinned: &crate::file::PinnedObject,
+) -> ObjectRemoval {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::HANDLE;
@@ -1118,7 +1151,7 @@ pub(crate) fn remove_path_if_same_object(path: &Path, expected_identity: &[u8]) 
         return ObjectRemoval::NotOwned;
     };
     match crate::file::opened_file_identity(&file) {
-        Ok(identity) if identity == expected_identity => {}
+        Ok(identity) if identity == pinned.identity() => {}
         _ => return ObjectRemoval::NotOwned,
     }
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
@@ -1140,15 +1173,15 @@ pub(crate) fn remove_path_if_same_object(path: &Path, expected_identity: &[u8]) 
     }
 }
 
-/// Deletes `path` only while the file object bound to the pathname is still
-/// `expected_identity` (F-05).
+/// Deletes `path` only while the file object bound to the pathname is still the
+/// one `pinned` holds open (F-05).
 ///
 /// POSIX has no unlink-by-handle: `unlink` names a *pathname*, so an identity
 /// check on an open handle followed by an unlink of the same name is two
 /// resolutions of a name another principal may rebind in between. Varve's Unix
 /// writer locks are advisory and do not stop a non-cooperating pathname
 /// mutator, so the previous code's acknowledgement of that interval was not a
-/// defence. This version closes it with two independent measures:
+/// defence. This version closes it with three independent measures:
 ///
 /// 1. **Exclusive directory.** The parent directory is opened once, and every
 ///    later operation is issued *relative to that directory handle* rather than
@@ -1163,15 +1196,33 @@ pub(crate) fn remove_path_if_same_object(path: &Path, expected_identity: &[u8]) 
 ///    (without following a final symlink), its identity checked, then opened
 ///    and checked once more immediately before `unlinkat`, so an interposition
 ///    that beats the first check still has to beat the second.
+/// 3. **A pinned reference object.** The identity compared against is read from
+///    a handle the caller *still holds*. Measures 1 and 2 were written on the
+///    premise that `(st_dev, st_ino)` names a file object; it does not. An
+///    inode number is an allocator slot, and a filesystem hands a just-freed
+///    slot to the next create — measured on Linux/overlayfs, where unlinking
+///    the artifact and creating an impostor at the same name reproduced the
+///    same `(dev, ino)`, so both identity checks above passed and the impostor
+///    was deleted. An open descriptor pins its inode, so while
+///    [`crate::file::PinnedObject`] lives no other object can bear its
+///    identity, and an interposed file is forced onto a different one.
 ///
 /// The residual boundary is a principal that can already write the exclusively
 /// owned directory — the same user, or root — which is outside Varve's threat
-/// model because it can rewrite the artifact's contents anyway.
+/// model because it can rewrite the artifact's contents anyway. Within that
+/// boundary one interval stays open and cannot be closed portably: Linux has no
+/// `funlinkat`, so between the final check and `unlinkat` the name is resolved
+/// once more. Measure 1 is what bounds who can be in it.
 #[cfg(not(windows))]
-pub(crate) fn remove_path_if_same_object(path: &Path, expected_identity: &[u8]) -> ObjectRemoval {
+pub(crate) fn remove_path_if_same_object(
+    path: &Path,
+    pinned: &crate::file::PinnedObject,
+) -> ObjectRemoval {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::AsRawFd;
+
+    let expected_identity = pinned.identity();
 
     let Some(name) = path.file_name() else {
         return ObjectRemoval::Refused("the self-test pathname has no final component");
@@ -1365,19 +1416,26 @@ fn remove_unowned_lock_marker(report: &mut FormatSelfTestReport, path: &Path) {
             return;
         }
     };
-    // The identity is captured while the writer lock is held, so it names the
-    // marker object of *this* claim. The lock is then released before the
+    // The marker is pinned while the writer lock is held, so the handle names
+    // the marker object of *this* claim. The lock is then released before the
     // removal, because the lock itself holds the marker open and the hardened
     // removal deliberately opens without delete sharing. Releasing first is
     // safe for the property that matters: the removal re-verifies the
     // identity, so the worst case is that a marker object which is still the
     // same object is unlinked - a marker any writer recreates on demand -
     // never the deletion of a different object bound at the same name.
-    let identity = std::fs::File::open(&marker)
-        .ok()
-        .and_then(|handle| crate::file::opened_file_identity(&handle).ok());
+    //
+    // A *pin* rather than bare identity bytes, for the same reason the artifact
+    // uses one: the bytes are an inode number, and an inode number outlives
+    // nothing. Holding the handle across the removal is what makes "still the
+    // same object" a fact instead of a coincidence of allocator reuse.
+    let pinned = crate::file::PinnedObject::open(&marker).ok();
     drop(guard);
-    let outcome = identity.map(|identity| remove_path_if_same_object(&marker, &identity));
+    let outcome = pinned
+        .as_ref()
+        .map(|pinned| remove_path_if_same_object(&marker, pinned));
+    // Same Windows reason as the artifact: the unlink completes on last close.
+    drop(pinned);
     match outcome {
         Some(ObjectRemoval::Removed) | Some(ObjectRemoval::NotOwned) => {}
         // F-08: the identity could not be captured, so the marker was left
@@ -1434,6 +1492,14 @@ mod tests {
     /// The probe runs inside a private temporary directory, i.e. a directory
     /// the removal path accepts as exclusively owned, so what is under test is
     /// the re-verified identity rather than the directory refusal.
+    ///
+    /// The artifact is held open for the whole call, exactly as the self-test
+    /// now holds it from creation to cleanup. That is not test scaffolding: it
+    /// is the property under test. Both re-verifications compare inode numbers,
+    /// and a filesystem hands the inode freed by the interposing `remove_file`
+    /// straight to the impostor's `write` — measured on Linux/overlayfs, where
+    /// this test deleted the impostor because both checks compared equal. The
+    /// pin is what forces the impostor onto a different inode.
     #[test]
     #[cfg(not(windows))]
     fn cleanup_does_not_delete_a_file_interposed_before_the_unlink() {
@@ -1442,10 +1508,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("private temp directory");
         let path = directory.path().join("interposed.vrv");
         std::fs::write(&path, b"created by this run").expect("create the artifact");
-        let identity = crate::file::opened_file_identity(
-            &std::fs::File::open(&path).expect("open the created artifact"),
-        )
-        .expect("identity of the created artifact");
+        let pinned =
+            crate::file::PinnedObject::open(&path).expect("pin the created artifact");
 
         let target = path.clone();
         set_interposition(Box::new(move || {
@@ -1456,7 +1520,7 @@ mod tests {
         }));
 
         assert_eq!(
-            remove_path_if_same_object(&path, &identity),
+            remove_path_if_same_object(&path, &pinned),
             ObjectRemoval::NotOwned,
         );
         assert_eq!(
@@ -1472,15 +1536,14 @@ mod tests {
         let directory = tempfile::tempdir().expect("private temp directory");
         let path = directory.path().join("owned.vrv");
         std::fs::write(&path, b"created by this run").expect("create the artifact");
-        let identity = crate::file::opened_file_identity(
-            &std::fs::File::open(&path).expect("open the created artifact"),
-        )
-        .expect("identity of the created artifact");
+        let pinned =
+            crate::file::PinnedObject::open(&path).expect("pin the created artifact");
 
         assert_eq!(
-            remove_path_if_same_object(&path, &identity),
+            remove_path_if_same_object(&path, &pinned),
             ObjectRemoval::Removed,
         );
+        drop(pinned);
         assert!(!path.exists());
     }
 
@@ -1491,18 +1554,45 @@ mod tests {
         let directory = tempfile::tempdir().expect("private temp directory");
         let path = directory.path().join("swapped.vrv");
         std::fs::write(&path, b"created by this run").expect("create the artifact");
-        let identity = crate::file::opened_file_identity(
-            &std::fs::File::open(&path).expect("open the created artifact"),
-        )
-        .expect("identity of the created artifact");
+        let pinned =
+            crate::file::PinnedObject::open(&path).expect("pin the created artifact");
         std::fs::remove_file(&path).expect("unlink the created object");
         std::fs::write(&path, b"someone else's file").expect("bind another object");
 
         assert_eq!(
-            remove_path_if_same_object(&path, &identity),
+            remove_path_if_same_object(&path, &pinned),
             ObjectRemoval::NotOwned,
         );
         assert!(path.exists());
+    }
+
+    /// The mechanism the two tests above rest on, asserted on its own so a
+    /// platform that ever broke it would say so directly instead of showing up
+    /// as a mysteriously deleted impostor.
+    ///
+    /// A held descriptor pins its inode, so the object created after the
+    /// unlink cannot bear the pinned identity. Without the pin this is false on
+    /// ordinary Linux filesystems: the same `(dev, ino)` came back for both.
+    #[test]
+    fn a_pin_keeps_a_recreated_file_off_the_pinned_identity() {
+        let directory = tempfile::tempdir().expect("private temp directory");
+        let path = directory.path().join("recycled.vrv");
+        std::fs::write(&path, b"created by this run").expect("create the artifact");
+        let pinned =
+            crate::file::PinnedObject::open(&path).expect("pin the created artifact");
+
+        std::fs::remove_file(&path).expect("unlink the pinned object");
+        std::fs::write(&path, b"someone else's file").expect("bind another object");
+        let replacement = crate::file::opened_file_identity(
+            &std::fs::File::open(&path).expect("open the replacement"),
+        )
+        .expect("identity of the replacement");
+
+        assert_ne!(
+            pinned.identity(),
+            replacement.as_slice(),
+            "a pinned object's identity must not be reissued to a file created after it",
+        );
     }
 
     /// API3-03. The writer-lock marker is the one destructive path in this
@@ -1525,17 +1615,15 @@ mod tests {
         std::fs::write(&path, b"artifact").expect("create the artifact");
         std::fs::write(&marker, b"someone else's file").expect("bind a foreign object");
 
-        // The removal runs through the real call site, which captures the
-        // marker's identity from its own open handle and then removes only
-        // that object. Interposition is simulated by handing the identity of a
-        // *different* object to the hardened primitive the call site uses -
-        // the state a pathname rebind between capture and unlink produces.
+        // The removal runs through the real call site, which pins the marker
+        // from its own open handle and then removes only that object.
+        // Interposition is simulated by handing a pin on a *different* object
+        // to the hardened primitive the call site uses - the state a pathname
+        // rebind between the pin and the unlink produces.
         let elsewhere = directory.path().join("elsewhere");
         std::fs::write(&elsewhere, b"a different object").expect("create another object");
-        let foreign = crate::file::opened_file_identity(
-            &std::fs::File::open(&elsewhere).expect("open the other object"),
-        )
-        .expect("identity of the other object");
+        let foreign =
+            crate::file::PinnedObject::open(&elsewhere).expect("pin the other object");
 
         assert_eq!(
             remove_path_if_same_object(&marker, &foreign),
@@ -1565,13 +1653,11 @@ mod tests {
             .expect("relax the directory permissions");
         let path = shared.join("artifact.vrv");
         std::fs::write(&path, b"created by this run").expect("create the artifact");
-        let identity = crate::file::opened_file_identity(
-            &std::fs::File::open(&path).expect("open the created artifact"),
-        )
-        .expect("identity of the created artifact");
+        let pinned =
+            crate::file::PinnedObject::open(&path).expect("pin the created artifact");
 
         assert!(matches!(
-            remove_path_if_same_object(&path, &identity),
+            remove_path_if_same_object(&path, &pinned),
             ObjectRemoval::Refused(_),
         ));
         assert!(path.exists(), "a refused cleanup must delete nothing");

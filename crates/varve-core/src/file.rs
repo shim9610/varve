@@ -2714,7 +2714,19 @@ impl VarveFile {
             return Err(Error::MatrixDimensionsRequired);
         }
         let path = path.to_path_buf();
-        let mut lock = WriterLock::acquire(&path)?;
+        let lock = WriterLock::acquire(&path)?;
+        // Everything past the acquisition runs inside `with_writer_lock`, so a
+        // failure gives the claim back before the error propagates instead of at
+        // scope exit; see `release_writer_lock_after_failure`.
+        with_writer_lock(lock, |lock| Self::create_locked(spec, path, exclusive, lock))
+    }
+
+    fn create_locked(
+        spec: FormatSpec,
+        path: PathBuf,
+        exclusive: bool,
+        lock: &mut WriterLock,
+    ) -> Result<Self> {
         let mut options = OpenOptions::new();
         options.read(true).write(true);
         if exclusive {
@@ -2750,7 +2762,7 @@ impl VarveFile {
             // request syncs the parent directory.
             pending_pathname_parent_sync: true,
             poison: PoisonFlag::healthy(),
-            _lock: Some(lock),
+            _lock: None,
         };
         file.write_embedded_manifest_if_needed()?;
         Ok(file)
@@ -2794,7 +2806,21 @@ impl VarveFile {
             return Self::create_impl(spec, path, exclusive);
         }
         let path = path.to_path_buf();
-        let mut lock = WriterLock::acquire(&path)?;
+        let lock = WriterLock::acquire(&path)?;
+        // As in `create_impl`: a failure past the acquisition gives the claim
+        // back before the error propagates.
+        with_writer_lock(lock, |lock| {
+            Self::create_with_dims_locked(spec, path, dims, exclusive, lock)
+        })
+    }
+
+    fn create_with_dims_locked(
+        spec: FormatSpec,
+        path: PathBuf,
+        dims: MatrixDimensions,
+        exclusive: bool,
+        lock: &mut WriterLock,
+    ) -> Result<Self> {
         let mut options = OpenOptions::new();
         options.read(true).write(true);
         if exclusive {
@@ -2835,7 +2861,7 @@ impl VarveFile {
             // request syncs the parent directory.
             pending_pathname_parent_sync: true,
             poison: PoisonFlag::healthy(),
-            _lock: Some(lock),
+            _lock: None,
         };
         file.write_embedded_manifest_if_needed()?;
         Ok(file)
@@ -2846,7 +2872,15 @@ impl VarveFile {
         spec.validate()?;
         ensure_native_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
-        let mut lock = WriterLock::acquire(&path)?;
+        let lock = WriterLock::acquire(&path)?;
+        // Every way this open can fail - a rejected header, a version or schema
+        // mismatch, a read-limit refusal, a corrupt tail - happens after the
+        // claim was taken, so all of them release it here. See
+        // `with_writer_lock`.
+        with_writer_lock(lock, |lock| Self::open_locked(spec, path, lock))
+    }
+
+    fn open_locked(spec: FormatSpec, path: PathBuf, lock: &mut WriterLock) -> Result<Self> {
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
         lock.bind_native(&file, &path)?;
         let captured_len = check_open_file_len(spec, &file)?;
@@ -2879,7 +2913,7 @@ impl VarveFile {
             keyed_tails: KeyedTails::new_empty(),
             pending_pathname_parent_sync: false,
             poison: PoisonFlag::healthy(),
-            _lock: Some(lock),
+            _lock: None,
         })
     }
 
@@ -2892,41 +2926,10 @@ impl VarveFile {
         spec.validate()?;
         ensure_native_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
-        let mut lock = WriterLock::acquire_with_policy(&path, policy)?;
-        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-        lock.bind_native(&file, &path)?;
-        let captured_len = check_open_file_len(spec, &file)?;
-        let header_len = read_file_header(spec, &mut file)?;
-        let (matrix, matrix_creation_nonce) = split_matrix_state(read_matrix_layout_if_needed(
-            spec,
-            &mut file,
-            header_len,
-            captured_len,
-        )?);
-        let append_start = append_log_start(header_len, matrix.as_ref());
-        let index = load_index(spec, &mut file, append_start, ScanIntent::Writer)?;
-        truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
-        let sequence_state = SequenceState::from_index(&index);
-        let checkpoint_cadence = CheckpointCadence::from_index(&index);
-        let block_tails = BlockTails::from_index(&index);
-        let snapshot = SnapshotFile::new(file.try_clone()?)?;
-        Ok(Self {
-            spec,
-            path,
-            file: RecordFile::new(file),
-            snapshot,
-            mode: OpenMode::ReadWrite,
-            index: ResidentIndex::adopt_generation(index),
-            matrix,
-            matrix_creation_nonce,
-            sequence_state,
-            checkpoint_cadence,
-            block_tails,
-            keyed_tails: KeyedTails::new_empty(),
-            pending_pathname_parent_sync: false,
-            poison: PoisonFlag::healthy(),
-            _lock: Some(lock),
-        })
+        let lock = WriterLock::acquire_with_policy(&path, policy)?;
+        // A broken stale claim that then fails to open must not become a new
+        // stale claim of this process's own making.
+        with_writer_lock(lock, |lock| Self::open_locked(spec, path, lock))
     }
 
     pub fn open_readonly<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
@@ -2981,7 +2984,20 @@ impl VarveFile {
         spec.validate()?;
         ensure_native_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
-        let mut lock = WriterLock::acquire(&path)?;
+        let lock = WriterLock::acquire(&path)?;
+        // This shape is a pair, not a bare `VarveFile`, so it uses
+        // `with_writer_lock_value` and installs the claim itself.
+        let ((mut file, report), lock) =
+            with_writer_lock_value(lock, |lock| Self::open_recover_locked(spec, path, lock))?;
+        file._lock = Some(lock);
+        Ok((file, report))
+    }
+
+    fn open_recover_locked(
+        spec: FormatSpec,
+        path: PathBuf,
+        lock: &mut WriterLock,
+    ) -> Result<(Self, RecoveryReport)> {
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
         lock.bind_native(&file, &path)?;
         let original_len = file.metadata()?.len();
@@ -3019,7 +3035,7 @@ impl VarveFile {
                 keyed_tails: KeyedTails::new_empty(),
                 pending_pathname_parent_sync: false,
                 poison: PoisonFlag::healthy(),
-                _lock: Some(lock),
+                _lock: None,
             },
             RecoveryReport {
                 original_len,
@@ -10070,6 +10086,110 @@ pub(crate) fn opened_file_identity(file: &File) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// A file object held open, together with the OS identity read from that open
+/// handle (F-05 follow-up).
+///
+/// [`opened_file_identity`] is `(st_dev, st_ino)` on Unix and
+/// `(volume serial, file index)` on Windows. Neither is a durable name for a
+/// file *object*: an inode number is a slot in an allocator, and a filesystem
+/// hands a just-freed slot straight back to the next create. Identity bytes
+/// copied out of a handle that is then closed therefore say nothing about a
+/// later object bearing the same bytes — which is exactly the comparison every
+/// identity-checked deletion in this crate was making. Measured on Linux
+/// (overlayfs over ext4): unlinking a file and immediately creating another at
+/// the same name reproduces the *same* `(dev, ino)`, so the check said "same
+/// object" about a file it had never seen.
+///
+/// An open descriptor pins its inode: the number cannot be handed to another
+/// object while any handle on it lives. Holding the handle for as long as the
+/// identity is used therefore restores the property the comparison assumes.
+/// The invariant this type exists to make structural is:
+///
+/// > identity bytes are only ever compared while a handle on the object they
+/// > were read from is still open.
+///
+/// The handle is opened read-only and never lent out, so a pin can neither
+/// write the object it holds nor be turned into something that can.
+#[derive(Debug)]
+pub(crate) struct PinnedObject {
+    /// Never read through; held open purely so the identity below stays a name
+    /// for this object. `_` because that is the whole contract.
+    _handle: File,
+    identity: Vec<u8>,
+}
+
+impl PinnedObject {
+    /// Opens `path` read-only and keeps the handle, so the identity read from
+    /// it names that object for as long as the returned value lives.
+    ///
+    /// This is the constructor for callers whose claim is "the object I am
+    /// about to delete is the one I just opened at this name" — the lock
+    /// marker and the stale sidecar. It cannot prove that the object at the
+    /// name is the one the caller created earlier; use [`Self::open_verified`]
+    /// when there is an earlier handle to check against.
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        let handle = open_pin_handle(path)?;
+        let identity = opened_file_identity(&handle)?;
+        Ok(Self {
+            _handle: handle,
+            identity,
+        })
+    }
+
+    /// As [`Self::open`], but refuses unless the object opened is still the one
+    /// `expected` names.
+    ///
+    /// Sound *only* while the caller holds the object `expected` was read from
+    /// open — which pins it, so equal identity bytes prove the same object
+    /// rather than a recycled slot. The self-test calls this with its writer
+    /// still alive, which is what closes the window between creating the
+    /// artifact and pinning it.
+    pub(crate) fn open_verified(path: &Path, expected: &[u8]) -> Result<Self> {
+        let pinned = Self::open(path)?;
+        if pinned.identity() != expected {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the pathname stopped naming the expected file object",
+            )));
+        }
+        Ok(pinned)
+    }
+
+    /// The identity of the pinned object. Valid as a name for that object only
+    /// while `self` lives, which is why it borrows from `self`.
+    pub(crate) fn identity(&self) -> &[u8] {
+        &self.identity
+    }
+}
+
+/// Opens the handle a [`PinnedObject`] holds: read-only, and on Unix without
+/// following a symlink at the final component, so a pin can never end up
+/// holding a file the name merely points at.
+#[cfg(unix)]
+fn open_pin_handle(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    Ok(OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?)
+}
+
+/// Windows counterpart. Deliberately *does* follow a reparse point, because the
+/// Windows removal arm resolves the same pathname the same way: pinning the
+/// link while deleting the target would compare two different objects.
+///
+/// The default `OpenOptions` share mode is read/write/delete, which is what
+/// keeps the pin compatible with the removal that follows it: the removal opens
+/// the same object for `DELETE`, which an existing handle only permits if that
+/// handle shares deletion, and it opens with `FILE_SHARE_READ`, which only
+/// admits existing handles whose granted access is read. A writable pin would
+/// fail the second test and turn every cleanup into a sharing violation.
+#[cfg(windows)]
+fn open_pin_handle(path: &Path) -> Result<File> {
+    Ok(OpenOptions::new().read(true).open(path)?)
+}
+
 /// RAII owner of a rewrite/publication temp file (STO4-P2).
 ///
 /// [`create_rewrite_temp_file`] hands back a bare `(PathBuf, File)`, so every
@@ -10733,12 +10853,19 @@ fn verify_dedicated_lock_marker(path: &Path, _file: &File) -> Result<()> {
 #[derive(Debug)]
 pub(crate) struct WriterLock {
     file: File,
+    /// Pathname of `file`, kept so a release can remove the marker object when
+    /// truncating its content cannot be proved to have worked. See
+    /// [`clear_and_verify_writer_lock_marker`].
+    marker_path: PathBuf,
     // Authoritative single-writer lock, held on the native file object itself.
     // Hard links and other path aliases all resolve to the same object, so an
     // object lock cannot be bypassed the way the path-derived ".lock" marker
     // can. The marker file above remains diagnostic metadata (pid, timestamps,
     // break-policy machinery) plus a fast same-path exclusion.
     native_guard: Option<File>,
+    /// Set by [`WriterLock::release`] so the drop that follows it does not
+    /// repeat work that was already reported on.
+    released: bool,
 }
 
 impl WriterLock {
@@ -10791,10 +10918,55 @@ impl WriterLock {
             created_unix_ms: unix_time_ms(),
         };
         if let Err(error) = write_writer_lock_info(&mut file, &info) {
-            let _ = clear_writer_lock_info(&mut file);
+            let _ = clear_and_verify_writer_lock_marker(&mut file, &path);
             return Err(error);
         }
-        Ok(Self { file, native_guard })
+        Ok(Self {
+            file,
+            marker_path: path,
+            native_guard,
+            released: false,
+        })
+    }
+
+    /// Gives back both things an acquisition took, in that order, and reports a
+    /// failure instead of discarding it.
+    ///
+    /// An acquisition takes the authoritative object lock on the target and the
+    /// marker's content, and a *live* writer keeps both on purpose. Anything
+    /// that acquired the lock and then failed - a refused open, a rejected
+    /// header, a corrupt tail - never became a writer and must keep neither, or
+    /// the next open is refused for a claim nobody holds.
+    ///
+    /// Two properties this has that [`Drop`] alone cannot:
+    ///
+    /// * it **reports**. `Drop` discarded `clear_writer_lock_info`'s error, so a
+    ///   marker whose truncation failed became a silent `Error::WriterLockHeld`
+    ///   on the next open, with nothing pointing at the cause.
+    /// * it is **ordered**: the object lock goes first. Clearing the marker
+    ///   first publishes "no writer here" while this process still holds the
+    ///   object lock, so a competing writer that reads the marker inside that
+    ///   window is refused by a lock that is already being given up.
+    pub(crate) fn release(mut self) -> Result<()> {
+        self.give_back_native_guard();
+        let result = clear_and_verify_writer_lock_marker(&mut self.file, &self.marker_path);
+        // Last, because clearing the marker is only safe while its own lock is
+        // still held: see `clear_and_verify_writer_lock_marker`.
+        let _ = unlock_writer_guard(&self.file);
+        self.released = true;
+        result
+    }
+
+    /// Releases the authoritative object lock, completely and now.
+    ///
+    /// `self.native_guard = None` was not enough: on Unix the guard is a `dup`
+    /// of the writer's own handle, so dropping it leaves the lock held by the
+    /// shared open file description, and any concurrently forked child holds
+    /// that description too until it `exec`s. See [`unlock_writer_guard`].
+    fn give_back_native_guard(&mut self) {
+        if let Some(guard) = self.native_guard.take() {
+            let _ = unlock_native_guard(&guard);
+        }
     }
 
     /// Moves the authoritative object lock onto the writer's own native handle.
@@ -10808,7 +10980,10 @@ impl WriterLock {
     /// resulting microscopic window makes this call fail, which aborts the
     /// caller instead of ever admitting two writers.
     pub(crate) fn bind_native(&mut self, native: &File, target_path: &Path) -> Result<()> {
-        self.native_guard = None;
+        // Unlock, not merely drop: a dropped duplicate keeps the lock alive on
+        // Unix, which would make the re-lock below conflict with the guard it
+        // is replacing rather than with a competing writer.
+        self.give_back_native_guard();
         let guard = native.try_clone()?;
         match try_lock_native_guard(&guard) {
             Ok(()) => {
@@ -10872,9 +11047,88 @@ fn try_lock_native_guard(file: &File) -> std::result::Result<(), WriterGuardLock
 // the file length, which can never reach this reserved offset, so ordinary
 // readers and the writer's own data I/O are unaffected.
 #[cfg(windows)]
+const NATIVE_WRITER_GUARD_OFFSET: u64 = u64::MAX - 1;
+
+#[cfg(windows)]
 fn try_lock_native_guard(file: &File) -> std::result::Result<(), WriterGuardLockError> {
-    const NATIVE_WRITER_GUARD_OFFSET: u64 = u64::MAX - 1;
     try_lock_exclusive_range(file, NATIVE_WRITER_GUARD_OFFSET)
+}
+
+/// Gives a writer guard back *explicitly*, instead of letting the handle's close
+/// do it.
+///
+/// Closing is not equivalent on Unix. `flock` binds the lock to the open file
+/// description, not to the descriptor, and a description outlives the
+/// descriptor that created it whenever any duplicate remains open - including
+/// duplicates this process cannot see or reach:
+///
+/// * `File::try_clone` is `dup`, so the native guard shares one description
+///   with the writer's own data handle. Dropping the guard alone releases
+///   nothing while that handle lives.
+/// * a `fork` anywhere in the process (every `std::process::Command::spawn` is
+///   one) duplicates every open descriptor into the child. The child's copies
+///   are `O_CLOEXEC` and so close at `exec`, but until they do, the child holds
+///   descriptions this process has already dropped - and the lock on them.
+///   Releasing by close therefore does not take effect when the release
+///   happens, but at some unrelated later instant in another process. That is
+///   how a released writer lock came back as [`Error::WriterLockHeld`] for a
+///   claim nobody held: `flock` reported `EAGAIN` with no lock owner anywhere
+///   in this process.
+///
+/// `LOCK_UN` releases the description's lock for every descriptor that refers
+/// to it, in this process and in any pre-`exec` child, so it is the only
+/// release that is complete at the moment it returns. Windows range locks are
+/// per-handle and are dropped at close, but unlocking the exact range first is
+/// the same statement made promptly, and `ERROR_NOT_LOCKED` on an
+/// already-released range is ignorable either way.
+#[cfg(not(windows))]
+fn unlock_writer_guard(file: &File) -> std::io::Result<()> {
+    file.unlock()
+}
+
+#[cfg(windows)]
+fn unlock_writer_guard(file: &File) -> std::io::Result<()> {
+    unlock_exclusive_range(file, WRITER_LOCK_MAX_LEN)
+}
+
+#[cfg(not(windows))]
+fn unlock_native_guard(file: &File) -> std::io::Result<()> {
+    file.unlock()
+}
+
+#[cfg(windows)]
+fn unlock_native_guard(file: &File) -> std::io::Result<()> {
+    unlock_exclusive_range(file, NATIVE_WRITER_GUARD_OFFSET)
+}
+
+#[cfg(windows)]
+fn unlock_exclusive_range(file: &File, offset: u64) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0_0};
+
+    let mut overlapped = OVERLAPPED::default();
+    overlapped.Anonymous.Anonymous = OVERLAPPED_0_0 {
+        Offset: offset as u32,
+        OffsetHigh: (offset >> 32) as u32,
+    };
+    // SAFETY: mirrors `try_lock_exclusive_range` - `file` is open for the
+    // duration, the OVERLAPPED value is initialized for the same synchronous
+    // one-byte range, and no pointer outlives the call.
+    let unlocked = unsafe {
+        UnlockFileEx(
+            file.as_raw_handle() as HANDLE,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if unlocked != 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::last_os_error())
 }
 
 #[cfg(windows)]
@@ -10929,9 +11183,81 @@ pub fn clear_stale_writer_lock(
     target_path: impl AsRef<Path>,
     policy: WriterLockBreakPolicy,
 ) -> Result<()> {
-    let mut lock = WriterLock::acquire_with_policy(target_path.as_ref(), policy)?;
-    clear_writer_lock_info(&mut lock.file)?;
-    Ok(())
+    // `release` is the reporting route: it clears the marker, proves it clear,
+    // and drops the object lock first, so this cannot return `Ok(())` over a
+    // marker that is still refusing.
+    WriterLock::acquire_with_policy(target_path.as_ref(), policy)?.release()
+}
+
+/// Releases a writer lock that an open acquired and then could not use, and
+/// returns the error to report.
+///
+/// An open that fails never became a writer, so the claim it took has to be
+/// given back before the error leaves the function - not at some later scope
+/// exit, and not silently. The original failure is what the caller asked about
+/// and is what propagates; a release failure replaces it, because a stranded
+/// claim is the more serious news and is the thing that would otherwise resurface
+/// as `Error::WriterLockHeld` on a file nobody holds.
+/// Runs `body` while holding `lock`, and gives the claim back explicitly if it
+/// fails.
+///
+/// `WriterLock` releases on drop, so the OS-level guard comes back either way.
+/// What drop cannot do is *report*, and the marker is the half that matters
+/// here: `Drop` clears its contents on a best-effort basis and discards the
+/// result, so a clear that failed left a non-empty marker behind and the next
+/// acquisition refused with `WriterLockHeld` under the default
+/// [`WriterLockBreakPolicy::Refuse`] — a live writer and a failed open became
+/// indistinguishable. That is what made a failed open poison the pathname.
+///
+/// On success the lock is handed to the caller inside the value it built, whose
+/// own drop owns it from then on. On failure it is released here, and a release
+/// error replaces the original: a caller that is told the open failed can retry,
+/// but a caller told only the *first* reason while the pathname is still claimed
+/// would retry forever.
+/// `body` builds the file while borrowing the lock and leaves `_lock` empty;
+/// this installs the lock on success, so the claim lives exactly as long as the
+/// handle. Deliberately not generic and deliberately not `mem::forget`: the
+/// borrow means `body` cannot take ownership, and forgetting the lock here would
+/// hold the OS guard and the marker for the life of the process.
+fn with_writer_lock(
+    lock: WriterLock,
+    body: impl FnOnce(&mut WriterLock) -> Result<VarveFile>,
+) -> Result<VarveFile> {
+    let (mut file, lock) = with_writer_lock_value(lock, body)?;
+    debug_assert!(
+        file._lock.is_none(),
+        "the body under `with_writer_lock` must leave `_lock` empty; \
+         installing it twice would drop the first claim early"
+    );
+    file._lock = Some(lock);
+    Ok(file)
+}
+
+/// The same lifecycle for anything an acquisition builds that is not a
+/// [`VarveFile`].
+///
+/// [`with_writer_lock`] can install the claim itself because it knows the one
+/// field to put it in. The layout writer and the recovering open build other
+/// shapes - a different struct, a `(file, report)` pair - so they get the lock
+/// handed back on success and install it themselves. What matters is identical:
+/// `body` only *borrows* the lock, so it cannot take ownership and cannot leak
+/// it, and a failure releases here with a report rather than at scope exit in
+/// silence.
+pub(crate) fn with_writer_lock_value<T>(
+    mut lock: WriterLock,
+    body: impl FnOnce(&mut WriterLock) -> Result<T>,
+) -> Result<(T, WriterLock)> {
+    match body(&mut lock) {
+        Ok(value) => Ok((value, lock)),
+        Err(error) => Err(release_writer_lock_after_failure(lock, error)),
+    }
+}
+
+fn release_writer_lock_after_failure(lock: WriterLock, error: Error) -> Error {
+    match lock.release() {
+        Ok(()) => error,
+        Err(release_error) => release_error,
+    }
 }
 
 fn write_writer_lock_info(file: &mut File, info: &WriterLockInfo) -> Result<()> {
@@ -10954,6 +11280,42 @@ fn clear_writer_lock_info(file: &mut File) -> Result<()> {
     file.seek(SeekFrom::Start(0))?;
     file.flush()?;
     Ok(())
+}
+
+/// Clears the marker's content and *proves* it is gone, removing the marker
+/// object if it is not.
+///
+/// The next acquisition decides from one observation only -
+/// `file.metadata()?.len() != 0` in [`WriterLock::acquire_with_policy`] - and
+/// under the default `WriterLockBreakPolicy::Refuse` a non-zero length is
+/// `Error::WriterLockHeld` without the content ever being read. So a release
+/// whose truncation silently did not take does not merely lose a diagnostic: it
+/// leaves the file unopenable by the default policy until someone runs
+/// `clear_stale_writer_lock`. Checking the length afterwards is what makes the
+/// truncation's success a fact rather than an assumption.
+///
+/// When the length is still non-zero the marker object is removed instead.
+/// That is safe precisely here and only here: the caller still holds the
+/// marker's own OS lock, so no acquisition can be part-way through reading it,
+/// and a caller that is releasing has no writer role left for the marker to
+/// describe. Removal is a fallback, not the normal path - a marker file that
+/// truncates correctly is left in place, zero length, exactly as before - so
+/// nothing that depends on the marker surviving normal use changes.
+fn clear_and_verify_writer_lock_marker(file: &mut File, path: &Path) -> Result<()> {
+    let cleared = clear_writer_lock_info(file);
+    // `u64::MAX` for an unreadable length: unprovable is treated as non-empty,
+    // never as empty.
+    let observed = file
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or(u64::MAX);
+    if observed == 0 {
+        return Ok(());
+    }
+    remove_file(path)?;
+    // The removal made the marker inert, which is what the next acquisition
+    // reads; report the truncation failure only if it did not already succeed.
+    cleared
 }
 
 fn read_writer_lock_info(target_path: &Path) -> Result<Option<WriterLockInfo>> {
@@ -11142,7 +11504,21 @@ fn process_is_absent(process_id: u32) -> bool {
 
 impl Drop for WriterLock {
     fn drop(&mut self) {
-        let _ = clear_writer_lock_info(&mut self.file);
+        if self.released {
+            return;
+        }
+        // Same order and same guarantee as `WriterLock::release`, which is the
+        // reporting route; this is the route a live writer's ordinary close
+        // takes, and the backstop for any path that still relies on scope exit.
+        // `Drop` cannot report, so the marker's emptiness is made *unconditional*
+        // here rather than hoped for: see `clear_and_verify_writer_lock_marker`.
+        // Both locks are given back by unlocking, never by letting the handle
+        // close - a closing handle releases nothing that a duplicate still
+        // holds, and `fork` makes duplicates this process cannot see. See
+        // `unlock_writer_guard`.
+        self.give_back_native_guard();
+        let _ = clear_and_verify_writer_lock_marker(&mut self.file, &self.marker_path);
+        let _ = unlock_writer_guard(&self.file);
     }
 }
 

@@ -462,3 +462,401 @@ fn layout_create_over_stale_file_truncates_through_bound_handle() -> Result<()> 
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// A *failed* open must give back everything it took.
+//
+// `WriterLock::acquire` takes two things before an open can do any work: the
+// authoritative object lock on the native file (`probe_native_target_lock` and
+// `WriterLock::bind_native`), and the diagnostic `<target>.lock` marker, whose
+// non-empty content is itself a refusal under `WriterLockBreakPolicy::Refuse`.
+// A live writer keeps both on purpose. An open that *fails* keeps neither: it
+// never became a writer, so the next open of any kind, including a recovering
+// one, must see a file nobody holds.
+//
+// The leak these cover was found by the first Linux CI run, in
+// `strict_open_rejects_and_recover_truncates_partial_tail`: a strict open
+// rejected a corrupt tail, and the recovering open that followed was refused
+// with `WriterLockHeld`. The shape is platform independent - a failed open
+// followed by another open - so these assert it directly rather than through a
+// recovery scenario, and they cover the sibling refusal paths too, because
+// whatever leaks on one of them leaks on all of them.
+
+fn lock_marker(path: &std::path::Path) -> std::path::PathBuf {
+    let mut value = path.as_os_str().to_owned();
+    value.push(".lock");
+    std::path::PathBuf::from(value)
+}
+
+/// Asserts that a failed open left no writer claim behind at `path`.
+///
+/// Two independent witnesses, one per thing an acquisition takes:
+///
+/// * the marker describes no writer. A zero-length marker file may remain - the
+///   object is deliberately not deleted - but `inspect_writer_lock` must report
+///   `None`, because a marker that still parses as writer metadata is exactly
+///   what `acquire_with_policy` refuses under `Refuse`.
+/// * the object lock is free, which `probe` proves: it performs an operation
+///   that acquires the writer lock, and must then fail or succeed on its own
+///   terms, never with a lock refusal.
+fn assert_no_writer_claim_left<T>(
+    path: &std::path::Path,
+    what: &str,
+    probe: impl FnOnce() -> Result<T>,
+) {
+    match VarveFile::inspect_writer_lock(path) {
+        Ok(None) => {}
+        Ok(Some(info)) => panic!(
+            "{what}: the failed open left live writer metadata in {}: {info:?}",
+            lock_marker(path).display()
+        ),
+        Err(error) => panic!("{what}: the failed open left an unreadable lock marker: {error:?}"),
+    }
+    // The same statement in the terms `acquire_with_policy` actually decides on:
+    // it reads the marker's *length* and refuses any non-zero one under
+    // `Refuse` without ever parsing the content. Absent is fine; empty is fine;
+    // anything else is a refusal waiting to happen.
+    let marker = lock_marker(path);
+    match fs::metadata(&marker) {
+        Ok(metadata) => assert_eq!(
+            metadata.len(),
+            0,
+            "{what}: the failed open left {} bytes in {}, which the next \
+             acquisition refuses without reading them",
+            metadata.len(),
+            marker.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("{what}: could not inspect {}: {error:?}", marker.display()),
+    }
+    match probe() {
+        Err(Error::WriterLockHeld(held)) => panic!(
+            "{what}: the failed open kept the writer lock on {held}, so the next open was refused"
+        ),
+        Err(Error::WriterLockBreakRefused(held)) => panic!(
+            "{what}: the failed open kept a writer claim on {held}, so the next open was refused"
+        ),
+        _ => {}
+    }
+}
+
+/// The CI failure itself, reduced to its shape: a strict open rejects a corrupt
+/// tail, and the recovering open that follows must be able to take the writer
+/// role. Before the fix this passed on Windows and failed on Linux with
+/// `WriterLockHeld`, because the two platforms release an object lock on
+/// different events.
+#[test]
+fn a_failed_open_on_a_corrupt_tail_releases_the_writer_lock() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("failed-open-corrupt-tail.varve");
+    {
+        let mut writer = VarveFile::create(spec(), &path)?;
+        writer.push(&LockRecord(1))?;
+        writer.push(&LockRecord(2))?;
+        writer.sync()?;
+    }
+    let intact_len = fs::metadata(&path)?.len();
+    // A record header that stops short: enough to be seen, too little to be a
+    // record.
+    append_bytes(&path, &[1, 2, 3, 4])?;
+
+    match VarveFile::open(spec(), &path) {
+        Err(Error::CorruptTail { .. }) => {}
+        other => panic!("strict open did not reject the partial tail: {other:?}"),
+    }
+
+    // The same failure twice: the second attempt must fail on the tail again,
+    // not on a lock the first attempt kept.
+    assert_no_writer_claim_left(&path, "corrupt tail", || VarveFile::open(spec(), &path));
+
+    // And the recovering open must be able to take the writer role, which is
+    // the exact step the Linux run failed on.
+    let recovering = spec().with_recovery_policy(RecoveryPolicy::TruncateTail);
+    let (recovered, report) = VarveFile::open_recover_with_report(recovering, &path)?;
+    assert_eq!(report.recovered_len, intact_len);
+    assert_eq!(recovered.blocks::<LockRecord>()?.len(), 2);
+    Ok(())
+}
+
+/// Sibling refusal path: the header is rejected before any record is scanned.
+/// The lock is already held at that point, so this leaks in exactly the same
+/// way if the release depends on anything but the failure itself.
+#[test]
+fn a_failed_open_on_an_invalid_header_releases_the_writer_lock() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("failed-open-bad-magic.varve");
+    {
+        let mut writer = VarveFile::create(spec(), &path)?;
+        writer.push(&LockRecord(3))?;
+        writer.sync()?;
+    }
+    let original = fs::read(&path)?;
+
+    // Corrupt the magic in place: same length, everything else untouched.
+    let mut damaged = original.clone();
+    damaged[0] ^= 0xFF;
+    fs::write(&path, &damaged)?;
+
+    match VarveFile::open(spec(), &path) {
+        Err(Error::InvalidMagic) => {}
+        other => panic!("open did not reject the damaged magic: {other:?}"),
+    }
+    assert_no_writer_claim_left(&path, "invalid magic", || VarveFile::open(spec(), &path));
+
+    // Restoring the header must be enough to open the file as a writer again:
+    // nothing about the refusal may outlive it.
+    fs::write(&path, &original)?;
+    let reopened = VarveFile::open(spec(), &path)?;
+    assert_eq!(reopened.blocks::<LockRecord>()?.get(0)?, Some(LockRecord(3)));
+    Ok(())
+}
+
+/// Sibling refusal path: a format-version mismatch, decided from the header of
+/// a file that is otherwise completely intact. The proof that nothing was kept
+/// is that the *matching* spec can then open it.
+#[test]
+fn a_failed_open_on_a_version_mismatch_releases_the_writer_lock() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("failed-open-version.varve");
+    {
+        let mut writer = VarveFile::create(spec(), &path)?;
+        writer.push(&LockRecord(4))?;
+        writer.sync()?;
+    }
+
+    let future = FormatSpec::new(
+        b"VSWLK",
+        2,
+        Endian::Little,
+        0,
+        IndexPolicy::ScanOnOpen,
+        IntegrityPolicy::None,
+        RecoveryPolicy::Strict,
+        ManifestPolicy::None,
+        BLOCKS,
+    )
+    .with_read_limits(ReadLimits::STANDARD);
+
+    match VarveFile::open(future, &path) {
+        Err(Error::FormatVersionMismatch { .. }) => {}
+        other => panic!("open did not reject the version mismatch: {other:?}"),
+    }
+    assert_no_writer_claim_left(&path, "version mismatch", || VarveFile::open(future, &path));
+
+    let reopened = VarveFile::open(spec(), &path)?;
+    assert_eq!(reopened.blocks::<LockRecord>()?.get(0)?, Some(LockRecord(4)));
+    Ok(())
+}
+
+/// Sibling refusal path: a refused read limit. This one fails at
+/// `check_open_file_len`, the first thing after the lock is bound, so it is the
+/// narrowest window in which a leak can happen at all.
+#[test]
+fn a_failed_open_on_a_refused_limit_releases_the_writer_lock() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("failed-open-limit.varve");
+    {
+        let mut writer = VarveFile::create(spec(), &path)?;
+        writer.push(&LockRecord(5))?;
+        writer.sync()?;
+    }
+
+    let refusing = spec().with_read_limits(ReadLimits::finite_all(1));
+    match VarveFile::open(refusing, &path) {
+        Err(Error::LimitExceeded { .. }) => {}
+        other => panic!("open did not refuse the file under a one-byte limit: {other:?}"),
+    }
+    assert_no_writer_claim_left(&path, "refused limit", || VarveFile::open(refusing, &path));
+
+    let reopened = VarveFile::open(spec(), &path)?;
+    assert_eq!(reopened.blocks::<LockRecord>()?.get(0)?, Some(LockRecord(5)));
+    Ok(())
+}
+
+/// Sibling refusal path: a schema-hash mismatch. Same header, same version,
+/// same records - only the caller's declared schema differs, and the refusal
+/// still happens with the claim already taken.
+#[test]
+fn a_failed_open_on_a_schema_hash_mismatch_releases_the_writer_lock() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("failed-open-schema.varve");
+    {
+        let mut writer = VarveFile::create(spec(), &path)?;
+        writer.push(&LockRecord(9))?;
+        writer.sync()?;
+    }
+
+    let other_schema = FormatSpec::new(
+        b"VSWLK",
+        1,
+        Endian::Little,
+        0x0BAD_5C4E_0000_0001,
+        IndexPolicy::ScanOnOpen,
+        IntegrityPolicy::None,
+        RecoveryPolicy::Strict,
+        ManifestPolicy::None,
+        BLOCKS,
+    )
+    .with_read_limits(ReadLimits::STANDARD);
+
+    match VarveFile::open(other_schema, &path) {
+        Err(Error::SchemaHashMismatch { .. }) => {}
+        other => panic!("open did not reject the schema-hash mismatch: {other:?}"),
+    }
+    assert_no_writer_claim_left(&path, "schema-hash mismatch", || {
+        VarveFile::open(other_schema, &path)
+    });
+
+    let reopened = VarveFile::open(spec(), &path)?;
+    assert_eq!(reopened.blocks::<LockRecord>()?.get(0)?, Some(LockRecord(9)));
+    Ok(())
+}
+
+/// The release must not depend on a handle *closing*, because closing is not
+/// when a lock is given back.
+///
+/// On Unix an advisory lock belongs to the open file description, and any
+/// `fork` duplicates every descriptor - so every description - into the child.
+/// `std::process::Command::spawn` is a `fork`, which makes this the ordinary
+/// case rather than an exotic one: an application that spawns *any* child
+/// process while a varve writer is open has handed a duplicate of that writer's
+/// lock descriptions to it. The duplicates are `O_CLOEXEC` and close at `exec`,
+/// but until then the lock stays held on the child's copies, and a writer that
+/// released by closing its own descriptor has released nothing yet. The next
+/// open is refused with `WriterLockHeld` for a claim no live writer holds, and
+/// `flock` reports `EAGAIN` with no owner visible anywhere in this process.
+///
+/// The window is fork-to-`exec`, and it has to be entered from another thread:
+/// `Command::spawn` does not return to its *own* caller until the child has
+/// `exec`ed, so the thread that spawns can never observe it. Every thread
+/// beside it can, which is exactly how this reached CI - one test spawning a
+/// child while a different test, on a different test-harness thread, released a
+/// writer and reopened it.
+///
+/// So: a spawner thread holds the window open with a `pre_exec` sleep, and this
+/// thread does the release and the reopen inside it. The sleep only makes the
+/// timing reliable; the bug needs a child spawned at the wrong microsecond and
+/// nothing more. Unix only, because `fork` is the whole mechanism - Windows
+/// creates processes without duplicating handles that are not marked
+/// inheritable.
+#[cfg(unix)]
+#[test]
+fn a_release_beside_a_forked_child_does_not_strand_the_writer_claim() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    const CHILD_HOLDS_THE_WINDOW: Duration = Duration::from_millis(400);
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("forked-child.varve");
+    {
+        let mut writer = VarveFile::create(spec(), &path)?;
+        writer.push(&LockRecord(10))?;
+        writer.sync()?;
+    }
+
+    // Open the writer first: the fork must duplicate descriptors that the claim
+    // is held on, which is only true while a writer is live.
+    let writer = VarveFile::open(spec(), &path)?;
+
+    let executable = std::env::current_exe()?;
+    let at_the_fork = Arc::new(Barrier::new(2));
+    let spawner = {
+        let at_the_fork = Arc::clone(&at_the_fork);
+        std::thread::spawn(move || -> std::io::Result<()> {
+            // `--list` makes the child a listing run that exits on its own.
+            let mut command = Command::new(executable);
+            command
+                .arg("--list")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            // SAFETY: this runs in the forked child before `exec`, where only
+            // async-signal-safe work is permitted. A sleep is `nanosleep` and
+            // nothing else: no allocation, no locks, no inherited state read or
+            // written.
+            unsafe {
+                command.pre_exec(|| {
+                    std::thread::sleep(CHILD_HOLDS_THE_WINDOW);
+                    Ok(())
+                });
+            }
+            at_the_fork.wait();
+            // Forks within microseconds of here, then blocks until the child
+            // `exec`s - which is why the release below cannot live on this
+            // thread.
+            command.spawn()?.wait()?;
+            Ok(())
+        })
+    };
+
+    at_the_fork.wait();
+    // Comfortably inside the window: the fork is microseconds away, the child
+    // then holds the duplicates for 400ms.
+    std::thread::sleep(Duration::from_millis(80));
+
+    // The release has to be complete when it returns, not when some other
+    // process happens to `exec`.
+    drop(writer);
+    let reopened = VarveFile::open(spec(), &path);
+    let refusal = match reopened {
+        Ok(file) => {
+            assert_eq!(file.blocks::<LockRecord>()?.get(0)?, Some(LockRecord(10)));
+            None
+        }
+        Err(error) => Some(error),
+    };
+    spawner.join().expect("spawner thread")?;
+
+    match refusal {
+        None => Ok(()),
+        Some(Error::WriterLockHeld(held)) => panic!(
+            "releasing a writer beside a forked child stranded the claim on {held}: \
+             the release waited on a descriptor closing in another process"
+        ),
+        Some(other) => Err(other),
+    }
+}
+
+/// Windows-only forensic companion to the four tests above.
+///
+/// They prove that no *lock* survives a failed open. This proves the stronger
+/// property they rest on - that no *handle* to the target file survives one -
+/// by reopening with `share_mode(0)`, which the OS refuses while any other
+/// handle to the object is open anywhere in the process. Unix has no equivalent
+/// (an fd cannot exclude other fds), but the handle lifecycle is written in
+/// platform-independent Rust, so a leak observable here is a leak on Linux too,
+/// where it additionally strands the advisory lock that fd holds.
+#[cfg(windows)]
+#[test]
+fn a_failed_open_leaves_no_handle_to_the_target() -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("failed-open-handles.varve");
+    {
+        let mut writer = VarveFile::create(spec(), &path)?;
+        writer.push(&LockRecord(6))?;
+        writer.sync()?;
+    }
+    append_bytes(&path, &[1, 2, 3, 4])?;
+
+    assert!(VarveFile::open(spec(), &path).is_err());
+
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(&path)
+        .expect("a handle to the target survived the failed open");
+    Ok(())
+}
+
+fn append_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let mut file = fs::OpenOptions::new().append(true).open(path)?;
+    file.write_all(bytes)?;
+    Ok(())
+}

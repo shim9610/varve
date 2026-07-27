@@ -797,29 +797,39 @@ impl LayoutWriter {
         spec.read_limits
             .check(ReadLimitKey::IndexBytes, index_bytes)?;
         let path = path.as_ref().to_path_buf();
-        let mut lock = crate::file::WriterLock::acquire(&path)?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
-        // DUR2-05: bind the single-writer object lock before any destructive
-        // initialization. Opening with `.truncate(true)` would clear the new
-        // object inside the pre-bind window where a losing concurrent creator
-        // could still hold an unbound handle to it; truncate through the bound
-        // handle instead. Mirrors VarveFile::create_impl.
-        lock.bind_native(&file, &path)?;
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        if let Some(header) = spec.layout.file_header() {
-            write_static_layout_fields(&mut file, header.fields, fields, spec.endian)?;
-        }
+        let lock = crate::file::WriterLock::acquire(&path)?;
+        // `_lock` here is not an `Option`, so this cannot use the wrapper that
+        // installs the claim into a `VarveFile`. `with_writer_lock_value` gives
+        // the same lifecycle for a different shape: the body borrows the lock
+        // and returns the parts, a failure releases with a report, and the
+        // claim is installed below only once there is a writer to own it.
+        let ((file, segment_counts), lock) =
+            crate::file::with_writer_lock_value(lock, |lock| {
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&path)?;
+                // DUR2-05: bind the single-writer object lock before any
+                // destructive initialization. Opening with `.truncate(true)`
+                // would clear the new object inside the pre-bind window where a
+                // losing concurrent creator could still hold an unbound handle
+                // to it; truncate through the bound handle instead. Mirrors
+                // VarveFile::create_impl.
+                lock.bind_native(&file, &path)?;
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
+                if let Some(header) = spec.layout.file_header() {
+                    write_static_layout_fields(&mut file, header.fields, fields, spec.endian)?;
+                }
+                Ok((file, initial_segment_counts(spec)?))
+            })?;
         Ok(Self {
             spec,
             path,
             file,
-            segment_counts: initial_segment_counts(spec)?,
+            segment_counts,
             index_bytes,
             poison: PoisonFlag::healthy(),
             _lock: lock,
@@ -858,17 +868,24 @@ impl LayoutWriter {
         ensure_custom_layout_spec(spec)?;
         ensure_layout_writer_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
-        let mut lock = crate::file::WriterLock::acquire(&path)?;
-        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-        lock.bind_native(&file, &path)?;
-        let snapshot = SnapshotFile::new(file.try_clone()?)?;
-        spec.read_limits
-            .check(ReadLimitKey::FileLen, snapshot.len())?;
-        let header = read_file_header(spec, &snapshot)?;
-        let (segments, index_bytes) =
-            scan_layout_segments(spec, &snapshot, header.len, header.index_bytes)?;
-        let segment_counts = segment_counts_from_infos(spec, &segments)?;
-        file.seek(SeekFrom::Start(snapshot.len()))?;
+        let lock = crate::file::WriterLock::acquire(&path)?;
+        // Every refusal below - the file-length limit, a rejected header, a
+        // segment scan that does not add up - happens with the claim already
+        // taken; see `create_inner` for why this shape uses this wrapper.
+        let ((file, segment_counts, index_bytes), lock) =
+            crate::file::with_writer_lock_value(lock, |lock| {
+                let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+                lock.bind_native(&file, &path)?;
+                let snapshot = SnapshotFile::new(file.try_clone()?)?;
+                spec.read_limits
+                    .check(ReadLimitKey::FileLen, snapshot.len())?;
+                let header = read_file_header(spec, &snapshot)?;
+                let (segments, index_bytes) =
+                    scan_layout_segments(spec, &snapshot, header.len, header.index_bytes)?;
+                let segment_counts = segment_counts_from_infos(spec, &segments)?;
+                file.seek(SeekFrom::Start(snapshot.len()))?;
+                Ok((file, segment_counts, index_bytes))
+            })?;
         Ok(Self {
             spec,
             path,

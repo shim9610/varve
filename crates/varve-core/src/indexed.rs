@@ -1388,19 +1388,17 @@ where
     // *against* publication (fail closed, retire the sidecar) instead of
     // surfacing as a plain IO error that leaves the caller unable to tell what
     // is on disk.
-    let published_identity = fs::File::open(&path)
-        .ok()
-        .and_then(|file| crate::file::opened_file_identity(&file).ok());
+    // Held open, not merely stat-ed: the retirement below deletes by pathname
+    // and can only tell "still my sidecar" from "somebody else's file at the
+    // same name" while this handle keeps the identity from being reissued.
+    let published = crate::file::PinnedObject::open(&path).ok();
     let republished = fs::File::open(native_path)
         .ok()
         .and_then(|file| SnapshotFile::new(file).ok())
         .and_then(|snapshot| primary_identity(spec, &snapshot).ok());
     if republished.as_ref() != Some(&identity) {
         return Err(index_error(
-            crate::stream::retire_sidecar_for_replaced_primary(
-                &path,
-                published_identity.as_deref(),
-            ),
+            crate::stream::retire_sidecar_for_replaced_primary(&path, published),
         ));
     }
     drop(current);

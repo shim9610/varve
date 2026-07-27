@@ -392,6 +392,9 @@ mod region_reader {
         /// difference between four threads reading 91,137 cells/s through one
         /// convoyed file object and 593,337 through four. See `MatrixReadPool`.
         pub(crate) fn read_exact_at(&self, offset: u64, buffer: &mut [u8]) -> Result<()> {
+            // One count per logical read, not per retry: the subject is whether
+            // a read was *issued* while a bitmap page-store lock was held.
+            super::count_matrix_region_read();
             let private = self.pool.and_then(|pool| pool.private_handle(self.file));
             let file: &File = private.as_deref().unwrap_or(self.file);
             let mut consumed = 0usize;
@@ -1021,10 +1024,24 @@ mod scaling_counters {
         /// a test can prove what a *process-level* interruption leaves on disk.
         /// Zero is inert.
         pub(super) static REBUILD_ABORT_STAGE: Cell<u64> = const { Cell::new(0) };
+        /// Page-store locks this thread holds *right now*
+        /// ([`super::PageStoreGuard`]). Not a total: it rises and falls.
+        pub(super) static BITMAP_STORE_GUARDS_HELD: Cell<u64> = const { Cell::new(0) };
+        /// Positional matrix-region reads issued on this thread
+        /// ([`super::MatrixRegionReader::read_exact_at`]).
+        pub(super) static MATRIX_REGION_READS: Cell<u64> = const { Cell::new(0) };
+        /// Of those, the ones issued while a page-store lock was held. The
+        /// read-path contract is that this stays zero; see
+        /// [`super::MatrixRecoveryReport::matrix_region_reads_under_bitmap_lock`].
+        pub(super) static MATRIX_REGION_READS_UNDER_LOCK: Cell<u64> = const { Cell::new(0) };
     }
 
     pub(super) fn add(cell: &'static std::thread::LocalKey<Cell<u64>>, value: u64) {
         cell.with(|counter| counter.set(counter.get().saturating_add(value)));
+    }
+
+    pub(super) fn sub(cell: &'static std::thread::LocalKey<Cell<u64>>, value: u64) {
+        cell.with(|counter| counter.set(counter.get().saturating_sub(value)));
     }
 
     pub(super) fn set(cell: &'static std::thread::LocalKey<Cell<u64>>, value: u64) {
@@ -1116,6 +1133,54 @@ fn count_lazy_fault_bytes_read(bytes: u64) {
 
 #[cfg(not(any(test, feature = "scalable-fault-injection")))]
 fn count_lazy_fault_bytes_read(_bytes: u64) {}
+
+/// Records that this thread has acquired one more page-store lock.
+///
+/// Called by [`PageStoreGuard::new`] and paired with
+/// [`leave_page_store_guard`] by its `Drop`, so the depth is exact rather than
+/// approximate: a `MutexGuard` is `!Send`, so acquisition and release always
+/// happen on one thread and a thread-local count needs no synchronisation and
+/// cannot be attributed to the wrong reader.
+///
+/// This exists so that the matrix read path's central concurrency invariant —
+/// **no read is issued while a page-store lock is held** — is a counted fact.
+/// It replaces a wall-clock ratio that could not distinguish a convoy from a
+/// busy machine.
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+fn enter_page_store_guard() {
+    scaling_counters::add(&scaling_counters::BITMAP_STORE_GUARDS_HELD, 1);
+}
+
+#[cfg(not(any(test, feature = "scalable-fault-injection")))]
+fn enter_page_store_guard() {}
+
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+fn leave_page_store_guard() {
+    scaling_counters::sub(&scaling_counters::BITMAP_STORE_GUARDS_HELD, 1);
+}
+
+#[cfg(not(any(test, feature = "scalable-fault-injection")))]
+fn leave_page_store_guard() {}
+
+/// Counts one positional matrix-region read, and separately counts it as a
+/// violation when a page-store lock is held while it is issued.
+///
+/// The whole matrix region — cell payloads, per-cell checksums, aux ranges,
+/// bitmap pages and page digests — is read through
+/// [`MatrixRegionReader::read_exact_at`], so this sees every read the matrix
+/// performs. What it does not see is I/O issued through any other handle:
+/// `SnapshotFile` reads of the *record* region, and the writer's
+/// cursor-relative `&mut File` writes.
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+fn count_matrix_region_read() {
+    scaling_counters::add(&scaling_counters::MATRIX_REGION_READS, 1);
+    if scaling_counters::get_always(&scaling_counters::BITMAP_STORE_GUARDS_HELD) != 0 {
+        scaling_counters::add(&scaling_counters::MATRIX_REGION_READS_UNDER_LOCK, 1);
+    }
+}
+
+#[cfg(not(any(test, feature = "scalable-fault-injection")))]
+fn count_matrix_region_read() {}
 
 /// Tracks the live demand-cache total, so criterion (B)'s "residency tracks the
 /// working set, in both directions" is a measured number rather than a claim.
@@ -1621,6 +1686,63 @@ impl MatrixRecoveryReport {
         scaling_counters::get(&scaling_counters::LAZY_FAULT_BYTES_READ)
     }
 
+    /// Positional matrix-region reads issued on this thread.
+    ///
+    /// Every byte the matrix reads — cell payloads, per-cell checksums, aux
+    /// ranges, commit-map pages and page digests — is fetched by one
+    /// `read_exact_at`, and each of those counts one here. A test uses this to
+    /// prove it actually exercised the read path before believing
+    /// [`MatrixRecoveryReport::matrix_region_reads_under_bitmap_lock`]: zero
+    /// violations out of zero reads is not evidence of anything.
+    pub fn matrix_region_reads() -> u64 {
+        scaling_counters::get(&scaling_counters::MATRIX_REGION_READS)
+    }
+
+    /// Of those reads, the number issued while this thread held a commit-map
+    /// page-store lock. **The contract is that this is always zero.**
+    ///
+    /// This is the deterministic form of criterion (C)'s convoy check. Demand
+    /// loading gave each bitmap a `Mutex` over its page map so a fault-in can
+    /// happen under `&self`; the property that keeps concurrent readers from
+    /// serialising is not that the lock is absent but that it is never held
+    /// across I/O. A nonzero value here is precisely a reader parked on a
+    /// `pread` while holding a lock every other reader of the same category
+    /// needs.
+    ///
+    /// What it catches: any read — fault-in, aggregate, cell payload, checksum,
+    /// aux — issued inside a page-store critical section, on any platform, at
+    /// any machine load, from one thread. It needs no second thread to observe
+    /// a violation, and no quiet machine.
+    ///
+    /// What it does *not* catch: contention that is genuine but lock-free (the
+    /// Windows file-object convoy `MatrixReadPool` exists to break leaves this
+    /// at zero), a lock held across a long *computation* rather than I/O, I/O
+    /// issued through a handle other than the matrix region reader, and any
+    /// question of throughput. Scaling is still worth measuring; it is just not
+    /// assertable on a shared runner.
+    pub fn matrix_region_reads_under_bitmap_lock() -> u64 {
+        scaling_counters::get(&scaling_counters::MATRIX_REGION_READS_UNDER_LOCK)
+    }
+
+    /// Commit-map page-store locks this thread holds at this instant.
+    ///
+    /// Zero at every point outside `varve-core`'s own matrix code, so a test can
+    /// assert it after a run and know the depth it audited was balanced rather
+    /// than leaked by an early return.
+    pub fn matrix_bitmap_store_guards_held() -> u64 {
+        scaling_counters::get(&scaling_counters::BITMAP_STORE_GUARDS_HELD)
+    }
+
+    /// Resets the two lock-audit totals for the calling thread.
+    ///
+    /// Deliberately leaves `matrix_bitmap_store_guards_held` alone: that is a
+    /// live depth, not a total, and zeroing it mid-flight would make the audit
+    /// lie in the one direction that matters.
+    pub fn reset_matrix_lock_audit_counters() {
+        scaling_counters::set(&scaling_counters::MATRIX_REGION_READS, 0);
+        scaling_counters::set(&scaling_counters::MATRIX_REGION_READS_UNDER_LOCK, 0);
+    }
+
     /// Resets the two demand-loading counters, so a test can measure one phase
     /// of a session rather than its total.
     pub fn reset_matrix_lazy_counters() {
@@ -1769,11 +1891,23 @@ struct LazyBacking {
 ///
 /// It is taken only for `O(1)` map operations and is **never held across
 /// I/O** — see [`SparseBitmap::faulted_store`], which drops it for the whole
-/// of the fault-in read. So concurrent readers serialise on a hash lookup, not
-/// on a `pread`. Stated because "there is no lock in the matrix read path" was
-/// true of round 16 and is no longer true of this one: there is one, it is
-/// per-bitmap, and the wall-clock scaling contract in
-/// `crates/varve/tests/matrix_concurrent_reads.rs` is what holds it honest.
+/// of the fault-in read, and [`SparseBitmap::ones_total`], which takes it once
+/// per page rather than once per aggregate. So concurrent readers serialise on
+/// a hash lookup, not on a `pread`. Stated because "there is no lock in the
+/// matrix read path" was true of round 16 and is no longer true of this one:
+/// there is one, and it is per-bitmap.
+///
+/// That "never" is *counted*, not argued: acquiring the lock goes through
+/// [`PageStoreGuard`], every matrix read goes through
+/// [`MatrixRegionReader::read_exact_at`], and the second increments a violation
+/// counter if the first is outstanding. `page_store_lock_audit_tests` below
+/// asserts the counter is zero for the fault-in and the aggregate, and asserts
+/// separately that it is *not* zero when a read is deliberately issued under
+/// the lock, so a passing run means the detector was live. The wall-clock ratio
+/// that used to stand in for this is now a printed measurement in
+/// `crates/varve/tests/matrix_concurrent_reads.rs`, because two runs of it on
+/// identical code differ by 1.4x versus 2.1x on a shared CI runner and a
+/// threshold that survives that noise would also pass a real convoy.
 #[derive(Debug, Default)]
 struct PageStore {
     pages: HashMap<u64, BitmapPage>,
@@ -1815,6 +1949,57 @@ impl PageStore {
             return true;
         }
         false
+    }
+}
+
+/// A held page-store lock.
+///
+/// A newtype over `MutexGuard` for exactly one reason: it makes "this thread is
+/// holding a page-store lock right now" observable, which turns the read path's
+/// concurrency contract into something a test can *count* rather than time.
+/// The contract is
+///
+/// > no matrix-region read is issued while a page-store lock is held,
+///
+/// and it is what makes concurrent readers scale: they contend for `O(1)` hash
+/// lookups, never for each other's `pread`. `matrix.rs`'s own
+/// `page_store_lock_audit_tests` assert it directly, on every platform and
+/// under any machine load, which a wall-clock ratio on a shared CI runner
+/// cannot do.
+///
+/// The cost, stated exactly: one field, no extra state, and two calls whose
+/// bodies are empty without `cfg(test)` or the `scalable-fault-injection`
+/// feature. What remains in an ordinary build is a newtype with an empty `Drop`
+/// — not zero source, but zero work, and no lock is held for one instruction
+/// longer than the `MutexGuard` alone would be.
+struct PageStoreGuard<'a> {
+    inner: MutexGuard<'a, PageStore>,
+}
+
+impl<'a> PageStoreGuard<'a> {
+    fn new(inner: MutexGuard<'a, PageStore>) -> Self {
+        enter_page_store_guard();
+        Self { inner }
+    }
+}
+
+impl std::ops::Deref for PageStoreGuard<'_> {
+    type Target = PageStore;
+
+    fn deref(&self) -> &PageStore {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for PageStoreGuard<'_> {
+    fn deref_mut(&mut self) -> &mut PageStore {
+        &mut self.inner
+    }
+}
+
+impl Drop for PageStoreGuard<'_> {
+    fn drop(&mut self) {
+        leave_page_store_guard();
     }
 }
 
@@ -1967,8 +2152,8 @@ impl SparseBitmap {
     /// leaves the store consistent — every mutation is a completed
     /// prepare-then-commit pair — so refusing every later read would convert a
     /// panic elsewhere into permanent unavailability of the matrix.
-    fn store(&self) -> MutexGuard<'_, PageStore> {
-        self.store.lock().unwrap_or_else(|err| err.into_inner())
+    fn store(&self) -> PageStoreGuard<'_> {
+        PageStoreGuard::new(self.store.lock().unwrap_or_else(|err| err.into_inner()))
     }
 
     /// The page store under an exclusive borrow, which takes no lock.
@@ -2004,7 +2189,7 @@ impl SparseBitmap {
     /// authenticated against its own stored digest before installation, and
     /// cached pages are write-through, so two loads of one page either agree or
     /// both fail.
-    fn faulted_store(&self, page: u64) -> Result<MutexGuard<'_, PageStore>> {
+    fn faulted_store(&self, page: u64) -> Result<PageStoreGuard<'_>> {
         let Some(backing) = self.backing.as_ref() else {
             return Ok(self.store());
         };
@@ -2521,17 +2706,37 @@ impl SparseBitmap {
     /// pass use. Without that this was the one place a *count* could be derived
     /// from bytes nothing had checked — an aggregate is an answer like any other,
     /// and a damaged page must refuse rather than contribute a number.
+    ///
+    /// # The lock is taken per page, not per aggregate
+    ///
+    /// This used to hold one [`PageStoreGuard`] for the whole loop, which meant
+    /// `O(live pages)` of `pread` under a lock every concurrent reader of the
+    /// same category needs for its own `O(1)` lookups — a convoy of exactly the
+    /// kind [`PageStore`] documents it does not create, reachable from a `&self`
+    /// entry point (`resume_signal`). It now takes the lock once per page and
+    /// releases it before that page's read.
+    ///
+    /// Re-acquiring per page observes the same map a single acquisition would
+    /// have: every mutator takes `&mut self`, so no mutation can be in flight
+    /// while this `&self` borrow exists. A concurrent *reader* may fault a page
+    /// in mid-loop, but each page is still counted exactly once, and from
+    /// memory or from disk it is the same authenticated value — demand-cached
+    /// pages are write-through.
     fn ones_total(&self) -> Result<u64> {
         let Some(backing) = self.backing.as_ref() else {
             return Ok(self.ones());
         };
-        let store = self.store();
         let reader = MatrixRegionReader::new(backing.file.as_ref());
         let mut total = 0u64;
         let mut buffer: Option<PageVerifyBuffer> = None;
         for page in self.indexed_pages.keys().copied() {
-            if let Some(held) = store.pages.get(&page) {
-                total = total.saturating_add(held.ones);
+            // Bound to a `let` on purpose: the guard is a temporary of *this*
+            // statement and is released at the semicolon, so it cannot still be
+            // held at the read below whatever the edition's temporary-scope
+            // rules are.
+            let resident_ones = self.store().pages.get(&page).map(|held| held.ones);
+            if let Some(ones) = resident_ones {
+                total = total.saturating_add(ones);
                 continue;
             }
             let len = self.page_len(page)?;
@@ -8862,6 +9067,173 @@ mod sparse_bitmap_tests {
             );
             assert!(!page_bytes_are_authentic(&live, live_crc, 2).expect("unknown state"));
         }
+    }
+}
+
+/// Criterion (C), stated as a counted invariant instead of a wall clock.
+///
+/// The property that keeps concurrent matrix readers from serialising is not
+/// that there is no lock in the read path — since demand loading there is one,
+/// a `Mutex` over each bitmap's page map — but that **it is never held across
+/// I/O**. These tests assert that directly: they run the read paths that fault
+/// pages in and that aggregate over them, and require that the number of reads
+/// issued while a page-store lock was held is zero while the number of reads
+/// issued at all is not.
+///
+/// Deliberately here and not only in `crates/varve/tests/`: the counters are
+/// compiled under `cfg(test)` as well as under the `scalable-fault-injection`
+/// feature, so this module is the copy of the gate that runs in *every* feature
+/// configuration, including the default one. The integration-test copy exercises
+/// the same invariant through the public multi-threaded read path but needs the
+/// feature to see the counters.
+///
+/// These are single-threaded on purpose. A violation is a property of one
+/// thread's control flow — a read issued inside a critical section — so it is
+/// observable without a second thread, without contention, and without a quiet
+/// machine. That is the whole reason to prefer this over a ratio.
+#[cfg(test)]
+mod page_store_lock_audit_tests {
+    use super::*;
+
+    /// Four live pages, so an aggregate has several reads to perform and a
+    /// one-page cache has something to evict.
+    const PAGES: u64 = 4;
+
+    fn reads() -> u64 {
+        scaling_counters::get_always(&scaling_counters::MATRIX_REGION_READS)
+    }
+
+    fn reads_under_lock() -> u64 {
+        scaling_counters::get_always(&scaling_counters::MATRIX_REGION_READS_UNDER_LOCK)
+    }
+
+    fn guards_held() -> u64 {
+        scaling_counters::get_always(&scaling_counters::BITMAP_STORE_GUARDS_HELD)
+    }
+
+    fn reset() {
+        scaling_counters::set(&scaling_counters::MATRIX_REGION_READS, 0);
+        scaling_counters::set(&scaling_counters::MATRIX_REGION_READS_UNDER_LOCK, 0);
+    }
+
+    /// A lazily backed bitmap over a real file, every page live with one set
+    /// bit, and `cache_limit` bytes of demand cache.
+    ///
+    /// `digest_base: None`: the subject is locking, and without digests this
+    /// holds in builds without the `integrity` feature too.
+    fn backed_bitmap(cache_limit: u64) -> (tempfile::TempDir, Arc<File>, SparseBitmap) {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("commit-map");
+        let mut bytes = vec![0u8; (PAGES * BITMAP_PAGE_BYTES) as usize];
+        for page in 0..PAGES {
+            bytes[(page * BITMAP_PAGE_BYTES) as usize] = 0b0000_0001;
+        }
+        std::fs::write(&path, &bytes).expect("write map");
+        let file = Arc::new(File::open(&path).expect("open map"));
+        let mut map = SparseBitmap::new(PAGES * BITMAP_PAGE_BYTES * 8).expect("bitmap");
+        map.backing = Some(LazyBacking {
+            file: Arc::clone(&file),
+            pool: Arc::new(MatrixReadPool::new()),
+            base_offset: 0,
+            digest_base: None,
+            cache_limit,
+        });
+        for page in 0..PAGES {
+            map.indexed_pages.insert(page, page + 1);
+            map.index_slots.push(page);
+        }
+        (directory, file, map)
+    }
+
+    /// The first bit of `page`, which `backed_bitmap` leaves set.
+    fn first_bit_of(page: u64) -> u64 {
+        page * BITMAP_PAGE_BYTES * 8
+    }
+
+    /// Demand loading: `faulted_store` drops the lock for the whole of
+    /// `load_page`, so a fault-in read is never issued under it.
+    ///
+    /// The configuration is hostile on purpose — a one-page cache against four
+    /// live pages, so all but the first visit to a page misses, evicts, and
+    /// enters the guarded window again.
+    #[test]
+    fn a_fault_in_reads_without_holding_the_page_store_lock() {
+        let (_directory, _file, map) = backed_bitmap(BITMAP_PAGE_BYTES);
+        reset();
+        for round in 0..3 {
+            for page in 0..PAGES {
+                assert!(
+                    map.get(first_bit_of(page)).expect("committed bit"),
+                    "round {round}, page {page}"
+                );
+            }
+        }
+        assert!(
+            reads() >= PAGES * 3,
+            "the cache absorbed the faults, so nothing was audited: {} reads",
+            reads()
+        );
+        assert_eq!(
+            reads_under_lock(),
+            0,
+            "a fault-in `pread` was issued while the page store was locked; every other \
+             reader of this bitmap would queue behind it"
+        );
+        assert_eq!(guards_held(), 0, "a page-store guard outlived its scope");
+    }
+
+    /// The whole-map aggregate: `O(live pages)` of reads, so holding the lock
+    /// once for the loop would park every concurrent reader of the category for
+    /// the length of the scan. Reachable under `&self` through `resume_signal`,
+    /// which is what made it worth fixing rather than documenting.
+    #[test]
+    fn an_aggregate_reads_without_holding_the_page_store_lock() {
+        let (_directory, _file, map) = backed_bitmap(BITMAP_PAGE_BYTES * PAGES);
+        reset();
+        assert_eq!(map.ones_total().expect("aggregate"), PAGES);
+        assert!(
+            reads() >= PAGES,
+            "the aggregate read fewer pages than the map has: {} reads",
+            reads()
+        );
+        assert_eq!(
+            reads_under_lock(),
+            0,
+            "`ones_total` held the page-store lock across its reads"
+        );
+        assert_eq!(guards_held(), 0, "a page-store guard outlived its scope");
+    }
+
+    /// The audit itself, which the two tests above are worthless without: a
+    /// counter that can never rise proves nothing by staying at zero.
+    ///
+    /// This is the shape of the defect they forbid — a read issued inside the
+    /// critical section — written out deliberately, and it must be counted.
+    #[test]
+    fn the_audit_counts_a_read_issued_under_the_lock() {
+        let (_directory, file, map) = backed_bitmap(BITMAP_PAGE_BYTES);
+        reset();
+        let reader = MatrixRegionReader::new(file.as_ref());
+        let mut byte = [0u8; 1];
+        {
+            let _guard = map.store();
+            assert_eq!(guards_held(), 1, "the guard did not register itself");
+            reader.read_exact_at(0, &mut byte).expect("read under lock");
+            assert_eq!(
+                reads_under_lock(),
+                1,
+                "the audit did not notice a read issued under the page-store lock, so its \
+                 zero elsewhere means nothing"
+            );
+        }
+        assert_eq!(guards_held(), 0, "the guard did not release its count");
+        reader.read_exact_at(0, &mut byte).expect("read outside lock");
+        assert_eq!(reads(), 2, "both reads should be counted");
+        assert_eq!(
+            reads_under_lock(),
+            1,
+            "a read outside the lock was counted as a violation"
+        );
     }
 }
 

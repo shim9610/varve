@@ -348,11 +348,10 @@ where
     // plain IO failure that would leave a caller unable to tell what is on
     // disk.
     let sidecar = state_sidecar_path(&path);
-    let published_identity = OpenOptions::new()
-        .read(true)
-        .open(&sidecar)
-        .ok()
-        .and_then(|file| opened_file_identity(&file).ok());
+    // Held open, not merely stat-ed: the retirement below deletes by pathname
+    // and can only tell "still my sidecar" from "somebody else's file at the
+    // same name" while this handle keeps the identity from being reissued.
+    let published = crate::file::PinnedObject::open(&sidecar).ok();
     let republished_identity = OpenOptions::new()
         .read(true)
         .open(&path)
@@ -360,8 +359,7 @@ where
         .and_then(|file| opened_file_identity(&file).ok());
     if republished_identity.as_deref() != Some(snapshot_identity.as_slice()) {
         return Err(state_error(retire_sidecar_for_replaced_primary(
-            &sidecar,
-            published_identity.as_deref(),
+            &sidecar, published,
         )));
     }
     drop(verified);
@@ -1787,9 +1785,9 @@ pub(crate) fn set_publication_interposition(primary: &Path, hook: Box<dyn FnOnce
 /// process that replaces the primary without it is outside that contract.
 pub(crate) fn retire_sidecar_for_replaced_primary(
     sidecar: &Path,
-    published_identity: Option<&[u8]>,
+    published: Option<crate::file::PinnedObject>,
 ) -> crate::disk_index::DiskIndexError {
-    let Some(published_identity) = published_identity else {
+    let Some(published) = published else {
         // The sidecar's own identity could not be captured, so removing it
         // would be a deletion by unverified pathname — the very thing this
         // helper exists to avoid. Report what the caller must clean up.
@@ -1799,7 +1797,11 @@ pub(crate) fn retire_sidecar_for_replaced_primary(
              reusing the file",
         );
     };
-    match crate::diagnostics::remove_path_if_same_object(sidecar, published_identity) {
+    // A pin, not identity bytes: the removal compares inode numbers, and an
+    // inode number freed between the capture and the unlink is reissued to
+    // whatever is created next, so bytes copied out of a closed handle would
+    // let this delete a sidecar it never published.
+    match crate::diagnostics::remove_path_if_same_object(sidecar, &published) {
         // Removed, or already replaced by whoever else is writing this
         // pathname: either way this call left no sidecar of its own behind.
         crate::diagnostics::ObjectRemoval::Removed
