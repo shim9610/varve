@@ -9227,7 +9227,9 @@ mod page_store_lock_audit_tests {
             );
         }
         assert_eq!(guards_held(), 0, "the guard did not release its count");
-        reader.read_exact_at(0, &mut byte).expect("read outside lock");
+        reader
+            .read_exact_at(0, &mut byte)
+            .expect("read outside lock");
         assert_eq!(reads(), 2, "both reads should be counted");
         assert_eq!(
             reads_under_lock(),

@@ -607,7 +607,10 @@ fn a_failed_open_on_an_invalid_header_releases_the_writer_lock() -> Result<()> {
     // nothing about the refusal may outlive it.
     fs::write(&path, &original)?;
     let reopened = VarveFile::open(spec(), &path)?;
-    assert_eq!(reopened.blocks::<LockRecord>()?.get(0)?, Some(LockRecord(3)));
+    assert_eq!(
+        reopened.blocks::<LockRecord>()?.get(0)?,
+        Some(LockRecord(3))
+    );
     Ok(())
 }
 
@@ -644,7 +647,10 @@ fn a_failed_open_on_a_version_mismatch_releases_the_writer_lock() -> Result<()> 
     assert_no_writer_claim_left(&path, "version mismatch", || VarveFile::open(future, &path));
 
     let reopened = VarveFile::open(spec(), &path)?;
-    assert_eq!(reopened.blocks::<LockRecord>()?.get(0)?, Some(LockRecord(4)));
+    assert_eq!(
+        reopened.blocks::<LockRecord>()?.get(0)?,
+        Some(LockRecord(4))
+    );
     Ok(())
 }
 
@@ -669,7 +675,10 @@ fn a_failed_open_on_a_refused_limit_releases_the_writer_lock() -> Result<()> {
     assert_no_writer_claim_left(&path, "refused limit", || VarveFile::open(refusing, &path));
 
     let reopened = VarveFile::open(spec(), &path)?;
-    assert_eq!(reopened.blocks::<LockRecord>()?.get(0)?, Some(LockRecord(5)));
+    assert_eq!(
+        reopened.blocks::<LockRecord>()?.get(0)?,
+        Some(LockRecord(5))
+    );
     Ok(())
 }
 
@@ -708,7 +717,10 @@ fn a_failed_open_on_a_schema_hash_mismatch_releases_the_writer_lock() -> Result<
     });
 
     let reopened = VarveFile::open(spec(), &path)?;
-    assert_eq!(reopened.blocks::<LockRecord>()?.get(0)?, Some(LockRecord(9)));
+    assert_eq!(
+        reopened.blocks::<LockRecord>()?.get(0)?,
+        Some(LockRecord(9))
+    );
     Ok(())
 }
 

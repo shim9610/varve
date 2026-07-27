@@ -2718,7 +2718,9 @@ impl VarveFile {
         // Everything past the acquisition runs inside `with_writer_lock`, so a
         // failure gives the claim back before the error propagates instead of at
         // scope exit; see `release_writer_lock_after_failure`.
-        with_writer_lock(lock, |lock| Self::create_locked(spec, path, exclusive, lock))
+        with_writer_lock(lock, |lock| {
+            Self::create_locked(spec, path, exclusive, lock)
+        })
     }
 
     fn create_locked(
@@ -11116,15 +11118,8 @@ fn unlock_exclusive_range(file: &File, offset: u64) -> std::io::Result<()> {
     // SAFETY: mirrors `try_lock_exclusive_range` - `file` is open for the
     // duration, the OVERLAPPED value is initialized for the same synchronous
     // one-byte range, and no pointer outlives the call.
-    let unlocked = unsafe {
-        UnlockFileEx(
-            file.as_raw_handle() as HANDLE,
-            0,
-            1,
-            0,
-            &mut overlapped,
-        )
-    };
+    let unlocked =
+        unsafe { UnlockFileEx(file.as_raw_handle() as HANDLE, 0, 1, 0, &mut overlapped) };
     if unlocked != 0 {
         return Ok(());
     }

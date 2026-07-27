@@ -459,12 +459,9 @@ impl FormatSelfTest {
         // pathname already names something else, `open_verified` refuses and
         // cleanup skips the native file exactly as an uncapturable identity
         // makes it skip.
-        let created = writer
-            .native_object_identity()
-            .ok()
-            .and_then(|identity| {
-                crate::file::PinnedObject::open_verified(&self.path, &identity).ok()
-            });
+        let created = writer.native_object_identity().ok().and_then(|identity| {
+            crate::file::PinnedObject::open_verified(&self.path, &identity).ok()
+        });
 
         let mut write_failed = false;
         for case in &self.cases {
@@ -1508,8 +1505,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("private temp directory");
         let path = directory.path().join("interposed.vrv");
         std::fs::write(&path, b"created by this run").expect("create the artifact");
-        let pinned =
-            crate::file::PinnedObject::open(&path).expect("pin the created artifact");
+        let pinned = crate::file::PinnedObject::open(&path).expect("pin the created artifact");
 
         let target = path.clone();
         set_interposition(Box::new(move || {
@@ -1536,8 +1532,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("private temp directory");
         let path = directory.path().join("owned.vrv");
         std::fs::write(&path, b"created by this run").expect("create the artifact");
-        let pinned =
-            crate::file::PinnedObject::open(&path).expect("pin the created artifact");
+        let pinned = crate::file::PinnedObject::open(&path).expect("pin the created artifact");
 
         assert_eq!(
             remove_path_if_same_object(&path, &pinned),
@@ -1554,8 +1549,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("private temp directory");
         let path = directory.path().join("swapped.vrv");
         std::fs::write(&path, b"created by this run").expect("create the artifact");
-        let pinned =
-            crate::file::PinnedObject::open(&path).expect("pin the created artifact");
+        let pinned = crate::file::PinnedObject::open(&path).expect("pin the created artifact");
         std::fs::remove_file(&path).expect("unlink the created object");
         std::fs::write(&path, b"someone else's file").expect("bind another object");
 
@@ -1578,8 +1572,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("private temp directory");
         let path = directory.path().join("recycled.vrv");
         std::fs::write(&path, b"created by this run").expect("create the artifact");
-        let pinned =
-            crate::file::PinnedObject::open(&path).expect("pin the created artifact");
+        let pinned = crate::file::PinnedObject::open(&path).expect("pin the created artifact");
 
         std::fs::remove_file(&path).expect("unlink the pinned object");
         std::fs::write(&path, b"someone else's file").expect("bind another object");
@@ -1622,8 +1615,7 @@ mod tests {
         // rebind between the pin and the unlink produces.
         let elsewhere = directory.path().join("elsewhere");
         std::fs::write(&elsewhere, b"a different object").expect("create another object");
-        let foreign =
-            crate::file::PinnedObject::open(&elsewhere).expect("pin the other object");
+        let foreign = crate::file::PinnedObject::open(&elsewhere).expect("pin the other object");
 
         assert_eq!(
             remove_path_if_same_object(&marker, &foreign),
@@ -1653,8 +1645,7 @@ mod tests {
             .expect("relax the directory permissions");
         let path = shared.join("artifact.vrv");
         std::fs::write(&path, b"created by this run").expect("create the artifact");
-        let pinned =
-            crate::file::PinnedObject::open(&path).expect("pin the created artifact");
+        let pinned = crate::file::PinnedObject::open(&path).expect("pin the created artifact");
 
         assert!(matches!(
             remove_path_if_same_object(&path, &pinned),
