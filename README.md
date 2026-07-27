@@ -233,6 +233,43 @@ the assurance those notes record — together with its limits — is summarised 
 [Status](#status) below and in
 [Known Limitations §6](docs/known-limitations.md#6-not-verified).
 
+## Add It To Your Project
+
+Varve is **not on crates.io**, so `cargo add varve` will not find it. Depend on
+the git repository and pin a tag:
+
+```toml
+[dependencies]
+varve = { git = "https://github.com/shim9610/varve", tag = "v0.5.0" }
+```
+
+Pin the tag rather than tracking `main`: `main` moves, and this project is at a
+stage where it moves in ways that change behaviour at an unchanged signature —
+see [API Changes](docs/api-changes.md).
+
+Requires Rust **1.95** or newer (`rust-version = "1.95"`).
+
+Every capability beyond the base format is an optional feature, off by default;
+a build that enables none is the smallest one. Enable what a format declaration
+actually asks for:
+
+```toml
+varve = { git = "https://github.com/shim9610/varve", tag = "v0.5.0",
+          features = ["integrity", "compression-zstd"] }
+```
+
+| Feature | Turns on |
+| --- | --- |
+| `integrity` | per-record and per-page checksum verification |
+| `compression-zstd` | the zstd codec for compressed blocks |
+| `mmap` | memory-mapped reads |
+| `zero-copy` | borrowed reads that avoid a copy out of the page cache — also enables `mmap` |
+| `high-cardinality-dev` | the experimental stream/indexed APIs — see [Scalable I/O](docs/scalable-io.md) |
+| `scalable-fault-injection` | test-only fault injection; also enables `high-cardinality-dev`, and is not for production builds |
+
+[Format Author Guide](docs/format-author-guide.md) says which declaration
+choices require which feature, and what each costs.
+
 ## Minimal Shape
 
 ```rust
