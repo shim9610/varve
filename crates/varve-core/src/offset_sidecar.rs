@@ -35,10 +35,24 @@
 //! all. Enabling a derived cache would be a migration. It must not be.
 //!
 //! **C2 — every divergence between the two files is detectable and repairable
-//! without loss.** Consistency is not maintained by keeping them in step at
+//! without loss.**
+//!
+//! Read that as one file occupying two spaces, not as two files to be
+//! reconciled. There is exactly one writer, and it maintains both; nothing here
+//! is a cross-file agreement to be verified between equals. The checks below
+//! exist because a *crash*, a *copy*, or a *deletion* can separate the two
+//! spaces behind the writer's back — not because the two could legitimately
+//! disagree while the writer is running.
+//!
+//! Getting that backwards is what produces machinery this does not need. It is
+//! also why the revision lives here rather than in the native file header:
+//! [`SidecarHeader::revision`] is the writer's own state, consumed by readers,
+//! not a token two parties compare.
+//!
+//! Consistency is therefore not maintained by keeping the spaces in step at
 //! every instant; that would need a two-phase commit across two objects on
 //! every append, and the append hot path forbids it. Instead every way they can
-//! diverge has a detection and a repair, and none of them is an error:
+//! separate has a detection and a repair, and none of them is an error:
 //!
 //! | divergence | detected by | repair |
 //! | --- | --- | --- |
@@ -116,8 +130,9 @@ const OFF_FINGERPRINT: usize = OFF_SCHEMA_HASH + 8;
 const OFF_COVERED_MAIN_LEN: usize = OFF_FINGERPRINT + 32;
 const OFF_COVERED_ELEMENTS: usize = OFF_COVERED_MAIN_LEN + 8;
 const OFF_COVERED_SEQUENCE: usize = OFF_COVERED_ELEMENTS + 8;
+const OFF_REVISION: usize = OFF_COVERED_SEQUENCE + 8;
 /// Byte length of the header prefix the check value covers.
-const CHECKED_PREFIX_LEN: usize = OFF_COVERED_SEQUENCE + 8;
+const CHECKED_PREFIX_LEN: usize = OFF_REVISION + 8;
 
 /// FNV-1a over the header prefix.
 ///
@@ -194,9 +209,26 @@ pub(crate) struct SidecarHeader {
     pub(crate) covered_main_len: u64,
     /// Number of valid elements in the array.
     pub(crate) covered_elements: u64,
-    /// `sequence` of the last indexed record, for diagnostics and for the
-    /// stale-generation check after an atomic republish.
+    /// `sequence` of the last indexed record, for diagnostics.
     pub(crate) covered_sequence: u64,
+    /// Revision of the array's *content*, maintained by the writer.
+    ///
+    /// The two spaces are one file with one writer, so this is not a
+    /// cross-file agreement to be verified — it is state the writer keeps, and
+    /// the reader consumes.
+    ///
+    /// Within a revision the array is **append-only**: `covered_elements` only
+    /// grows and element `i` is immutable once written. That is what lets a
+    /// reader hold a view of a prefix and an in-memory increment beyond it
+    /// without re-checking anything on any read.
+    ///
+    /// The writer bumps it exactly when a record offset that was already
+    /// published stops being valid — which is one operation,
+    /// `rebind_published_generation`, reached only from the two replace paths
+    /// that rewrite the whole file and publish it atomically. A reader that
+    /// sees a bump discards its increment and resyncs; nothing smaller is
+    /// salvageable, because every offset moved.
+    pub(crate) revision: u64,
 }
 
 impl SidecarHeader {
@@ -216,6 +248,7 @@ impl SidecarHeader {
         put(&self.covered_main_len.to_le_bytes(), &mut at);
         put(&self.covered_elements.to_le_bytes(), &mut at);
         put(&self.covered_sequence.to_le_bytes(), &mut at);
+        put(&self.revision.to_le_bytes(), &mut at);
         debug_assert_eq!(at, CHECKED_PREFIX_LEN);
         let check = header_check(&bytes[..CHECKED_PREFIX_LEN]);
         bytes[CHECKED_PREFIX_LEN..CHECKED_PREFIX_LEN + 8].copy_from_slice(&check.to_le_bytes());
@@ -265,6 +298,7 @@ impl SidecarHeader {
             covered_main_len: u64_at(OFF_COVERED_MAIN_LEN)?,
             covered_elements: u64_at(OFF_COVERED_ELEMENTS)?,
             covered_sequence: u64_at(OFF_COVERED_SEQUENCE)?,
+            revision: u64_at(OFF_REVISION)?,
         })
     }
 
@@ -285,11 +319,21 @@ impl SidecarHeader {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SidecarState {
     /// `covered_main_len == main_len`. Adopt as is; no scan.
-    Current { elements: u64 },
+    Current { elements: u64, revision: u64 },
     /// The sidecar describes a prefix. Scan forward from `from_offset`.
-    Behind { elements: u64, from_offset: u64 },
+    ///
+    /// A reader cannot perform this catch-up against the file -- it must not
+    /// write -- but it can perform it *in memory*: read the covered prefix,
+    /// scan only the uncovered delta, and hold that increment for its own
+    /// lifetime. That is why this carries the revision: the increment is only
+    /// valid while the revision it was built against still stands.
+    Behind {
+        elements: u64,
+        revision: u64,
+        from_offset: u64,
+    },
     /// Absent, foreign, torn, or ahead of a main file that was truncated.
-    /// Rebuild from scratch by full scan — today's `scan_on_open` cost.
+    /// Rebuild from scratch by full scan -- today's `scan_on_open` cost.
     Rebuild,
 }
 
@@ -300,6 +344,21 @@ impl SidecarState {
             Self::Current { .. } => 0,
             Self::Behind { from_offset, .. } => main_len.saturating_sub(*from_offset),
             Self::Rebuild => main_len,
+        }
+    }
+
+    /// The revision this state was observed at, if any was readable.
+    ///
+    /// A reader captures this beside its in-memory increment. On a later
+    /// resync it re-reads the header: an equal revision means the array only
+    /// grew, so the increment is still valid and can be extended; a different
+    /// one means every offset moved, so the increment is discarded whole.
+    /// There is nothing in between -- `rebind_published_generation` rewrites
+    /// the entire file.
+    pub(crate) fn revision(&self) -> Option<u64> {
+        match self {
+            Self::Current { revision, .. } | Self::Behind { revision, .. } => Some(*revision),
+            Self::Rebuild => None,
         }
     }
 }
@@ -318,6 +377,12 @@ pub(crate) struct OffsetSidecar {
     native_fingerprint: [u8; 32],
     /// Elements durably in the array, buffer excluded.
     written_elements: u64,
+    /// The revision this handle is writing, or the one it read.
+    ///
+    /// Held rather than passed per call so `publish` cannot be given a value
+    /// that disagrees with what `bump_revision` established -- the two spaces
+    /// are one file with one writer, and the revision is that writer's state.
+    revision: u64,
     buffer: Vec<u64>,
     /// Set when a write failed. A failed sidecar stops updating for the
     /// session and the next open catches up by scan; it never fails an append.
@@ -397,6 +462,7 @@ impl OffsetSidecar {
             schema_hash,
             native_fingerprint,
             written_elements: 0,
+            revision: 0,
             buffer: Vec::new(),
             // A read-only sidecar is permanently in the state a failed write
             // leaves a writable one in: readable, never written. Reusing the
@@ -405,8 +471,13 @@ impl OffsetSidecar {
             disabled: access == SidecarAccess::ReadOnly,
         };
         let state = sidecar.classify(spec, main_len)?;
-        if let SidecarState::Current { elements } | SidecarState::Behind { elements, .. } = state {
+        if let SidecarState::Current { elements, revision }
+        | SidecarState::Behind {
+            elements, revision, ..
+        } = state
+        {
             sidecar.written_elements = elements;
+            sidecar.revision = revision;
         }
         Ok(Some((sidecar, state)))
     }
@@ -474,19 +545,41 @@ impl OffsetSidecar {
         if header.covered_main_len == main_len {
             return Ok(SidecarState::Current {
                 elements: header.covered_elements,
+                revision: header.revision,
             });
         }
         Ok(SidecarState::Behind {
             elements: header.covered_elements,
+            revision: header.revision,
             from_offset: header.covered_main_len,
         })
     }
 
-    /// Discards the array and starts over. Used when the state is
-    /// [`SidecarState::Rebuild`] and the caller has scanned the main file.
+    /// Discards the array and starts over, on a new revision.
+    ///
+    /// Every offset the old array held is being replaced, so this is exactly
+    /// the event a reader must not survive silently: the bump is what tells it
+    /// to drop its increment rather than extend it.
     pub(crate) fn reset(&mut self) {
         self.written_elements = 0;
         self.buffer.clear();
+        self.bump_revision();
+    }
+
+    /// Declares that every already-published offset has stopped being valid.
+    ///
+    /// The writer calls this from `rebind_published_generation` -- the one
+    /// operation in the crate that moves records that were already indexed,
+    /// reached only from the two replace paths that rewrite the whole file and
+    /// publish it atomically. Appending never calls it, because appending
+    /// invalidates nothing.
+    pub(crate) fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// The revision a reader captured, or the one a writer is writing.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Appends one record offset.
@@ -574,6 +667,7 @@ impl OffsetSidecar {
             covered_main_len,
             covered_elements: self.written_elements,
             covered_sequence,
+            revision: self.revision,
         };
         if write_all_at(&self.file, &header.encode(), 0).is_err() {
             self.disabled = true;
@@ -716,6 +810,7 @@ mod tests {
             covered_main_len: 4096,
             covered_elements: 12,
             covered_sequence: 11,
+            revision: 3,
         }
     }
 
@@ -868,17 +963,87 @@ mod tests {
         // A read-only caller cannot perform the catch-up `Behind` calls for,
         // so `Behind` must not read as usable to it.
         assert!(OffsetSidecar::is_usable_without_repair(
-            SidecarState::Current { elements: 3 }
+            SidecarState::Current {
+                elements: 3,
+                revision: 7,
+            }
         ));
         assert!(!OffsetSidecar::is_usable_without_repair(
             SidecarState::Behind {
                 elements: 3,
+                revision: 7,
                 from_offset: 64,
             }
         ));
         assert!(!OffsetSidecar::is_usable_without_repair(
             SidecarState::Rebuild
         ));
+    }
+
+    #[test]
+    fn a_reset_bumps_the_revision_so_a_reader_cannot_extend_across_it() {
+        // reset() replaces every offset the array held. A reader that kept
+        // extending its increment across that would be reading offsets from a
+        // generation its snapshot is not looking at.
+        let dir = scratch_dir();
+        let path = dir.join("data.varve.vix");
+        let (mut sidecar, _) = OffsetSidecar::open(
+            test_spec(),
+            path,
+            None,
+            1,
+            [0u8; 32],
+            0,
+            SidecarAccess::Writable,
+        )
+        .expect("open must not error")
+        .expect("writable open creates the sidecar");
+
+        let before = sidecar.revision();
+        sidecar.push(4096);
+        assert_eq!(
+            sidecar.revision(),
+            before,
+            "appending invalidates nothing, so it must not bump"
+        );
+        sidecar.reset();
+        assert_ne!(
+            sidecar.revision(),
+            before,
+            "a rebuild replaces every offset and must be visible as a bump"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_revision_survives_the_header_round_trip() {
+        let mut header = header();
+        header.revision = u64::MAX;
+        assert_eq!(SidecarHeader::decode(&header.encode()), Some(header));
+    }
+
+    #[test]
+    fn only_a_readable_state_reports_a_revision() {
+        // Rebuild means nothing was believed, so there is no revision to
+        // resync against -- the caller starts over rather than extending.
+        assert_eq!(
+            SidecarState::Current {
+                elements: 3,
+                revision: 7,
+            }
+            .revision(),
+            Some(7)
+        );
+        assert_eq!(
+            SidecarState::Behind {
+                elements: 3,
+                revision: 7,
+                from_offset: 64,
+            }
+            .revision(),
+            Some(7)
+        );
+        assert_eq!(SidecarState::Rebuild.revision(), None);
     }
 
     #[test]
