@@ -37,17 +37,24 @@
 //! **C2 — every divergence between the two files is detectable and repairable
 //! without loss.**
 //!
-//! Read that as one file occupying two spaces, not as two files to be
-//! reconciled. There is exactly one writer, and it maintains both; nothing here
-//! is a cross-file agreement to be verified between equals. The checks below
-//! exist because a *crash*, a *copy*, or a *deletion* can separate the two
-//! spaces behind the writer's back — not because the two could legitimately
-//! disagree while the writer is running.
+//! **Logically one file in two spaces; physically two objects.** Both halves of
+//! that sentence are load-bearing, and each rules out a different mistake.
 //!
-//! Getting that backwards is what produces machinery this does not need. It is
-//! also why the revision lives here rather than in the native file header:
-//! [`SidecarHeader::revision`] is the writer's own state, consumed by readers,
-//! not a token two parties compare.
+//! *Logically one* is why there is no reconciliation protocol here. There is
+//! exactly one writer and it maintains both spaces, so the two can never
+//! legitimately disagree while it runs, and nothing below is a cross-file
+//! agreement negotiated between equals. Getting this backwards is what produces
+//! machinery this does not need — it is why the revision lives here rather than
+//! in the native file header: [`SidecarHeader::revision`] is the writer's own
+//! state, consumed by readers, not a token two parties compare.
+//!
+//! *Physically two* is why the detection below is mandatory anyway. The
+//! operating system does not know these are one file. A copy takes one and
+//! leaves the other, a delete removes one, a restore brings back a mismatched
+//! pair, and a crash lands between the write to one space and the write to the
+//! other. None of those is the writer disagreeing with itself; all of them are
+//! the environment separating two objects behind its back, and every one has to
+//! be survivable at open.
 //!
 //! Consistency is therefore not maintained by keeping the spaces in step at
 //! every instant; that would need a two-phase commit across two objects on
