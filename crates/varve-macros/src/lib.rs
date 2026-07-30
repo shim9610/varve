@@ -907,31 +907,53 @@ enum SchemaHashChoice {
     Computed,
 }
 
-#[derive(Clone, Copy)]
+/// Declared offset-sidecar scope.
+///
+/// `Blocks` holds block **type** names rather than ids: a registry block's id
+/// lives in its `VarveBlock` impl, not in the declaration, so the id is emitted
+/// as `<T as VarveBlock>::ID` in a `const` context instead of resolved here.
+#[derive(Clone)]
+enum SidecarChoice {
+    None,
+    Unified,
+    PerBlock,
+    Blocks(Vec<Type>),
+}
+
+#[derive(Clone)]
 struct IndexChoice {
     scan_on_open: bool,
     checkpoint_on_flush: bool,
     block_offset_chain: bool,
     keyed_offset_chain: bool,
+    offset_sidecar: SidecarChoice,
 }
 
 impl IndexChoice {
-    const fn scan_on_open() -> Self {
+    fn empty() -> Self {
         Self {
-            scan_on_open: true,
+            scan_on_open: false,
             checkpoint_on_flush: false,
             block_offset_chain: false,
             keyed_offset_chain: false,
+            offset_sidecar: SidecarChoice::None,
         }
     }
 
-    const fn with_block_offset_chain(mut self) -> Self {
+    fn scan_on_open() -> Self {
+        Self {
+            scan_on_open: true,
+            ..Self::empty()
+        }
+    }
+
+    fn with_block_offset_chain(mut self) -> Self {
         self.scan_on_open = true;
         self.block_offset_chain = true;
         self
     }
 
-    const fn with_keyed_offset_chain(mut self) -> Self {
+    fn with_keyed_offset_chain(mut self) -> Self {
         self.scan_on_open = true;
         self.block_offset_chain = true;
         self.keyed_offset_chain = true;
@@ -1455,31 +1477,78 @@ fn parse_index_choice(input: ParseStream<'_>) -> Result<IndexChoice> {
     if input.peek(syn::token::Bracket) {
         let inner;
         bracketed!(inner in input);
-        let mut choice = IndexChoice {
-            scan_on_open: false,
-            checkpoint_on_flush: false,
-            block_offset_chain: false,
-            keyed_offset_chain: false,
-        };
-        let values = Punctuated::<Ident, Token![,]>::parse_terminated(&inner)?;
-        if values.is_empty() {
-            return Err(inner.error("index list must not be empty"));
+        let mut choice = IndexChoice::empty();
+        let mut seen_any = false;
+        while !inner.is_empty() {
+            choice = parse_index_entry(&inner, choice)?;
+            seen_any = true;
+            if inner.is_empty() {
+                break;
+            }
+            inner.parse::<Token![,]>()?;
         }
-        for value in values {
-            choice = apply_index_ident(choice, value)?;
+        if !seen_any {
+            return Err(inner.error("index list must not be empty"));
         }
         return Ok(choice);
     }
+    parse_index_entry(input, IndexChoice::empty())
+}
+
+/// One entry of the `index: [...]` list.
+///
+/// Entries are bare idents (`scan_on_open`) or call-shaped
+/// (`offset_sidecar(per_block)`); the list previously parsed as
+/// `Punctuated<Ident, Comma>`, which cannot express the second form.
+fn parse_index_entry(input: ParseStream<'_>, choice: IndexChoice) -> Result<IndexChoice> {
     let value: Ident = input.parse()?;
-    apply_index_ident(
-        IndexChoice {
-            scan_on_open: false,
-            checkpoint_on_flush: false,
-            block_offset_chain: false,
-            keyed_offset_chain: false,
-        },
-        value,
-    )
+    if input.peek(syn::token::Paren) {
+        if value != "offset_sidecar" {
+            return Err(syn::Error::new_spanned(
+                value,
+                "only offset_sidecar takes arguments",
+            ));
+        }
+        let args;
+        parenthesized!(args in input);
+        return apply_offset_sidecar_args(choice, &args);
+    }
+    apply_index_ident(choice, value)
+}
+
+fn apply_offset_sidecar_args(
+    mut choice: IndexChoice,
+    args: ParseStream<'_>,
+) -> Result<IndexChoice> {
+    let selector: Ident = args.parse()?;
+    match selector.to_string().as_str() {
+        "unified" => {
+            choice.offset_sidecar = SidecarChoice::Unified;
+        }
+        "per_block" => {
+            choice.offset_sidecar = SidecarChoice::PerBlock;
+        }
+        "blocks" => {
+            let inner;
+            parenthesized!(inner in args);
+            let types = Punctuated::<Type, Token![,]>::parse_terminated(&inner)?;
+            if types.is_empty() {
+                return Err(inner.error("offset_sidecar block list must not be empty"));
+            }
+            choice.offset_sidecar = SidecarChoice::Blocks(types.into_iter().collect());
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                selector,
+                "expected unified, per_block, or blocks(..)",
+            ));
+        }
+    }
+    if !args.is_empty() {
+        return Err(args.error("offset_sidecar takes one selector"));
+    }
+    choice.scan_on_open = true;
+    Ok(choice)
 }
 
 fn apply_index_ident(mut choice: IndexChoice, value: Ident) -> Result<IndexChoice> {
@@ -1495,9 +1564,17 @@ fn apply_index_ident(mut choice: IndexChoice, value: Ident) -> Result<IndexChoic
         }
         "block_offset_chain" => Ok(choice.with_block_offset_chain()),
         "keyed_offset_chain" => Ok(choice.with_keyed_offset_chain()),
+        "offset_sidecar" => {
+            // Bare `offset_sidecar` is the unified scope: one array over every
+            // record, which is the shape that needs no selector.
+            choice.offset_sidecar = SidecarChoice::Unified;
+            choice.scan_on_open = true;
+            Ok(choice)
+        }
         _ => Err(syn::Error::new_spanned(
             value,
-            "expected scan_on_open, checkpoint_on_flush, block_offset_chain, or keyed_offset_chain",
+            "expected scan_on_open, checkpoint_on_flush, block_offset_chain, keyed_offset_chain, \
+             or offset_sidecar",
         )),
     }
 }
@@ -3509,13 +3586,38 @@ fn index_tokens(choice: IndexChoice) -> TokenStream2 {
     let checkpoint_on_flush = choice.checkpoint_on_flush;
     let block_offset_chain = choice.block_offset_chain;
     let keyed_offset_chain = choice.keyed_offset_chain;
-    quote! {
+    let base = quote! {
         ::varve::__core::IndexPolicy::new(
             #scan_on_open,
             #checkpoint_on_flush,
             #block_offset_chain,
             #keyed_offset_chain,
         )
+    };
+    // `None` emits no call at all, so an undeclared format's generated tokens
+    // are byte-identical to the previous release's.
+    match choice.offset_sidecar {
+        SidecarChoice::None => base,
+        SidecarChoice::Unified => quote! {
+            #base.with_offset_sidecar(::varve::__core::OffsetSidecarScope::Unified)
+        },
+        SidecarChoice::PerBlock => quote! {
+            #base.with_offset_sidecar(::varve::__core::OffsetSidecarScope::PerBlock)
+        },
+        SidecarChoice::Blocks(types) => {
+            // The id lives in the block's `VarveBlock` impl, so it is named
+            // rather than resolved here; `ID` is an associated const, so the
+            // slice is still a `&'static [u32]` built at compile time.
+            let ids = types
+                .iter()
+                .map(|ty| quote!(<#ty as ::varve::__core::VarveBlock>::ID));
+            quote! {
+                #base.with_offset_sidecar(::varve::__core::OffsetSidecarScope::Blocks({
+                    const __VARVE_SIDECAR_BLOCKS: &[u32] = &[#(#ids),*];
+                    __VARVE_SIDECAR_BLOCKS
+                }))
+            }
+        }
     }
 }
 

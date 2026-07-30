@@ -987,12 +987,68 @@ pub enum IntegrityPolicy {
     Crc32WithHeader,
 }
 
+/// Which records, if any, get a derived offset sidecar.
+///
+/// The sidecar is a cache: it holds one `u64` record offset per element and
+/// nothing else, and every other fact about a record is read from the record
+/// itself at that offset. Deleting it loses nothing and costs one full scan at
+/// the next open, which is exactly what an undeclared format pays today.
+///
+/// Because it changes no byte of the main file, this choice is **not** part of
+/// the computed schema hash and not recorded in the embedded manifest. A file
+/// written by a handle that declared a scope is byte-identical to one written
+/// by a handle that did not, and either can be opened by the other. Making the
+/// scope part of the format's identity would make a file's identity depend on
+/// a cache, which is the one thing this type must never do.
+///
+/// `#[non_exhaustive]` from the start: `MatrixMetadataResidency` had to acquire
+/// it retroactively in 0.5.0 and that broke every exhaustive `match`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OffsetSidecarScope {
+    /// No sidecar. The default, and byte-identical to every earlier release.
+    None,
+    /// One sidecar over every record, in append order.
+    Unified,
+    /// One sidecar per declared block id.
+    PerBlock,
+    /// One sidecar for each named block id. Ids that name no declared block are
+    /// refused by [`FormatSpec::validate`].
+    Blocks(&'static [u32]),
+}
+
+impl OffsetSidecarScope {
+    /// Whether any sidecar is written at all.
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Whether `block_id` is covered by a block-scoped sidecar.
+    ///
+    /// [`Self::Unified`] answers `false`: its single array is not block-scoped,
+    /// so it cannot serve a typed collection without the block filter.
+    pub fn covers_block(self, block_id: u32) -> bool {
+        match self {
+            Self::None | Self::Unified => false,
+            Self::PerBlock => true,
+            Self::Blocks(ids) => ids.contains(&block_id),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexPolicy {
     pub scan_on_open: bool,
     pub checkpoint_on_flush: bool,
     pub block_offset_chain: bool,
     pub keyed_offset_chain: bool,
+    /// Derived offset sidecar scope; see [`OffsetSidecarScope`].
+    ///
+    /// This field is deliberately absent from [`IndexPolicy::new`], which keeps
+    /// its four-argument signature. A new option must default off and cost
+    /// nothing, and an arity change would have broken every existing caller for
+    /// a value they all want to be `None`.
+    pub offset_sidecar: OffsetSidecarScope,
 }
 
 #[allow(non_upper_case_globals)]
@@ -1002,6 +1058,7 @@ impl IndexPolicy {
         checkpoint_on_flush: false,
         block_offset_chain: false,
         keyed_offset_chain: false,
+        offset_sidecar: OffsetSidecarScope::None,
     };
 
     pub const CheckpointOnFlush: Self = Self {
@@ -1009,6 +1066,7 @@ impl IndexPolicy {
         checkpoint_on_flush: true,
         block_offset_chain: false,
         keyed_offset_chain: false,
+        offset_sidecar: OffsetSidecarScope::None,
     };
 
     pub const BlockOffsetChain: Self = Self {
@@ -1016,6 +1074,7 @@ impl IndexPolicy {
         checkpoint_on_flush: false,
         block_offset_chain: true,
         keyed_offset_chain: false,
+        offset_sidecar: OffsetSidecarScope::None,
     };
 
     pub const KeyedOffsetChain: Self = Self {
@@ -1023,6 +1082,7 @@ impl IndexPolicy {
         checkpoint_on_flush: false,
         block_offset_chain: true,
         keyed_offset_chain: true,
+        offset_sidecar: OffsetSidecarScope::None,
     };
 
     pub const fn new(
@@ -1036,7 +1096,13 @@ impl IndexPolicy {
             checkpoint_on_flush,
             block_offset_chain,
             keyed_offset_chain,
+            offset_sidecar: OffsetSidecarScope::None,
         }
+    }
+
+    pub const fn with_offset_sidecar(mut self, scope: OffsetSidecarScope) -> Self {
+        self.offset_sidecar = scope;
+        self
     }
 
     pub const fn with_scan_on_open(mut self, enabled: bool) -> Self {
@@ -2415,6 +2481,29 @@ impl FormatSpec {
             return Err(Error::InvalidFormatSpec(
                 "keyed_offset_chain requires block_offset_chain",
             ));
+        }
+        if let OffsetSidecarScope::Blocks(ids) = self.index_policy.offset_sidecar {
+            if ids.is_empty() {
+                return Err(Error::InvalidFormatSpec(
+                    "offset_sidecar block list must not be empty",
+                ));
+            }
+            for id in ids {
+                if self.block(*id).is_none() {
+                    return Err(Error::InvalidFormatSpec(
+                        "offset_sidecar names an undeclared block id",
+                    ));
+                }
+            }
+            // A repeated id would open the same sidecar path twice in one
+            // session, so two write buffers would race for one array.
+            for (position, id) in ids.iter().enumerate() {
+                if ids[..position].contains(id) {
+                    return Err(Error::InvalidFormatSpec(
+                        "offset_sidecar block list repeats a block id",
+                    ));
+                }
+            }
         }
         for (index, block) in self.blocks.iter().enumerate() {
             if block.id >= RESERVED_BLOCK_ID_START {
