@@ -25,8 +25,14 @@
 //!
 //! C1 has one consequence that is easy to miss and important: the scope is
 //! **not** part of the computed schema hash and not recorded in the embedded
-//! manifest. If it were, a file's identity would depend on a cache, and a
-//! handle that declared a sidecar could not read a file written without one.
+//! manifest, because a file's identity must not depend on a cache.
+//!
+//! The concrete cost of getting that wrong is about *evolution*, not about two
+//! handles disagreeing. `computed_schema_hash()` is stored in newly created
+//! files, and a format may pin it and compare it at open. So if the scope were
+//! hashed, then turning the sidecar on for an existing format would make every
+//! file already written refuse to open — files whose bytes did not change at
+//! all. Enabling a derived cache would be a migration. It must not be.
 //!
 //! **C2 — every divergence between the two files is detectable and repairable
 //! without loss.** Consistency is not maintained by keeping them in step at
@@ -319,12 +325,51 @@ pub(crate) struct OffsetSidecar {
     disabled: bool,
 }
 
+/// Who is opening, and therefore whether the sidecar may be written.
+///
+/// This distinction is load-bearing, not a convenience.
+///
+/// **A read-only open must never create, extend, or repair the sidecar.** Three
+/// things go wrong the moment it does:
+///
+/// 1. It makes a *read* mutate the filesystem. Every read entry point takes
+///    `&self` so one handle can serve concurrent readers; a read that repairs
+///    would need `&mut`, or interior mutability over a file two threads are
+///    both trying to rebuild.
+/// 2. Read-only opens do not take the single-writer lock — that lock protects
+///    the main file. Two concurrent read-only opens finding the sidecar stale
+///    would both rebuild it, interleaving header and array writes on one file
+///    with nothing serialising them. The tear is detected and repaired, so
+///    nothing is *wrong*, but every open would rewrite it, forever.
+/// 3. A file on a read-only medium, or in a directory the process cannot write,
+///    could not be opened at all — an accelerator's absence would become a
+///    refusal to open the data. That is a direct C1 violation.
+///
+/// So a reader uses the sidecar when it is valid and current, and otherwise
+/// simply does not use it: it falls back to the scan, which is exactly what an
+/// undeclared format pays at every open today. Creation and repair belong to
+/// the writer, which already holds the lock that serialises them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SidecarAccess {
+    /// Read-only. Opens an existing sidecar without `create` and without
+    /// `write`, and never mutates it.
+    ReadOnly,
+    /// The single-writer handle. May create, extend and repair.
+    Writable,
+}
+
 impl OffsetSidecar {
-    /// Opens or creates the sidecar and reports what state it is in.
+    /// Opens the sidecar and reports what state it is in.
     ///
-    /// Never returns an error for a sidecar problem — only for a failure to
-    /// touch the filesystem at all, which the caller also treats as "no
-    /// sidecar" rather than as a fault.
+    /// Returns `Ok(None)` — never `Err` — when the sidecar cannot be used at
+    /// all: absent under [`SidecarAccess::ReadOnly`], unopenable, or on a
+    /// medium that refuses the access. C1 makes that the correct outcome
+    /// rather than a fault: the main file is sufficient, so the caller scans.
+    ///
+    /// A returned sidecar under [`SidecarAccess::ReadOnly`] is usable for
+    /// reads; whether it may be *believed* is [`SidecarState`]'s answer, and a
+    /// read-only caller that gets anything but [`SidecarState::Current`] must
+    /// fall back to the scan rather than repair.
     pub(crate) fn open(
         spec: FormatSpec,
         path: PathBuf,
@@ -332,13 +377,19 @@ impl OffsetSidecar {
         schema_hash: u64,
         native_fingerprint: [u8; 32],
         main_len: u64,
-    ) -> Result<(Self, SidecarState)> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        access: SidecarAccess,
+    ) -> Result<Option<(Self, SidecarState)>> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        if access == SidecarAccess::Writable {
+            options.write(true).create(true).truncate(false);
+        }
+        // An open failure is a cache miss, not a fault. A missing sidecar under
+        // ReadOnly, a read-only directory, a permission denial: all mean "no
+        // accelerator", and none of them may stop the main file from opening.
+        let Ok(file) = options.open(&path) else {
+            return Ok(None);
+        };
         let mut sidecar = Self {
             file,
             path,
@@ -347,22 +398,50 @@ impl OffsetSidecar {
             native_fingerprint,
             written_elements: 0,
             buffer: Vec::new(),
-            disabled: false,
+            // A read-only sidecar is permanently in the state a failed write
+            // leaves a writable one in: readable, never written. Reusing the
+            // flag means there is one predicate guarding every mutation rather
+            // than two that could disagree.
+            disabled: access == SidecarAccess::ReadOnly,
         };
         let state = sidecar.classify(spec, main_len)?;
         if let SidecarState::Current { elements } | SidecarState::Behind { elements, .. } = state {
             sidecar.written_elements = elements;
         }
-        Ok((sidecar, state))
+        Ok(Some((sidecar, state)))
     }
 
+    /// Whether this handle may be believed without further work.
+    ///
+    /// A read-only handle answers `true` only for [`SidecarState::Current`]:
+    /// it cannot perform the catch-up that [`SidecarState::Behind`] calls for,
+    /// and must not try.
+    pub(crate) fn is_usable_without_repair(state: SidecarState) -> bool {
+        matches!(state, SidecarState::Current { .. })
+    }
+
+    /// Classifies the sidecar. Total by construction: **every** rejection is a
+    /// [`SidecarState`], never an `Err`.
+    ///
+    /// A metadata failure, a length over `max_sidecar_len`, an unreadable
+    /// header — under C1 all of these mean the same thing, that the cache
+    /// cannot be believed, and the main file answers anyway. Propagating any of
+    /// them would let a damaged accelerator fail an open.
     fn classify(&mut self, spec: FormatSpec, main_len: u64) -> Result<SidecarState> {
-        let physical_len = self.file.metadata()?.len();
+        let Ok(metadata) = self.file.metadata() else {
+            return Ok(SidecarState::Rebuild);
+        };
+        let physical_len = metadata.len();
         if physical_len < HEADER_LEN {
             return Ok(SidecarState::Rebuild);
         }
-        spec.read_limits
-            .check(ReadLimitKey::SidecarLen, physical_len)?;
+        if spec
+            .read_limits
+            .check(ReadLimitKey::SidecarLen, physical_len)
+            .is_err()
+        {
+            return Ok(SidecarState::Rebuild);
+        }
         let mut bytes = vec![0u8; HEADER_LEN as usize];
         if read_exact_at(&self.file, &mut bytes, 0).is_err() {
             return Ok(SidecarState::Rebuild);
@@ -678,6 +757,128 @@ mod tests {
         assert!(!header.matches(Some(7), header.schema_hash, &[7u8; 32]));
         assert!(!header.matches(None, header.schema_hash, &[7u8; 32]));
         assert!(!header.matches(Some(6), header.schema_hash ^ 1, &[7u8; 32]));
+    }
+
+    fn test_spec() -> FormatSpec {
+        FormatSpec::builder()
+            .magic(b"VIXT")
+            .build()
+            .expect("minimal spec")
+    }
+
+    fn scratch_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("varve-sidecar-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn a_read_only_open_never_creates_the_sidecar() {
+        // A read that mutates the filesystem is the defect this guards. It
+        // would also need `&mut` on a read path, and would let two concurrent
+        // read-only opens race to rebuild one file with no lock between them.
+        let dir = scratch_dir();
+        let path = dir.join("data.varve.vix");
+        let result = OffsetSidecar::open(
+            test_spec(),
+            path.clone(),
+            None,
+            1,
+            [0u8; 32],
+            0,
+            SidecarAccess::ReadOnly,
+        )
+        .expect("open must not error");
+        assert!(result.is_none(), "read-only open must report no sidecar");
+        assert!(
+            !path.exists(),
+            "read-only open created {}; a read must not write",
+            path.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_writable_open_of_a_fresh_path_asks_for_a_rebuild() {
+        let dir = scratch_dir();
+        let path = dir.join("data.varve.vix");
+        let (sidecar, state) = OffsetSidecar::open(
+            test_spec(),
+            path.clone(),
+            None,
+            1,
+            [0u8; 32],
+            0,
+            SidecarAccess::Writable,
+        )
+        .expect("open must not error")
+        .expect("writable open creates the sidecar");
+        assert_eq!(state, SidecarState::Rebuild);
+        assert!(!sidecar.is_disabled());
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_only_handle_refuses_to_mutate() {
+        // The read-only handle is born in the same state a failed write leaves
+        // a writable one in, so one predicate guards every mutation.
+        let dir = scratch_dir();
+        let path = dir.join("data.varve.vix");
+        // Create it with a writable handle first, so ReadOnly can open it.
+        let _ = OffsetSidecar::open(
+            test_spec(),
+            path.clone(),
+            None,
+            1,
+            [0u8; 32],
+            0,
+            SidecarAccess::Writable,
+        );
+        let (mut sidecar, _) = OffsetSidecar::open(
+            test_spec(),
+            path.clone(),
+            None,
+            1,
+            [0u8; 32],
+            0,
+            SidecarAccess::ReadOnly,
+        )
+        .expect("open must not error")
+        .expect("an existing sidecar opens read-only");
+        assert!(sidecar.is_disabled());
+        let before = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        sidecar.push(4096);
+        sidecar.publish(4096, 1);
+        sidecar.sync();
+        assert_eq!(sidecar.elements(), 0, "a read-only handle buffers nothing");
+        assert_eq!(
+            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            before,
+            "a read-only handle changed the sidecar's bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_current_sidecar_may_be_believed_without_repair() {
+        // A read-only caller cannot perform the catch-up `Behind` calls for,
+        // so `Behind` must not read as usable to it.
+        assert!(OffsetSidecar::is_usable_without_repair(
+            SidecarState::Current { elements: 3 }
+        ));
+        assert!(!OffsetSidecar::is_usable_without_repair(
+            SidecarState::Behind {
+                elements: 3,
+                from_offset: 64,
+            }
+        ));
+        assert!(!OffsetSidecar::is_usable_without_repair(
+            SidecarState::Rebuild
+        ));
     }
 
     #[test]
