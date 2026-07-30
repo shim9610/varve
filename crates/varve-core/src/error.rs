@@ -99,6 +99,15 @@ pub enum Error {
     #[error("invalid or stale index checkpoint")]
     InvalidIndexCheckpoint,
 
+    /// A segment record did not describe the file it was found in.
+    ///
+    /// Never reaches a caller through `open`: the segment chain is derived, so
+    /// open answers this by falling back to the full record scan. It exists so
+    /// the walk can say *why* it stopped, and so a diagnostic tool that reads a
+    /// segment directly gets more than a bare `false`.
+    #[error("invalid or stale index segment")]
+    InvalidIndexSegment,
+
     #[error("block version mismatch for block {block_id}: expected {expected}, got {actual}")]
     BlockVersionMismatch {
         block_id: u32,

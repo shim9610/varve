@@ -316,15 +316,25 @@ to `Theta(N)` for a file a Varve writer produced; the `N log N` bound is the
 guarantee for reordered or hostile input). Budget about **104 bytes of resident
 index per record** (`size_of::<RecordIndexEntry>()`).
 
-**Every open scans the whole record region, and no policy avoids it.** Two
-policies look as though they might, and neither does:
+**One policy avoids the scan, and two that look as though they might do not.**
 
+- `IndexPolicy::segment_on_flush` **does** avoid it. Each commit point appends an
+  internal *segment* record covering the records that commit point added, chained
+  to the previous one through the record footer's `prev_same_block_offset`. Open
+  confirms a record footer at the end of the file and walks that chain backwards,
+  reading one record per commit point and **no data record at all**. What it
+  removes is the open-time walk, not the index: the resident index it produces is
+  the same `Vec<RecordIndexEntry>`, so the 104-bytes-per-record figure above is
+  unchanged. See [Known Limitations
+  §2.1](known-limitations.md#21-varvefile-scans-the-whole-file-at-open-and-holds-a-record-index)
+  for what it costs and when it falls back.
 - `IndexPolicy::CheckpointOnFlush` does **not** seed an open from a checkpoint.
-  Every open calls `load_index` → `scan_records_from`, which walks from the header
-  to the file length; a checkpoint met on the way is validated and its decoded
-  entries are discarded. What the policy bounds is writer-side checkpoint bytes
-  (it spaces full checkpoints geometrically), not open cost. `docs/spec.md`
-  describes a checkpoint-seeded open as a design target; it is not implemented.
+  Every open without the segment chain calls `load_index` → `scan_records_from`,
+  which walks from the header to the file length; a checkpoint met on the way is
+  validated and its decoded entries are discarded. What the policy bounds is
+  writer-side checkpoint bytes (it spaces full checkpoints geometrically), not
+  open cost. `docs/spec.md` describes a checkpoint-seeded open as a design
+  target; it is not implemented.
 - The `scan_on_open` flag is **not** a behaviour switch — it is folded into the
   schema manifest and hash bytes and is consulted nowhere else in `varve-core`, so
   clearing it does not produce a non-scanning open.

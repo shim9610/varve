@@ -377,6 +377,33 @@ The writer automatically fills `prev_same_block_offset` for each block id and,
 for generated keyed writers, `prev_same_key_offset` for the key. User code never
 has to calculate or patch offsets.
 
+### Making Open Stop Scanning
+
+Open builds a resident record index, and by default it builds it by reading
+every record in the file. `segment_on_flush` replaces that walk: each commit
+point appends an internal **segment** record covering the records it added,
+chained to the previous one through `prev_same_block_offset`, and open follows
+that chain backwards from the end of the file without reading a data record.
+
+It is not a DSL clause, on purpose. A block is the unit your declaration names;
+a segment is varve's internal lookup unit, and choosing its granularity is not
+something a format author should have to do. Turn it on where the rest of the
+runtime policy lives:
+
+```rust
+const SPEC: FormatSpec = MyFormat::SPEC
+    .with_index_policy(MyFormat::SPEC.index_policy.with_segment_on_flush(true));
+```
+
+It requires `block_offset_chain` (which it turns on for you — the chain is that
+footer field) and a `crc32` integrity policy, and it gives up in-place fixed
+replacement. Each segment record carries 73 bytes per record it covers, so the
+bytes it costs are set by how often you flush; it pays for itself at a commit
+point every few hundred records and not at a commit point per record. A file it
+cannot account for — one written before you enabled it, one whose writer
+appended past its last commit point, a truncated tail — opens by the old scan
+and produces the identical index. See `docs/known-limitations.md` §2.1.
+
 ## Custom Physical Layout
 
 Most formats should use the Varve-native append log. Use custom physical layout

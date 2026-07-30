@@ -858,6 +858,7 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::UnknownWireType(_)
         | Error::CorruptTail { .. }
         | Error::InvalidIndexCheckpoint
+        | Error::InvalidIndexSegment
         | Error::ChecksumMismatch { .. }
         | Error::UnsupportedCompressionAlgorithm(_)
         | Error::InvalidCompressionHeader

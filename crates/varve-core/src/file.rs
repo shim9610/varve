@@ -37,6 +37,11 @@ pub const MANIFEST_BLOCK_ID: u32 = 0xFFFF_FFFA;
 pub const COMMIT_BLOCK_ID: u32 = 0xFFFF_FFF9;
 /// Carries the per-create nonce of a stream/indexed primary (STO-01).
 pub const CREATION_NONCE_BLOCK_ID: u32 = 0xFFFF_FFF8;
+/// Carries one internal segment: the records a single commit point added.
+///
+/// A segment is varve's own lookup unit and has no declaration surface. See
+/// [`IndexPolicy::segment_on_flush`].
+pub const SEGMENT_BLOCK_ID: u32 = 0xFFFF_FFF7;
 const RESERVED_BLOCK_ID_START: u32 = 0xFFFF_FF00;
 pub(crate) const RECORD_HEADER_LEN: u64 = 32;
 pub(crate) const RECORD_FOOTER_LEN: u64 = 32;
@@ -52,6 +57,22 @@ pub(crate) const RECORD_FOOTER_KNOWN_FLAGS: u16 =
 const COMMIT_PAYLOAD_MAGIC: &[u8; 4] = b"VCMT";
 const INDEX_CHECKPOINT_MAGIC: &[u8; 4] = b"VIDX";
 const INDEX_CHECKPOINT_VERSION: u16 = 3;
+const SEGMENT_MAGIC: &[u8; 4] = b"VSEG";
+const SEGMENT_VERSION: u16 = 1;
+/// magic(4) + version(2) + flags(2) + covered_start(8) + entry_count(8)
+/// + preceding_records(8).
+const SEGMENT_PREFIX_LEN: u64 = 4 + 2 + 2 + 8 + 8 + 8;
+/// The segment record's own start offset, written at the end of its payload.
+///
+/// Open arrives at EOF holding a footer and nothing else: the footer carries
+/// no self offset and the header that would give one is `payload_len` bytes
+/// further back, a distance only the header states. This trailer is the one
+/// value that closes that circle, and it costs eight bytes of payload rather
+/// than a byte of format.
+const SEGMENT_TRAILER_LEN: u64 = 8;
+/// One serialized index entry, in the layout `read_index_entry_payload`
+/// decodes at checkpoint version 3.
+const SEGMENT_ENTRY_LEN: u64 = 4 + 2 + 2 + 8 + 8 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 1;
 /// Smallest live-tail growth that forces a fresh full index checkpoint.
 ///
 /// Below this floor the geometric-spacing rule in [`VarveFile::needs_index_checkpoint`]
@@ -1094,7 +1115,7 @@ impl CheckpointCadence {
                     next_threshold: core::cmp::max(INDEX_CHECKPOINT_MIN_RECORDS, position / 2),
                 };
             }
-            if entry.block_id != COMMIT_BLOCK_ID {
+            if !matches!(entry.block_id, COMMIT_BLOCK_ID | SEGMENT_BLOCK_ID) {
                 eligible = eligible.saturating_add(1);
             }
         }
@@ -1108,14 +1129,14 @@ impl CheckpointCadence {
     /// Advances the cadence for the entry just pushed at `position` in the
     /// resident index. A checkpoint record resets the tail count and derives
     /// the next geometric threshold from its own position (the number of
-    /// entries it serialized); commit markers never alter checkpoint identity;
-    /// every other record grows the eligible tail by one.
+    /// entries it serialized); commit markers and segment records never alter
+    /// checkpoint identity; every other record grows the eligible tail by one.
     fn note_appended(&mut self, position: usize, block_id: u32) {
         note_checkpoint_cadence_index_touches(1);
         if block_id == INDEX_BLOCK_ID {
             self.eligible_since_checkpoint = 0;
             self.next_threshold = core::cmp::max(INDEX_CHECKPOINT_MIN_RECORDS, position / 2);
-        } else if block_id != COMMIT_BLOCK_ID {
+        } else if !matches!(block_id, COMMIT_BLOCK_ID | SEGMENT_BLOCK_ID) {
             self.eligible_since_checkpoint = self.eligible_since_checkpoint.saturating_add(1);
         }
     }
@@ -1138,6 +1159,71 @@ fn note_checkpoint_cadence_index_touches(count: u64) {
         .with(|touches| touches.set(touches.get().saturating_add(count)));
     #[cfg(not(feature = "scalable-fault-injection"))]
     let _ = count;
+}
+
+/// O(1) writer-side state for the internal segment chain.
+///
+/// A segment covers the records one commit point added, so writing one needs
+/// two things: where in the resident index that run begins, and where it begins
+/// on disk. Both are derivable by walking back to the newest segment record,
+/// and neither is derived that way — the walk would be `Theta(g)` per commit
+/// point and `Theta(N)` on a file that has records but no segment record yet,
+/// which is the same shape PERF2-02 and PERF2-05 removed from the flush and
+/// append paths.
+///
+/// Invariant: at all times this equals `SegmentCursor::from_index(&index)` for
+/// the current resident index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SegmentCursor {
+    /// Resident-index position just past the newest segment record: the first
+    /// entry the next segment covers.
+    next_position: usize,
+    /// File offset just past the newest segment record, or `None` when the file
+    /// holds no segment record and coverage therefore starts at the append log.
+    covered_start: Option<u64>,
+}
+
+impl SegmentCursor {
+    fn new_empty() -> Self {
+        Self {
+            next_position: 0,
+            covered_start: None,
+        }
+    }
+
+    /// Recovers the cursor with one reverse walk that stops at the newest
+    /// segment record, so a reopen or a generation rebind pays the live tail
+    /// once instead of every commit point paying it again.
+    ///
+    /// `physical_end` saturates rather than overflowing. The entries here come
+    /// from a completed scan or a validated generation, so it cannot saturate
+    /// in practice; if it ever did, the next segment would record a coverage
+    /// start the following open cannot match, and that open falls back to the
+    /// full scan rather than trusting the chain.
+    fn from_index(entries: &[RecordIndexEntry]) -> Self {
+        match entries
+            .iter()
+            .rposition(|entry| entry.block_id == SEGMENT_BLOCK_ID)
+        {
+            Some(position) => Self {
+                next_position: position + 1,
+                covered_start: Some(entries[position].physical_end()),
+            },
+            None => Self::new_empty(),
+        }
+    }
+
+    /// Advances the cursor for the entry just pushed at `position`.
+    ///
+    /// `record_end` is the physical end the append path budgeted and checked
+    /// before writing, so this stays infallible on the far side of the
+    /// authoritative write (INVARIANT 3).
+    fn note_appended(&mut self, position: usize, block_id: u32, record_end: u64) {
+        if block_id == SEGMENT_BLOCK_ID {
+            self.next_position = position + 1;
+            self.covered_start = Some(record_end);
+        }
+    }
 }
 
 /// O(1)-append / O(log B) resident block-offset tails (PERF2-05).
@@ -1426,6 +1512,7 @@ struct AppendSnapshot {
     sequence_state: SequenceState,
     index_len: usize,
     checkpoint_cadence: CheckpointCadence,
+    segment_cursor: SegmentCursor,
 }
 
 #[cfg(test)]
@@ -1898,6 +1985,9 @@ pub struct VarveFile {
     // O(1) append-side block-offset-chain predecessors; must equal
     // `BlockTails::from_index(&index)` at all times (PERF2-05).
     block_tails: BlockTails,
+    // O(1) commit-point state for the internal segment chain; must equal
+    // `SegmentCursor::from_index(&index)` at all times.
+    segment_cursor: SegmentCursor,
     // Lazily built keyed-offset-chain predecessors for the generic keyed
     // append path; a cached map is either absent or exact (API2-05).
     keyed_tails: KeyedTails,
@@ -2768,6 +2858,7 @@ impl VarveFile {
             sequence_state: SequenceState::Available(0),
             checkpoint_cadence: CheckpointCadence::new_empty(),
             block_tails: BlockTails::new_empty(),
+            segment_cursor: SegmentCursor::new_empty(),
             keyed_tails: KeyedTails::new_empty(),
             // DUR3-01: this handle established the pathname, so its
             // directory entry is not durable until the first durability
@@ -2867,6 +2958,7 @@ impl VarveFile {
             sequence_state: SequenceState::Available(0),
             checkpoint_cadence: CheckpointCadence::new_empty(),
             block_tails: BlockTails::new_empty(),
+            segment_cursor: SegmentCursor::new_empty(),
             keyed_tails: KeyedTails::new_empty(),
             // DUR3-01: this handle established the pathname, so its
             // directory entry is not durable until the first durability
@@ -2909,6 +3001,7 @@ impl VarveFile {
         let sequence_state = SequenceState::from_index(&index);
         let checkpoint_cadence = CheckpointCadence::from_index(&index);
         let block_tails = BlockTails::from_index(&index);
+        let segment_cursor = SegmentCursor::from_index(&index);
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         Ok(Self {
             spec,
@@ -2922,6 +3015,7 @@ impl VarveFile {
             sequence_state,
             checkpoint_cadence,
             block_tails,
+            segment_cursor,
             keyed_tails: KeyedTails::new_empty(),
             pending_pathname_parent_sync: false,
             poison: PoisonFlag::healthy(),
@@ -2963,6 +3057,7 @@ impl VarveFile {
         let sequence_state = SequenceState::from_index(&index);
         let checkpoint_cadence = CheckpointCadence::from_index(&index);
         let block_tails = BlockTails::from_index(&index);
+        let segment_cursor = SegmentCursor::from_index(&index);
         let logical_len = validated_snapshot_len(append_start, &index)?;
         let snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, logical_len)?;
         Ok(Self {
@@ -2977,6 +3072,7 @@ impl VarveFile {
             sequence_state,
             checkpoint_cadence,
             block_tails,
+            segment_cursor,
             keyed_tails: KeyedTails::new_empty(),
             pending_pathname_parent_sync: false,
             poison: PoisonFlag::healthy(),
@@ -3029,6 +3125,7 @@ impl VarveFile {
         let sequence_state = SequenceState::from_index(&index);
         let checkpoint_cadence = CheckpointCadence::from_index(&index);
         let block_tails = BlockTails::from_index(&index);
+        let segment_cursor = SegmentCursor::from_index(&index);
         let records_preserved = index.len();
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         Ok((
@@ -3044,6 +3141,7 @@ impl VarveFile {
                 sequence_state,
                 checkpoint_cadence,
                 block_tails,
+                segment_cursor,
                 keyed_tails: KeyedTails::new_empty(),
                 pending_pathname_parent_sync: false,
                 poison: PoisonFlag::healthy(),
@@ -3654,6 +3752,11 @@ impl VarveFile {
                 requested: index_bytes,
             })?;
 
+        let rewrite_append_start = append_log_start_for_file(self)?;
+        // Segment coverage in the new generation, tracked exactly as the
+        // writer's `SegmentCursor` tracks it in the old one.
+        let mut segment_start = 0usize;
+        let mut segment_covered_start: Option<u64> = None;
         let (temp_path, mut temp_file) = create_rewrite_temp_file(&self.path)?;
         let prepare_result = (|| -> Result<()> {
             if let Ok(metadata) = self.file.metadata() {
@@ -3674,6 +3777,23 @@ impl VarveFile {
                         temp_file.stream_position()?,
                     )?;
                     RewritePayload::Bytes(&checkpoint_payload)
+                } else if source_entry.block_id == SEGMENT_BLOCK_ID {
+                    // A segment payload is record offsets, and this rewrite
+                    // moves them. Copying the bytes would publish a generation
+                    // whose chain describes the file it replaced.
+                    let record_offset = temp_file.stream_position()?;
+                    checkpoint_payload = encode_segment_payload(
+                        self.spec,
+                        &new_index[segment_start..],
+                        segment_covered_start.unwrap_or(rewrite_append_start),
+                        u64::try_from(segment_start).map_err(|_| {
+                            Error::ResourceArithmeticOverflow {
+                                resource: "segment entry count",
+                            }
+                        })?,
+                        record_offset,
+                    )?;
+                    RewritePayload::Bytes(&checkpoint_payload)
                 } else {
                     RewritePayload::Snapshot {
                         offset: source_entry.payload_offset,
@@ -3689,6 +3809,10 @@ impl VarveFile {
                     info,
                     &new_index,
                 )?;
+                if updated.block_id == SEGMENT_BLOCK_ID {
+                    segment_covered_start = Some(updated.checked_physical_end()?);
+                    segment_start = new_index.len() + 1;
+                }
                 new_index.push(updated);
             }
             temp_file.flush()?;
@@ -3741,8 +3865,33 @@ impl VarveFile {
     /// usable, but the rename is not yet guaranteed durable against power loss
     /// until the parent directory is synced (for example by a later successful
     /// publication or an explicit directory sync).
+    /// Refuses an in-place record mutation on a segment-chained format.
+    ///
+    /// A segment payload records the header fields of every record it covers,
+    /// and an in-place replacement restamps the sequence and checksum of a
+    /// record that is already covered. Nothing rewrites the segment behind it,
+    /// so the chain would keep describing the record as it was - and open would
+    /// have no way to notice, because it reads no data record.
+    ///
+    /// Patching the covering segment instead was considered and is the shape
+    /// §4A.5 rejected for the index anchor: an in-place rewrite of a derived
+    /// structure, with a tear window a lock-free `open_readonly` can observe.
+    /// So this is a capability trade rather than a repair: in-place fixed
+    /// replacement and the segment chain are alternatives, and
+    /// `replace_block` - which publishes a whole new generation, and re-encodes
+    /// every segment payload against the new offsets - is available under both.
+    fn ensure_in_place_replacement_allowed(&self) -> Result<()> {
+        if self.spec.index_policy.segment_on_flush {
+            return Err(Error::InvalidFormatSpec(
+                "in-place replacement is not supported for segment_on_flush formats",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn replace_fixed<T: VarveBlock>(&mut self, index: usize, block: &T) -> Result<u64> {
         let _permit = self.ensure_write()?;
+        self.ensure_in_place_replacement_allowed()?;
         self.ensure_user_block::<T>()?;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         if T::KIND != BlockKind::Fixed {
@@ -3904,6 +4053,7 @@ impl VarveFile {
         block: &T,
     ) -> Result<u64> {
         let permit = self.ensure_write()?;
+        self.ensure_in_place_replacement_allowed()?;
         self.ensure_user_block::<T>()?;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         if T::KIND != BlockKind::Fixed {
@@ -4138,6 +4288,9 @@ impl VarveFile {
         {
             self.write_commit_marker()?;
         }
+        // Last, and after the marker: the chain is found from the end of the
+        // file, so anything appended behind this record hides it.
+        self.write_index_segment_if_needed();
         self.file.flush()?;
         Ok(())
     }
@@ -4160,9 +4313,13 @@ impl VarveFile {
                 .rev()
                 .find(|entry| entry.block_id == COMMIT_BLOCK_ID)
         {
-            return Ok(AppendInfo::from(entry));
+            let info = AppendInfo::from(entry);
+            self.write_index_segment_if_needed();
+            return Ok(info);
         }
-        self.write_commit_marker()
+        let info = self.write_commit_marker()?;
+        self.write_index_segment_if_needed();
+        Ok(info)
     }
 
     pub fn commit_durable(&mut self) -> Result<AppendInfo> {
@@ -4184,6 +4341,7 @@ impl VarveFile {
                 .find(|entry| entry.block_id == COMMIT_BLOCK_ID)
         {
             let info = AppendInfo::from(entry);
+            self.write_index_segment_if_needed();
             self.file.flush()?;
             self.file.sync_all()?;
             // DUR3-01: a durable commit on a file this handle created must
@@ -4194,6 +4352,12 @@ impl VarveFile {
         self.file.flush()?;
         self.file.sync_data()?;
         let info = self.write_commit_marker()?;
+        // The segment closes the commit point, so it is appended after the
+        // marker and before the durability request that makes both durable.
+        // `write_index_segment_if_needed` cannot report a failure for the same
+        // reason the two steps below do not report theirs as a bare `Err`: the
+        // commit has happened.
+        self.write_index_segment_if_needed();
         // INVARIANT 3: `write_commit_marker` is the authoritative commit. From
         // here the marker record is in the file and a reader that opens it
         // after a clean process exit sees the transaction as committed, so a
@@ -5247,6 +5411,20 @@ impl VarveFile {
         BLOCK_TAIL_ENTRIES_MOVED.with(|moved| moved.get())
     }
 
+    /// Returns the cumulative number of records this thread has framed - read a
+    /// header, an extent and a footer for - while building an index.
+    ///
+    /// Fault-testing hook only. This is the unit `IndexPolicy::segment_on_flush`
+    /// exists to reduce: a scan frames every record in the file, and a segment
+    /// chain frames one record per commit point and no data record at all, so a
+    /// regression test can delta-measure an open and tell the two apart by the
+    /// count rather than by the wall clock.
+    #[cfg(feature = "scalable-fault-injection")]
+    #[doc(hidden)]
+    pub fn records_framed() -> u64 {
+        RECORDS_FRAMED.with(|framed| framed.get())
+    }
+
     #[cfg(feature = "mmap")]
     /// Maps the file's indexed record payloads as a read-only snapshot.
     ///
@@ -5493,6 +5671,7 @@ impl VarveFile {
                 // moved, so every cached generic keyed tail is stale (API2-05).
                 self.checkpoint_cadence = CheckpointCadence::from_index(&self.index);
                 self.block_tails = BlockTails::from_index(&self.index);
+                self.segment_cursor = SegmentCursor::from_index(&self.index);
                 self.keyed_tails.invalidate_all();
                 self.publish_sequence(sequence);
                 Ok(sequence)
@@ -5539,6 +5718,7 @@ impl VarveFile {
                 // moved, so every cached generic keyed tail is stale (API2-05).
                 self.checkpoint_cadence = CheckpointCadence::from_index(&self.index);
                 self.block_tails = BlockTails::from_index(&self.index);
+                self.segment_cursor = SegmentCursor::from_index(&self.index);
                 self.keyed_tails.invalidate_all();
                 Ok(info)
             }
@@ -5774,6 +5954,7 @@ impl VarveFile {
             sequence_state: self.sequence_state,
             index_len: self.index.len(),
             checkpoint_cadence: self.checkpoint_cadence,
+            segment_cursor: self.segment_cursor,
         };
         let record_offset = snapshot.eof;
         let payload_offset = record_offset.checked_add(RECORD_HEADER_LEN).ok_or(
@@ -5891,6 +6072,8 @@ impl VarveFile {
         self.checkpoint_cadence
             .note_appended(self.index.len() - 1, block_id);
         self.block_tails.note_appended(block_id, record_offset);
+        self.segment_cursor
+            .note_appended(self.index.len() - 1, block_id, prospective_len);
         self.snapshot = new_snapshot;
         self.publish_sequence(sequence);
         Ok(info)
@@ -5908,6 +6091,7 @@ impl VarveFile {
         }
         self.sequence_state = snapshot.sequence_state;
         self.checkpoint_cadence = snapshot.checkpoint_cadence;
+        self.segment_cursor = snapshot.segment_cursor;
 
         #[cfg(test)]
         let truncate_result =
@@ -5924,6 +6108,44 @@ impl VarveFile {
         } else {
             operation_error
         }
+    }
+
+    /// The payload length a full checkpoint of the current index would need.
+    fn index_checkpoint_payload_len(&self) -> Result<u64> {
+        const CHECKPOINT_PREFIX_LEN: u64 = 4 + 2 + 8 + 8;
+        let entry_count =
+            u64::try_from(self.index.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+                resource: "checkpoint entry count",
+            })?;
+        entry_count
+            .checked_mul(SEGMENT_ENTRY_LEN)
+            .and_then(|bytes| bytes.checked_add(CHECKPOINT_PREFIX_LEN))
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "checkpoint payload length",
+            })
+    }
+
+    /// Whether a full checkpoint of the current index would fit the format's
+    /// own record ceilings.
+    ///
+    /// The index only grows, so once this is false it stays false and the
+    /// answer costs one multiply per flush. Every way it can be false is a
+    /// reason `write_index_checkpoint` would refuse, which is why the decision
+    /// belongs here: a checkpoint is derived, and declining to write one costs
+    /// the next open a scan it already knows how to do.
+    fn index_checkpoint_fits(&self) -> bool {
+        let Ok(payload_len) = self.index_checkpoint_payload_len() else {
+            return false;
+        };
+        let limits = &self.spec.read_limits;
+        u64::try_from(self.index.len())
+            .is_ok_and(|count| limits.check(ReadLimitKey::Records, count).is_ok())
+            && limits
+                .check(ReadLimitKey::RecordPayloadLen, payload_len)
+                .is_ok()
+            && limits
+                .check(ReadLimitKey::LogicalPayloadLen, payload_len)
+                .is_ok()
     }
 
     fn write_index_checkpoint(&mut self) -> Result<u64> {
@@ -5963,21 +6185,88 @@ impl VarveFile {
         payload.extend_from_slice(&covered_offset.to_le_bytes());
         payload.extend_from_slice(&entry_count.to_le_bytes());
         for entry in self.index.iter() {
-            payload.extend_from_slice(&entry.block_id.to_le_bytes());
-            payload.extend_from_slice(&entry.block_version.to_le_bytes());
-            payload.extend_from_slice(&entry.flags.to_le_bytes());
-            payload.extend_from_slice(&entry.sequence.to_le_bytes());
-            payload.extend_from_slice(&entry.record_offset.to_le_bytes());
-            payload.extend_from_slice(&entry.payload_offset.to_le_bytes());
-            payload.extend_from_slice(&entry.payload_len.to_le_bytes());
-            payload.extend_from_slice(&entry.checksum.to_le_bytes());
-            payload.extend_from_slice(&entry.uncompressed_len_hint.to_le_bytes());
-            payload.extend_from_slice(&entry.footer_offset.unwrap_or(0).to_le_bytes());
-            payload.extend_from_slice(&entry.prev_same_block_offset.unwrap_or(0).to_le_bytes());
-            payload.extend_from_slice(&entry.prev_same_key_offset.unwrap_or(0).to_le_bytes());
-            payload.push(u8::from(entry.committed));
+            push_index_entry_bytes(&mut payload, entry, entry.committed);
         }
         self.write_record(INDEX_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, &payload)
+    }
+
+    /// Appends the segment record that closes this commit point.
+    ///
+    /// It must be the last record the commit point writes. Open finds the
+    /// chain by reading the last record footer in the file, so any record
+    /// appended after this one hides it — which costs the next open a full
+    /// scan, never correctness.
+    fn write_segment_record(&mut self) -> Result<()> {
+        let start = self.segment_cursor.next_position;
+        debug_assert!(start <= self.index.len());
+        let covered_start = match self.segment_cursor.covered_start {
+            Some(offset) => offset,
+            None => append_log_start_for_file(self)?,
+        };
+        let preceding_records =
+            u64::try_from(start).map_err(|_| Error::ResourceArithmeticOverflow {
+                resource: "segment entry count",
+            })?;
+        // The record lands at the current end of file, and the trailer has to
+        // name that offset before the header that would state it exists. The
+        // append core budgets the same value from the same source and refuses
+        // to write anywhere else, so the two cannot disagree.
+        let record_offset = self.file.metadata()?.len();
+        let payload = encode_segment_payload(
+            self.spec,
+            &self.index[start..],
+            covered_start,
+            preceding_records,
+            record_offset,
+        )?;
+        let permit = self.ensure_write()?;
+        let info = self.write_record_with_prev_key(
+            &permit,
+            SEGMENT_BLOCK_ID,
+            SEGMENT_VERSION,
+            RECORD_FLAG_INTERNAL,
+            0,
+            &payload,
+            None,
+        )?;
+        debug_assert_eq!(info.record_offset, record_offset);
+        Ok(())
+    }
+
+    /// Whether this commit point should close a segment.
+    ///
+    /// Three conditions, and the third is the one that matters: a segment is
+    /// only written once everything it would cover is committed. Under a
+    /// transaction-marker policy that means the commit marker is already down.
+    /// A segment that covered uncommitted records would outlive them — the next
+    /// writer open truncates them — and would then describe a file that no
+    /// longer exists.
+    fn needs_index_segment(&self) -> bool {
+        self.spec.index_policy.segment_on_flush
+            && self.segment_cursor.next_position < self.index.len()
+            && !(self.spec.commit_policy.is_transaction_marker()
+                && self.has_uncommitted_since_last_commit())
+    }
+
+    /// Writes the segment record if one is due, and reports nothing if it
+    /// could not be written.
+    ///
+    /// INVARIANT 3. Every caller runs this *after* the record its operation is
+    /// accountable for is in the file, and for a commit point that record is
+    /// the commit marker. The segment is derived from records that are already
+    /// durable, so its failure cannot make the operation not have happened; the
+    /// next open answers a missing or torn segment with the full scan. Turning
+    /// it into an error here would tell a caller to re-run a transaction that
+    /// is already committed.
+    ///
+    /// A failed append rolls itself back, and a failed *rollback* poisons the
+    /// writer, so a failure this swallows is still visible: the next operation
+    /// on this handle refuses.
+    fn write_index_segment_if_needed(&mut self) {
+        if self.mode != OpenMode::ReadWrite || !self.needs_index_segment() {
+            return;
+        }
+        let _ = self.write_segment_record();
     }
 
     fn write_embedded_manifest_if_needed(&mut self) -> Result<()> {
@@ -6018,9 +6307,18 @@ impl VarveFile {
         // reduces to "the newest entry is not a commit marker". The former
         // reverse search re-walked the index on every flush, adding another
         // O(N^2) cumulative flush cost for marker-on-flush formats (PERF2-02).
-        self.index
-            .last()
-            .is_some_and(|entry| entry.block_id != COMMIT_BLOCK_ID)
+        //
+        // With one exception, and it is bounded at one entry: a segment record
+        // is appended *after* the marker that certified its coverage, because
+        // open has to find it at the end of the file. Skipping it here is what
+        // stops a repeated flush from writing marker, segment, marker, segment
+        // forever on a file nothing is being appended to.
+        let mut newest = self.index.iter().rev();
+        let entry = match newest.next() {
+            Some(entry) if entry.block_id == SEGMENT_BLOCK_ID => newest.next(),
+            other => other,
+        };
+        entry.is_some_and(|entry| entry.block_id != COMMIT_BLOCK_ID)
     }
 
     /// Decides whether `flush`/`commit` should serialize a fresh full index
@@ -6050,6 +6348,15 @@ impl VarveFile {
     /// implementation recomputed by reverse-searching the resident index on
     /// every flush, which made cumulative flush CPU O(N^2) for
     /// flush-per-record workloads.
+    /// (c) *Skip when it would not fit.* A full checkpoint serializes the whole
+    ///     index into one record, so past `(max_record_payload_len - 22) / 73`
+    ///     entries — 919,299 on the 64 MiB default — there is no record that
+    ///     can hold it. `write_index_checkpoint` answered that with
+    ///     `LimitExceeded`, and because `flush` propagates, a file simply
+    ///     stopped being flushable at that record count. The checkpoint is
+    ///     derived: not writing one costs the next open the scan it already
+    ///     falls back to, so the ceiling belongs in the decision, not in the
+    ///     write.
     fn needs_index_checkpoint(&self) -> bool {
         // Rule (a): commit markers never grow the eligible tail, so an
         // unchanged checkpoint is suppressed by `eligible_since_checkpoint`
@@ -6057,7 +6364,9 @@ impl VarveFile {
         // checkpoint's position, whose entry count is a faithful proxy for
         // that checkpoint's byte cost.
         let new_records = self.checkpoint_cadence.eligible_since_checkpoint;
-        new_records != 0 && new_records >= self.checkpoint_cadence.next_threshold
+        new_records != 0
+            && new_records >= self.checkpoint_cadence.next_threshold
+            && self.index_checkpoint_fits()
     }
 }
 
@@ -6474,21 +6783,175 @@ fn encode_index_checkpoint_payload(
     payload.extend_from_slice(&covered_offset.to_le_bytes());
     payload.extend_from_slice(&count.to_le_bytes());
     for entry in entries {
-        payload.extend_from_slice(&entry.block_id.to_le_bytes());
-        payload.extend_from_slice(&entry.block_version.to_le_bytes());
-        payload.extend_from_slice(&entry.flags.to_le_bytes());
-        payload.extend_from_slice(&entry.sequence.to_le_bytes());
-        payload.extend_from_slice(&entry.record_offset.to_le_bytes());
-        payload.extend_from_slice(&entry.payload_offset.to_le_bytes());
-        payload.extend_from_slice(&entry.payload_len.to_le_bytes());
-        payload.extend_from_slice(&entry.checksum.to_le_bytes());
-        payload.extend_from_slice(&entry.uncompressed_len_hint.to_le_bytes());
-        payload.extend_from_slice(&entry.footer_offset.unwrap_or(0).to_le_bytes());
-        payload.extend_from_slice(&entry.prev_same_block_offset.unwrap_or(0).to_le_bytes());
-        payload.extend_from_slice(&entry.prev_same_key_offset.unwrap_or(0).to_le_bytes());
-        payload.push(u8::from(entry.committed));
+        push_index_entry_bytes(&mut payload, entry, entry.committed);
     }
     Ok(payload)
+}
+
+/// Serializes one index entry in the layout [`read_index_entry_payload`]
+/// decodes at checkpoint version 3.
+///
+/// `committed` is a parameter rather than a field read because the two writers
+/// answer it differently: a checkpoint records the writer's live view, while a
+/// segment is only ever written once its whole coverage is committed, so it
+/// records what a scan of the same bytes would produce.
+fn push_index_entry_bytes(payload: &mut Vec<u8>, entry: &RecordIndexEntry, committed: bool) {
+    payload.extend_from_slice(&entry.block_id.to_le_bytes());
+    payload.extend_from_slice(&entry.block_version.to_le_bytes());
+    payload.extend_from_slice(&entry.flags.to_le_bytes());
+    payload.extend_from_slice(&entry.sequence.to_le_bytes());
+    payload.extend_from_slice(&entry.record_offset.to_le_bytes());
+    payload.extend_from_slice(&entry.payload_offset.to_le_bytes());
+    payload.extend_from_slice(&entry.payload_len.to_le_bytes());
+    payload.extend_from_slice(&entry.checksum.to_le_bytes());
+    payload.extend_from_slice(&entry.uncompressed_len_hint.to_le_bytes());
+    payload.extend_from_slice(&entry.footer_offset.unwrap_or(0).to_le_bytes());
+    payload.extend_from_slice(&entry.prev_same_block_offset.unwrap_or(0).to_le_bytes());
+    payload.extend_from_slice(&entry.prev_same_key_offset.unwrap_or(0).to_le_bytes());
+    payload.push(u8::from(committed));
+}
+
+/// The payload length a segment record covering `count` entries occupies.
+fn segment_payload_len(count: u64) -> Result<u64> {
+    count
+        .checked_mul(SEGMENT_ENTRY_LEN)
+        .and_then(|bytes| bytes.checked_add(SEGMENT_PREFIX_LEN))
+        .and_then(|bytes| bytes.checked_add(SEGMENT_TRAILER_LEN))
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "segment payload length",
+        })
+}
+
+/// Serializes one segment: the records a single commit point added, and the
+/// segment record's own start offset as the closing trailer.
+fn encode_segment_payload(
+    spec: FormatSpec,
+    entries: &[RecordIndexEntry],
+    covered_start: u64,
+    preceding_records: u64,
+    record_offset: u64,
+) -> Result<Vec<u8>> {
+    let count = u64::try_from(entries.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+        resource: "segment entry count",
+    })?;
+    let payload_len = segment_payload_len(count)?;
+    spec.read_limits.check(ReadLimitKey::Records, count)?;
+    spec.read_limits
+        .check(ReadLimitKey::RecordPayloadLen, payload_len)?;
+    spec.read_limits
+        .check(ReadLimitKey::LogicalPayloadLen, payload_len)?;
+    let capacity =
+        usize::try_from(payload_len).map_err(|_| Error::LengthOverflow { value: payload_len })?;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(capacity)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "segment payload",
+            requested: payload_len,
+        })?;
+    payload.extend_from_slice(SEGMENT_MAGIC);
+    payload.extend_from_slice(&SEGMENT_VERSION.to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&covered_start.to_le_bytes());
+    payload.extend_from_slice(&count.to_le_bytes());
+    payload.extend_from_slice(&preceding_records.to_le_bytes());
+    for entry in entries {
+        // A segment is written only after every record it covers is committed,
+        // so this is not the writer's live `committed` bit - which stays false
+        // for a data record under a marker policy - but what a scan of these
+        // same bytes reports. The two open paths must agree entry for entry.
+        push_index_entry_bytes(&mut payload, entry, true);
+    }
+    payload.extend_from_slice(&record_offset.to_le_bytes());
+    Ok(payload)
+}
+
+/// One segment, as read back from its record.
+#[derive(Debug)]
+struct DecodedSegment {
+    /// File offset of the first record this segment covers.
+    covered_start: u64,
+    /// Records in the file before `covered_start`.
+    preceding_records: u64,
+    entries: Vec<RecordIndexEntry>,
+}
+
+fn decode_segment_payload(
+    spec: FormatSpec,
+    payload: &[u8],
+    record_offset: u64,
+    file_len: u64,
+) -> Result<DecodedSegment> {
+    let prefix_len = SEGMENT_PREFIX_LEN as usize;
+    let trailer_len = SEGMENT_TRAILER_LEN as usize;
+    let entry_len = SEGMENT_ENTRY_LEN as usize;
+    if payload.len() < prefix_len + trailer_len || &payload[..4] != SEGMENT_MAGIC {
+        return Err(Error::InvalidIndexSegment);
+    }
+    let mut u16_buf = [0; 2];
+    u16_buf.copy_from_slice(&payload[4..6]);
+    if u16::from_le_bytes(u16_buf) != SEGMENT_VERSION {
+        return Err(Error::InvalidIndexSegment);
+    }
+    u16_buf.copy_from_slice(&payload[6..8]);
+    if u16::from_le_bytes(u16_buf) != 0 {
+        return Err(Error::InvalidIndexSegment);
+    }
+    let mut u64_buf = [0; 8];
+    u64_buf.copy_from_slice(&payload[8..16]);
+    let covered_start = u64::from_le_bytes(u64_buf);
+    u64_buf.copy_from_slice(&payload[16..24]);
+    let count = u64::from_le_bytes(u64_buf);
+    u64_buf.copy_from_slice(&payload[24..32]);
+    let preceding_records = u64::from_le_bytes(u64_buf);
+    // The trailer is what let this record be found from EOF at all; if it does
+    // not name this record, the bytes at EOF were not this record's.
+    u64_buf.copy_from_slice(&payload[payload.len() - trailer_len..]);
+    if u64::from_le_bytes(u64_buf) != record_offset {
+        return Err(Error::InvalidIndexSegment);
+    }
+
+    spec.read_limits.check(ReadLimitKey::Records, count)?;
+    let count_usize = usize::try_from(count).map_err(|_| Error::LengthOverflow { value: count })?;
+    let resident_bytes = index_bytes_for_count(count_usize)?;
+    spec.read_limits
+        .check(ReadLimitKey::IndexBytes, resident_bytes)?;
+    let expected_len = usize::try_from(segment_payload_len(count)?)
+        .map_err(|_| Error::LengthOverflow { value: count })?;
+    if payload.len() != expected_len {
+        return Err(Error::InvalidIndexSegment);
+    }
+
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(count_usize)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "segment index",
+            requested: resident_bytes,
+        })?;
+    let mut position = prefix_len;
+    for _ in 0..count_usize {
+        let entry = read_index_entry_payload(
+            &payload[position..position + entry_len],
+            INDEX_CHECKPOINT_VERSION,
+        );
+        if entry.checked_physical_end()? > file_len {
+            return Err(Error::InvalidIndexSegment);
+        }
+        // A segment never covers another segment: they are written last, so
+        // the record after one is the first record of the next segment. A
+        // chain that claimed otherwise could hide records between two links.
+        if entry.block_id == SEGMENT_BLOCK_ID {
+            return Err(Error::InvalidIndexSegment);
+        }
+        entries.push(entry);
+        position += entry_len;
+    }
+    Ok(DecodedSegment {
+        covered_start,
+        preceding_records,
+        entries,
+    })
 }
 
 fn encode_schema_manifest(spec: FormatSpec) -> Result<Vec<u8>> {
@@ -6790,18 +7253,20 @@ fn index_policy_byte(policy: IndexPolicy) -> u8 {
         })
         | (if policy.block_offset_chain { 1 << 2 } else { 0 })
         | (if policy.keyed_offset_chain { 1 << 3 } else { 0 })
+        | (if policy.segment_on_flush { 1 << 4 } else { 0 })
 }
 
 fn index_policy_from_byte(value: u8) -> Result<IndexPolicy> {
     match value {
         1 => Ok(IndexPolicy::ScanOnOpen),
         2 => Ok(IndexPolicy::CheckpointOnFlush),
-        3..=15 => Ok(IndexPolicy::new(
+        3..=31 => Ok(IndexPolicy::new(
             value & 0x01 != 0,
             value & 0x02 != 0,
             value & 0x04 != 0,
             value & 0x08 != 0,
-        )),
+        )
+        .with_segment_on_flush(value & 0x10 != 0)),
         _ => Err(Error::InvalidSchemaManifest),
     }
 }
@@ -8368,6 +8833,19 @@ struct ScanChecks {
     verify_checksums: bool,
 }
 
+#[cfg(feature = "scalable-fault-injection")]
+std::thread_local! {
+    static RECORDS_FRAMED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts records framed while building an index on this thread. Inert without
+/// the `scalable-fault-injection` feature.
+#[inline]
+fn note_record_framed() {
+    #[cfg(feature = "scalable-fault-injection")]
+    RECORDS_FRAMED.with(|framed| framed.set(framed.get().saturating_add(1)));
+}
+
 fn read_record_entry_at(
     spec: FormatSpec,
     file: &mut File,
@@ -8376,6 +8854,7 @@ fn read_record_entry_at(
     checks: ScanChecks,
     accounting: &mut ScanAccounting,
 ) -> Result<RecordRead> {
+    note_record_framed();
     let ScanChecks {
         partial_boundary,
         checksum_boundary,
@@ -8573,7 +9052,7 @@ impl NativeStreamScanner {
         };
         if matches!(
             entry.block_id,
-            OP_BLOCK_ID | INDEX_BLOCK_ID | COMMIT_BLOCK_ID
+            OP_BLOCK_ID | INDEX_BLOCK_ID | COMMIT_BLOCK_ID | SEGMENT_BLOCK_ID
         ) {
             return Err(Error::StreamingUnsupported);
         }
@@ -8942,12 +9421,35 @@ fn prepare_stream_record(
     })
 }
 
+/// Whether this open may take the segment chain instead of the record scan.
+///
+/// Two exclusions, and both are about what the scan does that the walk does
+/// not. A **recovery** scan verifies every record and truncates on the
+/// mismatch; that evidence is the point of the open, and a walk that reads no
+/// data record cannot produce it. [`IntegrityVerification::AtOpen`] asks for
+/// the same verification of every record for the same reason. Under either,
+/// the walk would be answering a cheaper question than the one asked.
+fn segment_chain_open_is_allowed(spec: FormatSpec, intent: ScanIntent) -> bool {
+    spec.index_policy.segment_on_flush
+        && intent != ScanIntent::Recover
+        && spec
+            .read_limits
+            .resolve()
+            .effective_integrity_verification()
+            != IntegrityVerification::AtOpen
+}
+
 fn load_index(
     spec: FormatSpec,
     file: &mut File,
     header_len: u64,
     intent: ScanIntent,
 ) -> Result<Vec<RecordIndexEntry>> {
+    if segment_chain_open_is_allowed(spec, intent)
+        && let Some(entries) = load_index_from_segments(spec, file, header_len)?
+    {
+        return Ok(entries);
+    }
     // Sequence uniqueness is validated exactly once, inside
     // `scan_records_from`, on the complete scanned entry list *before* any
     // commit-boundary truncation; a truncated prefix of a duplicate-free list
@@ -8956,10 +9458,262 @@ fn load_index(
     scan_records_from(spec, file, header_len, intent)
 }
 
+/// Rebuilds the resident index from the internal segment chain, or reports
+/// that this file's chain does not describe it.
+///
+/// `Ok(None)` is the ordinary answer for a file the chain cannot account for:
+/// one written before segments were enabled, one whose writer appended past
+/// its last commit point, one truncated mid-record, one whose chain is stale.
+/// Every one of those is answered by the full scan, which is what open did
+/// before and is never an error. Only a *resource refusal* propagates — a
+/// limit, an allocation, an arithmetic ceiling — because those are the format
+/// saying no, and silently doing more work instead is how a limit gets
+/// bypassed.
+fn load_index_from_segments(
+    spec: FormatSpec,
+    file: &mut File,
+    append_start: u64,
+) -> Result<Option<Vec<RecordIndexEntry>>> {
+    match walk_segment_chain(spec, file, append_start) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(error @ Error::LimitExceeded { .. })
+        | Err(error @ Error::MissingResourceLimit { .. })
+        | Err(error @ Error::TrustedUnboundedRequiresExplicitApi { .. })
+        | Err(error @ Error::ResourceArithmeticOverflow { .. })
+        | Err(error @ Error::LengthOverflow { .. })
+        | Err(error @ Error::AllocationFailed { .. }) => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Finds the newest segment record from the end of the file.
+///
+/// The last 32 bytes are a record footer if this file ends in a record at all,
+/// and the eight before them are that record's payload trailer if that record
+/// is a segment. Neither alone is proof — the footer carries no block id and
+/// the trailer is only eight bytes of payload — so the offset this returns is a
+/// candidate that the caller confirms by reading the header there.
+fn read_segment_tip_offset(file: &mut File, append_start: u64, file_len: u64) -> Result<u64> {
+    let probe_len = SEGMENT_TRAILER_LEN + RECORD_FOOTER_LEN;
+    let minimum = RECORD_HEADER_LEN + SEGMENT_PREFIX_LEN + probe_len;
+    if file_len
+        .checked_sub(append_start)
+        .is_none_or(|available| available < minimum)
+    {
+        return Err(Error::InvalidIndexSegment);
+    }
+    let probe_offset = file_len - probe_len;
+    let mut probe = [0u8; (SEGMENT_TRAILER_LEN + RECORD_FOOTER_LEN) as usize];
+    file.seek(SeekFrom::Start(probe_offset))?;
+    file.read_exact(&mut probe)?;
+    let trailer_len = SEGMENT_TRAILER_LEN as usize;
+    if &probe[trailer_len..trailer_len + 4] != RECORD_FOOTER_MAGIC {
+        return Err(Error::InvalidIndexSegment);
+    }
+    let mut version = [0; 2];
+    version.copy_from_slice(&probe[trailer_len + 4..trailer_len + 6]);
+    if u16::from_le_bytes(version) != RECORD_FOOTER_VERSION {
+        return Err(Error::InvalidIndexSegment);
+    }
+    let mut trailer = [0; SEGMENT_TRAILER_LEN as usize];
+    trailer.copy_from_slice(&probe[..trailer_len]);
+    let record_offset = u64::from_le_bytes(trailer);
+    if record_offset < append_start || record_offset > probe_offset - SEGMENT_PREFIX_LEN {
+        return Err(Error::InvalidIndexSegment);
+    }
+    Ok(record_offset)
+}
+
+/// Walks the segment chain backwards from the end of the file and materializes
+/// the index it describes.
+///
+/// Every link is checked against the file it claims to describe rather than
+/// trusted: the record at each offset must be a segment record, its extent must
+/// end exactly where the following link said its coverage began, and the
+/// entries it carries must tile its coverage with no gap and no overlap. The
+/// oldest link must reach the start of the append log. A chain that fails any
+/// of these describes some other file, and the caller falls back to the scan.
+///
+/// Termination is structural: each link's predecessor offset must be strictly
+/// smaller and no smaller than `append_start`, so the walk is bounded by the
+/// segments in the file whatever the bytes say.
+fn walk_segment_chain(
+    spec: FormatSpec,
+    file: &mut File,
+    append_start: u64,
+) -> Result<Vec<RecordIndexEntry>> {
+    let file_len = file.metadata()?.len();
+    spec.read_limits.check(ReadLimitKey::FileLen, file_len)?;
+    let mut accounting = ScanAccounting::default();
+    accounting.advance(spec, append_start)?;
+
+    let mut chain: Vec<(RecordIndexEntry, DecodedSegment)> = Vec::new();
+    let mut next = Some(read_segment_tip_offset(file, append_start, file_len)?);
+    // What the link being read must end at: the end of the file for the tip,
+    // and the coverage start of its successor for every link behind it.
+    let mut expected_end = file_len;
+    while let Some(record_offset) = next {
+        let entry = match read_record_entry_at(
+            spec,
+            file,
+            file_len,
+            record_offset,
+            // A chain link is either wholly there or it is not a link. There is
+            // no recoverable tail here and no boundary to truncate back to: the
+            // scan owns that decision, and this walk defers to it by failing.
+            ScanChecks {
+                partial_boundary: None,
+                checksum_boundary: None,
+                verify_checksums: true,
+            },
+            &mut accounting,
+        )? {
+            RecordRead::Entry(entry) => entry,
+            RecordRead::RecoverableTail(_) => return Err(Error::InvalidIndexSegment),
+        };
+        if entry.block_id != SEGMENT_BLOCK_ID
+            || entry.block_version != SEGMENT_VERSION
+            || entry.flags != RECORD_FLAG_INTERNAL
+            || entry.checked_physical_end()? != expected_end
+        {
+            return Err(Error::InvalidIndexSegment);
+        }
+        let payload = entry.read_payload_file_with_len(file, file_len)?;
+        let segment = decode_segment_payload(spec, &payload, record_offset, file_len)?;
+        if segment.covered_start < append_start || segment.covered_start > record_offset {
+            return Err(Error::InvalidIndexSegment);
+        }
+        expected_end = segment.covered_start;
+        next = match entry.prev_same_block_offset {
+            Some(previous) if previous >= record_offset || previous < append_start => {
+                return Err(Error::InvalidIndexSegment);
+            }
+            previous => previous,
+        };
+        let links = u64::try_from(chain.len())
+            .ok()
+            .and_then(|links| links.checked_add(1))
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "segment count",
+            })?;
+        spec.read_limits.check(ReadLimitKey::Segments, links)?;
+        chain.try_reserve(1).map_err(|_| Error::AllocationFailed {
+            resource: "segment chain",
+            requested: links,
+        })?;
+        chain.push((entry, segment));
+    }
+    // The oldest link must reach the append log, or records written before the
+    // chain began are outside every segment and would be lost.
+    if expected_end != append_start {
+        return Err(Error::InvalidIndexSegment);
+    }
+
+    let mut entries = Vec::new();
+    let mut running = append_start;
+    for (link, segment) in chain.into_iter().rev() {
+        let count =
+            u64::try_from(entries.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+                resource: "record count",
+            })?;
+        if segment.covered_start != running || segment.preceding_records != count {
+            return Err(Error::InvalidIndexSegment);
+        }
+        for covered in segment.entries {
+            running = push_scanned_entry(spec, &mut entries, covered, running)?;
+        }
+        // The segment record closes its own coverage, so it sits immediately
+        // after the last record it describes.
+        if link.record_offset != running {
+            return Err(Error::InvalidIndexSegment);
+        }
+        running = push_scanned_entry(spec, &mut entries, link, running)?;
+    }
+    if running != file_len {
+        return Err(Error::InvalidIndexSegment);
+    }
+    // Same single witness the scan carries, on the same shape of list
+    // (PERF2-07): a chain is written by this crate but read from a file
+    // anyone can hand over.
+    validate_unique_sequences(&entries)?;
+    Ok(entries)
+}
+
+/// Appends one entry to an index under construction, charging the same limits
+/// the record scan charges, and reports where the record after it must begin.
+fn push_scanned_entry(
+    spec: FormatSpec,
+    entries: &mut Vec<RecordIndexEntry>,
+    entry: RecordIndexEntry,
+    expected_offset: u64,
+) -> Result<u64> {
+    if entry.record_offset != expected_offset
+        || entry.payload_offset
+            != expected_offset
+                .checked_add(RECORD_HEADER_LEN)
+                .ok_or(Error::InvalidIndexSegment)?
+    {
+        return Err(Error::InvalidIndexSegment);
+    }
+    let end = entry.checked_physical_end()?;
+    reserve_scanned_entry(spec, entries)?;
+    entries.push(entry);
+    Ok(end)
+}
+
+/// Charges the record and index-byte ceilings for one more index entry and
+/// reserves room for it.
+fn reserve_scanned_entry(spec: FormatSpec, entries: &mut Vec<RecordIndexEntry>) -> Result<()> {
+    let record_count = u64::try_from(entries.len())
+        .map_err(|_| Error::ResourceArithmeticOverflow {
+            resource: "record count",
+        })?
+        .checked_add(1)
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "record count",
+        })?;
+    spec.read_limits
+        .check(ReadLimitKey::Records, record_count)?;
+    let index_bytes = index_bytes_for_count(usize::try_from(record_count).map_err(|_| {
+        Error::LengthOverflow {
+            value: record_count,
+        }
+    })?)?;
+    spec.read_limits
+        .check(ReadLimitKey::IndexBytes, index_bytes)?;
+    entries.try_reserve(1).map_err(|_| Error::AllocationFailed {
+        resource: "record index",
+        requested: index_bytes,
+    })
+}
+
 fn validated_snapshot_len(append_start: u64, entries: &[RecordIndexEntry]) -> Result<u64> {
     match entries.last() {
         Some(entry) => entry.checked_physical_end(),
         None => Ok(append_start),
+    }
+}
+
+/// How many leading entries a transaction-marker format treats as committed.
+///
+/// The commit marker is the boundary, and everything after it is a writer's
+/// unfinished work — with exactly one exception, bounded at one entry. A
+/// segment record is appended *after* the marker whose transaction it closes,
+/// because open finds the chain at the end of the file and a record behind the
+/// segment would hide it. That segment describes only records the marker
+/// already committed, so it is inside the boundary rather than past it.
+///
+/// Returns `None` when the file holds no commit marker, which means nothing in
+/// it is committed.
+fn committed_prefix_len(entries: &[RecordIndexEntry]) -> Option<usize> {
+    let position = entries
+        .iter()
+        .rposition(|entry| entry.block_id == COMMIT_BLOCK_ID)?;
+    let kept = position + 1;
+    if entries.len() == kept + 1 && entries[kept].block_id == SEGMENT_BLOCK_ID {
+        Some(kept + 1)
+    } else {
+        Some(kept)
     }
 }
 
@@ -8972,12 +9726,8 @@ fn truncate_uncommitted_tail_if_needed(
     if !spec.commit_policy.is_transaction_marker() {
         return Ok(());
     }
-    let committed_end = match entries
-        .iter()
-        .rev()
-        .find(|entry| entry.block_id == COMMIT_BLOCK_ID)
-    {
-        Some(entry) => entry.checked_physical_end()?,
+    let committed_end = match committed_prefix_len(entries) {
+        Some(len) => entries[len - 1].checked_physical_end()?,
         None => header_len,
     };
     if file.metadata()?.len() > committed_end {
@@ -9184,6 +9934,14 @@ fn validate_index_checkpoint(
         return Err(Error::InvalidIndexCheckpoint);
     }
 
+    // The records a checkpoint covers are contiguous, because the append log
+    // is. `<` accepted a *gap* between one record's end and the next record's
+    // start, so a one-entry checkpoint could claim `covered_offset` far past
+    // the record it listed and validate: every record in between is on disk,
+    // absent from the checkpoint, and therefore absent from `index_entries()`
+    // and from every typed read. `!=` is the check that was meant, and the
+    // terminal equality below closes the same hole at the far end - without it
+    // the gap simply moves to after the last entry.
     let mut previous_offset = header_len;
     for entry in &checkpoint.entries {
         let expected_payload_offset = entry
@@ -9191,7 +9949,7 @@ fn validate_index_checkpoint(
             .checked_add(RECORD_HEADER_LEN)
             .ok_or(Error::InvalidIndexCheckpoint)?;
         if entry.record_offset < header_len
-            || entry.record_offset < previous_offset
+            || entry.record_offset != previous_offset
             || entry.payload_offset != expected_payload_offset
             || entry.record_offset == checkpoint_record.record_offset
         {
@@ -9204,6 +9962,9 @@ fn validate_index_checkpoint(
             return Err(Error::InvalidIndexCheckpoint);
         }
         previous_offset = physical_end;
+    }
+    if previous_offset != checkpoint.covered_offset {
+        return Err(Error::InvalidIndexCheckpoint);
     }
     Ok(())
 }
@@ -9234,7 +9995,6 @@ fn scan_records_from(
     spec.read_limits.check(ReadLimitKey::FileLen, file_len)?;
     let mut offset = header_len;
     let mut entries = Vec::new();
-    let mut latest_commit_position = None;
     let mut latest_commit_end = None;
     let mut accounting = ScanAccounting::default();
     accounting.advance(spec, header_len)?;
@@ -9298,29 +10058,7 @@ fn scan_records_from(
             .map_err(|_| Error::ResourceArithmeticOverflow {
                 resource: "record extent",
             })?;
-        let record_count = u64::try_from(entries.len())
-            .map_err(|_| Error::ResourceArithmeticOverflow {
-                resource: "record count",
-            })?
-            .checked_add(1)
-            .ok_or(Error::ResourceArithmeticOverflow {
-                resource: "record count",
-            })?;
-        spec.read_limits
-            .check(ReadLimitKey::Records, record_count)?;
-        let index_bytes = index_bytes_for_count(usize::try_from(record_count).map_err(|_| {
-            Error::LengthOverflow {
-                value: record_count,
-            }
-        })?)?;
-        spec.read_limits
-            .check(ReadLimitKey::IndexBytes, index_bytes)?;
-        entries
-            .try_reserve(1)
-            .map_err(|_| Error::AllocationFailed {
-                resource: "record index",
-                requested: index_bytes,
-            })?;
+        reserve_scanned_entry(spec, &mut entries)?;
         if entry.block_id == INDEX_BLOCK_ID
             && (1..=INDEX_CHECKPOINT_VERSION).contains(&entry.block_version)
         {
@@ -9328,7 +10066,6 @@ fn scan_records_from(
             inspect_index_checkpoint(spec, &payload, header_len, file_len, &entry, &entries)?;
         }
         if entry.block_id == COMMIT_BLOCK_ID {
-            latest_commit_position = Some(entries.len());
             latest_commit_end = Some(offset);
         }
         entries.push(entry);
@@ -9339,10 +10076,10 @@ fn scan_records_from(
     // shrink an already-validated set.
     validate_unique_sequences(&entries)?;
     if spec.commit_policy.is_transaction_marker() {
-        let Some(position) = latest_commit_position else {
+        let Some(committed) = committed_prefix_len(&entries) else {
             return Ok(Vec::new());
         };
-        entries.truncate(position + 1);
+        entries.truncate(committed);
         for entry in &mut entries {
             entry.committed = true;
         }
@@ -11642,6 +12379,106 @@ struct TypedMarker<T>(PhantomData<T>);
 mod tests {
     use super::*;
     use crate::{VarveDecode, VarveEncode};
+
+    /// One index entry for a record of `payload_len` bytes at `record_offset`,
+    /// with no footer, as a checkpoint would hold it.
+    fn checkpoint_test_entry(record_offset: u64, payload_len: u64) -> RecordIndexEntry {
+        RecordIndexEntry {
+            block_id: 7,
+            block_version: 1,
+            flags: 0,
+            sequence: record_offset,
+            record_offset,
+            payload_offset: record_offset + RECORD_HEADER_LEN,
+            payload_len,
+            checksum: 0,
+            uncompressed_len_hint: 0,
+            footer_offset: None,
+            prev_same_block_offset: None,
+            prev_same_key_offset: None,
+            committed: true,
+        }
+    }
+
+    fn checkpoint_record_at(record_offset: u64) -> RecordIndexEntry {
+        let mut entry = checkpoint_test_entry(record_offset, 0);
+        entry.block_id = INDEX_BLOCK_ID;
+        entry
+    }
+
+    // The records a checkpoint covers are contiguous, and the predicate used to
+    // compare `record_offset < previous_offset`. That accepts a *gap*: a
+    // one-entry checkpoint could name `covered_offset` far past the record it
+    // listed, and every record in between is on disk, absent from the
+    // checkpoint, and therefore absent from `index_entries()` and from every
+    // typed read.
+    #[test]
+    fn a_checkpoint_that_skips_records_is_refused() {
+        let header_len = 32;
+        let first = checkpoint_test_entry(header_len, 8);
+        let skipped = checkpoint_test_entry(first.physical_end(), 8);
+        let record = checkpoint_record_at(skipped.physical_end());
+
+        let contiguous = IndexCheckpoint {
+            covered_offset: record.record_offset,
+            entries: vec![first.clone(), skipped.clone()],
+        };
+        assert!(
+            validate_index_checkpoint(
+                header_len,
+                record.physical_end(),
+                &record,
+                &contiguous,
+                &contiguous.entries,
+            )
+            .is_ok(),
+            "a checkpoint that tiles its coverage must still validate",
+        );
+
+        // The same file, with the middle record simply left out. The observed
+        // prefix is what the scan saw, so it agrees with the checkpoint - the
+        // hole is only visible as an offset gap.
+        let with_gap = IndexCheckpoint {
+            covered_offset: record.record_offset,
+            entries: vec![first.clone()],
+        };
+        assert!(matches!(
+            validate_index_checkpoint(
+                header_len,
+                record.physical_end(),
+                &record,
+                &with_gap,
+                &with_gap.entries,
+            ),
+            Err(Error::InvalidIndexCheckpoint),
+        ));
+    }
+
+    // The same hole, moved to the far end: every entry is contiguous, and the
+    // checkpoint simply stops before its own record. Only the terminal
+    // `previous_offset == covered_offset` catches this one.
+    #[test]
+    fn a_checkpoint_that_stops_short_of_its_coverage_is_refused() {
+        let header_len = 32;
+        let first = checkpoint_test_entry(header_len, 8);
+        let trailing = checkpoint_test_entry(first.physical_end(), 8);
+        let record = checkpoint_record_at(trailing.physical_end());
+
+        let short = IndexCheckpoint {
+            covered_offset: record.record_offset,
+            entries: vec![first.clone()],
+        };
+        assert!(matches!(
+            validate_index_checkpoint(
+                header_len,
+                record.physical_end(),
+                &record,
+                &short,
+                &short.entries,
+            ),
+            Err(Error::InvalidIndexCheckpoint),
+        ));
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct MatrixTestCell {

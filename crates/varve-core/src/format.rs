@@ -1108,6 +1108,18 @@ pub struct IndexPolicy {
     pub checkpoint_on_flush: bool,
     pub block_offset_chain: bool,
     pub keyed_offset_chain: bool,
+    /// Whether a commit point appends an internal *segment* record.
+    ///
+    /// A segment is varve's own lookup unit, not a unit the declaration names:
+    /// one segment covers exactly the records a single commit point added, and
+    /// its record's footer chains back to the previous segment through
+    /// `prev_same_block_offset`. Open follows that chain backwards from the
+    /// last record footer and never reads a data record.
+    ///
+    /// Deliberately absent from the layout DSL. Blocks are what a user
+    /// declares; segment granularity is varve's decision, so there is nothing
+    /// here for a declaration to choose.
+    pub segment_on_flush: bool,
 }
 
 #[allow(non_upper_case_globals)]
@@ -1117,6 +1129,7 @@ impl IndexPolicy {
         checkpoint_on_flush: false,
         block_offset_chain: false,
         keyed_offset_chain: false,
+        segment_on_flush: false,
     };
 
     pub const CheckpointOnFlush: Self = Self {
@@ -1124,6 +1137,7 @@ impl IndexPolicy {
         checkpoint_on_flush: true,
         block_offset_chain: false,
         keyed_offset_chain: false,
+        segment_on_flush: false,
     };
 
     pub const BlockOffsetChain: Self = Self {
@@ -1131,6 +1145,7 @@ impl IndexPolicy {
         checkpoint_on_flush: false,
         block_offset_chain: true,
         keyed_offset_chain: false,
+        segment_on_flush: false,
     };
 
     pub const KeyedOffsetChain: Self = Self {
@@ -1138,6 +1153,16 @@ impl IndexPolicy {
         checkpoint_on_flush: false,
         block_offset_chain: true,
         keyed_offset_chain: true,
+        segment_on_flush: false,
+    };
+
+    /// Segment-chained open, built on the block offset chain it needs.
+    pub const SegmentOnFlush: Self = Self {
+        scan_on_open: true,
+        checkpoint_on_flush: false,
+        block_offset_chain: true,
+        keyed_offset_chain: false,
+        segment_on_flush: true,
     };
 
     pub const fn new(
@@ -1151,6 +1176,7 @@ impl IndexPolicy {
             checkpoint_on_flush,
             block_offset_chain,
             keyed_offset_chain,
+            segment_on_flush: false,
         }
     }
 
@@ -1184,8 +1210,22 @@ impl IndexPolicy {
         self
     }
 
+    /// Enables the internal segment chain.
+    ///
+    /// The chain *is* `prev_same_block_offset` in the record footer, so this
+    /// turns the block offset chain on with it; there is no segment chain
+    /// without a footer to carry it.
+    pub const fn with_segment_on_flush(mut self, enabled: bool) -> Self {
+        self.segment_on_flush = enabled;
+        if enabled {
+            self.scan_on_open = true;
+            self.block_offset_chain = true;
+        }
+        self
+    }
+
     pub const fn requires_record_footer(self) -> bool {
-        self.block_offset_chain || self.keyed_offset_chain
+        self.block_offset_chain || self.keyed_offset_chain || self.segment_on_flush
     }
 }
 
@@ -2531,6 +2571,28 @@ impl FormatSpec {
                 "keyed_offset_chain requires block_offset_chain",
             ));
         }
+        if self.index_policy.segment_on_flush && !self.index_policy.block_offset_chain {
+            return Err(Error::InvalidFormatSpec(
+                "segment_on_flush requires block_offset_chain",
+            ));
+        }
+        // A record scan reads each record's own header, so damage to one record
+        // misindexes that record. A segment chain reads one payload that
+        // describes many records, so damage to it misindexes records whose own
+        // bytes are intact - and open would have no way to notice. The record
+        // checksum is what closes that, and the chain walk verifies it on every
+        // link, so the chain is available exactly where there is a checksum to
+        // verify.
+        if self.index_policy.segment_on_flush
+            && !matches!(
+                self.integrity_policy,
+                IntegrityPolicy::Crc32 | IntegrityPolicy::Crc32WithHeader
+            )
+        {
+            return Err(Error::InvalidFormatSpec(
+                "segment_on_flush requires a crc32 integrity policy",
+            ));
+        }
         for (index, block) in self.blocks.iter().enumerate() {
             if block.id >= RESERVED_BLOCK_ID_START {
                 return Err(Error::InvalidFormatSpec("user block id is reserved"));
@@ -3018,6 +3080,10 @@ const fn matrix_commit_kind_hash_byte(kind: MatrixCommitKind) -> u8 {
 }
 
 const fn index_policy_hash_byte(policy: IndexPolicy) -> u8 {
+    // Bit 4 is `segment_on_flush`. It is hashed because it changes the bytes
+    // a writer produces - a segment record is a record - so a file written
+    // with it is not the file a spec without it describes. A spec that leaves
+    // it off hashes to exactly the byte it hashed to before the bit existed.
     (if policy.scan_on_open { 1 } else { 0 })
         | (if policy.checkpoint_on_flush {
             1 << 1
@@ -3026,6 +3092,7 @@ const fn index_policy_hash_byte(policy: IndexPolicy) -> u8 {
         })
         | (if policy.block_offset_chain { 1 << 2 } else { 0 })
         | (if policy.keyed_offset_chain { 1 << 3 } else { 0 })
+        | (if policy.segment_on_flush { 1 << 4 } else { 0 })
 }
 
 const fn commit_policy_hash_byte(policy: CommitPolicy) -> u8 {

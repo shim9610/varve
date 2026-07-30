@@ -4,6 +4,60 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
+## Unreleased
+
+### Internal segments: open can stop reading every record
+
+`IndexPolicy::segment_on_flush` makes every commit point append an internal
+*segment* record covering exactly the records that commit point added. Its
+record footer's `prev_same_block_offset` names the previous segment — a value
+known when it is written, so nothing is back-patched and nothing is rewritten in
+place. Open confirms a record footer at the end of the file, walks that chain
+backwards, and reads **no data record**. At a commit point every 256 records, a
+3,000,000-record file frames about 11,700 records at open instead of 3,000,000.
+
+A segment is varve's internal lookup unit, not something a declaration names, so
+it has no `varve_format!` clause. Enable it with
+`IndexPolicy::with_segment_on_flush`.
+
+**No on-disk format change and no new file.** The record footer already carried
+a chain and a magic; open simply never used either.
+
+**What it does not change:** the resident index. It is still one
+`RecordIndexEntry` per record, still about 104 bytes each. What segments remove
+is the open-time walk, not the residency.
+
+The option is off by default, and a spec that leaves it off writes byte-identical
+files and hashes to the same `computed_schema_hash()` as before. Turning it on
+requires `block_offset_chain` (which it enables — the chain is that footer field)
+and a `crc32` integrity policy, and it refuses in-place fixed replacement
+(`replace_fixed`, `replace_fixed_in_place_exclusive`,
+`ReplaceStrategy::FixedCopyOnWrite`), which would restamp a record an already
+written segment describes. `replace_block` re-encodes every segment payload
+against the new generation and still works.
+
+The chain is derived. A file it cannot account for — written before the option,
+appended past the last commit point, truncated, corrupt, or broken mid-chain —
+falls back to the full scan and produces the identical index, never an error.
+`open_recover` and any open under `IntegrityVerification::AtOpen` always scan.
+
+### Fixed
+
+- **`flush` was fatal past a checkpoint ceiling.** A full index checkpoint
+  serializes the whole index into one record, so past
+  `(max_record_payload_len - 22) / 73` entries — 919,299 on the 64 MiB default —
+  no record can hold it, and `write_index_checkpoint` answered `LimitExceeded`.
+  `flush` propagated it, so a file stopped being flushable at that record count.
+  The ceiling is now part of `needs_index_checkpoint`: an oversized checkpoint is
+  skipped, which costs the next open the scan it already falls back to.
+- **An index checkpoint could claim coverage it did not describe.**
+  `validate_index_checkpoint` compared record offsets with `<`, which accepts a
+  *gap*: a one-entry checkpoint could name a covered offset far past the record
+  it listed, and every record in between was on disk, absent from the checkpoint,
+  and therefore absent from `index_entries()` and from every typed read. Entries
+  must now tile their coverage exactly, and the walk must end at the covered
+  offset.
+
 ## 0.5.0 - 2026-07-25
 
 **This was scoped as a `0.4.1` hotfix and is released as `0.5.0`, because the

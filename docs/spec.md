@@ -45,7 +45,7 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - The final record header word is `uncompressed_len_hint` for compressed records and `0` otherwise. `payload length` is always the physical stored byte length.
 - `VARVE1` is used for plain records, `VARVE2` is used for file-header extensions such as file-explicit compression, and `VARVE3` is used when `record_footer`/`transaction_marker` commit policy or block/keyed offset chains are enabled.
 - A `VARVE3` record has a fixed 32-byte footer after the stored payload: `b"VRF1"`, footer version, footer flags, `prev_same_block_offset`, `prev_same_key_offset`, reserved `footer_crc32`, and reserved bytes. Offset fields are `0` when absent.
-- User block ids are explicit `u32` values below `0xFFFF_FF00`; higher ids are reserved for internal records.
+- User block ids are explicit `u32` values below `0xFFFF_FF00`; higher ids are reserved for internal records. `0xFFFF_FFF7` is the segment record.
 - Fixed blocks use canonical field encoding, not raw Rust memory layout.
 - Variable blocks encode fields as `field_id + wire_type + length + payload`, allowing unknown fields to be skipped.
 - Variable user blocks may be compressed after canonical field encoding and before record write. A format may set one global variable-block compression policy, or opt individual variable block ids into record-explicit compression with `BlockCompressionDescriptor`. Fixed blocks and internal records are not compressed.
@@ -152,16 +152,20 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Read-only open never truncates. Recovery truncation is explicit through `open_recover` or `open_recover_with_report`.
 - Read-write open for `CommitPolicy::TransactionMarker` truncates uncommitted tail after the latest valid marker so appends cannot accidentally commit stale tail data.
 - `IntegrityPolicy::Crc32` and `IntegrityPolicy::Crc32WithHeader` are feature-gated behind `integrity` and reject corrupted covered bytes.
-- `IndexPolicy` is a bitset-style policy with `scan_on_open`, `checkpoint_on_flush`, `block_offset_chain`, and `keyed_offset_chain`. Offset-chain policies are written automatically in `VARVE3` footers.
+- `IndexPolicy` is a bitset-style policy with `scan_on_open`, `checkpoint_on_flush`, `block_offset_chain`, `keyed_offset_chain`, and `segment_on_flush`. Offset-chain policies are written automatically in `VARVE3` footers.
 - `CommitPolicy::RecordFooter` treats valid record footers as the commit flag for each record.
 - `CommitPolicy::TransactionMarker(on_flush|explicit)` appends internal `COMMIT_BLOCK_ID` marker records. Readers expose the latest marker-covered snapshot; writer open truncates uncommitted tail after the latest marker.
+- `IndexPolicy::segment_on_flush` makes every commit point append an internal segment record covering exactly the records that commit point added. See [Internal Segments](#internal-segments).
 - `IndexPolicy::CheckpointOnFlush` writes an internal checkpoint record, spaced geometrically so cumulative checkpoint bytes stay bounded. **Checkpoint-seeded open is specified but not implemented**: as of 0.5.0 every open scans the full record region (`load_index` -> `scan_records_from`), validates any checkpoint it meets, and discards the checkpoint's decoded entries. See the design target below and `docs/known-limitations.md` §2.1.
 - `CompressionPolicy::VariableBlocks` and block-specific compression descriptors are feature-gated by the selected backend. The first backend is optional `compression-zstd`; compressed records are rejected when the backend is not enabled.
 
 ## Update And Merge
 
 - `replace_fixed` performs snapshot-preserving copy-on-write replacement and
-  requires an unchanged encoded payload size.
+  requires an unchanged encoded payload size. It is refused for a format with
+  `segment_on_flush`, which is also true of
+  `replace_fixed_in_place_exclusive`: both restamp a record that an already
+  written segment describes.
 - `replace_rewrite` rewrites through a completed temporary file and atomically replaces the original file path.
 - `replace_block` is the generated/core sequence-preserving replacement path.
   It permits a native fixed or variable payload to grow or shrink, rebuilds
@@ -276,7 +280,7 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   generated reader indexes are per segment kind, while low-level layout reader
   indexes remain physical stream indexes.
 - `schema_hash: computed;` asks the macro to call `with_computed_schema_hash()` after policies are attached.
-- `index` accepts either a single legacy identifier or a list such as `[scan_on_open, checkpoint_on_flush, block_offset_chain, keyed_offset_chain]`.
+- `index` accepts either a single legacy identifier or a list such as `[scan_on_open, checkpoint_on_flush, block_offset_chain, keyed_offset_chain]`. `segment_on_flush` is deliberately **not** one of them: a block is the unit a declaration names, a segment is varve's internal lookup unit, and its granularity is varve's decision. Enable it on the `FormatSpec` with `IndexPolicy::with_segment_on_flush`.
 - `commit` accepts `none`, `record_footer`, or `transaction_marker(on_flush|explicit)`.
 - Generated typed writers expose both `commit()` and `commit_durable()`.
   `commit()` is a logical visibility marker and does not imply fsync.
@@ -418,6 +422,53 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
 - Unknown record flag bits are rejected during scan.
 - Compressed flags on fixed, internal, metadata, op, tombstone, index, or manifest records are invalid.
 
+### Internal Segments
+
+- A **segment** is varve's internal lookup unit: the records one commit point
+  added. It has no declaration surface, and its granularity is not a knob — a
+  block is what a declaration names, a segment is what varve indexes by.
+- Enabled by `IndexPolicy::segment_on_flush`, which is off by default. A file
+  written with it off is byte-identical to one written before the option
+  existed, and `computed_schema_hash()` is unchanged.
+- It requires `block_offset_chain` — the chain *is* `prev_same_block_offset` —
+  and a `crc32` integrity policy, because the chain walk trusts a payload that
+  describes records it never reads.
+- Segment records use internal block id `SEGMENT_BLOCK_ID` (`0xFFFF_FFF7`),
+  block version `1`, and the internal record flag.
+- The payload layout is:
+  - magic bytes `b"VSEG"`,
+  - payload version `u16 = 1`,
+  - flags `u16`, currently `0`,
+  - covered start offset `u64` — the first record this segment covers,
+  - entry count `u64`,
+  - preceding record count `u64` — records in the file before the covered start,
+  - `entry count` index entries in the checkpoint version 3 entry layout,
+  - the segment record's own start offset `u64`.
+- The trailing self offset is what makes the record findable from the end of the
+  file: the footer carries no self offset, and the header that would give one is
+  `payload_len` bytes further back.
+- A commit point writes its segment **last**, after any commit marker, and only
+  when every record it would cover is committed. A segment record that trails the
+  latest commit marker is inside the committed prefix; anything else after that
+  marker is not.
+- A commit point that added no record writes no segment.
+- Open reads the last 32 bytes, confirms the record footer magic and version,
+  reads the eight bytes before them as the candidate record offset, and confirms
+  a segment record there whose extent ends at the file length. It then follows
+  `prev_same_block_offset` backwards. Predecessor offsets must decrease strictly
+  and stay at or above the append-log start, so the walk is bounded by the
+  segments in the file whatever the bytes claim.
+- A chain is accepted only if each link ends exactly where its successor's
+  coverage began, the entries of each link tile that coverage with no gap and no
+  overlap, the oldest link reaches the append-log start, and the whole walk ends
+  at the file length. No link may cover another segment record.
+- A chain that fails any of this is not an error: open falls back to the full
+  record scan and produces the identical index. So does an open under
+  `IntegrityVerification::AtOpen`, and every recovery open.
+- `replace_block` re-encodes every segment payload against the published
+  generation's offsets. In-place replacement is refused, because nothing rewrites
+  the segment describing the record it restamps.
+
 ### Checkpoint Index
 
 - Checkpoint records use internal block id `INDEX_BLOCK_ID`.
@@ -433,7 +484,7 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
   - the payload decodes exactly,
   - covered offset is within the file length,
   - every entry has valid offsets and payload bounds,
-  - entries are ordered by record offset and end no later than the covered offset,
+  - entries tile the covered range exactly: each entry starts where the previous entry ended, the first starts at the append-log start, and the last ends at the covered offset,
   - no entry points to the checkpoint record itself,
   - CRC validation passes for the checkpoint payload when integrity is enabled.
 - For `IndexPolicy::CheckpointOnFlush`, open should scan from the header until the latest valid checkpoint, then rebuild the index from the checkpoint and scan only records after the covered offset. **Not implemented as of 0.5.0** — this is a design target. The checkpoint is validated on the way past and its entries are discarded; open scans the whole region.

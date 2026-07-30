@@ -600,15 +600,54 @@ Varve writer produced, the sort degrades to `Theta(N)`; `O(N log N)` is the
 guaranteed bound for a reordered or hostile input.) The whole index stays in
 memory for the life of the handle.
 
-**Every open scans the whole record region, and no policy changes that.** This
-correction matters because the previous version of this document offered a
-mitigation that does not exist:
+**One policy changes that, and it changes the walk rather than the residency.**
+`IndexPolicy::segment_on_flush` makes each commit point append an internal
+*segment* record covering the records that commit point added, chained to the
+previous segment through the record footer's `prev_same_block_offset`. Open
+confirms a record footer at the end of the file and walks that chain backwards,
+so it frames one record per commit point and reads no data record. At a commit
+point every 256 records, a 3,000,000-record file takes about 11,700 framed
+records at open instead of 3,000,000, and zero seeks per data record.
+
+What it does **not** change is the paragraph below: the index it produces is the
+same `Vec<RecordIndexEntry>` with one entry per record, so `104 * records` is
+still what a handle holds. Reducing that is a separate mechanism and is not
+built.
+
+It is opt-in, off by default, and a file written with it off is byte-identical
+to one written before the option existed. Enabling it costs:
+
+- a segment record per commit point, holding 73 bytes per record it covers —
+  measure this against your flush cadence, since a flush per record roughly
+  triples the bytes written;
+- `block_offset_chain`, which the chain *is*, so every record carries a 32-byte
+  footer;
+- a `crc32` integrity policy. A scan reads each record's own header, so damage
+  is local; a segment payload describes many records, so without a checksum on
+  it damage would misindex records whose own bytes are intact;
+- in-place fixed replacement (`replace_fixed`,
+  `replace_fixed_in_place_exclusive`, `ReplaceStrategy::FixedCopyOnWrite`), which
+  is refused with `Error::InvalidFormatSpec`. It restamps a record a segment
+  already describes. `replace_block` publishes a whole new generation and
+  re-encodes every segment payload against the new offsets, so it still works.
+
+The chain is derived, so anything it cannot account for falls back to the full
+scan and produces the identical index — never an error. That covers a file
+written before the option was enabled, a writer that appended past its last
+commit point, a truncated or corrupt tail, and a broken chain link. Two opens
+never take it at all: `open_recover`, whose contract is to verify every record
+and truncate on the mismatch, and any open under
+`IntegrityVerification::AtOpen`, which asks for the same verification.
+
+**Otherwise every open scans the whole record region, and no policy changes
+that.** This correction matters because the previous version of this document
+offered a mitigation that does not exist:
 
 - `IndexPolicy::CheckpointOnFlush` does **not** seed an open from a checkpoint.
-  Every open path calls `load_index`, which calls `scan_records_from`, which walks
-  from `header_len` to `file_len` unconditionally. A checkpoint met during that
-  walk is *validated* (`inspect_index_checkpoint`) and its decoded entries are
-  discarded. There is no public checkpoint-seeded open. What the policy actually
+  Every open path calls `load_index`, which calls `scan_records_from` for any
+  format without the segment chain, and that walks from `header_len` to
+  `file_len` unconditionally. A checkpoint met during that walk is *validated*
+  (`inspect_index_checkpoint`) and its decoded entries are discarded. There is no public checkpoint-seeded open. What the policy actually
   bounds is the writer side: it spaces full index checkpoints geometrically, which
   bounds cumulative checkpoint **bytes written**, not open cost.
   `docs/spec.md` describes the checkpoint-seeded open as a design target; it is
