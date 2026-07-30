@@ -267,45 +267,6 @@ pub(crate) fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::R
     file.read(buffer)
 }
 
-/// Positional counterpart to [`read_at`], looping over short writes.
-///
-/// Positional because the offset sidecar's header sits at a fixed address that
-/// is rewritten while the array beyond it is being appended, so a shared cursor
-/// would make the two interleave.
-#[cfg(any(unix, windows))]
-pub(crate) fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
-    #[cfg(unix)]
-    use std::os::unix::fs::FileExt;
-    #[cfg(windows)]
-    use std::os::windows::fs::FileExt;
-
-    let mut written = 0usize;
-    while written < bytes.len() {
-        let position = offset
-            .checked_add(written as u64)
-            .ok_or_else(|| std::io::Error::other("positional write offset overflow"))?;
-        #[cfg(unix)]
-        let result = file.write_at(&bytes[written..], position);
-        #[cfg(windows)]
-        let result = file.seek_write(&bytes[written..], position);
-        match result {
-            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
-            Ok(count) => written += count,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn write_all_at(_file: &File, _bytes: &[u8], _offset: u64) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "no native positional file-write implementation",
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use std::{

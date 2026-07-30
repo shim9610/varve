@@ -16,7 +16,6 @@ mod layout;
 mod matrix;
 mod merge;
 mod native_layout;
-mod offset_sidecar;
 #[cfg(all(test, feature = "high-cardinality-dev"))]
 mod pib_probe;
 mod scalable_extent;
@@ -108,9 +107,9 @@ pub use format::{
     LayoutPlanPartKind, LayoutPlanRegion, LayoutPlanRegionSource, LayoutPlanSegment, LayoutPreset,
     LayoutSpec, LeadInDescriptor, ManifestPolicy, MatrixAuxDescriptor, MatrixBlockDescriptor,
     MatrixCommitDescriptor, MatrixCommitKind, MatrixDimensionDescriptor, MatrixMetadataResidency,
-    MatrixMetadataVerification, MetadataDescriptor, OffsetSidecarScope, RawRegionDescriptor,
-    ReadLimit, ReadLimits, RecoveryPolicy, ResourceLimits, SegmentDescriptor, SegmentRepeat,
-    TransactionMarkerMode, VariableCompression,
+    MatrixMetadataVerification, MetadataDescriptor, RawRegionDescriptor, ReadLimit, ReadLimits,
+    RecoveryPolicy, ResourceLimits, SegmentDescriptor, SegmentRepeat, TransactionMarkerMode,
+    VariableCompression,
 };
 #[cfg(feature = "high-cardinality-dev")]
 pub use indexed::{
