@@ -776,10 +776,25 @@ fn crc_integrity_detects_payload_tampering() -> varve::Result<()> {
     };
 
     tamper_byte(&path, payload_offset)?;
+    // Declaring AtOpen keeps the original contract: damage announced while
+    // opening. IntegrityVerification::DEFAULT is now OnDemand, which moves the
+    // announcement to the read rather than losing it -- asserted below.
+    let eager = CrcFormat::spec().with_read_limits(
+        varve::ReadLimits::MISSING
+            .with_integrity_verification(varve::IntegrityVerification::AtOpen),
+    );
     assert!(matches!(
-        CrcFormat::open_readonly(&path),
+        varve::VarveFile::open_readonly(eager, &path),
         Err(Error::ChecksumMismatch { .. })
     ));
+    let lazy = CrcFormat::open_readonly(&path)?;
+    assert!(matches!(
+        lazy.blocks::<ContractBlock>()?.get(0),
+        Err(Error::ChecksumMismatch { .. })
+    ));
+    drop(lazy);
+    // Recovery verifies whatever the policy says: the checksum mismatch is the
+    // evidence TruncateTail truncates on, so this must hold under the default.
     let recovering_spec = CrcFormat::spec().with_recovery_policy(RecoveryPolicy::TruncateTail);
     assert!(matches!(
         recovering_spec.open_recover_with_report(&path),

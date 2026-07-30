@@ -378,6 +378,92 @@ const _: () = assert!(
     "MatrixMetadataVerification::DEFAULT must name a real policy"
 );
 
+/// When record integrity is verified.
+///
+/// Separate from [`IntegrityPolicy`], which says *whether* a checksum exists,
+/// because the two answer different questions and conflating them is what made
+/// open cost scale with the file. This is the same split `matrix.rs` made in
+/// 0.5.0 between residency and verification, for the same defect and with the
+/// same standing: **a choice about when damage is announced, not about whether
+/// bytes are checked.**
+///
+/// Every typed read already re-verifies the record it returns —
+/// `read_payload_snapshot` re-reads the header, compares all seven fields
+/// against the index entry, checks the footer, and recomputes the payload CRC.
+/// So verifying every record again while scanning at open is redundant for
+/// everything a caller actually reads, and it is what makes open read the whole
+/// file instead of its framing.
+///
+/// Measured on Linux x86_64, cold cache, one 2,052 MB file of 50,000 records:
+/// open took 7,096 ms verifying at open and 3,621 ms not verifying at open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IntegrityVerification {
+    /// "Nobody declared a policy." Never overwrites a declaration, and resolves
+    /// to [`Self::DEFAULT`] in [`ReadLimits::effective_integrity_verification`]
+    /// and only there.
+    Missing,
+    /// Verify every record while scanning at open.
+    ///
+    /// The behaviour before this policy existed. Costs a full read of every
+    /// payload in the file, and detects damage in records the caller never
+    /// touches.
+    AtOpen,
+    /// Do not verify while scanning at open. Verify on the read that returns the
+    /// record, which already happens, and on an explicit `verify_all`.
+    ///
+    /// **This is [`Self::DEFAULT`].** What it gives up is the *announcement*, not
+    /// the check: damage in a record is reported when that record is read rather
+    /// than when the file is opened, and damage in a record that is never read is
+    /// never reported unless `verify_all` is called.
+    ///
+    /// One thing does not follow this policy, deliberately: a **recovery** scan
+    /// verifies unconditionally, because a checksum mismatch is the evidence
+    /// `RecoveryPolicy::TruncateTail` truncates on. Losing it there would turn a
+    /// recoverable tail into a silently accepted one.
+    OnDemand,
+}
+
+impl IntegrityVerification {
+    /// The policy [`Self::Missing`] resolves to, and the one line that changes it.
+    ///
+    /// [`Self::OnDemand`], because the standing requirement is that open reads a
+    /// header and work is bounded by what is used, and because the read path
+    /// already performs the identical check on every record it returns. A caller
+    /// that wants damage announced up front declares [`Self::AtOpen`] or calls
+    /// `verify_all` — both are one line, and neither is silently lost.
+    pub const DEFAULT: Self = Self::OnDemand;
+
+    /// A runtime declaration replaces the format's; a runtime silence does not.
+    /// Same rule as `MatrixMetadataVerification::overlay`.
+    const fn overlay(self, value: Self) -> Self {
+        match value {
+            Self::Missing => self,
+            value => value,
+        }
+    }
+
+    /// A declaration wins over the unset state, and only over that. Same
+    /// composition rule as `MatrixMetadataVerification::tighten`, so a runtime
+    /// `ReadLimits` cannot silently drop a policy the format declared.
+    const fn tighten(self, value: Self) -> Self {
+        match self {
+            Self::Missing => value,
+            declared => declared,
+        }
+    }
+}
+
+/// The unset state is not a policy: [`IntegrityVerification::DEFAULT`] is what
+/// resolves it, so it must itself be resolved.
+const _: () = assert!(
+    !matches!(
+        IntegrityVerification::DEFAULT,
+        IntegrityVerification::Missing
+    ),
+    "IntegrityVerification::DEFAULT must be a resolved policy"
+);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReadLimits {
@@ -425,6 +511,12 @@ pub struct ReadLimits {
     /// reported on, residency decides what is kept in memory afterwards, and
     /// every combination of the two is meaningful.
     pub matrix_metadata_verification: MatrixMetadataVerification,
+    /// Declared record-integrity verification policy; see
+    /// [`IntegrityVerification`]. Like the matrix policies it lives on
+    /// `ReadLimits` rather than on `FormatSpec`, because it is a property of
+    /// one open and not of the file: it changes no byte, so it is neither
+    /// hashed nor persisted.
+    pub integrity_verification: IntegrityVerification,
     trusted_api: bool,
 }
 
@@ -469,6 +561,7 @@ impl ReadLimits {
         // policy would be indistinguishable from a caller who declared one, and
         // would win over a format's declaration through `overlay`.
         matrix_metadata_verification: MatrixMetadataVerification::Missing,
+        integrity_verification: IntegrityVerification::Missing,
         trusted_api: false,
     };
     /// Finite companion to [`Self::STANDARD`] for input from untrusted
@@ -512,6 +605,7 @@ impl ReadLimits {
             // policy, exactly as they declare no ceilings.
             matrix_metadata_residency: MatrixMetadataResidency::Missing,
             matrix_metadata_verification: MatrixMetadataVerification::Missing,
+            integrity_verification: IntegrityVerification::Missing,
             trusted_api: false,
         }
     }
@@ -567,6 +661,21 @@ impl ReadLimits {
     /// [`MatrixMetadataVerification::Missing`] resolves here, and only here, to
     /// [`MatrixMetadataVerification::DEFAULT`]. A declared policy is returned
     /// unchanged.
+    /// The verification policy in force: the declared one, or
+    /// [`IntegrityVerification::DEFAULT`] when nobody declared one.
+    pub const fn effective_integrity_verification(self) -> IntegrityVerification {
+        match self.integrity_verification {
+            IntegrityVerification::Missing => IntegrityVerification::DEFAULT,
+            declared => declared,
+        }
+    }
+
+    /// Declares when record integrity is verified. See [`IntegrityVerification`].
+    pub const fn with_integrity_verification(mut self, policy: IntegrityVerification) -> Self {
+        self.integrity_verification = policy;
+        self
+    }
+
     pub const fn effective_matrix_metadata_verification(self) -> MatrixMetadataVerification {
         match self.matrix_metadata_verification {
             MatrixMetadataVerification::Missing => MatrixMetadataVerification::DEFAULT,
@@ -697,6 +806,9 @@ impl ReadLimits {
             matrix_metadata_verification: self
                 .matrix_metadata_verification
                 .tighten(runtime.matrix_metadata_verification),
+            integrity_verification: self
+                .integrity_verification
+                .tighten(runtime.integrity_verification),
             max_file_len: self.max_file_len.tighten(runtime.max_file_len),
             max_records: self.max_records.tighten(runtime.max_records),
             max_index_bytes: self.max_index_bytes.tighten(runtime.max_index_bytes),
@@ -755,6 +867,9 @@ impl ReadLimits {
             matrix_metadata_verification: self
                 .matrix_metadata_verification
                 .overlay(runtime.matrix_metadata_verification),
+            integrity_verification: self
+                .integrity_verification
+                .overlay(runtime.integrity_verification),
             max_file_len: self.max_file_len.overlay(runtime.max_file_len),
             max_records: self.max_records.overlay(runtime.max_records),
             max_index_bytes: self.max_index_bytes.overlay(runtime.max_index_bytes),

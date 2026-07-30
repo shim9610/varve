@@ -6,7 +6,29 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "integrity")]
 use varve::Error;
-use varve::{COMMIT_BLOCK_ID, CommitPolicy, IndexPolicy, VarveBlock, varve_format};
+use varve::{
+    COMMIT_BLOCK_ID, CommitPolicy, IndexPolicy, IntegrityVerification, ReadLimits, VarveBlock,
+    VarveFile, varve_format,
+};
+
+/// Opens read-only with verification forced on at open.
+///
+/// These three contracts were written when open-time verification was the only
+/// behaviour there was. `IntegrityVerification::DEFAULT` is now `OnDemand`,
+/// which moves the refusal from the open to the read that returns the damaged
+/// record -- so each contract below now asserts *both*: that declaring `AtOpen`
+/// still refuses at open, and that the default still refuses the record.
+fn open_verified_at_open(
+    spec: varve::FormatSpec,
+    path: &std::path::Path,
+) -> varve::Result<VarveFile> {
+    VarveFile::open_readonly(
+        spec.with_read_limits(
+            ReadLimits::MISSING.with_integrity_verification(IntegrityVerification::AtOpen),
+        ),
+        path,
+    )
+}
 
 varve_format! {
     pub format DslFormat {
@@ -463,9 +485,16 @@ fn crc32_covers_varve3_record_footer() -> varve::Result<()> {
     let footer_offset = second.footer_offset.expect("VARVE3 footer");
     tamper_byte(&path, footer_offset + 8)?;
     assert!(matches!(
-        CrcFooterFormat::open_reader(&path),
+        open_verified_at_open(CrcFooterFormat::spec(), &path),
         Err(Error::ChecksumMismatch { .. })
     ));
+    // And under the default the damage is still caught -- on the read.
+    let reader = CrcFooterFormat::open_reader(&path)?;
+    assert!(matches!(
+        reader.crc_points()?.get(1),
+        Err(Error::ChecksumMismatch { .. })
+    ));
+    drop(reader);
 
     cleanup(&path);
     Ok(())
@@ -538,9 +567,15 @@ fn transaction_marker_crc_corruption_before_marker_is_fatal() -> varve::Result<(
 
     tamper_byte(&path, committed.payload_offset)?;
     assert!(matches!(
-        CrcTxnFormat::open_reader(&path),
+        open_verified_at_open(CrcTxnFormat::spec(), &path),
         Err(Error::ChecksumMismatch { .. })
     ));
+    let reader = CrcTxnFormat::open_reader(&path)?;
+    assert!(matches!(
+        reader.crc_txn_points()?.get(0),
+        Err(Error::ChecksumMismatch { .. })
+    ));
+    drop(reader);
 
     cleanup(&path);
     Ok(())
@@ -559,9 +594,23 @@ fn crc32_with_header_detects_header_tampering() -> varve::Result<()> {
 
     tamper_byte(&path, info.record_offset)?;
     assert!(matches!(
-        CrcHeaderFormat::open_reader(&path),
+        open_verified_at_open(CrcHeaderFormat::spec(), &path),
         Err(Error::ChecksumMismatch { .. })
     ));
+    // Under the default this one degrades rather than refusing, and the
+    // difference is worth stating: the tampered byte is inside the record
+    // header, so the scan indexes the record under a *different* block id and
+    // the typed collection simply does not contain it. `AtOpen` above catches
+    // it; `OnDemand` turns it into an absence. What must still hold, and is
+    // what this asserts, is that no tampered record is ever handed back as
+    // valid.
+    let reader = CrcHeaderFormat::open_reader(&path)?;
+    let observed = reader.crc_header_points()?.get(0);
+    assert!(
+        !matches!(observed, Ok(Some(_))),
+        "a tampered header must never decode as a valid record, got {observed:?}"
+    );
+    drop(reader);
 
     cleanup(&path);
     Ok(())

@@ -11,11 +11,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::{
     BlockDescriptor, BlockKind, BlockVec, CommitPolicy, CompressionAlgorithm,
     CompressionHeaderMode, CompressionLevel, CompressionPolicy, Endian, Error, FormatSpec,
-    IndexPolicy, IntegrityPolicy, KeyedBlockVec, ManifestPolicy, MatrixCellStatus,
-    MatrixCommitEvent, MatrixDimensions, MatrixKey, MatrixRecoveryAction, MatrixRecoveryReport,
-    MatrixResumeSignal, RecoveryPolicy, Result, SnapshotFile, VariableCompression, VarveBlock,
-    VarveEncode, VarveKeyedBlock, VarveMatrixBlock, VarveMerge, VarveMigration, VarveReplaceBlock,
-    WireType,
+    IndexPolicy, IntegrityPolicy, IntegrityVerification, KeyedBlockVec, ManifestPolicy,
+    MatrixCellStatus, MatrixCommitEvent, MatrixDimensions, MatrixKey, MatrixRecoveryAction,
+    MatrixRecoveryReport, MatrixResumeSignal, RecoveryPolicy, Result, SnapshotFile,
+    VariableCompression, VarveBlock, VarveEncode, VarveKeyedBlock, VarveMatrixBlock, VarveMerge,
+    VarveMigration, VarveReplaceBlock, WireType,
     codec::encode_to_vec_limited,
     collections::MaterializationBudget,
     format::ReadLimitKey,
@@ -1982,6 +1982,11 @@ impl VarveReader {
         self.file.scan()
     }
 
+    /// Verifies every record's stored checksum. See [`VarveFile::verify_all`].
+    pub fn verify_all(&self) -> Result<usize> {
+        self.file.verify_all()
+    }
+
     pub fn index_entries(&self) -> &[RecordIndexEntry] {
         self.file.index_entries()
     }
@@ -2219,6 +2224,11 @@ impl VarveWriter {
 
     pub fn mode(&self) -> OpenMode {
         self.file.mode()
+    }
+
+    /// Verifies every record's stored checksum. See [`VarveFile::verify_all`].
+    pub fn verify_all(&self) -> Result<usize> {
+        self.file.verify_all()
     }
 
     pub fn index_entries(&self) -> &[RecordIndexEntry] {
@@ -4419,6 +4429,35 @@ impl VarveFile {
         self.index.iter().map(BlockEvent::from)
     }
 
+    /// Verifies every record's stored checksum against its bytes.
+    ///
+    /// This is the pass [`IntegrityVerification::AtOpen`] runs while opening,
+    /// available on demand so that choosing [`IntegrityVerification::OnDemand`]
+    /// defers the announcement rather than losing it. Reads every payload, so
+    /// it costs a full pass over the file; that cost is the reason it is not
+    /// the default at open.
+    ///
+    /// Takes `&self` and reads positionally, so it can run on a shared handle
+    /// while other readers use it.
+    ///
+    /// Returns the number of records verified. A mismatch is
+    /// [`Error::ChecksumMismatch`] naming the offending record's offset.
+    pub fn verify_all(&self) -> Result<usize> {
+        if self.spec.integrity_policy == IntegrityPolicy::None {
+            return Ok(0);
+        }
+        let mut verified = 0usize;
+        for entry in self.index.iter() {
+            // `read_payload_snapshot` is the same check the read path performs,
+            // which is exactly the point: there is one verification in the
+            // crate, and this method chooses when it runs rather than adding a
+            // second copy of it.
+            let _ = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
+            verified += 1;
+        }
+        Ok(verified)
+    }
+
     pub fn index_entries(&self) -> &[RecordIndexEntry] {
         &self.index
     }
@@ -6080,8 +6119,14 @@ fn validate_generation_file_inner(
             file,
             file_len,
             offset,
-            None,
-            None,
+            // Generation validation proves a just-published file matches what
+            // was indexed; verifying is the point of this walk, so it does not
+            // consult the open-time policy.
+            ScanChecks {
+                partial_boundary: None,
+                checksum_boundary: None,
+                verify_checksums: true,
+            },
             &mut accounting,
         )? {
             RecordRead::Entry(entry) => entry,
@@ -8304,15 +8349,38 @@ impl ScanAccounting {
     }
 }
 
+/// What a single record read is allowed to tolerate, and what it must check.
+///
+/// One value rather than three parameters because the three are one decision:
+/// how this particular walk treats a record it cannot fully validate. Splitting
+/// them let a caller pass a recovery boundary while silently skipping the check
+/// that produces the evidence for it.
+#[derive(Clone, Copy, Debug)]
+struct ScanChecks {
+    /// Offset a torn record may be truncated back to, if tolerated.
+    partial_boundary: Option<u64>,
+    /// Offset a checksum mismatch may be truncated back to, if tolerated.
+    checksum_boundary: Option<u64>,
+    /// Whether the stored checksum is recomputed from the payload here.
+    ///
+    /// False only on the open path under `IntegrityVerification::OnDemand`,
+    /// where the identical check runs on the read that returns the record.
+    verify_checksums: bool,
+}
+
 fn read_record_entry_at(
     spec: FormatSpec,
     file: &mut File,
     file_len: u64,
     offset: u64,
-    partial_boundary: Option<u64>,
-    checksum_boundary: Option<u64>,
+    checks: ScanChecks,
     accounting: &mut ScanAccounting,
 ) -> Result<RecordRead> {
+    let ScanChecks {
+        partial_boundary,
+        checksum_boundary,
+        verify_checksums,
+    } = checks;
     let remaining = file_len
         .checked_sub(offset)
         .ok_or(Error::ResourceArithmeticOverflow {
@@ -8376,10 +8444,19 @@ fn read_record_entry_at(
         None
     };
 
-    if matches!(
-        spec.integrity_policy,
-        IntegrityPolicy::Crc32 | IntegrityPolicy::Crc32WithHeader
-    ) {
+    // SCAN-01: this is the single line that made open read the whole file. The
+    // check itself is not removed - it is *relocated* to the read that returns
+    // the record, where `read_payload_snapshot` already performs the identical
+    // one on every typed read. See `IntegrityVerification` for why that is a
+    // choice about when damage is announced rather than whether bytes are
+    // checked, and for the one caller that must never take this branch off:
+    // recovery, whose truncation evidence *is* the mismatch.
+    if verify_checksums
+        && matches!(
+            spec.integrity_policy,
+            IntegrityPolicy::Crc32 | IntegrityPolicy::Crc32WithHeader
+        )
+    {
         let expected = checksum_record_file(
             spec,
             file,
@@ -8479,8 +8556,13 @@ impl NativeStreamScanner {
             &mut self.file,
             self.snapshot.len(),
             self.offset,
-            partial_boundary,
-            None,
+            // An explicit scan is a caller asking to walk records; it is not
+            // the open path this policy exists to shorten.
+            ScanChecks {
+                partial_boundary,
+                checksum_boundary: None,
+                verify_checksums: true,
+            },
             &mut self.accounting,
         )? {
             RecordRead::Entry(entry) => entry,
@@ -8568,8 +8650,13 @@ pub(crate) fn read_stream_entry_at_file(
         file,
         snapshot.len(),
         offset,
-        partial_boundary,
-        None,
+        // A single record read by offset: the caller named this record, so the
+        // check belongs here and costs one payload, not a file.
+        ScanChecks {
+            partial_boundary,
+            checksum_boundary: None,
+            verify_checksums: true,
+        },
         &mut accounting,
     )? {
         RecordRead::Entry(entry) => Ok(entry),
@@ -9168,13 +9255,27 @@ fn scan_records_from(
         } else {
             None
         };
+        // A recovery scan verifies whatever the policy says, because a checksum
+        // mismatch is the evidence `RecoveryPolicy::TruncateTail` truncates on:
+        // `checksum_boundary` above is only reachable through this check.
+        // Dropping it here would turn a recoverable tail into a silently
+        // accepted one, which is the failure this whole policy must not create.
+        let verify_checksums = intent == ScanIntent::Recover
+            || spec
+                .read_limits
+                .resolve()
+                .effective_integrity_verification()
+                == IntegrityVerification::AtOpen;
         let entry = match read_record_entry_at(
             spec,
             file,
             file_len,
             offset,
-            partial_boundary,
-            checksum_boundary,
+            ScanChecks {
+                partial_boundary,
+                checksum_boundary,
+                verify_checksums,
+            },
             &mut accounting,
         )? {
             RecordRead::Entry(entry) => entry,
