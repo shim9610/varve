@@ -399,10 +399,28 @@ It requires `block_offset_chain` (which it turns on for you — the chain is tha
 footer field) and a `crc32` integrity policy, and it gives up in-place fixed
 replacement. Each segment record carries 73 bytes per record it covers, so the
 bytes it costs are set by how often you flush; it pays for itself at a commit
-point every few hundred records and not at a commit point per record. A file it
-cannot account for — one written before you enabled it, one whose writer
-appended past its last commit point, a truncated tail — opens by the old scan
-and produces the identical index. See `docs/known-limitations.md` §2.1.
+point every few hundred records and not at a commit point per record.
+
+Measured with a commit point every 256 records and 4 KiB payloads: an 852 MB,
+200,000-record file opens in 370 ms instead of 5,867 ms, framing 782 records
+instead of 200,782.
+
+**Finish writing with `flush()`.** Open finds the chain by looking at the record
+at the end of the file, so a writer that stops on a data record leaves nothing to
+start from and the open scans the whole file — correct, but with none of the
+benefit and no warning. The shape that bites is a loop with no final flush:
+
+```rust
+for i in 0..n {
+    writer.push(&block)?;
+    if i % 256 == 255 { writer.flush()?; }
+}
+writer.flush()?;   // <-- without this, n = 50_000 opens in 1,272 ms, not 60 ms
+```
+
+A file it cannot account for — one written before you enabled it, one whose
+writer appended past its last commit point, a truncated tail — opens by the old
+scan and produces the identical index. See `docs/known-limitations.md` §2.1.
 
 ## Custom Physical Layout
 

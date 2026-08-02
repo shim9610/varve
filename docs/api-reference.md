@@ -322,12 +322,16 @@ index per record** (`size_of::<RecordIndexEntry>()`).
   internal *segment* record covering the records that commit point added, chained
   to the previous one through the record footer's `prev_same_block_offset`. Open
   confirms a record footer at the end of the file and walks that chain backwards,
-  reading one record per commit point and **no data record at all**. What it
-  removes is the open-time walk, not the index: the resident index it produces is
-  the same `Vec<RecordIndexEntry>`, so the 104-bytes-per-record figure above is
-  unchanged. See [Known Limitations
+  reading one record per commit point and **no data record at all**. Measured on
+  one Linux host with a commit point every 256 records: an 852 MB, 200,000-record
+  file opens in 370 ms chained against 5,867 ms scanning, framing 782 records
+  instead of 200,782. What it removes is the open-time walk, not the index: the
+  resident index it produces is the same `Vec<RecordIndexEntry>`, so the
+  104-bytes-per-record figure above is unchanged. **A writing session must end
+  with `flush` or `commit`** — a data record at the end of the file leaves open
+  no chain to start from, and it silently scans instead. See [Known Limitations
   §2.1](known-limitations.md#21-varvefile-scans-the-whole-file-at-open-and-holds-a-record-index)
-  for what it costs and when it falls back.
+  for the full table, the other costs, and every fallback.
 - `IndexPolicy::CheckpointOnFlush` does **not** seed an open from a checkpoint.
   Every open without the segment chain calls `load_index` → `scan_records_from`,
   which walks from the header to the file length; a checkpoint met on the way is

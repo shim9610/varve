@@ -452,6 +452,9 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
   latest commit marker is inside the committed prefix; anything else after that
   marker is not.
 - A commit point that added no record writes no segment.
+- A writer that stops without a commit point leaves a data record at the end of
+  the file, so the chain has no entry point and the next open scans. This is the
+  fallback below, not an error, but it costs the whole benefit and is silent.
 - Open reads the last 32 bytes, confirms the record footer magic and version,
   reads the eight bytes before them as the candidate record offset, and confirms
   a segment record there whose extent ends at the file length. It then follows

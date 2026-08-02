@@ -605,9 +605,24 @@ memory for the life of the handle.
 *segment* record covering the records that commit point added, chained to the
 previous segment through the record footer's `prev_same_block_offset`. Open
 confirms a record footer at the end of the file and walks that chain backwards,
-so it frames one record per commit point and reads no data record. At a commit
-point every 256 records, a 3,000,000-record file takes about 11,700 framed
-records at open instead of 3,000,000, and zero seeks per data record.
+so it frames one record per commit point and reads no data record.
+
+**Measured**, on one Linux host, `rustc 1.95` release build, 4 KiB payloads, a
+flush every 256 records **and a final flush**, page cache dropped between the
+write and the open:
+
+| records | file | open, scanning | open, chained | records the open framed |
+| --- | --- | --- | --- | --- |
+| 50,000 | 213 MB | 1,272 ms | **60 ms** | 196 |
+| 100,000 | 426 MB | 2,930 ms | **149 ms** | 391 |
+| 150,000 | 639 MB | 5,005 ms | **172 ms** | 586 |
+| 200,000 | 852 MB | 5,867 ms | **370 ms** | 782 |
+
+The framed-record count is the load-bearing column: it is exactly the number of
+segment records, so the open read no data record at any size. The wall-clock
+ratio is 16x-29x here, but this host's scan timings vary by about 2x run to
+run — read it as an order of magnitude, not a factor. Nothing above was measured
+on Windows, and nothing above was measured beyond 200,000 records.
 
 What it does **not** change is the paragraph below: the index it produces is the
 same `Vec<RecordIndexEntry>` with one entry per record, so `104 * records` is
@@ -638,6 +653,19 @@ commit point, a truncated or corrupt tail, and a broken chain link. Two opens
 never take it at all: `open_recover`, whose contract is to verify every record
 and truncate on the mismatch, and any open under
 `IntegrityVerification::AtOpen`, which asks for the same verification.
+
+> **The last write before you stop must be a commit point, or you get none of
+> this.** Open starts the chain from the record at the end of the file. A writer
+> that pushes records and then drops without a final `flush` (or `commit`)
+> leaves a *data* record there, so there is no chain to start from and the open
+> scans the whole file. This is the fallback working as designed, and that is
+> exactly what makes it dangerous: it is silent, it costs the entire benefit,
+> and it needs only a loop whose record count is not a multiple of the flush
+> interval. In the table above, the same 50,000-record file opens in 60 ms with
+> a final flush and 1,272 ms without one — the measurement that produced this
+> warning was a benchmark of ours that omitted it and appeared to show the
+> feature doing nothing. End a writing session with `flush`, and check that a
+> loop like `if i % 256 == 255 { flush() }` is followed by one.
 
 **Otherwise every open scans the whole record region, and no policy changes
 that.** This correction matters because the previous version of this document

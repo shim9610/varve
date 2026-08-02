@@ -13,8 +13,26 @@ increment the minor version.
 record footer's `prev_same_block_offset` names the previous segment — a value
 known when it is written, so nothing is back-patched and nothing is rewritten in
 place. Open confirms a record footer at the end of the file, walks that chain
-backwards, and reads **no data record**. At a commit point every 256 records, a
-3,000,000-record file frames about 11,700 records at open instead of 3,000,000.
+backwards, and reads **no data record**.
+
+Measured on one Linux host, `rustc 1.95` release build, 4 KiB payloads, a commit
+point every 256 records, page cache dropped between the write and the open:
+
+| records | file | open, scanning | open, chained | records the open framed |
+| --- | --- | --- | --- | --- |
+| 50,000 | 213 MB | 1,272 ms | **60 ms** | 196 |
+| 200,000 | 852 MB | 5,867 ms | **370 ms** | 782 |
+
+The framed-record count is the load-bearing figure — it is exactly the number of
+segment records. The wall-clock ratio is 16x-29x across the range measured, on a
+host whose scan timings vary by about 2x run to run; read it as an order of
+magnitude. Not measured on Windows, and not measured past 200,000 records.
+
+**A writing session must end with `flush` or `commit`.** Open starts the chain
+from the record at the end of the file, so a writer that stops on a data record
+leaves nothing to start from and the open scans — correctly, silently, and with
+none of the benefit. The same 50,000-record file above opens in 60 ms with a
+final flush and 1,272 ms without one.
 
 A segment is varve's internal lookup unit, not something a declaration names, so
 it has no `varve_format!` clause. Enable it with
