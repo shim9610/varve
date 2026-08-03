@@ -448,9 +448,11 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
   file: the footer carries no self offset, and the header that would give one is
   `payload_len` bytes further back.
 - A commit point writes its segment **last**, after any commit marker, and only
-  when every record it would cover is committed. A segment record that trails the
-  latest commit marker is inside the committed prefix; anything else after that
-  marker is not.
+  when every record it would cover is committed. A segment record that follows
+  the latest commit marker is inside the committed prefix, **whether or not it
+  is the final record in the file** — it describes only records that marker
+  already committed, so a writer's later unflushed appends do not make it
+  uncommitted. Every other record after that marker is uncommitted.
 - A commit point that added no record writes no segment.
 - A writer that stops without a commit point leaves a data record at the end of
   the file, so the chain has no entry point and the next open scans. This is the
@@ -465,9 +467,24 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
   coverage began, the entries of each link tile that coverage with no gap and no
   overlap, the oldest link reaches the append-log start, and the whole walk ends
   at the file length. No link may cover another segment record.
+- Under a transaction-marker policy a chain is additionally refused unless the
+  index it produces is **wholly inside the committed prefix**. A chain can tile
+  the whole append log and still contain no commit marker — structurally
+  perfect, and a lie: the writer open that follows cuts the file back to the
+  header, and a handle holding the untruncated index would then append onto an
+  offset its own index already claims.
 - A chain that fails any of this is not an error: open falls back to the full
   record scan and produces the identical index. So does an open under
   `IntegrityVerification::AtOpen`, and every recovery open.
+- **A resource refusal raised while walking is one of those failures, not an
+  error.** The walk charges ceilings against bytes it has not validated yet —
+  the segment count, and the payload length at an offset the trailer only
+  claims is a segment — so a limit hit there is evidence about the chain, not
+  about the file. Falling back bypasses nothing: the scan charges `Records`,
+  `IndexBytes`, `ScanBytes` and `RecordPayloadLen` itself and refuses honestly
+  if the file really is too large. Only `MissingResourceLimit` and
+  `TrustedUnboundedRequiresExplicitApi` propagate, because those describe the
+  caller's configuration rather than these bytes.
 - `replace_block` re-encodes every segment payload against the published
   generation's offsets. In-place replacement is refused, because nothing rewrites
   the segment describing the record it restamps.
