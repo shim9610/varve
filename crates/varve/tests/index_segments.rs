@@ -363,13 +363,14 @@ fn a_record_appended_after_the_chain_falls_back() -> varve::Result<()> {
     }
     let actual = entry_shape(segment_spec().open_readonly(&path)?.index_entries());
     assert_eq!(actual, scanned_shape(&path)?);
-    // That trailing record is uncommitted, and so - once it is no longer the
-    // last record in the file - is the segment behind it. Both stop at the
-    // commit marker, and the records the marker committed are all there.
+    // The trailing data record is uncommitted and stops at the boundary, but
+    // the segment in front of it does not: it describes only records the marker
+    // already committed, so it stays. Losing it here is what made the next
+    // writer restart coverage and grow every later segment.
     assert_eq!(
         actual.last().map(|entry| entry.0),
-        Some(COMMIT_BLOCK_ID),
-        "the committed prefix ends at the marker",
+        Some(SEGMENT_BLOCK_ID),
+        "the segment behind an uncommitted record is still committed",
     );
     assert_eq!(
         actual.iter().filter(|entry| entry.0 == 60).count(),
@@ -379,42 +380,155 @@ fn a_record_appended_after_the_chain_falls_back() -> varve::Result<()> {
     Ok(())
 }
 
+// COVERAGE, not a regression test: this still passes against the unfixed
+// `committed_prefix_len`, so it does not discriminate. The defect it describes
+// was reproduced by the review's own probe (`probe_b_segment_growth`), which
+// read the raw `VSEG` entry counts off disk rather than through the resident
+// index - the index drops the trailing segment under the unfixed code, so
+// reading the growth through it measures the wrong record. Pinning this
+// properly needs a disk-level reader the test file does not have.
+//
+// Review finding 3. `open; push; flush; push; drop` needs no crash
+// - the writer has no flushing `Drop` - and each cycle used to take the newest
+// segment down with the uncommitted record, so coverage restarted from the
+// older segment and every later segment re-covered everything since. That is an
+// O(N) payload and an O(N) allocation per flush on a workload that flushes per
+// line, and it ended by exceeding `max_record_payload_len`, after which
+// `write_index_segment_if_needed` swallowed the failure and no segment was ever
+// written again.
 #[test]
-fn a_writer_reopen_rebuilds_the_chain_it_truncated() -> varve::Result<()> {
-    let path = temp_path("reopen_after_uncommitted");
-    write_lines(segment_spec(), &path, 16, 8)?;
+fn segments_do_not_grow_when_a_writer_stops_uncommitted() -> varve::Result<()> {
+    let path = temp_path("no_segment_growth");
     {
-        // Leave an uncommitted record behind, which puts the newest segment
-        // outside the committed prefix; the next writer open truncates both.
-        let mut file = segment_spec().open(&path)?;
-        file.push(&Line { value: 999 })?;
-    }
-    {
-        let mut file = segment_spec().open(&path)?;
-        for value in 16..24 {
-            file.push(&Line { value })?;
-        }
+        let mut file = segment_spec().create(&path)?;
+        file.push(&Line { value: 0 })?;
         file.flush()?;
     }
-
-    // The truncated segment took its coverage with it, so the segment written
-    // now must start where the surviving one ended and cover the rest.
-    let file = segment_spec().open_readonly(&path)?;
-    let segments: Vec<&RecordIndexEntry> = file
-        .index_entries()
-        .iter()
-        .filter(|entry| entry.block_id == SEGMENT_BLOCK_ID)
-        .collect();
-    assert_eq!(segments.len(), 2);
-    assert_eq!(
-        segments[1].prev_same_block_offset,
-        Some(segments[0].record_offset)
+    let mut covered = Vec::new();
+    for cycle in 1..12u32 {
+        {
+            let mut file = segment_spec().open(&path)?;
+            file.push(&Line { value: cycle * 10 })?;
+            file.flush()?;
+            // The uncommitted record that used to cost the segment.
+            file.push(&Line {
+                value: cycle * 10 + 1,
+            })?;
+        }
+        let file = segment_spec().open_readonly(&path)?;
+        let largest = file
+            .index_entries()
+            .iter()
+            .filter(|entry| entry.block_id == SEGMENT_BLOCK_ID)
+            .map(|entry| entry.payload_len)
+            .max()
+            .expect("the chain must survive an uncommitted tail");
+        covered.push(largest);
+    }
+    // Every segment covers one line plus one marker, whatever the cycle.
+    let first = covered[0];
+    assert!(
+        covered.iter().all(|len| *len == first),
+        "segment payloads must not grow per cycle: {covered:?}",
     );
+    Ok(())
+}
+
+// Regression, review finding 1. A writer never charges `Segments`, so a chain
+// longer than the declared ceiling is a file the writer produced and its own
+// reader refused - while a scan of the same bytes reads it perfectly. The
+// refusal must fall back, not propagate.
+#[test]
+fn a_chain_past_the_segment_ceiling_still_opens() -> varve::Result<()> {
+    let path = temp_path("segment_ceiling");
+    let capped = segment_spec().with_read_limits(segment_spec().read_limits.with_max_segments(4));
+    {
+        let mut file = capped.create(&path)?;
+        for value in 0..12u32 {
+            file.push(&Line { value })?;
+            file.flush()?;
+        }
+    }
+    // Twelve commit points against a ceiling of four.
+    let file = capped.open_readonly(&path)?;
     let blocks = file.blocks::<Line>()?;
-    assert_eq!(blocks.len(), 24);
-    for value in 0..24u32 {
+    assert_eq!(
+        blocks.len(),
+        12,
+        "the scan fallback must index every record"
+    );
+    for value in 0..12u32 {
         assert_eq!(blocks.get(value as usize)?, Some(Line { value }));
     }
+    // And a writer open must not refuse it either.
+    let mut writer = capped.open(&path)?;
+    writer.push(&Line { value: 12 })?;
+    writer.flush()?;
+    Ok(())
+}
+
+// COVERAGE, not a regression test: an 8-byte, 8-mutation sweep does not reach
+// the 4 of 22,208 single-bit flips the review's exhaustive sweep found, so this
+// passes against the unfixed propagate list too. It pins that a mangled trailer
+// falls back, which is worth having; it does not pin the limit-refusal path.
+//
+// Review finding 1, second reachability. `read_segment_tip_offset`
+// returns an *unconfirmed* offset, so the framing read charges
+// `RecordPayloadLen` against whatever `payload_len` sits there. A flipped bit in
+// the eight trailer bytes at `file_len - 40` used to turn a scannable file into
+// a hard `LimitExceeded`.
+#[test]
+fn a_corrupt_trailer_falls_back_rather_than_refusing() -> varve::Result<()> {
+    let path = temp_path("corrupt_trailer");
+    write_lines(segment_spec(), &path, 24, 8)?;
+    let expected = scanned_shape(&path)?;
+    let file_len = std::fs::metadata(&*path)?.len();
+
+    // Sweep every bit of the trailer; each must open, and open as the scan does.
+    for byte in 0..8u64 {
+        let mut bytes = std::fs::read(&*path)?;
+        let at = (file_len - 40 + byte) as usize;
+        bytes[at] ^= 0xFF;
+        let probe = temp_path("corrupt_trailer_probe");
+        std::fs::write(&*probe, &bytes)?;
+        let actual = entry_shape(segment_spec().open_readonly(&probe)?.index_entries());
+        assert_eq!(actual, expected, "trailer byte {byte} must fall back");
+    }
+    Ok(())
+}
+
+// Regression, review finding 2. A chain can tile the whole append log and still
+// contain no commit marker - structurally perfect, and a lie, because
+// `truncate_uncommitted_tail_if_needed` runs next and cuts the file to the
+// header. Accepting it left the handle holding an index of records no longer on
+// disk, after which the next append landed on an offset the index already
+// claimed and the file became unreadable by either path.
+#[test]
+fn a_chain_with_no_commit_marker_falls_back() -> varve::Result<()> {
+    let path = temp_path("chain_without_marker");
+    // Written by a policy that writes no markers, read by one that requires
+    // them. Both declare the same schema hash, so the header check passes.
+    let unmarked = segment_spec().with_commit_policy(varve::CommitPolicy::None);
+    write_lines(unmarked, &path, 8, 4)?;
+
+    let before = std::fs::read(&*path)?;
+    // Read-only never truncates, and must agree with the scan.
+    let actual = entry_shape(segment_spec().open_readonly(&path)?.index_entries());
+    assert_eq!(actual, scanned_shape(&path)?);
+    assert!(actual.is_empty(), "nothing in it is committed");
+    assert_eq!(std::fs::read(&*path)?, before, "a read must not write");
+
+    // A writer open truncates the uncommitted log - that is the pre-existing
+    // transaction-marker contract - but the index it keeps must match what is
+    // left, so the handle stays usable and the file stays readable.
+    {
+        let mut file = segment_spec().open(&path)?;
+        assert!(file.index_entries().is_empty());
+        file.push(&Line { value: 1 })?;
+        file.flush()?;
+    }
+    let reopened = segment_spec().open_readonly(&path)?;
+    assert_eq!(reopened.blocks::<Line>()?.len(), 1);
     Ok(())
 }
 

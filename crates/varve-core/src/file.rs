@@ -9465,10 +9465,27 @@ fn load_index(
 /// one written before segments were enabled, one whose writer appended past
 /// its last commit point, one truncated mid-record, one whose chain is stale.
 /// Every one of those is answered by the full scan, which is what open did
-/// before and is never an error. Only a *resource refusal* propagates — a
-/// limit, an allocation, an arithmetic ceiling — because those are the format
-/// saying no, and silently doing more work instead is how a limit gets
-/// bypassed.
+/// before and is never an error.
+///
+/// **A resource refusal is one of them, and the first version of this got that
+/// backwards.** It propagated `LimitExceeded` and its siblings, reasoning that
+/// quietly doing more work is how a ceiling gets bypassed. Falling back
+/// bypasses nothing: the scan builds the identical index through the same
+/// `reserve_scanned_entry` and charges `Records`, `IndexBytes`, `ScanBytes` and
+/// `RecordPayloadLen` itself, so it either opens inside the limits or refuses
+/// honestly. Propagating cost two real failures. A writer never charges
+/// `Segments`, so past `max_segments` commit points it built a file its own
+/// reader refused while a scan read it perfectly — 65,537 flushes under
+/// `ReadLimits::UNTRUSTED`. And `read_segment_tip_offset` returns an
+/// *unconfirmed* offset, so the framing read charges `RecordPayloadLen` against
+/// whatever `payload_len` happens to sit there: four single-bit flips in the
+/// eight trailer bytes at `file_len - 40` turned a scannable file into a hard
+/// `LimitExceeded`.
+///
+/// Only a *spec-level* refusal still propagates: `MissingResourceLimit` and
+/// `TrustedUnboundedRequiresExplicitApi` are statements about the caller's
+/// configuration, not about these bytes, and the scan answers them the same
+/// way.
 fn load_index_from_segments(
     spec: FormatSpec,
     file: &mut File,
@@ -9476,12 +9493,11 @@ fn load_index_from_segments(
 ) -> Result<Option<Vec<RecordIndexEntry>>> {
     match walk_segment_chain(spec, file, append_start) {
         Ok(entries) => Ok(Some(entries)),
-        Err(error @ Error::LimitExceeded { .. })
-        | Err(error @ Error::MissingResourceLimit { .. })
-        | Err(error @ Error::TrustedUnboundedRequiresExplicitApi { .. })
-        | Err(error @ Error::ResourceArithmeticOverflow { .. })
-        | Err(error @ Error::LengthOverflow { .. })
-        | Err(error @ Error::AllocationFailed { .. }) => Err(error),
+        // Only a *spec-level* refusal propagates: the format declared no
+        // ceiling, or demanded the explicit unbounded API. Those describe the
+        // caller's configuration and are the same answer the scan would give.
+        Err(error @ Error::MissingResourceLimit { .. })
+        | Err(error @ Error::TrustedUnboundedRequiresExplicitApi { .. }) => Err(error),
         Err(_) => Ok(None),
     }
 }
@@ -9636,6 +9652,20 @@ fn walk_segment_chain(
     // (PERF2-07): a chain is written by this crate but read from a file
     // anyone can hand over.
     validate_unique_sequences(&entries)?;
+    // The scan ends by cutting its list to the committed prefix, and the walk
+    // must not hand back a list the scan would have cut. A chain that tiles the
+    // whole append log without a commit marker in it is structurally perfect
+    // and still a lie: `truncate_uncommitted_tail_if_needed` runs next, cuts
+    // the file to the header, and would leave this handle holding an index of
+    // records that are no longer on disk — after which the next append lands on
+    // an offset the index already claims and the file is unreadable by either
+    // path. Refusing routes it to the scan, which already knows how to truncate
+    // and to report the empty index that goes with it.
+    if spec.commit_policy.is_transaction_marker()
+        && committed_prefix_len(&entries) != Some(entries.len())
+    {
+        return Err(Error::InvalidIndexSegment);
+    }
     Ok(entries)
 }
 
@@ -9710,7 +9740,16 @@ fn committed_prefix_len(entries: &[RecordIndexEntry]) -> Option<usize> {
         .iter()
         .rposition(|entry| entry.block_id == COMMIT_BLOCK_ID)?;
     let kept = position + 1;
-    if entries.len() == kept + 1 && entries[kept].block_id == SEGMENT_BLOCK_ID {
+    // `entries.len() == kept + 1` was too strict: it kept the segment only when
+    // it was the very last entry, so one uncommitted record appended after a
+    // flush took the segment down with it. The writer then restarted coverage
+    // from the older surviving segment, and every later segment re-covered
+    // everything since — an O(N) payload and an O(N) allocation on every flush,
+    // until `segment_payload_len` passed `max_record_payload_len` and segments
+    // stopped being written at all, silently. The segment describes only
+    // records the marker already committed, so keeping it is exactly as safe
+    // whatever follows it.
+    if entries.len() > kept && entries[kept].block_id == SEGMENT_BLOCK_ID {
         Some(kept + 1)
     } else {
         Some(kept)
