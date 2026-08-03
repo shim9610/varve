@@ -872,3 +872,34 @@ fn flip_byte(path: &Path, offset: u64) -> varve::Result<()> {
     file.sync_all()?;
     Ok(())
 }
+
+// §6.2, settled 2026-08-03. The spec asked whether `VBTL` supersedes
+// `checkpoint_on_flush` or coexists with it. `VBTL` never shipped - the segment
+// chain replaced it - so the live question was whether the *chain* supersedes
+// the checkpoint, and it does on every axis: the checkpoint serialises the
+// whole index from scratch on a geometric cadence, the chain carries the delta
+// per commit point; the checkpoint stops fitting in a record past ~919,299
+// entries, the chain is sized by the commit point; and open reads the chain
+// while it merely validates a checkpoint and throws its entries away. With the
+// chain on, a checkpoint is a periodic full copy of the index that nothing
+// reads. Refused rather than silently cleared, so a format that declared it
+// finds out.
+#[test]
+fn a_checkpoint_and_a_segment_chain_cannot_both_be_declared() {
+    let both = segment_spec()
+        .with_index_policy(segment_spec().index_policy.with_checkpoint_on_flush(true));
+    assert!(matches!(
+        both.validate(),
+        Err(varve::Error::InvalidFormatSpec(
+            "segment_on_flush supersedes checkpoint_on_flush; declare one"
+        )),
+    ));
+    // Either alone is fine.
+    assert!(segment_spec().validate().is_ok());
+    assert!(
+        plain_spec()
+            .with_index_policy(plain_spec().index_policy.with_checkpoint_on_flush(true))
+            .validate()
+            .is_ok()
+    );
+}

@@ -396,8 +396,10 @@ const SPEC: FormatSpec = MyFormat::SPEC
 ```
 
 It requires `block_offset_chain` (which it turns on for you — the chain is that
-footer field) and a `crc32` integrity policy, and it gives up in-place fixed
-replacement. Each segment record carries 73 bytes per record it covers, so the
+footer field) and a `crc32` integrity policy, it gives up in-place fixed
+replacement, and it replaces `checkpoint_on_flush` — declaring both is refused,
+because with the chain on a checkpoint is a periodic full copy of the index that
+nothing reads. Each segment record carries 73 bytes per record it covers, so the
 bytes it costs are set by how often you flush; it pays for itself at a commit
 point every few hundred records and not at a commit point per record.
 

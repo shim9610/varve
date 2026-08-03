@@ -2571,6 +2571,21 @@ impl FormatSpec {
                 "keyed_offset_chain requires block_offset_chain",
             ));
         }
+        // A full checkpoint answers "what is the whole index?" by serialising
+        // every entry from scratch; a segment answers it incrementally, and
+        // unlike the checkpoint it is the thing open actually reads - open
+        // validates a checkpoint it walks past and discards its entries. With
+        // the chain on, `checkpoint_on_flush` writes a periodic full copy of
+        // the index that nothing will ever read, and stops fitting in a record
+        // at all past `(max_record_payload_len - 22) / 73` entries. Refusing is
+        // louder than quietly clearing it: a format that declared the
+        // checkpoint asked for something, and silently not delivering it is how
+        // a policy becomes folklore.
+        if self.index_policy.segment_on_flush && self.index_policy.checkpoint_on_flush {
+            return Err(Error::InvalidFormatSpec(
+                "segment_on_flush supersedes checkpoint_on_flush; declare one",
+            ));
+        }
         if self.index_policy.segment_on_flush && !self.index_policy.block_offset_chain {
             return Err(Error::InvalidFormatSpec(
                 "segment_on_flush requires block_offset_chain",

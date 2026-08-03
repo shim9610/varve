@@ -28,6 +28,13 @@ segment records. The wall-clock ratio is 16x-29x across the range measured, on a
 host whose scan timings vary by about 2x run to run; read it as an order of
 magnitude. Not measured on Windows, and not measured past 200,000 records.
 
+`segment_on_flush` **supersedes `checkpoint_on_flush`**, and declaring both is
+refused. The chain answers the same question incrementally rather than
+serialising the whole index from scratch, has no `(max_record_payload_len - 22)
+/ 73` entry ceiling, and is the thing open actually reads — a checkpoint is
+validated on the way past and its entries discarded. Refused rather than
+silently cleared, so a format that declared the checkpoint finds out.
+
 **A writing session must end with `flush` or `commit`.** Open starts the chain
 from the record at the end of the file, so a writer that stops on a data record
 leaves nothing to start from and the open scans — correctly, silently, and with

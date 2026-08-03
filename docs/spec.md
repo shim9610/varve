@@ -433,6 +433,14 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
 - It requires `block_offset_chain` — the chain *is* `prev_same_block_offset` —
   and a `crc32` integrity policy, because the chain walk trusts a payload that
   describes records it never reads.
+- It **supersedes `checkpoint_on_flush`**, and declaring both is refused. Both
+  answer "what is the whole index?", but the checkpoint serialises every entry
+  from scratch on a geometric cadence while the chain carries the delta a commit
+  point added; the checkpoint stops fitting in a record past
+  `(max_record_payload_len - 22) / 73` entries while a segment is sized by its
+  commit point; and open *reads* the chain, whereas it merely validates a
+  checkpoint it walks past and discards the entries. With the chain on, a
+  checkpoint is a periodic full copy of the index that nothing reads.
 - Segment records use internal block id `SEGMENT_BLOCK_ID` (`0xFFFF_FFF7`),
   block version `1`, and the internal record flag.
 - The payload layout is:

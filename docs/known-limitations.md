@@ -640,6 +640,9 @@ to one written before the option existed. Enabling it costs:
 - a `crc32` integrity policy. A scan reads each record's own header, so damage
   is local; a segment payload describes many records, so without a checksum on
   it damage would misindex records whose own bytes are intact;
+- `checkpoint_on_flush`, which it supersedes — declaring both is refused with
+  `Error::InvalidFormatSpec`. The chain answers the same question incrementally,
+  is the thing open actually reads, and has no entry ceiling;
 - in-place fixed replacement (`replace_fixed`,
   `replace_fixed_in_place_exclusive`, `ReplaceStrategy::FixedCopyOnWrite`), which
   is refused with `Error::InvalidFormatSpec`. It restamps a record a segment
