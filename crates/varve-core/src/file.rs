@@ -86,6 +86,12 @@ const COMPRESSION_ENVELOPE_MAGIC: &[u8; 4] = b"VCMP";
 const COMPRESSION_ENVELOPE_VERSION: u8 = 1;
 const FILE_COMPRESSION_MAGIC: &[u8; 4] = b"VCHD";
 const FILE_COMPRESSION_VERSION: u8 = 1;
+/// `VCHD`'s payload, excluding its magic.
+///
+/// `VCHD` predates the block framing below and carries no length prefix, so its
+/// length is fixed by its own layout: version, algorithm, level kind, and the
+/// `only_if_smaller` flag, then the exact level and the two length bounds.
+const FILE_COMPRESSION_PAYLOAD_LEN: usize = 1 + 1 + 1 + 1 + 4 + 8 + 8;
 const MATRIX_SIDECAR_MAGIC: &[u8; 4] = b"VSID";
 // v2 bound the sidecar to the native file's OS-object identity and matrix
 // layout generation (DUR-04/05). v3 additionally binds it to the per-create
@@ -1974,6 +1980,13 @@ pub struct VarveFile {
     // Shape A, mechanical enforcement: the mirror is not a `Vec`.
     // See `mod resident_index` for what that forbids.
     index: ResidentIndex,
+    // The extension region this file actually carries, which is not always the
+    // one `spec` would write: an unknown block is skipped at open, so a file
+    // from a later release has a longer region than this build produces. Every
+    // header-derived offset comes from here, and a rewrite writes it back
+    // verbatim rather than regenerating it — regenerating would drop the
+    // unknown block and silently move the append log.
+    header_extensions: Vec<u8>,
     matrix: Option<crate::matrix::MatrixLayout>,
     // Present exactly when `matrix` is present: read once at open/create time
     // so sidecar identity checks never touch the file per operation (DUR2-03).
@@ -2844,7 +2857,7 @@ impl VarveFile {
         lock.bind_native(&file, &path)?;
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
-        write_file_header(spec, &mut file)?;
+        let header_extensions = write_file_header(spec, &mut file)?;
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         let mut file = Self {
             spec,
@@ -2853,6 +2866,7 @@ impl VarveFile {
             snapshot,
             mode: OpenMode::ReadWrite,
             index: ResidentIndex::adopt_generation(Vec::new()),
+            header_extensions,
             matrix: None,
             matrix_creation_nonce: None,
             sequence_state: SequenceState::Available(0),
@@ -2937,7 +2951,7 @@ impl VarveFile {
         lock.bind_native(&file, &path)?;
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
-        write_file_header(spec, &mut file)?;
+        let header_extensions = write_file_header(spec, &mut file)?;
         // DUR2-03: stamp a fresh creation nonce so this logical matrix is
         // distinguishable from any earlier matrix that lived in the same OS
         // file object at the same layout offsets.
@@ -2953,6 +2967,7 @@ impl VarveFile {
             snapshot,
             mode: OpenMode::ReadWrite,
             index: ResidentIndex::adopt_generation(Vec::new()),
+            header_extensions,
             matrix: Some(matrix),
             matrix_creation_nonce: Some(creation_nonce),
             sequence_state: SequenceState::Available(0),
@@ -2988,7 +3003,7 @@ impl VarveFile {
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
         lock.bind_native(&file, &path)?;
         let captured_len = check_open_file_len(spec, &file)?;
-        let header_len = read_file_header(spec, &mut file)?;
+        let (header_len, header_extensions) = read_file_header_parts(spec, &mut file)?;
         let (matrix, matrix_creation_nonce) = split_matrix_state(read_matrix_layout_if_needed(
             spec,
             &mut file,
@@ -3010,6 +3025,7 @@ impl VarveFile {
             snapshot,
             mode: OpenMode::ReadWrite,
             index: ResidentIndex::adopt_generation(index),
+            header_extensions,
             matrix,
             matrix_creation_nonce,
             sequence_state,
@@ -3045,7 +3061,7 @@ impl VarveFile {
         let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new().read(true).open(&path)?;
         let captured_len = check_open_file_len(spec, &file)?;
-        let header_len = read_file_header(spec, &mut file)?;
+        let (header_len, header_extensions) = read_file_header_parts(spec, &mut file)?;
         let (matrix, matrix_creation_nonce) = split_matrix_state(read_matrix_layout_if_needed(
             spec,
             &mut file,
@@ -3067,6 +3083,7 @@ impl VarveFile {
             snapshot,
             mode: OpenMode::ReadOnly,
             index: ResidentIndex::adopt_generation(index),
+            header_extensions,
             matrix,
             matrix_creation_nonce,
             sequence_state,
@@ -3111,7 +3128,7 @@ impl VarveFile {
         let original_len = file.metadata()?.len();
         spec.read_limits
             .check(ReadLimitKey::FileLen, original_len)?;
-        let header_len = read_file_header(spec, &mut file)?;
+        let (header_len, header_extensions) = read_file_header_parts(spec, &mut file)?;
         let (matrix, matrix_creation_nonce) = split_matrix_state(read_matrix_layout_if_needed(
             spec,
             &mut file,
@@ -3136,6 +3153,7 @@ impl VarveFile {
                 snapshot,
                 mode: OpenMode::ReadWrite,
                 index: ResidentIndex::adopt_generation(index),
+                header_extensions,
                 matrix,
                 matrix_creation_nonce,
                 sequence_state,
@@ -3762,7 +3780,10 @@ impl VarveFile {
             if let Ok(metadata) = self.file.metadata() {
                 temp_file.set_permissions(metadata.permissions())?;
             }
-            write_file_header(self.spec, &mut temp_file)?;
+            // Write back the region this file carries, not the one `spec`
+            // would generate: regenerating drops any block this build does not
+            // know and moves the append log out from under the index.
+            write_native_file_header(&mut temp_file, self.spec, &self.header_extensions)?;
             for (position, source_entry) in self.index.iter().enumerate() {
                 let mut updated = source_entry.clone();
                 let checkpoint_payload;
@@ -4181,7 +4202,10 @@ impl VarveFile {
             if let Ok(metadata) = self.file.metadata() {
                 temp_file.set_permissions(metadata.permissions())?;
             }
-            write_file_header(self.spec, &mut temp_file)?;
+            // Write back the region this file carries, not the one `spec`
+            // would generate: regenerating drops any block this build does not
+            // know and moves the append log out from under the index.
+            write_native_file_header(&mut temp_file, self.spec, &self.header_extensions)?;
             for (position, source_entry) in self.index.iter().enumerate() {
                 let mut updated = source_entry.clone();
                 let checkpoint_payload;
@@ -4217,14 +4241,7 @@ impl VarveFile {
             validate_generation_file(
                 self.spec,
                 &mut temp_file,
-                native_file_header_len(
-                    self.spec,
-                    u64::try_from(file_header_extensions(self.spec)?.len()).map_err(|_| {
-                        Error::ResourceArithmeticOverflow {
-                            resource: "file-header length",
-                        }
-                    })?,
-                ),
+                append_log_start_for_file(self)?,
                 &new_index,
             )?;
             Ok(())
@@ -6374,7 +6391,11 @@ fn append_log_start_for_file(file: &VarveFile) -> Result<u64> {
     if let Some(matrix) = &file.matrix {
         return Ok(matrix.append_log_start());
     }
-    let extension_len = u64::try_from(file_header_extensions(file.spec)?.len()).map_err(|_| {
+    // From the file's own region, not from `spec`: a block this build does not
+    // know is skipped at open rather than refused, so a file can carry a longer
+    // header than this build writes. Deriving the boundary from `spec` would
+    // put the append log inside that block's bytes.
+    let extension_len = u64::try_from(file.header_extensions.len()).map_err(|_| {
         Error::ResourceArithmeticOverflow {
             resource: "file-header length",
         }
@@ -7649,15 +7670,111 @@ fn file_header_extensions(spec: FormatSpec) -> Result<Vec<u8>> {
     Ok(payload)
 }
 
+/// One block of the file-header extension region.
+struct HeaderExtensionBlock<'a> {
+    magic: [u8; 4],
+    /// The block's bytes *including* its magic and any length prefix, so a
+    /// known block is compared against what this spec would write without
+    /// re-encoding the framing.
+    encoded: &'a [u8],
+}
+
+/// Whether this build decodes a block, as opposed to stepping over it.
+///
+/// The whole point of the walk: a magic that is not on this list is skipped,
+/// so a file carrying a block from a later release still opens here.
+fn is_known_header_extension_magic(magic: &[u8; 4]) -> bool {
+    magic == FILE_COMPRESSION_MAGIC
+}
+
+/// Walk the extension region as a block sequence.
+///
+/// The framing is `magic[4] | len: u32 | payload[len]`, with one exception:
+/// `VCHD` shipped before the framing existed and has no length prefix, so it is
+/// identified by magic and its payload length is the constant above. Every
+/// block added after this walk carries the prefix, which is what makes an
+/// unknown one skippable.
+///
+/// A truncated block, a length that overruns the region, or a repeated magic is
+/// refused — skipping an unknown block is forward compatibility, but a region
+/// that cannot be framed at all is a corrupt header.
+fn parse_file_header_extension_blocks(region: &[u8]) -> Result<Vec<HeaderExtensionBlock<'_>>> {
+    let mut blocks: Vec<HeaderExtensionBlock<'_>> = Vec::new();
+    let mut offset = 0usize;
+    while offset < region.len() {
+        let start = offset;
+        let magic: [u8; 4] = region
+            .get(offset..offset + 4)
+            .ok_or(Error::InvalidCompressionHeader)?
+            .try_into()
+            .map_err(|_| Error::InvalidCompressionHeader)?;
+        offset += 4;
+        let payload_len = if &magic == FILE_COMPRESSION_MAGIC {
+            FILE_COMPRESSION_PAYLOAD_LEN
+        } else {
+            let len: [u8; 4] = region
+                .get(offset..offset + 4)
+                .ok_or(Error::InvalidCompressionHeader)?
+                .try_into()
+                .map_err(|_| Error::InvalidCompressionHeader)?;
+            offset += 4;
+            usize::try_from(u32::from_le_bytes(len)).map_err(|_| Error::InvalidCompressionHeader)?
+        };
+        offset = offset
+            .checked_add(payload_len)
+            .ok_or(Error::InvalidCompressionHeader)?;
+        if offset > region.len() {
+            return Err(Error::InvalidCompressionHeader);
+        }
+        if blocks.iter().any(|block| block.magic == magic) {
+            return Err(Error::InvalidCompressionHeader);
+        }
+        blocks.push(HeaderExtensionBlock {
+            magic,
+            encoded: &region[start..offset],
+        });
+    }
+    Ok(blocks)
+}
+
+/// Judge the region a file carries against the one this spec would write.
+///
+/// A block this build knows must be present exactly when it is expected and
+/// must match byte for byte; a block it does not know is stepped over. The
+/// equality fast path keeps the ordinary case — a file written by this build —
+/// off the walk entirely.
+///
+/// This buys forward compatibility from the release that carries it, not
+/// backward compatibility with the ones that do not: a reader older than this
+/// walk still refuses any region it would not have written itself.
 fn validate_file_header_extensions(spec: FormatSpec, extensions: &[u8]) -> Result<()> {
     let expected = file_header_extensions(spec)?;
     if expected == extensions {
         return Ok(());
     }
-    if expected.is_empty() && extensions.is_empty() {
-        return Ok(());
+    let present = parse_file_header_extension_blocks(extensions)?;
+    let expected_blocks = parse_file_header_extension_blocks(&expected)?;
+    for expected_block in &expected_blocks {
+        let found = present
+            .iter()
+            .find(|block| block.magic == expected_block.magic)
+            .ok_or(Error::InvalidCompressionHeader)?;
+        if found.encoded != expected_block.encoded {
+            return Err(Error::InvalidCompressionHeader);
+        }
     }
-    Err(Error::InvalidCompressionHeader)
+    for block in &present {
+        if !is_known_header_extension_magic(&block.magic) {
+            continue;
+        }
+        if !expected_blocks
+            .iter()
+            .any(|expected_block| expected_block.magic == block.magic)
+        {
+            return Err(Error::InvalidCompressionHeader);
+        }
+    }
+    Ok(())
 }
 
 fn compression_algorithm_byte(algorithm: CompressionAlgorithm) -> u8 {
@@ -8559,13 +8676,25 @@ where
     Ok(Some((key, op)))
 }
 
-pub(crate) fn write_file_header(spec: FormatSpec, file: &mut File) -> Result<()> {
+/// Write the header this spec describes, and hand back the extension region it
+/// put there so the caller can record what this file actually carries.
+pub(crate) fn write_file_header(spec: FormatSpec, file: &mut File) -> Result<Vec<u8>> {
     let extensions = file_header_extensions(spec)?;
     write_native_file_header(file, spec, &extensions)?;
-    Ok(())
+    Ok(extensions)
 }
 
 pub(crate) fn read_file_header(spec: FormatSpec, file: &mut File) -> Result<u64> {
+    Ok(read_file_header_parts(spec, file)?.0)
+}
+
+/// The header length *and* the extension region the file carries.
+///
+/// The two are not interchangeable with what `spec` would produce: once an
+/// unknown block is skippable rather than refused, a file's region can be
+/// longer than this build would write, and every offset derived from the header
+/// has to come from the file rather than from the spec.
+pub(crate) fn read_file_header_parts(spec: FormatSpec, file: &mut File) -> Result<(u64, Vec<u8>)> {
     file.seek(SeekFrom::Start(0))?;
     let header = read_native_file_header(file, spec)?;
     let hash = header.schema_hash;
@@ -8586,12 +8715,12 @@ pub(crate) fn read_file_header(spec: FormatSpec, file: &mut File) -> Result<u64>
     }
     if header.has_extension_len {
         validate_file_header_extensions(spec, &header.extensions)?;
-        Ok(header.header_len)
+        Ok((header.header_len, header.extensions))
     } else {
         if uses_file_explicit_compression(spec) {
             return Err(Error::InvalidCompressionHeader);
         }
-        Ok(native_file_header_len(spec, 0))
+        Ok((native_file_header_len(spec, 0), Vec::new()))
     }
 }
 

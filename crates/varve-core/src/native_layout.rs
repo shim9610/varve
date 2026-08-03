@@ -12,6 +12,13 @@ const CONTAINER_MARKER_V1: &[u8; 6] = b"VARVE1";
 const CONTAINER_MARKER_V2: &[u8; 6] = b"VARVE2";
 const CONTAINER_MARKER_V3: &[u8; 6] = b"VARVE3";
 const FILE_HEADER_FIXED_LEN: u64 = 6 + 2 + 1 + 1 + 8;
+/// The largest extension region a reader will accept.
+///
+/// The region's length field is a `u32`, so an untrusted header could otherwise
+/// name a 4 GiB region and have open allocate it before a single block is
+/// parsed. Header blocks are tens of bytes; 64 KiB is far above any use and
+/// keeps the allocation bounded, which is what open being cheap depends on.
+pub(crate) const MAX_FILE_HEADER_EXTENSION_LEN: u64 = 64 * 1024;
 const FILE_EXPLICIT_COMPRESSION_HEADER_LEN: u64 = 28;
 const INTERNAL_PREFIX_LEN: usize = 4 + 8;
 
@@ -283,7 +290,18 @@ pub(crate) fn read_native_file_header<R: Read>(
         )?;
         let extension_len = value_as_u32("extension_len", &extension_len)?;
         let extension_len = u64::from(extension_len);
-        if extension_len != native_file_header_plan_extension_len(spec) {
+        // The region is no longer required to be exactly what this spec would
+        // write: a block whose magic this build does not know is skipped, and
+        // that is only possible if a longer region can be read at all. What
+        // the region *contains* is judged by the block walk in `file.rs`.
+        if extension_len > MAX_FILE_HEADER_EXTENSION_LEN {
+            return Err(Error::InvalidCompressionHeader);
+        }
+        // No writer emits a length field for an empty region — it picks
+        // `VARVE1` — and `checked_native_file_header_len` reconstructs the
+        // field's presence from the length alone, so it would compute a header
+        // four bytes short for this combination. Refuse it instead.
+        if extension_len == 0 && !spec.spec_needs_record_footer() {
             return Err(Error::InvalidCompressionHeader);
         }
         match read_native_value(
