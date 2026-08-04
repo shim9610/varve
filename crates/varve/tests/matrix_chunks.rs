@@ -1200,6 +1200,226 @@ fn a_chunked_read_does_not_pay_for_records_it_does_not_touch() -> varve::Result<
 }
 
 // ---------------------------------------------------------------------------
+// Chunk compression: the knob for the sparse cost
+// ---------------------------------------------------------------------------
+
+fn compressed_spec() -> FormatSpec {
+    growing_spec().with_chunk_compression(varve::VariableCompression::zstd(
+        varve::CompressionHeaderMode::RecordExplicit,
+    ))
+}
+
+#[test]
+fn chunk_compression_is_inert_when_not_declared() {
+    assert!(growing_spec().chunk_compression.is_none());
+    // A spec that declares no growing dimension still hashes to what it hashed
+    // to before either option existed.
+    assert_eq!(base_spec().computed_schema_hash(), BASE_SCHEMA_HASH);
+    assert_ne!(
+        compressed_spec().computed_schema_hash(),
+        growing_spec().computed_schema_hash(),
+        "a compressed chunk is not the file the plain spec describes",
+    );
+}
+
+#[test]
+fn chunk_compression_requires_a_growing_dimension() {
+    assert!(matches!(
+        base_spec()
+            .with_chunk_compression(varve::VariableCompression::zstd(
+                varve::CompressionHeaderMode::RecordExplicit,
+            ))
+            .validate(),
+        Err(Error::InvalidFormatSpec(
+            "chunk compression requires a growing matrix dimension"
+        )),
+    ));
+}
+
+#[test]
+fn compressed_chunks_read_back_every_cell() -> varve::Result<()> {
+    let path = temp_path("compressed_roundtrip");
+    let rows = ROWS_PER_CHUNK * 6;
+    {
+        let mut writer = compressed_spec().create_writer_with_dims(path.path(), dims())?;
+        for row in 0..rows {
+            for ch in 0..CHANNELS {
+                let cell = key(row, ch);
+                writer.write_matrix_cell(
+                    cell,
+                    &Sample {
+                        value: (row * CHANNELS + ch) as u32 + 1,
+                    },
+                )?;
+                writer.commit_matrix_cell::<Sample>(cell)?;
+            }
+        }
+        writer.flush()?;
+    }
+    let reader = compressed_spec().open_reader(path.path())?;
+    for row in 0..rows {
+        for ch in 0..CHANNELS {
+            assert_eq!(
+                reader.read_matrix_cell::<Sample>(key(row, ch))?,
+                Sample {
+                    value: (row * CHANNELS + ch) as u32 + 1
+                },
+                "row {row} ch {ch}",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_partly_filled_chunk_costs_less_when_compressed() -> varve::Result<()> {
+    // The point of the knob. Uncompressed, a chunk 1/4096 filled costs exactly
+    // what a full one costs — `an_unfilled_chunk_costs_its_whole_size` pins
+    // that. Compressed, the untouched cells are zeros and collapse.
+    //
+    // A tall chunk, so the slot region dominates the file rather than the
+    // header: at ROWS_PER_CHUNK the same comparison is 3,644 vs 2,836 bytes and
+    // says more about the matrix region than about this mechanism.
+    const TALL: u64 = 4_096;
+    fn write(spec: FormatSpec, path: &Path) -> varve::Result<u64> {
+        let dims = MatrixDimensions::from_pairs([("scan", TALL), ("ch", CHANNELS)]);
+        {
+            let mut writer = spec.create_writer_with_dims(path, dims)?;
+            for chunk in 1..=8u64 {
+                for ch in 0..CHANNELS {
+                    let cell = key(chunk * TALL, ch);
+                    writer.write_matrix_cell(cell, &Sample { value: 7 })?;
+                    writer.commit_matrix_cell::<Sample>(cell)?;
+                }
+            }
+            writer.flush()?;
+        }
+        Ok(std::fs::metadata(path)?.len())
+    }
+
+    let plain_path = temp_path("sparse_plain");
+    let comp_path = temp_path("sparse_compressed");
+    let plain = write(
+        growing_spec().with_growing_matrix_dimension("scan", TALL),
+        plain_path.path(),
+    )?;
+    let compressed = write(
+        compressed_spec().with_growing_matrix_dimension("scan", TALL),
+        comp_path.path(),
+    )?;
+    println!("PROBE: one filled row of {TALL} — plain {plain} B, compressed {compressed} B");
+    // The floor is the matrix region — chunk 0, which lives in the declared
+    // extent and is not a record, so this knob does not reach it. With eight
+    // chunks beyond it the plain file is nine regions' worth and the compressed
+    // one is barely more than the region itself.
+    assert!(
+        compressed * 4 < plain,
+        "eight chunks with one filled row of {TALL} must collapse: {compressed} \
+         vs {plain}",
+    );
+    Ok(())
+}
+
+#[test]
+fn a_corrupted_compressed_sub_block_is_refused() -> varve::Result<()> {
+    // The per-cell checksum is computed over the *uncompressed* cell bytes and
+    // stored plain, so it still guards a compressed chunk: a damaged sub-block
+    // either fails to decode or decodes to bytes whose checksum does not match.
+    let path = temp_path("compressed_corrupt");
+    let cell = key(ROWS_PER_CHUNK, 0);
+    {
+        let mut writer = compressed_spec().create_writer_with_dims(path.path(), dims())?;
+        for ch in 0..CHANNELS {
+            let at = key(ROWS_PER_CHUNK, ch);
+            writer.write_matrix_cell(at, &Sample { value: 0xABCD })?;
+            writer.commit_matrix_cell::<Sample>(at)?;
+        }
+        writer.flush()?;
+    }
+    // Corrupt a byte inside the first compressed sub-block. zstd frames start
+    // with the magic 0x28 0xB5 0x2F 0xFD, and the first one after the chunk
+    // prefix belongs to `Sample` — the lower block id, so the first block
+    // region in the payload.
+    let bytes = std::fs::read(path.path())?;
+    let (_, at) = first_chunk_payload(path.path())?;
+    let frame = bytes[at..]
+        .windows(4)
+        .position(|window| window == [0x28, 0xB5, 0x2F, 0xFD])
+        .map(|offset| at + offset)
+        .expect("a zstd frame inside the chunk record");
+    // Past the frame header, in its compressed body.
+    patch(path.path(), frame + 8, &[bytes[frame + 8] ^ 0xFF])?;
+
+    let reader = compressed_spec().open_reader(path.path())?;
+    assert!(
+        reader.read_matrix_cell::<Sample>(cell).is_err(),
+        "a corrupted compressed sub-block must not decode to data",
+    );
+    Ok(())
+}
+
+#[cfg(feature = "scalable-fault-injection")]
+#[test]
+fn a_compressed_read_costs_one_sub_block_not_the_chunk() -> varve::Result<()> {
+    use varve::VarveFile;
+
+    // The trade this knob makes, stated as a number rather than as a promise:
+    // a plain chunked read touches the cell, a compressed one touches its
+    // sub-block. Both must stay far below the chunk.
+    const WIDE_ROWS: u64 = 4_096;
+    let plain = growing_spec().with_growing_matrix_dimension("scan", WIDE_ROWS);
+    let compressed = plain.with_chunk_compression(varve::VariableCompression::zstd(
+        varve::CompressionHeaderMode::RecordExplicit,
+    ));
+    let wide_dims = MatrixDimensions::from_pairs([("scan", WIDE_ROWS), ("ch", CHANNELS)]);
+    let chunk_slot_bytes = WIDE_ROWS * CHANNELS * Sample::SLOT_STRIDE;
+
+    fn cost(
+        spec: FormatSpec,
+        dims: MatrixDimensions,
+        path: &Path,
+        rows: u64,
+    ) -> varve::Result<u64> {
+        let cell = MatrixKey::new(rows + 7, 2);
+        {
+            let mut writer = spec.create_writer_with_dims(path, dims)?;
+            writer.write_matrix_cell(cell, &Sample { value: 77 })?;
+            writer.commit_matrix_cell::<Sample>(cell)?;
+            writer.write_matrix_cell(MatrixKey::new(rows * 2, 0), &Sample { value: 1 })?;
+            writer.commit_matrix_cell::<Sample>(MatrixKey::new(rows * 2, 0))?;
+            writer.flush()?;
+        }
+        let reader = spec.open_reader(path)?;
+        reader.read_matrix_cell::<Sample>(cell)?;
+        let before = VarveFile::chunk_bytes_read();
+        assert_eq!(
+            reader.read_matrix_cell::<Sample>(cell)?,
+            Sample { value: 77 }
+        );
+        Ok(VarveFile::chunk_bytes_read() - before)
+    }
+
+    let plain_path = temp_path("cost_plain");
+    let comp_path = temp_path("cost_compressed");
+    let plain_cost = cost(plain, wide_dims.clone(), plain_path.path(), WIDE_ROWS)?;
+    let comp_cost = cost(compressed, wide_dims, comp_path.path(), WIDE_ROWS)?;
+
+    println!(
+        "PROBE: plain {plain_cost} B, compressed {comp_cost} B, chunk slots {chunk_slot_bytes} B"
+    );
+    assert!(
+        plain_cost < 4096,
+        "a plain chunked read must stay small: {plain_cost}",
+    );
+    assert!(
+        comp_cost < chunk_slot_bytes / 8,
+        "a compressed read must touch its sub-block, not the chunk: {comp_cost} of \
+         {chunk_slot_bytes}",
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Hostile input: a chunk record's own extent is the wall
 // ---------------------------------------------------------------------------
 //

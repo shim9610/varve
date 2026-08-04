@@ -89,7 +89,27 @@ const MATRIX_CHUNK_VERSION: u16 = 1;
 /// not, so a single flipped bit in a sealed chunk came back as data. The matrix
 /// region solves this with a per-cell checksum and so does a chunk.
 const MATRIX_CHUNK_FLAG_CELL_CRC: u16 = 0x0001;
-const MATRIX_CHUNK_KNOWN_FLAGS: u16 = MATRIX_CHUNK_FLAG_CELL_CRC;
+/// Prefix flag: every block's slot region is a sub-block index followed by
+/// compressed sub-blocks, rather than plain cells.
+///
+/// A chunk is written whole, so an unfilled one costs its full size — measured
+/// identical at 5% and 100% filled. Only the slot regions are compressed: the
+/// prefix, the descriptors, the commit maps and the checksum tables stay plain,
+/// so addressing a cell, reading its commit bit and checking its checksum are
+/// unchanged, and only the `stride`-byte positional read becomes a sub-block
+/// decode.
+const MATRIX_CHUNK_FLAG_COMPRESSED_SLOTS: u16 = 0x0002;
+const MATRIX_CHUNK_KNOWN_FLAGS: u16 =
+    MATRIX_CHUNK_FLAG_CELL_CRC | MATRIX_CHUNK_FLAG_COMPRESSED_SLOTS;
+/// Uncompressed bytes a slot sub-block covers, before rounding to whole cells.
+///
+/// A cell's sub-block is `ordinal / cells_per_sub_block(stride)` — arithmetic,
+/// not a search — and both sides derive the divisor from `stride` alone so they
+/// cannot disagree.
+const MATRIX_CHUNK_SUB_BLOCK_BYTES: u64 = 8192;
+/// One `u32` offset per sub-block, plus a terminator, so a sub-block's extent
+/// is two reads and no prefix sum.
+const MATRIX_CHUNK_SUB_BLOCK_OFFSET_LEN: u64 = 4;
 /// Bytes of stored checksum per cell.
 const MATRIX_CHUNK_CRC_LEN: u64 = 4;
 /// magic(4) + version(2) + flags(2) + chunk_index(8) + first_row(8) + rows(8)
@@ -1241,15 +1261,137 @@ fn chunk_payload_len_for(spec: FormatSpec, dims: &MatrixDimensions) -> Result<u6
         } else {
             0
         };
+        // The uncompressed size plus the sub-block index. Compression can only
+        // make the sealed record smaller, so bounding the uncompressed form is
+        // the conservative check — a spec must not depend on its data
+        // compressing in order to fit.
+        let index = if spec.chunk_compression.is_some() {
+            sub_block_count(cells, compressed_cell_width(block.slot_stride, cell_crc))
+                .checked_add(1)
+                .and_then(|entries| entries.checked_mul(MATRIX_CHUNK_SUB_BLOCK_OFFSET_LEN))
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "matrix chunk sub-block index",
+                })?
+        } else {
+            0
+        };
         len = len
             .checked_add(cells.div_ceil(8))
             .and_then(|len| len.checked_add(crc))
+            .and_then(|len| len.checked_add(index))
             .and_then(|len| len.checked_add(slots))
             .ok_or(Error::ResourceArithmeticOverflow {
                 resource: "matrix chunk payload length",
             })?;
     }
     Ok(len)
+}
+
+/// Writes one block's slot region as a sub-block index plus compressed
+/// sub-blocks.
+///
+/// The index is `sub_block_count + 1` little-endian `u32` offsets relative to
+/// the end of the index, so a sub-block's extent is `off[i]..off[i + 1]` — two
+/// four-byte reads and no prefix sum.
+///
+/// **A sub-block is stored raw when compressing it does not shrink it**, and
+/// the reader tells the two apart by length alone: stored length equal to the
+/// uncompressed length means raw. The writer therefore never emits a compressed
+/// sub-block of exactly that length, which costs nothing — such a sub-block is
+/// stored raw instead, byte for byte the same thing.
+fn encode_compressed_slots(
+    payload: &mut Vec<u8>,
+    block: &OpenChunkBlock,
+    compression: VariableCompression,
+) -> Result<()> {
+    let cell_crc = !block.crc.is_empty();
+    let width = compressed_cell_width(block.stride, cell_crc);
+    let per = cells_per_sub_block(width);
+    let count = sub_block_count(block.cells, width);
+    let count_usize = usize::try_from(count).map_err(|_| Error::InvalidMatrixChunk)?;
+    let stride = usize::try_from(block.stride).map_err(|_| Error::InvalidMatrixChunk)?;
+    let width_usize = usize::try_from(width).map_err(|_| Error::InvalidMatrixChunk)?;
+    let per_usize = usize::try_from(per).map_err(|_| Error::InvalidMatrixChunk)?;
+    let cells = usize::try_from(block.cells).map_err(|_| Error::InvalidMatrixChunk)?;
+
+    let mut stored: Vec<Vec<u8>> = Vec::new();
+    stored
+        .try_reserve_exact(count_usize)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "matrix chunk sub-blocks",
+            requested: count,
+        })?;
+    let mut packed = Vec::new();
+    for index in 0..count_usize {
+        let first = index * per_usize;
+        let last = ((index + 1) * per_usize).min(cells);
+        packed.clear();
+        packed
+            .try_reserve((last.saturating_sub(first)) * width_usize)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "matrix chunk sub-block",
+                requested: width,
+            })?;
+        for cell in first..last {
+            packed.extend_from_slice(&block.slots[cell * stride..(cell + 1) * stride]);
+            if cell_crc {
+                packed.extend_from_slice(&block.crc[cell * 4..(cell + 1) * 4]);
+            }
+        }
+        let compressed =
+            compress_with_algorithm(compression.algorithm, compression.level, &packed)?;
+        if compressed.len() >= packed.len() {
+            stored.push(packed.clone());
+        } else {
+            stored.push(compressed);
+        }
+    }
+
+    let mut offset = 0u32;
+    for bytes in &stored {
+        payload.extend_from_slice(&offset.to_le_bytes());
+        offset = offset
+            .checked_add(u32::try_from(bytes.len()).map_err(|_| Error::InvalidMatrixChunk)?)
+            .ok_or(Error::InvalidMatrixChunk)?;
+    }
+    payload.extend_from_slice(&offset.to_le_bytes());
+    for bytes in &stored {
+        payload.extend_from_slice(bytes);
+    }
+    Ok(())
+}
+
+/// Bytes a compressed sub-block holds per cell.
+///
+/// **The checksum travels with its cell.** Compressing only the slot region
+/// left the per-cell checksum table — four bytes per cell, all zeros for every
+/// never-written cell — as the dominant term: measured 1,606,396 B plain
+/// against 1,083,604 B with slots-only compression, a 33% saving where the
+/// slots alone are half the file. Packing each cell beside its checksum makes
+/// one decode yield both and lets the zeros collapse together.
+const fn compressed_cell_width(stride: u64, cell_crc: bool) -> u64 {
+    if cell_crc {
+        stride + MATRIX_CHUNK_CRC_LEN
+    } else {
+        stride
+    }
+}
+
+/// Cells one compressed sub-block covers, for a given packed cell width.
+///
+/// Derived from the width alone so the writer and the reader cannot disagree
+/// about where a cell lives.
+const fn cells_per_sub_block(stride: u64) -> u64 {
+    if stride == 0 || stride >= MATRIX_CHUNK_SUB_BLOCK_BYTES {
+        1
+    } else {
+        MATRIX_CHUNK_SUB_BLOCK_BYTES / stride
+    }
+}
+
+/// Sub-blocks a block's slot region is cut into.
+fn sub_block_count(cells: u64, stride: u64) -> u64 {
+    cells.div_ceil(cells_per_sub_block(stride)).max(1)
 }
 
 /// A zeroed buffer of `len` bytes, allocated fallibly.
@@ -1302,6 +1444,7 @@ struct ChunkPrefix {
     rows: u64,
     block_count: u32,
     cell_crc: bool,
+    compressed_slots: bool,
 }
 
 /// One sealed chunk, located.
@@ -1315,6 +1458,7 @@ struct ChunkLocator {
     payload_len: u64,
     block_count: u32,
     cell_crc: bool,
+    compressed_slots: bool,
 }
 
 /// Every sealed chunk, by chunk index, ordered once.
@@ -1376,6 +1520,8 @@ struct OpenChunk {
     index: u64,
     first_row: u64,
     rows: u64,
+    /// How the slot regions are stored when this chunk is sealed.
+    compression: Option<VariableCompression>,
     blocks: Vec<OpenChunkBlock>,
     /// Whether any cell has been committed since the chunk was opened. A chunk
     /// nothing committed is not written: an empty chunk and an absent chunk
@@ -1422,9 +1568,23 @@ impl OpenChunk {
                 u64::try_from(block.crc.len()).map_err(|_| Error::ResourceArithmeticOverflow {
                     resource: "matrix chunk checksum table",
                 })?;
+            let index = if self.compression.is_some() {
+                sub_block_count(
+                    block.cells,
+                    compressed_cell_width(block.stride, !block.crc.is_empty()),
+                )
+                .checked_add(1)
+                .and_then(|entries| entries.checked_mul(MATRIX_CHUNK_SUB_BLOCK_OFFSET_LEN))
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "matrix chunk sub-block index",
+                })?
+            } else {
+                0
+            };
             len = len
                 .checked_add(commit)
                 .and_then(|len| len.checked_add(crc))
+                .and_then(|len| len.checked_add(index))
                 .and_then(|len| len.checked_add(slots))
                 .ok_or(Error::ResourceArithmeticOverflow {
                     resource: "matrix chunk payload length",
@@ -1434,6 +1594,9 @@ impl OpenChunk {
     }
 
     fn encode(&self) -> Result<Vec<u8>> {
+        // The uncompressed size, which is exact when plain and an upper bound
+        // when compressing. Reserving the bound is the point: a compressed
+        // chunk must never need more than the ceiling `create` checked.
         let payload_len = self.payload_len()?;
         let capacity = usize::try_from(payload_len)
             .map_err(|_| Error::LengthOverflow { value: payload_len })?;
@@ -1448,11 +1611,14 @@ impl OpenChunk {
             u32::try_from(self.blocks.len()).map_err(|_| Error::ResourceArithmeticOverflow {
                 resource: "matrix chunk block count",
             })?;
-        let flags = if self.blocks.iter().any(|block| !block.crc.is_empty()) {
+        let mut flags = if self.blocks.iter().any(|block| !block.crc.is_empty()) {
             MATRIX_CHUNK_FLAG_CELL_CRC
         } else {
             0
         };
+        if self.compression.is_some() {
+            flags |= MATRIX_CHUNK_FLAG_COMPRESSED_SLOTS;
+        }
         payload.extend_from_slice(MATRIX_CHUNK_MAGIC);
         payload.extend_from_slice(&MATRIX_CHUNK_VERSION.to_le_bytes());
         payload.extend_from_slice(&flags.to_le_bytes());
@@ -1475,8 +1641,17 @@ impl OpenChunk {
         }
         for block in &self.blocks {
             payload.extend_from_slice(&block.commit);
-            payload.extend_from_slice(&block.crc);
-            payload.extend_from_slice(&block.slots);
+            match self.compression {
+                Some(compression) => {
+                    // No separate checksum table: each cell is packed beside
+                    // its own, inside the sub-block.
+                    encode_compressed_slots(&mut payload, block, compression)?;
+                }
+                None => {
+                    payload.extend_from_slice(&block.crc);
+                    payload.extend_from_slice(&block.slots);
+                }
+            }
         }
         Ok(payload)
     }
@@ -1493,6 +1668,13 @@ struct ChunkBlockLocation {
     /// `None` when the chunk carries no per-cell checksums.
     crc_offset: Option<u64>,
     slots_offset: u64,
+    /// One past the last byte of this block's slot region, so a compressed
+    /// sub-block's extent is bounded without consulting the record again.
+    slots_end: u64,
+    compressed_slots: bool,
+    /// Whether cells carry a checksum at all, which a compressed block needs
+    /// even though it has no separate table.
+    cell_crc: bool,
     stride: u64,
     cells: u64,
 }
@@ -5439,6 +5621,7 @@ impl VarveFile {
             index,
             first_row,
             rows,
+            compression: self.spec.chunk_compression,
             blocks,
             dirty: false,
         });
@@ -5472,7 +5655,7 @@ impl VarveFile {
     /// holding it costs a commit point nothing, and an idle flush still writes
     /// no record, which is the property this guard was for.
     fn seal_open_chunk(&mut self) -> Result<()> {
-        let (payload, index, block_count, cell_crc) = {
+        let (payload, index, block_count, cell_crc, compressed_slots) = {
             let Some(chunk) = self.open_chunk.as_ref() else {
                 return Ok(());
             };
@@ -5488,6 +5671,7 @@ impl VarveFile {
                     }
                 })?,
                 chunk.blocks.iter().any(|block| !block.crc.is_empty()),
+                chunk.compression.is_some(),
             )
         };
         let payload_len = payload.len() as u64;
@@ -5519,6 +5703,7 @@ impl VarveFile {
                 payload_len,
                 block_count,
                 cell_crc,
+                compressed_slots,
             });
         }
         Ok(())
@@ -5868,7 +6053,9 @@ impl VarveFile {
                 return Err(Error::InvalidMatrixChunk);
             }
             let cell_crc = !matches!(self.spec.integrity_policy, IntegrityPolicy::None);
-            if prefix.cell_crc != cell_crc {
+            if prefix.cell_crc != cell_crc
+                || prefix.compressed_slots != self.spec.chunk_compression.is_some()
+            {
                 return Err(Error::InvalidMatrixChunk);
             }
             // The binary search below is only legal on an ordered list, and
@@ -5891,6 +6078,7 @@ impl VarveFile {
                 payload_len: entry.payload_len,
                 block_count: prefix.block_count,
                 cell_crc: prefix.cell_crc,
+                compressed_slots: prefix.compressed_slots,
             });
         }
         Ok(ChunkDirectory { chunks })
@@ -5954,6 +6142,7 @@ impl VarveFile {
             rows,
             block_count,
             cell_crc: flags & MATRIX_CHUNK_FLAG_CELL_CRC != 0,
+            compressed_slots: flags & MATRIX_CHUNK_FLAG_COMPRESSED_SLOTS != 0,
         })
     }
 
@@ -5979,6 +6168,7 @@ impl VarveFile {
         payload_len: u64,
         block_count: u32,
         cell_crc: bool,
+        compressed_slots: bool,
         block_id: u32,
     ) -> Result<Option<ChunkBlockLocation>> {
         let payload_offset = record_offset
@@ -6035,7 +6225,9 @@ impl VarveFile {
                 .checked_add(commit_len)
                 .filter(|offset| *offset <= payload_end)
                 .ok_or(Error::InvalidMatrixChunk)?;
-            let crc_len = if cell_crc {
+            // A compressed block packs each checksum beside its cell inside the
+            // sub-block, so there is no separate table to skip.
+            let crc_len = if cell_crc && !compressed_slots {
                 cells
                     .checked_mul(MATRIX_CHUNK_CRC_LEN)
                     .ok_or(Error::InvalidMatrixChunk)?
@@ -6046,7 +6238,33 @@ impl VarveFile {
                 .checked_add(crc_len)
                 .filter(|offset| *offset <= payload_end)
                 .ok_or(Error::InvalidMatrixChunk)?;
-            let slots_len = cells.checked_mul(stride).ok_or(Error::InvalidMatrixChunk)?;
+            // A plain slot region's length is arithmetic. A compressed one's
+            // is whatever its own index terminator says, which is a value from
+            // the file and so is bounded by `payload_end` like every other.
+            let slots_len = if compressed_slots {
+                let count = sub_block_count(cells, compressed_cell_width(stride, cell_crc));
+                let index_len = count
+                    .checked_add(1)
+                    .and_then(|entries| entries.checked_mul(MATRIX_CHUNK_SUB_BLOCK_OFFSET_LEN))
+                    .filter(|len| {
+                        slots_offset
+                            .checked_add(*len)
+                            .is_some_and(|end| end <= payload_end)
+                    })
+                    .ok_or(Error::InvalidMatrixChunk)?;
+                let terminator = slots_offset
+                    .checked_add(index_len)
+                    .and_then(|end| end.checked_sub(MATRIX_CHUNK_SUB_BLOCK_OFFSET_LEN))
+                    .ok_or(Error::InvalidMatrixChunk)?;
+                let mut bytes = [0u8; MATRIX_CHUNK_SUB_BLOCK_OFFSET_LEN as usize];
+                self.snapshot.read_exact_at(terminator, &mut bytes)?;
+                note_chunk_bytes_read(MATRIX_CHUNK_SUB_BLOCK_OFFSET_LEN);
+                index_len
+                    .checked_add(u64::from(u32::from_le_bytes(bytes)))
+                    .ok_or(Error::InvalidMatrixChunk)?
+            } else {
+                cells.checked_mul(stride).ok_or(Error::InvalidMatrixChunk)?
+            };
             let next = slots_offset
                 .checked_add(slots_len)
                 .filter(|offset| *offset <= payload_end)
@@ -6077,8 +6295,11 @@ impl VarveFile {
                 }
                 found = Some(ChunkBlockLocation {
                     commit_offset: cursor,
-                    crc_offset: cell_crc.then_some(crc_offset),
+                    crc_offset: (cell_crc && !compressed_slots).then_some(crc_offset),
                     slots_offset,
+                    slots_end: next,
+                    compressed_slots,
+                    cell_crc,
                     stride,
                     cells,
                 });
@@ -6110,6 +6331,7 @@ impl VarveFile {
             locator.payload_len,
             locator.block_count,
             locator.cell_crc,
+            locator.compressed_slots,
             T::ID,
         )?
         else {
@@ -6277,21 +6499,150 @@ impl VarveFile {
         self.spec
             .read_limits
             .check(ReadLimitKey::MaterializedBytes, location.stride)?;
-        let mut payload = try_zeroed_vec(location.stride, "matrix chunk slot payload")?;
-        self.snapshot.read_exact_at(
-            location
-                .slots_offset
-                .checked_add(
-                    ordinal
-                        .checked_mul(location.stride)
-                        .ok_or(Error::InvalidMatrixChunk)?,
-                )
-                .ok_or(Error::InvalidMatrixChunk)?,
-            &mut payload,
-        )?;
-        note_chunk_bytes_read(location.stride);
+        let payload = if location.compressed_slots {
+            let (payload, stored) = self.read_compressed_chunk_cell(location, ordinal)?;
+            // The checksum came out of the same decode as the cell, so a
+            // damaged sub-block cannot produce a matching pair.
+            if let Some(expected) = stored {
+                let actual = crc32_bytes(&payload)?;
+                if actual != expected {
+                    return Err(Error::MatrixChecksumMismatch {
+                        offset: location.slots_offset,
+                        expected,
+                        actual,
+                    });
+                }
+            }
+            return Ok(payload);
+        } else {
+            let mut payload = try_zeroed_vec(location.stride, "matrix chunk slot payload")?;
+            self.snapshot.read_exact_at(
+                location
+                    .slots_offset
+                    .checked_add(
+                        ordinal
+                            .checked_mul(location.stride)
+                            .ok_or(Error::InvalidMatrixChunk)?,
+                    )
+                    .ok_or(Error::InvalidMatrixChunk)?,
+                &mut payload,
+            )?;
+            note_chunk_bytes_read(location.stride);
+            payload
+        };
         self.verify_chunk_cell(location, ordinal, &payload)?;
         Ok(payload)
+    }
+
+    /// One cell out of a compressed slot region.
+    ///
+    /// The sub-block is arithmetic — `ordinal / cells_per_sub_block(stride)` —
+    /// so finding it costs two four-byte reads of the offset index and no
+    /// search. What it costs over a plain chunk is exactly one sub-block
+    /// decode, and that is the whole price of `with_chunk_compression`.
+    ///
+    /// The per-cell checksum still guards the result: it is computed over the
+    /// *uncompressed* cell bytes and stored plain, so a corrupted sub-block
+    /// decodes to something whose checksum does not match, and the caller sees
+    /// the mismatch rather than the bytes.
+    fn read_compressed_chunk_cell(
+        &self,
+        location: ChunkBlockLocation,
+        ordinal: u64,
+    ) -> Result<(Vec<u8>, Option<u32>)> {
+        let cell_crc = location.cell_crc;
+        let width = compressed_cell_width(location.stride, cell_crc);
+        let per = cells_per_sub_block(width);
+        let count = sub_block_count(location.cells, width);
+        let index = ordinal / per;
+        if index >= count {
+            return Err(Error::InvalidMatrixChunk);
+        }
+        let index_len = count
+            .checked_add(1)
+            .and_then(|entries| entries.checked_mul(MATRIX_CHUNK_SUB_BLOCK_OFFSET_LEN))
+            .ok_or(Error::InvalidMatrixChunk)?;
+        let entry_at = location
+            .slots_offset
+            .checked_add(
+                index
+                    .checked_mul(MATRIX_CHUNK_SUB_BLOCK_OFFSET_LEN)
+                    .ok_or(Error::InvalidMatrixChunk)?,
+            )
+            .ok_or(Error::InvalidMatrixChunk)?;
+        let mut pair = [0u8; 2 * MATRIX_CHUNK_SUB_BLOCK_OFFSET_LEN as usize];
+        self.snapshot.read_exact_at(entry_at, &mut pair)?;
+        note_chunk_bytes_read(2 * MATRIX_CHUNK_SUB_BLOCK_OFFSET_LEN);
+        let start = u64::from(u32::from_le_bytes(pair[..4].try_into().expect("slice")));
+        let end = u64::from(u32::from_le_bytes(pair[4..].try_into().expect("slice")));
+        if end < start {
+            return Err(Error::InvalidMatrixChunk);
+        }
+        let stored_len = end - start;
+        let data_at = location
+            .slots_offset
+            .checked_add(index_len)
+            .and_then(|base| base.checked_add(start))
+            .filter(|at| {
+                at.checked_add(stored_len)
+                    .is_some_and(|end| end <= location.slots_end)
+            })
+            .ok_or(Error::InvalidMatrixChunk)?;
+
+        // The uncompressed extent of this sub-block: a full one everywhere but
+        // possibly the last.
+        let cells_here = per.min(location.cells.saturating_sub(index * per));
+        let raw_len = cells_here
+            .checked_mul(width)
+            .ok_or(Error::InvalidMatrixChunk)?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::MaterializedBytes, raw_len)?;
+
+        let mut stored = try_zeroed_vec(stored_len, "matrix chunk sub-block")?;
+        self.snapshot.read_exact_at(data_at, &mut stored)?;
+        note_chunk_bytes_read(stored_len);
+
+        // Equal lengths mean the writer stored it raw, which it does whenever
+        // compressing did not shrink it. The writer never emits a compressed
+        // sub-block of exactly the uncompressed length, so this is unambiguous.
+        let raw = if stored_len == raw_len {
+            stored
+        } else {
+            let compression = self
+                .spec
+                .chunk_compression
+                .ok_or(Error::InvalidMatrixChunk)?;
+            let decoded = decompress_with_algorithm(compression.algorithm, &stored, raw_len)?;
+            if decoded.len() as u64 != raw_len {
+                return Err(Error::DecompressedLengthMismatch {
+                    expected: raw_len,
+                    actual: decoded.len() as u64,
+                });
+            }
+            decoded
+        };
+
+        let at = usize::try_from(
+            (ordinal % per)
+                .checked_mul(width)
+                .ok_or(Error::InvalidMatrixChunk)?,
+        )
+        .map_err(|_| Error::InvalidMatrixChunk)?;
+        let stride = usize::try_from(location.stride).map_err(|_| Error::InvalidMatrixChunk)?;
+        let payload = raw
+            .get(at..at + stride)
+            .map(<[u8]>::to_vec)
+            .ok_or(Error::InvalidMatrixChunk)?;
+        let stored = if cell_crc {
+            let bytes = raw
+                .get(at + stride..at + stride + 4)
+                .ok_or(Error::InvalidMatrixChunk)?;
+            Some(u32::from_le_bytes(bytes.try_into().expect("slice")))
+        } else {
+            None
+        };
+        Ok((payload, stored))
     }
 
     /// Checks one chunked cell against the checksum stored beside it.
@@ -14781,6 +15132,7 @@ mod tests {
             index: 1,
             first_row: 4,
             rows: 4,
+            compression: None,
             blocks: vec![OpenChunkBlock {
                 block_id: 900,
                 stride: 4,

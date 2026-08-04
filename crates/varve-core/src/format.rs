@@ -1712,6 +1712,8 @@ pub struct FormatSpec {
     pub matrix_aux: &'static [MatrixAuxDescriptor],
     /// The dimension that grows past its declared extent, if any.
     pub growing_matrix: Option<GrowingMatrixDimension>,
+    /// How a chunk's slot regions are compressed, if at all.
+    pub chunk_compression: Option<VariableCompression>,
     /// Per-block schema identity of the implementations backing
     /// [`FormatSpec::blocks`], as `(block_id, declared endian override,
     /// keyedness, generated schema fingerprint)` tuples (API2-01).
@@ -1769,6 +1771,7 @@ pub struct FormatSpecBuilder {
     matrix_blocks: &'static [MatrixBlockDescriptor],
     matrix_aux: &'static [MatrixAuxDescriptor],
     growing_matrix: Option<GrowingMatrixDimension>,
+    chunk_compression: Option<VariableCompression>,
     block_identities: &'static [(u32, Option<Endian>, bool, u64)],
     layout: LayoutSpec,
     read_limits: ReadLimits,
@@ -1823,6 +1826,7 @@ impl FormatSpec {
             matrix_blocks: &[],
             matrix_aux: &[],
             growing_matrix: None,
+            chunk_compression: None,
             block_identities: &[],
             layout: LayoutSpec::varve_native(),
             read_limits: ReadLimits::MISSING,
@@ -1934,6 +1938,33 @@ impl FormatSpec {
         growing: Option<GrowingMatrixDimension>,
     ) -> Self {
         self.growing_matrix = growing;
+        self
+    }
+
+    /// Compresses each matrix block's slot region inside a chunk record.
+    ///
+    /// A chunk is written whole, so an unfilled one costs its full size on
+    /// disk — measured identical at 5% and 100% filled. This is the knob for
+    /// that, and the only other one is `rows_per_chunk`.
+    ///
+    /// **What it costs is one sub-block decode per cell read** instead of a
+    /// `stride`-byte positional read. Only the *slot regions* are compressed:
+    /// the prefix, the descriptors, the commit maps and the checksum tables
+    /// stay plain, so addressing a cell, reading its commit bit and checking
+    /// its checksum all still cost what they cost.
+    ///
+    /// Inert when not declared: a format that does not call this writes
+    /// byte-identical chunks and hashes identically.
+    pub const fn with_chunk_compression(mut self, compression: VariableCompression) -> Self {
+        self.chunk_compression = Some(compression);
+        self
+    }
+
+    pub(crate) const fn with_optional_chunk_compression(
+        mut self,
+        compression: Option<VariableCompression>,
+    ) -> Self {
+        self.chunk_compression = compression;
         self
     }
 
@@ -2620,6 +2651,10 @@ impl FormatSpec {
             hash.write_str(growing.name);
             hash.write_bytes(&growing.rows_per_chunk.to_le_bytes());
         }
+        if let Some(compression) = self.chunk_compression {
+            hash.write_bytes(b"chunk-compression-v1");
+            hash.write_u8(compression_algorithm_hash_byte(compression.algorithm));
+        }
         if !self.layout.is_varve_native_default() {
             hash.write_bytes(b"layout-v1");
             hash_layout_spec(&mut hash, self.layout);
@@ -3147,6 +3182,11 @@ impl FormatSpec {
                 ));
             }
         }
+        if self.chunk_compression.is_some() && self.growing_matrix.is_none() {
+            return Err(Error::InvalidFormatSpec(
+                "chunk compression requires a growing matrix dimension",
+            ));
+        }
         if !self.matrix_aux.is_empty() && self.matrix_blocks.is_empty() {
             return Err(Error::InvalidFormatSpec(
                 "matrix aux requires at least one matrix block",
@@ -3669,6 +3709,7 @@ impl FormatSpecBuilder {
             matrix_blocks: &[],
             matrix_aux: &[],
             growing_matrix: None,
+            chunk_compression: None,
             block_identities: &[],
             layout: LayoutSpec::varve_native(),
             read_limits: ReadLimits::MISSING,
@@ -3777,6 +3818,11 @@ impl FormatSpecBuilder {
         self
     }
 
+    pub const fn chunk_compression(mut self, compression: VariableCompression) -> Self {
+        self.chunk_compression = Some(compression);
+        self
+    }
+
     pub const fn growing_matrix_dimension(
         mut self,
         name: &'static str,
@@ -3826,6 +3872,7 @@ impl FormatSpecBuilder {
         )
         .with_matrix_aux(self.matrix_aux)
         .with_optional_growing_matrix(self.growing_matrix)
+        .with_optional_chunk_compression(self.chunk_compression)
         .with_block_identities(self.block_identities)
         .with_layout(self.layout)
         .with_read_limits(self.read_limits);
