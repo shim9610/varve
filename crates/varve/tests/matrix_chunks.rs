@@ -824,6 +824,82 @@ fn a_truncated_file_loses_no_committed_cell_and_shows_no_half_chunk() -> varve::
 }
 
 // ---------------------------------------------------------------------------
+// The cost of a chunked read must not scale with the file
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "scalable-fault-injection")]
+#[test]
+fn a_chunked_read_does_not_pay_for_records_it_does_not_touch() -> varve::Result<()> {
+    use std::time::Instant;
+    use varve::VarveFile;
+
+    // The defect this pins: `find_chunk_record` filtered the whole resident
+    // index and collected it into a fresh `Vec` on **every** chunked cell read
+    // — `O(total records)` plus a heap allocation per read — behind a doc
+    // comment claiming `O(log chunks)` and "no state built at open". It is the
+    // same shape `CheckpointCadence`, `BlockTails` and `SegmentCursor` each
+    // exist to remove, in a file where all three are already written down.
+    //
+    // Measured as a ratio *and* as an absolute byte count, because a ratio
+    // alone is satisfied by any large constant — see
+    // `.internal-docs/index-residency-spec.md` §4.6.1.
+    fn build(path: &Path, chunks: u64) -> varve::Result<()> {
+        let mut writer = growing_spec().create_writer_with_dims(path, dims())?;
+        for chunk in 1..=chunks {
+            let cell = key(chunk * ROWS_PER_CHUNK, 0);
+            writer.write_matrix_cell(
+                cell,
+                &Sample {
+                    value: chunk as u32,
+                },
+            )?;
+            writer.commit_matrix_cell::<Sample>(cell)?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn one_read_cost(path: &Path, reads: u32) -> varve::Result<(u64, f64)> {
+        let reader = growing_spec().open_reader(path)?;
+        let cell = key(ROWS_PER_CHUNK, 0);
+        // Warm the directory so this measures the steady state, which is what
+        // a per-read walk would dominate.
+        reader.read_matrix_cell::<Sample>(cell)?;
+        let before = VarveFile::chunk_bytes_read();
+        let start = Instant::now();
+        for _ in 0..reads {
+            reader.read_matrix_cell::<Sample>(cell)?;
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        Ok((VarveFile::chunk_bytes_read() - before, elapsed))
+    }
+
+    let small = temp_path("cost_small");
+    let large = temp_path("cost_large");
+    build(small.path(), 8)?;
+    build(large.path(), 256)?;
+
+    let reads = 200u32;
+    let (small_bytes, _) = one_read_cost(small.path(), reads)?;
+    let (large_bytes, _) = one_read_cost(large.path(), reads)?;
+
+    // Absolute first: a steady-state read touches the prefix, the descriptors,
+    // one commit byte and one slot. Nothing per chunk, nothing per record.
+    let per_read = large_bytes / u64::from(reads);
+    assert!(
+        per_read < 256,
+        "a chunked read must not scale with the file: {per_read} bytes per read \
+         over {reads} reads on a 256-chunk file",
+    );
+    // And the 32x larger file must not cost more per read than the small one.
+    assert_eq!(
+        small_bytes, large_bytes,
+        "32x the chunks must cost the same per read",
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Hostile input: a chunk record's own extent is the wall
 // ---------------------------------------------------------------------------
 //
