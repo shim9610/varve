@@ -572,19 +572,48 @@ created. **A matrix cannot represent an indefinitely growing stream.**
   and their readers, for bounded-memory ingest and point lookup over data far
   larger than RAM. See [Scalable I/O](scalable-io.md).
 
-Over-provisioning the matrix at create time is possible, but three things bound
-how far:
+**Over-provisioning is the answer for a dimension whose extent you can bound,
+and it is close to free.** Declare the ceiling, not the expectation. The region
+is a hole: `create_layout` marks the file sparse, writes only the fixed-size
+descriptor tables, and establishes the commit map, slot region, bitmaps and
+checksum table with one `set_len`. Nothing scales with the declared cell count.
 
-- Create cost is bounded by live state rather than by declared cell count **only
-  on a filesystem that gives you holes** — see the precondition in §1.1. Where it
-  does not, `set_len` allocates the whole declared extent.
-- `max_matrix_cells` defaults to 16,000,000 and is checked per block *and*
-  aggregated across blocks (§1.5), so over-provisioning needs an explicit raise.
-- The allocation-map term in §1.1 and the scatter arithmetic in §1.3 both respond
-  to a larger declared extent.
+**Measured on this host, 2026-08-04**, ext4, `rustc 1.95` debug build. Each row
+creates the matrix, writes and commits one cell at the **far end** of the scan
+dimension, then reopens:
 
-**Planned.** No grow path is planned. Growth is what the stream/indexed family is
-for.
+| declared | cells | apparent size | **allocated on disk** | create | open |
+| --- | --- | --- | --- | --- | --- |
+| 1,000 x 128 | 128,000 | 1.06 MB | 28,672 B | 0.5 ms | 0.2 ms |
+| 10,000 x 128 | 1,280,000 | 10.6 MB | 24,576 B | 0.3 ms | 0.2 ms |
+| 1,000,000 x 128 | 128,000,000 | 1.06 GB | 36,864 B | 0.3 ms | 0.2 ms |
+| **100,000,000 x 128** | **12,800,000,000** | **105.6 GB** | **40,960 B** | **0.2 ms** | **0.2 ms** |
+
+A hundred million scans costs 40 KB and 0.2 ms more than a thousand does. So
+"the dimension is fixed at create" is a limit on *knowing a ceiling*, not a
+limit on size — pick a number you will not reach and the cost of being wrong by
+five orders of magnitude is four pages.
+
+Three things still bound it, and only the second is likely to stop you:
+
+- The table above is **ext4, with holes**. On a filesystem that does not give
+  you them, `set_len` allocates the whole declared extent — see the precondition
+  in §1.1. That turns row four from 40 KB into 105 GB.
+- `max_matrix_cells` defaults to **16,000,000**, checked per block *and*
+  aggregated across blocks (§1.5). Every row above the second needs an explicit
+  raise; the table was produced with the ceilings lifted. This is the gate you
+  will actually hit, and it refuses at create rather than costing anything.
+- The allocation-map term in §1.1 and the scatter arithmetic in §1.3 both
+  respond to a larger declared extent.
+
+**What over-provisioning still cannot do** is represent a stream with no ceiling
+at all. Some number has to be named. If there genuinely is not one, that is the
+append log's job, not the matrix's.
+
+**Planned.** No grow path is planned. A matrix cell's address is arithmetic —
+`slot_region_off + ordinal * stride` — with no indirection to update, and that is
+what makes it random-access; a growable dimension would need exactly the
+indirection layer the append log and its index already are.
 
 ---
 
