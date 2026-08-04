@@ -509,6 +509,321 @@ fn the_segment_chain_still_frames_commit_points_not_chunks() -> varve::Result<()
 }
 
 // ---------------------------------------------------------------------------
+// The API sweep: every matrix entry point, against a chunked row
+// ---------------------------------------------------------------------------
+//
+// Written after sweeping them by hand found that only four of thirteen had been
+// routed. The tests above all read through a *fresh reader after a flush*, so
+// none of them could see the largest defect: a writer could not read back a
+// cell it had just written and committed.
+
+#[test]
+fn a_writer_reads_back_what_it_just_wrote_into_the_open_chunk() -> varve::Result<()> {
+    // The open chunk is in memory, not on disk. Before this was routed,
+    // `read_matrix_cell` answered `MatrixNotCommitted` until the next seal —
+    // a write-then-read inconsistency that no test which flushes first can see.
+    let path = temp_path("open_chunk_readback");
+    let cell = key(ROWS_PER_CHUNK + 1, 2);
+    let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+    writer.write_matrix_cell(cell, &Sample { value: 5 })?;
+    writer.commit_matrix_cell::<Sample>(cell)?;
+
+    assert_eq!(
+        writer.read_matrix_cell::<Sample>(cell)?,
+        Sample { value: 5 },
+        "the writer must see its own committed cell before the seal",
+    );
+    assert_eq!(
+        writer.matrix_cell_payload::<Sample>(cell)?.len(),
+        Sample::SLOT_STRIDE as usize,
+    );
+    assert_eq!(
+        writer.matrix_cell_status::<Sample>(cell)?,
+        MatrixCellStatus::Committed,
+    );
+
+    // And the same three answers after the seal, from the same handle.
+    writer.flush()?;
+    assert_eq!(
+        writer.read_matrix_cell::<Sample>(cell)?,
+        Sample { value: 5 }
+    );
+    assert_eq!(
+        writer.matrix_cell_status::<Sample>(cell)?,
+        MatrixCellStatus::Committed,
+    );
+    Ok(())
+}
+
+#[test]
+fn an_uncommitted_write_to_the_open_chunk_reads_as_absent() -> varve::Result<()> {
+    let path = temp_path("open_chunk_uncommitted");
+    let cell = key(ROWS_PER_CHUNK, 0);
+    let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+    writer.write_matrix_cell(cell, &Sample { value: 5 })?;
+    // Written but not committed: the commit bit is the answer, in a chunk
+    // exactly as in the region.
+    assert_eq!(
+        writer.matrix_cell_status::<Sample>(cell)?,
+        MatrixCellStatus::NotCommitted,
+    );
+    assert!(matches!(
+        writer.read_matrix_cell::<Sample>(cell),
+        Err(Error::MatrixNotCommitted),
+    ));
+    Ok(())
+}
+
+#[test]
+fn the_payload_write_entry_point_routes_like_the_typed_one() -> varve::Result<()> {
+    let path = temp_path("payload_write");
+    let cell = key(ROWS_PER_CHUNK, 3);
+    // `write_matrix_cell_payload` lives on `VarveFile`, not on `VarveWriter` —
+    // `VarveWriter::copy_matrix_cell_bytes_from` reaches it, so an unrouted
+    // version would have shown up there as a bounds error on a valid key.
+    let mut writer = varve::VarveFile::create_with_dims(growing_spec(), path.path(), dims())?;
+    writer.write_matrix_cell_payload::<Sample>(cell, &7u32.to_le_bytes())?;
+    writer.commit_matrix_cell::<Sample>(cell)?;
+    writer.flush()?;
+    drop(writer);
+
+    let reader = growing_spec().open_reader(path.path())?;
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(cell)?,
+        Sample { value: 7 }
+    );
+    Ok(())
+}
+
+#[test]
+fn clearing_a_cell_in_the_open_chunk_works_and_in_a_sealed_one_is_refused() -> varve::Result<()> {
+    let path = temp_path("clear");
+    let sealed_cell = key(ROWS_PER_CHUNK, 0);
+    let open_cell = key(ROWS_PER_CHUNK * 2, 1);
+    let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+    writer.write_matrix_cell(sealed_cell, &Sample { value: 1 })?;
+    writer.commit_matrix_cell::<Sample>(sealed_cell)?;
+    writer.write_matrix_cell(open_cell, &Sample { value: 2 })?;
+    writer.commit_matrix_cell::<Sample>(open_cell)?;
+
+    writer.clear_matrix_cell::<Sample>(open_cell)?;
+    assert_eq!(
+        writer.matrix_cell_status::<Sample>(open_cell)?,
+        MatrixCellStatus::NotCommitted,
+    );
+    // A sealed chunk is a written record, and a record is not rewritten — the
+    // same refusal a late write gets, for the same reason.
+    assert!(matches!(
+        writer.clear_matrix_cell::<Sample>(sealed_cell),
+        Err(Error::MatrixChunkSealed { chunk: 1, .. }),
+    ));
+    assert!(matches!(
+        writer.clear_matrix_cell_by_category(Sample::CATEGORY, sealed_cell),
+        Err(Error::MatrixChunkSealed { chunk: 1, .. }),
+    ));
+    Ok(())
+}
+
+#[test]
+fn the_entry_points_that_do_not_apply_say_so_by_name() -> varve::Result<()> {
+    // Both of these used to answer with something misleading: the durable write
+    // raised `MatrixKeyOutOfBounds`, which says nothing about why, and the
+    // rebuild returned `Ok(0)` — indistinguishable from "the commit map was
+    // already correct" on a file whose cells it never looked at.
+    let path = temp_path("not_applicable");
+    let cell = key(ROWS_PER_CHUNK, 0);
+    let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+    assert!(matches!(
+        writer.write_matrix_cell_durable(cell, &Sample { value: 1 }, |_| Ok(())),
+        Err(Error::InvalidFormatSpec(message))
+            if message.contains("does not apply to a chunked row"),
+    ));
+    assert!(matches!(
+        writer.rebuild_matrix_commit_from_crc::<Sample>(),
+        Err(Error::InvalidFormatSpec(message))
+            if message.contains("matrix region only"),
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_reopened_writer_appends_to_a_later_chunk_and_still_refuses_the_sealed_one() -> varve::Result<()>
+{
+    let path = temp_path("reopen_append");
+    let first = key(ROWS_PER_CHUNK, 0);
+    let later = key(ROWS_PER_CHUNK * 3, 0);
+    {
+        let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+        writer.write_matrix_cell(first, &Sample { value: 5 })?;
+        writer.commit_matrix_cell::<Sample>(first)?;
+        writer.flush()?;
+    }
+    let mut writer = growing_spec().open_writer(path.path())?;
+    // The sealed write comes **first**, while no chunk is open. Ordered the
+    // other way this test proved nothing: opening chunk 3 first makes the
+    // refusal come from the in-memory `open_chunk.index > index` branch, so a
+    // build that forgot the watermark across a reopen still passed. Only the
+    // crash sweep caught that, which is why the order here is deliberate.
+    assert!(matches!(
+        writer.write_matrix_cell(first, &Sample { value: 1 }),
+        Err(Error::MatrixChunkSealed { chunk: 1, open: 1 }),
+    ));
+    writer.write_matrix_cell(later, &Sample { value: 9 })?;
+    writer.commit_matrix_cell::<Sample>(later)?;
+    assert!(matches!(
+        writer.write_matrix_cell(first, &Sample { value: 1 }),
+        Err(Error::MatrixChunkSealed { chunk: 1, open: 3 }),
+    ));
+    writer.flush()?;
+    drop(writer);
+
+    let reader = growing_spec().open_reader(path.path())?;
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(first)?,
+        Sample { value: 5 }
+    );
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(later)?,
+        Sample { value: 9 }
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// §6.5 Crash sweep
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_truncated_file_loses_no_committed_cell_and_shows_no_half_chunk() -> varve::Result<()> {
+    // Cut the file at every 64th offset. At each cut: a read-only open must
+    // never show a cell it cannot fully back, and a writer reopen — which
+    // truncates the uncommitted tail — must then read back exactly the chunks
+    // that survived, and must still refuse to reopen one of them.
+    // Transaction markers, because without them there is no commit point to cut
+    // back to and a writer reopen answers `CorruptTail` instead of truncating —
+    // 144 of 150 cuts, measuring the commit policy rather than the chunk code.
+    // The guard at the end of this test caught two versions of that mistake:
+    // sweeping from byte 64 (3 of 70 cuts opened, most landing in the matrix
+    // region) and sweeping under `CommitPolicy::None`.
+    let spec = growing_spec()
+        .with_commit_policy(varve::CommitPolicy::TransactionMarker(
+            varve::TransactionMarkerMode::OnFlush,
+        ))
+        .with_recovery_policy(varve::RecoveryPolicy::TruncateTail);
+    let path = temp_path("crash_sweep_source");
+    let chunks = 6u64;
+    {
+        let mut writer = spec.create_writer_with_dims(path.path(), dims())?;
+        for chunk in 1..=chunks {
+            let cell = key(chunk * ROWS_PER_CHUNK, 0);
+            writer.write_matrix_cell(
+                cell,
+                &Sample {
+                    value: chunk as u32,
+                },
+            )?;
+            writer.commit_matrix_cell::<Sample>(cell)?;
+            // A commit point per chunk, so a cut has something to fall back to
+            // rather than destroying the only one.
+            writer.flush()?;
+        }
+    }
+    let source = std::fs::read(path.path())?;
+
+    // Sweep the append log, not the whole file. A cut inside the matrix region
+    // truncates the header's own structures, so the file does not open at all
+    // and the cut proves nothing — the first version of this swept from byte 64
+    // and opened 3 files out of ~70, which the guard at the end caught.
+    let append_start = {
+        let reader = spec.open_readonly(path.path())?;
+        let first = reader
+            .index_entries()
+            .first()
+            .expect("the file holds records")
+            .record_offset;
+        usize::try_from(first).expect("offset")
+    };
+
+    let mut opened = 0usize;
+    for cut in (append_start..source.len()).step_by(16) {
+        let cut_path = temp_path("crash_sweep_cut");
+        std::fs::write(cut_path.path(), &source[..cut])?;
+
+        // Read-only: whatever it shows must be internally consistent. A cell it
+        // reports as committed must decode. This half opens only when the cut
+        // lands on a record boundary — a read-only handle never truncates — so
+        // it is not what the guard below counts.
+        if let Ok(reader) = spec.open_readonly(cut_path.path()) {
+            for chunk in 1..=chunks {
+                let cell = key(chunk * ROWS_PER_CHUNK, 0);
+                if reader.matrix_cell_status::<Sample>(cell)? == MatrixCellStatus::Committed {
+                    assert_eq!(
+                        reader.read_matrix_cell::<Sample>(cell)?,
+                        Sample {
+                            value: chunk as u32
+                        },
+                        "cut {cut}: chunk {chunk} reported committed but did not read back",
+                    );
+                }
+            }
+            drop(reader);
+        }
+
+        // Writer reopen truncates the uncommitted tail. What it then reports
+        // must survive a further append and another reopen.
+        let Ok(mut writer) = spec.open_writer(cut_path.path()) else {
+            continue;
+        };
+        opened += 1;
+        let mut survived = Vec::new();
+        for chunk in 1..=chunks {
+            let cell = key(chunk * ROWS_PER_CHUNK, 0);
+            if writer.matrix_cell_status::<Sample>(cell)? == MatrixCellStatus::Committed {
+                survived.push(chunk);
+            }
+        }
+        // A surviving chunk is sealed: reopening it must be refused, not
+        // silently duplicated.
+        if let Some(newest) = survived.last() {
+            assert!(
+                matches!(
+                    writer.write_matrix_cell(key(newest * ROWS_PER_CHUNK, 1), &Sample { value: 0 }),
+                    Err(Error::MatrixChunkSealed { .. }),
+                ),
+                "cut {cut}: chunk {newest} survived but was reopenable",
+            );
+        }
+        let fresh = key((chunks + 4) * ROWS_PER_CHUNK, 0);
+        writer.write_matrix_cell(fresh, &Sample { value: 99 })?;
+        writer.commit_matrix_cell::<Sample>(fresh)?;
+        writer.flush()?;
+        drop(writer);
+
+        let reader = spec.open_readonly(cut_path.path())?;
+        for chunk in &survived {
+            assert_eq!(
+                reader.read_matrix_cell::<Sample>(key(chunk * ROWS_PER_CHUNK, 0))?,
+                Sample {
+                    value: *chunk as u32
+                },
+                "cut {cut}: chunk {chunk} survived the reopen but not the append",
+            );
+        }
+        assert_eq!(
+            reader.read_matrix_cell::<Sample>(fresh)?,
+            Sample { value: 99 }
+        );
+    }
+    let cuts = (source.len() - append_start).div_ceil(16);
+    assert!(
+        opened * 2 > cuts,
+        "the writer reopen must succeed on most cuts, not skip them: \
+         {opened} of {cuts}",
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 
 struct TempPath {
     path: PathBuf,
