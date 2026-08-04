@@ -634,7 +634,10 @@ exactly as before and is not mirrored in memory, so `104 * records` counts only
 the blocks you kept. It requires `block_offset_chain`, and it gives up
 `blocks::<T>()` (a typed `Error::BlockNotResident`, not an empty collection),
 replacement, and whole-generation rewrite for the whole format. Reach the block
-through `VarveFile::block_tail_offset(block_id)` and the footer chain.
+through `VarveFile::block_chain(block_id)`, which walks its records newest-first
+by positional reads, and `read_block_at::<T>(offset)`, which decodes one. Both
+take `&self` and materialise one entry at a time, so the walk costs the working
+set rather than the record count.
 
 It is opt-in, off by default, and a file written with it off is byte-identical
 to one written before the option existed. Enabling it costs:
