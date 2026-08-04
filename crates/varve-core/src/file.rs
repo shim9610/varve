@@ -5225,16 +5225,16 @@ impl VarveFile {
         if let Some(sealed) = self.sealed_chunk_through {
             return Ok(Some(sealed));
         }
-        let Some(newest) = self
+        let Some((newest, payload_len)) = self
             .index
             .iter()
             .rev()
             .find(|entry| entry.block_id == MATRIX_CHUNK_BLOCK_ID)
-            .map(|entry| entry.record_offset)
+            .map(|entry| (entry.record_offset, entry.payload_len))
         else {
             return Ok(None);
         };
-        let (index, _, _, _) = self.read_chunk_prefix(newest)?;
+        let (index, _, _, _) = self.read_chunk_prefix(newest, payload_len)?;
         self.sealed_chunk_through = Some(index);
         Ok(Some(index))
     }
@@ -5561,16 +5561,22 @@ impl VarveFile {
         })
     }
 
-    /// The record offsets of every sealed chunk, oldest first.
+    /// Every sealed chunk as `(record offset, payload length)`, oldest first.
     ///
     /// Chunks are written in increasing index order — only the newest is open —
     /// so this list is sorted by chunk index, which is what makes the binary
     /// search below legal.
-    fn chunk_record_offsets(&self) -> Vec<u64> {
+    ///
+    /// **`payload_len` is the point, not a convenience.** Every offset the chunk
+    /// decode computes comes from bytes in the file, and without the record's
+    /// own extent to bound them a crafted chunk reads whatever it names. The
+    /// framing already established this length and already charged it against
+    /// `RecordPayloadLen`; the decode below treats it as the wall.
+    fn chunk_record_offsets(&self) -> Vec<(u64, u64)> {
         self.index
             .iter()
             .filter(|entry| entry.block_id == MATRIX_CHUNK_BLOCK_ID)
-            .map(|entry| entry.record_offset)
+            .map(|entry| (entry.record_offset, entry.payload_len))
             .collect()
     }
 
@@ -5578,7 +5584,14 @@ impl VarveFile {
     ///
     /// `MATRIX_CHUNK_PREFIX_LEN` bytes whatever the chunk holds. This is the
     /// read that keeps a cell lookup off the chunk's own size.
-    fn read_chunk_prefix(&self, record_offset: u64) -> Result<(u64, u64, u64, u32)> {
+    fn read_chunk_prefix(
+        &self,
+        record_offset: u64,
+        payload_len: u64,
+    ) -> Result<(u64, u64, u64, u32)> {
+        if payload_len < MATRIX_CHUNK_PREFIX_LEN {
+            return Err(Error::InvalidMatrixChunk);
+        }
         let payload_offset = record_offset
             .checked_add(RECORD_HEADER_LEN)
             .ok_or(Error::InvalidMatrixChunk)?;
@@ -5595,20 +5608,33 @@ impl VarveFile {
         let first_row = u64::from_le_bytes(prefix[16..24].try_into().expect("slice"));
         let rows = u64::from_le_bytes(prefix[24..32].try_into().expect("slice"));
         let block_count = u32::from_le_bytes(prefix[32..36].try_into().expect("slice"));
+        // The descriptor table has to fit in this record. Without this the field
+        // is a bare `u32` from disk: `0xFFFF_FFFF` asked for a 137,438,953,440
+        // byte reservation out of a 1 KB file, which `try_reserve` refused on
+        // this host and a host with overcommit would have accepted and then
+        // faulted in. No `ReadLimits` ceiling was charged, including under
+        // `STANDARD`, which is the setting for untrusted input.
+        let descriptors_len = MATRIX_CHUNK_BLOCK_DESC_LEN
+            .checked_mul(u64::from(block_count))
+            .ok_or(Error::InvalidMatrixChunk)?;
+        if descriptors_len > payload_len - MATRIX_CHUNK_PREFIX_LEN {
+            return Err(Error::InvalidMatrixChunk);
+        }
         Ok((index, first_row, rows, block_count))
     }
 
     /// Finds the sealed chunk with this index, by binary search over the chunk
     /// records — `O(log chunks)` prefix reads, and no state built at open.
-    fn find_chunk_record(&self, chunk_index: u64) -> Result<Option<u64>> {
+    fn find_chunk_record(&self, chunk_index: u64) -> Result<Option<(u64, u64)>> {
         let offsets = self.chunk_record_offsets();
         let mut low = 0usize;
         let mut high = offsets.len();
         while low < high {
             let mid = low + (high - low) / 2;
-            let (index, _, _, _) = self.read_chunk_prefix(offsets[mid])?;
+            let (offset, payload_len) = offsets[mid];
+            let (index, _, _, _) = self.read_chunk_prefix(offset, payload_len)?;
             match index.cmp(&chunk_index) {
-                std::cmp::Ordering::Equal => return Ok(Some(offsets[mid])),
+                std::cmp::Ordering::Equal => return Ok(Some((offset, payload_len))),
                 std::cmp::Ordering::Less => low = mid + 1,
                 std::cmp::Ordering::Greater => high = mid,
             }
@@ -5617,17 +5643,33 @@ impl VarveFile {
     }
 
     /// Where one block's commit map and slot region sit inside a chunk record.
+    ///
+    /// **Every offset here is derived from bytes in the file, so every one of
+    /// them is bounded by `payload_len` — the record's own extent, which the
+    /// framing established and already charged.** Without that wall a crafted
+    /// `commit_len` moved a block's slot region onto a *neighbouring record* and
+    /// a cell read returned that record's bytes decoded as a value: no error, no
+    /// refusal, and `IntegrityPolicy::Crc32` did not catch it, because a
+    /// positional cell read never verifies a footer under the default
+    /// `IntegrityVerification::OnDemand`.
     fn chunk_block_location(
         &self,
         record_offset: u64,
+        payload_len: u64,
         block_count: u32,
         block_id: u32,
     ) -> Result<Option<ChunkBlockLocation>> {
         let payload_offset = record_offset
             .checked_add(RECORD_HEADER_LEN)
             .ok_or(Error::InvalidMatrixChunk)?;
+        let payload_end = payload_offset
+            .checked_add(payload_len)
+            .ok_or(Error::InvalidMatrixChunk)?;
+        // `read_chunk_prefix` already proved this fits; recomputed rather than
+        // threaded so the bound and its use cannot drift apart.
         let descriptors_len = MATRIX_CHUNK_BLOCK_DESC_LEN
             .checked_mul(u64::from(block_count))
+            .filter(|len| *len <= payload_len - MATRIX_CHUNK_PREFIX_LEN)
             .ok_or(Error::InvalidMatrixChunk)?;
         let descriptors_len_usize =
             usize::try_from(descriptors_len).map_err(|_| Error::InvalidMatrixChunk)?;
@@ -5653,11 +5695,23 @@ impl VarveFile {
                 u64::from_le_bytes(descriptors[base + 16..base + 24].try_into().expect("slice"));
             let commit_len =
                 u64::from_le_bytes(descriptors[base + 24..base + 32].try_into().expect("slice"));
+            // The commit map, then the slots, then the next block — each must
+            // land at or before the end of this record's payload.
             let slots_offset = cursor
                 .checked_add(commit_len)
+                .filter(|offset| *offset <= payload_end)
                 .ok_or(Error::InvalidMatrixChunk)?;
             let slots_len = cells.checked_mul(stride).ok_or(Error::InvalidMatrixChunk)?;
+            let next = slots_offset
+                .checked_add(slots_len)
+                .filter(|offset| *offset <= payload_end)
+                .ok_or(Error::InvalidMatrixChunk)?;
             if id == block_id {
+                // The commit map must cover the cells it claims, or the bit read
+                // for a high ordinal lands in the slot region.
+                if commit_len < cells.div_ceil(8) {
+                    return Err(Error::InvalidMatrixChunk);
+                }
                 found = Some(ChunkBlockLocation {
                     commit_offset: cursor,
                     slots_offset,
@@ -5665,9 +5719,7 @@ impl VarveFile {
                     cells,
                 });
             }
-            cursor = slots_offset
-                .checked_add(slots_len)
-                .ok_or(Error::InvalidMatrixChunk)?;
+            cursor = next;
         }
         Ok(found)
     }
@@ -5683,11 +5735,13 @@ impl VarveFile {
         chunk_index: u64,
         local_row: u64,
     ) -> Result<Option<(ChunkBlockLocation, u64)>> {
-        let Some(record_offset) = self.find_chunk_record(chunk_index)? else {
+        let Some((record_offset, payload_len)) = self.find_chunk_record(chunk_index)? else {
             return Ok(None);
         };
-        let (_, _, _, block_count) = self.read_chunk_prefix(record_offset)?;
-        let Some(location) = self.chunk_block_location(record_offset, block_count, T::ID)? else {
+        let (_, _, _, block_count) = self.read_chunk_prefix(record_offset, payload_len)?;
+        let Some(location) =
+            self.chunk_block_location(record_offset, payload_len, block_count, T::ID)?
+        else {
             return Err(Error::MatrixBlockMissing(T::ID));
         };
         let width = location

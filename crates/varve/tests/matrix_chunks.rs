@@ -824,6 +824,143 @@ fn a_truncated_file_loses_no_committed_cell_and_shows_no_half_chunk() -> varve::
 }
 
 // ---------------------------------------------------------------------------
+// Hostile input: a chunk record's own extent is the wall
+// ---------------------------------------------------------------------------
+//
+// Every offset the chunk decode computes comes from bytes in the file. Both
+// defects below were found by an adversarial review of this feature and both
+// reproduced under `IntegrityPolicy::Crc32` — a positional cell read never
+// verifies a record footer under the default `IntegrityVerification::OnDemand`,
+// so the checksum is not the guard here. The record's `payload_len`, which the
+// framing established and already charged, is.
+
+/// Overwrites `count` bytes at the byte offset `at` inside the file.
+fn patch(path: &Path, at: usize, bytes: &[u8]) -> varve::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    file.seek(SeekFrom::Start(at as u64))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Byte offset of the first `VMCK` chunk payload in the file.
+fn first_chunk_payload(path: &Path) -> varve::Result<(Vec<u8>, usize)> {
+    let bytes = std::fs::read(path)?;
+    let at = bytes
+        .windows(4)
+        .position(|window| window == b"VMCK")
+        .expect("the file holds a chunk record");
+    Ok((bytes, at))
+}
+
+fn two_chunk_file(path: &Path) -> varve::Result<()> {
+    let mut writer = growing_spec().create_writer_with_dims(path, dims())?;
+    writer.write_matrix_cell(key(ROWS_PER_CHUNK, 0), &Sample { value: 5 })?;
+    writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0))?;
+    writer.write_matrix_cell(key(ROWS_PER_CHUNK * 2, 0), &Sample { value: 6 })?;
+    writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK * 2, 0))?;
+    writer.flush()?;
+    Ok(())
+}
+
+#[test]
+fn a_crafted_block_count_cannot_make_the_reader_allocate() -> varve::Result<()> {
+    // `block_count` is a `u32` at payload+32. Unbounded, `0xFFFF_FFFF` asked for
+    // a **137,438,953,440-byte** reservation out of a 1 KB file — `try_reserve`
+    // refused it on this host, and a host with overcommit would have accepted
+    // it and then faulted the pages in. Nothing charged a `ReadLimits` ceiling,
+    // including under `STANDARD`, which is the setting for untrusted input.
+    let path = temp_path("hostile_block_count");
+    two_chunk_file(path.path())?;
+    let (_, at) = first_chunk_payload(path.path())?;
+    patch(path.path(), at + 32, &u32::MAX.to_le_bytes())?;
+
+    let reader = growing_spec().open_reader(path.path())?;
+    assert!(matches!(
+        reader.read_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0)),
+        Err(Error::InvalidMatrixChunk),
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_crafted_commit_length_cannot_read_outside_the_record() -> varve::Result<()> {
+    // `commit_len` is the last field of block descriptor 0, at payload+40+24.
+    // Growing it moves that block's slot region forward while leaving the
+    // commit map — and so the commit bit — where it was. Unbounded, the read
+    // returned a *neighbouring record's* bytes decoded as a cell value: the
+    // cell holding 5 answered `Sample { value: 1 }`, with no error at all.
+    let path = temp_path("hostile_commit_len");
+    two_chunk_file(path.path())?;
+    let (bytes, at) = first_chunk_payload(path.path())?;
+    let commit_len_at = at + 40 + 24;
+    let real = u64::from_le_bytes(
+        bytes[commit_len_at..commit_len_at + 8]
+            .try_into()
+            .expect("slice"),
+    );
+    patch(path.path(), commit_len_at, &(real + 232).to_le_bytes())?;
+
+    let reader = growing_spec().open_reader(path.path())?;
+    assert!(matches!(
+        reader.read_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0)),
+        Err(Error::InvalidMatrixChunk),
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_crafted_cell_count_cannot_outrun_its_commit_map() -> varve::Result<()> {
+    // `cells` at payload+40+16. Grown, the ordinal bound widens while the
+    // commit map does not, so a high ordinal's commit bit is read out of the
+    // slot region — a value byte answering a "was this committed" question.
+    let path = temp_path("hostile_cells");
+    two_chunk_file(path.path())?;
+    let (_, at) = first_chunk_payload(path.path())?;
+    patch(path.path(), at + 40 + 16, &1_000_000u64.to_le_bytes())?;
+
+    let reader = growing_spec().open_reader(path.path())?;
+    assert!(matches!(
+        reader.read_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0)),
+        Err(Error::InvalidMatrixChunk),
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_truncated_chunk_payload_is_refused() -> varve::Result<()> {
+    // The extent itself, made too small to hold even the prefix.
+    let path = temp_path("hostile_short_payload");
+    two_chunk_file(path.path())?;
+    let (bytes, at) = first_chunk_payload(path.path())?;
+    // Header layout (native_layout.rs:88): block_id u32, block_version u16,
+    // flags u16, sequence u64, payload_len u64 — so payload_len is at +16.
+    let header_at = at - 32;
+    let real = u64::from_le_bytes(
+        bytes[header_at + 16..header_at + 24]
+            .try_into()
+            .expect("slice"),
+    );
+    assert!(real > 0, "the chunk record has a payload");
+    patch(path.path(), header_at + 16, &8u64.to_le_bytes())?;
+
+    // Open may refuse outright (the framing no longer adds up) or may open and
+    // refuse the read. Either is acceptable; returning a value is not.
+    if let Ok(reader) = growing_spec().open_reader(path.path()) {
+        assert!(
+            reader
+                .read_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0))
+                .is_err(),
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 
 struct TempPath {
     path: PathBuf,
