@@ -496,6 +496,12 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
 - `replace_block` re-encodes every segment payload against the published
   generation's offsets. In-place replacement is refused, because nothing rewrites
   the segment describing the record it restamps.
+- **The append-log start above is the file's, not the header's.** In a matrix
+  file the matrix region sits between the header and the append log, so both the
+  coverage a writer records and the boundary the walk demands the oldest link
+  reach are `MatrixLayout::append_log_start()`. A matrix format may declare
+  `segment_on_flush` and gets the same chain; measured on a 4x4 matrix with 128
+  append-log records over 8 commit points, open framed 8 records.
 
 ### Checkpoint Index
 

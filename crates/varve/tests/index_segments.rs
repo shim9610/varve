@@ -16,8 +16,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use varve::{
-    COMMIT_BLOCK_ID, FormatSpec, IndexPolicy, RecordIndexEntry, SEGMENT_BLOCK_ID, VarveBlock,
-    VarveFile, varve_format,
+    BlockDescriptor, BlockKind, COMMIT_BLOCK_ID, CommitPolicy, Endian, FormatSpec, IndexPolicy,
+    IntegrityPolicy, MatrixBlockDescriptor, MatrixCommitDescriptor, MatrixCommitKind,
+    MatrixDimensionDescriptor, MatrixDimensions, MatrixKey, RecordIndexEntry, SEGMENT_BLOCK_ID,
+    TransactionMarkerMode, VarveBlock, VarveFile, VarveMatrixBlock, varve_format,
 };
 
 #[derive(Clone, Debug, PartialEq, VarveBlock)]
@@ -605,6 +607,218 @@ fn a_recovery_open_still_scans() -> varve::Result<()> {
     let expected = scanned_shape(&path)?;
     let recovered = segment_spec().open_recover(&path)?;
     assert_eq!(entry_shape(recovered.index_entries()), expected);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// A matrix file: the append log does not start at the header
+// ---------------------------------------------------------------------------
+//
+// Every other test here writes a file whose append log begins immediately after
+// the file header. A matrix file does not: the matrix region — commit map,
+// bitmaps, slot region — sits between them, and the append log starts at
+// `MatrixLayout::append_log_start()`.
+//
+// That offset is load-bearing on both sides of the chain and in a way that is
+// invisible if it is only ever `header_len`. The writer resolves the first
+// segment's `covered_start` from it, and the walk demands that the oldest link
+// reach it exactly — `expected_end != append_start` refuses the chain. So a
+// mismatch does not corrupt anything and does not raise anything: the walk
+// fails, `load_index_from_segments` answers `Ok(None)`, and open falls back to
+// the full scan. A matrix file would silently never take the chain, and the
+// only symptom would be the speed.
+//
+// Every existing matrix test declares `IndexPolicy::ScanOnOpen`, so nothing
+// crossed these two features before this test.
+
+#[derive(Clone, Debug, PartialEq, Eq, VarveBlock)]
+#[varve(id = 61, version = 1, kind = "matrix")]
+struct Cell {
+    value: u32,
+}
+
+impl VarveMatrixBlock for Cell {
+    const DIMENSIONS: [&'static str; 2] = ["scan", "ch"];
+    const CATEGORY: &'static str = "analysis";
+    const SLOT_STRIDE: u64 = 4;
+}
+
+/// A matrix format that also carries the append-log block, with the chain on.
+///
+/// There is no DSL for this pairing — `with_matrix_spec` is a `FormatSpec`
+/// builder and so is `with_segment_on_flush` — so it is spelled out here.
+fn matrix_segment_spec() -> FormatSpec {
+    static BLOCKS: &[BlockDescriptor] = &[
+        BlockDescriptor {
+            id: Cell::ID,
+            name: "Cell",
+            version: Cell::VERSION,
+            kind: BlockKind::Matrix,
+            fields: &[],
+        },
+        BlockDescriptor {
+            id: Line::ID,
+            name: "Line",
+            version: Line::VERSION,
+            kind: BlockKind::Fixed,
+            fields: Line::FIELDS,
+        },
+    ];
+    static DIMS: &[MatrixDimensionDescriptor] = &[
+        MatrixDimensionDescriptor { name: "scan" },
+        MatrixDimensionDescriptor { name: "ch" },
+    ];
+    static COMMITS: &[MatrixCommitDescriptor] = &[MatrixCommitDescriptor {
+        name: Cell::CATEGORY,
+        kind: MatrixCommitKind::Cell,
+    }];
+    static MATRIX_BLOCKS: &[MatrixBlockDescriptor] = &[MatrixBlockDescriptor {
+        block_id: Cell::ID,
+        dimensions: Cell::DIMENSIONS,
+        category: Cell::CATEGORY,
+        slot_stride: Cell::SLOT_STRIDE,
+    }];
+    FormatSpec::new(
+        b"SEGMTX00",
+        1,
+        Endian::Little,
+        0,
+        IndexPolicy::new(true, false, true, false).with_segment_on_flush(true),
+        IntegrityPolicy::Crc32,
+        varve::RecoveryPolicy::Strict,
+        varve::ManifestPolicy::None,
+        BLOCKS,
+    )
+    .with_commit_policy(CommitPolicy::TransactionMarker(
+        TransactionMarkerMode::OnFlush,
+    ))
+    // Borrowed from `SegmentFormat`, which declares every matrix ceiling; the
+    // dimensions below are 4x4, so the region they size is a few pages.
+    .with_read_limits(SegmentFormat::spec().read_limits)
+    .with_matrix_spec(DIMS, COMMITS, MATRIX_BLOCKS)
+}
+
+fn matrix_dims() -> MatrixDimensions {
+    MatrixDimensions::from_pairs([("scan", 4), ("ch", 4)])
+}
+
+/// Writes a matrix file with one committed cell and `lines` append-log records,
+/// flushing every `per_flush`.
+fn write_matrix_lines(
+    spec: FormatSpec,
+    path: &Path,
+    lines: u32,
+    per_flush: u32,
+) -> varve::Result<()> {
+    let mut writer = spec.create_writer_with_dims(path, matrix_dims())?;
+    writer.write_matrix_cell(MatrixKey::new(1, 1), &Cell { value: 7 })?;
+    writer.commit_matrix_cell::<Cell>(MatrixKey::new(1, 1))?;
+    for value in 0..lines {
+        writer.push(&Line { value })?;
+        if (value + 1) % per_flush == 0 {
+            writer.flush()?;
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+#[test]
+fn a_matrix_file_puts_the_append_log_after_the_matrix_region() -> varve::Result<()> {
+    // The premise of the two tests below. If this ever stops holding, they stop
+    // discriminating and say so here rather than passing quietly.
+    let path = temp_path("matrix_region_is_between");
+    write_matrix_lines(matrix_segment_spec(), &path, 16, 8)?;
+    let reader = matrix_segment_spec().open_reader(&path)?;
+    let first = reader
+        .index_entries()
+        .first()
+        .expect("the file holds records")
+        .record_offset;
+
+    let plain = temp_path("matrix_region_is_between_plain");
+    write_lines(segment_spec(), &plain, 16, 8)?;
+    let plain_first = segment_spec()
+        .open_readonly(&plain)?
+        .index_entries()
+        .first()
+        .expect("the file holds records")
+        .record_offset;
+
+    assert!(
+        first > plain_first,
+        "a matrix file's first record must sit past the matrix region: \
+         {first} vs {plain_first} without one",
+    );
+    Ok(())
+}
+
+#[test]
+fn a_matrix_file_builds_and_walks_a_segment_chain() -> varve::Result<()> {
+    let path = temp_path("matrix_chain");
+    write_matrix_lines(matrix_segment_spec(), &path, 32, 8)?;
+
+    let reader = matrix_segment_spec().open_reader(&path)?;
+    let entries = reader.index_entries();
+    let segments: Vec<&RecordIndexEntry> = entries
+        .iter()
+        .filter(|entry| entry.block_id == SEGMENT_BLOCK_ID)
+        .collect();
+    assert_eq!(segments.len(), 4, "one segment record per commit point");
+    assert_eq!(
+        entries.last().map(|entry| entry.block_id),
+        Some(SEGMENT_BLOCK_ID),
+        "the segment record must be the last record in the file",
+    );
+
+    // The chain the writer built must describe the same file the scan reads.
+    // `AtOpen` verification is one of the two cases that must take the scan, so
+    // this indexes the same bytes through the other path.
+    let scanned_spec = matrix_segment_spec().with_read_limits(
+        matrix_segment_spec()
+            .read_limits
+            .with_integrity_verification(varve::IntegrityVerification::AtOpen),
+    );
+    assert_eq!(
+        entry_shape(entries),
+        entry_shape(scanned_spec.open_reader(&path)?.index_entries()),
+    );
+    Ok(())
+}
+
+#[cfg(feature = "scalable-fault-injection")]
+#[test]
+fn a_matrix_file_open_frames_commit_points_not_records() -> varve::Result<()> {
+    // The one that discriminates. The assertion above would still hold if the
+    // chain were refused, because the fallback scan produces the identical
+    // index — that is the whole point of the fallback. This counts framed
+    // records instead: taking the chain frames one per commit point, and
+    // falling back to the scan frames every data record in the file.
+    let lines = 128u32;
+    let per_flush = 16u32;
+    let path = temp_path("matrix_frames");
+    write_matrix_lines(matrix_segment_spec(), &path, lines, per_flush)?;
+
+    let before = VarveFile::records_framed();
+    let indexed = matrix_segment_spec()
+        .open_reader(&path)?
+        .index_entries()
+        .len();
+    let framed = VarveFile::records_framed() - before;
+
+    let commit_points = u64::from(lines / per_flush);
+    assert_eq!(
+        framed, commit_points,
+        "a matrix file must take the chain, not fall back to the scan: \
+         {framed} records framed for {commit_points} commit points",
+    );
+    // And it must not have got there by indexing less: the data records, the
+    // commit markers and the segment records.
+    assert_eq!(
+        indexed,
+        lines as usize + 2 * commit_points as usize,
+        "the chain must still account for every record",
+    );
     Ok(())
 }
 
