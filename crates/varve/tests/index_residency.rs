@@ -184,38 +184,106 @@ fn a_reopen_does_not_reissue_a_non_resident_sequence() -> varve::Result<()> {
     Ok(())
 }
 
-// §5.3, second half, and H2. The chain is the only way back, so its entry point
-// must survive a reopen for a block the resident index cannot see.
+// H2. The capability H1 trades for: a non-resident block read through the
+// public API alone, with no second handle and no retaining spec. `block_chain`
+// walks the footer chain newest-first by positional reads, and `read_block_at`
+// turns an offset into a value. Nothing enters the resident index.
+#[test]
+fn a_non_resident_block_is_readable_through_the_chain_alone() -> varve::Result<()> {
+    let lines = 40u32;
+    let path = temp_path("chain_read");
+    write(lean_spec(), &path, lines, 8)?;
+
+    let file = lean_spec().open_readonly(&path)?;
+    let resident_before = file.index_entries().len();
+
+    let mut read_back = Vec::new();
+    for step in file.block_chain(70)? {
+        let entry = step?;
+        read_back.push(file.read_block_at::<Line>(entry.record_offset)?);
+    }
+    read_back.reverse();
+    assert_eq!(
+        read_back,
+        (0..lines).map(|value| Line { value }).collect::<Vec<_>>(),
+        "the chain must yield every line, newest first",
+    );
+    // Walking must not grow the resident index — that is the whole point.
+    assert_eq!(file.index_entries().len(), resident_before);
+    Ok(())
+}
+
+#[test]
+fn the_chain_refuses_a_format_without_the_footer_chain() -> varve::Result<()> {
+    // Without `block_offset_chain` the footer carries no predecessor, so a walk
+    // would stop after one record. It must say so instead.
+    let no_chain = ResidencyFormat::spec().with_index_policy(varve::IndexPolicy::ScanOnOpen);
+    let path = temp_path("chain_refused");
+    write(no_chain, &path, 8, 4)?;
+    let file = no_chain.open_readonly(&path)?;
+    assert!(matches!(
+        file.block_chain(70).err(),
+        Some(varve::Error::InvalidFormatSpec(
+            "block_chain requires block_offset_chain"
+        )),
+    ));
+    Ok(())
+}
+
+// §5.3, second half. Every record exactly once, and no more.
 #[test]
 fn the_chain_reaches_every_non_resident_record_exactly_once() -> varve::Result<()> {
     let lines = 40u32;
     let path = temp_path("chain_walk");
     write(lean_spec(), &path, lines, 8)?;
 
-    let lean = lean_spec().open_readonly(&path)?;
-    let tail = lean
-        .block_tail_offset(70)
-        .expect("a non-resident block still publishes its tail after a reopen");
-
-    let every = full_spec().open_readonly(&path)?;
-    let by_offset: std::collections::HashMap<u64, &varve::RecordIndexEntry> = every
-        .index_entries()
-        .iter()
-        .map(|entry| (entry.record_offset, entry))
-        .collect();
-
-    let mut visited = Vec::new();
-    let mut next = Some(tail);
-    while let Some(offset) = next {
-        let entry = by_offset.get(&offset).expect("chain names a real record");
+    let file = lean_spec().open_readonly(&path)?;
+    let mut sequences = Vec::new();
+    for step in file.block_chain(70)? {
+        let entry = step?;
         assert_eq!(entry.block_id, 70, "the chain must stay within its block");
-        visited.push(entry.sequence);
-        next = entry.prev_same_block_offset;
+        sequences.push(entry.sequence);
     }
-    assert_eq!(visited.len() as u32, lines, "exactly once, and all of them");
-    visited.sort_unstable();
-    visited.dedup();
-    assert_eq!(visited.len() as u32, lines);
+    assert_eq!(sequences.len() as u32, lines, "all of them");
+    let mut unique = sequences.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len() as u32, lines, "exactly once");
+    Ok(())
+}
+
+// A chain is read from a file anyone can hand over, so it must be bounded by
+// the file rather than by what the footers claim. A predecessor pointing at or
+// past its own record is the natural loop, and it never reaches the walk:
+// `decode_native_record_footer` refuses it, so the file is refused at open.
+// The walk carries the same check anyway, because it frames records the scan
+// never looked at — but no test can reach it through a whole file, and that is
+// recorded here rather than claimed.
+#[test]
+fn a_self_referential_chain_link_is_refused_at_open() -> varve::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let path = temp_path("chain_loop");
+    write(lean_spec(), &path, 16, 8)?;
+    let (tail, footer) = {
+        let file = lean_spec().open_readonly(&path)?;
+        let entry = file.block_chain(70)?.next().expect("at least one link")?;
+        (entry.record_offset, entry.footer_offset.expect("a footer"))
+    };
+
+    let mut raw = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&*path)?;
+    raw.seek(SeekFrom::Start(footer + 8))?;
+    raw.write_all(&tail.to_le_bytes())?;
+    raw.sync_all()?;
+    drop(raw);
+
+    assert!(matches!(
+        lean_spec().open_readonly(&path).err(),
+        Some(varve::Error::InvalidRecordFooter { .. }),
+    ));
     Ok(())
 }
 

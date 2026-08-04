@@ -4516,6 +4516,56 @@ impl VarveFile {
         self.block_tails.tail(block_id)
     }
 
+    /// Walks a block's records newest-first through the footer chain.
+    ///
+    /// H2, and the only way to read a non-resident block. Takes `&self`, reads
+    /// positionally through the open snapshot, and materialises one entry at a
+    /// time — the resident index is never consulted and never grown, so this
+    /// costs the working set rather than the record count.
+    ///
+    /// Refuses without `block_offset_chain`: without it the footer carries no
+    /// predecessor, and a walk would silently stop after one record rather than
+    /// report that it cannot answer.
+    pub fn block_chain(&self, block_id: u32) -> Result<BlockChain<'_>> {
+        if !self.spec.index_policy.block_offset_chain {
+            return Err(Error::InvalidFormatSpec(
+                "block_chain requires block_offset_chain",
+            ));
+        }
+        Ok(BlockChain {
+            spec: self.spec,
+            snapshot: &self.snapshot,
+            block_id,
+            next: self.block_tails.tail(block_id),
+            visited: 0,
+        })
+    }
+
+    /// Decodes the record at `record_offset` as `T`.
+    ///
+    /// The companion to [`Self::block_chain`]: the walk yields offsets and
+    /// entries, this turns one into a value. Positional and `&self`, so a
+    /// non-resident block is read without anything entering the resident index.
+    pub fn read_block_at<T: VarveBlock>(&self, record_offset: u64) -> Result<T> {
+        crate::collections::ensure_registered_block::<T>(self.spec)?;
+        let entry = read_record_entry_positional(self.spec, &self.snapshot, record_offset)?;
+        if entry.block_id != T::ID {
+            return Err(Error::UnregisteredBlock(entry.block_id));
+        }
+        if entry.block_version != T::VERSION {
+            return Err(Error::BlockVersionMismatch {
+                block_id: T::ID,
+                expected: T::VERSION,
+                actual: entry.block_version,
+            });
+        }
+        let mut budget = MaterializationBudget::new(self.spec);
+        let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
+        budget.consume(logical_len)?;
+        let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
+        budget.decode(&payload, T::ENDIAN.unwrap_or(self.spec.endian))
+    }
+
     pub fn blocks<T: VarveBlock>(&self) -> Result<BlockVec<T>> {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         // A non-resident block has no entries here, and an empty collection
@@ -6478,6 +6528,123 @@ impl VarveFile {
             && new_records >= self.checkpoint_cadence.next_threshold
             && self.index_checkpoint_fits()
     }
+}
+
+/// Newest-first walk of one block's footer chain.
+///
+/// Each step is two positional reads — the record header, then its footer — and
+/// yields the entry it just framed. Nothing is retained: the walk holds one
+/// offset, so a block with more records than memory is still walkable.
+#[derive(Debug)]
+pub struct BlockChain<'a> {
+    spec: FormatSpec,
+    snapshot: &'a SnapshotFile,
+    block_id: u32,
+    next: Option<u64>,
+    visited: u64,
+}
+
+impl Iterator for BlockChain<'_> {
+    type Item = Result<RecordIndexEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let offset = self.next?;
+        match self.step(offset) {
+            Ok(entry) => Some(Ok(entry)),
+            Err(error) => {
+                // A failed step ends the walk rather than repeating itself.
+                self.next = None;
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+impl BlockChain<'_> {
+    fn step(&mut self, offset: u64) -> Result<RecordIndexEntry> {
+        self.visited = self
+            .visited
+            .checked_add(1)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "record count",
+            })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::Records, self.visited)?;
+        let entry = read_record_entry_positional(self.spec, self.snapshot, offset)?;
+        if entry.block_id != self.block_id {
+            return Err(Error::InvalidCanonicalEncoding(
+                "block offset chain left its block",
+            ));
+        }
+        // Strictly decreasing, so a crafted or damaged chain cannot loop: the
+        // walk is bounded by the file whatever the footers claim. Defence in
+        // depth rather than the first line - `decode_native_record_footer`
+        // already refuses a predecessor at or past its own record, so a whole
+        // file carrying one is refused at open and never reaches here. This
+        // walk frames records that scan never looked at, which is why it
+        // carries the check itself.
+        self.next = match entry.prev_same_block_offset {
+            Some(previous) if previous >= offset => {
+                return Err(Error::InvalidCanonicalEncoding(
+                    "block offset chain does not decrease",
+                ));
+            }
+            previous => previous,
+        };
+        Ok(entry)
+    }
+}
+
+/// Frames one record through the snapshot, without touching the resident index.
+fn read_record_entry_positional(
+    spec: FormatSpec,
+    snapshot: &SnapshotFile,
+    record_offset: u64,
+) -> Result<RecordIndexEntry> {
+    let mut header = [0u8; RECORD_HEADER_LEN as usize];
+    snapshot.read_exact_at(record_offset, &mut header)?;
+    let decoded = read_native_record_header(&mut &header[..], record_offset)?;
+    let fields = decoded.fields;
+    let payload_offset =
+        record_offset
+            .checked_add(decoded.lead_in_len)
+            .ok_or(Error::CorruptTail {
+                offset: record_offset,
+            })?;
+    spec.read_limits
+        .check(ReadLimitKey::RecordPayloadLen, fields.payload_len)?;
+    let payload_end = payload_offset
+        .checked_add(fields.payload_len)
+        .ok_or(Error::CorruptTail {
+            offset: record_offset,
+        })?;
+    let mut entry = RecordIndexEntry {
+        block_id: fields.block_id,
+        block_version: fields.block_version,
+        flags: fields.flags,
+        sequence: fields.sequence,
+        record_offset,
+        payload_offset,
+        payload_len: fields.payload_len,
+        checksum: fields.checksum,
+        uncompressed_len_hint: fields.uncompressed_len_hint,
+        footer_offset: None,
+        prev_same_block_offset: None,
+        prev_same_key_offset: None,
+        committed: true,
+    };
+    validate_record_entry(spec, &entry)?;
+    if spec.spec_needs_record_footer() {
+        let mut footer = [0u8; RECORD_FOOTER_LEN as usize];
+        snapshot.read_exact_at(payload_end, &mut footer)?;
+        let decoded = decode_record_footer(&footer, payload_end, record_offset)?;
+        entry.footer_offset = Some(payload_end);
+        entry.prev_same_block_offset = decoded.prev_same_block_offset;
+        entry.prev_same_key_offset = decoded.prev_same_key_offset;
+    }
+    entry.validate_payload_extent(snapshot.len())?;
+    Ok(entry)
 }
 
 fn append_log_start_for_file(file: &VarveFile) -> Result<u64> {
