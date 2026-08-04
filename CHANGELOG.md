@@ -109,30 +109,6 @@ shipped a capability with no way to use it. `block_chain` refuses a format
 without `block_offset_chain`, where a walk that stopped after one record would
 look like an answer.
 
-### A native file can record the policies it was written under
-
-`FormatSpec::with_header_policy_block(true)` writes a `VPOL` block into the file
-header carrying the index, commit, integrity, recovery and manifest policy
-bytes. Open compares them against the spec and refuses a mismatch **by name** —
-`Error::HeaderPolicyMismatch { policy, stored, declared }` — rather than opening
-someone else's file and misreading it.
-
-Without it a native file says nothing about its policies. The header `flags`
-byte is a reserved zero, and the schema hash is a hash: the bits are not
-recoverable, and it is not compared at all when a format declares no hash, which
-is the default. The container marker separates footer-bearing policies from the
-rest and nothing finer.
-
-A spec that does **not** declare the block still honours a file that carries
-one. Skipping the comparison there would reopen the door the block closes.
-
-Off by default, byte-identical when off, and hashed only when on so no existing
-`computed_schema_hash()` moves. On, it costs 20 header bytes once — and files
-written with it **do not open on readers older than the release that added
-header-extension block framing**, which demand the region be byte-for-byte what
-their own spec would write. That cost cannot be avoided: the evidence has to be
-bytes in the header.
-
 ### Fixed
 
 - **`flush` was fatal past a checkpoint ceiling.** A full index checkpoint

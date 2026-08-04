@@ -1680,21 +1680,6 @@ pub struct FormatSpec {
     pub compression_policy: CompressionPolicy,
     pub block_compression: &'static [BlockCompressionDescriptor],
     pub block_residency: &'static [BlockResidencyDescriptor],
-    /// Whether the file header records the policies the file was written under.
-    ///
-    /// A native file otherwise says nothing about them: the `flags` byte is a
-    /// reserved zero, and the schema hash is a hash — the bits are not
-    /// recoverable, and it is not even checked when a format declares no hash.
-    /// With this on, open compares the file's own record against the spec and
-    /// refuses a mismatch by name.
-    ///
-    /// Off by default and byte-identical when off. **On, the file does not open
-    /// on a reader older than the release that added header-extension block
-    /// framing** — those readers demand the region be byte-for-byte what their
-    /// own spec would write, so any block they do not know is a refusal. That
-    /// is the cost, and it cannot be avoided: the evidence has to be bytes in
-    /// the header.
-    pub header_policy_block: bool,
     pub blocks: &'static [BlockDescriptor],
     pub matrix_dimensions: &'static [MatrixDimensionDescriptor],
     pub matrix_commits: &'static [MatrixCommitDescriptor],
@@ -1751,7 +1736,6 @@ pub struct FormatSpecBuilder {
     compression_policy: CompressionPolicy,
     block_compression: &'static [BlockCompressionDescriptor],
     block_residency: &'static [BlockResidencyDescriptor],
-    header_policy_block: bool,
     blocks: &'static [BlockDescriptor],
     matrix_dimensions: &'static [MatrixDimensionDescriptor],
     matrix_commits: &'static [MatrixCommitDescriptor],
@@ -1805,7 +1789,6 @@ impl FormatSpec {
             compression_policy: CompressionPolicy::None,
             block_compression: &[],
             block_residency: &[],
-            header_policy_block: false,
             blocks,
             matrix_dimensions: &[],
             matrix_commits: &[],
@@ -1889,13 +1872,6 @@ impl FormatSpec {
         block_residency: &'static [BlockResidencyDescriptor],
     ) -> Self {
         self.block_residency = block_residency;
-        self
-    }
-
-    /// Records the file's policies in its header. See
-    /// [`FormatSpec::header_policy_block`].
-    pub const fn with_header_policy_block(mut self, enabled: bool) -> Self {
-        self.header_policy_block = enabled;
         self
     }
 
@@ -2544,12 +2520,6 @@ impl FormatSpec {
                 hash.write_str(extension);
             }
             None => hash.write_u8(0),
-        }
-        // Conditional on purpose: the block changes the file's bytes, so it
-        // belongs in the hash, and mixing anything in unconditionally would
-        // change the hash of every format that never asked for it.
-        if self.header_policy_block {
-            hash.write_bytes(b"vpol");
         }
         hash.write_u8(index_policy_hash_byte(self.index_policy));
         hash.write_u8(commit_policy_hash_byte(self.commit_policy));
@@ -3587,7 +3557,6 @@ impl FormatSpecBuilder {
             compression_policy: CompressionPolicy::None,
             block_compression: &[],
             block_residency: &[],
-            header_policy_block: false,
             blocks: &[],
             matrix_dimensions: &[],
             matrix_commits: &[],
@@ -3670,11 +3639,6 @@ impl FormatSpecBuilder {
         self
     }
 
-    pub const fn header_policy_block(mut self, enabled: bool) -> Self {
-        self.header_policy_block = enabled;
-        self
-    }
-
     pub const fn blocks(mut self, blocks: &'static [BlockDescriptor]) -> Self {
         self.blocks = blocks;
         self
@@ -3736,7 +3700,6 @@ impl FormatSpecBuilder {
         .with_compression_policy(self.compression_policy)
         .with_block_compression(self.block_compression)
         .with_block_residency(self.block_residency)
-        .with_header_policy_block(self.header_policy_block)
         .with_matrix_spec(
             self.matrix_dimensions,
             self.matrix_commits,

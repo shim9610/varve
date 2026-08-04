@@ -118,21 +118,6 @@ pub enum Error {
     #[error("block {block_id} is declared non-resident; read it through the block offset chain")]
     BlockNotResident { block_id: u32 },
 
-    /// The file's own record of the policies it was written under disagrees
-    /// with the spec opening it.
-    ///
-    /// Only files written with `header_policy_block` carry that record; without
-    /// it a native file says nothing about its policies and a mismatched spec
-    /// opens it and misreads it. Names the policy that differs, because "this
-    /// file is not yours" is not actionable and "its commit policy is 1, yours
-    /// is 3" is.
-    #[error("file header records {policy} {stored}, but this format declares {declared}")]
-    HeaderPolicyMismatch {
-        policy: &'static str,
-        stored: u8,
-        declared: u8,
-    },
-
     #[error("block version mismatch for block {block_id}: expected {expected}, got {actual}")]
     BlockVersionMismatch {
         block_id: u32,

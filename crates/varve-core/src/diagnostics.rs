@@ -860,7 +860,6 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::InvalidIndexCheckpoint
         | Error::InvalidIndexSegment
         | Error::BlockNotResident { .. }
-        | Error::HeaderPolicyMismatch { .. }
         | Error::ChecksumMismatch { .. }
         | Error::UnsupportedCompressionAlgorithm(_)
         | Error::InvalidCompressionHeader
