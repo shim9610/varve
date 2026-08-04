@@ -66,6 +66,73 @@ appended past the last commit point, truncated, corrupt, or broken mid-chain —
 falls back to the full scan and produces the identical index, never an error.
 `open_recover` and any open under `IntegrityVerification::AtOpen` always scan.
 
+### H1: a block can be kept out of the resident index
+
+`BlockResidencyDescriptor` on `FormatSpec`, via `with_block_residency`. A block
+declared `resident: false` has its records written, sequenced, chained and
+recovered exactly as before, and **not** mirrored in memory — at write and at
+open. Resident cost stops tracking that block's record count, which is the law
+the index work exists to break: 104 bytes per record for the life of the handle.
+
+Off by default, not in the computed schema hash, and byte-identical output when
+unused — residency changes no byte of the file, so enabling it must not become a
+migration for files that did not change.
+
+It requires `block_offset_chain`, because the footer chain is the only way back
+to a non-resident record, and gives up, loudly:
+
+- `blocks::<T>()` returns `Error::BlockNotResident` rather than an empty
+  collection, which would be indistinguishable from "nothing was written";
+- replacement, which resolves its target by position in the resident index;
+- whole-generation rewrite, refused for the format, because both rewrite paths
+  rebuild the file by iterating that index and would silently drop what it does
+  not hold.
+
+Three pieces of writer state were derived from the resident index and could not
+stay that way, each a silent corruption if left: the **next sequence** (a reopen
+re-issued numbers already on disk), the **block tails** (a non-resident block's
+tail vanished), and **"is there anything to commit"** (a flush after only
+non-resident appends skipped the marker, leaving those records permanently
+uncommitted and invisible). All three now come from the scan or the append site.
+
+### H2: reading a block through its footer chain
+
+`VarveFile::block_chain(block_id)` walks a block's records newest-first, and
+`read_block_at::<T>(record_offset)` turns one into a value. Both take `&self`
+and read positionally through the open snapshot, materialising one entry at a
+time — the resident index is never consulted and never grown, so the walk costs
+the working set rather than the record count. `block_tail_offset(block_id)` is
+the entry point on its own.
+
+This is what a non-resident block is read through; without it H1 would have
+shipped a capability with no way to use it. `block_chain` refuses a format
+without `block_offset_chain`, where a walk that stopped after one record would
+look like an answer.
+
+### A native file can record the policies it was written under
+
+`FormatSpec::with_header_policy_block(true)` writes a `VPOL` block into the file
+header carrying the index, commit, integrity, recovery and manifest policy
+bytes. Open compares them against the spec and refuses a mismatch **by name** —
+`Error::HeaderPolicyMismatch { policy, stored, declared }` — rather than opening
+someone else's file and misreading it.
+
+Without it a native file says nothing about its policies. The header `flags`
+byte is a reserved zero, and the schema hash is a hash: the bits are not
+recoverable, and it is not compared at all when a format declares no hash, which
+is the default. The container marker separates footer-bearing policies from the
+rest and nothing finer.
+
+A spec that does **not** declare the block still honours a file that carries
+one. Skipping the comparison there would reopen the door the block closes.
+
+Off by default, byte-identical when off, and hashed only when on so no existing
+`computed_schema_hash()` moves. On, it costs 20 header bytes once — and files
+written with it **do not open on readers older than the release that added
+header-extension block framing**, which demand the region be byte-for-byte what
+their own spec would write. That cost cannot be avoided: the evidence has to be
+bytes in the header.
+
 ### Fixed
 
 - **`flush` was fatal past a checkpoint ceiling.** A full index checkpoint
