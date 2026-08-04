@@ -427,6 +427,100 @@ fn a_markerless_reopen_does_not_reissue_a_non_resident_sequence() -> varve::Resu
     Ok(())
 }
 
+// §5.7. Kill the writer at every offset in the file, reopen, and check the two
+// things that must hold: no record the last commit marker covered is lost, and
+// the tails a reopen publishes never point past the bytes that survived. The
+// tail is the only way back to a non-resident block, so a tail ahead of durable
+// bytes is that block becoming unreadable rather than merely short.
+#[test]
+fn a_kill_at_every_offset_loses_no_committed_non_resident_record() -> varve::Result<()> {
+    let source = temp_path("crash_source");
+    {
+        // Many commit points, not one. With a single marker at the end every
+        // truncation destroys the only commit point, the index comes back
+        // empty, and the sweep checks nothing.
+        let mut file = lean_spec().create(&source)?;
+        for value in 0..24u32 {
+            file.push(&Line { value })?;
+            if (value + 1) % 8 == 0 {
+                file.push(&Summary {
+                    first_line: u64::from(value + 1 - 8),
+                })?;
+                file.flush()?;
+            }
+        }
+        file.flush()?;
+    }
+    let bytes = std::fs::read(&*source)?;
+
+    // How many lines each truncation point should still be able to reach.
+    let full = lean_spec().open_readonly(&source)?;
+    let committed_lines = full.block_chain(70)?.count();
+    drop(full);
+    assert_eq!(committed_lines, 24);
+
+    for cut in (1..bytes.len()).step_by(7) {
+        let path = temp_path("crash_cut");
+        std::fs::write(&*path, &bytes[..cut])?;
+
+        // A reader either refuses the truncated file or reports a prefix; it
+        // must never report more than the bytes can support.
+        let Ok(file) = lean_spec().open_readonly(&path) else {
+            continue;
+        };
+        let file_len = std::fs::metadata(&*path)?.len();
+        if let Some(tail) = file.block_tail_offset(70) {
+            assert!(
+                tail < file_len,
+                "tail {tail} is past the surviving bytes {file_len} at cut {cut}",
+            );
+        }
+        let mut reached = 0usize;
+        for step in file.block_chain(70)? {
+            let entry = step?;
+            assert!(
+                entry.record_offset < file_len,
+                "the chain left the surviving bytes at cut {cut}",
+            );
+            reached += 1;
+        }
+        assert!(
+            reached <= committed_lines,
+            "cut {cut} reported {reached} lines, more than the file ever held",
+        );
+        drop(file);
+
+        // The read-only open above cannot see the real hazard: it never
+        // truncates, so a tail pointing past the commit boundary is still
+        // inside the file. A writer open truncates and then appends onto what
+        // is left, and a tail left pointing into the removed region makes that
+        // append write a footer naming a record that is no longer there.
+        let Ok(mut writer) = lean_spec().open(&path) else {
+            continue;
+        };
+        writer.push(&Line {
+            value: 900 + cut as u32,
+        })?;
+        writer.flush()?;
+        drop(writer);
+
+        let reopened = lean_spec()
+            .open_readonly(&path)
+            .unwrap_or_else(|error| panic!("cut {cut} left an unreadable file: {error:?}"));
+        let after: Vec<u64> = reopened
+            .block_chain(70)?
+            .map(|step| step.map(|entry| entry.record_offset))
+            .collect::<varve::Result<_>>()
+            .unwrap_or_else(|error| panic!("cut {cut} broke the chain: {error:?}"));
+        assert_eq!(
+            after.len(),
+            reached + 1,
+            "cut {cut}: the appended record must extend the chain by exactly one",
+        );
+    }
+    Ok(())
+}
+
 struct TempPath {
     path: PathBuf,
     _dir: tempfile::TempDir,

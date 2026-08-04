@@ -5988,6 +5988,12 @@ impl VarveFile {
         self.sequence_state = SequenceState::after_publishing(sequence);
     }
 
+    #[cfg(test)]
+    fn push_info_for_test(&mut self, block_id: u32, payload: &[u8]) -> Result<AppendInfo> {
+        let permit = self.ensure_write()?;
+        self.write_record_with_prev_key(&permit, block_id, 1, 0, 0, payload, None)
+    }
+
     pub(crate) fn write_record(
         &mut self,
         block_id: u32,
@@ -6254,11 +6260,17 @@ impl VarveFile {
         let truncated = self.index.len() > snapshot.index_len;
         self.index.truncate(snapshot.index_len);
         // Restore the one tail this append moved rather than rebuilding the
-        // table from the resident index. Rebuilding was correct only while the
-        // index mirrored every record: with a non-resident block it would drop
-        // that block's tail entirely, and the tail is the only way back to its
-        // records. It is also O(1) and allocation-free, which the rebuild was
-        // not (PERF2-05).
+        // table from the resident index.
+        //
+        // **Unreachable today, and kept anyway.** Both rollback points are
+        // above `block_tails.note_appended`, so a rollback always finds the
+        // tail where it started and this restores it to itself — exactly as
+        // the rebuild it replaces never actually ran, for the same reason.
+        // What changed is which one is *correct if the ordering ever moves*:
+        // rebuilding from the resident index drops a non-resident block's tail
+        // entirely, and that tail is the only way back to its records. This is
+        // also `O(1)` and allocation-free, which the rebuild was not
+        // (PERF2-05).
         self.block_tails
             .restore(snapshot.block_id, snapshot.previous_block_tail);
         self.uncommitted_since_commit = snapshot.uncommitted_since_commit;
@@ -13209,6 +13221,111 @@ mod tests {
                 Err(Error::ReplacementKeyMismatch)
             }
         }
+    }
+
+    /// A format with one declared block kept out of the resident index, and the
+    /// footer chain that makes it reachable.
+    fn residency_test_spec() -> FormatSpec {
+        const BLOCKS: &[BlockDescriptor] = &[BlockDescriptor {
+            id: 12,
+            name: "line",
+            version: 1,
+            kind: BlockKind::Variable,
+            fields: &[],
+        }];
+        const RESIDENCY: &[crate::BlockResidencyDescriptor] = &[crate::BlockResidencyDescriptor {
+            block_id: 12,
+            resident: false,
+        }];
+        FormatSpec::new(
+            b"VSRES",
+            1,
+            Endian::Little,
+            0,
+            IndexPolicy::BlockOffsetChain,
+            IntegrityPolicy::None,
+            RecoveryPolicy::Strict,
+            ManifestPolicy::None,
+            BLOCKS,
+        )
+        .with_block_residency(RESIDENCY)
+        .with_read_limits(crate::ReadLimits::finite_all(u64::MAX))
+    }
+
+    // §5.4. A rolled-back append of a non-resident record must leave nothing
+    // behind: the file length, the sequence and - the part residency makes
+    // load-bearing - the block tail, which is the only way back to that block's
+    // records.
+    //
+    // This does *not* exercise `BlockTails::restore`. Both rollback points sit
+    // above `block_tails.note_appended`, so a rollback always finds the tail
+    // where it started; the restore is unreachable and is kept for the ordering
+    // rather than for today. Reverting it to the old rebuild-from-index, or
+    // deleting it outright, leaves this test green, and that is recorded rather
+    // than papered over.
+    #[test]
+    fn a_rolled_back_non_resident_append_leaves_the_tail_alone() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("residency-rollback.varve");
+        let mut file = VarveFile::create(residency_test_spec(), &path)?;
+
+        file.write_record(12, 1, 0, b"first")?;
+        let tail_before = file.block_tails.tail(12);
+        assert!(
+            tail_before.is_some(),
+            "the tail is published for a non-resident block"
+        );
+        assert!(file.index.is_empty(), "and nothing is resident");
+        let len_before = file.file.metadata()?.len();
+        let sequence_before = file.sequence_state;
+
+        inject_write_fault(WriteFault::AppendAfterHeader);
+        assert!(matches!(
+            file.write_record(12, 1, 0, b"rolled back"),
+            Err(Error::Io(_))
+        ));
+
+        assert_eq!(
+            file.block_tails.tail(12),
+            tail_before,
+            "the rolled-back record must not stay reachable through the tail",
+        );
+        assert_eq!(file.file.metadata()?.len(), len_before);
+        assert_eq!(file.sequence_state, sequence_before);
+        assert!(!file.poison.is_refusing());
+
+        // The next append chains onto the surviving record, not the ghost.
+        let info = file.push_info_for_test(12, b"second")?;
+        assert_eq!(info.prev_same_block_offset, tail_before);
+        Ok(())
+    }
+
+    // The first append of a block publishes no tail if it rolls back, so the
+    // next surviving record is still the head of the chain.
+    #[test]
+    fn a_rolled_back_first_append_leaves_no_tail() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("residency-first.varve");
+        let mut file = VarveFile::create(residency_test_spec(), &path)?;
+        assert_eq!(file.block_tails.tail(12), None);
+
+        inject_write_fault(WriteFault::AppendAfterHeader);
+        assert!(matches!(
+            file.write_record(12, 1, 0, b"x"),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(
+            file.block_tails.tail(12),
+            None,
+            "a rollback of the first append must leave no tail behind",
+        );
+
+        let info = file.push_info_for_test(12, b"real")?;
+        assert_eq!(
+            info.prev_same_block_offset, None,
+            "the first surviving record names no predecessor",
+        );
+        Ok(())
     }
 
     fn test_spec() -> FormatSpec {
