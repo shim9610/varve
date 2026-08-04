@@ -1040,6 +1040,90 @@ fn the_resume_signal_is_not_clean_over_an_unsealed_chunk() -> varve::Result<()> 
 }
 
 // ---------------------------------------------------------------------------
+// What a chunk costs, pinned so the spec's cost table cannot drift back
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compression_cannot_be_declared_on_a_matrix_block() {
+    // The chunk spec §3.2 named per-block compression as the knob for a
+    // chunk's lost sparseness. It is not one: `validate` refuses the
+    // declaration outright, and a chunk record is written by
+    // `write_record_with_prev_key` rather than through
+    // `prepare_user_record_payload`, which is the only place compression is
+    // applied. Pinned so the claim cannot be made again.
+    static COMPRESSED: &[varve::BlockCompressionDescriptor] =
+        &[varve::BlockCompressionDescriptor {
+            block_id: Sample::ID,
+            compression: varve::VariableCompression::zstd(
+                varve::CompressionHeaderMode::RecordExplicit,
+            ),
+        }];
+    assert!(matches!(
+        growing_spec().with_block_compression(COMPRESSED).validate(),
+        Err(Error::InvalidFormatSpec(
+            "block compression requires a variable block"
+        )),
+    ));
+}
+
+#[test]
+fn an_unfilled_chunk_costs_its_whole_size() -> varve::Result<()> {
+    // The spec's cost table said an unfilled grid "compresses to almost
+    // nothing". Measured 2026-08-04 on ext4: a chunk 5% filled and a chunk 100%
+    // filled produce byte-identical file sizes, apparent *and* allocated. A
+    // chunk is written as contiguous bytes and nothing punches holes in them,
+    // so the waste is total, not partial — and the only knob that bounds it is
+    // `rows_per_chunk`.
+    let mut sizes = Vec::new();
+    for fill in [ROWS_PER_CHUNK, ROWS_PER_CHUNK / 2, 1] {
+        let path = temp_path(&format!("fill_{fill}"));
+        {
+            let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+            for row in 0..fill {
+                let cell = key(ROWS_PER_CHUNK + row, 0);
+                writer.write_matrix_cell(cell, &Sample { value: 1 })?;
+                writer.commit_matrix_cell::<Sample>(cell)?;
+            }
+            writer.flush()?;
+        }
+        sizes.push(std::fs::metadata(path.path())?.len());
+    }
+    assert_eq!(
+        sizes[0], sizes[1],
+        "a half-filled chunk must cost what a full one does — it does, and that \
+         is the cost this feature has",
+    );
+    assert_eq!(sizes[1], sizes[2]);
+    Ok(())
+}
+
+#[test]
+fn a_smaller_chunk_height_bounds_the_waste() -> varve::Result<()> {
+    // The one real knob, since compression is not available: halving
+    // `rows_per_chunk` halves what a single touched row drags along.
+    fn one_row(rows_per_chunk: u64) -> varve::Result<u64> {
+        let spec = base_spec().with_growing_matrix_dimension("scan", rows_per_chunk);
+        let dims = MatrixDimensions::from_pairs([("scan", rows_per_chunk), ("ch", CHANNELS)]);
+        let path = temp_path(&format!("height_{rows_per_chunk}"));
+        {
+            let mut writer = spec.create_writer_with_dims(path.path(), dims)?;
+            let cell = key(rows_per_chunk, 0);
+            writer.write_matrix_cell(cell, &Sample { value: 1 })?;
+            writer.commit_matrix_cell::<Sample>(cell)?;
+            writer.flush()?;
+        }
+        Ok(std::fs::metadata(path.path())?.len())
+    }
+    let tall = one_row(64)?;
+    let short = one_row(8)?;
+    assert!(
+        short < tall,
+        "a shorter chunk must drag less along: {short} vs {tall}",
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // The cost of a chunked read must not scale with the file
 // ---------------------------------------------------------------------------
 
