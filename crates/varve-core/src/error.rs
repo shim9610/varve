@@ -507,6 +507,17 @@ pub enum Error {
     #[error("matrix cell was not written before commit")]
     MatrixCellNotWritten,
 
+    /// A write addressed a chunk that has already been sealed.
+    ///
+    /// Only the newest chunk accepts writes. Late data is refused rather than
+    /// dropped: a value that silently does not arrive is indistinguishable from
+    /// one that was never sent.
+    #[error("matrix chunk {chunk} is sealed; the open chunk is {open}")]
+    MatrixChunkSealed { chunk: u64, open: u64 },
+
+    #[error("invalid matrix chunk record")]
+    InvalidMatrixChunk,
+
     #[error("invalid matrix sidecar envelope")]
     InvalidMatrixSidecar,
 

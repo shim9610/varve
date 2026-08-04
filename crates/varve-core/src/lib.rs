@@ -86,13 +86,14 @@ pub use error::{Error, Result};
 pub use file::{
     AppendInfo, BlockChain, BlockEvent, COMMIT_BLOCK_ID, CREATION_NONCE_BLOCK_ID,
     FileMatrixDurabilityBarrier, INDEX_BLOCK_ID, KeyedMergeEstimate, MANIFEST_BLOCK_ID,
-    METADATA_BLOCK_ID, MatrixDurabilityBarrier, MatrixNumeric, MatrixSidecarManifest, OP_BLOCK_ID,
-    OpenMode, RecordIndexEntry, RecoveryReport, ReplacePublicationFailure, ReplaceStrategy,
-    ReplacementInfo, SEGMENT_BLOCK_ID, SchemaBlockDescriptor, SchemaFieldDescriptor,
-    SchemaManifest, TOMBSTONE_BLOCK_ID, VarveFile, VarveReader, VarveWriter, WriterLockBreakPolicy,
-    WriterLockInfo, classify_replace_publication_error, clear_stale_writer_lock,
-    compact_keyed_files, compact_keyed_files_with_key_limit, estimate_keyed_merge,
-    merge_keyed_files, merge_keyed_files_with_key_limit,
+    MATRIX_CHUNK_BLOCK_ID, METADATA_BLOCK_ID, MatrixDurabilityBarrier, MatrixNumeric,
+    MatrixSidecarManifest, OP_BLOCK_ID, OpenMode, RecordIndexEntry, RecoveryReport,
+    ReplacePublicationFailure, ReplaceStrategy, ReplacementInfo, SEGMENT_BLOCK_ID,
+    SchemaBlockDescriptor, SchemaFieldDescriptor, SchemaManifest, TOMBSTONE_BLOCK_ID, VarveFile,
+    VarveReader, VarveWriter, WriterLockBreakPolicy, WriterLockInfo,
+    classify_replace_publication_error, clear_stale_writer_lock, compact_keyed_files,
+    compact_keyed_files_with_key_limit, estimate_keyed_merge, merge_keyed_files,
+    merge_keyed_files_with_key_limit,
 };
 #[cfg(feature = "mmap")]
 pub use file::{MmapMatrix, MmapPayloads};
@@ -100,16 +101,16 @@ pub use format::{
     BlockCompressionDescriptor, BlockDescriptor, BlockKind, BlockResidencyDescriptor, CommitPolicy,
     CompressionAlgorithm, CompressionHeaderMode, CompressionLevel, CompressionPolicy, Endian,
     FieldDescriptor, FieldPresence, FileHeaderDescriptor, FooterDescriptor, FormatSpec,
-    FormatSpecBuilder, IndexPolicy, IntegrityPolicy, IntegrityVerification, LayoutAnchor,
-    LayoutBytesSource, LayoutFieldDescriptor, LayoutFieldSource, LayoutFieldType, LayoutFinalize,
-    LayoutPartDescriptor, LayoutPartKind, LayoutPlan, LayoutPlanField, LayoutPlanFieldGroup,
-    LayoutPlanFieldSource, LayoutPlanFieldType, LayoutPlanLen, LayoutPlanPartDescriptor,
-    LayoutPlanPartKind, LayoutPlanRegion, LayoutPlanRegionSource, LayoutPlanSegment, LayoutPreset,
-    LayoutSpec, LeadInDescriptor, ManifestPolicy, MatrixAuxDescriptor, MatrixBlockDescriptor,
-    MatrixCommitDescriptor, MatrixCommitKind, MatrixDimensionDescriptor, MatrixMetadataResidency,
-    MatrixMetadataVerification, MetadataDescriptor, RawRegionDescriptor, ReadLimit, ReadLimits,
-    RecoveryPolicy, ResourceLimits, SegmentDescriptor, SegmentRepeat, TransactionMarkerMode,
-    VariableCompression,
+    FormatSpecBuilder, GrowingMatrixDimension, IndexPolicy, IntegrityPolicy, IntegrityVerification,
+    LayoutAnchor, LayoutBytesSource, LayoutFieldDescriptor, LayoutFieldSource, LayoutFieldType,
+    LayoutFinalize, LayoutPartDescriptor, LayoutPartKind, LayoutPlan, LayoutPlanField,
+    LayoutPlanFieldGroup, LayoutPlanFieldSource, LayoutPlanFieldType, LayoutPlanLen,
+    LayoutPlanPartDescriptor, LayoutPlanPartKind, LayoutPlanRegion, LayoutPlanRegionSource,
+    LayoutPlanSegment, LayoutPreset, LayoutSpec, LeadInDescriptor, ManifestPolicy,
+    MatrixAuxDescriptor, MatrixBlockDescriptor, MatrixCommitDescriptor, MatrixCommitKind,
+    MatrixDimensionDescriptor, MatrixMetadataResidency, MatrixMetadataVerification,
+    MetadataDescriptor, RawRegionDescriptor, ReadLimit, ReadLimits, RecoveryPolicy, ResourceLimits,
+    SegmentDescriptor, SegmentRepeat, TransactionMarkerMode, VariableCompression,
 };
 #[cfg(feature = "high-cardinality-dev")]
 pub use indexed::{

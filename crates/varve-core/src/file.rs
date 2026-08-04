@@ -73,6 +73,24 @@ const SEGMENT_TRAILER_LEN: u64 = 8;
 /// One serialized index entry, in the layout `read_index_entry_payload`
 /// decodes at checkpoint version 3.
 const SEGMENT_ENTRY_LEN: u64 = 4 + 2 + 2 + 8 + 8 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 1;
+/// Carries one matrix chunk: `rows_per_chunk` rows of every matrix block.
+///
+/// A chunk is what makes a matrix dimension grow past the extent declared at
+/// create. Chunk 0 *is* the matrix region; chunk `k > 0` is a record with the
+/// region's layout. See [`GrowingMatrixDimension`].
+pub const MATRIX_CHUNK_BLOCK_ID: u32 = 0xFFFF_FFF6;
+const MATRIX_CHUNK_MAGIC: &[u8; 4] = b"VMCK";
+const MATRIX_CHUNK_VERSION: u16 = 1;
+/// magic(4) + version(2) + flags(2) + chunk_index(8) + first_row(8) + rows(8)
+/// + block_count(4) + reserved(4).
+const MATRIX_CHUNK_PREFIX_LEN: u64 = 4 + 2 + 2 + 8 + 8 + 8 + 4 + 4;
+/// block_id(4) + reserved(4) + stride(8) + cells(8) + commit_len(8).
+///
+/// Every block's descriptor precedes every block's data, so a reader computes
+/// any block's slot offset from the descriptors alone — one small positional
+/// read, whatever the chunk's size. That is what keeps a cell read from
+/// materialising the chunk.
+const MATRIX_CHUNK_BLOCK_DESC_LEN: u64 = 4 + 4 + 8 + 8 + 8;
 /// Smallest live-tail growth that forces a fresh full index checkpoint.
 ///
 /// Below this floor the geometric-spacing rule in [`VarveFile::needs_index_checkpoint`]
@@ -1159,6 +1177,158 @@ fn note_checkpoint_cadence_index_touches(count: u64) {
     let _ = count;
 }
 
+/// A zeroed buffer of `len` bytes, allocated fallibly.
+///
+/// A chunk's buffers are sized by a declared knob, so an over-large
+/// `rows_per_chunk` must report `AllocationFailed` rather than abort.
+fn try_zeroed_vec(len: u64, resource: &'static str) -> Result<Vec<u8>> {
+    let capacity = usize::try_from(len).map_err(|_| Error::LengthOverflow { value: len })?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(capacity)
+        .map_err(|_| Error::AllocationFailed {
+            resource,
+            requested: len,
+        })?;
+    buffer.resize(capacity, 0);
+    Ok(buffer)
+}
+
+/// One matrix block's slice of the chunk being filled.
+#[derive(Debug)]
+struct OpenChunkBlock {
+    block_id: u32,
+    stride: u64,
+    /// `rows * dimension 1`, the cells this chunk holds for this block.
+    cells: u64,
+    /// One bit per cell, the chunk-local form of the region's commit map.
+    commit: Vec<u8>,
+    /// `cells * stride` bytes, addressed exactly as the region's slot region is.
+    slots: Vec<u8>,
+}
+
+/// The chunk a growing matrix is currently filling.
+///
+/// Held in memory until sealed, which is the one cost this design has and the
+/// reason `rows_per_chunk` is a declared knob rather than a constant. Sealing
+/// writes it as one ordinary record, so nothing else in the file format learns
+/// that chunks exist.
+///
+/// Only the newest chunk is open. A write addressing an older one is refused
+/// rather than dropped — see `Error::MatrixChunkSealed`.
+#[derive(Debug)]
+struct OpenChunk {
+    index: u64,
+    first_row: u64,
+    rows: u64,
+    blocks: Vec<OpenChunkBlock>,
+    /// Whether any cell has been committed since the chunk was opened. A chunk
+    /// nothing committed is not written: an empty chunk and an absent chunk
+    /// answer every read identically, and writing one would grow the file on
+    /// every idle flush the way an empty segment once did.
+    dirty: bool,
+}
+
+impl OpenChunk {
+    fn block_position(&self, block_id: u32) -> Option<usize> {
+        self.blocks
+            .iter()
+            .position(|block| block.block_id == block_id)
+    }
+
+    fn payload_len(&self) -> Result<u64> {
+        let mut len = MATRIX_CHUNK_PREFIX_LEN
+            .checked_add(
+                MATRIX_CHUNK_BLOCK_DESC_LEN
+                    .checked_mul(u64::try_from(self.blocks.len()).map_err(|_| {
+                        Error::ResourceArithmeticOverflow {
+                            resource: "matrix chunk block count",
+                        }
+                    })?)
+                    .ok_or(Error::ResourceArithmeticOverflow {
+                        resource: "matrix chunk descriptors",
+                    })?,
+            )
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "matrix chunk prefix",
+            })?;
+        for block in &self.blocks {
+            let commit = u64::try_from(block.commit.len()).map_err(|_| {
+                Error::ResourceArithmeticOverflow {
+                    resource: "matrix chunk commit map",
+                }
+            })?;
+            let slots = u64::try_from(block.slots.len()).map_err(|_| {
+                Error::ResourceArithmeticOverflow {
+                    resource: "matrix chunk slot region",
+                }
+            })?;
+            len = len
+                .checked_add(commit)
+                .and_then(|len| len.checked_add(slots))
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "matrix chunk payload length",
+                })?;
+        }
+        Ok(len)
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        let payload_len = self.payload_len()?;
+        let capacity = usize::try_from(payload_len)
+            .map_err(|_| Error::LengthOverflow { value: payload_len })?;
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(capacity)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "matrix chunk payload",
+                requested: payload_len,
+            })?;
+        let block_count =
+            u32::try_from(self.blocks.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+                resource: "matrix chunk block count",
+            })?;
+        payload.extend_from_slice(MATRIX_CHUNK_MAGIC);
+        payload.extend_from_slice(&MATRIX_CHUNK_VERSION.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(&self.index.to_le_bytes());
+        payload.extend_from_slice(&self.first_row.to_le_bytes());
+        payload.extend_from_slice(&self.rows.to_le_bytes());
+        payload.extend_from_slice(&block_count.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        for block in &self.blocks {
+            let commit_len = u64::try_from(block.commit.len()).map_err(|_| {
+                Error::ResourceArithmeticOverflow {
+                    resource: "matrix chunk commit map",
+                }
+            })?;
+            payload.extend_from_slice(&block.block_id.to_le_bytes());
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&block.stride.to_le_bytes());
+            payload.extend_from_slice(&block.cells.to_le_bytes());
+            payload.extend_from_slice(&commit_len.to_le_bytes());
+        }
+        for block in &self.blocks {
+            payload.extend_from_slice(&block.commit);
+            payload.extend_from_slice(&block.slots);
+        }
+        Ok(payload)
+    }
+}
+
+/// Where one block's bytes sit inside a chunk record's payload.
+///
+/// Produced by reading the prefix and the descriptors — a fixed, small read
+/// whatever the chunk holds — so a cell read is that read plus one `stride`-byte
+/// positional read, and never the chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChunkBlockLocation {
+    commit_offset: u64,
+    slots_offset: u64,
+    stride: u64,
+    cells: u64,
+}
+
 /// O(1) writer-side state for the internal segment chain.
 ///
 /// A segment covers the records one commit point added, so writing one needs
@@ -2017,6 +2187,19 @@ pub struct VarveFile {
     // O(1) append-side block-offset-chain predecessors; must equal
     // `BlockTails::from_index(&index)` at all times (PERF2-05).
     block_tails: BlockTails,
+    // The matrix chunk being filled, when a growing dimension is declared. See
+    // `OpenChunk`; `None` until a write lands past the declared extent.
+    open_chunk: Option<OpenChunk>,
+    // The newest chunk index this handle has sealed, which `open_chunk` cannot
+    // carry: sealing clears it, and a flush between two writes would otherwise
+    // let the second reopen a chunk the first already wrote. That would append
+    // a second record for one chunk index, out of order, and the binary search
+    // that finds a chunk assumes exactly the opposite.
+    //
+    // `None` means "not yet established" rather than "nothing sealed": a
+    // reopened writer recovers it from the index on first use, so open pays
+    // nothing for a file that never touches a chunk.
+    sealed_chunk_through: Option<u64>,
     // O(1) commit-point state for the internal segment chain; must equal
     // `SegmentCursor::from_index(&index)` at all times.
     segment_cursor: SegmentCursor,
@@ -2148,7 +2331,7 @@ impl VarveReader {
         &self,
         key: MatrixKey,
     ) -> Result<MatrixCellStatus> {
-        self.file.matrix_cell_status::<T>(key)
+        self.file.matrix_chunk_cell_status::<T>(key)
     }
 
     pub fn is_matrix_single_committed(&self, name: &str) -> Result<bool> {
@@ -2693,7 +2876,7 @@ impl VarveWriter {
         &self,
         key: MatrixKey,
     ) -> Result<MatrixCellStatus> {
-        self.file.matrix_cell_status::<T>(key)
+        self.file.matrix_chunk_cell_status::<T>(key)
     }
 
     pub fn commit_matrix_cell<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<()> {
@@ -2904,6 +3087,8 @@ impl VarveFile {
             // DUR3-01: this handle established the pathname, so its
             // directory entry is not durable until the first durability
             // request syncs the parent directory.
+            open_chunk: None,
+            sealed_chunk_through: None,
             pending_pathname_parent_sync: true,
             poison: PoisonFlag::healthy(),
             _lock: None,
@@ -2948,6 +3133,23 @@ impl VarveFile {
         check_initial_native_file_len(spec)?;
         if !spec.has_matrix_blocks() {
             return Self::create_impl(spec, path, exclusive);
+        }
+        // Chunk 0 *is* the matrix region, and `chunk_for_row` divides by
+        // `rows_per_chunk` to find it. If the declared extent were any other
+        // value the two would disagree: with an extent of 100 and chunks of 4,
+        // row 50 routes to chunk 12 while the region already holds it, and the
+        // region's rows 4..100 become unreachable. Refused at create, where the
+        // dimension value first exists.
+        if let Some(growing) = spec.growing_matrix {
+            let declared = dims
+                .get(growing.name)
+                .ok_or_else(|| Error::MatrixDimensionMissing(growing.name.to_string()))?;
+            if declared != growing.rows_per_chunk {
+                return Err(Error::MatrixSizeMismatch {
+                    expected: growing.rows_per_chunk,
+                    actual: declared,
+                });
+            }
         }
         let path = path.to_path_buf();
         let lock = WriterLock::acquire(&path)?;
@@ -3006,6 +3208,8 @@ impl VarveFile {
             // DUR3-01: this handle established the pathname, so its
             // directory entry is not durable until the first durability
             // request syncs the parent directory.
+            open_chunk: None,
+            sealed_chunk_through: None,
             pending_pathname_parent_sync: true,
             poison: PoisonFlag::healthy(),
             _lock: None,
@@ -3063,6 +3267,8 @@ impl VarveFile {
             sequence_state,
             checkpoint_cadence,
             block_tails,
+            open_chunk: None,
+            sealed_chunk_through: None,
             segment_cursor,
             uncommitted_since_commit: false,
             keyed_tails: KeyedTails::new_empty(),
@@ -3123,6 +3329,8 @@ impl VarveFile {
             sequence_state,
             checkpoint_cadence,
             block_tails,
+            open_chunk: None,
+            sealed_chunk_through: None,
             segment_cursor,
             uncommitted_since_commit: false,
             keyed_tails: KeyedTails::new_empty(),
@@ -3195,6 +3403,8 @@ impl VarveFile {
                 sequence_state,
                 checkpoint_cadence,
                 block_tails,
+                open_chunk: None,
+                sealed_chunk_through: None,
                 segment_cursor,
                 uncommitted_since_commit: false,
                 keyed_tails: KeyedTails::new_empty(),
@@ -4351,6 +4561,13 @@ impl VarveFile {
     pub fn flush(&mut self) -> Result<()> {
         let _permit = self.ensure_not_poisoned()?;
         self.write_embedded_manifest_if_needed()?;
+        // First, before the checkpoint and before the marker. A chunk is an
+        // ordinary record: sealing after the marker would leave it outside the
+        // committed prefix, and sealing after the checkpoint would leave it out
+        // of the index that checkpoint serialises.
+        if self.mode == OpenMode::ReadWrite {
+            self.seal_open_chunk()?;
+        }
         if self.mode == OpenMode::ReadWrite
             && self.spec.index_policy.checkpoint_on_flush
             && self.needs_index_checkpoint()
@@ -4378,6 +4595,7 @@ impl VarveFile {
             ));
         }
         self.write_embedded_manifest_if_needed()?;
+        self.seal_open_chunk()?;
         if self.spec.index_policy.checkpoint_on_flush && self.needs_index_checkpoint() {
             self.write_index_checkpoint()?;
         }
@@ -4405,6 +4623,7 @@ impl VarveFile {
             ));
         }
         self.write_embedded_manifest_if_needed()?;
+        self.seal_open_chunk()?;
         if self.spec.index_policy.checkpoint_on_flush && self.needs_index_checkpoint() {
             self.write_index_checkpoint()?;
         }
@@ -4894,12 +5113,236 @@ impl VarveFile {
         Ok(offsets)
     }
 
+    // -----------------------------------------------------------------------
+    // Growing matrices: chunk routing
+    // -----------------------------------------------------------------------
+
+    /// Which chunk a row belongs to, and its row inside that chunk.
+    ///
+    /// `None` when no dimension grows, or when the row is inside the declared
+    /// extent — chunk 0 is the matrix region, so those rows take the path they
+    /// always took and this feature is invisible to them.
+    fn chunk_for_row(&self, row: u64) -> Option<(u64, u64)> {
+        let rows = self.spec.growing_rows_per_chunk()?;
+        let chunk = row / rows;
+        if chunk == 0 {
+            return None;
+        }
+        Some((chunk, row % rows))
+    }
+
+    /// Cells per row for one matrix block, i.e. the extent of dimension 1.
+    fn chunk_row_width(&self, block: &crate::format::MatrixBlockDescriptor) -> Result<u64> {
+        let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
+        matrix
+            .dimension(block.dimensions[1])
+            .ok_or_else(|| Error::MatrixDimensionMissing(block.dimensions[1].to_string()))
+    }
+
+    /// Opens chunk `index`, sealing whatever chunk was open before it.
+    ///
+    /// Refuses a chunk older than the open one. That refusal is the whole
+    /// contract of sealing: a value that arrives late is reported, not dropped.
+    fn open_chunk_at(&mut self, index: u64) -> Result<()> {
+        match &self.open_chunk {
+            Some(open) if open.index == index => return Ok(()),
+            Some(open) if open.index > index => {
+                return Err(Error::MatrixChunkSealed {
+                    chunk: index,
+                    open: open.index,
+                });
+            }
+            Some(_) => self.seal_open_chunk()?,
+            None => {}
+        }
+        let sealed = self.sealed_chunk_through_now()?;
+        if let Some(sealed) = sealed
+            && index <= sealed
+        {
+            return Err(Error::MatrixChunkSealed {
+                chunk: index,
+                open: sealed,
+            });
+        }
+        let rows = self
+            .spec
+            .growing_rows_per_chunk()
+            .ok_or(Error::MatrixLayoutMissing)?;
+        let first_row = index
+            .checked_mul(rows)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "matrix chunk first row",
+            })?;
+        let mut blocks = Vec::new();
+        blocks
+            .try_reserve_exact(self.spec.matrix_blocks.len())
+            .map_err(|_| Error::AllocationFailed {
+                resource: "matrix chunk blocks",
+                requested: self.spec.matrix_blocks.len() as u64,
+            })?;
+        for descriptor in self.spec.matrix_blocks {
+            let width = self.chunk_row_width(descriptor)?;
+            let cells = rows
+                .checked_mul(width)
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "matrix chunk cells",
+                })?;
+            self.spec
+                .read_limits
+                .check(ReadLimitKey::MatrixCells, cells)?;
+            let slot_len = cells.checked_mul(descriptor.slot_stride).ok_or(
+                Error::ResourceArithmeticOverflow {
+                    resource: "matrix chunk slot region",
+                },
+            )?;
+            self.spec
+                .read_limits
+                .check(ReadLimitKey::MatrixSlotRegionLen, slot_len)?;
+            let commit_len = cells.div_ceil(8);
+            blocks.push(OpenChunkBlock {
+                block_id: descriptor.block_id,
+                stride: descriptor.slot_stride,
+                cells,
+                commit: try_zeroed_vec(commit_len, "matrix chunk commit map")?,
+                slots: try_zeroed_vec(slot_len, "matrix chunk slot region")?,
+            });
+        }
+        self.open_chunk = Some(OpenChunk {
+            index,
+            first_row,
+            rows,
+            blocks,
+            dirty: false,
+        });
+        Ok(())
+    }
+
+    /// The newest sealed chunk index, established from the index on first use.
+    ///
+    /// One prefix read, and only for a handle that actually writes a chunk —
+    /// so a reopened writer that never grows the matrix pays nothing.
+    fn sealed_chunk_through_now(&mut self) -> Result<Option<u64>> {
+        if let Some(sealed) = self.sealed_chunk_through {
+            return Ok(Some(sealed));
+        }
+        let Some(newest) = self
+            .index
+            .iter()
+            .rev()
+            .find(|entry| entry.block_id == MATRIX_CHUNK_BLOCK_ID)
+            .map(|entry| entry.record_offset)
+        else {
+            return Ok(None);
+        };
+        let (index, _, _, _) = self.read_chunk_prefix(newest)?;
+        self.sealed_chunk_through = Some(index);
+        Ok(Some(index))
+    }
+
+    /// Writes the open chunk as one ordinary internal record.
+    ///
+    /// A chunk with no committed cell is dropped rather than written: an empty
+    /// chunk and an absent chunk answer every read identically, and writing one
+    /// would grow the file on every idle flush.
+    fn seal_open_chunk(&mut self) -> Result<()> {
+        let Some(chunk) = self.open_chunk.take() else {
+            return Ok(());
+        };
+        if !chunk.dirty {
+            return Ok(());
+        }
+        let payload = chunk.encode()?;
+        let payload_len = payload.len() as u64;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::RecordPayloadLen, payload_len)?;
+        let index = chunk.index;
+        self.write_record(
+            MATRIX_CHUNK_BLOCK_ID,
+            MATRIX_CHUNK_VERSION,
+            RECORD_FLAG_INTERNAL,
+            &payload,
+        )?;
+        self.sealed_chunk_through = Some(index);
+        Ok(())
+    }
+
+    fn chunk_block_slice<T: VarveMatrixBlock>(
+        &mut self,
+        chunk_index: u64,
+        local_row: u64,
+        key: MatrixKey,
+    ) -> Result<(usize, u64)> {
+        self.open_chunk_at(chunk_index)?;
+        let width = self
+            .spec
+            .matrix_blocks
+            .iter()
+            .find(|block| block.block_id == T::ID)
+            .ok_or(Error::MatrixBlockMissing(T::ID))
+            .and_then(|block| self.chunk_row_width(block))?;
+        if key.ch >= width {
+            return Err(Error::MatrixKeyOutOfBounds {
+                scan: key.scan,
+                ch: key.ch,
+            });
+        }
+        let ordinal = local_row
+            .checked_mul(width)
+            .and_then(|base| base.checked_add(key.ch))
+            .ok_or(Error::InvalidMatrixLayout)?;
+        let chunk = self.open_chunk.as_ref().ok_or(Error::InvalidMatrixChunk)?;
+        let position = chunk
+            .block_position(T::ID)
+            .ok_or(Error::MatrixBlockMissing(T::ID))?;
+        Ok((position, ordinal))
+    }
+
     pub fn write_matrix_cell<T: VarveMatrixBlock>(
         &mut self,
         key: MatrixKey,
         value: &T,
     ) -> Result<()> {
         let _permit = self.ensure_write()?;
+        if let Some((chunk_index, local_row)) = self.chunk_for_row(key.scan) {
+            let (position, ordinal) = self.chunk_block_slice::<T>(chunk_index, local_row, key)?;
+            let stride = self
+                .open_chunk
+                .as_ref()
+                .ok_or(Error::InvalidMatrixChunk)?
+                .blocks[position]
+                .stride;
+            // Bounded exactly as the region path bounds it (DEF-02): one byte
+            // past the stride is enough to report the true length, and no
+            // further buffering is possible whatever the encode does.
+            let encoded = match crate::codec::encode_to_vec_limited(
+                value,
+                T::ENDIAN.unwrap_or(self.spec.endian),
+                stride.saturating_add(1),
+                "matrix chunk slot payload",
+            ) {
+                Ok(encoded) => encoded,
+                Err(Error::LimitExceeded { actual, .. }) => {
+                    return Err(Error::MatrixSizeMismatch {
+                        expected: stride,
+                        actual,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            if encoded.len() as u64 != stride {
+                return Err(Error::MatrixSizeMismatch {
+                    expected: stride,
+                    actual: encoded.len() as u64,
+                });
+            }
+            let chunk = self.open_chunk.as_mut().ok_or(Error::InvalidMatrixChunk)?;
+            let block = &mut chunk.blocks[position];
+            let start =
+                usize::try_from(ordinal * block.stride).map_err(|_| Error::InvalidMatrixLayout)?;
+            block.slots[start..start + encoded.len()].copy_from_slice(&encoded);
+            return Ok(());
+        }
         let result = {
             let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
             crate::matrix::write_cell(self.spec, matrix, self.file.matrix_region(), key, value)
@@ -5072,9 +5515,235 @@ impl VarveFile {
         })
     }
 
+    /// The record offsets of every sealed chunk, oldest first.
+    ///
+    /// Chunks are written in increasing index order — only the newest is open —
+    /// so this list is sorted by chunk index, which is what makes the binary
+    /// search below legal.
+    fn chunk_record_offsets(&self) -> Vec<u64> {
+        self.index
+            .iter()
+            .filter(|entry| entry.block_id == MATRIX_CHUNK_BLOCK_ID)
+            .map(|entry| entry.record_offset)
+            .collect()
+    }
+
+    /// Reads one chunk record's prefix: its index, first row and row count.
+    ///
+    /// `MATRIX_CHUNK_PREFIX_LEN` bytes whatever the chunk holds. This is the
+    /// read that keeps a cell lookup off the chunk's own size.
+    fn read_chunk_prefix(&self, record_offset: u64) -> Result<(u64, u64, u64, u32)> {
+        let payload_offset = record_offset
+            .checked_add(RECORD_HEADER_LEN)
+            .ok_or(Error::InvalidMatrixChunk)?;
+        let mut prefix = [0u8; MATRIX_CHUNK_PREFIX_LEN as usize];
+        self.snapshot.read_exact_at(payload_offset, &mut prefix)?;
+        note_chunk_bytes_read(MATRIX_CHUNK_PREFIX_LEN);
+        if &prefix[..4] != MATRIX_CHUNK_MAGIC {
+            return Err(Error::InvalidMatrixChunk);
+        }
+        if u16::from_le_bytes([prefix[4], prefix[5]]) != MATRIX_CHUNK_VERSION {
+            return Err(Error::InvalidMatrixChunk);
+        }
+        let index = u64::from_le_bytes(prefix[8..16].try_into().expect("slice"));
+        let first_row = u64::from_le_bytes(prefix[16..24].try_into().expect("slice"));
+        let rows = u64::from_le_bytes(prefix[24..32].try_into().expect("slice"));
+        let block_count = u32::from_le_bytes(prefix[32..36].try_into().expect("slice"));
+        Ok((index, first_row, rows, block_count))
+    }
+
+    /// Finds the sealed chunk with this index, by binary search over the chunk
+    /// records — `O(log chunks)` prefix reads, and no state built at open.
+    fn find_chunk_record(&self, chunk_index: u64) -> Result<Option<u64>> {
+        let offsets = self.chunk_record_offsets();
+        let mut low = 0usize;
+        let mut high = offsets.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let (index, _, _, _) = self.read_chunk_prefix(offsets[mid])?;
+            match index.cmp(&chunk_index) {
+                std::cmp::Ordering::Equal => return Ok(Some(offsets[mid])),
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Greater => high = mid,
+            }
+        }
+        Ok(None)
+    }
+
+    /// Where one block's commit map and slot region sit inside a chunk record.
+    fn chunk_block_location(
+        &self,
+        record_offset: u64,
+        block_count: u32,
+        block_id: u32,
+    ) -> Result<Option<ChunkBlockLocation>> {
+        let payload_offset = record_offset
+            .checked_add(RECORD_HEADER_LEN)
+            .ok_or(Error::InvalidMatrixChunk)?;
+        let descriptors_len = MATRIX_CHUNK_BLOCK_DESC_LEN
+            .checked_mul(u64::from(block_count))
+            .ok_or(Error::InvalidMatrixChunk)?;
+        let descriptors_len_usize =
+            usize::try_from(descriptors_len).map_err(|_| Error::InvalidMatrixChunk)?;
+        let mut descriptors = try_zeroed_vec(descriptors_len, "matrix chunk descriptors")?;
+        self.snapshot.read_exact_at(
+            payload_offset
+                .checked_add(MATRIX_CHUNK_PREFIX_LEN)
+                .ok_or(Error::InvalidMatrixChunk)?,
+            &mut descriptors[..descriptors_len_usize],
+        )?;
+        note_chunk_bytes_read(descriptors_len);
+        let mut cursor = payload_offset
+            .checked_add(MATRIX_CHUNK_PREFIX_LEN)
+            .and_then(|offset| offset.checked_add(descriptors_len))
+            .ok_or(Error::InvalidMatrixChunk)?;
+        let mut found = None;
+        for position in 0..block_count as usize {
+            let base = position * MATRIX_CHUNK_BLOCK_DESC_LEN as usize;
+            let id = u32::from_le_bytes(descriptors[base..base + 4].try_into().expect("slice"));
+            let stride =
+                u64::from_le_bytes(descriptors[base + 8..base + 16].try_into().expect("slice"));
+            let cells =
+                u64::from_le_bytes(descriptors[base + 16..base + 24].try_into().expect("slice"));
+            let commit_len =
+                u64::from_le_bytes(descriptors[base + 24..base + 32].try_into().expect("slice"));
+            let slots_offset = cursor
+                .checked_add(commit_len)
+                .ok_or(Error::InvalidMatrixChunk)?;
+            let slots_len = cells.checked_mul(stride).ok_or(Error::InvalidMatrixChunk)?;
+            if id == block_id {
+                found = Some(ChunkBlockLocation {
+                    commit_offset: cursor,
+                    slots_offset,
+                    stride,
+                    cells,
+                });
+            }
+            cursor = slots_offset
+                .checked_add(slots_len)
+                .ok_or(Error::InvalidMatrixChunk)?;
+        }
+        Ok(found)
+    }
+
+    /// The chunk-local ordinal of `key`, and where its block's bytes are.
+    ///
+    /// `Ok(None)` means no chunk record holds that row — which is not an error:
+    /// a chunk nothing committed is never written, so its rows read exactly as
+    /// a written chunk's uncommitted rows do.
+    fn locate_chunk_cell<T: VarveMatrixBlock>(
+        &self,
+        key: MatrixKey,
+        chunk_index: u64,
+        local_row: u64,
+    ) -> Result<Option<(ChunkBlockLocation, u64)>> {
+        let Some(record_offset) = self.find_chunk_record(chunk_index)? else {
+            return Ok(None);
+        };
+        let (_, _, _, block_count) = self.read_chunk_prefix(record_offset)?;
+        let Some(location) = self.chunk_block_location(record_offset, block_count, T::ID)? else {
+            return Err(Error::MatrixBlockMissing(T::ID));
+        };
+        let width = location
+            .cells
+            .checked_div(self.spec.growing_rows_per_chunk().unwrap_or(1))
+            .ok_or(Error::InvalidMatrixChunk)?;
+        if key.ch >= width {
+            return Err(Error::MatrixKeyOutOfBounds {
+                scan: key.scan,
+                ch: key.ch,
+            });
+        }
+        let ordinal = local_row
+            .checked_mul(width)
+            .and_then(|base| base.checked_add(key.ch))
+            .filter(|ordinal| *ordinal < location.cells)
+            .ok_or(Error::InvalidMatrixChunk)?;
+        Ok(Some((location, ordinal)))
+    }
+
+    fn chunk_cell_is_committed(&self, location: ChunkBlockLocation, ordinal: u64) -> Result<bool> {
+        let mut byte = [0u8; 1];
+        self.snapshot.read_exact_at(
+            location
+                .commit_offset
+                .checked_add(ordinal / 8)
+                .ok_or(Error::InvalidMatrixChunk)?,
+            &mut byte,
+        )?;
+        note_chunk_bytes_read(1);
+        Ok(byte[0] & (1u8 << (ordinal % 8)) != 0)
+    }
+
+    /// One cell out of a sealed chunk, read positionally.
+    ///
+    /// Two small reads and one `stride`-byte read. The chunk itself is never
+    /// materialised, whatever it holds.
+    fn read_chunk_cell_payload<T: VarveMatrixBlock>(
+        &self,
+        key: MatrixKey,
+        chunk_index: u64,
+        local_row: u64,
+    ) -> Result<Vec<u8>> {
+        let Some((location, ordinal)) = self.locate_chunk_cell::<T>(key, chunk_index, local_row)?
+        else {
+            return Err(Error::MatrixNotCommitted);
+        };
+        if !self.chunk_cell_is_committed(location, ordinal)? {
+            return Err(Error::MatrixNotCommitted);
+        }
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::RecordPayloadLen, location.stride)?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::MaterializedBytes, location.stride)?;
+        let mut payload = try_zeroed_vec(location.stride, "matrix chunk slot payload")?;
+        self.snapshot.read_exact_at(
+            location
+                .slots_offset
+                .checked_add(
+                    ordinal
+                        .checked_mul(location.stride)
+                        .ok_or(Error::InvalidMatrixChunk)?,
+                )
+                .ok_or(Error::InvalidMatrixChunk)?,
+            &mut payload,
+        )?;
+        note_chunk_bytes_read(location.stride);
+        Ok(payload)
+    }
+
     pub fn read_matrix_cell<T: VarveMatrixBlock>(&self, key: MatrixKey) -> Result<T> {
+        if let Some((chunk_index, local_row)) = self.chunk_for_row(key.scan) {
+            let payload = self.read_chunk_cell_payload::<T>(key, chunk_index, local_row)?;
+            return crate::codec::decode_from_slice(
+                &payload,
+                T::ENDIAN.unwrap_or(self.spec.endian),
+            );
+        }
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
         crate::matrix::read_cell(self.spec, matrix, self.file.matrix_region_reader(), key)
+    }
+
+    /// Whether a cell has a committed value, without raising if it does not.
+    ///
+    /// Answers for a chunked row the same way it answers for a region row: a
+    /// value that never arrived is `NotCommitted`, permanently and by design.
+    /// Sealing asks no question about completeness.
+    pub fn matrix_chunk_cell_status<T: VarveMatrixBlock>(
+        &self,
+        key: MatrixKey,
+    ) -> Result<MatrixCellStatus> {
+        let Some((chunk_index, local_row)) = self.chunk_for_row(key.scan) else {
+            return self.matrix_cell_status::<T>(key);
+        };
+        match self.locate_chunk_cell::<T>(key, chunk_index, local_row)? {
+            Some((location, ordinal)) if self.chunk_cell_is_committed(location, ordinal)? => {
+                Ok(MatrixCellStatus::Committed)
+            }
+            _ => Ok(MatrixCellStatus::NotCommitted),
+        }
     }
 
     pub fn matrix_cell_payload<T: VarveMatrixBlock>(&self, key: MatrixKey) -> Result<Vec<u8>> {
@@ -5130,6 +5799,28 @@ impl VarveFile {
 
     pub fn commit_matrix_cell<T: VarveMatrixBlock>(&mut self, key: MatrixKey) -> Result<()> {
         let _permit = self.ensure_write()?;
+        if let Some((chunk_index, local_row)) = self.chunk_for_row(key.scan) {
+            let (position, ordinal) = self.chunk_block_slice::<T>(chunk_index, local_row, key)?;
+            let chunk = self.open_chunk.as_mut().ok_or(Error::InvalidMatrixChunk)?;
+            let block = &mut chunk.blocks[position];
+            let byte = usize::try_from(ordinal / 8).map_err(|_| Error::InvalidMatrixLayout)?;
+            let bit = 1u8 << (ordinal % 8);
+            // The region path refuses a commit of a cell that was never
+            // written; the chunk path answers the same question from the slot
+            // bytes it is holding.
+            if block.commit[byte] & bit == 0
+                && block.slots[usize::try_from(ordinal * block.stride)
+                    .map_err(|_| Error::InvalidMatrixLayout)?..]
+                    [..usize::try_from(block.stride).map_err(|_| Error::InvalidMatrixLayout)?]
+                    .iter()
+                    .all(|byte| *byte == 0)
+            {
+                return Err(Error::MatrixCellNotWritten);
+            }
+            block.commit[byte] |= bit;
+            chunk.dirty = true;
+            return Ok(());
+        }
         let result = {
             let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
             crate::matrix::commit_cell::<T>(self.spec, matrix, self.file.matrix_region(), key)
@@ -5562,6 +6253,18 @@ impl VarveFile {
     #[doc(hidden)]
     pub fn records_framed() -> u64 {
         RECORDS_FRAMED.with(|framed| framed.get())
+    }
+
+    /// Cumulative bytes this thread has read to answer chunked cell reads.
+    ///
+    /// Fault-testing hook only. This is the unit a growing matrix's read path
+    /// exists to keep small: a chunk is one record, so "read the cell" and
+    /// "read the chunk" differ by orders of magnitude and a regression test can
+    /// tell them apart by an absolute byte count rather than a ratio.
+    #[cfg(feature = "scalable-fault-injection")]
+    #[doc(hidden)]
+    pub fn chunk_bytes_read() -> u64 {
+        CHUNK_BYTES_READ.with(|read| read.get())
     }
 
     #[cfg(feature = "mmap")]
@@ -9237,6 +9940,17 @@ struct ScanChecks {
 #[cfg(feature = "scalable-fault-injection")]
 std::thread_local! {
     static RECORDS_FRAMED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static CHUNK_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts bytes read to answer a chunked cell read on this thread. Inert
+/// without the `scalable-fault-injection` feature.
+#[inline]
+fn note_chunk_bytes_read(bytes: u64) {
+    #[cfg(feature = "scalable-fault-injection")]
+    CHUNK_BYTES_READ.with(|read| read.set(read.get().saturating_add(bytes)));
+    #[cfg(not(feature = "scalable-fault-injection"))]
+    let _ = bytes;
 }
 
 /// Counts records framed while building an index on this thread. Inert without

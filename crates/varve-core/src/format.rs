@@ -1363,6 +1363,31 @@ pub struct BlockResidencyDescriptor {
     pub resident: bool,
 }
 
+/// One matrix dimension that grows past its declared extent, and the row count
+/// each chunk covers.
+///
+/// A matrix's dimensions are otherwise fixed at create, which cannot model a
+/// stream whose extent is unknown when the file is made — you learn a grid is
+/// full when it fills. Declaring this makes rows past the declared extent land
+/// in *chunks*: ordinary internal records in the append log, each covering
+/// `rows_per_chunk` rows of every matrix block.
+///
+/// **The declared extent is chunk 0.** The dimension's value at create must
+/// equal `rows_per_chunk`, so the matrix region *is* the first chunk and every
+/// later chunk has its byte-for-byte layout. Nothing about the region changes.
+///
+/// Only the newest chunk accepts writes. A write addressing a sealed chunk is
+/// refused rather than dropped, and a cell that never received a value keeps
+/// its clear commit bit and reads as `MatrixNotCommitted` — sealing asks no
+/// question about completeness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GrowingMatrixDimension {
+    /// The dimension that grows. Must be `dimensions[0]` of every matrix block.
+    pub name: &'static str,
+    /// Rows per chunk, and the declared value of `name` at create.
+    pub rows_per_chunk: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldPresence {
     Required,
@@ -1685,6 +1710,8 @@ pub struct FormatSpec {
     pub matrix_commits: &'static [MatrixCommitDescriptor],
     pub matrix_blocks: &'static [MatrixBlockDescriptor],
     pub matrix_aux: &'static [MatrixAuxDescriptor],
+    /// The dimension that grows past its declared extent, if any.
+    pub growing_matrix: Option<GrowingMatrixDimension>,
     /// Per-block schema identity of the implementations backing
     /// [`FormatSpec::blocks`], as `(block_id, declared endian override,
     /// keyedness, generated schema fingerprint)` tuples (API2-01).
@@ -1741,6 +1768,7 @@ pub struct FormatSpecBuilder {
     matrix_commits: &'static [MatrixCommitDescriptor],
     matrix_blocks: &'static [MatrixBlockDescriptor],
     matrix_aux: &'static [MatrixAuxDescriptor],
+    growing_matrix: Option<GrowingMatrixDimension>,
     block_identities: &'static [(u32, Option<Endian>, bool, u64)],
     layout: LayoutSpec,
     read_limits: ReadLimits,
@@ -1794,6 +1822,7 @@ impl FormatSpec {
             matrix_commits: &[],
             matrix_blocks: &[],
             matrix_aux: &[],
+            growing_matrix: None,
             block_identities: &[],
             layout: LayoutSpec::varve_native(),
             read_limits: ReadLimits::MISSING,
@@ -1881,6 +1910,36 @@ impl FormatSpec {
             .iter()
             .find(|descriptor| descriptor.block_id == block_id)
             .is_none_or(|descriptor| descriptor.resident)
+    }
+
+    /// Declares the matrix dimension that grows past its declared extent.
+    ///
+    /// `rows_per_chunk` is both the chunk height and the value `name` must be
+    /// given at create: the matrix region is chunk 0, and every later chunk is
+    /// a record with the region's layout. See [`GrowingMatrixDimension`].
+    pub const fn with_growing_matrix_dimension(
+        mut self,
+        name: &'static str,
+        rows_per_chunk: u64,
+    ) -> Self {
+        self.growing_matrix = Some(GrowingMatrixDimension {
+            name,
+            rows_per_chunk,
+        });
+        self
+    }
+
+    pub(crate) const fn with_optional_growing_matrix(
+        mut self,
+        growing: Option<GrowingMatrixDimension>,
+    ) -> Self {
+        self.growing_matrix = growing;
+        self
+    }
+
+    /// Rows each chunk covers, or `None` when no dimension grows.
+    pub fn growing_rows_per_chunk(self) -> Option<u64> {
+        self.growing_matrix.map(|growing| growing.rows_per_chunk)
     }
 
     /// Whether any declared block opts out of residency.
@@ -2553,6 +2612,14 @@ impl FormatSpec {
             hash.write_str(aux.name);
             hash.write_bytes(&aux.byte_len.to_le_bytes());
         }
+        // Folded only when declared: a growing dimension changes which bytes a
+        // writer produces, and a spec that declares none must hash to exactly
+        // what it hashed to before this existed.
+        if let Some(growing) = self.growing_matrix {
+            hash.write_bytes(b"growing-matrix-v1");
+            hash.write_str(growing.name);
+            hash.write_bytes(&growing.rows_per_chunk.to_le_bytes());
+        }
         if !self.layout.is_varve_native_default() {
             hash.write_bytes(b"layout-v1");
             hash_layout_spec(&mut hash, self.layout);
@@ -3039,6 +3106,45 @@ impl FormatSpec {
                         "matrix cell commit category must be unique per block",
                     ));
                 }
+            }
+        }
+        if let Some(growing) = self.growing_matrix {
+            // Every refusal here exists so that "chunk k has the matrix
+            // region's layout" is true by construction rather than by care.
+            if self.matrix_blocks.is_empty() {
+                return Err(Error::InvalidFormatSpec(
+                    "a growing matrix dimension requires at least one matrix block",
+                ));
+            }
+            if growing.rows_per_chunk == 0 {
+                return Err(Error::InvalidFormatSpec(
+                    "growing matrix rows_per_chunk must be non-zero",
+                ));
+            }
+            if !self
+                .matrix_dimensions
+                .iter()
+                .any(|candidate| candidate.name == growing.name)
+            {
+                return Err(Error::InvalidFormatSpec(
+                    "growing matrix dimension is not declared",
+                ));
+            }
+            for block in self.matrix_blocks {
+                // `ordinal = key.scan * dim1 + key.ch`, so only dimension 0 can
+                // grow without renumbering every cell already written.
+                if block.dimensions[0] != growing.name {
+                    return Err(Error::InvalidFormatSpec(
+                        "the growing dimension must be dimension 0 of every matrix block",
+                    ));
+                }
+            }
+            // A chunk is a record: its payload has to be materialised whole to
+            // be written, and a reader charges it against the same ceiling.
+            if matches!(self.read_limits.max_record_payload_len, ReadLimit::Missing) {
+                return Err(Error::InvalidFormatSpec(
+                    "a growing matrix dimension requires a record payload limit",
+                ));
             }
         }
         if !self.matrix_aux.is_empty() && self.matrix_blocks.is_empty() {
@@ -3562,6 +3668,7 @@ impl FormatSpecBuilder {
             matrix_commits: &[],
             matrix_blocks: &[],
             matrix_aux: &[],
+            growing_matrix: None,
             block_identities: &[],
             layout: LayoutSpec::varve_native(),
             read_limits: ReadLimits::MISSING,
@@ -3670,6 +3777,18 @@ impl FormatSpecBuilder {
         self
     }
 
+    pub const fn growing_matrix_dimension(
+        mut self,
+        name: &'static str,
+        rows_per_chunk: u64,
+    ) -> Self {
+        self.growing_matrix = Some(GrowingMatrixDimension {
+            name,
+            rows_per_chunk,
+        });
+        self
+    }
+
     pub const fn layout(mut self, layout: LayoutSpec) -> Self {
         self.layout = layout;
         self
@@ -3706,6 +3825,7 @@ impl FormatSpecBuilder {
             self.matrix_blocks,
         )
         .with_matrix_aux(self.matrix_aux)
+        .with_optional_growing_matrix(self.growing_matrix)
         .with_block_identities(self.block_identities)
         .with_layout(self.layout)
         .with_read_limits(self.read_limits);
