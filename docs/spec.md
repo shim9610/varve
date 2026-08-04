@@ -422,6 +422,22 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
 - Unknown record flag bits are rejected during scan.
 - Compressed flags on fixed, internal, metadata, op, tombstone, index, or manifest records are invalid.
 
+### Header Policy Block
+
+- `FormatSpec::with_header_policy_block(true)` adds a `VPOL` block to the
+  file-header extension region: magic `b"VPOL"`, a `u32` length, then version
+  `u16`, flags `u16`, the index, commit, integrity, recovery and manifest policy
+  bytes, and three reserved bytes.
+- Open compares each byte against the opening spec and refuses the first
+  difference with `Error::HeaderPolicyMismatch { policy, stored, declared }`.
+- A spec that does not declare the block still compares it when the file carries
+  one.
+- Off by default and byte-identical when off. It is mixed into
+  `computed_schema_hash()` only when enabled, so a format that never asks for it
+  hashes exactly as before.
+- Files carrying it do not open on readers predating header-extension block
+  framing, which require the region to match their own spec byte for byte.
+
 ### Internal Segments
 
 - A **segment** is varve's internal lookup unit: the records one commit point

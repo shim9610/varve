@@ -85,6 +85,11 @@ const WRITER_LOCK_MAGIC: &str = "varve-lock-v1";
 const COMPRESSION_ENVELOPE_MAGIC: &[u8; 4] = b"VCMP";
 const COMPRESSION_ENVELOPE_VERSION: u8 = 1;
 const FILE_COMPRESSION_MAGIC: &[u8; 4] = b"VCHD";
+/// The header block that records the policies a file was written under.
+const HEADER_POLICY_MAGIC: &[u8; 4] = b"VPOL";
+const HEADER_POLICY_VERSION: u16 = 1;
+/// version(2) + flags(2) + five policy bytes + three reserved.
+const HEADER_POLICY_PAYLOAD_LEN: usize = 12;
 const FILE_COMPRESSION_VERSION: u8 = 1;
 /// `VCHD`'s payload, excluding its magic.
 ///
@@ -7923,7 +7928,82 @@ fn validate_record_entry(spec: FormatSpec, entry: &RecordIndexEntry) -> Result<(
     ensure_compression_algorithm_available(compression.algorithm)
 }
 
+/// The policies a file records about itself, in a fixed order so a mismatch can
+/// be named rather than reported as "these bytes differ".
+const HEADER_POLICY_FIELDS: [&str; 5] = [
+    "index policy",
+    "commit policy",
+    "integrity policy",
+    "recovery policy",
+    "manifest policy",
+];
+
+fn header_policy_bytes(spec: FormatSpec) -> [u8; 5] {
+    [
+        index_policy_byte(spec.index_policy),
+        commit_policy_byte(spec.commit_policy),
+        integrity_policy_byte(spec.integrity_policy),
+        recovery_policy_byte(spec.recovery_policy),
+        manifest_policy_byte(spec.manifest_policy),
+    ]
+}
+
+/// Encodes the `VPOL` block, length-prefixed like every block added after the
+/// framing shipped.
+fn encode_header_policy_block(spec: FormatSpec) -> Vec<u8> {
+    let mut block = Vec::with_capacity(8 + HEADER_POLICY_PAYLOAD_LEN);
+    block.extend_from_slice(HEADER_POLICY_MAGIC);
+    block.extend_from_slice(&(HEADER_POLICY_PAYLOAD_LEN as u32).to_le_bytes());
+    block.extend_from_slice(&HEADER_POLICY_VERSION.to_le_bytes());
+    block.extend_from_slice(&0u16.to_le_bytes());
+    block.extend_from_slice(&header_policy_bytes(spec));
+    block.extend_from_slice(&[0u8; 3]);
+    block
+}
+
+/// Names the first policy the file disagrees with this spec about.
+///
+/// A byte comparison would answer "different" and stop there, which tells a
+/// caller nothing they can act on. The stored bytes are the same encoding the
+/// embedded manifest uses, so a future version can add fields at the end
+/// without this refusing an older file it understands.
+fn compare_header_policy_block(spec: FormatSpec, encoded: &[u8]) -> Result<()> {
+    let payload = encoded
+        .get(8..)
+        .ok_or(Error::InvalidCanonicalEncoding("truncated header policy"))?;
+    if payload.len() < 4 + HEADER_POLICY_FIELDS.len() {
+        return Err(Error::InvalidCanonicalEncoding("truncated header policy"));
+    }
+    let mut version = [0u8; 2];
+    version.copy_from_slice(&payload[0..2]);
+    if u16::from_le_bytes(version) != HEADER_POLICY_VERSION {
+        return Err(Error::InvalidCanonicalEncoding(
+            "unsupported header policy version",
+        ));
+    }
+    let declared = header_policy_bytes(spec);
+    for (index, name) in HEADER_POLICY_FIELDS.iter().enumerate() {
+        let stored = payload[4 + index];
+        if stored != declared[index] {
+            return Err(Error::HeaderPolicyMismatch {
+                policy: name,
+                stored,
+                declared: declared[index],
+            });
+        }
+    }
+    Ok(())
+}
+
 fn file_header_extensions(spec: FormatSpec) -> Result<Vec<u8>> {
+    let mut region = compression_header_extension(spec)?;
+    if spec.header_policy_block {
+        region.extend_from_slice(&encode_header_policy_block(spec));
+    }
+    Ok(region)
+}
+
+fn compression_header_extension(spec: FormatSpec) -> Result<Vec<u8>> {
     let Some(compression) = variable_compression(spec) else {
         return Ok(Vec::new());
     };
@@ -7956,7 +8036,7 @@ struct HeaderExtensionBlock<'a> {
 /// The whole point of the walk: a magic that is not on this list is skipped,
 /// so a file carrying a block from a later release still opens here.
 fn is_known_header_extension_magic(magic: &[u8; 4]) -> bool {
-    magic == FILE_COMPRESSION_MAGIC
+    magic == FILE_COMPRESSION_MAGIC || magic == HEADER_POLICY_MAGIC
 }
 
 /// Walk the extension region as a block sequence.
@@ -8032,12 +8112,22 @@ fn validate_file_header_extensions(spec: FormatSpec, extensions: &[u8]) -> Resul
             .find(|block| block.magic == expected_block.magic)
             .ok_or(Error::InvalidCompressionHeader)?;
         if found.encoded != expected_block.encoded {
+            if &expected_block.magic == HEADER_POLICY_MAGIC {
+                compare_header_policy_block(spec, found.encoded)?;
+            }
             return Err(Error::InvalidCompressionHeader);
         }
     }
     for block in &present {
         if !is_known_header_extension_magic(&block.magic) {
             continue;
+        }
+        // A file that records its policies must be judged against them. A spec
+        // that does not declare the block would otherwise skip the comparison
+        // and open a file written under policies it does not share - which is
+        // the whole failure the block exists to catch.
+        if &block.magic == HEADER_POLICY_MAGIC && !spec.header_policy_block {
+            compare_header_policy_block(spec, block.encoded)?;
         }
         if !expected_blocks
             .iter()
