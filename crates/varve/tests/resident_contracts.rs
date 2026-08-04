@@ -424,15 +424,20 @@ fn append_time_predecessor_lookup_never_reads_the_resident_index() -> varve::Res
 
     assert_eq!(small_appends, 0, "appends must not read the resident index");
     assert_eq!(large_appends, 0, "appends must not read the resident index");
-    // Calibration: the counter is wired, and the only index pass is the single
-    // one a wholesale load pays.
-    assert!(
-        small_open >= 512,
-        "reopen must rebuild tails once: {small_open}"
+    // Open used to pay a second pass over the index to rebuild the tails, and
+    // this asserted that pass was there. H1 removed it: the tails cannot come
+    // from the resident index any more, because a non-resident block's records
+    // are not in it, so the scan collects them as it goes and orders them once
+    // at the end. One pass instead of two, and the counter that measured the
+    // second one now reads zero at open by construction. It stays wired through
+    // the generation-rebind paths, which still call `BlockTails::from_index`.
+    assert_eq!(
+        small_open, 0,
+        "open must not pay a separate index pass for tails: {small_open}"
     );
-    assert!(
-        large_open >= 4_096,
-        "reopen must rebuild tails once: {large_open}"
+    assert_eq!(
+        large_open, 0,
+        "open must not pay a separate index pass for tails: {large_open}"
     );
     Ok(())
 }

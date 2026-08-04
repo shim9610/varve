@@ -1339,6 +1339,30 @@ pub struct BlockCompressionDescriptor {
     pub compression: VariableCompression,
 }
 
+/// Declares that a block's records are **not retained in the resident index**.
+///
+/// The resident index holds one 104-byte entry per record for the life of the
+/// handle, which is what makes an open cost memory proportional to record count
+/// rather than to bytes. A non-resident block breaks that for its own records:
+/// they are written, sequenced, chained and recoverable exactly as before, and
+/// they are simply not mirrored in memory.
+///
+/// **Not part of the computed schema hash.** Residency changes no byte of the
+/// file — a file written with `resident = false` on a block is byte-identical
+/// to one written without it — so hashing it would turn a memory optimisation
+/// into a migration for files that did not change.
+///
+/// What a non-resident block gives up is everything that reads the resident
+/// index: `blocks::<T>()` refuses rather than returning an empty collection,
+/// the records are absent from `index_entries()`, and replacement cannot
+/// resolve a target. Reach them through the block offset chain, which this
+/// option requires for exactly that reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockResidencyDescriptor {
+    pub block_id: u32,
+    pub resident: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldPresence {
     Required,
@@ -1655,6 +1679,7 @@ pub struct FormatSpec {
     pub manifest_policy: ManifestPolicy,
     pub compression_policy: CompressionPolicy,
     pub block_compression: &'static [BlockCompressionDescriptor],
+    pub block_residency: &'static [BlockResidencyDescriptor],
     pub blocks: &'static [BlockDescriptor],
     pub matrix_dimensions: &'static [MatrixDimensionDescriptor],
     pub matrix_commits: &'static [MatrixCommitDescriptor],
@@ -1710,6 +1735,7 @@ pub struct FormatSpecBuilder {
     manifest_policy: ManifestPolicy,
     compression_policy: CompressionPolicy,
     block_compression: &'static [BlockCompressionDescriptor],
+    block_residency: &'static [BlockResidencyDescriptor],
     blocks: &'static [BlockDescriptor],
     matrix_dimensions: &'static [MatrixDimensionDescriptor],
     matrix_commits: &'static [MatrixCommitDescriptor],
@@ -1762,6 +1788,7 @@ impl FormatSpec {
             manifest_policy,
             compression_policy: CompressionPolicy::None,
             block_compression: &[],
+            block_residency: &[],
             blocks,
             matrix_dimensions: &[],
             matrix_commits: &[],
@@ -1837,6 +1864,30 @@ impl FormatSpec {
     ) -> Self {
         self.block_compression = block_compression;
         self
+    }
+
+    /// Declares which blocks are kept out of the resident index.
+    pub const fn with_block_residency(
+        mut self,
+        block_residency: &'static [BlockResidencyDescriptor],
+    ) -> Self {
+        self.block_residency = block_residency;
+        self
+    }
+
+    /// Whether records of `block_id` are mirrored in the resident index.
+    pub fn block_is_resident(self, block_id: u32) -> bool {
+        self.block_residency
+            .iter()
+            .find(|descriptor| descriptor.block_id == block_id)
+            .is_none_or(|descriptor| descriptor.resident)
+    }
+
+    /// Whether any declared block opts out of residency.
+    pub fn has_non_resident_blocks(self) -> bool {
+        self.block_residency
+            .iter()
+            .any(|descriptor| !descriptor.resident)
     }
 
     pub const fn with_matrix_spec(
@@ -2581,6 +2632,22 @@ impl FormatSpec {
         // louder than quietly clearing it: a format that declared the
         // checkpoint asked for something, and silently not delivering it is how
         // a policy becomes folklore.
+        // A non-resident block is reachable only through its footer chain -
+        // nothing else in varve can find its records once they are out of the
+        // resident index - so the combination without a chain is not a
+        // trade-off to offer, it is a block written into a hole.
+        if self.has_non_resident_blocks() && !self.index_policy.block_offset_chain {
+            return Err(Error::InvalidFormatSpec(
+                "a non-resident block requires block_offset_chain to stay reachable",
+            ));
+        }
+        for descriptor in self.block_residency {
+            if self.block(descriptor.block_id).is_none() {
+                return Err(Error::InvalidFormatSpec(
+                    "residency declared for a block the format does not declare",
+                ));
+            }
+        }
         if self.index_policy.segment_on_flush && self.index_policy.checkpoint_on_flush {
             return Err(Error::InvalidFormatSpec(
                 "segment_on_flush supersedes checkpoint_on_flush; declare one",
@@ -3489,6 +3556,7 @@ impl FormatSpecBuilder {
             manifest_policy: ManifestPolicy::None,
             compression_policy: CompressionPolicy::None,
             block_compression: &[],
+            block_residency: &[],
             blocks: &[],
             matrix_dimensions: &[],
             matrix_commits: &[],
@@ -3563,6 +3631,14 @@ impl FormatSpecBuilder {
         self
     }
 
+    pub const fn block_residency(
+        mut self,
+        block_residency: &'static [BlockResidencyDescriptor],
+    ) -> Self {
+        self.block_residency = block_residency;
+        self
+    }
+
     pub const fn blocks(mut self, blocks: &'static [BlockDescriptor]) -> Self {
         self.blocks = blocks;
         self
@@ -3623,6 +3699,7 @@ impl FormatSpecBuilder {
         .with_commit_policy(self.commit_policy)
         .with_compression_policy(self.compression_policy)
         .with_block_compression(self.block_compression)
+        .with_block_residency(self.block_residency)
         .with_matrix_spec(
             self.matrix_dimensions,
             self.matrix_commits,

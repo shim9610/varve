@@ -1050,14 +1050,6 @@ enum SequenceState {
 }
 
 impl SequenceState {
-    fn from_index(index: &[RecordIndexEntry]) -> Self {
-        match index.iter().map(|entry| entry.sequence).max() {
-            None => Self::Available(0),
-            Some(u64::MAX) => Self::Exhausted,
-            Some(sequence) => Self::Available(sequence + 1),
-        }
-    }
-
     fn available(self) -> Result<u64> {
         match self {
             Self::Available(sequence) => Ok(sequence),
@@ -1281,7 +1273,17 @@ impl BlockTails {
         for entry in index {
             newest.insert(entry.block_id, entry.record_offset);
         }
-        let mut tails: Vec<(u32, u64)> = newest.into_iter().collect();
+        Self::from_newest(&newest)
+    }
+
+    /// Orders an already-collected newest-per-block map.
+    ///
+    /// The scan collects into a map rather than replaying `note_appended`, for
+    /// the reason `from_index` does: replaying inserts every first-seen id into
+    /// the sorted vector, and an index whose first appearances are in descending
+    /// id order moves `0 + 1 + ... + (B - 1)` tuples (PERF3-03).
+    fn from_newest(newest: &HashMap<u32, u64>) -> Self {
+        let mut tails: Vec<(u32, u64)> = newest.iter().map(|(id, offset)| (*id, *offset)).collect();
         tails.sort_unstable_by_key(|(block_id, _)| *block_id);
         Self { tails }
     }
@@ -1295,6 +1297,18 @@ impl BlockTails {
         self.tails
             .binary_search_by_key(&block_id, |(id, _)| *id)
             .ok()
+    }
+
+    /// Puts a block's tail back where it was before an append that rolled
+    /// back. `None` means the block had no record yet, so the entry is removed.
+    fn restore(&mut self, block_id: u32, previous: Option<u64>) {
+        match (self.position(block_id), previous) {
+            (Some(position), Some(offset)) => self.tails[position].1 = offset,
+            (Some(position), None) => {
+                self.tails.remove(position);
+            }
+            (None, _) => {}
+        }
     }
 
     /// Advances the tail for the entry just pushed. Updating a block id the
@@ -1519,6 +1533,11 @@ struct AppendSnapshot {
     index_len: usize,
     checkpoint_cadence: CheckpointCadence,
     segment_cursor: SegmentCursor,
+    /// The block this append is about to move the tail of, and where that tail
+    /// pointed before. Two words, so the rollback needs no allocation.
+    block_id: u32,
+    previous_block_tail: Option<u64>,
+    uncommitted_since_commit: bool,
 }
 
 #[cfg(test)]
@@ -2001,6 +2020,13 @@ pub struct VarveFile {
     // O(1) commit-point state for the internal segment chain; must equal
     // `SegmentCursor::from_index(&index)` at all times.
     segment_cursor: SegmentCursor,
+    // Whether a record that a commit marker would cover has been appended since
+    // the last one. Tracked here rather than read off the resident index,
+    // because a non-resident block's records are not in it: deriving the answer
+    // from the index made `flush` decide there was nothing to commit and skip
+    // the marker, which left every such record permanently uncommitted and
+    // invisible to every reader.
+    uncommitted_since_commit: bool,
     // Lazily built keyed-offset-chain predecessors for the generic keyed
     // append path; a cached map is either absent or exact (API2-05).
     keyed_tails: KeyedTails,
@@ -2873,6 +2899,7 @@ impl VarveFile {
             checkpoint_cadence: CheckpointCadence::new_empty(),
             block_tails: BlockTails::new_empty(),
             segment_cursor: SegmentCursor::new_empty(),
+            uncommitted_since_commit: false,
             keyed_tails: KeyedTails::new_empty(),
             // DUR3-01: this handle established the pathname, so its
             // directory entry is not durable until the first durability
@@ -2974,6 +3001,7 @@ impl VarveFile {
             checkpoint_cadence: CheckpointCadence::new_empty(),
             block_tails: BlockTails::new_empty(),
             segment_cursor: SegmentCursor::new_empty(),
+            uncommitted_since_commit: false,
             keyed_tails: KeyedTails::new_empty(),
             // DUR3-01: this handle established the pathname, so its
             // directory entry is not durable until the first durability
@@ -3012,10 +3040,14 @@ impl VarveFile {
         )?);
         let append_start = append_log_start(header_len, matrix.as_ref());
         let index = load_index(spec, &mut file, append_start, ScanIntent::Writer)?;
+        // The sequence high-water mark and the block tails come from the scan
+        // rather than from the index, because the index is filtered: a
+        // non-resident block's records are on disk and not in it.
+        let sequence_state = index.sequence_state();
+        let block_tails = index.block_tails();
+        let index = index.entries;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
-        let sequence_state = SequenceState::from_index(&index);
         let checkpoint_cadence = CheckpointCadence::from_index(&index);
-        let block_tails = BlockTails::from_index(&index);
         let segment_cursor = SegmentCursor::from_index(&index);
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         Ok(Self {
@@ -3032,6 +3064,7 @@ impl VarveFile {
             checkpoint_cadence,
             block_tails,
             segment_cursor,
+            uncommitted_since_commit: false,
             keyed_tails: KeyedTails::new_empty(),
             pending_pathname_parent_sync: false,
             poison: PoisonFlag::healthy(),
@@ -3070,9 +3103,10 @@ impl VarveFile {
         )?);
         let append_start = append_log_start(header_len, matrix.as_ref());
         let index = load_index(spec, &mut file, append_start, ScanIntent::ReadOnly)?;
-        let sequence_state = SequenceState::from_index(&index);
+        let sequence_state = index.sequence_state();
+        let block_tails = index.block_tails();
+        let index = index.entries;
         let checkpoint_cadence = CheckpointCadence::from_index(&index);
-        let block_tails = BlockTails::from_index(&index);
         let segment_cursor = SegmentCursor::from_index(&index);
         let logical_len = validated_snapshot_len(append_start, &index)?;
         let snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, logical_len)?;
@@ -3090,6 +3124,7 @@ impl VarveFile {
             checkpoint_cadence,
             block_tails,
             segment_cursor,
+            uncommitted_since_commit: false,
             keyed_tails: KeyedTails::new_empty(),
             pending_pathname_parent_sync: false,
             poison: PoisonFlag::healthy(),
@@ -3137,11 +3172,12 @@ impl VarveFile {
         )?);
         let append_start = append_log_start(header_len, matrix.as_ref());
         let index = load_index(spec, &mut file, append_start, ScanIntent::Recover)?;
+        let sequence_state = index.sequence_state();
+        let block_tails = index.block_tails();
+        let index = index.entries;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
         let recovered_len = file.metadata()?.len();
-        let sequence_state = SequenceState::from_index(&index);
         let checkpoint_cadence = CheckpointCadence::from_index(&index);
-        let block_tails = BlockTails::from_index(&index);
         let segment_cursor = SegmentCursor::from_index(&index);
         let records_preserved = index.len();
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
@@ -3160,6 +3196,7 @@ impl VarveFile {
                 checkpoint_cadence,
                 block_tails,
                 segment_cursor,
+                uncommitted_since_commit: false,
                 keyed_tails: KeyedTails::new_empty(),
                 pending_pathname_parent_sync: false,
                 poison: PoisonFlag::healthy(),
@@ -3757,6 +3794,7 @@ impl VarveFile {
             new_physical_len,
         };
 
+        self.ensure_generation_rewrite_allowed()?;
         self.validate_source_generation()?;
         let index_bytes = index_bytes_for_count(self.index.len())?;
         self.spec
@@ -3901,6 +3939,23 @@ impl VarveFile {
     /// replacement and the segment chain are alternatives, and
     /// `replace_block` - which publishes a whole new generation, and re-encodes
     /// every segment payload against the new offsets - is available under both.
+    /// Refuses a whole-generation rewrite for a format with a non-resident
+    /// block.
+    ///
+    /// Both rewrite paths rebuild the new generation by iterating the resident
+    /// index, which no longer mirrors every record: a non-resident block's
+    /// records would be absent from the copy and silently dropped from the
+    /// published file. This is a format-level refusal rather than a per-block
+    /// one, because the loss is of blocks the caller did not name.
+    fn ensure_generation_rewrite_allowed(&self) -> Result<()> {
+        if self.spec.has_non_resident_blocks() {
+            return Err(Error::InvalidFormatSpec(
+                "a generation rewrite is not supported for a format with a non-resident block",
+            ));
+        }
+        Ok(())
+    }
+
     fn ensure_in_place_replacement_allowed(&self) -> Result<()> {
         if self.spec.index_policy.segment_on_flush {
             return Err(Error::InvalidFormatSpec(
@@ -3945,6 +4000,7 @@ impl VarveFile {
         self.spec
             .read_limits
             .check(ReadLimitKey::FileLen, self.snapshot.len())?;
+        self.ensure_generation_rewrite_allowed()?;
         self.validate_source_generation()?;
 
         let sequence = self.sequence_state.available()?;
@@ -4107,6 +4163,7 @@ impl VarveFile {
                 new: payload_len,
             });
         }
+        self.ensure_generation_rewrite_allowed()?;
         self.validate_source_generation()?;
         let sequence = self.sequence_state.available()?;
         let entry = &self.index[target_position];
@@ -4183,6 +4240,7 @@ impl VarveFile {
         self.spec
             .read_limits
             .check(ReadLimitKey::RecordPayloadLen, replacement_len)?;
+        self.ensure_generation_rewrite_allowed()?;
         self.validate_source_generation()?;
 
         let index_bytes = index_bytes_for_count(self.index.len())?;
@@ -4447,8 +4505,22 @@ impl VarveFile {
         }
     }
 
+    /// The record offset of the newest record of `block_id`, or `None` if the
+    /// file holds none.
+    ///
+    /// H2. The entry point of the block offset chain, and the only way to reach
+    /// a non-resident block: from here each record's footer names its
+    /// predecessor. `&self`, answered from the maintained tail table without
+    /// touching the resident index (PERF2-05).
+    pub fn block_tail_offset(&self, block_id: u32) -> Option<u64> {
+        self.block_tails.tail(block_id)
+    }
+
     pub fn blocks<T: VarveBlock>(&self) -> Result<BlockVec<T>> {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
+        // A non-resident block has no entries here, and an empty collection
+        // would say "nothing was written" rather than "not through this door".
+        crate::collections::ensure_resident_block::<T>(self.spec)?;
         let entries =
             clone_matching_entries(self.spec, &self.index, |entry| entry.block_id == T::ID)?;
         Ok(BlockVec::new(self.spec, self.snapshot.clone(), entries))
@@ -5957,6 +6029,11 @@ impl VarveFile {
         // token they produce is the only thing that can install the entry
         // afterwards. See `mod reserved_index_slot`.
         let spec = self.spec;
+        // H1, and the only per-block branch the index append has ever had.
+        // Internal records are always resident: the manifest, commit markers,
+        // checkpoints and segments are varve's own bookkeeping and every open
+        // path expects to find them.
+        let resident = block_id >= RESERVED_BLOCK_ID_START || spec.block_is_resident(block_id);
         let index_slot = self.index.reserve(|| {
             let index_bytes = index_bytes_for_count(record_count)?;
             spec.read_limits
@@ -5972,6 +6049,9 @@ impl VarveFile {
             index_len: self.index.len(),
             checkpoint_cadence: self.checkpoint_cadence,
             segment_cursor: self.segment_cursor,
+            block_id,
+            previous_block_tail: self.block_tails.tail(block_id),
+            uncommitted_since_commit: self.uncommitted_since_commit,
         };
         let record_offset = snapshot.eof;
         let payload_offset = record_offset.checked_add(RECORD_HEADER_LEN).ok_or(
@@ -6081,16 +6161,37 @@ impl VarveFile {
             committed,
         };
         let info = AppendInfo::from(&entry);
-        self.index.install(index_slot, entry);
-        // Single index append site: keep the O(1) flush-cadence state in
-        // lockstep with the resident index (PERF2-02), and the block tails
-        // with it (PERF2-05). Both run only after the record is durable in the
-        // append log, so the rollback path never has to undo them.
-        self.checkpoint_cadence
-            .note_appended(self.index.len() - 1, block_id);
+        // A non-resident block's record is written, sequenced, chained and
+        // recoverable exactly as any other; it is simply not mirrored in
+        // memory, which is what stops resident cost tracking record count.
+        //
+        // Three things are deliberately *not* skipped with it. Sequences are
+        // file-global and gapless, so `publish_sequence` below runs either way.
+        // `BlockTails` is what makes the footer chain walkable and is
+        // `O(blocks)`, not `O(records)` - it is the only way back to a
+        // non-resident record, so it is maintained for every block. And the
+        // record's own footer chain went to disk above, not to memory.
+        if resident {
+            self.index.install(index_slot, entry);
+            // Single index append site: keep the O(1) flush-cadence state in
+            // lockstep with the resident index (PERF2-02). It counts resident
+            // entries, so a non-resident record must not advance it.
+            self.checkpoint_cadence
+                .note_appended(self.index.len() - 1, block_id);
+            self.segment_cursor
+                .note_appended(self.index.len() - 1, block_id, prospective_len);
+        } else {
+            drop(index_slot);
+        }
         self.block_tails.note_appended(block_id, record_offset);
-        self.segment_cursor
-            .note_appended(self.index.len() - 1, block_id, prospective_len);
+        // The marker itself clears the flag; a segment record is written after
+        // the marker it certifies and must not set it again, or a repeated idle
+        // flush would write marker, segment, marker, segment forever.
+        self.uncommitted_since_commit = match block_id {
+            COMMIT_BLOCK_ID => false,
+            SEGMENT_BLOCK_ID => self.uncommitted_since_commit,
+            _ => true,
+        };
         self.snapshot = new_snapshot;
         self.publish_sequence(sequence);
         Ok(info)
@@ -6102,8 +6203,16 @@ impl VarveFile {
         // the `BlockTails::from_index` invariant unconditional (PERF2-05).
         let truncated = self.index.len() > snapshot.index_len;
         self.index.truncate(snapshot.index_len);
+        // Restore the one tail this append moved rather than rebuilding the
+        // table from the resident index. Rebuilding was correct only while the
+        // index mirrored every record: with a non-resident block it would drop
+        // that block's tail entirely, and the tail is the only way back to its
+        // records. It is also O(1) and allocation-free, which the rebuild was
+        // not (PERF2-05).
+        self.block_tails
+            .restore(snapshot.block_id, snapshot.previous_block_tail);
+        self.uncommitted_since_commit = snapshot.uncommitted_since_commit;
         if truncated {
-            self.block_tails = BlockTails::from_index(&self.index);
             self.keyed_tails.invalidate_all();
         }
         self.sequence_state = snapshot.sequence_state;
@@ -6319,23 +6428,7 @@ impl VarveFile {
     }
 
     fn has_uncommitted_since_last_commit(&self) -> bool {
-        // Every entry after the last commit marker is by definition not a
-        // commit marker, so "any non-commit entry after the last commit"
-        // reduces to "the newest entry is not a commit marker". The former
-        // reverse search re-walked the index on every flush, adding another
-        // O(N^2) cumulative flush cost for marker-on-flush formats (PERF2-02).
-        //
-        // With one exception, and it is bounded at one entry: a segment record
-        // is appended *after* the marker that certified its coverage, because
-        // open has to find it at the end of the file. Skipping it here is what
-        // stops a repeated flush from writing marker, segment, marker, segment
-        // forever on a file nothing is being appended to.
-        let mut newest = self.index.iter().rev();
-        let entry = match newest.next() {
-            Some(entry) if entry.block_id == SEGMENT_BLOCK_ID => newest.next(),
-            other => other,
-        };
-        entry.is_some_and(|entry| entry.block_id != COMMIT_BLOCK_ID)
+        self.uncommitted_since_commit
     }
 
     /// Decides whether `flush`/`commit` should serialize a fresh full index
@@ -9558,6 +9651,102 @@ fn prepare_stream_record(
 /// data record cannot produce it. [`IntegrityVerification::AtOpen`] asks for
 /// the same verification of every record for the same reason. Under either,
 /// the walk would be answering a cheaper question than the one asked.
+/// What an open recovers from the file, beyond the resident index itself.
+///
+/// The index is filtered — a non-resident block's records are on disk and not
+/// in it — so two things that used to be derived *from* the index cannot be any
+/// more, and are carried out of the walk instead.
+#[derive(Debug)]
+struct ScannedIndex {
+    entries: Vec<RecordIndexEntry>,
+    /// The highest sequence any record in the file carries, resident or not.
+    ///
+    /// `SequenceState::from_index` took the maximum in the resident index. With
+    /// a non-resident block that maximum is stale, and the writer would re-issue
+    /// sequence numbers already on disk — silently, and for exactly the block
+    /// the option exists to serve. Sequences are file-global and gapless, so
+    /// the high-water mark has to come from every record.
+    sequence_high_water: Option<u64>,
+    /// The high-water mark as of the newest commit marker.
+    ///
+    /// A writer open discards everything after that marker, so those sequences
+    /// go with it and may be re-issued — which is what the pre-H1 behaviour did
+    /// by taking the maximum of the already-truncated index. Every non-resident
+    /// survivor sits at or before the marker, so this bounds them all; the one
+    /// record that survives *past* the marker is the trailing segment, and it
+    /// is resident, so the final entry list covers it.
+    sequence_high_water_at_commit: Option<u64>,
+    /// The tails as of the newest commit marker, for the same reason.
+    ///
+    /// A tail left pointing into the truncated region makes the next append
+    /// write a footer naming a record past the end of the file, and the reopen
+    /// after that fails with `InvalidRecordFooter`.
+    newest_at_commit: HashMap<u32, u64>,
+    /// Newest record offset per block id, resident or not.
+    ///
+    /// `BlockTails::from_index` cannot answer this any more: it would drop the
+    /// tail of a non-resident block, and that tail is the only way back to its
+    /// records. Collected in a map and ordered exactly once at the end, because
+    /// a per-record `note_appended` reintroduces the `Theta(B^2)` sorted-vector
+    /// insertion term PERF3-03 removed.
+    newest: HashMap<u32, u64>,
+}
+
+impl ScannedIndex {
+    /// Records one record's contribution to the parts that outlive filtering.
+    fn note(&mut self, entry: &RecordIndexEntry) {
+        self.sequence_high_water = Some(match self.sequence_high_water {
+            Some(seen) => seen.max(entry.sequence),
+            None => entry.sequence,
+        });
+        self.newest.insert(entry.block_id, entry.record_offset);
+        if entry.block_id == COMMIT_BLOCK_ID {
+            self.sequence_high_water_at_commit = self.sequence_high_water;
+            // O(B) and allocation-free after the first marker: the keys are
+            // already there, only the values move.
+            self.newest_at_commit.clear();
+            self.newest_at_commit
+                .extend(self.newest.iter().map(|(id, offset)| (*id, *offset)));
+        }
+    }
+
+    /// Drops the recovered state to what survives a commit-boundary truncation.
+    ///
+    /// `entries` is the surviving resident list. Everything non-resident that
+    /// survives sits at or before the newest commit marker, so the snapshots
+    /// taken there bound it; the one record that survives *past* the marker is
+    /// the trailing segment, which is resident and therefore in `entries`.
+    fn commit_boundary_applied(&mut self, entries: &[RecordIndexEntry]) {
+        let surviving = entries.iter().map(|entry| entry.sequence).max();
+        self.sequence_high_water = match (self.sequence_high_water_at_commit, surviving) {
+            (Some(at_commit), Some(resident)) => Some(at_commit.max(resident)),
+            (at_commit, resident) => at_commit.or(resident),
+        };
+        self.newest.clear();
+        self.newest.extend(
+            self.newest_at_commit
+                .iter()
+                .map(|(id, offset)| (*id, *offset)),
+        );
+        for entry in entries {
+            self.newest.insert(entry.block_id, entry.record_offset);
+        }
+    }
+
+    /// Orders the collected tails exactly once (PERF3-03).
+    fn block_tails(&self) -> BlockTails {
+        BlockTails::from_newest(&self.newest)
+    }
+
+    fn sequence_state(&self) -> SequenceState {
+        match self.sequence_high_water {
+            None => SequenceState::Available(0),
+            Some(u64::MAX) => SequenceState::Exhausted,
+            Some(sequence) => SequenceState::Available(sequence + 1),
+        }
+    }
+}
+
 fn segment_chain_open_is_allowed(spec: FormatSpec, intent: ScanIntent) -> bool {
     spec.index_policy.segment_on_flush
         && intent != ScanIntent::Recover
@@ -9573,11 +9762,11 @@ fn load_index(
     file: &mut File,
     header_len: u64,
     intent: ScanIntent,
-) -> Result<Vec<RecordIndexEntry>> {
+) -> Result<ScannedIndex> {
     if segment_chain_open_is_allowed(spec, intent)
-        && let Some(entries) = load_index_from_segments(spec, file, header_len)?
+        && let Some(scanned) = load_index_from_segments(spec, file, header_len)?
     {
-        return Ok(entries);
+        return Ok(scanned);
     }
     // Sequence uniqueness is validated exactly once, inside
     // `scan_records_from`, on the complete scanned entry list *before* any
@@ -9619,9 +9808,9 @@ fn load_index_from_segments(
     spec: FormatSpec,
     file: &mut File,
     append_start: u64,
-) -> Result<Option<Vec<RecordIndexEntry>>> {
+) -> Result<Option<ScannedIndex>> {
     match walk_segment_chain(spec, file, append_start) {
-        Ok(entries) => Ok(Some(entries)),
+        Ok(scanned) => Ok(Some(scanned)),
         // Only a *spec-level* refusal propagates: the format declared no
         // ceiling, or demanded the explicit unbounded API. Those describe the
         // caller's configuration and are the same answer the scan would give.
@@ -9686,7 +9875,7 @@ fn walk_segment_chain(
     spec: FormatSpec,
     file: &mut File,
     append_start: u64,
-) -> Result<Vec<RecordIndexEntry>> {
+) -> Result<ScannedIndex> {
     let file_len = file.metadata()?.len();
     spec.read_limits.check(ReadLimitKey::FileLen, file_len)?;
     let mut accounting = ScanAccounting::default();
@@ -9754,29 +9943,40 @@ fn walk_segment_chain(
         return Err(Error::InvalidIndexSegment);
     }
 
-    let mut entries = Vec::new();
+    let mut scanned = ScannedIndex {
+        entries: Vec::new(),
+        sequence_high_water: None,
+        sequence_high_water_at_commit: None,
+        newest: HashMap::new(),
+        newest_at_commit: HashMap::new(),
+    };
     let mut running = append_start;
     for (link, segment) in chain.into_iter().rev() {
-        let count =
-            u64::try_from(entries.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+        // `preceding_records` is the writer's *resident* index position, and
+        // the filter below drops exactly what the writer never installed, so
+        // the two counts stay comparable with a non-resident block in play.
+        let count = u64::try_from(scanned.entries.len()).map_err(|_| {
+            Error::ResourceArithmeticOverflow {
                 resource: "record count",
-            })?;
+            }
+        })?;
         if segment.covered_start != running || segment.preceding_records != count {
             return Err(Error::InvalidIndexSegment);
         }
         for covered in segment.entries {
-            running = push_scanned_entry(spec, &mut entries, covered, running)?;
+            running = push_scanned_entry(spec, &mut scanned, covered, running)?;
         }
         // The segment record closes its own coverage, so it sits immediately
         // after the last record it describes.
         if link.record_offset != running {
             return Err(Error::InvalidIndexSegment);
         }
-        running = push_scanned_entry(spec, &mut entries, link, running)?;
+        running = push_scanned_entry(spec, &mut scanned, link, running)?;
     }
     if running != file_len {
         return Err(Error::InvalidIndexSegment);
     }
+    let entries = scanned.entries;
     // Same single witness the scan carries, on the same shape of list
     // (PERF2-07): a chain is written by this crate but read from a file
     // anyone can hand over.
@@ -9795,14 +9995,14 @@ fn walk_segment_chain(
     {
         return Err(Error::InvalidIndexSegment);
     }
-    Ok(entries)
+    Ok(ScannedIndex { entries, ..scanned })
 }
 
 /// Appends one entry to an index under construction, charging the same limits
 /// the record scan charges, and reports where the record after it must begin.
 fn push_scanned_entry(
     spec: FormatSpec,
-    entries: &mut Vec<RecordIndexEntry>,
+    scanned: &mut ScannedIndex,
     entry: RecordIndexEntry,
     expected_offset: u64,
 ) -> Result<u64> {
@@ -9815,9 +10015,23 @@ fn push_scanned_entry(
         return Err(Error::InvalidIndexSegment);
     }
     let end = entry.checked_physical_end()?;
-    reserve_scanned_entry(spec, entries)?;
-    entries.push(entry);
+    // Every record contributes its sequence and its block tail; only a resident
+    // one is materialised. The chain carries every record precisely so this
+    // filter can happen here rather than on disk.
+    scanned.note(&entry);
+    if record_is_resident(spec, entry.block_id) {
+        reserve_scanned_entry(spec, &mut scanned.entries)?;
+        scanned.entries.push(entry);
+    }
     Ok(end)
+}
+
+/// Whether a record of `block_id` is mirrored in the resident index.
+///
+/// varve's own bookkeeping is always resident: the manifest, commit markers,
+/// checkpoints and segment records are what the open paths navigate by.
+fn record_is_resident(spec: FormatSpec, block_id: u32) -> bool {
+    block_id >= RESERVED_BLOCK_ID_START || spec.block_is_resident(block_id)
 }
 
 /// Charges the record and index-byte ceilings for one more index entry and
@@ -10158,11 +10372,18 @@ fn scan_records_from(
     file: &mut File,
     header_len: u64,
     intent: ScanIntent,
-) -> Result<Vec<RecordIndexEntry>> {
+) -> Result<ScannedIndex> {
     let file_len = file.metadata()?.len();
     spec.read_limits.check(ReadLimitKey::FileLen, file_len)?;
     let mut offset = header_len;
     let mut entries = Vec::new();
+    let mut scanned = ScannedIndex {
+        entries: Vec::new(),
+        sequence_high_water: None,
+        sequence_high_water_at_commit: None,
+        newest: HashMap::new(),
+        newest_at_commit: HashMap::new(),
+    };
     let mut latest_commit_end = None;
     let mut accounting = ScanAccounting::default();
     accounting.advance(spec, header_len)?;
@@ -10226,7 +10447,15 @@ fn scan_records_from(
             .map_err(|_| Error::ResourceArithmeticOverflow {
                 resource: "record extent",
             })?;
-        reserve_scanned_entry(spec, &mut entries)?;
+        // Every record contributes its sequence and its block tail even when it
+        // is not materialised: the high-water mark is what the next append
+        // continues from, and the tail is the only way back to a non-resident
+        // record.
+        scanned.note(&entry);
+        let resident = record_is_resident(spec, entry.block_id);
+        if resident {
+            reserve_scanned_entry(spec, &mut entries)?;
+        }
         if entry.block_id == INDEX_BLOCK_ID
             && (1..=INDEX_CHECKPOINT_VERSION).contains(&entry.block_version)
         {
@@ -10236,7 +10465,9 @@ fn scan_records_from(
         if entry.block_id == COMMIT_BLOCK_ID {
             latest_commit_end = Some(offset);
         }
-        entries.push(entry);
+        if resident {
+            entries.push(entry);
+        }
     }
     // Single sequence-uniqueness witness for the whole load path: `load_index`
     // relies on this check and must not repeat it (PERF2-07). It runs on the
@@ -10245,14 +10476,19 @@ fn scan_records_from(
     validate_unique_sequences(&entries)?;
     if spec.commit_policy.is_transaction_marker() {
         let Some(committed) = committed_prefix_len(&entries) else {
-            return Ok(Vec::new());
+            scanned.commit_boundary_applied(&[]);
+            return Ok(ScannedIndex {
+                entries: Vec::new(),
+                ..scanned
+            });
         };
         entries.truncate(committed);
         for entry in &mut entries {
             entry.committed = true;
         }
+        scanned.commit_boundary_applied(&entries);
     }
-    Ok(entries)
+    Ok(ScannedIndex { entries, ..scanned })
 }
 
 impl RecordIndexEntry {

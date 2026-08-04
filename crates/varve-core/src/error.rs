@@ -108,6 +108,16 @@ pub enum Error {
     #[error("invalid or stale index segment")]
     InvalidIndexSegment,
 
+    /// A read that resolves through the resident index was asked for a block
+    /// declared non-resident.
+    ///
+    /// The loud half of the residency trade. An empty collection would be
+    /// indistinguishable from "nothing was ever written", so a caller who opted
+    /// a block out and then read it through the wrong door would see their data
+    /// as missing rather than as unreachable by that door.
+    #[error("block {block_id} is declared non-resident; read it through the block offset chain")]
+    BlockNotResident { block_id: u32 },
+
     #[error("block version mismatch for block {block_id}: expected {expected}, got {actual}")]
     BlockVersionMismatch {
         block_id: u32,

@@ -859,6 +859,7 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::CorruptTail { .. }
         | Error::InvalidIndexCheckpoint
         | Error::InvalidIndexSegment
+        | Error::BlockNotResident { .. }
         | Error::ChecksumMismatch { .. }
         | Error::UnsupportedCompressionAlgorithm(_)
         | Error::InvalidCompressionHeader

@@ -224,6 +224,18 @@ where
     }
 }
 
+/// Refuses a read that resolves through the resident index for a block that is
+/// not in it.
+///
+/// Not folded into [`ensure_registered_block`]: appending to a non-resident
+/// block is the whole point of declaring one, and that path shares the gate.
+pub(crate) fn ensure_resident_block<T: VarveBlock>(spec: FormatSpec) -> Result<()> {
+    if spec.block_is_resident(T::ID) {
+        return Ok(());
+    }
+    Err(crate::Error::BlockNotResident { block_id: T::ID })
+}
+
 pub(crate) fn ensure_registered_block<T: VarveBlock>(spec: FormatSpec) -> Result<()> {
     let descriptor = spec
         .block(T::ID)

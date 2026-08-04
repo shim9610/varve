@@ -97,11 +97,11 @@ pub use file::{
 #[cfg(feature = "mmap")]
 pub use file::{MmapMatrix, MmapPayloads};
 pub use format::{
-    BlockCompressionDescriptor, BlockDescriptor, BlockKind, CommitPolicy, CompressionAlgorithm,
-    CompressionHeaderMode, CompressionLevel, CompressionPolicy, Endian, FieldDescriptor,
-    FieldPresence, FileHeaderDescriptor, FooterDescriptor, FormatSpec, FormatSpecBuilder,
-    IndexPolicy, IntegrityPolicy, IntegrityVerification, LayoutAnchor, LayoutBytesSource,
-    LayoutFieldDescriptor, LayoutFieldSource, LayoutFieldType, LayoutFinalize,
+    BlockCompressionDescriptor, BlockDescriptor, BlockKind, BlockResidencyDescriptor, CommitPolicy,
+    CompressionAlgorithm, CompressionHeaderMode, CompressionLevel, CompressionPolicy, Endian,
+    FieldDescriptor, FieldPresence, FileHeaderDescriptor, FooterDescriptor, FormatSpec,
+    FormatSpecBuilder, IndexPolicy, IntegrityPolicy, IntegrityVerification, LayoutAnchor,
+    LayoutBytesSource, LayoutFieldDescriptor, LayoutFieldSource, LayoutFieldType, LayoutFinalize,
     LayoutPartDescriptor, LayoutPartKind, LayoutPlan, LayoutPlanField, LayoutPlanFieldGroup,
     LayoutPlanFieldSource, LayoutPlanFieldType, LayoutPlanLen, LayoutPlanPartDescriptor,
     LayoutPlanPartKind, LayoutPlanRegion, LayoutPlanRegionSource, LayoutPlanSegment, LayoutPreset,

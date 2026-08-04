@@ -626,8 +626,15 @@ on Windows, and nothing above was measured beyond 200,000 records.
 
 What it does **not** change is the paragraph below: the index it produces is the
 same `Vec<RecordIndexEntry>` with one entry per record, so `104 * records` is
-still what a handle holds. Reducing that is a separate mechanism and is not
-built.
+still what a handle holds for the blocks that are in it.
+
+**`BlockResidencyDescriptor` is the mechanism that reduces that**, per block. A
+block declared `resident: false` is written, sequenced, chained and recovered
+exactly as before and is not mirrored in memory, so `104 * records` counts only
+the blocks you kept. It requires `block_offset_chain`, and it gives up
+`blocks::<T>()` (a typed `Error::BlockNotResident`, not an empty collection),
+replacement, and whole-generation rewrite for the whole format. Reach the block
+through `VarveFile::block_tail_offset(block_id)` and the footer chain.
 
 It is opt-in, off by default, and a file written with it off is byte-identical
 to one written before the option existed. Enabling it costs:
