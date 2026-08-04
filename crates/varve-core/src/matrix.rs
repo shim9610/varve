@@ -5358,6 +5358,13 @@ fn block_index_for_category(
 /// Yields the fatal-access witness as well as making the quarantine refusal,
 /// so a caller that has established publishability does not re-read the gate to
 /// address the category it just checked.
+/// The two gates a chunked cell access must pass, for callers outside this
+/// module that address cells without a `MatrixLayout` slot.
+pub(crate) fn ensure_chunk_access_allowed(layout: &MatrixLayout, category: &str) -> Result<()> {
+    ensure_commit_publishable(layout, category)?;
+    Ok(())
+}
+
 fn ensure_commit_publishable(layout: &MatrixLayout, category: &str) -> Result<FatalAccessAllowed> {
     let allowed = layout.ensure_fatal_access_allowed()?;
     let commit = &layout.commits[layout.commit_index(&allowed, category)?];

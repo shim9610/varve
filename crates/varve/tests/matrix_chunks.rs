@@ -348,9 +348,16 @@ fn a_write_into_a_sealed_chunk_is_refused_and_changes_nothing() -> varve::Result
 
     // Late data is reported, not dropped: a value that silently does not arrive
     // is indistinguishable from one that was never sent.
+    //
+    // `open` is `None` because the flush above sealed chunk 2, so nothing is
+    // open — which the error now says, rather than naming the refused chunk as
+    // its own opener.
     assert!(matches!(
         writer.write_matrix_cell(key(ROWS_PER_CHUNK, 1), &Sample { value: 3 }),
-        Err(Error::MatrixChunkSealed { chunk: 1, open: 2 }),
+        Err(Error::MatrixChunkSealed {
+            chunk: 1,
+            open: None
+        }),
     ));
     writer.flush()?;
     assert_eq!(std::fs::read(path.path())?, before);
@@ -666,13 +673,19 @@ fn a_reopened_writer_appends_to_a_later_chunk_and_still_refuses_the_sealed_one()
     // crash sweep caught that, which is why the order here is deliberate.
     assert!(matches!(
         writer.write_matrix_cell(first, &Sample { value: 1 }),
-        Err(Error::MatrixChunkSealed { chunk: 1, open: 1 }),
+        Err(Error::MatrixChunkSealed {
+            chunk: 1,
+            open: None
+        }),
     ));
     writer.write_matrix_cell(later, &Sample { value: 9 })?;
     writer.commit_matrix_cell::<Sample>(later)?;
     assert!(matches!(
         writer.write_matrix_cell(first, &Sample { value: 1 }),
-        Err(Error::MatrixChunkSealed { chunk: 1, open: 3 }),
+        Err(Error::MatrixChunkSealed {
+            chunk: 1,
+            open: Some(3)
+        }),
     ));
     writer.flush()?;
     drop(writer);
@@ -824,6 +837,209 @@ fn a_truncated_file_loses_no_committed_cell_and_shows_no_half_chunk() -> varve::
 }
 
 // ---------------------------------------------------------------------------
+// Nothing committed is lost, and nothing is lost quietly
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_zero_valued_cell_can_be_committed() -> varve::Result<()> {
+    // `commit_matrix_cell` decided "was this written" by testing whether the
+    // slot read as all zeros, so `Sample { value: 0 }` — a legitimate value —
+    // could never be committed in a chunk while committing fine in the region.
+    // The region keeps a write bitmap for exactly this reason; a chunk does now
+    // too.
+    let path = temp_path("zero_value");
+    let chunked = key(ROWS_PER_CHUNK, 0);
+    let region = key(0, 0);
+    {
+        let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+        writer.write_matrix_cell(region, &Sample { value: 0 })?;
+        writer.commit_matrix_cell::<Sample>(region)?;
+        writer.write_matrix_cell(chunked, &Sample { value: 0 })?;
+        writer.commit_matrix_cell::<Sample>(chunked)?;
+        writer.flush()?;
+    }
+    let reader = growing_spec().open_reader(path.path())?;
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(region)?,
+        Sample { value: 0 }
+    );
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(chunked)?,
+        Sample { value: 0 },
+    );
+    Ok(())
+}
+
+#[test]
+fn a_cell_never_written_still_refuses_to_commit() -> varve::Result<()> {
+    // The other half of the same rule: replacing the all-zero test with a write
+    // bitmap must not make commit accept anything.
+    let path = temp_path("uncommitted_refusal");
+    let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+    assert!(matches!(
+        writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 2)),
+        Err(Error::MatrixCellNotWritten),
+    ));
+    Ok(())
+}
+
+#[test]
+fn write_then_flush_then_commit_keeps_the_write() -> varve::Result<()> {
+    // A chunk with no committed cell used to be *dropped* at flush, so this
+    // sequence lost the write on a chunked row while working on a region row —
+    // and the row could become permanently unwritable once a later chunk sealed
+    // past it. It stays open now: there is nothing to publish, so a commit
+    // point holding it costs nothing.
+    let path = temp_path("write_flush_commit");
+    let cell = key(ROWS_PER_CHUNK, 1);
+    {
+        let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+        writer.write_matrix_cell(cell, &Sample { value: 33 })?;
+        writer.flush()?;
+        writer.commit_matrix_cell::<Sample>(cell)?;
+        writer.flush()?;
+    }
+    let reader = growing_spec().open_reader(path.path())?;
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(cell)?,
+        Sample { value: 33 }
+    );
+    Ok(())
+}
+
+#[test]
+fn dropping_a_writer_seals_the_open_chunk() -> varve::Result<()> {
+    // Every other byte a writer accepts is on disk before the call returns; a
+    // chunked cell was the one exception, and dropping the writer lost every
+    // committed cell in the open chunk. Best effort — `drop` cannot report a
+    // failure — but the ordinary case must not lose data.
+    let path = temp_path("drop_seals");
+    let cell = key(ROWS_PER_CHUNK, 0);
+    {
+        let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+        writer.write_matrix_cell(cell, &Sample { value: 21 })?;
+        writer.commit_matrix_cell::<Sample>(cell)?;
+        // No flush, no commit, no sync.
+    }
+    let reader = growing_spec().open_reader(path.path())?;
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(cell)?,
+        Sample { value: 21 }
+    );
+    Ok(())
+}
+
+#[test]
+fn sync_makes_a_committed_chunked_cell_durable() -> varve::Result<()> {
+    // `sync()` returned Ok having made nothing durable for a chunked row, while
+    // the same call did for a region row. Read from a *second* handle so this
+    // is about the file, not about the writer's memory.
+    let path = temp_path("sync_durable");
+    let cell = key(ROWS_PER_CHUNK, 0);
+    let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+    writer.write_matrix_cell(cell, &Sample { value: 12 })?;
+    writer.commit_matrix_cell::<Sample>(cell)?;
+    writer.sync()?;
+
+    let reader = growing_spec().open_readonly(path.path())?;
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(cell)?,
+        Sample { value: 12 }
+    );
+    Ok(())
+}
+
+#[test]
+fn a_chunk_that_could_never_be_sealed_is_refused_at_create() -> varve::Result<()> {
+    // A chunk is buffered against `MatrixSlotRegionLen` and sealed against
+    // `RecordPayloadLen`, and nothing reconciled them: a spec passed
+    // `validate`, accepted writes, and then died at the first seal with the
+    // data already in RAM and no way to get it out. Refused at create now,
+    // before a byte is accepted.
+    //
+    // Closing this also closed the only public route to a failed seal, so the
+    // property that a failed seal keeps its chunk moved to a unit test in
+    // `file.rs` (`a_failed_seal_keeps_the_chunk`), which says so.
+    let path = temp_path("ceiling_mismatch");
+    let tight =
+        growing_spec().with_read_limits(growing_spec().read_limits.with_max_record_payload_len(64));
+    assert!(matches!(
+        tight.create_writer_with_dims(path.path(), dims()),
+        Err(Error::LimitExceeded {
+            resource: "record payload length",
+            ..
+        }),
+    ));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Whole-matrix operations must account for chunked rows
+// ---------------------------------------------------------------------------
+
+#[test]
+fn clearing_a_category_counts_the_open_chunk_and_refuses_a_sealed_one() -> varve::Result<()> {
+    // `clear_matrix_category` cleared the matrix region only, so a caller
+    // asking for a clean category got one silently: chunked rows stayed
+    // committed, stayed readable, and were not in the count.
+    let path = temp_path("clear_category_open");
+    let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+    let region = key(0, 0);
+    let chunked = key(ROWS_PER_CHUNK, 0);
+    writer.write_matrix_cell(region, &Sample { value: 1 })?;
+    writer.commit_matrix_cell::<Sample>(region)?;
+    writer.write_matrix_cell(chunked, &Sample { value: 2 })?;
+    writer.commit_matrix_cell::<Sample>(chunked)?;
+
+    // One region cell and one open-chunk cell.
+    assert_eq!(writer.clear_matrix_category(Sample::CATEGORY)?, 2);
+    assert_eq!(
+        writer.matrix_cell_status::<Sample>(chunked)?,
+        MatrixCellStatus::NotCommitted,
+    );
+    assert_eq!(
+        writer.matrix_cell_status::<Sample>(region)?,
+        MatrixCellStatus::NotCommitted,
+    );
+
+    // Once a chunk is sealed it is a written record, and records are not
+    // rewritten. Saying so is the only honest answer.
+    writer.write_matrix_cell(chunked, &Sample { value: 3 })?;
+    writer.commit_matrix_cell::<Sample>(chunked)?;
+    writer.flush()?;
+    assert!(matches!(
+        writer.clear_matrix_category(Sample::CATEGORY),
+        Err(Error::InvalidFormatSpec(message)) if message.contains("sealed chunk"),
+    ));
+    Ok(())
+}
+
+#[test]
+fn the_resume_signal_is_not_clean_over_an_unsealed_chunk() -> varve::Result<()> {
+    // `Clean` told a caller the acquisition had finished. An open chunk is live
+    // state this handle holds and the next one will not, so it never is.
+    let path = temp_path("resume_signal");
+    let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+    assert_eq!(
+        writer.matrix_resume_signal(Sample::CATEGORY)?,
+        varve::MatrixResumeSignal::Clean,
+    );
+    writer.write_matrix_cell(key(ROWS_PER_CHUNK, 0), &Sample { value: 1 })?;
+    writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0))?;
+    assert_ne!(
+        writer.matrix_resume_signal(Sample::CATEGORY)?,
+        varve::MatrixResumeSignal::Clean,
+        "an unsealed chunk is unfinished work",
+    );
+    writer.flush()?;
+    assert_eq!(
+        writer.matrix_resume_signal(Sample::CATEGORY)?,
+        varve::MatrixResumeSignal::Clean,
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // The cost of a chunked read must not scale with the file
 // ---------------------------------------------------------------------------
 
@@ -944,6 +1160,79 @@ fn two_chunk_file(path: &Path) -> varve::Result<()> {
 }
 
 #[test]
+fn a_flipped_bit_in_a_sealed_chunk_is_refused_not_returned() -> varve::Result<()> {
+    // The review reproduced this: flipping bytes in a sealed chunk's slot
+    // region made `read_matrix_cell` return the corrupted value with no error,
+    // while `verify_all()` on the same handle reported ChecksumMismatch — the
+    // record CRC existed and covered those bytes and was never consulted. The
+    // identical flip one row earlier, in the matrix region, was refused, so the
+    // same API call verified for row 3 and returned corrupt data for row 4.
+    //
+    // The record footer's CRC is verified on a *record* read; a positional cell
+    // read is not one. A chunk carries per-cell checksums now, as the region
+    // already did.
+    let path = temp_path("flipped_bit");
+    let cell = key(ROWS_PER_CHUNK, 0);
+    {
+        let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+        writer.write_matrix_cell(cell, &Sample { value: 0x1234_5678 })?;
+        writer.commit_matrix_cell::<Sample>(cell)?;
+        writer.flush()?;
+    }
+    // Find the value in the sealed chunk and corrupt it in place.
+    let bytes = std::fs::read(path.path())?;
+    let (_, at) = first_chunk_payload(path.path())?;
+    let needle = 0x1234_5678u32.to_le_bytes();
+    let value_at = bytes[at..]
+        .windows(4)
+        .position(|window| window == needle)
+        .map(|offset| at + offset)
+        .expect("the value is in the chunk record");
+    patch(path.path(), value_at, &0x9999_9999u32.to_le_bytes())?;
+
+    let reader = growing_spec().open_reader(path.path())?;
+    assert!(
+        matches!(
+            reader.read_matrix_cell::<Sample>(cell),
+            Err(Error::MatrixChecksumMismatch { .. }),
+        ),
+        "a corrupted chunk cell must be refused, not returned",
+    );
+    Ok(())
+}
+
+#[test]
+fn a_format_without_integrity_stores_no_chunk_checksums() -> varve::Result<()> {
+    // Inertness for the other direction: a format that declares no integrity
+    // policy must not start paying four bytes per cell for a table nothing
+    // reads.
+    let with_crc = temp_path("crc_on");
+    let without = temp_path("crc_off");
+    let plain = growing_spec().with_integrity_policy(IntegrityPolicy::None);
+    for (spec, path) in [(growing_spec(), &with_crc), (plain, &without)] {
+        let mut writer = spec.create_writer_with_dims(path.path(), dims())?;
+        writer.write_matrix_cell(key(ROWS_PER_CHUNK, 0), &Sample { value: 1 })?;
+        writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0))?;
+        writer.flush()?;
+    }
+    let crc_len = std::fs::metadata(with_crc.path())?.len();
+    let plain_len = std::fs::metadata(without.path())?.len();
+    assert!(
+        crc_len > plain_len,
+        "the checksum table must cost something when on: {crc_len} vs {plain_len}",
+    );
+    // Both must still read back.
+    let reader = growing_spec()
+        .with_integrity_policy(IntegrityPolicy::None)
+        .open_reader(without.path())?;
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0))?,
+        Sample { value: 1 },
+    );
+    Ok(())
+}
+
+#[test]
 fn a_crafted_block_count_cannot_make_the_reader_allocate() -> varve::Result<()> {
     // `block_count` is a `u32` at payload+32. Unbounded, `0xFFFF_FFFF` asked for
     // a **137,438,953,440-byte** reservation out of a 1 KB file — `try_reserve`
@@ -1004,6 +1293,59 @@ fn a_crafted_cell_count_cannot_outrun_its_commit_map() -> varve::Result<()> {
         reader.read_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0)),
         Err(Error::InvalidMatrixChunk),
     ));
+    Ok(())
+}
+
+#[test]
+fn a_chunk_written_under_a_different_rows_per_chunk_is_refused() -> varve::Result<()> {
+    // `read_chunk_prefix` decoded `rows` and `first_row` and every caller threw
+    // them away, and the row width came from the record's `cells` divided by
+    // *this spec's* `rows_per_chunk`. So a file written under a different chunk
+    // height was not refused, it was reinterpreted — and a read returned
+    // another row's bytes with no error anywhere.
+    let path = temp_path("geometry_mismatch");
+    {
+        let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+        writer.write_matrix_cell(key(ROWS_PER_CHUNK, 0), &Sample { value: 5 })?;
+        writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0))?;
+        writer.flush()?;
+    }
+    // Same format, different chunk height. Opening is fine — the header does
+    // not carry it — but reading a chunk must not reinterpret it. The key is
+    // chosen to route to a *chunk* under the reader's own arithmetic: with
+    // twice the chunk height, row `2 * ROWS_PER_CHUNK` is chunk 1 there.
+    let other = base_spec().with_growing_matrix_dimension("scan", ROWS_PER_CHUNK * 2);
+    let reader = other.open_reader(path.path())?;
+    assert!(matches!(
+        reader.read_matrix_cell::<Sample>(key(ROWS_PER_CHUNK * 2, 0)),
+        Err(Error::InvalidMatrixChunk),
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_crafted_stride_or_cell_count_is_refused() -> varve::Result<()> {
+    // `stride` and `cells` were taken from the record and never compared to the
+    // block descriptor, so a widened `cells` changed the row pitch and every
+    // key resolved to a different cell.
+    for (name, field_offset, value) in [
+        ("stride", 40 + 8, 8u64),
+        ("cells", 40 + 16, ROWS_PER_CHUNK * CHANNELS * 2),
+    ] {
+        let path = temp_path(&format!("crafted_{name}"));
+        two_chunk_file(path.path())?;
+        let (_, at) = first_chunk_payload(path.path())?;
+        patch(path.path(), at + field_offset, &value.to_le_bytes())?;
+
+        let reader = growing_spec().open_reader(path.path())?;
+        assert!(
+            matches!(
+                reader.read_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0)),
+                Err(Error::InvalidMatrixChunk),
+            ),
+            "a crafted {name} must be refused",
+        );
+    }
     Ok(())
 }
 

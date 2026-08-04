@@ -512,8 +512,14 @@ pub enum Error {
     /// Only the newest chunk accepts writes. Late data is refused rather than
     /// dropped: a value that silently does not arrive is indistinguishable from
     /// one that was never sent.
-    #[error("matrix chunk {chunk} is sealed; the open chunk is {open}")]
-    MatrixChunkSealed { chunk: u64, open: u64 },
+    /// `open` is the chunk a caller may still write to, or `None` when there
+    /// is none. Reporting the refused chunk as its own opener read as a
+    /// contradiction.
+    #[error("matrix chunk {chunk} is sealed{}", match open {
+        Some(open) => format!("; the open chunk is {open}"),
+        None => String::from("; no chunk is open"),
+    })]
+    MatrixChunkSealed { chunk: u64, open: Option<u64> },
 
     #[error("invalid matrix chunk record")]
     InvalidMatrixChunk,
