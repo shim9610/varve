@@ -13872,6 +13872,74 @@ fn encode_record_footer(footer: RecordFooterFields) -> Result<[u8; RECORD_FOOTER
     encode_native_record_footer(footer)
 }
 
+/// Rebuilds a record's index entry from the record itself, positionally.
+///
+/// **`&self` throughout, which is the whole point.** `read_record_entry_at`
+/// takes `&mut File` and seeks, so it cannot serve a read path that one handle
+/// shares between concurrent readers — and a demand-filled index is exactly
+/// such a path: every read of an entry the index no longer holds has to come
+/// from the file, under `&self`. This reads the two fixed-size regions through
+/// `SnapshotFile::read_exact_at` and hands them to the same decoders the
+/// scanning reader uses, so there is one decode of a record header in the
+/// crate and not two.
+///
+/// `committed` is the caller's, because it is writer state with no
+/// representation in the record — proved, not assumed, by
+/// `every_index_entry_can_be_rebuilt_from_its_own_record`.
+///
+/// `#[cfg(test)]` because nothing calls it yet: the store it exists for is
+/// still a `Vec<RecordIndexEntry>`. It is here, and proven, so that swapping
+/// the store is a change to the store and not also a new reader written under
+/// the same commit. The cfg comes off when `ResidentIndex` starts faulting.
+#[cfg(test)]
+pub(crate) fn fault_record_entry(
+    snapshot: &SnapshotFile,
+    spec: FormatSpec,
+    record_offset: u64,
+    committed: bool,
+) -> Result<RecordIndexEntry> {
+    let mut header_bytes = [0; RECORD_HEADER_LEN as usize];
+    snapshot.read_exact_at(record_offset, &mut header_bytes)?;
+    let decoded = read_native_record_header(&mut header_bytes.as_slice(), record_offset)?;
+    debug_assert_eq!(decoded.lead_in_len, RECORD_HEADER_LEN);
+    let header = decoded.fields;
+    let payload_offset =
+        record_offset
+            .checked_add(RECORD_HEADER_LEN)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "record payload offset",
+            })?;
+    let mut entry = RecordIndexEntry {
+        block_id: header.block_id,
+        block_version: header.block_version,
+        flags: header.flags,
+        sequence: header.sequence,
+        record_offset,
+        payload_offset,
+        payload_len: header.payload_len,
+        checksum: header.checksum,
+        uncompressed_len_hint: header.uncompressed_len_hint,
+        footer_offset: None,
+        prev_same_block_offset: None,
+        prev_same_key_offset: None,
+        committed,
+    };
+    if spec.spec_needs_record_footer() {
+        let footer_offset = payload_offset.checked_add(entry.payload_len).ok_or(
+            Error::ResourceArithmeticOverflow {
+                resource: "record footer offset",
+            },
+        )?;
+        let mut footer_bytes = [0; RECORD_FOOTER_LEN as usize];
+        snapshot.read_exact_at(footer_offset, &mut footer_bytes)?;
+        let footer = decode_record_footer(&footer_bytes, footer_offset, record_offset)?;
+        entry.footer_offset = Some(footer_offset);
+        entry.prev_same_block_offset = footer.prev_same_block_offset;
+        entry.prev_same_key_offset = footer.prev_same_key_offset;
+    }
+    Ok(entry)
+}
+
 fn read_record_footer_bytes(
     file: &mut File,
     offset: u64,
@@ -17585,9 +17653,23 @@ mod tests {
                 entry.record_offset
             );
         }
+        // And the same again through the positional `&self` reader, which is
+        // the one a demand-filled index would actually use: `read_record_entry_at`
+        // above takes `&mut File` and seeks, which no shared read path can do.
+        let snapshot = SnapshotFile::new(OpenOptions::new().read(true).open(&path)?)?;
+        for entry in resident.iter() {
+            let faulted =
+                fault_record_entry(&snapshot, spec, entry.record_offset, entry.committed)?;
+            assert_eq!(
+                &faulted, entry,
+                "positional fault of the record at {} produced a different entry",
+                entry.record_offset
+            );
+        }
         println!(
             "(rebuild) {} entries rebuilt from their records, {committed_differed} differed only \
-             in `committed`",
+             in `committed`; all {} also matched through the positional &self reader",
+            resident.len(),
             resident.len()
         );
         Ok(())
