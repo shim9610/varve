@@ -566,20 +566,33 @@ pub(crate) fn read_native_record_header<R: Read>(
     })
 }
 
-pub(crate) fn encode_native_record_footer(footer: RecordFooterFields) -> Result<Vec<u8>> {
-    let footer_len = native_record_footer_len();
-    let footer_len =
-        usize::try_from(footer_len).map_err(|_| Error::LengthOverflow { value: footer_len })?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(footer_len)
-        .map_err(|_| Error::AllocationFailed {
-            resource: "native record footer",
-            requested: u64::try_from(footer_len).unwrap_or(u64::MAX),
-        })?;
+/// Encodes the record footer into a stack array, as the identical-size header
+/// beside it already does.
+///
+/// The footer is exactly `RECORD_FOOTER_LEN` bytes — the `const _: ()` above
+/// makes the compiler prove `RECORD_FOOTER_FIELDS_LEN` equals it — so the `Vec`
+/// this used to build was a heap allocation of a statically known 32 bytes,
+/// taken and dropped once per appended record. Continuous high-rate streaming
+/// append is the primary workload and is specified to make no per-record
+/// allocation; this was one.
+///
+/// The cursor must land exactly at the end. The `Vec` form got that check for
+/// free — its length *was* what the fields wrote, and `encode_record_footer`
+/// compared it — so a fixed array has to state it, or a field table that stopped
+/// short would silently emit trailing zeros as a valid-looking footer.
+pub(crate) fn encode_native_record_footer(
+    footer: RecordFooterFields,
+) -> Result<[u8; crate::file::RECORD_FOOTER_LEN as usize]> {
+    let mut bytes = [0; crate::file::RECORD_FOOTER_LEN as usize];
+    let mut cursor = &mut bytes[..];
     for def in RECORD_FOOTER_FIELDS {
         let value = native_footer_value(*def, footer)?;
-        write_native_value(&mut bytes, def.field, &value)?;
+        write_native_value(&mut cursor, def.field, &value)?;
+    }
+    if !cursor.is_empty() {
+        return Err(Error::InvalidFormatSpec(
+            "native record footer fields did not fill the footer",
+        ));
     }
     Ok(bytes)
 }

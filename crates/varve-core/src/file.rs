@@ -8256,7 +8256,7 @@ impl VarveFile {
             checksum: 0,
             uncompressed_len_hint,
         };
-        let footer_bytes = footer.as_deref().unwrap_or(&[]);
+        let footer_bytes = footer.as_ref().map_or(&[][..], |bytes| &bytes[..]);
         let checksum =
             checksum_record_fields(self.spec, record_offset, header, payload, footer_bytes)?;
         let header_bytes = encode_native_record_header(
@@ -8281,7 +8281,7 @@ impl VarveFile {
             record_offset,
             &header_bytes,
             payload,
-            footer.as_deref(),
+            footer.as_ref().map(|bytes| &bytes[..]),
             || {
                 #[cfg(test)]
                 fail_append_after_header_if_requested()?;
@@ -9065,22 +9065,23 @@ fn rewrite_replacement_record_streaming(
         RewritePayload::Bytes(bytes) => output.write_all(bytes)?,
         RewritePayload::Snapshot { offset, len } => snapshot.copy_range_to(offset, len, output)?,
     }
-    let footer = if spec.spec_needs_record_footer() {
+    let encoded_footer = if spec.spec_needs_record_footer() {
         let footer = encode_record_footer(RecordFooterFields {
             prev_same_block_offset: entry.prev_same_block_offset,
             prev_same_key_offset: entry.prev_same_key_offset,
         })?;
         output.write_all(&footer)?;
-        footer
+        Some(footer)
     } else {
-        Vec::new()
+        None
     };
+    let footer = encoded_footer.as_ref().map_or(&[][..], |bytes| &bytes[..]);
     validate_replacement_predecessors(output, &entry, rewritten_prefix)?;
 
     entry.checksum = match spec.integrity_policy {
         IntegrityPolicy::None => 0,
         IntegrityPolicy::Crc32 | IntegrityPolicy::Crc32WithHeader => {
-            checksum_record_file(spec, output, &entry, &footer)?
+            checksum_record_file(spec, output, &entry, footer)?
         }
     };
     output.seek(SeekFrom::Start(record_offset))?;
@@ -11968,14 +11969,15 @@ fn prepare_stream_record(
             .ok_or(Error::ResourceArithmeticOverflow {
                 resource: "file length",
             })?;
-    let footer = if spec.spec_needs_record_footer() {
-        encode_record_footer(RecordFooterFields {
+    let encoded_footer = if spec.spec_needs_record_footer() {
+        Some(encode_record_footer(RecordFooterFields {
             prev_same_block_offset,
             prev_same_key_offset,
-        })?
+        })?)
     } else {
-        Vec::new()
+        None
     };
+    let footer = encoded_footer.as_ref().map_or(&[][..], |bytes| &bytes[..]);
     let _record_end =
         payload_end
             .checked_add(footer.len() as u64)
@@ -11991,7 +11993,7 @@ fn prepare_stream_record(
         checksum: 0,
         uncompressed_len_hint,
     };
-    let checksum = checksum_record_fields(spec, record_offset, header, payload, &footer)?;
+    let checksum = checksum_record_fields(spec, record_offset, header, payload, footer)?;
     let header = encode_native_record_header(
         RecordHeaderFields { checksum, ..header },
         record_offset,
@@ -12013,7 +12015,7 @@ fn prepare_stream_record(
         })?;
     bytes.extend_from_slice(&header);
     bytes.extend_from_slice(payload);
-    bytes.extend_from_slice(&footer);
+    bytes.extend_from_slice(footer);
     Ok(PreparedStreamRecord {
         bytes,
         block_id,
@@ -13273,10 +13275,8 @@ fn write_record_header(
     write_native_record_header(file, header, record_offset, footer_len)
 }
 
-fn encode_record_footer(footer: RecordFooterFields) -> Result<Vec<u8>> {
-    let bytes = encode_native_record_footer(footer)?;
-    debug_assert_eq!(bytes.len() as u64, RECORD_FOOTER_LEN);
-    Ok(bytes)
+fn encode_record_footer(footer: RecordFooterFields) -> Result<[u8; RECORD_FOOTER_LEN as usize]> {
+    encode_native_record_footer(footer)
 }
 
 fn read_record_footer_bytes(

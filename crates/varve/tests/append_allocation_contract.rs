@@ -185,6 +185,46 @@ varve_format! {
     }
 }
 
+// A spec that writes a record footer, which `PlainFormat` does not.
+//
+// `spec_needs_record_footer` is `commit_policy.requires_record_footer() ||
+// index_policy.requires_record_footer()`, and a bare `varve_format!` asks for
+// neither — which is why the footer allocation was invisible to every
+// measurement in this file until this format existed. `block_offset_chain` is
+// the cheapest clause that turns the footer on: it adds the back-pointer the
+// footer carries and nothing else per record.
+varve_format! {
+    pub format FooterFormat {
+        magic: b"ALLOCFTR";
+        version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
+        endian: little;
+        index: block_offset_chain;
+        blocks {
+            variable FooterPayload(id = 1) {
+                data: Vec<u8>,
+            }
+        }
+    }
+}
+
 const PUSHES: u64 = 1_000;
 const SMALL: usize = 256;
 const LARGE: usize = 256 * 1024;
@@ -328,6 +368,74 @@ fn plain_window(payload_len: usize) -> Counts {
     });
     file.flush().expect("flush");
     counts
+}
+
+fn footer_window(payload_len: usize) -> Counts {
+    let path = temp_path(&format!("footer_{payload_len}"));
+    let block = FooterPayload {
+        data: vec![0x5a; payload_len],
+    };
+    let mut file = FooterFormat::create(&path).expect("create");
+    file.push(&block).expect("warm-up push");
+    let counts = measure(|| {
+        for _ in 0..PUSHES {
+            file.push(&block).expect("push");
+        }
+    });
+    file.flush().expect("flush");
+    counts
+}
+
+/// **The cost.** Writing a record footer allocates nothing per record.
+///
+/// The footer is `RECORD_FOOTER_LEN` bytes — 32, and the `const _: ()` in
+/// `native_layout` makes the compiler prove it — yet `encode_native_record_footer`
+/// built a `Vec` for it, wrote it, and dropped it, once per appended record.
+/// The identical-size record *header* has always been encoded into a stack
+/// array beside it.
+///
+/// **The gap between the two specs is the instrument, and it is not all
+/// footer.** Measured on this tree at 1,000 pushes of a 256-byte payload:
+///
+/// |                       | allocations/push | bytes/push |
+/// | ---                   | ---              | ---        |
+/// | `PlainFormat`, no footer | 5.01          | 650.1      |
+/// | `FooterFormat`, before   | **7.01**      | **686.1**  |
+/// | `FooterFormat`, after    | **6.01**      | **654.1**  |
+///
+/// One allocation and **exactly 32 bytes** per record disappear, which is the
+/// footer and nothing else. The 1.00 allocation per push that remains over the
+/// footerless spec is the block-offset chain's own bookkeeping — it is not this
+/// fix, it is not claimed by this fix, and stating the assertion as "equal to
+/// plain" would have failed against correct code.
+///
+/// So the ceilings below are literals captured from the **pre-change build**,
+/// which is the only baseline that can discriminate: a baseline taken inside
+/// the post-fix run proves nothing, and that pattern is why six proofs in the
+/// audit round did not discriminate.
+#[test]
+fn writing_a_record_footer_allocates_nothing_per_record() {
+    let plain = plain_window(SMALL);
+    let footer = footer_window(SMALL);
+    report("plain/small", SMALL, plain);
+    report("footer/small", SMALL, footer);
+
+    let extra_allocations = (footer.allocations - plain.allocations) as f64 / PUSHES as f64;
+    let extra_bytes = (footer.bytes - plain.bytes) as f64 / PUSHES as f64;
+
+    // The footer is a fixed 32 bytes. Before this fix the gap carried them.
+    assert!(
+        extra_bytes < 32.0,
+        "a footer record allocated {extra_bytes:.1} bytes per push more than a footerless one; \
+         before this fix it was 36.0, of which 32 was the footer's own Vec"
+    );
+    // And the allocation it took with it. One remains, and it is the chain's.
+    assert!(
+        extra_allocations <= 1.0 + 0.05,
+        "a footer record made {extra_allocations:.2} allocations per push more than a \
+         footerless one; before this fix it was 2.00, and only the block-offset chain's own \
+         one is expected to survive"
+    );
 }
 
 #[cfg(feature = "compression-zstd")]
