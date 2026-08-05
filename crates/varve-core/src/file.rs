@@ -9317,6 +9317,40 @@ struct DecodedSegment {
     entries: Vec<RecordIndexEntry>,
 }
 
+/// What the chain walk's first pass reads out of a segment's fixed prefix.
+///
+/// Only `covered_start`: the pass exists to check that the links join up, and
+/// `preceding_records` is checked in pass two against the index actually built,
+/// where it means something. Reading it here would be a number compared to
+/// nothing.
+#[derive(Clone, Copy, Debug)]
+struct SegmentPrefix {
+    covered_start: u64,
+}
+
+/// Decodes only the fixed prefix, which is everything the chain walk's first
+/// pass needs to check that the links join up.
+fn decode_segment_prefix(prefix: &[u8]) -> Result<SegmentPrefix> {
+    let prefix_len = SEGMENT_PREFIX_LEN as usize;
+    if prefix.len() < prefix_len || &prefix[..4] != SEGMENT_MAGIC {
+        return Err(Error::InvalidIndexSegment);
+    }
+    let mut u16_buf = [0; 2];
+    u16_buf.copy_from_slice(&prefix[4..6]);
+    if u16::from_le_bytes(u16_buf) != SEGMENT_VERSION {
+        return Err(Error::InvalidIndexSegment);
+    }
+    u16_buf.copy_from_slice(&prefix[6..8]);
+    if u16::from_le_bytes(u16_buf) != 0 {
+        return Err(Error::InvalidIndexSegment);
+    }
+    let mut u64_buf = [0; 8];
+    u64_buf.copy_from_slice(&prefix[8..16]);
+    Ok(SegmentPrefix {
+        covered_start: u64::from_le_bytes(u64_buf),
+    })
+}
+
 fn decode_segment_payload(
     spec: FormatSpec,
     payload: &[u8],
@@ -12509,7 +12543,22 @@ fn walk_segment_chain(
     let mut accounting = ScanAccounting::default();
     accounting.advance(spec, append_start)?;
 
-    let mut chain: Vec<(RecordIndexEntry, DecodedSegment)> = Vec::new();
+    // **Pass one carries the links, not the segments they describe.** This used
+    // to collect `(RecordIndexEntry, DecodedSegment)` per link, and a
+    // `DecodedSegment` owns the entries it describes — so the whole file's index
+    // was materialised here and then materialised again into `scanned.entries`
+    // below, two live copies at peak.
+    //
+    // A `RecordIndexEntry` per link is bounded by the segment count, which is
+    // what `ReadLimitKey::Segments` already bounds; the entry arrays are what
+    // followed the record count. So the links stay and the segments go: pass one
+    // reads each link's fixed `SEGMENT_PREFIX_LEN` prefix for the one number it
+    // needs to check that the links join up, and pass two reads the entry array
+    // one segment at a time.
+    //
+    // Keeping the entry also keeps the accounting honest: each segment record's
+    // header is read and charged exactly once, as before.
+    let mut links: Vec<RecordIndexEntry> = Vec::new();
     let mut next = Some(read_segment_tip_offset(file, append_start, file_len)?);
     // What the link being read must end at: the end of the file for the tip,
     // and the coverage start of its successor for every link behind it.
@@ -12540,30 +12589,30 @@ fn walk_segment_chain(
         {
             return Err(Error::InvalidIndexSegment);
         }
-        let payload = entry.read_payload_file_with_len(file, file_len)?;
-        let segment = decode_segment_payload(spec, &payload, record_offset, file_len)?;
-        if segment.covered_start < append_start || segment.covered_start > record_offset {
+        let prefix = entry.read_payload_prefix_file_with_len(file, file_len, SEGMENT_PREFIX_LEN)?;
+        let prefix = decode_segment_prefix(&prefix)?;
+        if prefix.covered_start < append_start || prefix.covered_start > record_offset {
             return Err(Error::InvalidIndexSegment);
         }
-        expected_end = segment.covered_start;
+        expected_end = prefix.covered_start;
         next = match entry.prev_same_block_offset {
             Some(previous) if previous >= record_offset || previous < append_start => {
                 return Err(Error::InvalidIndexSegment);
             }
             previous => previous,
         };
-        let links = u64::try_from(chain.len())
+        let count = u64::try_from(links.len())
             .ok()
             .and_then(|links| links.checked_add(1))
             .ok_or(Error::ResourceArithmeticOverflow {
                 resource: "segment count",
             })?;
-        spec.read_limits.check(ReadLimitKey::Segments, links)?;
-        chain.try_reserve(1).map_err(|_| Error::AllocationFailed {
+        spec.read_limits.check(ReadLimitKey::Segments, count)?;
+        links.try_reserve(1).map_err(|_| Error::AllocationFailed {
             resource: "segment chain",
-            requested: links,
+            requested: count,
         })?;
-        chain.push((entry, segment));
+        links.push(entry);
     }
     // The oldest link must reach the append log, or records written before the
     // chain began are outside every segment and would be lost.
@@ -12580,8 +12629,15 @@ fn walk_segment_chain(
         physical_end: None,
         physical_end_at_commit: None,
     };
+    // **Pass two, oldest link first, one segment live at a time.** Each link is
+    // re-read and decoded here and its entries are moved straight into
+    // `scanned`, so the peak is one segment plus the index being built rather
+    // than the index twice.
     let mut running = append_start;
-    for (link, segment) in chain.into_iter().rev() {
+    for link in links.into_iter().rev() {
+        let payload = link.read_payload_file_with_len(file, file_len)?;
+        let segment = decode_segment_payload(spec, &payload, link.record_offset, file_len)?;
+        drop(payload);
         // `preceding_records` is the writer's *resident* index position, and
         // the filter below drops exactly what the writer never installed, so
         // the two counts stay comparable with a non-resident block in play.
@@ -13123,6 +13179,28 @@ impl RecordIndexEntry {
     fn read_payload_file_with_len(&self, file: &mut File, file_len: u64) -> Result<Vec<u8>> {
         self.validate_payload_extent(file_len)?;
         self.read_payload_file_validated(file)
+    }
+
+    /// Reads the first `len` bytes of this record's payload.
+    ///
+    /// For a segment link, everything the chain walk's first pass needs —
+    /// `covered_start`, the entry count and `preceding_records` — sits in the
+    /// fixed prefix, so the pass does not have to pull the whole entry array
+    /// off disk and throw it away.
+    fn read_payload_prefix_file_with_len(
+        &self,
+        file: &mut File,
+        file_len: u64,
+        len: u64,
+    ) -> Result<Vec<u8>> {
+        self.validate_payload_extent(file_len)?;
+        if self.payload_len < len {
+            return Err(Error::InvalidIndexSegment);
+        }
+        file.seek(SeekFrom::Start(self.payload_offset))?;
+        let mut prefix = try_alloc_bytes(len, PHYSICAL_PAYLOAD_RESOURCE)?;
+        file.read_exact(&mut prefix)?;
+        Ok(prefix)
     }
 
     fn read_payload_file_validated(&self, file: &mut File) -> Result<Vec<u8>> {
