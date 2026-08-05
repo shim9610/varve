@@ -804,7 +804,7 @@ use record_file::RecordFile;
 /// header read per entry, i.e. O(records) I/O added to open for index policies
 /// that do not scan. Checklist open item 29.
 pub(crate) mod resident_index {
-    use super::{RecordIndexEntry, Result};
+    use super::{FormatSpec, RecordIndexEntry, Result, SnapshotFile, fault_record_entry};
 
     /// Proof that the resident record index has spare capacity for one entry.
     ///
@@ -816,27 +816,121 @@ pub(crate) mod resident_index {
                   the entry; drop it only if the append is abandoned"]
     pub struct ReservedIndexSlot(());
 
-    /// The in-memory mirror of the records on disk.
+    /// Bytes the directory occupies for `count` records.
     ///
-    /// The backing `Vec` is unnameable outside this module; see the module
-    /// documentation for what that forbids and what it deliberately allows.
+    /// Only used to report a failed reservation honestly, so it saturates: a
+    /// number this large has already failed the allocation it describes. The
+    /// `IndexBytes` limit is stated in `RecordIndexEntry`s and charged through
+    /// `super::index_bytes_for_count`, which is a different and larger figure —
+    /// deliberately, because that is what the checkpoint and rewrite paths
+    /// still materialize.
+    fn slot_bytes_for_count(count: usize) -> u64 {
+        u64::try_from(count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(size_of::<IndexSlot>()).unwrap_or(u64::MAX))
+    }
+
+    /// One record's directory entry: where it starts, and the writer's view of
+    /// whether it is committed.
+    ///
+    /// Sixteen bytes against the ninety-six a `RecordIndexEntry` occupies,
+    /// because these are the only two facts about a record that are *not* in
+    /// the record. Everything else — block id, version, flags, sequence,
+    /// payload extent, checksum, footer chain — is in the header and footer
+    /// this offset names, so keeping a copy in memory is keeping a second copy
+    /// of the file.
+    #[derive(Clone, Copy, Debug)]
+    struct IndexSlot {
+        record_offset: u64,
+        committed: bool,
+    }
+
+    /// What an entry is rebuilt from.
+    ///
+    /// The snapshot has to be the *current* one, not the one open produced: a
+    /// writer's snapshot grows with every append, and reading a record past
+    /// the stored logical length is refused by `SnapshotFile` rather than
+    /// served. [`ResidentIndex::rebind`] is what keeps it current, and the
+    /// append path calls it on the same line that moves the writer's own.
+    #[derive(Clone, Debug)]
+    struct IndexSource {
+        snapshot: SnapshotFile,
+        spec: FormatSpec,
+    }
+
+    /// The record directory, and the file its entries come from.
+    ///
+    /// **Not a mirror any more.** It holds one 16-byte slot per record and
+    /// rebuilds the entry from the record's own bytes when asked. The `Vec` is
+    /// unnameable outside this module; see the module documentation for what
+    /// that forbids and what it deliberately allows.
     #[derive(Debug)]
     pub struct ResidentIndex {
-        entries: Vec<RecordIndexEntry>,
+        slots: Vec<IndexSlot>,
+        source: IndexSource,
     }
 
     impl ResidentIndex {
-        /// Adopts the entries of a freshly built generation.
+        /// Adopts the records of a freshly built generation.
         ///
-        /// Used at open time (the index scanned from the file) and by the
-        /// rewrite replacement paths (the index of the temporary generation
-        /// that has just become the file). Both hand over a `Vec` that already
-        /// describes records on disk, so this cannot introduce an entry the
-        /// disk does not have; and both build it with `try_reserve_exact`
-        /// before any byte is published, so no allocation is deferred past a
-        /// commit point.
-        pub(crate) fn adopt_generation(entries: Vec<RecordIndexEntry>) -> Self {
-            Self { entries }
+        /// Used at open time (the index scanned, chained or checkpointed from
+        /// the file) and by the rewrite replacement paths (the index of the
+        /// temporary generation that has just become the file). Both hand over
+        /// entries that already describe records on disk, so this cannot
+        /// introduce an entry the disk does not have.
+        ///
+        /// Fallible because the directory is reserved exactly once, before the
+        /// first slot is taken.
+        pub(crate) fn adopt_generation(
+            entries: &[RecordIndexEntry],
+            snapshot: SnapshotFile,
+            spec: FormatSpec,
+        ) -> Result<Self> {
+            let mut slots = Vec::new();
+            slots
+                .try_reserve_exact(entries.len())
+                .map_err(|_| super::Error::AllocationFailed {
+                    resource: "record index",
+                    requested: slot_bytes_for_count(entries.len()),
+                })?;
+            slots.extend(entries.iter().map(|entry| IndexSlot {
+                record_offset: entry.record_offset,
+                committed: entry.committed,
+            }));
+            Ok(Self {
+                slots,
+                source: IndexSource { snapshot, spec },
+            })
+        }
+
+        /// An empty directory, for a file that has just been created.
+        pub(crate) fn empty(snapshot: SnapshotFile, spec: FormatSpec) -> Self {
+            Self {
+                slots: Vec::new(),
+                source: IndexSource { snapshot, spec },
+            }
+        }
+
+        /// Points the directory at the file as it now is.
+        ///
+        /// Called wherever the owning handle rebinds its own snapshot: after
+        /// every append (the file grew, and the record just installed is only
+        /// readable once the snapshot reaches past it) and after a generation
+        /// republication (a different file entirely). Costs one `Arc` refcount
+        /// bump and a `u64` copy — no allocation and no syscall, which is what
+        /// lets it sit on the append hot path.
+        pub(crate) fn rebind(&mut self, snapshot: SnapshotFile) {
+            self.source.snapshot = snapshot;
+        }
+
+        /// Rebuilds the entry a slot names, from the record itself.
+        fn fault(&self, slot: IndexSlot) -> Result<RecordIndexEntry> {
+            fault_record_entry(
+                &self.source.snapshot,
+                self.source.spec,
+                slot.record_offset,
+                slot.committed,
+            )
         }
 
         /// Performs every fallible part of growing the mirror by one entry.
@@ -848,7 +942,7 @@ pub(crate) mod resident_index {
             charge: impl FnOnce() -> Result<u64>,
         ) -> Result<ReservedIndexSlot> {
             let index_bytes = charge()?;
-            self.entries
+            self.slots
                 .try_reserve(1)
                 .map_err(|_| super::Error::AllocationFailed {
                     resource: "record index",
@@ -857,35 +951,25 @@ pub(crate) mod resident_index {
             Ok(ReservedIndexSlot(()))
         }
 
-        /// Installs the entry into capacity that is already reserved.
+        /// Installs the record into capacity that is already reserved.
         ///
         /// Infallible and allocation-free by construction: this is the only
-        /// growth of the resident index in the crate.
-        pub(crate) fn install(&mut self, slot: ReservedIndexSlot, entry: RecordIndexEntry) {
+        /// growth of the record directory in the crate. Everything the entry
+        /// carries except its offset and its committed bit is dropped here —
+        /// it is already on disk, at that offset.
+        pub(crate) fn install(&mut self, slot: ReservedIndexSlot, entry: &RecordIndexEntry) {
             let ReservedIndexSlot(()) = slot;
-            self.entries.push(entry);
+            self.slots.push(IndexSlot {
+                record_offset: entry.record_offset,
+                committed: entry.committed,
+            });
         }
 
         /// Drops the tail beyond `len`, for the append rollback. Shrinking can
-        /// only make the mirror describe fewer records than the disk holds,
+        /// only make the directory describe fewer records than the disk holds,
         /// which is the direction rollback restores.
         pub(crate) fn truncate(&mut self, len: usize) {
-            self.entries.truncate(len);
-        }
-
-        /// Restamps the sequence and checksum of an entry already in the
-        /// mirror, for the in-place replacement path.
-        ///
-        /// Narrower than the `&mut RecordIndexEntry` it replaced, and
-        /// deliberately: those are the only two fields the restamp changes, and
-        /// they are also the two the record's own header carries. A store that
-        /// rebuilds the entry from that header does not need this call at all,
-        /// so keeping it a named two-field operation is what makes its removal
-        /// a deletion rather than a rewrite.
-        pub(crate) fn restamp(&mut self, position: usize, sequence: u64, checksum: u32) {
-            let entry = &mut self.entries[position];
-            entry.sequence = sequence;
-            entry.checksum = checksum;
+            self.slots.truncate(len);
         }
     }
 
@@ -911,17 +995,17 @@ pub(crate) mod resident_index {
             &self,
         ) -> impl DoubleEndedIterator<Item = Result<RecordIndexEntry>> + ExactSizeIterator + '_
         {
-            self.entries.iter().cloned().map(Ok)
+            self.slots.iter().map(|slot| self.fault(*slot))
         }
 
         pub(crate) fn len(&self) -> usize {
-            self.entries.len()
+            self.slots.len()
         }
 
         /// Only the unit tests ask; production code asks `len`.
         #[cfg(test)]
         pub(crate) fn is_empty(&self) -> bool {
-            self.entries.is_empty()
+            self.slots.is_empty()
         }
 
         /// The entry at `position`, or `UnexpectedEof` if there is none.
@@ -934,10 +1018,11 @@ pub(crate) mod resident_index {
         ///
         /// Returns the entry by value for the same reason [`Self::iter`] does.
         pub(crate) fn entry_at(&self, position: usize) -> crate::Result<RecordIndexEntry> {
-            self.entries
+            let slot = *self
+                .slots
                 .get(position)
-                .cloned()
-                .ok_or(crate::Error::UnexpectedEof)
+                .ok_or(crate::Error::UnexpectedEof)?;
+            self.fault(slot)
         }
 
         /// Whether any entry carries `block_id`, searching forwards.
@@ -972,15 +1057,6 @@ pub(crate) mod resident_index {
                 }
             }
             Ok(None)
-        }
-
-        /// The whole array, borrowed contiguously.
-        ///
-        /// This is the shape that keeps the index resident. Every caller is a
-        /// place laziness has to be designed for rather than dropped in, so the
-        /// name is deliberately awkward and the call sites are the worklist.
-        pub(crate) fn as_contiguous_slice(&self) -> &[RecordIndexEntry] {
-            &self.entries
         }
     }
 }
@@ -3674,9 +3750,9 @@ impl VarveFile {
             spec,
             path,
             file: RecordFile::new(file),
+            index: ResidentIndex::empty(snapshot.clone(), spec),
             snapshot,
             mode: OpenMode::ReadWrite,
-            index: ResidentIndex::adopt_generation(Vec::new()),
             header_extensions,
             matrix: None,
             matrix_creation_nonce: None,
@@ -3805,9 +3881,9 @@ impl VarveFile {
             spec,
             path,
             file: RecordFile::new(file),
+            index: ResidentIndex::empty(snapshot.clone(), spec),
             snapshot,
             mode: OpenMode::ReadWrite,
-            index: ResidentIndex::adopt_generation(Vec::new()),
             header_extensions,
             matrix: Some(matrix),
             matrix_creation_nonce: Some(creation_nonce),
@@ -3871,9 +3947,9 @@ impl VarveFile {
             spec,
             path,
             file: RecordFile::new(file),
+            index: ResidentIndex::adopt_generation(&index, snapshot.clone(), spec)?,
             snapshot,
             mode: OpenMode::ReadWrite,
-            index: ResidentIndex::adopt_generation(index),
             header_extensions,
             matrix,
             matrix_creation_nonce,
@@ -3947,9 +4023,9 @@ impl VarveFile {
             spec,
             path,
             file: RecordFile::new(file),
+            index: ResidentIndex::adopt_generation(&index, snapshot.clone(), spec)?,
             snapshot,
             mode: OpenMode::ReadOnly,
-            index: ResidentIndex::adopt_generation(index),
             header_extensions,
             matrix,
             matrix_creation_nonce,
@@ -4020,9 +4096,9 @@ impl VarveFile {
                 spec,
                 path,
                 file: RecordFile::new(file),
+                index: ResidentIndex::adopt_generation(&index, snapshot.clone(), spec)?,
                 snapshot,
                 mode: OpenMode::ReadWrite,
-                index: ResidentIndex::adopt_generation(index),
                 header_extensions,
                 matrix,
                 matrix_creation_nonce,
@@ -5067,7 +5143,10 @@ impl VarveFile {
             self.poison.poison();
             return Err(error);
         }
-        self.index.restamp(target_position, sequence, checksum);
+        // No index update. `overwrite_record_bytes_in_place` above wrote and
+        // flushed a header carrying this sequence and this checksum, and the
+        // entry for this position is rebuilt from that header — so the restamp
+        // this used to perform would copy the file's own bytes onto themselves.
         self.publish_sequence(sequence);
         Ok(sequence)
     }
@@ -8148,7 +8227,8 @@ impl VarveFile {
             Ok((file, snapshot)) => {
                 self.file = RecordFile::new(file);
                 self.snapshot = snapshot;
-                self.index = ResidentIndex::adopt_generation(new_index);
+                self.index =
+                    ResidentIndex::adopt_generation(&new_index, self.snapshot.clone(), self.spec)?;
                 // The resident index was replaced wholesale; recover the O(1)
                 // flush-cadence state once for the new generation (PERF2-02)
                 // and the O(1) block tails with it (PERF2-05). Record offsets
@@ -8196,7 +8276,8 @@ impl VarveFile {
             Ok((file, snapshot)) => {
                 self.file = RecordFile::new(file);
                 self.snapshot = snapshot;
-                self.index = ResidentIndex::adopt_generation(new_index);
+                self.index =
+                    ResidentIndex::adopt_generation(&new_index, self.snapshot.clone(), self.spec)?;
                 // The resident index was replaced wholesale; recover the O(1)
                 // flush-cadence state once for the new generation (PERF2-02)
                 // and the O(1) block tails with it (PERF2-05). Record offsets
@@ -8229,11 +8310,11 @@ impl VarveFile {
             ));
         }
         let mut file = self.snapshot.try_clone_file()?;
-        validate_generation_file(
+        validate_generation_index(
             self.spec,
             &mut file,
             append_log_start_for_file(self)?,
-            self.index.as_contiguous_slice(),
+            &self.index,
         )
     }
 
@@ -8604,7 +8685,7 @@ impl VarveFile {
         // non-resident record, so it is maintained for every block. And the
         // record's own footer chain went to disk above, not to memory.
         if resident {
-            self.index.install(index_slot, entry);
+            self.index.install(index_slot, &entry);
             // Single index append site: keep the O(1) flush-cadence state in
             // lockstep with the resident index (PERF2-02). It counts resident
             // entries, so a non-resident record must not advance it.
@@ -8625,6 +8706,14 @@ impl VarveFile {
             _ => true,
         };
         self.snapshot = new_snapshot;
+        // The directory's entries are rebuilt from the file, and the record
+        // just installed is past the end of the snapshot this handle held a
+        // moment ago — `SnapshotFile` refuses a read beyond its logical length
+        // rather than serving it, so without this the entry for the newest
+        // record would be unreadable until something else rebound. One `Arc`
+        // refcount bump and a `u64` copy: no allocation and no syscall, which
+        // is what lets it sit here.
+        self.index.rebind(self.snapshot.clone());
         self.publish_sequence(sequence);
         Ok(info)
     }
@@ -9049,13 +9138,47 @@ fn append_log_start_for_file(file: &VarveFile) -> Result<u64> {
     Ok(native_file_header_len(file.spec, extension_len))
 }
 
+/// Checks a live file against the record directory that indexes it.
+///
+/// **What this can still prove, and what it no longer can.** The directory
+/// holds each record's offset and nothing else; the entry it produces is
+/// rebuilt from the record's own header. So `physical_record_headers_match`
+/// below compares a header against itself here and cannot fail — the header
+/// fields of an indexed record are no longer a fact the index could disagree
+/// with the file about, because the index does not store them.
+///
+/// What the walk still establishes is everything that was ever load-bearing on
+/// this path: the directory's offsets are contiguous from `append_start`, they
+/// cover the file exactly (`offset != file_len` is the tail refusal), every
+/// record's stored checksum verifies against its bytes, every checkpoint's
+/// declared ceilings hold, and no sequence is reused. A file replaced or
+/// truncated under the writer fails the first or the second of those.
+fn validate_generation_index(
+    spec: FormatSpec,
+    file: &mut File,
+    append_start: u64,
+    index: &ResidentIndex,
+) -> Result<()> {
+    validate_generation_file_inner(spec, file, append_start, index.len(), index.iter(), None)
+}
+
+/// The same walk against entries the caller is still holding — the rewrite
+/// paths, which validate the generation they have just built before it is
+/// published and so have no directory for it yet.
 fn validate_generation_file(
     spec: FormatSpec,
     file: &mut File,
     append_start: u64,
     expected_entries: &[RecordIndexEntry],
 ) -> Result<()> {
-    validate_generation_file_inner(spec, file, append_start, expected_entries, false)
+    validate_generation_file_inner(
+        spec,
+        file,
+        append_start,
+        expected_entries.len(),
+        infallible_entries(expected_entries),
+        None,
+    )
 }
 
 fn validate_replacement_generation_file(
@@ -9064,15 +9187,27 @@ fn validate_replacement_generation_file(
     append_start: u64,
     expected_entries: &[RecordIndexEntry],
 ) -> Result<()> {
-    validate_generation_file_inner(spec, file, append_start, expected_entries, true)
+    validate_generation_file_inner(
+        spec,
+        file,
+        append_start,
+        expected_entries.len(),
+        infallible_entries(expected_entries),
+        Some(expected_entries),
+    )
 }
 
+/// `strict_prefix` is `Some` for the replacement path, which decodes each
+/// checkpoint in full and compares it against the entries preceding it. The
+/// other caller reads only the checkpoint prefix, which is what decides the two
+/// ceilings, and needs no prefix of its own.
 fn validate_generation_file_inner(
     spec: FormatSpec,
     file: &mut File,
     append_start: u64,
-    expected_entries: &[RecordIndexEntry],
-    strict_checkpoints: bool,
+    expected_count: usize,
+    expected_entries: impl Iterator<Item = Result<RecordIndexEntry>>,
+    strict_prefix: Option<&[RecordIndexEntry]>,
 ) -> Result<()> {
     let file_len = check_open_file_len(spec, file)?;
     let header_len = read_file_header(spec, file)?;
@@ -9084,7 +9219,28 @@ fn validate_generation_file_inner(
     let mut accounting = ScanAccounting::default();
     accounting.advance(spec, append_start)?;
     let mut offset = append_start;
-    for (position, expected) in expected_entries.iter().enumerate() {
+    // Sequence uniqueness, folded into this walk instead of a second one over
+    // the same entries. The `8N` temporary is taken up front rather than only
+    // on the out-of-order fallback, because the fallback needs every sequence
+    // including the ones an ascending prefix already passed, and a streaming
+    // check cannot go back for them. `sequence_uniqueness_transient_bytes`
+    // already charges this unconditionally — the resident merge estimate has
+    // always treated the fallback as the published worst case. The sort is
+    // still skipped when the file is ascending, which is the ordinary case.
+    let sequence_bytes = sequence_uniqueness_transient_bytes(expected_count)?;
+    let mut sequences = Vec::new();
+    sequences
+        .try_reserve_exact(expected_count)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "sequence uniqueness index",
+            requested: sequence_bytes,
+        })?;
+    let mut ascending = true;
+    let mut walked = 0usize;
+    for (position, expected) in expected_entries.enumerate() {
+        let expected = expected?;
+        let expected = &expected;
+        walked += 1;
         if expected.record_offset != offset {
             return Err(Error::InvalidCanonicalEncoding(
                 "native record offsets are not contiguous",
@@ -9122,7 +9278,7 @@ fn validate_generation_file_inner(
         {
             // Only the strict path uses the entries; everything else needed
             // the two ceilings, which the prefix decides.
-            if !strict_checkpoints {
+            if strict_prefix.is_none() {
                 let prefix = actual.read_payload_prefix_file_with_len(
                     file,
                     file_len,
@@ -9130,7 +9286,7 @@ fn validate_generation_file_inner(
                 )?;
                 check_index_checkpoint_limits(spec, &prefix)?;
             }
-            if strict_checkpoints {
+            if let Some(prefix) = strict_prefix {
                 let payload = actual.read_payload_file_with_len(file, file_len)?;
                 inspect_index_checkpoint(
                     spec,
@@ -9139,7 +9295,7 @@ fn validate_generation_file_inner(
                     file_len,
                     &actual,
                     position,
-                    expected_entries.iter().take(position),
+                    prefix.iter().take(position),
                 )?;
                 let checkpoint = decode_index_checkpoint(spec, &payload, file_len)?;
                 validate_index_checkpoint(
@@ -9148,16 +9304,28 @@ fn validate_generation_file_inner(
                     &actual,
                     &checkpoint,
                     position,
-                    expected_entries.iter().take(position),
+                    prefix.iter().take(position),
                 )?;
             }
         }
+        ascending &= sequences.last().is_none_or(|last| *last < actual.sequence);
+        sequences.push(actual.sequence);
         offset = actual.checked_physical_end()?;
     }
+    debug_assert_eq!(walked, expected_count, "declared entry count did not hold");
     if offset != file_len {
         return Err(Error::CorruptTail { offset });
     }
-    validate_unique_sequences(expected_entries)
+    if ascending {
+        return Ok(());
+    }
+    sequences.sort_unstable();
+    if sequences.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(Error::InvalidCanonicalEncoding(
+            "duplicate native record sequence",
+        ));
+    }
+    Ok(())
 }
 
 fn physical_record_headers_match(left: &RecordIndexEntry, right: &RecordIndexEntry) -> bool {
@@ -13982,11 +14150,9 @@ fn encode_record_footer(footer: RecordFooterFields) -> Result<[u8; RECORD_FOOTER
 /// representation in the record — proved, not assumed, by
 /// `every_index_entry_can_be_rebuilt_from_its_own_record`.
 ///
-/// `#[cfg(test)]` because nothing calls it yet: the store it exists for is
-/// still a `Vec<RecordIndexEntry>`. It is here, and proven, so that swapping
-/// the store is a change to the store and not also a new reader written under
-/// the same commit. The cfg comes off when `ResidentIndex` starts faulting.
-#[cfg(test)]
+/// This is what `ResidentIndex` calls for every entry it produces.
+/// `every_index_entry_can_be_rebuilt_from_its_own_record` is the proof that
+/// what comes back matches what the scanning reader would have built.
 pub(crate) fn fault_record_entry(
     snapshot: &SnapshotFile,
     spec: FormatSpec,
@@ -17866,19 +18032,42 @@ mod tests {
 /// Retained on purpose, with the reason at the declaration: `ResidentIndex::
 /// adopt_generation` (open and the rewrite paths hand over a `Vec` that already
 /// describes records on disk), `ResidentIndex::truncate` (the append rollback)
-/// and `ResidentIndex::restamp` (the in-place restamp). None of them can add
-/// an entry the disk does not have, which is the property the token protects.
+/// and `ResidentIndex::rebind` (pointing the directory at the file as it now
+/// is). None of them can add an entry the disk does not have, which is the
+/// property the token protects.
 #[cfg(test)]
 mod bypass_catalogue {
     use super::*;
+
+    /// A directory over an empty file. The token tests never produce an entry,
+    /// so what backs it never has to hold a record.
+    fn empty_index() -> (tempfile::TempDir, ResidentIndex) {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("empty.varve");
+        std::fs::write(&path, b"").expect("create");
+        let snapshot = SnapshotFile::new(File::open(&path).expect("open")).expect("snapshot");
+        let spec = FormatSpec::new(
+            b"VSBYPS",
+            1,
+            Endian::Little,
+            0,
+            IndexPolicy::ScanOnOpen,
+            IntegrityPolicy::None,
+            RecoveryPolicy::Strict,
+            ManifestPolicy::None,
+            &[],
+        );
+        let index = ResidentIndex::empty(snapshot, spec);
+        (directory, index)
+    }
 
     /// The legitimate route still works, and still costs the reservation: the
     /// only producer of the token is the fallible half of the append.
     #[test]
     fn the_checked_route_still_produces_the_reservation_it_should() {
-        let mut index = ResidentIndex::adopt_generation(Vec::new());
+        let (_directory, mut index) = empty_index();
         let slot = index.reserve(|| Ok(64)).expect("reservation");
-        index.install(slot, sample_index_entry());
+        index.install(slot, &sample_index_entry());
         assert_eq!(index.len(), 1);
     }
 
@@ -17886,7 +18075,7 @@ mod bypass_catalogue {
     /// would have followed it cannot be spelled.
     #[test]
     fn a_refused_charge_yields_no_reservation() {
-        let mut index = ResidentIndex::adopt_generation(Vec::new());
+        let (_directory, mut index) = empty_index();
         assert!(
             index
                 .reserve(|| Err(Error::AllocationFailed {

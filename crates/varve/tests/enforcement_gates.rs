@@ -910,13 +910,16 @@ fn the_resident_record_index_cannot_be_grown_or_outrun() {
     );
     assert!(
         source.contains(
-            "    pub struct ResidentIndex {\n        entries: Vec<RecordIndexEntry>,\n    }"
+            "    pub struct ResidentIndex {\n        slots: Vec<IndexSlot>,\n        source: \
+             IndexSource,\n    }"
         ),
-        "the mirror's `Vec` must stay a private field of `ResidentIndex`"
+        "the directory's `Vec` must stay a private field of `ResidentIndex`"
     );
     assert!(
         !source.contains("impl DerefMut for ResidentIndex")
+            && !source.contains("fn slots_mut")
             && !source.contains("fn entries_mut")
+            && !source.contains("-> &mut Vec<IndexSlot>")
             && !source.contains("-> &mut Vec<RecordIndexEntry>"),
         "`ResidentIndex` must not lend out its `Vec`: a `&mut Vec` is every growth operation \
          at once"
@@ -932,9 +935,9 @@ fn the_resident_record_index_cannot_be_grown_or_outrun() {
          tests/ui/fail_fabricated_index_reservation.rs asserts"
     );
     assert_eq!(
-        source.matches("self.entries.push(").count(),
+        source.matches("self.slots.push(").count(),
         1,
-        "there must be exactly one growth of the resident index in the crate, and it must be \
+        "there must be exactly one growth of the record directory in the crate, and it must be \
          `ResidentIndex::install`, which consumes the token"
     );
     assert!(
@@ -944,8 +947,8 @@ fn the_resident_record_index_cannot_be_grown_or_outrun() {
          a comment above it"
     );
     assert!(
-        source.contains("self.index.install(index_slot, entry);"),
-        "the single post-append mirror install must stay routed through the token"
+        source.contains("self.index.install(index_slot, &entry);"),
+        "the single post-append directory install must stay routed through the token"
     );
     // Carried over from the round-12 gate this supersedes: the spelling that
     // grew the mirror directly must not come back, even though the type now
