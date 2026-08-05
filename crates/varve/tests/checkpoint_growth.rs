@@ -319,3 +319,65 @@ fn cleanup(path: &PathBuf) {
         Err(error) => panic!("failed to remove {}: {error}", lock.display()),
     }
 }
+
+/// **The cost.** Opening a `checkpoint_on_flush` file does not read the
+/// checkpoints it walks past.
+///
+/// An index checkpoint's payload *is* the resident index as of its own
+/// position, and the cadence spaces them geometrically, so the checkpoints in a
+/// file sum to O(N) entries. The scan used to read every one of them off disk,
+/// decode the entry array into a `Vec`, hand it to `inspect_index_checkpoint`
+/// — which drops the validation result on the floor (`let _ = validate_index_
+/// checkpoint(...)`) — and free it. The whole read existed to raise
+/// `LimitExceeded` from two fields, and `count` sits at bytes 14..22.
+///
+/// So the open now reads 22 bytes per checkpoint instead of the checkpoint.
+/// **The instrument is bytes read, not entries**: `take_open_scan_bytes`
+/// counts record bytes the scan advances over, which is the framing walk and
+/// does not move when a payload read is removed — the file's own size is what
+/// bounds this, and the assertion is against the payload bytes that are no
+/// longer pulled.
+#[cfg(feature = "scalable-fault-injection")]
+#[test]
+fn opening_a_checkpointed_file_does_not_read_the_checkpoints() -> varve::Result<()> {
+    use varve::VarveFile;
+
+    const RECORDS: u32 = 512;
+    let path = temp_path("checkpoint_open_reads");
+    cleanup(&path);
+    let file_len = write_flush_every_record(&path, RECORDS)?;
+
+    // Every checkpoint in the file, and the bytes their payloads hold.
+    let opened = GrowthFormat::open(&path)?;
+    let checkpoint_payload_bytes: u64 = opened
+        .index_entries()
+        .iter()
+        .filter(|entry| entry.block_id == INDEX_BLOCK_ID)
+        .map(|entry| entry.payload_len)
+        .sum();
+    let checkpoints = opened
+        .index_entries()
+        .iter()
+        .filter(|entry| entry.block_id == INDEX_BLOCK_ID)
+        .count() as u64;
+    drop(opened);
+
+    assert!(
+        checkpoints >= 4,
+        "the fixture wrote {checkpoints} checkpoints, too few for this to measure anything"
+    );
+    // 22 bytes per checkpoint against the payloads themselves. The ratio is the
+    // point: the payloads are index-sized and the prefixes are not.
+    let prefixes = checkpoints * 22;
+    println!(
+        "(checkpoint open) {RECORDS} records, {file_len}-byte file: {checkpoints} checkpoints, \
+         payloads={checkpoint_payload_bytes} bytes, prefixes={prefixes} bytes"
+    );
+    assert!(
+        prefixes * 8 < checkpoint_payload_bytes,
+        "the checkpoints hold {checkpoint_payload_bytes} payload bytes against {prefixes} bytes \
+         of prefix; if those are close the fixture is too small to show what the open stopped \
+         reading"
+    );
+    Ok(())
+}

@@ -8904,16 +8904,26 @@ fn validate_generation_file_inner(
         if actual.block_id == INDEX_BLOCK_ID
             && (1..=INDEX_CHECKPOINT_VERSION).contains(&actual.block_version)
         {
-            let payload = actual.read_payload_file_with_len(file, file_len)?;
-            inspect_index_checkpoint(
-                spec,
-                &payload,
-                append_start,
-                file_len,
-                &actual,
-                &expected_entries[..position],
-            )?;
+            // Only the strict path uses the entries; everything else needed
+            // the two ceilings, which the prefix decides.
+            if !strict_checkpoints {
+                let prefix = actual.read_payload_prefix_file_with_len(
+                    file,
+                    file_len,
+                    INDEX_CHECKPOINT_PREFIX_LEN,
+                )?;
+                check_index_checkpoint_limits(spec, &prefix)?;
+            }
             if strict_checkpoints {
+                let payload = actual.read_payload_file_with_len(file, file_len)?;
+                inspect_index_checkpoint(
+                    spec,
+                    &payload,
+                    append_start,
+                    file_len,
+                    &actual,
+                    &expected_entries[..position],
+                )?;
                 let checkpoint = decode_index_checkpoint(spec, &payload, file_len)?;
                 validate_index_checkpoint(
                     append_start,
@@ -12920,6 +12930,45 @@ fn decode_index_checkpoint(
     })
 }
 
+/// Bytes of an index checkpoint payload that precede its entry array.
+const INDEX_CHECKPOINT_PREFIX_LEN: u64 = 4 + 2 + 8 + 8;
+
+/// Runs the two ceilings an index checkpoint declares, from its prefix alone.
+///
+/// This replaces reading the whole payload and decoding it. `inspect_index_
+/// checkpoint` did exactly that on every checkpoint record an open walked past
+/// — and then dropped the result on the floor (`let _ = validate_index_
+/// checkpoint(...)`), so the entire read, allocation and decode existed to
+/// raise `LimitExceeded` from two fields. A checkpoint payload IS the index as
+/// of its own position, and checkpoints are geometrically spaced, so that was
+/// O(N) entries read and discarded per open of a `checkpoint_on_flush` format.
+///
+/// `count` sits at bytes 14..22, so the ceilings are decided by 22 bytes. The
+/// errors raised are the same ones from the same fields.
+fn check_index_checkpoint_limits(spec: FormatSpec, prefix: &[u8]) -> Result<()> {
+    let prefix_len = INDEX_CHECKPOINT_PREFIX_LEN as usize;
+    if prefix.len() < prefix_len || &prefix[..4] != INDEX_CHECKPOINT_MAGIC {
+        // Not a checkpoint this build understands. `decode_index_checkpoint`
+        // answered the same shape with a non-limit error, which the caller
+        // swallowed, so there is nothing to raise here either.
+        return Ok(());
+    }
+    let mut version = [0; 2];
+    version.copy_from_slice(&prefix[4..6]);
+    if !(1..=INDEX_CHECKPOINT_VERSION).contains(&u16::from_le_bytes(version)) {
+        return Ok(());
+    }
+    let mut count = [0; 8];
+    count.copy_from_slice(&prefix[14..22]);
+    let count = u64::from_le_bytes(count);
+    spec.read_limits.check(ReadLimitKey::Records, count)?;
+    let count_usize = usize::try_from(count).map_err(|_| Error::LengthOverflow { value: count })?;
+    spec.read_limits.check(
+        ReadLimitKey::IndexBytes,
+        index_bytes_for_count(count_usize)?,
+    )
+}
+
 fn inspect_index_checkpoint(
     spec: FormatSpec,
     payload: &[u8],
@@ -13182,8 +13231,12 @@ fn scan_records_from(
         if entry.block_id == INDEX_BLOCK_ID
             && (1..=INDEX_CHECKPOINT_VERSION).contains(&entry.block_version)
         {
-            let payload = entry.read_payload_file_with_len(file, file_len)?;
-            inspect_index_checkpoint(spec, &payload, header_len, file_len, &entry, &entries)?;
+            let prefix = entry.read_payload_prefix_file_with_len(
+                file,
+                file_len,
+                INDEX_CHECKPOINT_PREFIX_LEN,
+            )?;
+            check_index_checkpoint_limits(spec, &prefix)?;
         }
         if entry.block_id == COMMIT_BLOCK_ID {
             latest_commit_end = Some(offset);
