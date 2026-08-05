@@ -625,12 +625,31 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
         } else {
             quote!((#(self.#key_fields.clone(),)*))
         };
+        // The borrowing counterpart of `key_value`: the same fields, compared
+        // in place. `key()` clones every key field, so a caller that only wants
+        // to know whether the key matches allocated once per heap-typed field
+        // and dropped the answer. Generated field by field rather than as
+        // `&self.key() == other`, which is exactly the clone being avoided.
+        let key_eq_value = if key_fields.len() == 1 {
+            let key = &key_fields[0];
+            quote!(self.#key == *other)
+        } else {
+            let comparisons = key_fields.iter().enumerate().map(|(position, key)| {
+                let index = syn::Index::from(position);
+                quote!(self.#key == other.#index)
+            });
+            quote!(#(#comparisons)&&*)
+        };
         quote! {
             impl ::varve::__core::VarveKeyedBlock for #ident {
                 type Key = #key_type;
 
                 fn key(&self) -> Self::Key {
                     #key_value
+                }
+
+                fn key_eq(&self, other: &Self::Key) -> bool {
+                    #key_eq_value
                 }
             }
         }

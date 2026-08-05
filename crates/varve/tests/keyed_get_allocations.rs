@@ -1,0 +1,212 @@
+#![cfg(feature = "high-cardinality-dev")]
+//! F-12 — asking a record "is this your key?" built the key to answer.
+//!
+//! `VarveKeyedBlock::key` clones every key field, and the disk-index verify
+//! path called it purely to compare: `if &value.key() != key`. For a `String`
+//! key that is a heap allocation and a copy of the key bytes, per `get`, thrown
+//! away the moment the comparison succeeds — which is the case a `get` that
+//! finds its record always takes.
+//!
+//! The fix adds `VarveKeyedBlock::key_eq`, which `varve_format!` generates
+//! field by field so it borrows. The default implementation on the trait is the
+//! old expression, so a hand-written `impl` that predates the method keeps
+//! working.
+//!
+//! **The key type is the instrument.** A `u32`-keyed block cannot see this
+//! defect at all — its `key()` is a `Copy` and allocates nothing, which is why
+//! every existing keyed allocation test in this workspace is blind to it. So
+//! the measurement is `String`-keyed, and the second arm is the same shape
+//! keyed by `u32`: the gap between them is the key clone, and it is the whole
+//! of what this fix removes.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
+use varve::{DiskIndexOptions, varve_format};
+
+struct CountingAllocator;
+
+std::thread_local! {
+    /// Allocation calls on this thread since the window opened. Per-thread
+    /// because `cargo test` runs test functions concurrently and a
+    /// process-wide counter would be counting the neighbours.
+    static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+fn count_allocation() {
+    let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+}
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc(layout) };
+        if !pointer.is_null() {
+            count_allocation();
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(pointer, layout) };
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let replacement = unsafe { System.realloc(pointer, layout, new_size) };
+        if !replacement.is_null() {
+            count_allocation();
+        }
+        replacement
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+fn allocations() -> u64 {
+    ALLOCATIONS.with(Cell::get)
+}
+
+varve_format! {
+    pub format StringKeyFormat {
+        magic: b"SKEY";
+        version: 1;
+        blocks {
+            variable Doc(id = 1, key = [name], key_index = disk) {
+                name: String,
+                value: u32,
+            }
+        }
+    }
+}
+
+varve_format! {
+    pub format ScalarKeyFormat {
+        magic: b"UKEY";
+        version: 1;
+        blocks {
+            variable Row(id = 1, key = [id], key_index = disk) {
+                id: u32,
+                value: u32,
+            }
+        }
+    }
+}
+
+const RECORDS: u32 = 500;
+const RECORDS_U64: u64 = RECORDS as u64;
+
+fn options() -> DiskIndexOptions {
+    DiskIndexOptions {
+        cache_bytes: 1024 * 1024,
+        ..DiskIndexOptions::default()
+    }
+}
+
+/// A label long enough that its clone cannot be a small-string optimisation
+/// living in the `String` header — `String` has no such optimisation in std,
+/// but a 48-byte label also makes the allocation unmistakably payload-sized.
+fn label(ordinal: u32) -> String {
+    format!("document-key-{ordinal:0>34}")
+}
+
+/// Allocations issued by `RECORDS` successful `get`s on a `String`-keyed block.
+fn string_key_get_allocations() -> varve::Result<u64> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("string.varve");
+    let mut writer = StringKeyFormat::create_indexed_writer(&path, options())?;
+    for ordinal in 0..RECORDS {
+        writer.push_doc(&Doc {
+            name: label(ordinal),
+            value: ordinal,
+        })?;
+    }
+    writer.sync()?;
+    drop(writer);
+
+    let reader = StringKeyFormat::open_indexed_reader(&path, options())?;
+    // Warm whatever the first lookup builds lazily.
+    let _ = reader.get_doc(&label(0))?;
+    let keys: Vec<String> = (0..RECORDS).map(label).collect();
+
+    let start = allocations();
+    for key in &keys {
+        let found = reader.get_doc(key)?;
+        assert!(found.is_some(), "the fixture lost a record");
+    }
+    Ok(allocations() - start)
+}
+
+/// The same shape keyed by `u32`, whose `key()` allocates nothing at all.
+fn scalar_key_get_allocations() -> varve::Result<u64> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("scalar.varve");
+    let mut writer = ScalarKeyFormat::create_indexed_writer(&path, options())?;
+    for ordinal in 0..RECORDS {
+        writer.push_row(&Row {
+            id: ordinal,
+            value: ordinal,
+        })?;
+    }
+    writer.sync()?;
+    drop(writer);
+
+    let reader = ScalarKeyFormat::open_indexed_reader(&path, options())?;
+    let _ = reader.get_row(&0)?;
+
+    let start = allocations();
+    for ordinal in 0..RECORDS {
+        let found = reader.get_row(&ordinal)?;
+        assert!(found.is_some(), "the fixture lost a record");
+    }
+    Ok(allocations() - start)
+}
+
+/// **The cost.** A successful `get` does not allocate to check the key it was
+/// given against the key it found.
+///
+/// Measured on this tree at 500 gets:
+///
+/// |                      | allocations/get |
+/// | ---                  | ---             |
+/// | `u32` key            | 10.00           |
+/// | `String` key, before | **13.00**       |
+/// | `String` key, after  | **12.00**       |
+///
+/// One allocation per `get` disappears, and it is the key clone. Two of the
+/// three-allocation gap over the scalar arm remain and are NOT this fix: the
+/// `String` the decoded record owns — that record is decoded either way, it is
+/// what `get` returns — and the encoded lookup key the index probe builds.
+/// Stating the assertion as "equal to the scalar arm" would have failed
+/// against correct code.
+///
+/// The ceiling is a literal captured from the **pre-change build**. A baseline
+/// taken inside the post-fix run proves nothing, and that is the pattern that
+/// left six proofs in the 2026-08-05 audit round unable to discriminate.
+#[test]
+fn a_successful_get_does_not_build_the_key_to_compare_it() -> varve::Result<()> {
+    let string_key = string_key_get_allocations()?;
+    let scalar_key = scalar_key_get_allocations()?;
+    let string_per_get = string_key as f64 / RECORDS_U64 as f64;
+    let scalar_per_get = scalar_key as f64 / RECORDS_U64 as f64;
+    println!(
+        "(keyed get) {RECORDS} gets: string_key={string_per_get:.2}/get \
+         scalar_key={scalar_per_get:.2}/get"
+    );
+
+    let extra = string_per_get - scalar_per_get;
+    assert!(
+        extra < 3.0,
+        "a String-keyed get allocated {extra:.2} times per get more than a u32-keyed one; \
+         before this fix it was 3.00, of which one was the key built only to be compared \
+         against the key the caller already held"
+    );
+    // And the scalar arm must not move: it never had the clone to lose, so a
+    // "fix" that traded one allocation for another somewhere shared shows up
+    // here rather than hiding in the gap.
+    assert!(
+        scalar_per_get <= 10.0,
+        "a u32-keyed get allocated {scalar_per_get:.2} times per get; it was 10.00 before this \
+         fix and has no key clone to remove"
+    );
+    Ok(())
+}

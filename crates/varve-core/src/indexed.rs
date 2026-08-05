@@ -385,7 +385,7 @@ impl VarveIndexedReader {
         let payload =
             entry.read_logical_payload_snapshot(self.stream.spec(), self.stream.snapshot())?;
         let value: T = budget.decode(&payload, T::ENDIAN.unwrap_or(self.stream.spec().endian))?;
-        if &value.key() != key {
+        if !value.key_eq(key) {
             return Err(index_invariant("put candidate key mismatch"));
         }
         Ok(value)

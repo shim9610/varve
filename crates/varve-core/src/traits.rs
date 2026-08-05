@@ -66,6 +66,20 @@ pub trait VarveKeyedBlock: VarveBlock {
     type Key: VarveKey;
 
     fn key(&self) -> Self::Key;
+
+    /// Whether this value's key equals `other`, without building the key.
+    ///
+    /// [`key`](Self::key) clones every key field, so asking a record "is this
+    /// your key?" allocated once per heap-typed key field and dropped the
+    /// answer immediately. On the disk-index verify path that is per candidate
+    /// record, for a value that is thrown away when it matches.
+    ///
+    /// The default is the old behaviour, so a hand-written implementation that
+    /// predates this method keeps compiling and keeps working. `varve_format!`
+    /// generates a field-by-field override that borrows.
+    fn key_eq(&self, other: &Self::Key) -> bool {
+        &self.key() == other
+    }
 }
 
 pub trait VarveMatrixBlock: VarveBlock {
