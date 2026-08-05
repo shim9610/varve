@@ -37,14 +37,21 @@ fn run() -> io::Result<ExitCode> {
     let cargo_args = ensure_locked_resolution(cargo_args);
     reject_recursive_invocation(&cargo_args)?;
 
+    // Resolved before the session directory is made, so a runner invoked
+    // outside a workspace fails without leaving one behind.
+    let workspace = workspace_root()?;
+
     let session = TestSession::create()?;
     let session_root = session.path().to_path_buf();
+    // The workspace is printed, not merely used: the failure this replaced was
+    // silent precisely because nothing said which tree was under test.
+    eprintln!("Varve workspace under test: {}", workspace.display());
     eprintln!("Varve test artifacts: {}", session_root.display());
 
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let status = Command::new(cargo)
         .args(&cargo_args)
-        .current_dir(workspace_root())
+        .current_dir(&workspace)
         .env("TEMP", &session_root)
         .env("TMP", &session_root)
         .env("TMPDIR", &session_root)
@@ -75,11 +82,58 @@ fn run() -> io::Result<ExitCode> {
     }
 }
 
-fn workspace_root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("test runner must live under tools/<crate>")
+/// The workspace whose tests this invocation is about, resolved from where the
+/// runner was **invoked** rather than from where it was **built**.
+///
+/// This used to be `env!("CARGO_MANIFEST_DIR")`, and that is a compile-time
+/// constant baked into the binary. Two checkouts that share a
+/// `CARGO_TARGET_DIR` — a second worktree, a second clone, anyone who sets that
+/// variable once in a shell profile — produce the *same* unit hash for this
+/// crate, so cargo reuses the artifact instead of rebuilding it. Measured on
+/// 2026-08-05 with two worktrees over one target directory: built from tree A,
+/// then `cargo build -p varve-test-runner` in tree B reported `Finished` with
+/// no `Compiling` line, one artifact existed
+/// (`varve_test_runner-1cfa41ebddd3b020`), and the uplifted binary still
+/// carried tree A's path. Invoked from tree B it spawned cargo with
+/// `PWD=/home/user/rt-A`.
+///
+/// That is not a slow test run, it is a **green report about a tree nobody
+/// asked about**: on 2026-08-05 it ran 50 of 63 targets and reported
+/// `EXIT=0, 776 passed, 0 failed` while the tree in front of the operator had a
+/// failing test. Nothing in the output named the root it used, so a passing run
+/// was indistinguishable from a correct one.
+///
+/// Walking up from the current directory cannot be stale: there is no cached
+/// answer to be wrong. When the runner is invoked from outside any workspace it
+/// now refuses, which is the loud failure the old code turned into a quiet one.
+fn workspace_root() -> io::Result<PathBuf> {
+    workspace_root_from(&env::current_dir()?)
+}
+
+/// The [`workspace_root`] walk, over an explicit starting directory so it can
+/// be tested without moving the process's own current directory.
+fn workspace_root_from(start: &Path) -> io::Result<PathBuf> {
+    for directory in start.ancestors() {
+        let manifest = directory.join("Cargo.toml");
+        if !manifest.is_file() {
+            continue;
+        }
+        let text = fs::read_to_string(&manifest)?;
+        if text
+            .lines()
+            .any(|line| line.trim_end().trim_start() == "[workspace]")
+        {
+            return Ok(directory.to_path_buf());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "no Cargo.toml declaring [workspace] at or above {}; \
+             run the test runner from inside the workspace",
+            start.display()
+        ),
+    ))
 }
 
 /// Make locked dependency resolution the runner's default (REL-01).
@@ -281,6 +335,58 @@ fn validate_owned_session(root: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two workspaces, side by side, and the answer must follow the argument.
+    ///
+    /// This is the discriminating half. The predecessor was
+    /// `env!("CARGO_MANIFEST_DIR")`, a constant: it returns the same path
+    /// whatever it is asked about, so it answers `a` for a start inside `b` and
+    /// fails here. So does the likeliest wrong repair — caching the first
+    /// resolved root in a `OnceLock` — because the second call would return the
+    /// first call's answer. Only a resolver that reads its argument passes both
+    /// halves.
+    #[test]
+    fn the_workspace_root_follows_the_starting_directory() -> io::Result<()> {
+        let session = TestSession::create()?;
+        let a = session.path().join("a");
+        let b = session.path().join("b");
+        for root in [&a, &b] {
+            fs::create_dir_all(root.join("tools/varve-test-runner/src"))?;
+            fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n")?;
+            // A member manifest with no `[workspace]` table: the walk must pass
+            // through it rather than stop at the first Cargo.toml it meets.
+            fs::write(
+                root.join("tools/varve-test-runner/Cargo.toml"),
+                "[package]\nname = \"varve-test-runner\"\n",
+            )?;
+        }
+
+        assert_eq!(workspace_root_from(&a)?, a);
+        assert_eq!(workspace_root_from(&b)?, b);
+        assert_eq!(workspace_root_from(&a.join("tools/varve-test-runner"))?, a);
+        assert_eq!(
+            workspace_root_from(&b.join("tools/varve-test-runner/src"))?,
+            b
+        );
+        session.cleanup()
+    }
+
+    /// Outside any workspace the runner refuses instead of guessing, because a
+    /// guess is what silently tested the wrong tree.
+    #[test]
+    fn a_start_outside_any_workspace_is_refused() -> io::Result<()> {
+        let session = TestSession::create()?;
+        let orphan = session.path().join("orphan");
+        fs::create_dir_all(&orphan)?;
+        let error = workspace_root_from(&orphan)
+            .expect_err("a directory under no workspace manifest must not resolve");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error.to_string().contains("[workspace]"),
+            "the refusal must say what was looked for, got: {error}"
+        );
+        session.cleanup()
+    }
 
     #[test]
     fn sessions_are_fresh_unique_and_cleanup_is_verified() -> io::Result<()> {
