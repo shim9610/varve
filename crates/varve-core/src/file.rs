@@ -4727,7 +4727,10 @@ impl VarveFile {
         let record_offset = entry.record_offset;
         let payload_offset = entry.payload_offset;
 
-        let mut new_index = clone_matching_entries(self.spec, &self.index, |_| true)?;
+        // Every entry, so the count is the length and no counting pass is
+        // needed to learn it.
+        let mut new_index =
+            clone_matching_entries(self.spec, &self.index, self.index.len(), |_| true)?;
         new_index[target_position].sequence = sequence;
         new_index[target_position].checksum = checksum;
 
@@ -5281,8 +5284,16 @@ impl VarveFile {
         // A non-resident block has no entries here, and an empty collection
         // would say "nothing was written" rather than "not through this door".
         crate::collections::ensure_resident_block::<T>(self.spec)?;
-        let entries =
-            clone_matching_entries(self.spec, &self.index, |entry| entry.block_id == T::ID)?;
+        // Filtered, so the count is not free: one pass to learn it, because
+        // the charge and the reservation both have to happen before the copy.
+        let count = self
+            .index
+            .iter()
+            .filter(|entry| entry.block_id == T::ID)
+            .count();
+        let entries = clone_matching_entries(self.spec, &self.index, count, |entry| {
+            entry.block_id == T::ID
+        })?;
         Ok(BlockVec::new(self.spec, self.snapshot.clone(), entries))
     }
 
@@ -7676,9 +7687,10 @@ impl VarveFile {
     /// Use owned reads instead when external immutability cannot be guaranteed.
     pub unsafe fn mmap_payloads(&self) -> Result<MmapPayloads> {
         let mapped_len = self.snapshot.len();
-        self.spec
-            .read_limits
-            .check(ReadLimitKey::FileLen, mapped_len)?;
+        // `MmapLen` alone. `FileLen` was checked here too, against the same
+        // value — the mapping's length is the snapshot's length — so it bounded
+        // nothing the line below does not, and it made a caller who declared a
+        // mapping ceiling also have to declare a file ceiling to use it.
         self.spec
             .read_limits
             .check(ReadLimitKey::MmapLen, mapped_len)?;
@@ -7702,17 +7714,21 @@ impl VarveFile {
                 len: mapped_len,
             });
         }
+        // **One validation pass, against the stronger bound.** This used to
+        // walk every entry against `current_len`, map the file, then walk every
+        // entry again against `mapped_len`. `mapped_len <= current_len` is
+        // enforced immediately above, so the second bound implies the first:
+        // one pass against `mapped_len` is both the stronger check and the
+        // earlier one, and it fails before the mapping is taken rather than
+        // after.
         for entry in self.index.iter() {
-            validate_mmap_index_entry(entry, current_len)?;
+            validate_mmap_index_entry(entry, mapped_len)?;
         }
         let map_len =
             usize::try_from(mapped_len).map_err(|_| Error::LengthOverflow { value: mapped_len })?;
         // SAFETY: The caller guarantees that the cloned backing object remains
         // immutable and valid for the mapping's entire lifetime.
         let mmap = unsafe { memmap2::MmapOptions::new().len(map_len).map(&file)? };
-        for entry in self.index.iter() {
-            validate_mmap_index_entry(entry, mapped_len)?;
-        }
         let mut index = Vec::new();
         index
             .try_reserve_exact(self.index.len())
@@ -7720,16 +7736,6 @@ impl VarveFile {
                 resource: "mmap index",
                 requested: mmap_index_bytes,
             })?;
-        index.extend(self.index.iter().cloned());
-        // Records occupy contiguous ascending physical extents, so the copied
-        // index is strictly offset-ordered; `payload_window` relies on this
-        // for its binary-search membership check (PERF2-07).
-        debug_assert!(
-            index
-                .windows(2)
-                .all(|pair| pair[0].record_offset < pair[1].record_offset),
-            "resident index must be strictly ordered by record offset",
-        );
         let mut by_block: HashMap<u32, Vec<usize>> = HashMap::new();
         by_block
             .try_reserve(
@@ -7741,7 +7747,23 @@ impl VarveFile {
                 resource: "mmap block lookup",
                 requested: mmap_index_bytes,
             })?;
+        // **One build pass.** The copy, the per-block position lists and the
+        // ordering witness were three separate walks of the same entries; they
+        // are one now. The ordering check in particular was a `windows(2)` over
+        // the finished copy, which is a whole extra traversal in debug builds to
+        // learn something each step already knows.
+        //
+        // Records occupy contiguous ascending physical extents, so the copied
+        // index is strictly offset-ordered; `payload_window` relies on that for
+        // its binary-search membership check (PERF2-07).
+        let mut previous_offset: Option<u64> = None;
         for (position, entry) in self.index.iter().enumerate() {
+            debug_assert!(
+                previous_offset.is_none_or(|previous| previous < entry.record_offset),
+                "resident index must be strictly ordered by record offset",
+            );
+            previous_offset = Some(entry.record_offset);
+            index.push(entry.clone());
             let positions = by_block.entry(entry.block_id).or_default();
             positions
                 .try_reserve(1)
@@ -7782,9 +7804,10 @@ impl VarveFile {
             .ok_or(Error::MatrixLayoutMissing)?
             .clone();
         let mapped_len = self.snapshot.len();
-        self.spec
-            .read_limits
-            .check(ReadLimitKey::FileLen, mapped_len)?;
+        // `MmapLen` alone. `FileLen` was checked here too, against the same
+        // value — the mapping's length is the snapshot's length — so it bounded
+        // nothing the line below does not, and it made a caller who declared a
+        // mapping ceiling also have to declare a file ceiling to use it.
         self.spec
             .read_limits
             .check(ReadLimitKey::MmapLen, mapped_len)?;
@@ -13483,15 +13506,27 @@ fn validate_unique_sequences(entries: &[RecordIndexEntry]) -> Result<()> {
     Ok(())
 }
 
+/// Clones the entries a predicate selects, charged and reserved before the
+/// first one is copied.
+///
+/// **`count` is the caller's**, because the caller is what knows whether it can
+/// be had for free. This used to run the predicate over the whole source once
+/// to count and once to copy — and its heaviest caller passes `|_| true`, where
+/// the count is `source.len()` and the first pass was walking the entire index
+/// to learn something it already knew.
+///
+/// A count is still required rather than optional: the `IndexBytes` charge and
+/// the exact reservation must both precede the copy, which is the invariant that
+/// keeps a refused limit from leaving a half-built generation behind.
 fn clone_matching_entries<F>(
     spec: FormatSpec,
     source: &[RecordIndexEntry],
+    count: usize,
     mut matches: F,
 ) -> Result<Vec<RecordIndexEntry>>
 where
     F: FnMut(&RecordIndexEntry) -> bool,
 {
-    let count = source.iter().filter(|entry| matches(entry)).count();
     let requested = index_bytes_for_count(count)?;
     spec.read_limits
         .check(ReadLimitKey::IndexBytes, requested)?;
@@ -13503,6 +13538,11 @@ where
             requested,
         })?;
     entries.extend(source.iter().filter(|entry| matches(entry)).cloned());
+    debug_assert_eq!(
+        entries.len(),
+        count,
+        "declared count did not match the predicate"
+    );
     Ok(entries)
 }
 
