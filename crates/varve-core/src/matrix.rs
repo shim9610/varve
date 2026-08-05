@@ -1044,6 +1044,11 @@ mod scaling_counters {
         /// this measures the sweep's cost against the *set* bits rather than
         /// against the whole keyspace it still visits.
         pub(super) static REBUILD_SLOT_BYTES_READ: Cell<u64> = const { Cell::new(0) };
+        /// Slot bytes streamed back off the disk on this thread by the two
+        /// slot readers — the zero probe and the checksum pass. `commit_cell`
+        /// runs both, and the explicit rebuild's sweep runs the second, so this
+        /// is every read-back and not only the ones a mutation caused.
+        pub(super) static SLOT_BYTES_READ_BACK: Cell<u64> = const { Cell::new(0) };
         /// Positional matrix-region reads issued on this thread
         /// ([`super::MatrixRegionReader::read_exact_at`]).
         pub(super) static MATRIX_REGION_READS: Cell<u64> = const { Cell::new(0) };
@@ -1086,6 +1091,14 @@ fn count_bitmap_bytes_hashed(bytes: u64) {
 
 #[cfg(not(any(test, feature = "scalable-fault-injection")))]
 fn count_bitmap_bytes_hashed(_bytes: u64) {}
+
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+fn count_slot_bytes_read_back(bytes: u64) {
+    scaling_counters::add(&scaling_counters::SLOT_BYTES_READ_BACK, bytes);
+}
+
+#[cfg(not(any(test, feature = "scalable-fault-injection")))]
+fn count_slot_bytes_read_back(_bytes: u64) {}
 
 #[cfg(any(test, feature = "scalable-fault-injection"))]
 fn count_lru_touch_steps(steps: u64) {
@@ -1782,6 +1795,19 @@ impl MatrixRecoveryReport {
         scaling_counters::get(&scaling_counters::REBUILD_SLOT_BYTES_READ)
     }
 
+    /// Slot bytes streamed back off the disk on this thread.
+    ///
+    /// `commit_cell` has two reasons to re-read the slot it is committing: the
+    /// zero probe that distinguishes "never written" from "written zeros", and
+    /// the checksum pass that records the cell's CRC. The first is already
+    /// skipped for a cell this session wrote; the second is not, which is what
+    /// this counter exists to keep visible. The explicit rebuild's checksum
+    /// sweep goes through the same reader and is counted here too, so a
+    /// measurement about mutation should reset immediately before it.
+    pub fn matrix_slot_bytes_read_back() -> u64 {
+        scaling_counters::get(&scaling_counters::SLOT_BYTES_READ_BACK)
+    }
+
     /// Positional matrix-region reads issued on this thread.
     ///
     /// Every byte the matrix reads — cell payloads, per-cell checksums, aux
@@ -1946,6 +1972,7 @@ impl MatrixRecoveryReport {
         scaling_counters::set(&scaling_counters::LRU_TOUCH_STEPS, 0);
         scaling_counters::set(&scaling_counters::BITMAP_BYTE_WRITES, 0);
         scaling_counters::set(&scaling_counters::REBUILD_SLOT_BYTES_READ, 0);
+        scaling_counters::set(&scaling_counters::SLOT_BYTES_READ_BACK, 0);
     }
 }
 
@@ -7020,6 +7047,33 @@ fn verify_cell_crc(
     Ok(())
 }
 
+/// Widest slot read without reaching for the wide frame.
+///
+/// A slot stride is a record, not a file: `SLOT_STRIDE` is 4 for a `u32` cell
+/// and a few dozen bytes for a struct. Every one of those used to zero 64 KiB of
+/// stack to read those bytes — the `[0u8; 64 * 1024]` local is a `memset` of the
+/// whole frame before the first byte is read, and the read then fills the first
+/// four of them. This bound is one page, which covers the slot widths the format
+/// is for while leaving the wide frame available to the ones it is not.
+const NARROW_SLOT_BYTES: usize = 4096;
+/// The frame a slot wider than [`NARROW_SLOT_BYTES`] streams through. Wide
+/// enough that a megabyte-class slot is 16 reads and not 256.
+const WIDE_SLOT_BYTES: usize = 64 * 1024;
+
+/// Chunk size for streaming `stride` bytes: the work, never more than the frame.
+///
+/// Split out from the two readers so the choice can be asserted directly. A
+/// stack `memset` leaves no trace in any counter, so the *decision* is what a
+/// test can hold, and the alternative — believing the frame shrank because the
+/// diff says so — is how the unmeasured half of a fix ships.
+const fn slot_chunk_len(stride: u64) -> usize {
+    if stride <= NARROW_SLOT_BYTES as u64 {
+        NARROW_SLOT_BYTES
+    } else {
+        WIDE_SLOT_BYTES
+    }
+}
+
 fn slot_is_all_zero(
     layout: &MatrixLayout,
     file: &mut File,
@@ -7029,12 +7083,21 @@ fn slot_is_all_zero(
     let offset = layout.slot_offset(block_index, ordinal)?;
     let stride = layout.blocks[block_index].slot_stride;
     file.seek(SeekFrom::Start(offset))?;
-    let mut buffer = [0u8; 64 * 1024];
-    let mut remaining = stride;
+    if slot_chunk_len(stride) == NARROW_SLOT_BYTES {
+        let mut buffer = [0u8; NARROW_SLOT_BYTES];
+        read_is_all_zero(file, &mut buffer, stride)
+    } else {
+        let mut buffer = [0u8; WIDE_SLOT_BYTES];
+        read_is_all_zero(file, &mut buffer, stride)
+    }
+}
+
+fn read_is_all_zero(file: &mut File, buffer: &mut [u8], mut remaining: u64) -> Result<bool> {
     while remaining != 0 {
         let chunk_len = usize::try_from(remaining.min(buffer.len() as u64))
             .map_err(|_| Error::LengthOverflow { value: remaining })?;
         file.read_exact(&mut buffer[..chunk_len])?;
+        count_slot_bytes_read_back(chunk_len as u64);
         if buffer[..chunk_len].iter().any(|byte| *byte != 0) {
             return Ok(false);
         }
@@ -7046,13 +7109,23 @@ fn slot_is_all_zero(
 #[cfg(feature = "integrity")]
 fn crc32_file_range(file: &mut File, offset: u64, len: u64) -> Result<u32> {
     file.seek(SeekFrom::Start(offset))?;
+    if slot_chunk_len(len) == NARROW_SLOT_BYTES {
+        let mut buffer = [0u8; NARROW_SLOT_BYTES];
+        crc32_streamed(file, &mut buffer, len)
+    } else {
+        let mut buffer = [0u8; WIDE_SLOT_BYTES];
+        crc32_streamed(file, &mut buffer, len)
+    }
+}
+
+#[cfg(feature = "integrity")]
+fn crc32_streamed(file: &mut File, buffer: &mut [u8], mut remaining: u64) -> Result<u32> {
     let mut hasher = crc32fast::Hasher::new();
-    let mut buffer = [0u8; 64 * 1024];
-    let mut remaining = len;
     while remaining != 0 {
         let chunk_len = usize::try_from(remaining.min(buffer.len() as u64))
             .map_err(|_| Error::LengthOverflow { value: remaining })?;
         file.read_exact(&mut buffer[..chunk_len])?;
+        count_slot_bytes_read_back(chunk_len as u64);
         hasher.update(&buffer[..chunk_len]);
         remaining -= chunk_len as u64;
     }
@@ -10223,6 +10296,40 @@ mod mutation_precharge_rollback_tests {
 /// and the proof that the witness cannot be forged from outside the crate lives
 /// in `crates/varve/tests/ui/fail_fabricated_crc_valid_completeness.rs`. These
 /// are the unit-level statements the two of them rest on.
+#[cfg(test)]
+mod slot_frame_tests {
+    use super::{NARROW_SLOT_BYTES, WIDE_SLOT_BYTES, slot_chunk_len};
+
+    /// The frame follows the slot width, and a slot narrower than a page does
+    /// not reach for the wide one.
+    ///
+    /// This asserts a *decision*, deliberately, and it is the only thing about
+    /// this change a test can hold: the cost removed is a stack `memset`, which
+    /// no counter observes and no syscall count changes — a 4-byte slot is one
+    /// `read` either way. What differed is that the read used to be preceded by
+    /// zeroing 64 KiB of stack, 16,384 bytes of `memset` per byte of payload.
+    #[test]
+    fn the_slot_frame_follows_the_slot_width() {
+        // The widths the format is actually for: a u32 cell, a small struct.
+        for stride in [4, 8, 64, 512, NARROW_SLOT_BYTES as u64] {
+            assert_eq!(
+                slot_chunk_len(stride),
+                NARROW_SLOT_BYTES,
+                "a {stride}-byte slot reached for the wide frame"
+            );
+        }
+        // And a slot wider than the narrow frame still streams through the wide
+        // one, so a large slot is not turned into sixteen times the reads.
+        for stride in [NARROW_SLOT_BYTES as u64 + 1, 1 << 20] {
+            assert_eq!(
+                slot_chunk_len(stride),
+                WIDE_SLOT_BYTES,
+                "a {stride}-byte slot was streamed through the narrow frame"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod crc_valid_evidence_tests {
     use super::crc_valid_evidence::CrcValidEvidence;

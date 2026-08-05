@@ -422,6 +422,79 @@ fn a_bitmap_byte_that_does_not_change_hashes_no_page() -> varve::Result<()> {
     Ok(())
 }
 
+/// **The cost.** What committing a cell reads back off the disk, pinned.
+///
+/// `commit_cell` has two reasons to re-read the slot it is committing:
+///
+/// 1. the **zero probe**, which separates "never written" from "written zeros"
+///    — already skipped for a cell this session wrote, on the session
+///    write-tracking bit; and
+/// 2. the **checksum pass**, which is how the cell's CRC is recorded, and which
+///    is *not* skipped for such a cell.
+///
+/// So a write-then-commit pair reads the slot back once, and a commit of a cell
+/// this session did not write reads it back twice. Both numbers are here
+/// because the second half of that is the part still to do: `write_cell` holds
+/// the payload and could hand its checksum forward, and does not. Pinning it
+/// means the remaining work is a number that moves rather than a claim.
+///
+/// The read-back is per *slot*, so it scales with `SLOT_STRIDE` and not with the
+/// cell count — which is why the assertions below are written as multiples of
+/// the stride.
+#[test]
+fn committing_a_cell_reads_its_slot_back_once_per_pass_that_needs_it() -> varve::Result<()> {
+    const CELLS: u64 = 32;
+    const STRIDE: u64 = HotCell::SLOT_STRIDE;
+    let dir = temp_dir("slot-read-back");
+    let path = dir.path().join("matrix.varve");
+    let mut writer =
+        default_spec(IntegrityPolicy::Crc32).create_writer_with_dims(&path, dims(8))?;
+
+    MatrixRecoveryReport::reset_matrix_integrity_counters();
+    for ordinal in 0..CELLS {
+        writer.write_matrix_cell(key(ordinal), &HotCell { value: 7 })?;
+    }
+    let on_write = MatrixRecoveryReport::matrix_slot_bytes_read_back();
+
+    MatrixRecoveryReport::reset_matrix_integrity_counters();
+    for ordinal in 0..CELLS {
+        writer.commit_matrix_cell::<HotCell>(key(ordinal))?;
+    }
+    let same_session = MatrixRecoveryReport::matrix_slot_bytes_read_back();
+    writer.flush()?;
+    drop(writer);
+
+    // A fresh handle has no session write bits, so the zero probe runs too.
+    let mut reopened = default_spec(IntegrityPolicy::Crc32).open_writer(&path)?;
+    MatrixRecoveryReport::reset_matrix_integrity_counters();
+    for ordinal in 0..CELLS {
+        reopened.commit_matrix_cell::<HotCell>(key(ordinal))?;
+    }
+    let other_session = MatrixRecoveryReport::matrix_slot_bytes_read_back();
+    println!(
+        "(slot read-back) {CELLS} cells of {STRIDE} bytes: writes={on_write} \
+         commit_same_session={same_session} commit_other_session={other_session}"
+    );
+
+    assert_eq!(
+        on_write, 0,
+        "writing a cell read {on_write} slot bytes back; the payload is in hand there"
+    );
+    assert_eq!(
+        same_session,
+        CELLS * STRIDE,
+        "a cell this session wrote was read back {same_session} bytes; the zero probe is \
+         skipped on the session write bit, so this must be the checksum pass alone"
+    );
+    assert_eq!(
+        other_session,
+        CELLS * STRIDE * 2,
+        "a cell this session did not write was read back {other_session} bytes; both the \
+         zero probe and the checksum pass have to run"
+    );
+    Ok(())
+}
+
 /// Rewriting an already-committed cell is a real `1 -> 0` transition, so the
 /// skip must not swallow it.
 ///
