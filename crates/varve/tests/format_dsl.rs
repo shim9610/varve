@@ -305,8 +305,8 @@ fn format_first_dsl_generates_typed_api_and_offset_chains() -> varve::Result<()>
             .filter(|entry| entry.block_id == Point::ID)
             .all(|entry| entry.footer_offset.is_some())
     );
-    let user_entries = raw
-        .index_entries()
+    let raw_entries = raw.index_entries();
+    let user_entries = raw_entries
         .iter()
         .filter(|entry| entry.block_id == User::ID)
         .collect::<Vec<_>>();

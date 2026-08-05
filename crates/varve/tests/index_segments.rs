@@ -91,7 +91,7 @@ fn write_lines(spec: FormatSpec, path: &Path, lines: u32, per_flush: u32) -> var
 /// entry: what block, which sequence, where, how long, and committed or not.
 type EntryShape = (u32, u64, u64, u64, bool);
 
-fn entry_shape(entries: &[RecordIndexEntry]) -> Vec<EntryShape> {
+fn entry_shape(entries: varve::IndexEntries) -> Vec<EntryShape> {
     entries
         .iter()
         .map(|entry| {
@@ -292,8 +292,8 @@ fn a_writer_reopen_keeps_appending_a_valid_chain() -> varve::Result<()> {
     }
 
     let file = segment_spec().open_readonly(&path)?;
-    let segments: Vec<&RecordIndexEntry> = file
-        .index_entries()
+    let entries = file.index_entries();
+    let segments: Vec<&RecordIndexEntry> = entries
         .iter()
         .filter(|entry| entry.block_id == SEGMENT_BLOCK_ID)
         .collect();
@@ -1014,8 +1014,8 @@ fn a_replacement_generation_re_encodes_the_chain() -> varve::Result<()> {
     }
 
     let file = segment_spec().open_readonly(&path)?;
-    let segments: Vec<&RecordIndexEntry> = file
-        .index_entries()
+    let entries = file.index_entries();
+    let segments: Vec<&RecordIndexEntry> = entries
         .iter()
         .filter(|entry| entry.block_id == SEGMENT_BLOCK_ID)
         .collect();

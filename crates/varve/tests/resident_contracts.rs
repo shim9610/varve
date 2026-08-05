@@ -255,8 +255,8 @@ fn keyed_delete_links_the_predecessor_chain() -> varve::Result<()> {
     drop(file);
 
     let opened = ResidentChainFormat::open(&path)?;
-    let tombstone = opened
-        .index_entries()
+    let entries = opened.index_entries();
+    let tombstone = entries
         .iter()
         .find(|entry| entry.block_id == varve::TOMBSTONE_BLOCK_ID)
         .expect("tombstone record");

@@ -258,8 +258,9 @@ fn record_explicit_variable_blocks_roundtrip_with_physical_scan() -> varve::Resu
                 if compression.header_mode == CompressionHeaderMode::RecordExplicit
         ));
 
-        let compressed = file
-            .index_entries()
+        let entries = file.index_entries();
+
+        let compressed = entries
             .iter()
             .find(|entry| entry.block_id == CompressibleBlock::ID)
             .expect("compressed block");
@@ -268,8 +269,9 @@ fn record_explicit_variable_blocks_roundtrip_with_physical_scan() -> varve::Resu
         assert!(compressed.payload_len < logical_len);
         assert_eq!(&compressed.read_payload(&path)?[..4], b"VCMP");
 
-        let fixed_entry = file
-            .index_entries()
+        let entries = file.index_entries();
+
+        let fixed_entry = entries
             .iter()
             .find(|entry| entry.block_id == FixedBlock::ID)
             .expect("fixed block");
@@ -331,8 +333,8 @@ fn file_explicit_uses_varve2_header_and_raw_compressed_payload() -> varve::Resul
     {
         let mut file = FileExplicitCompressionFormat::create(&path)?;
         file.push(&value)?;
-        let entry = file
-            .index_entries()
+        let entries = file.index_entries();
+        let entry = entries
             .iter()
             .find(|entry| entry.block_id == CompressibleBlock::ID)
             .expect("compressed block");
@@ -469,14 +471,14 @@ fn block_specific_record_explicit_compression_overrides_global_none() -> varve::
         let mut file = spec.create(&path)?;
         file.push(&value)?;
         file.push(&FixedBlock { value: 99 })?;
-        let compressed = file
-            .index_entries()
+        let entries = file.index_entries();
+        let compressed = entries
             .iter()
             .find(|entry| entry.block_id == CompressibleBlock::ID)
             .expect("compressed variable block");
         assert!(compressed.is_compressed());
-        let fixed = file
-            .index_entries()
+        let entries = file.index_entries();
+        let fixed = entries
             .iter()
             .find(|entry| entry.block_id == FixedBlock::ID)
             .expect("fixed block");
@@ -567,8 +569,8 @@ fn compressed_checkpoint_and_rewrite_preserve_length_hint() -> varve::Result<()>
         assert_eq!(file.blocks::<CompressibleBlock>()?.get(0)?, Some(first));
         file.replace_rewrite(0, &second)?;
         file.flush()?;
-        let entry = file
-            .index_entries()
+        let entries = file.index_entries();
+        let entry = entries
             .iter()
             .find(|entry| entry.block_id == CompressibleBlock::ID)
             .expect("rewritten compressed block");

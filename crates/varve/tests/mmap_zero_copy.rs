@@ -224,7 +224,8 @@ fn mmap_payload_windows_match_indexed_payload_reads() -> varve::Result<()> {
     // SAFETY: The fixture is not modified while the mapping is alive.
     let mmap = unsafe { file.mmap_payloads()? };
 
-    for entry in file.index_entries() {
+    let snapshot = file.index_entries();
+    for entry in &snapshot {
         assert_eq!(mmap.payload_window(entry)?, entry.read_payload(&path)?);
     }
 

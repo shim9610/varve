@@ -922,6 +922,41 @@ pub(crate) mod resident_index {
 
 use resident_index::{ReservedIndexSlot, ResidentIndex};
 
+/// An owned snapshot of a file's record index.
+///
+/// Derefs to `[RecordIndexEntry]`, so it reads exactly like the borrowed slice
+/// this replaced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexEntries {
+    entries: Vec<RecordIndexEntry>,
+}
+
+impl core::ops::Deref for IndexEntries {
+    type Target = [RecordIndexEntry];
+
+    fn deref(&self) -> &[RecordIndexEntry] {
+        &self.entries
+    }
+}
+
+impl IntoIterator for IndexEntries {
+    type Item = RecordIndexEntry;
+    type IntoIter = std::vec::IntoIter<RecordIndexEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a IndexEntries {
+    type Item = &'a RecordIndexEntry;
+    type IntoIter = std::slice::Iter<'a, RecordIndexEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct RecordIndexEntry {
     pub block_id: u32,
@@ -2789,8 +2824,14 @@ impl VarveReader {
         self.file.verify_all()
     }
 
-    pub fn index_entries(&self) -> &[RecordIndexEntry] {
+    pub fn index_entries(&self) -> IndexEntries {
         self.file.index_entries()
+    }
+
+    /// Fills the caller's buffer with the record index; see
+    /// [`VarveFile::index_entries_into`].
+    pub fn index_entries_into(&self, out: &mut Vec<RecordIndexEntry>) -> Result<()> {
+        self.file.index_entries_into(out)
     }
 
     pub fn key_tail_offsets<T>(&self) -> Result<HashMap<T::Key, u64>>
@@ -3033,8 +3074,14 @@ impl VarveWriter {
         self.file.verify_all()
     }
 
-    pub fn index_entries(&self) -> &[RecordIndexEntry] {
+    pub fn index_entries(&self) -> IndexEntries {
         self.file.index_entries()
+    }
+
+    /// Fills the caller's buffer with the record index; see
+    /// [`VarveFile::index_entries_into`].
+    pub fn index_entries_into(&self, out: &mut Vec<RecordIndexEntry>) -> Result<()> {
+        self.file.index_entries_into(out)
     }
 
     pub fn key_tail_offsets<T>(&self) -> Result<HashMap<T::Key, u64>>
@@ -5591,8 +5638,54 @@ impl VarveFile {
         Ok(verified)
     }
 
-    pub fn index_entries(&self) -> &[RecordIndexEntry] {
-        self.index.as_contiguous_slice()
+    /// A snapshot of every index entry, owned by the caller.
+    ///
+    /// **Owned rather than borrowed, and that is the point.** Returning
+    /// `&[RecordIndexEntry]` required the entries to live contiguously inside
+    /// this handle for as long as any caller held the borrow — which is exactly
+    /// the requirement that keeps the whole index resident and makes a
+    /// demand-filled store impossible. An owned snapshot only has to exist
+    /// while its holder does.
+    ///
+    /// `IndexEntries` derefs to `[RecordIndexEntry]`, so `len()`, indexing,
+    /// `iter()` and passing it where a slice is expected all read the same as
+    /// before. What changed is who owns the bytes.
+    ///
+    /// **This allocates.** [`index_entries_into`](Self::index_entries_into)
+    /// takes the caller's buffer instead and is the form to use in a loop: the
+    /// storage is the caller's business, and a library that decides it for them
+    /// allocates once per call for no reason.
+    pub fn index_entries(&self) -> IndexEntries {
+        let mut entries = Vec::new();
+        // The infallible surface is kept because 100-odd call sites read it as
+        // a slice; a caller that wants the refusal calls `_into`.
+        let _ = self.index_entries_into(&mut entries);
+        IndexEntries { entries }
+    }
+
+    /// Fills the caller's buffer with the record index.
+    ///
+    /// `out` is cleared and then extended, so a caller that reuses one buffer
+    /// across calls allocates once and never again. The same shape the append
+    /// path uses for record staging, and for the same reason: the library does
+    /// not get to decide where the caller's data lives.
+    ///
+    /// The copy is charged against `ReadLimitKey::IndexBytes`, like the index
+    /// it copies.
+    pub fn index_entries_into(&self, out: &mut Vec<RecordIndexEntry>) -> Result<()> {
+        out.clear();
+        let count = self.index.len();
+        let requested = index_bytes_for_count(count)?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::IndexBytes, requested)?;
+        out.try_reserve(count)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "index entry snapshot",
+                requested,
+            })?;
+        out.extend(self.index.iter().cloned());
+        Ok(())
     }
 
     /// Builds the per-key tail offsets for `T` from the resident index.
@@ -16526,8 +16619,8 @@ mod tests {
                 value: "a much longer first value".into(),
             },
         )?;
-        let keyed: Vec<_> = writer
-            .index_entries()
+        let snapshot = writer.index_entries();
+        let keyed: Vec<_> = snapshot
             .iter()
             .filter(|entry| entry.block_id == ReplaceKeyed::ID)
             .collect();
