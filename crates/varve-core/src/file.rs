@@ -371,7 +371,7 @@ pub enum OpenMode {
 /// `fail_fabricated_record_overwrite.rs` (compile-fail), and by
 /// `crates/varve/tests/enforcement_gates.rs`.
 pub(crate) mod replacement_target {
-    use super::{Error, KeyedTails, RecordIndexEntry, Result, VarveBlock};
+    use super::{Error, KeyedTails, Result, VarveBlock};
 
     #[derive(Clone, Copy, Debug)]
     pub struct ReplacementTarget {
@@ -383,8 +383,14 @@ pub(crate) mod replacement_target {
         /// `block_version` that is not `T::VERSION`.
         ///
         /// This is the only way to build a [`ReplacementTarget`].
+        /// Takes the index itself, not a slice of it.
+        ///
+        /// What this needs is a forward scan that stops at the nth match and
+        /// then one positional read — both of which a demand-filled index can
+        /// serve. Asking for `&[RecordIndexEntry]` asked for every entry at
+        /// once, which is the shape that keeps the index resident.
         pub(super) fn resolve<T: VarveBlock>(
-            index: &[RecordIndexEntry],
+            index: &super::ResidentIndex,
             ordinal: usize,
         ) -> Result<Self> {
             let position = index
@@ -394,7 +400,7 @@ pub(crate) mod replacement_target {
                 .nth(ordinal)
                 .map(|(position, _)| position)
                 .ok_or(Error::UnexpectedEof)?;
-            let actual = index[position].block_version;
+            let actual = index.entry_at(position)?.block_version;
             if actual != T::VERSION {
                 return Err(Error::BlockVersionMismatch {
                     block_id: T::ID,
@@ -441,17 +447,20 @@ pub(crate) mod replacement_target {
         ///
         /// This is the only way to build a [`RecordOverwrite`], and a
         /// [`ReplacementTarget`] is the only way to call it.
+        /// One positional read, so it takes the index rather than a slice.
         pub(super) fn prepare(
             target: ReplacementTarget,
-            index: &[RecordIndexEntry],
+            index: &super::ResidentIndex,
             keyed_tails: &mut KeyedTails,
-        ) -> Self {
-            let entry = &index[target.position()];
+        ) -> Result<Self> {
+            let entry = index.entry_at(target.position())?;
+            let record_offset = entry.record_offset;
+            let payload_offset = entry.payload_offset;
             keyed_tails.invalidate(entry.block_id);
-            Self {
-                record_offset: entry.record_offset,
-                payload_offset: entry.payload_offset,
-            }
+            Ok(Self {
+                record_offset,
+                payload_offset,
+            })
         }
 
         pub(super) fn record_offset(&self) -> u64 {
@@ -3742,7 +3751,7 @@ impl VarveFile {
         let block_tails = index.block_tails();
         let index = index.entries;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
-        let derived = derive_index_state(&index, false);
+        let derived = derive_index_state(index.iter(), false);
         let checkpoint_cadence = derived.checkpoint_cadence;
         let segment_cursor = derived.segment_cursor;
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
@@ -3818,7 +3827,7 @@ impl VarveFile {
         // must not be visible here either. Both facts belong to the scan.
         let logical_len = scanned.physical_end(append_start);
         let index = scanned.entries;
-        let derived = derive_index_state(&index, false);
+        let derived = derive_index_state(index.iter(), false);
         let checkpoint_cadence = derived.checkpoint_cadence;
         let segment_cursor = derived.segment_cursor;
         let snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, logical_len)?;
@@ -3889,7 +3898,7 @@ impl VarveFile {
         let index = index.entries;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
         let recovered_len = file.metadata()?.len();
-        let derived = derive_index_state(&index, false);
+        let derived = derive_index_state(index.iter(), false);
         let checkpoint_cadence = derived.checkpoint_cadence;
         let segment_cursor = derived.segment_cursor;
         let records_preserved = index.len();
@@ -4485,8 +4494,7 @@ impl VarveFile {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         // F-01: resolution and the target-version refusal are one step, and
         // there is no other way to address the target. See `ReplacementTarget`.
-        let target_position =
-            ReplacementTarget::resolve::<T>(self.index.as_contiguous_slice(), index)?.position();
+        let target_position = ReplacementTarget::resolve::<T>(&self.index, index)?.position();
         let target = self.index.entry_at(target_position)?;
         let mut materialization = MaterializationBudget::new(self.spec);
         let old_logical_len = target.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
@@ -4722,8 +4730,7 @@ impl VarveFile {
         }
         // F-01: resolution and the target-version refusal are one step, and
         // there is no other way to address the target. See `ReplacementTarget`.
-        let target_position =
-            ReplacementTarget::resolve::<T>(self.index.as_contiguous_slice(), index)?.position();
+        let target_position = ReplacementTarget::resolve::<T>(&self.index, index)?.position();
 
         let endian = T::ENDIAN.unwrap_or(self.spec.endian);
         let payload = encode_logical_payload_limited(self.spec, block, endian)?;
@@ -4890,7 +4897,7 @@ impl VarveFile {
         }
         // F-01: resolution and the target-version refusal are one step, and
         // there is no other way to address the target. See `ReplacementTarget`.
-        let target = ReplacementTarget::resolve::<T>(self.index.as_contiguous_slice(), index)?;
+        let target = ReplacementTarget::resolve::<T>(&self.index, index)?;
         let target_position = target.position();
         let payload = encode_logical_payload_limited(
             self.spec,
@@ -4979,8 +4986,7 @@ impl VarveFile {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         // F-01: resolution and the target-version refusal are one step, and
         // there is no other way to address the target. See `ReplacementTarget`.
-        let target_position =
-            ReplacementTarget::resolve::<T>(self.index.as_contiguous_slice(), index)?.position();
+        let target_position = ReplacementTarget::resolve::<T>(&self.index, index)?.position();
         let sequence = self.sequence_state.available()?;
         let endian = T::ENDIAN.unwrap_or(self.spec.endian);
         let encoded = encode_logical_payload_limited(self.spec, block, endian)?;
@@ -7948,11 +7954,7 @@ impl VarveFile {
         // Both preconditions are discharged by constructing the permission:
         // the version refusal happened in `ReplacementTarget::resolve`, and
         // `prepare` drops the keyed-tail map before the write below.
-        let write = RecordOverwrite::prepare(
-            target,
-            self.index.as_contiguous_slice(),
-            &mut self.keyed_tails,
-        );
+        let write = RecordOverwrite::prepare(target, &self.index, &mut self.keyed_tails)?;
         self.file
             .overwrite_indexed_record(write, header_bytes, payload)
     }
@@ -7984,7 +7986,7 @@ impl VarveFile {
                 // flush-cadence state once for the new generation (PERF2-02)
                 // and the O(1) block tails with it (PERF2-05). Record offsets
                 // moved, so every cached generic keyed tail is stale (API2-05).
-                let derived = derive_index_state(self.index.as_contiguous_slice(), true);
+                let derived = derive_index_state(self.index.iter(), true);
                 self.checkpoint_cadence = derived.checkpoint_cadence;
                 self.block_tails = derived.block_tails.expect("tails were requested");
                 self.segment_cursor = derived.segment_cursor;
@@ -8032,7 +8034,7 @@ impl VarveFile {
                 // flush-cadence state once for the new generation (PERF2-02)
                 // and the O(1) block tails with it (PERF2-05). Record offsets
                 // moved, so every cached generic keyed tail is stale (API2-05).
-                let derived = derive_index_state(self.index.as_contiguous_slice(), true);
+                let derived = derive_index_state(self.index.iter(), true);
                 self.checkpoint_cadence = derived.checkpoint_cadence;
                 self.block_tails = derived.block_tails.expect("tails were requested");
                 self.segment_cursor = derived.segment_cursor;
@@ -13683,11 +13685,11 @@ struct DerivedIndexState {
 /// Each field is still computed by exactly the rule its own `from_index`
 /// states, so the invariants those doc comments assert are unchanged. The unit
 /// tests below compare this against all three.
-fn derive_index_state(index: &[RecordIndexEntry], with_tails: bool) -> DerivedIndexState {
-    if with_tails {
-        note_block_tail_index_touches(index.len() as u64);
-    }
-    note_checkpoint_cadence_index_touches(index.len() as u64);
+fn derive_index_state<'a>(
+    entries: impl Iterator<Item = &'a RecordIndexEntry>,
+    with_tails: bool,
+) -> DerivedIndexState {
+    let mut touched: u64 = 0;
     let mut newest: HashMap<u32, u64> = HashMap::new();
     // Position of, and entry at, the newest record of each kind the derived
     // structures key on.
@@ -13697,7 +13699,8 @@ fn derive_index_state(index: &[RecordIndexEntry], with_tails: bool) -> DerivedIn
     // time a checkpoint is seen, which leaves exactly the tail the reverse walk
     // used to accumulate.
     let mut eligible: usize = 0;
-    for (position, entry) in index.iter().enumerate() {
+    for (position, entry) in entries.enumerate() {
+        touched = touched.saturating_add(1);
         if with_tails {
             newest.insert(entry.block_id, entry.record_offset);
         }
@@ -13711,7 +13714,7 @@ fn derive_index_state(index: &[RecordIndexEntry], with_tails: bool) -> DerivedIn
             _ => eligible = eligible.saturating_add(1),
         }
     }
-    DerivedIndexState {
+    let state = DerivedIndexState {
         checkpoint_cadence: CheckpointCadence {
             eligible_since_checkpoint: eligible,
             next_threshold: match newest_checkpoint {
@@ -13727,7 +13730,12 @@ fn derive_index_state(index: &[RecordIndexEntry], with_tails: bool) -> DerivedIn
             None => SegmentCursor::new_empty(),
         },
         block_tails: with_tails.then(|| BlockTails::from_newest(&newest)),
+    };
+    if with_tails {
+        note_block_tail_index_touches(touched);
     }
+    note_checkpoint_cadence_index_touches(touched);
+    state
 }
 
 fn read_record_header(file: &mut File, _spec: FormatSpec, offset: u64) -> Result<RecordIndexEntry> {
@@ -15789,7 +15797,7 @@ mod tests {
         ];
 
         for (name, index) in shapes {
-            let derived = derive_index_state(&index, true);
+            let derived = derive_index_state(index.iter(), true);
             let cadence = CheckpointCadence::from_index(&index);
             assert_eq!(
                 derived.checkpoint_cadence.eligible_since_checkpoint,
