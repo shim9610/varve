@@ -1280,6 +1280,97 @@ fn concurrent_lazy_readers_are_not_serialised_behind_the_page_store() -> varve::
     Ok(())
 }
 
+/// A commit-map page cleared back to zero must drop its **persisted** page-index
+/// entry, and the only instrument that can see whether it did is a fresh open.
+///
+/// `PageResidencyDelta::released` is a *budget* quantity: it counts bytes handed
+/// back to `ReadLimitKey::MatrixBitmapBytes`. Residency is demand-filled for
+/// every handle since 0.5.0, so the page a mutation empties was faulted in by
+/// the cache and was never charged to the layout total — emptying it refunds
+/// `cached_bytes` and reports `released == 0`, correctly. Both apply sites keyed
+/// the *page-index* release on `released != 0`, which is therefore never true on
+/// the path that actually runs: **no emptied page ever released its entry**.
+/// Measured with a probe on the unfixed code over this fixture: 16 emptying
+/// mutations, every one of them `released == 0`.
+///
+/// The entry is persisted, so the cost is paid by every later open, forever,
+/// for a page that holds nothing.
+///
+/// **Why the assertion is on a reopened handle.**
+/// `matrix_resident_page_index_bytes` is recomputed from the live page set, so
+/// it falls to zero on the churning handle whether or not the disk entry went
+/// with it — it reported `768 -> 0` against the unfixed code and would have
+/// passed a test built on it. Reopening loads the mirror from the persisted
+/// array, so its size is the number of entries actually on disk.
+#[test]
+fn an_emptied_commit_page_releases_its_persisted_index_entry() -> varve::Result<()> {
+    const PAGES: u64 = 8;
+    const SCANS: u64 = PAGES * CELLS_PER_PAGE / CHANNELS;
+    let dir = temp_dir("empty-cached-page");
+    let path = dir.path().join("matrix.varve");
+    let live: Vec<u64> = (0..PAGES).collect();
+    fill_pages(&path, SCANS, &live)?;
+
+    // What the fixture's live pages cost on disk, read back from the file.
+    drop(lazy_spec(PAGES * PAGE_BYTES).open_readonly(&path)?);
+    let filled = MatrixRecoveryReport::matrix_resident_page_index_bytes();
+    assert_ne!(
+        filled, 0,
+        "the fixture persisted no page-index entries, so this measures nothing"
+    );
+
+    let mut writer = lazy_spec(PAGES * PAGE_BYTES).open_writer(&path)?;
+    // Touch every live page first, so each is faulted in as a *cached* page —
+    // the state in which emptying it reports `released == 0`.
+    for page in &live {
+        assert_eq!(
+            writer.matrix_cell_status::<LazyCell>(key(page * CELLS_PER_PAGE))?,
+            MatrixCellStatus::Committed
+        );
+    }
+    assert_eq!(
+        MatrixRecoveryReport::matrix_lazy_cached_bitmap_bytes(),
+        PAGES * PAGE_BYTES,
+        "the pages under test were not demand-cached, so the arm this covers never ran"
+    );
+
+    // Rewriting a committed cell clears its commit bit. One cell per page is
+    // committed, so each rewrite takes its commit-map page to zero.
+    for page in &live {
+        writer.write_matrix_cell(key(page * CELLS_PER_PAGE), &LazyCell { value: 9 })?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    drop(lazy_spec(PAGES * PAGE_BYTES).open_readonly(&path)?);
+    let emptied = MatrixRecoveryReport::matrix_resident_page_index_bytes();
+    println!("(page index) persisted bytes: filled={filled} after clearing={emptied}");
+    assert_eq!(
+        emptied, 0,
+        "clearing every commit bit left {emptied} bytes of persisted page index against \
+         {filled} when the pages were live; an emptied page kept its entry, and every \
+         later open pays for it"
+    );
+
+    // And the file still reads correctly: the cells are uncommitted, not lost.
+    let reader = verified_spec().open_readonly(&path)?;
+    for page in &live {
+        assert_eq!(
+            reader.matrix_cell_status::<LazyCell>(key(page * CELLS_PER_PAGE))?,
+            MatrixCellStatus::NotCommitted,
+            "clearing the commit bit lost the cell instead of uncommitting it"
+        );
+        assert!(
+            matches!(
+                reader.read_matrix_cell::<LazyCell>(key(page * CELLS_PER_PAGE)),
+                Err(Error::MatrixNotCommitted)
+            ),
+            "an uncommitted cell answered a read after its page index was released"
+        );
+    }
+    Ok(())
+}
+
 fn patch_byte(path: &Path, offset: u64, value: u8) {
     let mut file = OpenOptions::new()
         .write(true)

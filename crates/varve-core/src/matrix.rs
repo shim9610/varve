@@ -2356,22 +2356,39 @@ struct PreparedByteWrite {
 /// long-running set/clear churn cannot hold residency proportional to the pages
 /// it has historically touched. Both terms are reported so the caller can charge
 /// the growth *before* the memory is taken and refund the shrink afterwards.
+///
+/// `emptied` and `released` are **different questions**, and the callers ask
+/// each of them. `released` is a budget quantity: how many bytes went back to
+/// `ReadLimitKey::MatrixBitmapBytes`. `emptied` is a fact about the file: this
+/// page is now byte-for-byte the zero page, so its persisted page-index entry
+/// describes nothing and can go.
+///
+/// They came apart on the demand-cached page. A page faulted in by a read was
+/// never charged to the layout's resident total, so emptying it refunds the
+/// lazy cache and reports `released == 0` — correctly. Both apply sites keyed
+/// the *page-index* release on `released != 0`, so a cached page that cleared to
+/// zero kept its entry, permanently, while an identical charged page released
+/// its own. Every open thereafter reads the entry and materialises a zero page
+/// for it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PageResidencyDelta {
     materialised: u64,
     released: u64,
+    emptied: bool,
 }
 
 impl PageResidencyDelta {
     const NONE: Self = Self {
         materialised: 0,
         released: 0,
+        emptied: false,
     };
 
     const fn materialised(bytes: u64) -> Self {
         Self {
             materialised: bytes,
             released: 0,
+            emptied: false,
         }
     }
 }
@@ -2948,6 +2965,10 @@ impl SparseBitmap {
             return PageResidencyDelta {
                 materialised: prepared.materialised,
                 released,
+                // The page reached zero. That is true of the cached arm above,
+                // where `released` is 0 because the bytes belonged to the lazy
+                // cache and not to the layout's budget.
+                emptied: true,
             };
         }
         PageResidencyDelta::materialised(prepared.materialised)
@@ -5856,7 +5877,17 @@ fn prepare_commit_bit(
     // PERF-01: only the page holding the mutated byte is rehashed, so the cost
     // of a commit-bit mutation is bounded by `BITMAP_PAGE_BYTES` regardless of
     // how many bits the category has.
+    //
+    // And a byte that is already the intended value rehashes nothing at all. The
+    // page keeps the contents its digest was taken over — `write_bitmap_byte`
+    // declines the store — so the recorded digest still describes it, and
+    // recomputing it produces the value already on disk. `page_bytes_are_authentic`
+    // accepts the two states this can leave: an `PAGE_STATE_INITIALIZED` page
+    // against its unchanged checksum, and a page never written at all, which
+    // stays the hole `create` left, reads back as zero, and is exactly what
+    // `PAGE_STATE_UNINITIALIZED` asserts.
     let digest = match commit.digest_offset {
+        Some(_) if !bitmap.changes => None,
         Some(base) => {
             let page = bitmap.byte_index / BITMAP_PAGE_BYTES;
             let within = usize::try_from(bitmap.byte_index % BITMAP_PAGE_BYTES)
@@ -6594,6 +6625,15 @@ fn apply_commit_bit(
     commit_index: usize,
     update: CommitBitUpdate,
 ) -> Result<()> {
+    // Nothing below has anything to do. The durable byte already holds
+    // `byte_value`, so there is no page to materialise, no residency to charge,
+    // no page-index entry to publish for a live set that is not changing, and no
+    // write to order against. `commit_byte_write` already answered
+    // `PageResidencyDelta::NONE` for this case, so the ones counts and the
+    // recency chain end up where they would have anyway.
+    if !update.bitmap.changes {
+        return Ok(());
+    }
     let cost = layout.commits[commit_index]
         .bits
         .materialisation_cost(update.bitmap.byte_index, update.bitmap.byte_value)?;
@@ -6644,10 +6684,12 @@ fn apply_commit_bit(
         .bits
         .commit_byte_write(prepared);
     layout.settle_page_delta(delta);
-    if delta.released != 0 {
+    if delta.emptied {
         // The page is now byte-for-byte the zero page, and the bitmap byte
         // that made it so is already durable, so its index entry can go
-        // (F-03).
+        // (F-03). Keyed on `emptied` and not on `released`: a demand-cached
+        // page refunds the lazy cache rather than the budget, so it empties
+        // with `released == 0` and used to keep its entry forever.
         release_mutated_page_index(
             layout,
             file,
@@ -6884,6 +6926,10 @@ fn apply_cell_crc_valid(
     block_index: usize,
     update: BitmapByteUpdate,
 ) -> Result<()> {
+    // The commit-bit twin's short-circuit, for the same reason.
+    if !update.changes {
+        return Ok(());
+    }
     let cost = layout.blocks[block_index]
         .crc_valid_bits
         .materialisation_cost(update.byte_index, update.byte_value)?;
@@ -6920,7 +6966,8 @@ fn apply_cell_crc_valid(
         .crc_valid_bits
         .commit_byte_write(prepared);
     layout.settle_page_delta(delta);
-    if delta.released != 0 {
+    if delta.emptied {
+        // `emptied`, not `released` — see the commit-bit twin.
         release_mutated_page_index(
             layout,
             file,

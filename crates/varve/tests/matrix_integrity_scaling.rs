@@ -228,9 +228,11 @@ fn commit_bit_mutation_hashing_cost_is_independent_of_cell_count() -> varve::Res
         small, large,
         "per-mutation hashing scaled with cell count: {small} vs {large}"
     );
-    // Writing clears the commit bit and committing sets it, so each cell costs
-    // exactly two page hashes.
-    assert_eq!(small, CELLS * 2 * PAGE_BYTES);
+    // One page hash per cell, not two. Writing a fresh cell *clears* a commit
+    // bit that is already clear, and a mutation whose byte does not change
+    // rehashes nothing — so only the commit is a real transition. This read
+    // `CELLS * 2 * PAGE_BYTES` while the no-op half still hashed its page.
+    assert_eq!(small, CELLS * PAGE_BYTES);
     Ok(())
 }
 
@@ -244,13 +246,28 @@ fn a_single_mutation_hashes_exactly_one_page_anywhere_in_the_map() -> varve::Res
 
     // The last cell lives in the final commit-map page; the first lives in the
     // first page. Both must cost the same.
+    //
+    // The commit is the transition that gets measured, and the write before it
+    // is measured too — separately, and at zero. Writing a fresh cell clears a
+    // commit bit that is already clear, so it changes no byte and rehashes no
+    // page; measuring the write and calling its 4096 bytes "one page" is what
+    // this test used to do, which stated the bound over a mutation that should
+    // not have been hashing at all.
     for ordinal in [0, LARGE_SCANS * CHANNELS - 1] {
         MatrixRecoveryReport::reset_matrix_integrity_counters();
         writer.write_matrix_cell(key(ordinal), &ScalingCell { value: 7 })?;
         assert_eq!(
             MatrixRecoveryReport::matrix_bitmap_bytes_hashed(),
+            0,
+            "writing fresh cell {ordinal} changed no bitmap byte and must hash nothing"
+        );
+
+        MatrixRecoveryReport::reset_matrix_integrity_counters();
+        writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
+        assert_eq!(
+            MatrixRecoveryReport::matrix_bitmap_bytes_hashed(),
             PAGE_BYTES,
-            "mutation at ordinal {ordinal} hashed more than one page"
+            "committing cell {ordinal} hashed more than one page"
         );
     }
     Ok(())

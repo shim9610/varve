@@ -339,6 +339,89 @@ fn writing_a_fresh_cell_stores_no_bitmap_byte_and_committing_it_stores_every_one
     Ok(())
 }
 
+/// **The cost.** A bitmap byte that does not change hashes no page.
+///
+/// The skip that landed with `write_bitmap_byte` saved the cheapest half of a
+/// redundant mutation — one `seek` and one byte — and left the dear half in
+/// place. Under a checksum policy the same no-op mutation still read a whole
+/// 4096-byte page, ran CRC-32 over all of it, and wrote the 8-byte digest, so a
+/// first cell write cost a page hash to store a commit bit that was already
+/// clear. The write phase below is exactly that case: the companion test pins
+/// its bitmap-byte stores at zero, which is what makes every one of these
+/// mutations a no-op.
+///
+/// The digest skip is safe for the reason the byte skip is. The page keeps the
+/// bytes its recorded digest was taken over, so the digest still describes it —
+/// and a page that was never written stays a hole, reads back as zero, and
+/// authenticates against `PAGE_STATE_UNINITIALIZED`, which is what the state
+/// asserts. Writing `PAGE_STATE_INITIALIZED` over it, as this used to, spent an
+/// I/O to record a checksum of zeros for a page nobody had touched.
+#[test]
+fn a_bitmap_byte_that_does_not_change_hashes_no_page() -> varve::Result<()> {
+    const CELLS: u64 = 100;
+    const SCANS: u64 = 8;
+    /// The whole commit map here is one partial page: `SCANS * CHANNELS` cells,
+    /// one bit each. A real transition rehashes that page and nothing wider,
+    /// which is the `BITMAP_PAGE_BYTES` bound stated at its narrow end.
+    const MAP_BYTES: u64 = SCANS * CHANNELS / 8;
+    let dir = temp_dir("redundant-hashes");
+    let path = dir.path().join("matrix.varve");
+    let mut writer =
+        default_spec(IntegrityPolicy::Crc32).create_writer_with_dims(&path, dims(SCANS))?;
+
+    MatrixRecoveryReport::reset_matrix_integrity_counters();
+    for ordinal in 0..CELLS {
+        writer.write_matrix_cell(
+            key(ordinal),
+            &HotCell {
+                value: u32::try_from(ordinal + 1).expect("ordinal fits u32"),
+            },
+        )?;
+    }
+    let on_write = MatrixRecoveryReport::matrix_bitmap_bytes_hashed();
+    let stored = MatrixRecoveryReport::matrix_bitmap_byte_writes();
+
+    MatrixRecoveryReport::reset_matrix_integrity_counters();
+    for ordinal in 0..CELLS {
+        writer.commit_matrix_cell::<HotCell>(key(ordinal))?;
+    }
+    let on_commit = MatrixRecoveryReport::matrix_bitmap_bytes_hashed();
+    println!(
+        "(bitmap hashing) {CELLS} cells: writes hashed {on_write} bytes, commits hashed \
+         {on_commit}"
+    );
+
+    assert_eq!(
+        stored, 0,
+        "the fixture stored {stored} bitmap bytes, so these were not the no-op mutations \
+         this test is about"
+    );
+    assert_eq!(
+        on_write, 0,
+        "writing {CELLS} never-written cells hashed {on_write} bitmap bytes for mutations \
+         that changed nothing"
+    );
+    assert_eq!(
+        on_commit,
+        CELLS * MAP_BYTES,
+        "committing {CELLS} cells hashed {on_commit} bytes; each is one real transition and \
+         must still rehash its page, so a skip keyed on anything but the byte reports fewer"
+    );
+
+    // The commits are durable, so the skipped hashing was not skipped work.
+    writer.flush()?;
+    drop(writer);
+    let reader = default_spec(IntegrityPolicy::Crc32).open_readonly(&path)?;
+    for ordinal in 0..CELLS {
+        assert_eq!(
+            reader.matrix_cell_status::<HotCell>(key(ordinal))?,
+            MatrixCellStatus::Committed,
+            "cell {ordinal} lost its commit bit"
+        );
+    }
+    Ok(())
+}
+
 /// Rewriting an already-committed cell is a real `1 -> 0` transition, so the
 /// skip must not swallow it.
 ///
