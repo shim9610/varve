@@ -4584,7 +4584,7 @@ impl VarveFile {
                     let record_offset = temp_file.stream_position()?;
                     checkpoint_payload = encode_segment_payload(
                         self.spec,
-                        &new_index[segment_start..],
+                        new_index[segment_start..].iter(),
                         segment_covered_start.unwrap_or(rewrite_append_start),
                         u64::try_from(segment_start).map_err(|_| {
                             Error::ResourceArithmeticOverflow {
@@ -4783,12 +4783,8 @@ impl VarveFile {
 
         // Every entry, so the count is the length and no counting pass is
         // needed to learn it.
-        let mut new_index = clone_matching_entries(
-            self.spec,
-            self.index.as_contiguous_slice(),
-            self.index.len(),
-            |_| true,
-        )?;
+        let mut new_index =
+            clone_matching_entries(self.spec, &self.index, self.index.len(), |_| true)?;
         new_index[target_position].sequence = sequence;
         new_index[target_position].checksum = checksum;
 
@@ -5349,12 +5345,9 @@ impl VarveFile {
             .iter()
             .filter(|entry| entry.block_id == T::ID)
             .count();
-        let entries = clone_matching_entries(
-            self.spec,
-            self.index.as_contiguous_slice(),
-            count,
-            |entry| entry.block_id == T::ID,
-        )?;
+        let entries = clone_matching_entries(self.spec, &self.index, count, |entry| {
+            entry.block_id == T::ID
+        })?;
         Ok(BlockVec::new(self.spec, self.snapshot.clone(), entries))
     }
 
@@ -5493,7 +5486,7 @@ impl VarveFile {
         apply_merge_entries::<T>(
             self.spec,
             &self.snapshot,
-            self.index.as_contiguous_slice(),
+            &self.index,
             MergeShard::single_file(),
             &mut state,
             &mut budget,
@@ -8611,7 +8604,7 @@ impl VarveFile {
         let record_offset = self.file.metadata()?.len();
         let payload = encode_segment_payload(
             self.spec,
-            &self.index.as_contiguous_slice()[start..],
+            self.index.iter().skip(start),
             covered_start,
             preceding_records,
             record_offset,
@@ -9363,9 +9356,14 @@ fn segment_payload_len(count: u64) -> Result<u64> {
 
 /// Serializes one segment: the records a single commit point added, and the
 /// segment record's own start offset as the closing trailer.
-fn encode_segment_payload(
+/// Encodes a segment's entry array from a stream.
+///
+/// `ExactSizeIterator` because the payload length is charged and reserved
+/// before the first entry is written — the count has to be known, and a
+/// `skip(start)` over the index knows it without the index being a slice.
+fn encode_segment_payload<'a>(
     spec: FormatSpec,
-    entries: &[RecordIndexEntry],
+    entries: impl ExactSizeIterator<Item = &'a RecordIndexEntry>,
     covered_start: u64,
     preceding_records: u64,
     record_offset: u64,
@@ -10911,7 +10909,7 @@ where
     apply_merge_entries::<T>(
         spec,
         &file.snapshot,
-        file.index.as_contiguous_slice(),
+        &file.index,
         shard,
         state,
         budget,
@@ -10950,7 +10948,7 @@ where
 fn apply_merge_entries<T>(
     spec: FormatSpec,
     snapshot: &SnapshotFile,
-    entries: &[RecordIndexEntry],
+    entries: &ResidentIndex,
     shard: MergeShard,
     state: &mut HashMap<T::Key, (MergeOrder, Option<T>)>,
     budget: &mut MaterializationBudget,
@@ -13634,7 +13632,7 @@ fn validate_unique_sequences(entries: &[RecordIndexEntry]) -> Result<()> {
 /// keeps a refused limit from leaving a half-built generation behind.
 fn clone_matching_entries<F>(
     spec: FormatSpec,
-    source: &[RecordIndexEntry],
+    source: &ResidentIndex,
     count: usize,
     mut matches: F,
 ) -> Result<Vec<RecordIndexEntry>>
