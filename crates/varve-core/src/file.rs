@@ -17510,6 +17510,89 @@ mod tests {
     ///
     /// The assertion is a comparison count, not a wall clock. At N = 4096 the
     /// two are ~50k against ~8.4M, and the gap grows by 2x per doubling.
+    /// **Can an index entry be rebuilt from its record?** Every field but one.
+    ///
+    /// This is the precondition for a demand-filled index: if the entry the
+    /// file already holds can be reconstructed from the record it describes,
+    /// then the index does not have to keep the entry — only where to find it.
+    /// If it cannot, no amount of call-site refactoring makes the store lazy,
+    /// and finding that out by trying is cheaper than finding it out after the
+    /// swap.
+    ///
+    /// The one field that cannot come back is `committed`. It is writer state
+    /// with no representation in the record, so a rebuild reports the record as
+    /// framed rather than as committed. That is why the directory a lazy store
+    /// would keep is `(record_offset, committed)` and not `record_offset`
+    /// alone — and this test is what says so, rather than a comment guessing it.
+    #[test]
+    fn every_index_entry_can_be_rebuilt_from_its_own_record() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("rebuild.varve");
+        let spec = replacement_policy_spec();
+        assert!(
+            spec.spec_needs_record_footer(),
+            "a format without footers cannot exercise the footer half of a rebuild",
+        );
+        let mut writer = VarveFile::create(spec, &path)?;
+        for index in 0..64u64 {
+            writer.push(&ReplaceString(format!("v{index}")))?;
+            if index % 8 == 7 {
+                writer.flush()?;
+            }
+        }
+        writer.flush()?;
+        drop(writer);
+
+        let opened = VarveFile::open_readonly(spec, &path)?;
+        let resident = opened.index_entries();
+        assert!(resident.len() >= 64, "fixture is too small to say anything");
+
+        let mut file = OpenOptions::new().read(true).open(&path)?;
+        let file_len = file.metadata()?.len();
+        let mut accounting = ScanAccounting::default();
+        let mut committed_differed = 0usize;
+        for entry in resident.iter() {
+            let rebuilt = match read_record_entry_at(
+                spec,
+                &mut file,
+                file_len,
+                entry.record_offset,
+                ScanChecks {
+                    partial_boundary: None,
+                    checksum_boundary: None,
+                    verify_checksums: true,
+                },
+                &mut accounting,
+            )? {
+                RecordRead::Entry(rebuilt) => rebuilt,
+                RecordRead::RecoverableTail(_) => {
+                    panic!("record at {} did not rebuild", entry.record_offset)
+                }
+            };
+            if rebuilt.committed != entry.committed {
+                committed_differed += 1;
+            }
+            // Everything else has to match exactly, field for field. Comparing
+            // the whole struct with `committed` normalised is what makes this a
+            // proof rather than a spot check.
+            let normalised = RecordIndexEntry {
+                committed: entry.committed,
+                ..rebuilt
+            };
+            assert_eq!(
+                &normalised, entry,
+                "record at {} rebuilt into a different entry",
+                entry.record_offset
+            );
+        }
+        println!(
+            "(rebuild) {} entries rebuilt from their records, {committed_differed} differed only \
+             in `committed`",
+            resident.len()
+        );
+        Ok(())
+    }
+
     #[test]
     fn replace_block_finds_predecessors_without_rescanning_the_prefix() -> Result<()> {
         const RECORDS: u64 = 4096;
