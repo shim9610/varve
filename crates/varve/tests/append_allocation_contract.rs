@@ -394,25 +394,33 @@ fn footer_window(payload_len: usize) -> Counts {
 /// The identical-size record *header* has always been encoded into a stack
 /// array beside it.
 ///
-/// **The gap between the two specs is the instrument, and it is not all
-/// footer.** Measured on this tree at 1,000 pushes of a 256-byte payload:
+/// **The cost.** Writing a record footer costs nothing per record — not one
+/// allocation, not one byte.
 ///
-/// |                       | allocations/push | bytes/push |
-/// | ---                   | ---              | ---        |
-/// | `PlainFormat`, no footer | 5.01          | 650.1      |
-/// | `FooterFormat`, before   | **7.01**      | **686.1**  |
-/// | `FooterFormat`, after    | **6.01**      | **654.1**  |
+/// The two specs run the same append path and differ only by
+/// `index: block_offset_chain`, which is what turns the footer on, so the gap
+/// between them *is* the footer. Measured on this tree at 1,000 pushes of a
+/// 256-byte payload:
 ///
-/// One allocation and **exactly 32 bytes** per record disappear, which is the
-/// footer and nothing else. The 1.00 allocation per push that remains over the
-/// footerless spec is the block-offset chain's own bookkeeping — it is not this
-/// fix, it is not claimed by this fix, and stating the assertion as "equal to
-/// plain" would have failed against correct code.
+/// |                             | allocations/push | bytes/push |
+/// | ---                         | ---              | ---        |
+/// | `PlainFormat`, no footer    | 5.01             | 650.1      |
+/// | `FooterFormat`, original    | 7.01             | 686.1      |
+/// | after the stack-array footer| 6.01             | 654.1      |
+/// | after the borrowed magic    | **5.01**         | **650.1**  |
 ///
-/// So the ceilings below are literals captured from the **pre-change build**,
-/// which is the only baseline that can discriminate: a baseline taken inside
-/// the post-fix run proves nothing, and that pattern is why six proofs in the
-/// audit round did not discriminate.
+/// Two allocations, in two places, for one 32-byte footer. The first was the
+/// footer buffer itself, a `Vec` for a length the compiler proves is 32. The
+/// second hid inside it: the 4-byte magic is a `&'static [u8]` in the field
+/// table, and routing it through `LayoutValue::Bytes(Vec<u8>)` allocated a
+/// heap buffer for that constant on every record.
+///
+/// **The middle row was published with the wrong explanation.** Its residual
+/// 1.00 allocation and 4.0 bytes were recorded as "the block-offset chain's
+/// own bookkeeping". They were the magic — 4.0 bytes per push is the magic's
+/// width, and landing the borrowed form took the gap to zero. Equality is the
+/// assertion now precisely because it is what the code earns; asserting it
+/// against the middle row would have been wrong.
 #[test]
 fn writing_a_record_footer_allocates_nothing_per_record() {
     let plain = plain_window(SMALL);
@@ -420,21 +428,21 @@ fn writing_a_record_footer_allocates_nothing_per_record() {
     report("plain/small", SMALL, plain);
     report("footer/small", SMALL, footer);
 
-    let extra_allocations = (footer.allocations - plain.allocations) as f64 / PUSHES as f64;
-    let extra_bytes = (footer.bytes - plain.bytes) as f64 / PUSHES as f64;
-
-    // The footer is a fixed 32 bytes. Before this fix the gap carried them.
-    assert!(
-        extra_bytes < 32.0,
-        "a footer record allocated {extra_bytes:.1} bytes per push more than a footerless one; \
-         before this fix it was 36.0, of which 32 was the footer's own Vec"
+    // Signed on purpose: an unsigned difference would underflow rather than
+    // fail if the footer spec ever came in *under* the footerless one, and a
+    // silent wrap reads as a pass.
+    let extra_allocations = footer.allocations as i64 - plain.allocations as i64;
+    let extra_bytes = footer.bytes as i64 - plain.bytes as i64;
+    assert_eq!(
+        extra_bytes, 0,
+        "a footer record allocated {extra_bytes} bytes more than a footerless one over \
+         {PUSHES} pushes; the footer's own buffer was 32 of them per push and the magic 4"
     );
-    // And the allocation it took with it. One remains, and it is the chain's.
-    assert!(
-        extra_allocations <= 1.0 + 0.05,
-        "a footer record made {extra_allocations:.2} allocations per push more than a \
-         footerless one; before this fix it was 2.00, and only the block-offset chain's own \
-         one is expected to survive"
+    assert_eq!(
+        extra_allocations, 0,
+        "a footer record made {extra_allocations} allocations more than a footerless one over \
+         {PUSHES} pushes; it was 2 per push before the footer moved to a stack array and the \
+         magic stopped being copied"
     );
 }
 

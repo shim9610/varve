@@ -586,6 +586,14 @@ pub(crate) fn encode_native_record_footer(
     let mut bytes = [0; crate::file::RECORD_FOOTER_LEN as usize];
     let mut cursor = &mut bytes[..];
     for def in RECORD_FOOTER_FIELDS {
+        // The magic is a `&'static [u8]` in the field table and four bytes wide.
+        // Routing it through `LayoutValue::Bytes(Vec<u8>)` allocated a heap
+        // buffer for that constant on every appended record; writing it here
+        // emits the identical bytes and touches no allocator.
+        if let NativeRecordField::FooterMagic = def.role {
+            write_literal_bytes_field(&mut cursor, def.field)?;
+            continue;
+        }
         let value = native_footer_value(*def, footer)?;
         write_native_value(&mut cursor, def.field, &value)?;
     }
@@ -618,23 +626,30 @@ pub(crate) fn decode_native_record_footer(
     let mut prev_same_key_offset = None;
 
     for def in RECORD_FOOTER_FIELDS {
+        let invalid = || Error::InvalidRecordFooter {
+            offset: footer_offset,
+        };
+        // Compared against the cursor in place. The generic reader allocates a
+        // `Vec` the size of the field to hold bytes it only ever compares, and
+        // the footer is decoded once per record on every scan.
+        if let NativeRecordField::FooterMagic = def.role {
+            let expected = literal_bytes_of(def.field).ok_or_else(invalid)?;
+            let (actual, rest) = cursor
+                .split_at_checked(expected.len())
+                .ok_or_else(invalid)?;
+            if actual != expected {
+                return Err(invalid());
+            }
+            cursor = rest;
+            continue;
+        }
         let name = def.field.name;
         let value =
             read_native_value(&mut cursor, def.field).map_err(|_| Error::InvalidRecordFooter {
                 offset: footer_offset,
             })?;
-        let invalid = || Error::InvalidRecordFooter {
-            offset: footer_offset,
-        };
         match def.role {
-            NativeRecordField::FooterMagic => {
-                let NativeFieldSource::LiteralBytes(expected) = def.field.source else {
-                    return Err(invalid());
-                };
-                if !matches!(value, LayoutValue::Bytes(actual) if actual == expected) {
-                    return Err(invalid());
-                }
-            }
+            NativeRecordField::FooterMagic => return Err(invalid()),
             NativeRecordField::FooterVersion
             | NativeRecordField::FooterCrc32
             | NativeRecordField::FooterReserved => {
@@ -776,6 +791,29 @@ fn native_header_value(
             "footer role in the native record header table",
         )),
     }
+}
+
+/// The literal bytes a fixed-width byte field declares, when its declared
+/// width agrees with them.
+///
+/// Both the encoder and the decoder need exactly this, and both used to obtain
+/// it by building a `Vec`.
+fn literal_bytes_of(field: NativeField) -> Option<&'static [u8]> {
+    let NativeFieldSource::LiteralBytes(bytes) = field.source else {
+        return None;
+    };
+    let NativeFieldType::Bytes { len } = field.ty else {
+        return None;
+    };
+    (usize::try_from(len).ok() == Some(bytes.len())).then_some(bytes)
+}
+
+/// Writes a literal byte field's own bytes, with the same width check
+/// [`write_native_value`] applies to a `LayoutValue::Bytes`.
+fn write_literal_bytes_field<W: Write>(writer: &mut W, field: NativeField) -> Result<()> {
+    let bytes = literal_bytes_of(field).ok_or(Error::LayoutFieldTypeMismatch(field.name))?;
+    writer.write_all(bytes)?;
+    Ok(())
 }
 
 fn native_footer_value(
