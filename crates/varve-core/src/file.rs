@@ -7623,6 +7623,17 @@ impl VarveFile {
         crate::snapshot::take_snapshot_bounds_fstats()
     }
 
+    /// Record bytes this thread has walked while scanning, read and cleared.
+    ///
+    /// Fault-testing hook only. An open that follows the on-disk segment chain
+    /// walks the chain; an open that scans walks the file. This is the number
+    /// that tells them apart.
+    #[cfg(any(test, feature = "scalable-fault-injection"))]
+    #[doc(hidden)]
+    pub fn take_open_scan_bytes() -> u64 {
+        take_open_scan_bytes()
+    }
+
     /// Reads and clears the number of `fstat`s this thread has issued through
     /// the writer's own record handle (`RecordFile::metadata`).
     ///
@@ -11377,6 +11388,29 @@ enum RecordRead {
     RecoverableTail(RecoverableTail),
 }
 
+std::thread_local! {
+    /// Bytes this thread has advanced over while scanning records, all opens
+    /// summed. The single charge point for `ReadLimitKey::ScanBytes` is
+    /// `ScanAccounting::advance`, so this is every record byte an open walks —
+    /// and the number that separates an open that follows the on-disk index
+    /// from one that walks the file.
+    static OPEN_SCAN_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn count_open_scan_bytes(bytes: u64) {
+    #[cfg(any(test, feature = "scalable-fault-injection"))]
+    OPEN_SCAN_BYTES.with(|total| total.set(total.get().saturating_add(bytes)));
+    #[cfg(not(any(test, feature = "scalable-fault-injection")))]
+    let _ = bytes;
+}
+
+/// Reads and clears this thread's scanned-record byte total.
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+pub(crate) fn take_open_scan_bytes() -> u64 {
+    OPEN_SCAN_BYTES.with(|total| total.replace(0))
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct ScanAccounting {
     advanced: u64,
@@ -11391,6 +11425,7 @@ impl ScanAccounting {
                     resource: "scan bytes",
                 })?;
         spec.read_limits.check(ReadLimitKey::ScanBytes, advanced)?;
+        count_open_scan_bytes(bytes);
         self.advanced = advanced;
         Ok(())
     }
@@ -12322,9 +12357,24 @@ impl ScannedIndex {
     }
 }
 
+/// Whether this open may try the segment chain instead of the record scan.
+///
+/// **`segment_on_flush` is deliberately not consulted.** It is the *writer's*
+/// policy — whether flushing appends a segment — and asking it here made the
+/// reader consult its own configuration instead of the file in front of it: a
+/// file written with a chain, opened by a spec that does not declare one, had
+/// its index ignored and was walked header-to-EOF. The chain is a property of
+/// the bytes, so the bytes decide. `load_index_from_segments` already answers
+/// `Ok(None)` for a file whose chain does not describe it, and
+/// `read_segment_tip_offset` costs one seek and a 40-byte read to find that
+/// out, so a file without a chain pays that and falls back to the scan.
+///
+/// The other two conditions are about what the scan does that the walk does
+/// not, and they stay: a recovery open exists to look at every record, and
+/// `AtOpen` verification is a promise to checksum every record at open.
 fn segment_chain_open_is_allowed(spec: FormatSpec, intent: ScanIntent) -> bool {
-    spec.index_policy.segment_on_flush
-        && intent != ScanIntent::Recover
+    let _ = spec.index_policy.segment_on_flush;
+    intent != ScanIntent::Recover
         && spec
             .read_limits
             .resolve()

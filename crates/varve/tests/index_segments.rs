@@ -1117,3 +1117,82 @@ fn a_checkpoint_and_a_segment_chain_cannot_both_be_declared() {
             .is_ok()
     );
 }
+
+/// **The chain is a property of the file, not of the spec that opens it.**
+///
+/// `segment_chain_open_is_allowed` used to require `spec.index_policy
+/// .segment_on_flush` — the *writer's* policy — so a reader whose spec did not
+/// declare the chain ignored one that was on disk in front of it and walked the
+/// file header-to-EOF instead. The writer's policy governs whether flushing
+/// appends a segment. Whether an open can use one is decided by the bytes.
+///
+/// The instrument is `take_open_scan_bytes`, the single charge point for
+/// `ReadLimitKey::ScanBytes`, so it counts exactly the record bytes an open
+/// walks. Both open paths charge through it — which is the point: the chain
+/// walk is not free, it is bounded by the *index* instead of by the *file*.
+///
+/// **Measured on this fixture: chain 43,070 bytes, full scan 80,062.** Do not
+/// read that ratio as a constant. 512 records of one `u32` each make an index
+/// that is over half the bytes in the file; the same chain over records with
+/// real payloads walks a far smaller fraction, because what it walks follows
+/// the index and what the scan walks follows the data. The assertion is
+/// therefore strict inequality and not a factor — a factor here would be a
+/// number invented from one fixture.
+#[test]
+fn a_chained_file_opens_without_scanning_it_whatever_the_reader_declared() -> varve::Result<()> {
+    let path = temp_path("chain_decided_by_the_file");
+    write_lines(segment_spec(), &path, 512, 16)?;
+    let file_len = std::fs::metadata(&*path)?.len();
+
+    // A reader that does NOT declare the chain — the case that used to be
+    // forced into the full walk.
+    let unaware = plain_spec();
+    let _ = varve::VarveFile::take_open_scan_bytes();
+    let opened = unaware.open_readonly(&path)?;
+    let by_chain_bytes = varve::VarveFile::take_open_scan_bytes();
+    assert_eq!(
+        opened.blocks::<Line>()?.len(),
+        512,
+        "the chain-seeded open did not recover every record"
+    );
+    drop(opened);
+
+    // A recovery open is defined to look at every record, so it is the full
+    // walk, measured on the same file rather than assumed.
+    let _ = varve::VarveFile::take_open_scan_bytes();
+    let scanned = unaware.open_recover(&path)?;
+    let by_scan_bytes = varve::VarveFile::take_open_scan_bytes();
+    println!("(open cost) {file_len}-byte file: chain={by_chain_bytes} scan={by_scan_bytes}");
+    assert!(
+        by_chain_bytes < by_scan_bytes,
+        "the chain open walked {by_chain_bytes} record bytes against {by_scan_bytes} for the \
+         full scan of a {file_len}-byte file; before this change a reader that did not declare \
+         the chain walked the whole file, so these two were equal"
+    );
+    // The scan arm really is the whole append region: everything but the file
+    // header. Without this the inequality above could be satisfied by a scan
+    // that was itself short.
+    assert!(
+        by_scan_bytes + 512 >= file_len,
+        "the recovery open walked {by_scan_bytes} of a {file_len}-byte file, so it is not the \
+         full-scan arm this compares against"
+    );
+
+    // And the two paths agree on the index itself, not merely on its length.
+    let chained = segment_spec().open_readonly(&path)?;
+    let by_chain = chained.blocks::<Line>()?;
+    let by_scan = scanned.blocks::<Line>()?;
+    assert_eq!(
+        by_chain.len(),
+        by_scan.len(),
+        "the two open paths disagreed on the record count"
+    );
+    for position in 0..by_chain.len() {
+        assert_eq!(
+            by_chain.get(position)?,
+            by_scan.get(position)?,
+            "the two open paths disagreed at record {position}"
+        );
+    }
+    Ok(())
+}
