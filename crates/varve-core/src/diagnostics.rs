@@ -656,7 +656,25 @@ pub fn diagnose_file<P: AsRef<Path>>(spec: FormatSpec, path: P) -> FormatDiagnos
     ));
 
     let mut materialization = MaterializationBudget::new(spec);
-    for entry in file.index_entries() {
+    // `index_entries_into`, not `index_entries`: the infallible form swallows a
+    // refused `IndexBytes` charge and returns an empty snapshot, so a file that
+    // exceeds the ceiling would be reported here as a file with no records —
+    // which is the one answer a diagnostic must never invent. The buffer is
+    // also reused by the record count below instead of being built twice.
+    let mut entries = Vec::new();
+    if let Err(error) = file.index_entries_into(&mut entries) {
+        let (domain, hint) = classify_error_with_hint(&error);
+        report.push(
+            Diagnostic::error(
+                domain,
+                "file.index_entries.refused",
+                format!("the record index could not be read: {error}"),
+            )
+            .with_hint(hint),
+        );
+        return report;
+    }
+    for entry in &entries {
         let validation = (|| {
             let logical_len = entry.logical_payload_len_snapshot(spec, file.snapshot())?;
             materialization.consume(logical_len)?;
@@ -682,10 +700,7 @@ pub fn diagnose_file<P: AsRef<Path>>(spec: FormatSpec, path: P) -> FormatDiagnos
     report.push(Diagnostic::info(
         DiagnosticDomain::FileData,
         "file.records.scanned",
-        format!(
-            "{} append-log records validated",
-            file.index_entries().len()
-        ),
+        format!("{} append-log records validated", entries.len()),
     ));
 
     match file.schema_manifest() {

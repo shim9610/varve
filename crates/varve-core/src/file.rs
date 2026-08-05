@@ -2948,9 +2948,15 @@ impl VarveReader {
         self.file.blocks::<T>()
     }
 
-    /// See [`VarveFile::blocks_into`].
-    pub fn blocks_into<T: VarveBlock>(&self, out: &mut Vec<T>) -> Result<()> {
-        self.file.blocks_into::<T>(out)
+    /// See [`VarveFile::block_entries_into`].
+    pub fn block_entries_into<T: VarveBlock>(&self, out: &mut Vec<RecordIndexEntry>) -> Result<()> {
+        self.file.block_entries_into::<T>(out)
+    }
+
+    /// See [`VarveFile::decode_blocks_into`] — including why it is not the
+    /// `_into` twin of [`blocks`](Self::blocks).
+    pub fn decode_blocks_into<T: VarveBlock>(&self, out: &mut Vec<T>) -> Result<()> {
+        self.file.decode_blocks_into::<T>(out)
     }
 
     pub fn blocks_migrated<From, To, M>(&self) -> Result<Vec<To>>
@@ -5676,8 +5682,14 @@ impl VarveFile {
     /// The block's records as a lazy collection: one decoded value at a time.
     ///
     /// **This allocates** one index entry per matching record, which is what
-    /// makes `get(i)` positional. [`blocks_into`](Self::blocks_into) decodes
-    /// straight into the caller's buffer and holds no entries at all.
+    /// makes `get(i)` positional.
+    /// [`block_entries_into`](Self::block_entries_into) fills the caller's
+    /// buffer with those same entries instead.
+    ///
+    /// Deliberately *not* pointing at
+    /// [`decode_blocks_into`](Self::decode_blocks_into): that one decodes every
+    /// matching record, so it is bounded by the caller's buffer and not by the
+    /// file, which is the opposite of what this collection is for.
     pub fn blocks<T: VarveBlock>(&self) -> Result<BlockVec<T>> {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         // A non-resident block has no entries here, and an empty collection
@@ -5715,13 +5727,54 @@ impl VarveFile {
         Ok(BlockVec::new(self.spec, self.snapshot.clone(), entries))
     }
 
-    /// Fills the caller's buffer with every decoded block of type `T`.
+    /// Fills the caller's buffer with the index entry of every record of type
+    /// `T` — the entries [`blocks`](Self::blocks) would have allocated.
     ///
-    /// `out` is cleared and then extended. Unlike [`blocks`](Self::blocks) this
-    /// keeps no index entries: it decodes each record as the walk reaches it
-    /// and moves the value straight into `out`, so the peak is one payload plus
-    /// whatever the caller's buffer holds — and the caller decides that.
-    pub fn blocks_into<T: VarveBlock>(&self, out: &mut Vec<T>) -> Result<()> {
+    /// `out` is cleared and then extended. This is the caller-supplied-buffer
+    /// form of `blocks()`: same entries, same per-entry `IndexBytes` charge,
+    /// same laziness — no payload is read and nothing is decoded.
+    pub fn block_entries_into<T: VarveBlock>(&self, out: &mut Vec<RecordIndexEntry>) -> Result<()> {
+        crate::collections::ensure_registered_block::<T>(self.spec)?;
+        crate::collections::ensure_resident_block::<T>(self.spec)?;
+        out.clear();
+        for entry in self.index.iter() {
+            let entry = entry?;
+            if entry.block_id != T::ID {
+                continue;
+            }
+            let requested = index_bytes_for_count(out.len().saturating_add(1))?;
+            self.spec
+                .read_limits
+                .check(ReadLimitKey::IndexBytes, requested)?;
+            out.try_reserve(1).map_err(|_| Error::AllocationFailed {
+                resource: "block index",
+                requested,
+            })?;
+            out.push(entry);
+        }
+        Ok(())
+    }
+
+    /// Decodes **every** record of type `T` into the caller's buffer.
+    ///
+    /// `out` is cleared and then extended.
+    ///
+    /// **Not the `_into` twin of [`blocks`](Self::blocks), and named so it
+    /// cannot be mistaken for one.** `blocks()` returns a lazy collection whose
+    /// peak is one payload however many records it covers; this materializes
+    /// all of them, so what it costs is bounded by the caller's buffer and not
+    /// by the file. For a block carrying a `String` or a `Vec` that is
+    /// unbounded in the heap as well as in the buffer.
+    ///
+    /// It shipped for one round as `blocks_into`, with `blocks()`'s
+    /// documentation recommending it as the memory-friendly form. That was
+    /// backwards and is corrected here: reach for it when you want all of them
+    /// anyway, and for [`block_entries_into`](Self::block_entries_into) when
+    /// you want what `blocks()` holds.
+    ///
+    /// The per-record charge is unchanged from `BlockVec::get`: the
+    /// materialization ceiling bounds one payload, not the sum over the walk.
+    pub fn decode_blocks_into<T: VarveBlock>(&self, out: &mut Vec<T>) -> Result<()> {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         crate::collections::ensure_resident_block::<T>(self.spec)?;
         out.clear();

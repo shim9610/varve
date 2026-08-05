@@ -1401,8 +1401,12 @@ fn inspect_native_layout_file<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Resu
     let file_header_len = crate::file::read_file_header(spec, &mut header_file)?;
     let file_header_fields = read_native_file_header_fields(path, spec, file_header_len)?;
     let file = crate::file::VarveFile::open_readonly(spec, path)?;
-    let segments = file
-        .index_entries()
+    // `index_entries_into`, not `index_entries`: the infallible form swallows a
+    // refused `IndexBytes` charge and yields an empty snapshot, which this
+    // would report as a file with no segments rather than as a refusal.
+    let mut entries = Vec::new();
+    file.index_entries_into(&mut entries)?;
+    let segments = entries
         .iter()
         .map(native_record_to_layout_segment)
         .collect::<Result<Vec<_>>>()?;
