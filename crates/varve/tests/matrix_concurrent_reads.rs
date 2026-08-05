@@ -178,15 +178,29 @@ fn populated(fixture: &TempMatrix, integrity: varve::IntegrityPolicy) -> varve::
 /// Criterion (C), part 1: the handle crosses a thread boundary by shared
 /// reference.
 ///
-/// `VarveReader` owns a `RecordFile` (a `std::fs::File`), a `SnapshotFile`
-/// (`Arc<File>` plus plain-old-data bounds), a `MatrixLayout` (`HashMap`s,
-/// `Vec`s, `String`s and integers), a `ResidentIndex` (`Vec`), and a
-/// `PoisonFlag` (`AtomicBool`). Every one of those is `Sync`, and none of them
-/// is `Cell`/`RefCell`/raw-pointer shaped, so `Sync` is *derived* here — there
-/// is no `unsafe impl` anywhere in the crate for these types. This assertion
-/// exists so that a future field with interior mutability (for instance a
-/// demand-loaded bitmap cache behind a `RefCell`) fails the build here rather
-/// than silently making concurrent reads impossible again.
+/// `VarveReader` owns a `RecordFile` (a `std::fs::File` plus a `MatrixReadPool`,
+/// which is a `Mutex`), a `SnapshotFile` (`Arc<File>` plus plain-old-data
+/// bounds), a `MatrixLayout` (`HashMap`s, `Vec`s, `String`s and integers), a
+/// `ResidentIndex` (a `Vec` of 16-byte slots plus its own `SnapshotFile` and a
+/// `Copy` `FormatSpec` — it rebuilds each entry from the file on demand, so it
+/// reads through `&self` and holds no cache), a `PoisonFlag` (two plain `bool`s
+/// behind `&mut self`), and a `OnceLock<ChunkDirectory>`.
+///
+/// Two of those are interior mutability and are `Sync` anyway: `Mutex`
+/// unconditionally, and `OnceLock<T>` when `T: Send + Sync` — `ChunkDirectory`
+/// is a `Vec` of plain data. The chunk directory is also the one that is
+/// written *on a read path*, and it does its I/O before `get_or_init` rather
+/// than inside it, so the lock is never held across a read and two racing
+/// threads each build a copy instead of one waiting on the other.
+///
+/// Nothing here is `Cell`/`RefCell`/raw-pointer shaped, so `Sync` is *derived*
+/// — there is no `unsafe impl` anywhere in the crate for these types. This
+/// assertion exists so that a future field with interior mutability (for
+/// instance a demand-loaded bitmap cache behind a `RefCell`) fails the build
+/// here rather than silently making concurrent reads impossible again. Keep
+/// this list current: it is the reasoning a later reader will trust instead of
+/// re-deriving, and it has already been wrong once — it called `PoisonFlag` an
+/// `AtomicBool` and did not mention `chunk_directory` at all.
 #[test]
 fn the_reader_handle_is_sync_and_send() {
     fn assert_sync<T: Sync>() {}
