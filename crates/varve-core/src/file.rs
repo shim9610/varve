@@ -2900,6 +2900,17 @@ impl VarveReader {
         })
     }
 
+    /// See [`VarveFile::open_readonly_with_scratch`].
+    pub fn open_with_scratch<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        scratch: &mut Vec<RecordIndexEntry>,
+    ) -> Result<Self> {
+        Ok(Self {
+            file: VarveFile::open_readonly_with_scratch(spec, path, scratch)?,
+        })
+    }
+
     pub fn into_inner(self) -> VarveFile {
         self.file
     }
@@ -2924,12 +2935,22 @@ impl VarveReader {
         self.file.all_metadata()
     }
 
+    /// See [`VarveFile::all_metadata_into`].
+    pub fn all_metadata_into(&self, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
+        self.file.all_metadata_into(out)
+    }
+
     pub fn schema_manifest(&self) -> Result<Option<SchemaManifest>> {
         self.file.schema_manifest()
     }
 
     pub fn blocks<T: VarveBlock>(&self) -> Result<BlockVec<T>> {
         self.file.blocks::<T>()
+    }
+
+    /// See [`VarveFile::blocks_into`].
+    pub fn blocks_into<T: VarveBlock>(&self, out: &mut Vec<T>) -> Result<()> {
+        self.file.blocks_into::<T>(out)
     }
 
     pub fn blocks_migrated<From, To, M>(&self) -> Result<Vec<To>>
@@ -2939,6 +2960,16 @@ impl VarveReader {
         M: VarveMigration<From, To>,
     {
         self.file.blocks_migrated::<From, To, M>()
+    }
+
+    /// See [`VarveFile::blocks_migrated_into`].
+    pub fn blocks_migrated_into<From, To, M>(&self, out: &mut Vec<To>) -> Result<()>
+    where
+        From: VarveBlock,
+        To: VarveBlock,
+        M: VarveMigration<From, To>,
+    {
+        self.file.blocks_migrated_into::<From, To, M>(out)
     }
 
     pub fn keyed_blocks<T>(&self) -> Result<KeyedBlockVec<T::Key, T>>
@@ -2954,6 +2985,15 @@ impl VarveReader {
         T::Key: Eq + Hash,
     {
         self.file.materialized_keyed_blocks::<T>()
+    }
+
+    /// See [`VarveFile::materialized_keyed_blocks_into`].
+    pub fn materialized_keyed_blocks_into<T>(&self, out: &mut HashMap<T::Key, T>) -> Result<()>
+    where
+        T: VarveMerge,
+        T::Key: Eq + Hash,
+    {
+        self.file.materialized_keyed_blocks_into::<T>(out)
     }
 
     pub fn scan(&self) -> impl Iterator<Item = Result<BlockEvent>> + '_ {
@@ -2981,6 +3021,15 @@ impl VarveReader {
         T::Key: Eq + Hash,
     {
         self.file.key_tail_offsets::<T>()
+    }
+
+    /// See [`VarveFile::key_tail_offsets_into`].
+    pub fn key_tail_offsets_into<T>(&self, out: &mut HashMap<T::Key, u64>) -> Result<()>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
+    {
+        self.file.key_tail_offsets_into::<T>(out)
     }
 
     pub fn read_matrix_cell<T: VarveMatrixBlock>(&self, key: MatrixKey) -> Result<T> {
@@ -3170,6 +3219,17 @@ impl VarveWriter {
         })
     }
 
+    /// See [`VarveFile::open_with_scratch`].
+    pub fn open_with_scratch<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        scratch: &mut Vec<RecordIndexEntry>,
+    ) -> Result<Self> {
+        Ok(Self {
+            file: VarveFile::open_with_scratch(spec, path, scratch)?,
+        })
+    }
+
     pub fn open_with_lock_policy<P: AsRef<Path>>(
         spec: FormatSpec,
         path: P,
@@ -3231,6 +3291,15 @@ impl VarveWriter {
         T::Key: Eq + Hash,
     {
         self.file.key_tail_offsets::<T>()
+    }
+
+    /// See [`VarveFile::key_tail_offsets_into`].
+    pub fn key_tail_offsets_into<T>(&self, out: &mut HashMap<T::Key, u64>) -> Result<()>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
+    {
+        self.file.key_tail_offsets_into::<T>(out)
     }
 
     // F-01 (round 9): `VarveWriter::reserve_keyed_tail_slot` has been
@@ -3906,7 +3975,26 @@ impl VarveFile {
         Ok(file)
     }
 
+    /// Opens a read-write handle.
+    ///
+    /// **This allocates the scan's entry buffer.**
+    /// [`open_with_scratch`](Self::open_with_scratch) takes the caller's
+    /// instead; see [`open_readonly_with_scratch`](Self::open_readonly_with_scratch)
+    /// for what that buffer is and why the caller owns it.
     pub fn open<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        let mut scratch = Vec::new();
+        Self::open_with_scratch(spec, path, &mut scratch)
+    }
+
+    /// Opens a read-write handle, scanning into the caller's buffer.
+    ///
+    /// See [`open_readonly_with_scratch`](Self::open_readonly_with_scratch):
+    /// `scratch` is scratch, not output, and is cleared on entry.
+    pub fn open_with_scratch<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        scratch: &mut Vec<RecordIndexEntry>,
+    ) -> Result<Self> {
         let spec = spec.resolve_entrypoint();
         spec.validate()?;
         ensure_native_open_limits(spec)?;
@@ -3916,10 +4004,22 @@ impl VarveFile {
         // mismatch, a read-limit refusal, a corrupt tail - happens after the
         // claim was taken, so all of them release it here. See
         // `with_writer_lock`.
-        with_writer_lock(lock, |lock| Self::open_locked(spec, path, lock))
+        with_writer_lock(lock, |lock| {
+            Self::open_locked_with_scratch(spec, path, lock, scratch)
+        })
     }
 
     fn open_locked(spec: FormatSpec, path: PathBuf, lock: &mut WriterLock) -> Result<Self> {
+        let mut scratch = Vec::new();
+        Self::open_locked_with_scratch(spec, path, lock, &mut scratch)
+    }
+
+    fn open_locked_with_scratch(
+        spec: FormatSpec,
+        path: PathBuf,
+        lock: &mut WriterLock,
+        scratch: &mut Vec<RecordIndexEntry>,
+    ) -> Result<Self> {
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
         lock.bind_native(&file, &path)?;
         let captured_len = check_open_file_len(spec, &file)?;
@@ -3931,15 +4031,15 @@ impl VarveFile {
             captured_len,
         )?);
         let append_start = append_log_start(header_len, matrix.as_ref());
-        let index = load_index(spec, &mut file, append_start, ScanIntent::Writer)?;
+        let index = load_index(spec, &mut file, append_start, ScanIntent::Writer, scratch)?;
         // The sequence high-water mark and the block tails come from the scan
         // rather than from the index, because the index is filtered: a
         // non-resident block's records are on disk and not in it.
         let sequence_state = index.sequence_state();
         let block_tails = index.block_tails();
-        let index = index.entries;
-        truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
-        let derived = derive_index_state(infallible_entries(&index), false)?;
+        let index = &*scratch;
+        truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, index)?;
+        let derived = derive_index_state(infallible_entries(index), false)?;
         let checkpoint_cadence = derived.checkpoint_cadence;
         let segment_cursor = derived.segment_cursor;
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
@@ -3947,7 +4047,7 @@ impl VarveFile {
             spec,
             path,
             file: RecordFile::new(file),
-            index: ResidentIndex::adopt_generation(&index, snapshot.clone(), spec)?,
+            index: ResidentIndex::adopt_generation(index, snapshot.clone(), spec)?,
             snapshot,
             mode: OpenMode::ReadWrite,
             header_extensions,
@@ -3982,7 +4082,37 @@ impl VarveFile {
         with_writer_lock(lock, |lock| Self::open_locked(spec, path, lock))
     }
 
+    /// Opens a read-only handle.
+    ///
+    /// **This allocates the scan's entry buffer.**
+    /// [`open_readonly_with_scratch`](Self::open_readonly_with_scratch) takes
+    /// the caller's instead — the shape to use when opening many files, since
+    /// one buffer then serves all of them.
     pub fn open_readonly<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        let mut scratch = Vec::new();
+        Self::open_readonly_with_scratch(spec, path, &mut scratch)
+    }
+
+    /// Opens a read-only handle, scanning into the caller's buffer.
+    ///
+    /// `scratch` is where the open path builds the entries it reads out of the
+    /// file. It is **scratch, not output**: the handle keeps a 16-byte
+    /// directory slot per record and rebuilds each entry from the record when
+    /// asked, so nothing in `scratch` is retained past this call and the caller
+    /// may clear it, reuse it for the next open, or drop it.
+    ///
+    /// Taking it here is the point. The entry buffer is the largest allocation
+    /// an open makes — it scales with record count — and a library that sizes
+    /// and owns it decides the caller's memory for them. Opening a thousand
+    /// files through one buffer allocates once, not a thousand times.
+    ///
+    /// The buffer is cleared on entry, so its previous contents never leak into
+    /// this file's index.
+    pub fn open_readonly_with_scratch<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        scratch: &mut Vec<RecordIndexEntry>,
+    ) -> Result<Self> {
         let spec = spec.resolve_entrypoint();
         spec.validate()?;
         ensure_native_open_limits(spec)?;
@@ -3997,7 +4127,7 @@ impl VarveFile {
             captured_len,
         )?);
         let append_start = append_log_start(header_len, matrix.as_ref());
-        let scanned = load_index(spec, &mut file, append_start, ScanIntent::ReadOnly)?;
+        let scanned = load_index(spec, &mut file, append_start, ScanIntent::ReadOnly, scratch)?;
         let sequence_state = scanned.sequence_state();
         let block_tails = scanned.block_tails();
         // The snapshot comes from the scan, not from the resident list. The
@@ -4014,8 +4144,8 @@ impl VarveFile {
         // under a marker policy the uncommitted tail a writer open would delete
         // must not be visible here either. Both facts belong to the scan.
         let logical_len = scanned.physical_end(append_start);
-        let index = scanned.entries;
-        let derived = derive_index_state(infallible_entries(&index), false)?;
+        let index = &*scratch;
+        let derived = derive_index_state(infallible_entries(index), false)?;
         let checkpoint_cadence = derived.checkpoint_cadence;
         let segment_cursor = derived.segment_cursor;
         let snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, logical_len)?;
@@ -4023,7 +4153,7 @@ impl VarveFile {
             spec,
             path,
             file: RecordFile::new(file),
-            index: ResidentIndex::adopt_generation(&index, snapshot.clone(), spec)?,
+            index: ResidentIndex::adopt_generation(index, snapshot.clone(), spec)?,
             snapshot,
             mode: OpenMode::ReadOnly,
             header_extensions,
@@ -4069,6 +4199,16 @@ impl VarveFile {
         path: PathBuf,
         lock: &mut WriterLock,
     ) -> Result<(Self, RecoveryReport)> {
+        let mut scratch = Vec::new();
+        Self::open_recover_locked_with_scratch(spec, path, lock, &mut scratch)
+    }
+
+    fn open_recover_locked_with_scratch(
+        spec: FormatSpec,
+        path: PathBuf,
+        lock: &mut WriterLock,
+        scratch: &mut Vec<RecordIndexEntry>,
+    ) -> Result<(Self, RecoveryReport)> {
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
         lock.bind_native(&file, &path)?;
         let original_len = file.metadata()?.len();
@@ -4080,13 +4220,13 @@ impl VarveFile {
             original_len,
         )?);
         let append_start = append_log_start(header_len, matrix.as_ref());
-        let index = load_index(spec, &mut file, append_start, ScanIntent::Recover)?;
+        let index = load_index(spec, &mut file, append_start, ScanIntent::Recover, scratch)?;
         let sequence_state = index.sequence_state();
         let block_tails = index.block_tails();
-        let index = index.entries;
-        truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
+        let index = &*scratch;
+        truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, index)?;
         let recovered_len = file.metadata()?.len();
-        let derived = derive_index_state(infallible_entries(&index), false)?;
+        let derived = derive_index_state(infallible_entries(index), false)?;
         let checkpoint_cadence = derived.checkpoint_cadence;
         let segment_cursor = derived.segment_cursor;
         let records_preserved = index.len();
@@ -4096,7 +4236,7 @@ impl VarveFile {
                 spec,
                 path,
                 file: RecordFile::new(file),
-                index: ResidentIndex::adopt_generation(&index, snapshot.clone(), spec)?,
+                index: ResidentIndex::adopt_generation(index, snapshot.clone(), spec)?,
                 snapshot,
                 mode: OpenMode::ReadWrite,
                 header_extensions,
@@ -4619,8 +4759,20 @@ impl VarveFile {
         Ok(found.map(|(_, value)| value))
     }
 
+    /// **This allocates.** [`all_metadata_into`](Self::all_metadata_into) takes
+    /// the caller's buffer instead.
     pub fn all_metadata(&self) -> Result<Vec<(String, Vec<u8>)>> {
         let mut values = Vec::new();
+        self.all_metadata_into(&mut values)?;
+        Ok(values)
+    }
+
+    /// Fills the caller's buffer with every metadata pair.
+    ///
+    /// `out` is cleared and then extended, so a caller that reuses one buffer
+    /// across calls allocates once and never again.
+    pub fn all_metadata_into(&self, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
+        out.clear();
         let mut budget = MaterializationBudget::new(self.spec);
         for entry in self.index.iter() {
             let entry = entry?;
@@ -4630,13 +4782,13 @@ impl VarveFile {
             let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
             budget.consume(logical_len)?;
             let payload = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
-            values.try_reserve(1).map_err(|_| Error::AllocationFailed {
+            out.try_reserve(1).map_err(|_| Error::AllocationFailed {
                 resource: "metadata entries",
                 requested: logical_len,
             })?;
-            values.push(budget.decode(&payload, self.spec.endian)?);
+            out.push(budget.decode(&payload, self.spec.endian)?);
         }
-        Ok(values)
+        Ok(())
     }
 
     pub fn schema_manifest(&self) -> Result<Option<SchemaManifest>> {
@@ -5521,26 +5673,106 @@ impl VarveFile {
         budget.decode(&payload, T::ENDIAN.unwrap_or(self.spec.endian))
     }
 
+    /// The block's records as a lazy collection: one decoded value at a time.
+    ///
+    /// **This allocates** one index entry per matching record, which is what
+    /// makes `get(i)` positional. [`blocks_into`](Self::blocks_into) decodes
+    /// straight into the caller's buffer and holds no entries at all.
     pub fn blocks<T: VarveBlock>(&self) -> Result<BlockVec<T>> {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         // A non-resident block has no entries here, and an empty collection
         // would say "nothing was written" rather than "not through this door".
         crate::collections::ensure_resident_block::<T>(self.spec)?;
-        // Filtered, so the count is not free: one pass to learn it, because
-        // the charge and the reservation both have to happen before the copy.
-        let mut count = 0usize;
+        // **One traversal, charged per entry.** This used to walk the index
+        // once to count and once to copy, so that `IndexBytes` could be charged
+        // for the exact total before the first copy. That was nearly free when
+        // the index was a `Vec` in memory. It is not free now: each traversal
+        // faults every entry off disk, so the second pass was `N` extra
+        // positional reads to learn a number the first pass already knew.
+        //
+        // The charge still precedes the memory — it is now per entry, the same
+        // shape `key_tail_offsets` uses for `KeyedTailBytes` — so a file that
+        // exceeds the ceiling is still refused during the build rather than
+        // after the whole array is resident.
+        let mut entries: Vec<RecordIndexEntry> = Vec::new();
         for entry in self.index.iter() {
-            if entry?.block_id == T::ID {
-                count += 1;
+            let entry = entry?;
+            if entry.block_id != T::ID {
+                continue;
             }
+            let requested = index_bytes_for_count(entries.len().saturating_add(1))?;
+            self.spec
+                .read_limits
+                .check(ReadLimitKey::IndexBytes, requested)?;
+            entries
+                .try_reserve(1)
+                .map_err(|_| Error::AllocationFailed {
+                    resource: "block index",
+                    requested,
+                })?;
+            entries.push(entry);
         }
-        let entries = clone_matching_entries(self.spec, &self.index, count, |entry| {
-            entry.block_id == T::ID
-        })?;
         Ok(BlockVec::new(self.spec, self.snapshot.clone(), entries))
     }
 
+    /// Fills the caller's buffer with every decoded block of type `T`.
+    ///
+    /// `out` is cleared and then extended. Unlike [`blocks`](Self::blocks) this
+    /// keeps no index entries: it decodes each record as the walk reaches it
+    /// and moves the value straight into `out`, so the peak is one payload plus
+    /// whatever the caller's buffer holds — and the caller decides that.
+    pub fn blocks_into<T: VarveBlock>(&self, out: &mut Vec<T>) -> Result<()> {
+        crate::collections::ensure_registered_block::<T>(self.spec)?;
+        crate::collections::ensure_resident_block::<T>(self.spec)?;
+        out.clear();
+        let mut budget = MaterializationBudget::new(self.spec);
+        for entry in self.index.iter() {
+            let entry = entry?;
+            if entry.block_id != T::ID {
+                continue;
+            }
+            if entry.block_version != T::VERSION {
+                return Err(Error::BlockVersionMismatch {
+                    block_id: T::ID,
+                    expected: T::VERSION,
+                    actual: entry.block_version,
+                });
+            }
+            // One record's materialization at a time, exactly as `BlockVec::get`
+            // and `BlockIter::next` charge it: the ceiling bounds one payload,
+            // not the sum over the walk.
+            budget.reset();
+            let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
+            budget.consume(logical_len)?;
+            let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
+            out.try_reserve(1).map_err(|_| Error::AllocationFailed {
+                resource: "decoded blocks",
+                requested: logical_len,
+            })?;
+            out.push(budget.decode(&payload, T::ENDIAN.unwrap_or(self.spec.endian))?);
+        }
+        Ok(())
+    }
+
+    /// **This allocates.** [`blocks_migrated_into`](Self::blocks_migrated_into)
+    /// takes the caller's buffer instead.
     pub fn blocks_migrated<From, To, M>(&self) -> Result<Vec<To>>
+    where
+        From: VarveBlock,
+        To: VarveBlock,
+        M: VarveMigration<From, To>,
+    {
+        let mut migrated = Vec::new();
+        self.blocks_migrated_into::<From, To, M>(&mut migrated)?;
+        Ok(migrated)
+    }
+
+    /// Fills the caller's buffer with every migrated block.
+    ///
+    /// `out` is cleared and then extended. The peak is still one payload at a
+    /// time — the decode is per record and the decoded value is moved straight
+    /// into `out` — so what the caller now owns is the only thing that grows.
+    pub fn blocks_migrated_into<From, To, M>(&self, out: &mut Vec<To>) -> Result<()>
     where
         From: VarveBlock,
         To: VarveBlock,
@@ -5552,7 +5784,7 @@ impl VarveFile {
                 to: To::ID,
             });
         }
-        let mut migrated = Vec::new();
+        out.clear();
         let mut budget = MaterializationBudget::new(self.spec);
         for entry in self.index.iter() {
             let entry = entry?;
@@ -5563,15 +5795,13 @@ impl VarveFile {
             budget.consume(logical_len)?;
             let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
             let from: From = budget.decode(&payload, From::ENDIAN.unwrap_or(self.spec.endian))?;
-            migrated
-                .try_reserve(1)
-                .map_err(|_| Error::AllocationFailed {
-                    resource: "migrated blocks",
-                    requested: logical_len,
-                })?;
-            migrated.push(M::migrate(from)?);
+            out.try_reserve(1).map_err(|_| Error::AllocationFailed {
+                resource: "migrated blocks",
+                requested: logical_len,
+            })?;
+            out.push(M::migrate(from)?);
         }
-        Ok(migrated)
+        Ok(())
     }
 
     pub fn keyed_blocks<T>(&self) -> Result<KeyedBlockVec<T::Key, T>>
@@ -5665,7 +5895,28 @@ impl VarveFile {
         Ok(KeyedBlockVec::from_parts(blocks, by_key))
     }
 
+    /// **This allocates.**
+    /// [`materialized_keyed_blocks_into`](Self::materialized_keyed_blocks_into)
+    /// takes the caller's map instead.
     pub fn materialized_keyed_blocks<T>(&self) -> Result<HashMap<T::Key, T>>
+    where
+        T: VarveMerge,
+        T::Key: Eq + Hash,
+    {
+        let mut values = HashMap::new();
+        self.materialized_keyed_blocks_into::<T>(&mut values)?;
+        Ok(values)
+    }
+
+    /// Fills the caller's map with the merged live value per key.
+    ///
+    /// `out` is cleared and then filled. The transient merge state is still
+    /// this crate's — it holds a `MergeOrder` beside each value and cannot be
+    /// the caller's map without leaking that ordering into the signature — so
+    /// what this saves is the second map, not the first. Said plainly rather
+    /// than implied: reusing `out` across calls removes one allocation of
+    /// `distinct keys`, not both.
+    pub fn materialized_keyed_blocks_into<T>(&self, out: &mut HashMap<T::Key, T>) -> Result<()>
     where
         T: VarveMerge,
         T::Key: Eq + Hash,
@@ -5682,20 +5933,19 @@ impl VarveFile {
             &mut budget,
             u64::MAX,
         )?;
+        out.clear();
         let requested = allocation_bytes::<(T::Key, T)>(state.len(), "materialized keyed map")?;
-        let mut values = HashMap::new();
-        values
-            .try_reserve(state.len())
+        out.try_reserve(state.len())
             .map_err(|_| Error::AllocationFailed {
                 resource: "materialized keyed map",
                 requested,
             })?;
         for (key, (_, value)) in state {
             if let Some(value) = value {
-                values.insert(key, value);
+                out.insert(key, value);
             }
         }
-        Ok(values)
+        Ok(())
     }
 
     /// Every record's block identity and extent, in file order.
@@ -5877,7 +6127,28 @@ impl VarveFile {
     /// by a `T::Key` is not charged here. The *retained* cache this seeds is
     /// byte-keyed, and its charge does include the key payload heap it owns
     /// (see `KeyedTailMap::charge_for`).
+    /// **This allocates.**
+    /// [`key_tail_offsets_into`](Self::key_tail_offsets_into) takes the
+    /// caller's map instead.
     pub fn key_tail_offsets<T>(&self) -> Result<HashMap<T::Key, u64>>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
+    {
+        let mut offsets = HashMap::new();
+        self.key_tail_offsets_into::<T>(&mut offsets)?;
+        Ok(offsets)
+    }
+
+    /// Fills the caller's map with the newest record offset per key.
+    ///
+    /// `out` is cleared and then filled. As with
+    /// [`materialized_keyed_blocks_into`](Self::materialized_keyed_blocks_into),
+    /// the transient ordering map stays this crate's — it carries a
+    /// `MergeOrder` the caller has no use for — so this removes the second map
+    /// of `distinct keys`, not the first. The `KeyedTailBytes` charge below
+    /// still accounts for both being alive at once, unchanged.
+    pub fn key_tail_offsets_into<T>(&self, out: &mut HashMap<T::Key, u64>) -> Result<()>
     where
         T: VarveKeyedBlock,
         T::Key: Eq + Hash,
@@ -5975,15 +6246,14 @@ impl VarveFile {
         self.spec
             .read_limits
             .check(ReadLimitKey::KeyedTailBytes, peak)?;
-        let mut offsets = HashMap::new();
-        offsets
-            .try_reserve(tails.len())
+        out.clear();
+        out.try_reserve(tails.len())
             .map_err(|_| Error::AllocationFailed {
                 resource: "key tail offsets",
                 requested,
             })?;
-        offsets.extend(tails.into_iter().map(|(key, (_, offset))| (key, offset)));
-        Ok(offsets)
+        out.extend(tails.into_iter().map(|(key, (_, offset))| (key, offset)));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -12691,7 +12961,6 @@ fn prepare_stream_record_into(
 /// more, and are carried out of the walk instead.
 #[derive(Debug)]
 struct ScannedIndex {
-    entries: Vec<RecordIndexEntry>,
     /// The highest sequence any record in the file carries, resident or not.
     ///
     /// `SequenceState::from_index` took the maximum in the resident index. With
@@ -12859,18 +13128,23 @@ fn load_index(
     file: &mut File,
     header_len: u64,
     intent: ScanIntent,
+    out: &mut Vec<RecordIndexEntry>,
 ) -> Result<ScannedIndex> {
+    out.clear();
     if segment_chain_open_is_allowed(spec, intent)
-        && let Some(scanned) = load_index_from_segments(spec, file, header_len)?
+        && let Some(scanned) = load_index_from_segments(spec, file, header_len, out)?
     {
         return Ok(scanned);
     }
+    // The chain walk may have filled `out` before deciding this file's chain
+    // does not describe it. The scan below starts from nothing.
+    out.clear();
     // Sequence uniqueness is validated exactly once, inside
     // `scan_records_from`, on the complete scanned entry list *before* any
     // commit-boundary truncation; a truncated prefix of a duplicate-free list
     // is still duplicate-free, so revalidating here would only repeat the
     // N-element copy+sort on every open (PERF2-07).
-    scan_records_from(spec, file, header_len, intent)
+    scan_records_from(spec, file, header_len, intent, out)
 }
 
 /// Rebuilds the resident index from the internal segment chain, or reports
@@ -12905,8 +13179,9 @@ fn load_index_from_segments(
     spec: FormatSpec,
     file: &mut File,
     append_start: u64,
+    out: &mut Vec<RecordIndexEntry>,
 ) -> Result<Option<ScannedIndex>> {
-    match walk_segment_chain(spec, file, append_start) {
+    match walk_segment_chain(spec, file, append_start, out) {
         Ok(scanned) => Ok(Some(scanned)),
         // Only a *spec-level* refusal propagates: the format declared no
         // ceiling, or demanded the explicit unbounded API. Those describe the
@@ -12972,6 +13247,7 @@ fn walk_segment_chain(
     spec: FormatSpec,
     file: &mut File,
     append_start: u64,
+    entries: &mut Vec<RecordIndexEntry>,
 ) -> Result<ScannedIndex> {
     let file_len = file.metadata()?.len();
     let mut accounting = ScanAccounting::default();
@@ -13055,7 +13331,6 @@ fn walk_segment_chain(
     }
 
     let mut scanned = ScannedIndex {
-        entries: Vec::new(),
         sequence_high_water: None,
         sequence_high_water_at_commit: None,
         newest: HashMap::new(),
@@ -13075,32 +13350,30 @@ fn walk_segment_chain(
         // `preceding_records` is the writer's *resident* index position, and
         // the filter below drops exactly what the writer never installed, so
         // the two counts stay comparable with a non-resident block in play.
-        let count = u64::try_from(scanned.entries.len()).map_err(|_| {
-            Error::ResourceArithmeticOverflow {
+        let count =
+            u64::try_from(entries.len()).map_err(|_| Error::ResourceArithmeticOverflow {
                 resource: "record count",
-            }
-        })?;
+            })?;
         if segment.covered_start != running || segment.preceding_records != count {
             return Err(Error::InvalidIndexSegment);
         }
         for covered in segment.entries {
-            running = push_scanned_entry(spec, &mut scanned, covered, running)?;
+            running = push_scanned_entry(spec, &mut scanned, entries, covered, running)?;
         }
         // The segment record closes its own coverage, so it sits immediately
         // after the last record it describes.
         if link.record_offset != running {
             return Err(Error::InvalidIndexSegment);
         }
-        running = push_scanned_entry(spec, &mut scanned, link, running)?;
+        running = push_scanned_entry(spec, &mut scanned, entries, link, running)?;
     }
     if running != file_len {
         return Err(Error::InvalidIndexSegment);
     }
-    let entries = scanned.entries;
     // Same single witness the scan carries, on the same shape of list
     // (PERF2-07): a chain is written by this crate but read from a file
     // anyone can hand over.
-    validate_unique_sequences(&entries)?;
+    validate_unique_sequences(entries)?;
     // The scan ends by cutting its list to the committed prefix, and the walk
     // must not hand back a list the scan would have cut. A chain that tiles the
     // whole append log without a commit marker in it is structurally perfect
@@ -13111,11 +13384,11 @@ fn walk_segment_chain(
     // path. Refusing routes it to the scan, which already knows how to truncate
     // and to report the empty index that goes with it.
     if spec.commit_policy.is_transaction_marker()
-        && committed_prefix_len(&entries) != Some(entries.len())
+        && committed_prefix_len(entries) != Some(entries.len())
     {
         return Err(Error::InvalidIndexSegment);
     }
-    Ok(ScannedIndex { entries, ..scanned })
+    Ok(scanned)
 }
 
 /// Appends one entry to an index under construction, charging the same limits
@@ -13123,6 +13396,7 @@ fn walk_segment_chain(
 fn push_scanned_entry(
     spec: FormatSpec,
     scanned: &mut ScannedIndex,
+    entries: &mut Vec<RecordIndexEntry>,
     entry: RecordIndexEntry,
     expected_offset: u64,
 ) -> Result<u64> {
@@ -13141,8 +13415,8 @@ fn push_scanned_entry(
     // disk.
     scanned.note(&entry, end);
     if record_is_resident(spec, entry.block_id) {
-        reserve_scanned_entry(spec, &mut scanned.entries)?;
-        scanned.entries.push(entry);
+        reserve_scanned_entry(spec, entries)?;
+        entries.push(entry);
     }
     Ok(end)
 }
@@ -13528,12 +13802,12 @@ fn scan_records_from(
     file: &mut File,
     header_len: u64,
     intent: ScanIntent,
+    entries: &mut Vec<RecordIndexEntry>,
 ) -> Result<ScannedIndex> {
     let file_len = file.metadata()?.len();
     let mut offset = header_len;
-    let mut entries = Vec::new();
+    entries.clear();
     let mut scanned = ScannedIndex {
-        entries: Vec::new(),
         sequence_high_water: None,
         sequence_high_water_at_commit: None,
         newest: HashMap::new(),
@@ -13613,7 +13887,7 @@ fn scan_records_from(
         scanned.note(&entry, offset);
         let resident = record_is_resident(spec, entry.block_id);
         if resident {
-            reserve_scanned_entry(spec, &mut entries)?;
+            reserve_scanned_entry(spec, entries)?;
         }
         if entry.block_id == INDEX_BLOCK_ID
             && (1..=INDEX_CHECKPOINT_VERSION).contains(&entry.block_version)
@@ -13636,22 +13910,20 @@ fn scan_records_from(
     // relies on this check and must not repeat it (PERF2-07). It runs on the
     // full scanned list, so the commit-boundary truncation below can only
     // shrink an already-validated set.
-    validate_unique_sequences(&entries)?;
+    validate_unique_sequences(entries)?;
     if spec.commit_policy.is_transaction_marker() {
-        let Some(committed) = committed_prefix_len(&entries) else {
+        let Some(committed) = committed_prefix_len(entries) else {
+            entries.clear();
             scanned.commit_boundary_applied(&[])?;
-            return Ok(ScannedIndex {
-                entries: Vec::new(),
-                ..scanned
-            });
+            return Ok(scanned);
         };
         entries.truncate(committed);
-        for entry in &mut entries {
+        for entry in entries.iter_mut() {
             entry.committed = true;
         }
-        scanned.commit_boundary_applied(&entries)?;
+        scanned.commit_boundary_applied(entries)?;
     }
-    Ok(ScannedIndex { entries, ..scanned })
+    Ok(scanned)
 }
 
 impl RecordIndexEntry {

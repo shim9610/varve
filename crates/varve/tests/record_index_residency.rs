@@ -56,9 +56,19 @@ std::thread_local! {
     /// measuring whichever test happened to be running beside this one.
     static LIVE_BYTES: Cell<isize> = const { Cell::new(0) };
     static PEAK_BYTES: Cell<isize> = const { Cell::new(0) };
+    /// Every byte this thread has ever asked for, never decremented. Live and
+    /// peak both go back down when a buffer is freed, so neither can tell "one
+    /// allocation reused ten times" from "ten allocations freed in turn" — and
+    /// that difference is exactly what a caller-supplied buffer buys.
+    static TOTAL_BYTES: Cell<isize> = const { Cell::new(0) };
+    static TOTAL_ALLOCS: Cell<isize> = const { Cell::new(0) };
 }
 
 fn record(delta: isize) {
+    if delta > 0 {
+        let _ = TOTAL_BYTES.try_with(|total| total.set(total.get() + delta));
+        let _ = TOTAL_ALLOCS.try_with(|count| count.set(count.get() + 1));
+    }
     let _ = LIVE_BYTES.try_with(|live| {
         let now = live.get() + delta;
         live.set(now);
@@ -97,6 +107,11 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+/// `(total bytes, total allocations)` this thread has ever requested.
+fn totals() -> (isize, isize) {
+    (TOTAL_BYTES.with(Cell::get), TOTAL_ALLOCS.with(Cell::get))
+}
 
 fn begin_window() -> isize {
     let baseline = LIVE_BYTES.with(Cell::get);
@@ -185,6 +200,74 @@ fn an_open_handle_keeps_a_record_directory_and_not_the_records() -> varve::Resul
          {large_peak} at {LARGE}). Today's 193.5 is the scan's `Vec` (177.5) plus the \
          directory built from it (16); this ceiling refuses a change that materialises the \
          entries a second time on top of that."
+    );
+    Ok(())
+}
+
+/// Opening `N` files through one caller-supplied buffer allocates the scan's
+/// entry array **once**, not `N` times.
+///
+/// This is the half of the owner's rule that live-bytes and peak-bytes cannot
+/// see. Both go back down when a buffer is freed, so a library that allocates
+/// and frees an `N`-entry array on every open measures the same as one that
+/// reuses the caller's. Cumulative bytes is the measurement that separates
+/// them, so this is the one the test makes.
+///
+/// It is deliberately *cumulative and unbounded*: `TOTAL_BYTES` is never
+/// decremented.
+#[test]
+fn opening_many_files_through_one_buffer_allocates_the_entry_array_once() -> varve::Result<()> {
+    const RECORDS: u32 = 20_000;
+    const OPENS: usize = 8;
+
+    let directory = tempfile::tempdir()?;
+    let path = path_in(&directory, "reused.idxres");
+    build(&path, RECORDS)?;
+    let spec = IndexResidencyFormat::spec();
+
+    // Warm the process before either measurement, so one-time state does not
+    // land in whichever ran first.
+    drop(varve::VarveFile::open_readonly(spec, &path)?);
+
+    let (bytes_before, allocs_before) = totals();
+    for _ in 0..OPENS {
+        drop(varve::VarveFile::open_readonly(spec, &path)?);
+    }
+    let (bytes_after, allocs_after) = totals();
+    let owned_bytes = bytes_after - bytes_before;
+    let owned_allocs = allocs_after - allocs_before;
+
+    let mut scratch = Vec::new();
+    let (bytes_before, allocs_before) = totals();
+    for _ in 0..OPENS {
+        drop(varve::VarveFile::open_readonly_with_scratch(
+            spec,
+            &path,
+            &mut scratch,
+        )?);
+    }
+    let (bytes_after, allocs_after) = totals();
+    let shared_bytes = bytes_after - bytes_before;
+    let shared_allocs = allocs_after - allocs_before;
+
+    // Measured 2026-08-05, Linux/ext4, 20,000 records, 8 opens:
+    //
+    //   open_readonly              29,824,680 B over 168 allocations
+    //   open_readonly_with_scratch  5,969,576 B over  70 allocations
+    //
+    // 5.00x fewer bytes and 2.4x fewer allocations. The difference,
+    // 23,855,104 B, is seven further copies of the entry array and its growth
+    // steps — 7 x 3,407,872 = 23,855,104 to the byte. The caller's buffer is
+    // grown once on the first open and reused by the other seven.
+    //
+    // The 5,969,576 B that remains on the shared path is that first growth plus
+    // everything an open does that is not the entry array. That part is
+    // unchanged and is not what this measures.
+    assert!(
+        shared_bytes * 2 < owned_bytes,
+        "reusing one buffer across {OPENS} opens allocated {shared_bytes} bytes against \
+         {owned_bytes} for the library-owned form ({shared_allocs} vs {owned_allocs} \
+         allocations). If these are close, the scan is no longer filling the caller's buffer."
     );
     Ok(())
 }
