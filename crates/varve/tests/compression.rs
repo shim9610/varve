@@ -279,6 +279,8 @@ fn record_explicit_variable_blocks_roundtrip_with_physical_scan() -> varve::Resu
         assert_eq!(fixed_entry.uncompressed_len_hint, 0);
         assert_eq!(
             file.scan()
+                .collect::<varve::Result<Vec<_>>>()?
+                .into_iter()
                 .find(|event| event.block_id == CompressibleBlock::ID)
                 .expect("event")
                 .payload_len,

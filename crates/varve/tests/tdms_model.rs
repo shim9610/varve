@@ -211,7 +211,10 @@ fn tdms_data_model_reader_writer_can_be_built_on_public_api() -> varve::Result<(
     );
 
     let raw_file = TdmsModelFormat::open_readonly(&path)?;
-    let segment_ids: Vec<_> = raw_file.scan().map(|event| event.block_id).collect();
+    let segment_ids = raw_file
+        .scan()
+        .map(|event| Ok(event?.block_id))
+        .collect::<varve::Result<Vec<_>>>()?;
     assert!(segment_ids.contains(&TdmsSegment::ID));
     assert!(segment_ids.contains(&TdmsObject::ID));
     assert!(segment_ids.contains(&TdmsProperty::ID));

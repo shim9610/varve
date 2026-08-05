@@ -691,7 +691,10 @@ fn compact_keyed_file_writes_only_final_keyed_state() -> varve::Result<()> {
     compact_keyed_file::<User, _>(TestFormat::spec(), &input, &output)?;
 
     let compacted = TestFormat::open_readonly(&output)?;
-    let record_ids: Vec<_> = compacted.scan().map(|event| event.block_id).collect();
+    let record_ids = compacted
+        .scan()
+        .map(|event| Ok(event?.block_id))
+        .collect::<varve::Result<Vec<_>>>()?;
     assert_eq!(record_ids, vec![User::ID, User::ID]);
     assert!(!record_ids.contains(&Point::ID));
     assert!(!record_ids.contains(&OP_BLOCK_ID));
@@ -770,7 +773,10 @@ fn compact_keyed_files_materializes_base_and_delta_shards() -> varve::Result<()>
     compact_keyed_files::<User, _>(TestFormat::spec(), &base, &[&delta], &output)?;
 
     let compacted = TestFormat::open_readonly(&output)?;
-    let record_ids: Vec<_> = compacted.scan().map(|event| event.block_id).collect();
+    let record_ids = compacted
+        .scan()
+        .map(|event| Ok(event?.block_id))
+        .collect::<varve::Result<Vec<_>>>()?;
     assert_eq!(record_ids, vec![User::ID, User::ID]);
     assert!(!record_ids.contains(&Point::ID));
     assert!(!record_ids.contains(&OP_BLOCK_ID));

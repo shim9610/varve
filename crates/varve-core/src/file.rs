@@ -393,13 +393,19 @@ pub(crate) mod replacement_target {
             index: &super::ResidentIndex,
             ordinal: usize,
         ) -> Result<Self> {
-            let position = index
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| entry.block_id == T::ID)
-                .nth(ordinal)
-                .map(|(position, _)| position)
-                .ok_or(Error::UnexpectedEof)?;
+            let mut found = None;
+            let mut matches_seen = 0usize;
+            for (candidate, entry) in index.iter().enumerate() {
+                if entry?.block_id != T::ID {
+                    continue;
+                }
+                if matches_seen == ordinal {
+                    found = Some(candidate);
+                    break;
+                }
+                matches_seen += 1;
+            }
+            let position = found.ok_or(Error::UnexpectedEof)?;
             let actual = index.entry_at(position)?.block_version;
             if actual != T::VERSION {
                 return Err(Error::BlockVersionMismatch {
@@ -777,10 +783,11 @@ use record_file::RecordFile;
 ///   mirror half cannot be moved below the authoritative write — that ordering
 ///   is now a signature, not a comment.
 ///
-/// What is deliberately *not* forbidden: reading the mirror (it derefs to a
-/// slice), mutating fields of an entry already in it
-/// ([`ResidentIndex::entry_mut`], used by the in-place replacement path to
-/// restamp a sequence and checksum), shrinking it
+/// What is deliberately *not* forbidden: reading the mirror
+/// ([`ResidentIndex::iter`], [`ResidentIndex::entry_at`]), restamping the
+/// sequence and checksum of an entry already in it
+/// ([`ResidentIndex::restamp`], used by the in-place replacement path),
+/// shrinking it
 /// ([`ResidentIndex::truncate`], the append rollback), and replacing a whole
 /// generation ([`ResidentIndex::adopt_generation`], the rewrite paths, which
 /// build their `Vec` with `try_reserve_exact` before the new file exists).
@@ -866,24 +873,45 @@ pub(crate) mod resident_index {
             self.entries.truncate(len);
         }
 
-        /// Mutable access to an entry that is already in the mirror, for the
-        /// in-place replacement path's sequence and checksum restamp. The
-        /// entry count cannot change through this handle.
-        pub(crate) fn entry_mut(&mut self, position: usize) -> &mut RecordIndexEntry {
-            &mut self.entries[position]
+        /// Restamps the sequence and checksum of an entry already in the
+        /// mirror, for the in-place replacement path.
+        ///
+        /// Narrower than the `&mut RecordIndexEntry` it replaced, and
+        /// deliberately: those are the only two fields the restamp changes, and
+        /// they are also the two the record's own header carries. A store that
+        /// rebuilds the entry from that header does not need this call at all,
+        /// so keeping it a named two-field operation is what makes its removal
+        /// a deletion rather than a rewrite.
+        pub(crate) fn restamp(&mut self, position: usize, sequence: u64, checksum: u32) {
+            let entry = &mut self.entries[position];
+            entry.sequence = sequence;
+            entry.checksum = checksum;
         }
     }
 
     impl ResidentIndex {
-        /// Entries in order.
+        /// Entries in order, each one fallible.
         ///
         /// A method and not a `Deref` to `[RecordIndexEntry]`. The slice
         /// contract said "every entry, contiguous, borrowed at once", which is
         /// the one shape a demand-filled index cannot produce — and it was
         /// implicit, so nothing had to ask for it deliberately. Every caller
         /// that genuinely needs the whole array now says so by name.
-        pub(crate) fn iter(&self) -> std::slice::Iter<'_, RecordIndexEntry> {
-            self.entries.iter()
+        ///
+        /// Owned and `Result`, not `&RecordIndexEntry`: an entry a store
+        /// produces on demand is not borrowed from anything, and producing it
+        /// reads a file. `RecordIndexEntry` is scalars only, so the owned item
+        /// is a memcpy and not an allocation.
+        /// Double-ended and exact-size because a store keyed by position is
+        /// both whatever it does to produce an entry: the reverse searches
+        /// (newest commit marker, newest checkpoint) and the segment encoder's
+        /// payload sizing both need it, and neither is a reason to keep the
+        /// entries themselves resident.
+        pub(crate) fn iter(
+            &self,
+        ) -> impl DoubleEndedIterator<Item = Result<RecordIndexEntry>> + ExactSizeIterator + '_
+        {
+            self.entries.iter().cloned().map(Ok)
         }
 
         pub(crate) fn len(&self) -> usize {
@@ -903,10 +931,47 @@ pub(crate) mod resident_index {
         /// unreachable today — but a demand-filled store can fail to produce an
         /// entry for reasons a slice index cannot, and a panicking `[i]` leaves
         /// nowhere to put that.
-        pub(crate) fn entry_at(&self, position: usize) -> crate::Result<&RecordIndexEntry> {
+        ///
+        /// Returns the entry by value for the same reason [`Self::iter`] does.
+        pub(crate) fn entry_at(&self, position: usize) -> crate::Result<RecordIndexEntry> {
             self.entries
                 .get(position)
+                .cloned()
                 .ok_or(crate::Error::UnexpectedEof)
+        }
+
+        /// Whether any entry carries `block_id`, searching forwards.
+        ///
+        /// Forwards on purpose, and not [`Self::last_entry_of_block`] with an
+        /// `is_some`: its one caller asks about the embedded manifest, which a
+        /// file writes once and early, so a forward search stops within the
+        /// first few entries while a backward one would walk the whole index
+        /// back to it. It runs on every commit.
+        pub(crate) fn contains_block(&self, block_id: u32) -> Result<bool> {
+            for entry in self.iter() {
+                if entry?.block_id == block_id {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
+        /// The newest entry carrying `block_id`, searching backwards.
+        ///
+        /// A named reverse search rather than `iter().rev().find(..)` at the
+        /// call sites, because the `?` on each produced entry has to live
+        /// somewhere and a `find` closure is not that somewhere.
+        pub(crate) fn last_entry_of_block(
+            &self,
+            block_id: u32,
+        ) -> Result<Option<RecordIndexEntry>> {
+            for entry in self.iter().rev() {
+                let entry = entry?;
+                if entry.block_id == block_id {
+                    return Ok(Some(entry));
+                }
+            }
+            Ok(None)
         }
 
         /// The whole array, borrowed contiguously.
@@ -2815,7 +2880,7 @@ impl VarveReader {
         self.file.materialized_keyed_blocks::<T>()
     }
 
-    pub fn scan(&self) -> impl Iterator<Item = BlockEvent> + '_ {
+    pub fn scan(&self) -> impl Iterator<Item = Result<BlockEvent>> + '_ {
         self.file.scan()
     }
 
@@ -3798,7 +3863,7 @@ impl VarveFile {
         let block_tails = index.block_tails();
         let index = index.entries;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
-        let derived = derive_index_state(index.iter(), false);
+        let derived = derive_index_state(infallible_entries(&index), false)?;
         let checkpoint_cadence = derived.checkpoint_cadence;
         let segment_cursor = derived.segment_cursor;
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
@@ -3874,7 +3939,7 @@ impl VarveFile {
         // must not be visible here either. Both facts belong to the scan.
         let logical_len = scanned.physical_end(append_start);
         let index = scanned.entries;
-        let derived = derive_index_state(index.iter(), false);
+        let derived = derive_index_state(infallible_entries(&index), false)?;
         let checkpoint_cadence = derived.checkpoint_cadence;
         let segment_cursor = derived.segment_cursor;
         let snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, logical_len)?;
@@ -3945,7 +4010,7 @@ impl VarveFile {
         let index = index.entries;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
         let recovered_len = file.metadata()?.len();
-        let derived = derive_index_state(index.iter(), false);
+        let derived = derive_index_state(infallible_entries(&index), false)?;
         let checkpoint_cadence = derived.checkpoint_cadence;
         let segment_cursor = derived.segment_cursor;
         let records_preserved = index.len();
@@ -4452,6 +4517,7 @@ impl VarveFile {
         let mut found = None;
         let mut budget = MaterializationBudget::new(self.spec);
         for (record_ordinal, entry) in self.index.iter().enumerate() {
+            let entry = entry?;
             if entry.block_id != METADATA_BLOCK_ID {
                 continue;
             }
@@ -4480,11 +4546,11 @@ impl VarveFile {
     pub fn all_metadata(&self) -> Result<Vec<(String, Vec<u8>)>> {
         let mut values = Vec::new();
         let mut budget = MaterializationBudget::new(self.spec);
-        for entry in self
-            .index
-            .iter()
-            .filter(|entry| entry.block_id == METADATA_BLOCK_ID)
-        {
+        for entry in self.index.iter() {
+            let entry = entry?;
+            if entry.block_id != METADATA_BLOCK_ID {
+                continue;
+            }
             let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
             budget.consume(logical_len)?;
             let payload = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
@@ -4498,16 +4564,20 @@ impl VarveFile {
     }
 
     pub fn schema_manifest(&self) -> Result<Option<SchemaManifest>> {
-        let Some(entry) = self
-            .index
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.block_id == MANIFEST_BLOCK_ID)
-            .max_by_key(|(record_ordinal, entry)| {
-                MergeOrder::for_record(0, entry.sequence, *record_ordinal)
-            })
-            .map(|(_, entry)| entry)
-        else {
+        let mut newest: Option<(MergeOrder, RecordIndexEntry)> = None;
+        for (record_ordinal, entry) in self.index.iter().enumerate() {
+            let entry = entry?;
+            if entry.block_id != MANIFEST_BLOCK_ID {
+                continue;
+            }
+            let order = MergeOrder::for_record(0, entry.sequence, record_ordinal);
+            // `>=`, not `>`: this replaced a `max_by_key`, which returns the
+            // *last* of several equal maxima.
+            if newest.as_ref().is_none_or(|(best, _)| order >= *best) {
+                newest = Some((order, entry));
+            }
+        }
+        let Some((_, entry)) = newest else {
             return Ok(None);
         };
         let mut budget = MaterializationBudget::new(self.spec);
@@ -4611,6 +4681,7 @@ impl VarveFile {
             // know and moves the append log out from under the index.
             write_native_file_header(&mut temp_file, self.spec, &self.header_extensions)?;
             for (position, source_entry) in self.index.iter().enumerate() {
+                let source_entry = source_entry?;
                 let mut updated = source_entry.clone();
                 let checkpoint_payload;
                 let payload = if position == target_position {
@@ -4631,7 +4702,7 @@ impl VarveFile {
                     let record_offset = temp_file.stream_position()?;
                     checkpoint_payload = encode_segment_payload(
                         self.spec,
-                        new_index[segment_start..].iter(),
+                        infallible_entries(&new_index[segment_start..]),
                         segment_covered_start.unwrap_or(rewrite_append_start),
                         u64::try_from(segment_start).map_err(|_| {
                             Error::ResourceArithmeticOverflow {
@@ -4996,9 +5067,7 @@ impl VarveFile {
             self.poison.poison();
             return Err(error);
         }
-        let entry = self.index.entry_mut(target_position);
-        entry.sequence = sequence;
-        entry.checksum = checksum;
+        self.index.restamp(target_position, sequence, checksum);
         self.publish_sequence(sequence);
         Ok(sequence)
     }
@@ -5064,6 +5133,7 @@ impl VarveFile {
             // know and moves the append log out from under the index.
             write_native_file_header(&mut temp_file, self.spec, &self.header_extensions)?;
             for (position, source_entry) in self.index.iter().enumerate() {
+                let source_entry = source_entry?;
                 let mut updated = source_entry.clone();
                 let checkpoint_payload;
                 let payload = if position == target_position {
@@ -5189,13 +5259,9 @@ impl VarveFile {
             self.write_index_checkpoint()?;
         }
         if !self.has_uncommitted_since_last_commit()
-            && let Some(entry) = self
-                .index
-                .iter()
-                .rev()
-                .find(|entry| entry.block_id == COMMIT_BLOCK_ID)
+            && let Some(entry) = self.index.last_entry_of_block(COMMIT_BLOCK_ID)?
         {
-            let info = AppendInfo::from(entry);
+            let info = AppendInfo::from(&entry);
             self.write_index_segment_if_needed();
             return Ok(info);
         }
@@ -5217,13 +5283,9 @@ impl VarveFile {
             self.write_index_checkpoint()?;
         }
         if !self.has_uncommitted_since_last_commit()
-            && let Some(entry) = self
-                .index
-                .iter()
-                .rev()
-                .find(|entry| entry.block_id == COMMIT_BLOCK_ID)
+            && let Some(entry) = self.index.last_entry_of_block(COMMIT_BLOCK_ID)?
         {
-            let info = AppendInfo::from(entry);
+            let info = AppendInfo::from(&entry);
             self.write_index_segment_if_needed();
             self.file.flush()?;
             self.file.sync_all()?;
@@ -5387,11 +5449,12 @@ impl VarveFile {
         crate::collections::ensure_resident_block::<T>(self.spec)?;
         // Filtered, so the count is not free: one pass to learn it, because
         // the charge and the reservation both have to happen before the copy.
-        let count = self
-            .index
-            .iter()
-            .filter(|entry| entry.block_id == T::ID)
-            .count();
+        let mut count = 0usize;
+        for entry in self.index.iter() {
+            if entry?.block_id == T::ID {
+                count += 1;
+            }
+        }
         let entries = clone_matching_entries(self.spec, &self.index, count, |entry| {
             entry.block_id == T::ID
         })?;
@@ -5412,11 +5475,11 @@ impl VarveFile {
         }
         let mut migrated = Vec::new();
         let mut budget = MaterializationBudget::new(self.spec);
-        for entry in self
-            .index
-            .iter()
-            .filter(|entry| entry.block_id == From::ID && entry.block_version == From::VERSION)
-        {
+        for entry in self.index.iter() {
+            let entry = entry?;
+            if entry.block_id != From::ID || entry.block_version != From::VERSION {
+                continue;
+            }
             let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
             budget.consume(logical_len)?;
             let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
@@ -5446,6 +5509,7 @@ impl VarveFile {
         let mut state: HashMap<T::Key, (MergeOrder, Option<RecordIndexEntry>)> = HashMap::new();
         let mut budget = MaterializationBudget::new(self.spec);
         for (record_ordinal, entry) in self.index.iter().enumerate() {
+            let entry = entry?;
             // One record's materialization at a time. Every decoded block is
             // dropped once its key is taken; what survives the loop is index
             // entries and keys, each charged as it is taken through
@@ -5555,8 +5619,19 @@ impl VarveFile {
         Ok(values)
     }
 
-    pub fn scan(&self) -> impl Iterator<Item = BlockEvent> + '_ {
-        self.index.iter().map(BlockEvent::from)
+    /// Every record's block identity and extent, in file order.
+    ///
+    /// **Each item is fallible, and the iterator is lazy.** Producing an event
+    /// means producing the index entry behind it, which is a read on a store
+    /// that does not keep them all in memory; the two ways to hide that are to
+    /// materialize the whole scan into a `Vec` first — the eager load this
+    /// exists not to do — or to swallow a read error as an early `None`, which
+    /// would report a truncated file as a short one. So the `Result` is here,
+    /// on each item, and nothing is read until the item is asked for.
+    pub fn scan(&self) -> impl Iterator<Item = Result<BlockEvent>> + '_ {
+        self.index
+            .iter()
+            .map(|entry| entry.map(|entry| BlockEvent::from(&entry)))
     }
 
     /// Verifies every record's stored checksum against its bytes.
@@ -5610,6 +5685,7 @@ impl VarveFile {
         }
         let mut verified = 0usize;
         for entry in self.index.iter() {
+            let entry = entry?;
             // `read_payload_snapshot` is the same check the read path performs,
             // which is exactly the point: there is one verification in the
             // crate, and this method chooses when it runs rather than adding a
@@ -5684,7 +5760,9 @@ impl VarveFile {
                 resource: "index entry snapshot",
                 requested,
             })?;
-        out.extend(self.index.iter().cloned());
+        for entry in self.index.iter() {
+            out.push(entry?);
+        }
         Ok(())
     }
 
@@ -5733,6 +5811,7 @@ impl VarveFile {
         let mut tails: HashMap<T::Key, (MergeOrder, u64)> = HashMap::new();
         let mut budget = MaterializationBudget::new(self.spec);
         for (record_ordinal, entry) in self.index.iter().enumerate() {
+            let entry = entry?;
             // One record's materialization at a time (see
             // `MaterializationBudget`). Every decoded block is dropped once its
             // key is taken, so the peak here is one payload however many
@@ -6357,11 +6436,11 @@ impl VarveFile {
     /// `RecordPayloadLen`; the decode below treats it as the wall.
     fn build_chunk_directory(&self) -> Result<ChunkDirectory> {
         let mut chunks = Vec::new();
-        for entry in self
-            .index
-            .iter()
-            .filter(|entry| entry.block_id == MATRIX_CHUNK_BLOCK_ID)
-        {
+        for entry in self.index.iter() {
+            let entry = entry?;
+            if entry.block_id != MATRIX_CHUNK_BLOCK_ID {
+                continue;
+            }
             let prefix = self.read_chunk_prefix(entry.record_offset, entry.payload_len)?;
             // `rows` and `first_row` were decoded and thrown away by every
             // caller, and the row width was taken from the record's `cells`
@@ -7861,16 +7940,6 @@ impl VarveFile {
                 len: mapped_len,
             });
         }
-        // **One validation pass, against the stronger bound.** This used to
-        // walk every entry against `current_len`, map the file, then walk every
-        // entry again against `mapped_len`. `mapped_len <= current_len` is
-        // enforced immediately above, so the second bound implies the first:
-        // one pass against `mapped_len` is both the stronger check and the
-        // earlier one, and it fails before the mapping is taken rather than
-        // after.
-        for entry in self.index.iter() {
-            validate_mmap_index_entry(entry, mapped_len)?;
-        }
         let map_len =
             usize::try_from(mapped_len).map_err(|_| Error::LengthOverflow { value: mapped_len })?;
         // SAFETY: The caller guarantees that the cloned backing object remains
@@ -7894,24 +7963,36 @@ impl VarveFile {
                 resource: "mmap block lookup",
                 requested: mmap_index_bytes,
             })?;
-        // **One build pass.** The copy, the per-block position lists and the
-        // ordering witness were three separate walks of the same entries; they
-        // are one now. The ordering check in particular was a `windows(2)` over
-        // the finished copy, which is a whole extra traversal in debug builds to
-        // learn something each step already knows.
+        // **One pass, and it is now the only one.** The bounds validation, the
+        // copy, the per-block position lists and the ordering witness were four
+        // separate walks of the same entries. The ordering check in particular
+        // was a `windows(2)` over the finished copy, which is a whole extra
+        // traversal in debug builds to learn something each step already knows.
+        //
+        // What moved, and what it costs: validation used to run before the
+        // mapping was taken. It now runs after, so a file with an out-of-bounds
+        // entry pays one `mmap`/`munmap` before its refusal — the mapping is
+        // dropped by the `?` and nothing has read through it, since
+        // `MmapPayloads` is not constructed until the loop finishes. That is
+        // the whole price, and it buys one traversal instead of two on the
+        // path that succeeds. `mapped_len <= current_len` is still checked
+        // before the map, so the map itself is never oversized.
         //
         // Records occupy contiguous ascending physical extents, so the copied
         // index is strictly offset-ordered; `payload_window` relies on that for
         // its binary-search membership check (PERF2-07).
         let mut previous_offset: Option<u64> = None;
         for (position, entry) in self.index.iter().enumerate() {
+            let entry = entry?;
+            validate_mmap_index_entry(&entry, mapped_len)?;
             debug_assert!(
                 previous_offset.is_none_or(|previous| previous < entry.record_offset),
                 "resident index must be strictly ordered by record offset",
             );
             previous_offset = Some(entry.record_offset);
-            index.push(entry.clone());
-            let positions = by_block.entry(entry.block_id).or_default();
+            let block_id = entry.block_id;
+            index.push(entry);
+            let positions = by_block.entry(block_id).or_default();
             positions
                 .try_reserve(1)
                 .map_err(|_| Error::AllocationFailed {
@@ -8072,7 +8153,7 @@ impl VarveFile {
                 // flush-cadence state once for the new generation (PERF2-02)
                 // and the O(1) block tails with it (PERF2-05). Record offsets
                 // moved, so every cached generic keyed tail is stale (API2-05).
-                let derived = derive_index_state(self.index.iter(), true);
+                let derived = derive_index_state(self.index.iter(), true)?;
                 self.checkpoint_cadence = derived.checkpoint_cadence;
                 self.block_tails = derived.block_tails.expect("tails were requested");
                 self.segment_cursor = derived.segment_cursor;
@@ -8120,7 +8201,7 @@ impl VarveFile {
                 // flush-cadence state once for the new generation (PERF2-02)
                 // and the O(1) block tails with it (PERF2-05). Record offsets
                 // moved, so every cached generic keyed tail is stale (API2-05).
-                let derived = derive_index_state(self.index.iter(), true);
+                let derived = derive_index_state(self.index.iter(), true)?;
                 self.checkpoint_cadence = derived.checkpoint_cadence;
                 self.block_tails = derived.block_tails.expect("tails were requested");
                 self.segment_cursor = derived.segment_cursor;
@@ -8668,7 +8749,8 @@ impl VarveFile {
         payload.extend_from_slice(&covered_offset.to_le_bytes());
         payload.extend_from_slice(&entry_count.to_le_bytes());
         for entry in self.index.iter() {
-            push_index_entry_bytes(&mut payload, entry, entry.committed);
+            let entry = entry?;
+            push_index_entry_bytes(&mut payload, &entry, entry.committed);
         }
         self.write_record(INDEX_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, &payload)
     }
@@ -8754,10 +8836,7 @@ impl VarveFile {
 
     fn write_embedded_manifest_if_needed(&mut self) -> Result<()> {
         if self.spec.manifest_policy != ManifestPolicy::Embedded
-            || self
-                .index
-                .iter()
-                .any(|entry| entry.block_id == MANIFEST_BLOCK_ID)
+            || self.index.contains_block(MANIFEST_BLOCK_ID)?
         {
             return Ok(());
         }
@@ -9456,9 +9535,9 @@ fn segment_payload_len(count: u64) -> Result<u64> {
 /// `ExactSizeIterator` because the payload length is charged and reserved
 /// before the first entry is written — the count has to be known, and a
 /// `skip(start)` over the index knows it without the index being a slice.
-fn encode_segment_payload<'a>(
+fn encode_segment_payload(
     spec: FormatSpec,
-    entries: impl ExactSizeIterator<Item = &'a RecordIndexEntry>,
+    entries: impl ExactSizeIterator<Item = Result<RecordIndexEntry>>,
     covered_start: u64,
     preceding_records: u64,
     record_offset: u64,
@@ -9492,7 +9571,7 @@ fn encode_segment_payload<'a>(
         // so this is not the writer's live `committed` bit - which stays false
         // for a data record under a marker policy - but what a scan of these
         // same bytes reports. The two open paths must agree entry for entry.
-        push_index_entry_bytes(&mut payload, entry, true);
+        push_index_entry_bytes(&mut payload, &entry?, true);
     }
     payload.extend_from_slice(&record_offset.to_le_bytes());
     Ok(payload)
@@ -10688,15 +10767,13 @@ where
         u64::try_from(file.index.len()).map_err(|_| Error::ResourceArithmeticOverflow {
             resource: "record count",
         })?;
-    let key_bearing = file
-        .index
-        .iter()
-        .filter(|entry| {
-            entry.block_id == T::ID
-                || entry.block_id == TOMBSTONE_BLOCK_ID
-                || entry.block_id == OP_BLOCK_ID
-        })
-        .count();
+    let mut key_bearing = 0usize;
+    for entry in file.index.iter() {
+        let block_id = entry?.block_id;
+        if block_id == T::ID || block_id == TOMBSTONE_BLOCK_ID || block_id == OP_BLOCK_ID {
+            key_bearing += 1;
+        }
+    }
     let key_bearing =
         u64::try_from(key_bearing).map_err(|_| Error::ResourceArithmeticOverflow {
             resource: "record count",
@@ -11054,6 +11131,7 @@ where
     T::Key: Eq + Hash,
 {
     for (record_ordinal, entry) in entries.iter().enumerate() {
+        let entry = entry?;
         let order = MergeOrder::for_record(shard.ordinal, entry.sequence, record_ordinal);
         match entry.block_id {
             id if id == T::ID => {
@@ -13747,7 +13825,12 @@ where
             resource: "block index",
             requested,
         })?;
-    entries.extend(source.iter().filter(|entry| matches(entry)).cloned());
+    for entry in source.iter() {
+        let entry = entry?;
+        if matches(&entry) {
+            entries.push(entry);
+        }
+    }
     debug_assert_eq!(
         entries.len(),
         count,
@@ -13781,10 +13864,10 @@ struct DerivedIndexState {
 /// Each field is still computed by exactly the rule its own `from_index`
 /// states, so the invariants those doc comments assert are unchanged. The unit
 /// tests below compare this against all three.
-fn derive_index_state<'a>(
-    entries: impl Iterator<Item = &'a RecordIndexEntry>,
+fn derive_index_state(
+    entries: impl Iterator<Item = Result<RecordIndexEntry>>,
     with_tails: bool,
-) -> DerivedIndexState {
+) -> Result<DerivedIndexState> {
     let mut touched: u64 = 0;
     let mut newest: HashMap<u32, u64> = HashMap::new();
     // Position of, and entry at, the newest record of each kind the derived
@@ -13796,6 +13879,7 @@ fn derive_index_state<'a>(
     // used to accumulate.
     let mut eligible: usize = 0;
     for (position, entry) in entries.enumerate() {
+        let entry = entry?;
         touched = touched.saturating_add(1);
         if with_tails {
             newest.insert(entry.block_id, entry.record_offset);
@@ -13831,7 +13915,18 @@ fn derive_index_state<'a>(
         note_block_tail_index_touches(touched);
     }
     note_checkpoint_cadence_index_touches(touched);
-    state
+    Ok(state)
+}
+
+/// Borrowed entries as the fallible stream [`derive_index_state`] consumes.
+///
+/// The open paths still hold a plain `Vec` at the point they derive from it —
+/// they built it moments earlier — so their entries cannot fail to be produced.
+/// This says that in one place instead of at each call site.
+fn infallible_entries(
+    entries: &[RecordIndexEntry],
+) -> impl DoubleEndedIterator<Item = Result<RecordIndexEntry>> + ExactSizeIterator + '_ {
+    entries.iter().cloned().map(Ok)
 }
 
 fn read_record_header(file: &mut File, _spec: FormatSpec, offset: u64) -> Result<RecordIndexEntry> {
@@ -15961,7 +16056,8 @@ mod tests {
         ];
 
         for (name, index) in shapes {
-            let derived = derive_index_state(index.iter(), true);
+            let derived = derive_index_state(infallible_entries(&index), true)
+                .expect("borrowed entries cannot fail");
             let cadence = CheckpointCadence::from_index(&index);
             assert_eq!(
                 derived.checkpoint_cadence.eligible_since_checkpoint,
@@ -17770,7 +17866,7 @@ mod tests {
 /// Retained on purpose, with the reason at the declaration: `ResidentIndex::
 /// adopt_generation` (open and the rewrite paths hand over a `Vec` that already
 /// describes records on disk), `ResidentIndex::truncate` (the append rollback)
-/// and `ResidentIndex::entry_mut` (the in-place restamp). None of them can add
+/// and `ResidentIndex::restamp` (the in-place restamp). None of them can add
 /// an entry the disk does not have, which is the property the token protects.
 #[cfg(test)]
 mod bypass_catalogue {

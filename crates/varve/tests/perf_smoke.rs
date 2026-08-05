@@ -510,7 +510,10 @@ fn append_open_and_scan(case: PerfCase) -> varve::Result<()> {
 
     let elapsed = timed(|| {
         let file = PerfFormat::open_readonly(&path)?;
-        assert_eq!(file.scan().count(), case.records);
+        assert_eq!(
+            file.scan().collect::<varve::Result<Vec<_>>>()?.len(),
+            case.records
+        );
         let points = file.blocks::<PerfPoint>()?;
         assert_eq!(points.len(), case.records);
         assert_eq!(
@@ -658,7 +661,10 @@ fn compressed_variable_blocks(case: PerfCase) -> varve::Result<()> {
 
     let elapsed = timed(|| {
         let file = PerfCompressedFormat::open_readonly(&path)?;
-        assert_eq!(file.scan().count(), case.records);
+        assert_eq!(
+            file.scan().collect::<varve::Result<Vec<_>>>()?.len(),
+            case.records
+        );
         let users = file.blocks::<PerfUser>()?;
         assert_eq!(users.len(), case.records);
         assert_eq!(

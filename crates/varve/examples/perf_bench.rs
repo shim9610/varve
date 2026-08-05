@@ -134,7 +134,10 @@ fn append_open_scan_bench(records: usize) -> varve::Result<()> {
 
     let elapsed = timed(|| {
         let file = BenchFormat::open_readonly(&path)?;
-        assert_eq!(file.scan().count(), records + 2);
+        assert_eq!(
+            file.scan().collect::<varve::Result<Vec<_>>>()?.len(),
+            records + 2
+        );
         assert_eq!(file.blocks::<BenchPoint>()?.len(), records);
         Ok(())
     })?;
