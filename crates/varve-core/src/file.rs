@@ -11802,6 +11802,7 @@ pub(crate) struct PreparedStreamRecord {
     pub(crate) checksum: u32,
 }
 
+#[cfg(feature = "high-cardinality-dev")]
 /// What [`prepare_stream_record_into`] knows about the record it just appended
 /// to the caller's buffer.
 ///
@@ -11817,6 +11818,7 @@ pub(crate) struct PreparedRecordParts {
     pub(crate) checksum: u32,
 }
 
+#[cfg(feature = "high-cardinality-dev")]
 impl PreparedStreamRecord {
     /// The same record described as [`PreparedRecordParts`], for the callers
     /// that still take the owning form.
@@ -11835,6 +11837,7 @@ impl PreparedStreamRecord {
 /// The owning form, for the callers that want a record and nothing else: the
 /// creation nonce, the manifest, a tombstone, the probe. None of them is a hot
 /// path, and each allocates exactly the buffer it hands back.
+#[cfg(feature = "high-cardinality-dev")]
 #[allow(clippy::too_many_arguments)]
 fn prepare_stream_record(
     spec: FormatSpec,

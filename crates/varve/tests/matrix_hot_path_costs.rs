@@ -427,16 +427,24 @@ fn a_bitmap_byte_that_does_not_change_hashes_no_page() -> varve::Result<()> {
 /// `commit_cell` has two reasons to re-read the slot it is committing:
 ///
 /// 1. the **zero probe**, which separates "never written" from "written zeros"
-///    — already skipped for a cell this session wrote, on the session
+///    — skipped entirely for a cell this session wrote, on the session
 ///    write-tracking bit; and
-/// 2. the **checksum pass**, which is how the cell's CRC is recorded, and which
-///    is *not* skipped for such a cell.
+/// 2. the **checksum pass**, which is how the cell's CRC is recorded.
 ///
-/// So a write-then-commit pair reads the slot back once, and a commit of a cell
-/// this session did not write reads it back twice. Both numbers are here
-/// because the second half of that is the part still to do: `write_cell` holds
-/// the payload and could hand its checksum forward, and does not. Pinning it
-/// means the remaining work is a number that moves rather than a claim.
+/// They used to be two independent seek-and-stream passes over the same bytes,
+/// so a commit of a cell this session did not write read the slot back twice.
+/// `scan_slot` answers both in one pass — it hashes and tracks all-zero over
+/// the same buffer — so both cases now read the slot exactly once. Measured
+/// before the fusion on this fixture: 256 bytes for the other-session case
+/// against 128 now.
+///
+/// The refusal still happens before any commit state is prepared, so a slot
+/// about to be refused never has a CRC written for it — the ordering the
+/// separate probe used to give for free.
+///
+/// What remains, and is not this: `write_cell` holds the payload and could hand
+/// its checksum forward, so a cell this session wrote need not be read back at
+/// all. That is the 128 below, and it is still there.
 ///
 /// The read-back is per *slot*, so it scales with `SLOT_STRIDE` and not with the
 /// cell count — which is why the assertions below are written as multiples of
@@ -487,10 +495,17 @@ fn committing_a_cell_reads_its_slot_back_once_per_pass_that_needs_it() -> varve:
          skipped on the session write bit, so this must be the checksum pass alone"
     );
     assert_eq!(
+        other_session, same_session,
+        "a cell this session did not write was read back {other_session} bytes against \
+         {same_session} for one it did; the zero probe and the checksum pass read the same \
+         slot and must do it in one pass, not two"
+    );
+    assert_eq!(
         other_session,
-        CELLS * STRIDE * 2,
-        "a cell this session did not write was read back {other_session} bytes; both the \
-         zero probe and the checksum pass have to run"
+        CELLS * STRIDE,
+        "a cell this session did not write was read back {other_session} bytes; one pass over \
+         {CELLS} slots of {STRIDE} bytes is {}, and it was twice that before the fusion",
+        CELLS * STRIDE
     );
     Ok(())
 }

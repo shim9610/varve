@@ -4866,12 +4866,27 @@ pub(crate) fn commit_cell<T: VarveMatrixBlock>(
     let block_index = layout.block_index(&allowed, T::ID)?;
     let ordinal = layout.ordinal_for_block(block_index, key)?;
     let written_this_session = layout.blocks[block_index].current_write_bits.get(ordinal)?;
-    if !written_this_session && slot_is_all_zero(layout, file, block_index, ordinal)? {
-        return Err(Error::MatrixCellNotWritten);
-    }
+    // One pass, not two. The zero probe and the checksum pass read the same
+    // slot, and this used to seek and stream it once for each. `scan_slot`
+    // answers both, so a cell this session did not write costs its stride once
+    // instead of twice — and the refusal below still happens before any commit
+    // state is prepared, so a slot about to be refused never has a CRC written
+    // for it.
+    let scanned = if written_this_session {
+        None
+    } else {
+        let scanned = scan_slot(layout, file, block_index, ordinal)?;
+        if scanned.all_zero {
+            return Err(Error::MatrixCellNotWritten);
+        }
+        Some(scanned)
+    };
     let crc_valid_update = prepare_cell_crc_valid(layout, block_index, ordinal, true)?;
     let (commit_index, commit_update) = prepare_cell_commit(layout, T::CATEGORY, ordinal, true)?;
-    update_cell_crc(layout, file, block_index, ordinal)?;
+    match scanned {
+        Some(scanned) => write_cell_crc(layout, file, block_index, ordinal, scanned.crc)?,
+        None => update_cell_crc(layout, file, block_index, ordinal)?,
+    }
     if let Some(update) = crc_valid_update {
         apply_cell_crc_valid(layout, file, block_index, update)?;
     }
@@ -6890,6 +6905,23 @@ fn write_commit_map_pages(
     Ok(())
 }
 
+/// Records a checksum the caller already computed over the slot's bytes.
+///
+/// Takes the value rather than re-reading, so a caller that has just streamed
+/// the slot for another reason pays for those bytes once.
+fn write_cell_crc(
+    layout: &MatrixLayout,
+    file: &mut File,
+    block_index: usize,
+    ordinal: u64,
+    crc: u32,
+) -> Result<()> {
+    let Some(crc_offset) = layout.blocks[block_index].crc_offset else {
+        return Ok(());
+    };
+    write_crc_at(file, indexed_crc_offset(crc_offset, ordinal)?, crc)
+}
+
 fn update_cell_crc(
     layout: &MatrixLayout,
     file: &mut File,
@@ -7074,36 +7106,98 @@ const fn slot_chunk_len(stride: u64) -> usize {
     }
 }
 
-fn slot_is_all_zero(
+/// What one pass over a slot can answer: its checksum, and whether every byte
+/// of it was zero.
+///
+/// `commit_cell` needs both — the zero probe separates "never written" from
+/// "written zeros", and the checksum is what it records — and used to take
+/// them in two independent seek-and-stream passes over the same bytes.
+#[derive(Clone, Copy, Debug)]
+struct SlotScan {
+    crc: u32,
+    all_zero: bool,
+}
+
+/// Reads a slot once and answers both questions.
+///
+/// The CRC is computed unconditionally rather than only when the slot proves
+/// non-zero: the bytes are in the buffer either way, `crc32` over them costs no
+/// I/O, and computing it here is what lets the caller skip the second pass. A
+/// caller that goes on to refuse the cell simply drops the value.
+#[cfg(feature = "integrity")]
+fn scan_slot(
     layout: &MatrixLayout,
     file: &mut File,
     block_index: usize,
     ordinal: u64,
-) -> Result<bool> {
+) -> Result<SlotScan> {
     let offset = layout.slot_offset(block_index, ordinal)?;
     let stride = layout.blocks[block_index].slot_stride;
     file.seek(SeekFrom::Start(offset))?;
     if slot_chunk_len(stride) == NARROW_SLOT_BYTES {
         let mut buffer = [0u8; NARROW_SLOT_BYTES];
-        read_is_all_zero(file, &mut buffer, stride)
+        read_slot_scan(file, &mut buffer, stride)
     } else {
         let mut buffer = [0u8; WIDE_SLOT_BYTES];
-        read_is_all_zero(file, &mut buffer, stride)
+        read_slot_scan(file, &mut buffer, stride)
     }
 }
 
-fn read_is_all_zero(file: &mut File, buffer: &mut [u8], mut remaining: u64) -> Result<bool> {
+#[cfg(feature = "integrity")]
+fn read_slot_scan(file: &mut File, buffer: &mut [u8], mut remaining: u64) -> Result<SlotScan> {
+    let mut hasher = crc32fast::Hasher::new();
+    let mut all_zero = true;
     while remaining != 0 {
         let chunk_len = usize::try_from(remaining.min(buffer.len() as u64))
             .map_err(|_| Error::LengthOverflow { value: remaining })?;
         file.read_exact(&mut buffer[..chunk_len])?;
         count_slot_bytes_read_back(chunk_len as u64);
-        if buffer[..chunk_len].iter().any(|byte| *byte != 0) {
-            return Ok(false);
-        }
+        let chunk = &buffer[..chunk_len];
+        hasher.update(chunk);
+        // Not short-circuited: the CRC needs every byte, so there is nothing to
+        // gain by stopping early and the flag would then be undefined.
+        all_zero &= chunk.iter().all(|byte| *byte == 0);
         remaining -= chunk_len as u64;
     }
-    Ok(true)
+    Ok(SlotScan {
+        crc: hasher.finalize(),
+        all_zero,
+    })
+}
+
+/// The same single pass where the format carries no checksums: there is no CRC
+/// to take, so the scan answers only the question `commit_cell` still has.
+#[cfg(not(feature = "integrity"))]
+fn scan_slot(
+    layout: &MatrixLayout,
+    file: &mut File,
+    block_index: usize,
+    ordinal: u64,
+) -> Result<SlotScan> {
+    let offset = layout.slot_offset(block_index, ordinal)?;
+    let stride = layout.blocks[block_index].slot_stride;
+    file.seek(SeekFrom::Start(offset))?;
+    if slot_chunk_len(stride) == NARROW_SLOT_BYTES {
+        let mut buffer = [0u8; NARROW_SLOT_BYTES];
+        read_slot_scan(file, &mut buffer, stride)
+    } else {
+        let mut buffer = [0u8; WIDE_SLOT_BYTES];
+        read_slot_scan(file, &mut buffer, stride)
+    }
+}
+
+#[cfg(not(feature = "integrity"))]
+fn read_slot_scan(file: &mut File, buffer: &mut [u8], mut remaining: u64) -> Result<SlotScan> {
+    let mut all_zero = true;
+    while remaining != 0 {
+        let chunk_len = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| Error::LengthOverflow { value: remaining })?;
+        file.read_exact(&mut buffer[..chunk_len])?;
+        count_slot_bytes_read_back(chunk_len as u64);
+        all_zero &= buffer[..chunk_len].iter().all(|byte| *byte == 0);
+        remaining -= chunk_len as u64;
+    }
+    Ok(SlotScan { crc: 0, all_zero })
 }
 
 #[cfg(feature = "integrity")]
