@@ -8966,7 +8966,8 @@ fn validate_generation_file_inner(
                     append_start,
                     file_len,
                     &actual,
-                    &expected_entries[..position],
+                    position,
+                    expected_entries.iter().take(position),
                 )?;
                 let checkpoint = decode_index_checkpoint(spec, &payload, file_len)?;
                 validate_index_checkpoint(
@@ -8974,7 +8975,8 @@ fn validate_generation_file_inner(
                     file_len,
                     &actual,
                     &checkpoint,
-                    &expected_entries[..position],
+                    position,
+                    expected_entries.iter().take(position),
                 )?;
             }
         }
@@ -13013,13 +13015,14 @@ fn check_index_checkpoint_limits(spec: FormatSpec, prefix: &[u8]) -> Result<()> 
     )
 }
 
-fn inspect_index_checkpoint(
+fn inspect_index_checkpoint<'a>(
     spec: FormatSpec,
     payload: &[u8],
     header_len: u64,
     file_len: u64,
     checkpoint_record: &RecordIndexEntry,
-    observed_prefix: &[RecordIndexEntry],
+    observed_prefix_len: usize,
+    observed_prefix: impl Iterator<Item = &'a RecordIndexEntry>,
 ) -> Result<()> {
     match decode_index_checkpoint(spec, payload, file_len) {
         Ok(checkpoint) => {
@@ -13028,6 +13031,7 @@ fn inspect_index_checkpoint(
                 file_len,
                 checkpoint_record,
                 &checkpoint,
+                observed_prefix_len,
                 observed_prefix,
             );
             Ok(())
@@ -13105,12 +13109,13 @@ fn read_index_entry_payload(payload: &[u8], checkpoint_version: u16) -> RecordIn
     }
 }
 
-fn validate_index_checkpoint(
+fn validate_index_checkpoint<'a>(
     header_len: u64,
     file_len: u64,
     checkpoint_record: &RecordIndexEntry,
     checkpoint: &IndexCheckpoint,
-    observed_prefix: &[RecordIndexEntry],
+    observed_prefix_len: usize,
+    observed_prefix: impl Iterator<Item = &'a RecordIndexEntry>,
 ) -> Result<()> {
     if checkpoint.covered_offset != checkpoint_record.record_offset
         || checkpoint.covered_offset < header_len
@@ -13118,7 +13123,7 @@ fn validate_index_checkpoint(
     {
         return Err(Error::InvalidIndexCheckpoint);
     }
-    if checkpoint.entries.len() != observed_prefix.len()
+    if checkpoint.entries.len() != observed_prefix_len
         || !checkpoint.entries.iter().zip(observed_prefix).all(
             |(checkpoint_entry, observed_entry)| {
                 record_headers_match(checkpoint_entry, observed_entry)
@@ -15878,7 +15883,8 @@ mod tests {
                 record.physical_end(),
                 &record,
                 &contiguous,
-                &contiguous.entries,
+                contiguous.entries.len(),
+                contiguous.entries.iter(),
             )
             .is_ok(),
             "a checkpoint that tiles its coverage must still validate",
@@ -15897,7 +15903,8 @@ mod tests {
                 record.physical_end(),
                 &record,
                 &with_gap,
-                &with_gap.entries,
+                with_gap.entries.len(),
+                with_gap.entries.iter(),
             ),
             Err(Error::InvalidIndexCheckpoint),
         ));
@@ -15923,7 +15930,8 @@ mod tests {
                 record.physical_end(),
                 &record,
                 &short,
-                &short.entries,
+                short.entries.len(),
+                short.entries.iter(),
             ),
             Err(Error::InvalidIndexCheckpoint),
         ));
