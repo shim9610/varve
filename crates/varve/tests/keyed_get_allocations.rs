@@ -291,3 +291,60 @@ fn staging_a_record_for_append_does_not_allocate_per_record() -> varve::Result<(
     }
     Ok(())
 }
+
+/// **The cost.** A run of scalable appends issues no metadata syscall per
+/// record.
+///
+/// `SnapshotFile::with_len` ran an `fstat` to learn the file's physical length
+/// — the very fact a `write_all` that just returned `Ok` proves. The scalable
+/// append path now rebinds through `with_written_len`, which takes that proof
+/// as an argument, exactly as the non-scalable path already did.
+///
+/// **The seek is still there, deliberately.** The other half of the plan's
+/// entry was to shadow the file's offset and skip the `seek` before each
+/// write, on the reasoning that a successful write of `bytes` from `eof`
+/// leaves the offset at `eof + bytes.len()`, which is the next record's `eof`.
+/// Measured against the real offset on this fixture, the shadow was wrong on
+/// **every** append, by exactly 16 bytes each time: this handle is not the only
+/// writer to the native file, and the other one does not move this handle's
+/// offset. Skipping the seek wrote each record 16 bytes early and the file came
+/// out short — `NativeTooShort { required: 14542, actual: 14526 }`. The seek is
+/// what makes the append independent of that, and it stays until the second
+/// writer is part of the accounting.
+#[test]
+fn a_run_of_scalable_appends_pays_no_per_record_metadata_syscall() -> varve::Result<()> {
+    const N: u32 = 200;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("appends.varve");
+    let mut writer = ScalarKeyFormat::create_indexed_writer(&path, options())?;
+
+    // Open and the first record are not what this measures: open binds a
+    // snapshot, and the first append is the one that has to find the eof.
+    writer.push_row(&Row { id: 0, value: 0 })?;
+    let _ = varve::VarveFile::take_snapshot_bounds_fstats();
+
+    for id in 1..=N {
+        writer.push_row(&Row { id, value: id })?;
+    }
+    let fstats = varve::VarveFile::take_snapshot_bounds_fstats();
+    println!("(append syscalls) {N} records: snapshot fstats={fstats}");
+    assert_eq!(
+        fstats, 0,
+        "{N} appends ran {fstats} snapshot fstats; the write that returned Ok is the proof \
+         they were issued to obtain"
+    );
+
+    // Every record readable at its own key, which is what a snapshot bound to
+    // the wrong length would break.
+    writer.sync()?;
+    drop(writer);
+    let reader = ScalarKeyFormat::open_indexed_reader(&path, options())?;
+    for id in 0..=N {
+        assert_eq!(
+            reader.get_row(&id)?.expect("record present").value,
+            id,
+            "record {id} did not survive the witness-bound snapshot"
+        );
+    }
+    Ok(())
+}

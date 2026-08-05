@@ -19,6 +19,7 @@ use crate::file::{
     read_stream_creation_nonce, write_file_header,
 };
 use crate::scan_control::{ScanCancelled, ScanProgressDriver};
+use crate::snapshot::WrittenThrough;
 use crate::traits::KeyedBlockContract;
 use crate::{
     AppendInfo, BlockEvent, BlockKind, CREATION_NONCE_BLOCK_ID, CommitPolicy, Error, FormatSpec,
@@ -1305,6 +1306,12 @@ impl VarveStreamWriter {
                 resource: "file length",
             })?;
         self.reserve_state_chunk(&permit, records.len())?;
+        // Not shadowed, and that is a measurement rather than an oversight.
+        // Skipping this seek on the reasoning that the previous write left the
+        // offset at `eof` was wrong on every append of a 200-record run, by
+        // exactly 16 bytes each time: this handle is not the only writer to the
+        // native file, and the other one does not move this handle's offset.
+        // The records landed 16 bytes early and the file came out short.
         self.file.seek(SeekFrom::Start(eof))?;
         // Round 12, F-05: an armed fault makes the write fail *and* its
         // rollback fail, which is the pair that poisons the writer below.
@@ -1345,7 +1352,12 @@ impl VarveStreamWriter {
             }
             return Err(error.into());
         }
-        self.snapshot = match self.snapshot.with_len(new_eof) {
+        // The write returned `Ok`, which is proof the file reaches `new_eof` —
+        // the fact `with_len`'s `fstat` was issued to learn.
+        self.snapshot = match self
+            .snapshot
+            .with_written_len(WrittenThrough::after_write(new_eof))
+        {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 let truncate_result = self.file.set_len(eof);
