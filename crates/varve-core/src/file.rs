@@ -789,7 +789,6 @@ use record_file::RecordFile;
 /// that do not scan. Checklist open item 29.
 pub(crate) mod resident_index {
     use super::{RecordIndexEntry, Result};
-    use core::ops::Deref;
 
     /// Proof that the resident record index has spare capacity for one entry.
     ///
@@ -866,10 +865,47 @@ pub(crate) mod resident_index {
         }
     }
 
-    impl Deref for ResidentIndex {
-        type Target = [RecordIndexEntry];
+    impl ResidentIndex {
+        /// Entries in order.
+        ///
+        /// A method and not a `Deref` to `[RecordIndexEntry]`. The slice
+        /// contract said "every entry, contiguous, borrowed at once", which is
+        /// the one shape a demand-filled index cannot produce — and it was
+        /// implicit, so nothing had to ask for it deliberately. Every caller
+        /// that genuinely needs the whole array now says so by name.
+        pub(crate) fn iter(&self) -> std::slice::Iter<'_, RecordIndexEntry> {
+            self.entries.iter()
+        }
 
-        fn deref(&self) -> &[RecordIndexEntry] {
+        pub(crate) fn len(&self) -> usize {
+            self.entries.len()
+        }
+
+        /// Only the unit tests ask; production code asks `len`.
+        #[cfg(test)]
+        pub(crate) fn is_empty(&self) -> bool {
+            self.entries.is_empty()
+        }
+
+        /// The entry at `position`, or `UnexpectedEof` if there is none.
+        ///
+        /// Positions reaching this come from `ReplacementTarget::resolve`, which
+        /// found them by walking this same index, so the miss arm is
+        /// unreachable today — but a demand-filled store can fail to produce an
+        /// entry for reasons a slice index cannot, and a panicking `[i]` leaves
+        /// nowhere to put that.
+        pub(crate) fn entry_at(&self, position: usize) -> crate::Result<&RecordIndexEntry> {
+            self.entries
+                .get(position)
+                .ok_or(crate::Error::UnexpectedEof)
+        }
+
+        /// The whole array, borrowed contiguously.
+        ///
+        /// This is the shape that keeps the index resident. Every caller is a
+        /// place laziness has to be designed for rather than dropped in, so the
+        /// name is deliberately awkward and the call sites are the worklist.
+        pub(crate) fn as_contiguous_slice(&self) -> &[RecordIndexEntry] {
             &self.entries
         }
     }
@@ -4449,8 +4485,9 @@ impl VarveFile {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         // F-01: resolution and the target-version refusal are one step, and
         // there is no other way to address the target. See `ReplacementTarget`.
-        let target_position = ReplacementTarget::resolve::<T>(&self.index, index)?.position();
-        let target = &self.index[target_position];
+        let target_position =
+            ReplacementTarget::resolve::<T>(self.index.as_contiguous_slice(), index)?.position();
+        let target = self.index.entry_at(target_position)?;
         let mut materialization = MaterializationBudget::new(self.spec);
         let old_logical_len = target.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
         materialization.consume(old_logical_len)?;
@@ -4685,7 +4722,8 @@ impl VarveFile {
         }
         // F-01: resolution and the target-version refusal are one step, and
         // there is no other way to address the target. See `ReplacementTarget`.
-        let target_position = ReplacementTarget::resolve::<T>(&self.index, index)?.position();
+        let target_position =
+            ReplacementTarget::resolve::<T>(self.index.as_contiguous_slice(), index)?.position();
 
         let endian = T::ENDIAN.unwrap_or(self.spec.endian);
         let payload = encode_logical_payload_limited(self.spec, block, endian)?;
@@ -4697,7 +4735,7 @@ impl VarveFile {
         self.spec
             .read_limits
             .check(ReadLimitKey::LogicalPayloadLen, payload_len)?;
-        let old_len = self.index[target_position].payload_len;
+        let old_len = self.index.entry_at(target_position)?.payload_len;
         if old_len != payload_len {
             return Err(Error::ReplaceSizeMismatch {
                 old: old_len,
@@ -4708,7 +4746,7 @@ impl VarveFile {
         self.validate_source_generation()?;
 
         let sequence = self.sequence_state.available()?;
-        let entry = &self.index[target_position];
+        let entry = self.index.entry_at(target_position)?;
         let mut footer_bytes = [0; RECORD_FOOTER_LEN as usize];
         let footer = if let Some(footer_offset) = entry.footer_offset {
             self.snapshot
@@ -4738,8 +4776,12 @@ impl VarveFile {
 
         // Every entry, so the count is the length and no counting pass is
         // needed to learn it.
-        let mut new_index =
-            clone_matching_entries(self.spec, &self.index, self.index.len(), |_| true)?;
+        let mut new_index = clone_matching_entries(
+            self.spec,
+            self.index.as_contiguous_slice(),
+            self.index.len(),
+            |_| true,
+        )?;
         new_index[target_position].sequence = sequence;
         new_index[target_position].checksum = checksum;
 
@@ -4848,7 +4890,7 @@ impl VarveFile {
         }
         // F-01: resolution and the target-version refusal are one step, and
         // there is no other way to address the target. See `ReplacementTarget`.
-        let target = ReplacementTarget::resolve::<T>(&self.index, index)?;
+        let target = ReplacementTarget::resolve::<T>(self.index.as_contiguous_slice(), index)?;
         let target_position = target.position();
         let payload = encode_logical_payload_limited(
             self.spec,
@@ -4863,7 +4905,7 @@ impl VarveFile {
         self.spec
             .read_limits
             .check(ReadLimitKey::LogicalPayloadLen, payload_len)?;
-        let entry = &self.index[target_position];
+        let entry = self.index.entry_at(target_position)?;
         if entry.payload_len != payload_len {
             return Err(Error::ReplaceSizeMismatch {
                 old: entry.payload_len,
@@ -4873,7 +4915,7 @@ impl VarveFile {
         self.ensure_generation_rewrite_allowed()?;
         self.validate_source_generation()?;
         let sequence = self.sequence_state.available()?;
-        let entry = &self.index[target_position];
+        let entry = self.index.entry_at(target_position)?;
         let mut footer_bytes = [0; RECORD_FOOTER_LEN as usize];
         let footer = if let Some(footer_offset) = entry.footer_offset {
             self.snapshot
@@ -4937,7 +4979,8 @@ impl VarveFile {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         // F-01: resolution and the target-version refusal are one step, and
         // there is no other way to address the target. See `ReplacementTarget`.
-        let target_position = ReplacementTarget::resolve::<T>(&self.index, index)?.position();
+        let target_position =
+            ReplacementTarget::resolve::<T>(self.index.as_contiguous_slice(), index)?.position();
         let sequence = self.sequence_state.available()?;
         let endian = T::ENDIAN.unwrap_or(self.spec.endian);
         let encoded = encode_logical_payload_limited(self.spec, block, endian)?;
@@ -5300,9 +5343,12 @@ impl VarveFile {
             .iter()
             .filter(|entry| entry.block_id == T::ID)
             .count();
-        let entries = clone_matching_entries(self.spec, &self.index, count, |entry| {
-            entry.block_id == T::ID
-        })?;
+        let entries = clone_matching_entries(
+            self.spec,
+            self.index.as_contiguous_slice(),
+            count,
+            |entry| entry.block_id == T::ID,
+        )?;
         Ok(BlockVec::new(self.spec, self.snapshot.clone(), entries))
     }
 
@@ -5441,7 +5487,7 @@ impl VarveFile {
         apply_merge_entries::<T>(
             self.spec,
             &self.snapshot,
-            &self.index,
+            self.index.as_contiguous_slice(),
             MergeShard::single_file(),
             &mut state,
             &mut budget,
@@ -5547,7 +5593,7 @@ impl VarveFile {
     }
 
     pub fn index_entries(&self) -> &[RecordIndexEntry] {
-        &self.index
+        self.index.as_contiguous_slice()
     }
 
     /// Builds the per-key tail offsets for `T` from the resident index.
@@ -7902,7 +7948,11 @@ impl VarveFile {
         // Both preconditions are discharged by constructing the permission:
         // the version refusal happened in `ReplacementTarget::resolve`, and
         // `prepare` drops the keyed-tail map before the write below.
-        let write = RecordOverwrite::prepare(target, &self.index, &mut self.keyed_tails);
+        let write = RecordOverwrite::prepare(
+            target,
+            self.index.as_contiguous_slice(),
+            &mut self.keyed_tails,
+        );
         self.file
             .overwrite_indexed_record(write, header_bytes, payload)
     }
@@ -7934,7 +7984,7 @@ impl VarveFile {
                 // flush-cadence state once for the new generation (PERF2-02)
                 // and the O(1) block tails with it (PERF2-05). Record offsets
                 // moved, so every cached generic keyed tail is stale (API2-05).
-                let derived = derive_index_state(&self.index, true);
+                let derived = derive_index_state(self.index.as_contiguous_slice(), true);
                 self.checkpoint_cadence = derived.checkpoint_cadence;
                 self.block_tails = derived.block_tails.expect("tails were requested");
                 self.segment_cursor = derived.segment_cursor;
@@ -7982,7 +8032,7 @@ impl VarveFile {
                 // flush-cadence state once for the new generation (PERF2-02)
                 // and the O(1) block tails with it (PERF2-05). Record offsets
                 // moved, so every cached generic keyed tail is stale (API2-05).
-                let derived = derive_index_state(&self.index, true);
+                let derived = derive_index_state(self.index.as_contiguous_slice(), true);
                 self.checkpoint_cadence = derived.checkpoint_cadence;
                 self.block_tails = derived.block_tails.expect("tails were requested");
                 self.segment_cursor = derived.segment_cursor;
@@ -8014,7 +8064,7 @@ impl VarveFile {
             self.spec,
             &mut file,
             append_log_start_for_file(self)?,
-            &self.index,
+            self.index.as_contiguous_slice(),
         )
     }
 
@@ -8559,7 +8609,7 @@ impl VarveFile {
         let record_offset = self.file.metadata()?.len();
         let payload = encode_segment_payload(
             self.spec,
-            &self.index[start..],
+            &self.index.as_contiguous_slice()[start..],
             covered_start,
             preceding_records,
             record_offset,
@@ -10859,7 +10909,7 @@ where
     apply_merge_entries::<T>(
         spec,
         &file.snapshot,
-        &file.index,
+        file.index.as_contiguous_slice(),
         shard,
         state,
         budget,
