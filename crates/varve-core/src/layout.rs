@@ -879,9 +879,11 @@ impl LayoutWriter {
                 spec.read_limits
                     .check(ReadLimitKey::FileLen, snapshot.len())?;
                 let header = read_file_header(spec, &snapshot)?;
-                let (segments, index_bytes) =
-                    scan_layout_segments(spec, &snapshot, header.len, header.index_bytes)?;
-                let segment_counts = segment_counts_from_infos(spec, &segments)?;
+                // Counting, not retaining: the writer's only use for the scan is
+                // the per-name tally the walk already maintains, so nothing here
+                // grows with the number of segments in the file.
+                let (segment_counts, index_bytes) =
+                    scan_layout_segment_counts(spec, &snapshot, header.len, header.index_bytes)?;
                 file.seek(SeekFrom::Start(snapshot.len()))?;
                 Ok((file, segment_counts, index_bytes))
             })?;
@@ -1650,17 +1652,6 @@ fn initial_segment_counts(spec: FormatSpec) -> Result<Vec<SegmentCount>> {
         .collect())
 }
 
-fn segment_counts_from_infos(
-    spec: FormatSpec,
-    segments: &[LayoutSegmentInfo],
-) -> Result<Vec<SegmentCount>> {
-    let mut counts = initial_segment_counts(spec)?;
-    for segment in segments {
-        increment_segment_count(&mut counts, segment.name)?;
-    }
-    Ok(counts)
-}
-
 fn descriptor_lead_in_len(segment: SegmentDescriptor) -> Result<u64> {
     descriptor_fields_len(segment.lead_in.fields)
 }
@@ -1952,12 +1943,90 @@ fn read_static_layout_fields(
     Ok(fields)
 }
 
-fn scan_layout_segments(
+/// What a layout scan does with each segment it accepts.
+///
+/// There is exactly one implementation of the walk — [`scan_layout_segments_into`]
+/// — and this is the only thing that varies between its callers: a reader keeps
+/// the `LayoutSegmentInfo`s, a writer only ever wanted the per-name counts and
+/// the running index-byte total, both of which the walk already maintains. The
+/// limit half is the *same* code either way ([`charge_layout_segment`]), so a
+/// counting scan refuses the same file at the same segment with the same error
+/// as a retaining one; the only thing a counting sink skips is the `try_reserve`
+/// for storage it does not use.
+trait LayoutScanSink {
+    /// Segments accepted so far, which is the count both limit checks are
+    /// expressed against.
+    fn accepted(&self) -> usize;
+
+    /// Charges one more segment against the read limits, returning the new
+    /// index-byte total. Must not be applied unless the segment is then
+    /// accepted.
+    fn reserve(
+        &mut self,
+        spec: FormatSpec,
+        descriptor: SegmentDescriptor,
+        index_bytes: u64,
+    ) -> Result<u64>;
+
+    fn accept(&mut self, info: LayoutSegmentInfo);
+}
+
+/// Keeps every segment. What `LayoutReader::open` needs.
+struct RetainSegments(Vec<LayoutSegmentInfo>);
+
+impl LayoutScanSink for RetainSegments {
+    fn accepted(&self) -> usize {
+        self.0.len()
+    }
+
+    fn reserve(
+        &mut self,
+        spec: FormatSpec,
+        descriptor: SegmentDescriptor,
+        index_bytes: u64,
+    ) -> Result<u64> {
+        reserve_layout_segment(spec, &mut self.0, descriptor, index_bytes)
+    }
+
+    fn accept(&mut self, info: LayoutSegmentInfo) {
+        self.0.push(info);
+    }
+}
+
+/// Keeps nothing but the tally. What `LayoutWriter::open` needs: it discarded
+/// the whole `Vec` immediately after deriving the per-name counts from it, so
+/// its peak was `O(segments)` for a result that is `O(declared segment kinds)`.
+struct CountSegments(usize);
+
+impl LayoutScanSink for CountSegments {
+    fn accepted(&self) -> usize {
+        self.0
+    }
+
+    fn reserve(
+        &mut self,
+        spec: FormatSpec,
+        descriptor: SegmentDescriptor,
+        index_bytes: u64,
+    ) -> Result<u64> {
+        charge_layout_segment(spec, self.0, descriptor, index_bytes)
+    }
+
+    fn accept(&mut self, _info: LayoutSegmentInfo) {
+        self.0 += 1;
+    }
+}
+
+/// The layout segment walk. Returns the per-name counts it maintains as it goes
+/// and the final index-byte total; what happens to each `LayoutSegmentInfo` is
+/// the sink's business.
+fn scan_layout_segments_into<S: LayoutScanSink>(
     spec: FormatSpec,
     snapshot: &SnapshotFile,
     start_offset: u64,
     initial_index_bytes: u64,
-) -> Result<(Vec<LayoutSegmentInfo>, u64)> {
+    sink: &mut S,
+) -> Result<(Vec<SegmentCount>, u64)> {
     let dispatch = segment_dispatch_table(spec)?;
     let file_len = snapshot.len();
     spec.read_limits
@@ -1966,11 +2035,10 @@ fn scan_layout_segments(
         .check(ReadLimitKey::IndexBytes, initial_index_bytes)?;
     let mut offset = start_offset;
     let mut index_bytes = initial_index_bytes;
-    let mut segments = Vec::new();
     let mut segment_counts = initial_segment_counts(spec)?;
     let mut cursor = snapshot.cursor_at(start_offset)?;
     while offset < file_len {
-        check_pending_layout_segment_limits(spec, &dispatch, segments.len(), index_bytes)?;
+        check_pending_layout_segment_limits(spec, &dispatch, sink.accepted(), index_bytes)?;
         let dispatch_index =
             select_segment_descriptor(spec, &dispatch, &mut cursor, offset, file_len)?;
         let descriptor = dispatch[dispatch_index].descriptor;
@@ -1984,8 +2052,7 @@ fn scan_layout_segments(
                 offset,
             });
         }
-        let next_index_bytes =
-            reserve_layout_segment(spec, &mut segments, descriptor, index_bytes)?;
+        let next_index_bytes = sink.reserve(spec, descriptor, index_bytes)?;
         let info = read_layout_segment_at(spec, &mut cursor, descriptor, offset, file_len)
             .map_err(|failure| failure.error)?;
         if info.segment_end <= offset {
@@ -1993,13 +2060,37 @@ fn scan_layout_segments(
         }
         offset = info.segment_end;
         increment_segment_count(&mut segment_counts, descriptor.name)?;
-        segments.push(info);
+        sink.accept(info);
         index_bytes = next_index_bytes;
     }
     if offset != file_len {
         return Err(Error::LayoutInvalidSegmentBounds { offset });
     }
-    Ok((segments, index_bytes))
+    Ok((segment_counts, index_bytes))
+}
+
+fn scan_layout_segments(
+    spec: FormatSpec,
+    snapshot: &SnapshotFile,
+    start_offset: u64,
+    initial_index_bytes: u64,
+) -> Result<(Vec<LayoutSegmentInfo>, u64)> {
+    let mut sink = RetainSegments(Vec::new());
+    let (_counts, index_bytes) =
+        scan_layout_segments_into(spec, snapshot, start_offset, initial_index_bytes, &mut sink)?;
+    Ok((sink.0, index_bytes))
+}
+
+/// The same walk, retaining nothing. The counts are maintained by the walk
+/// itself, so deriving them no longer requires the segments to still exist.
+fn scan_layout_segment_counts(
+    spec: FormatSpec,
+    snapshot: &SnapshotFile,
+    start_offset: u64,
+    initial_index_bytes: u64,
+) -> Result<(Vec<SegmentCount>, u64)> {
+    let mut sink = CountSegments(0);
+    scan_layout_segments_into(spec, snapshot, start_offset, initial_index_bytes, &mut sink)
 }
 
 fn scan_layout_segments_report(
@@ -2110,13 +2201,21 @@ fn check_pending_layout_segment_limits(
     Ok(())
 }
 
-fn reserve_layout_segment(
+/// Charges one more accepted segment against `Segments` and `IndexBytes`,
+/// returning the new index-byte total.
+///
+/// Split out of [`reserve_layout_segment`] so that a scan which retains nothing
+/// still performs exactly these checks, in this order, with these values: a
+/// counting scan must refuse the same file at the same segment with the same
+/// error as a retaining one, and that is a property of sharing the code rather
+/// than of two copies agreeing.
+fn charge_layout_segment(
     spec: FormatSpec,
-    segments: &mut Vec<LayoutSegmentInfo>,
+    accepted: usize,
     descriptor: SegmentDescriptor,
     index_bytes: u64,
 ) -> Result<u64> {
-    let segment_count = u64::try_from(segments.len())
+    let segment_count = u64::try_from(accepted)
         .map_err(|_| Error::LengthOverflow { value: u64::MAX })?
         .checked_add(1)
         .ok_or(Error::ResourceArithmeticOverflow {
@@ -2133,6 +2232,16 @@ fn reserve_layout_segment(
             })?;
     spec.read_limits
         .check(ReadLimitKey::IndexBytes, next_index_bytes)?;
+    Ok(next_index_bytes)
+}
+
+fn reserve_layout_segment(
+    spec: FormatSpec,
+    segments: &mut Vec<LayoutSegmentInfo>,
+    descriptor: SegmentDescriptor,
+    index_bytes: u64,
+) -> Result<u64> {
+    let next_index_bytes = charge_layout_segment(spec, segments.len(), descriptor, index_bytes)?;
     segments
         .try_reserve(1)
         .map_err(|_| Error::AllocationFailed {

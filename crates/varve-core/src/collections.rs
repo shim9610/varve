@@ -9,6 +9,35 @@ use crate::{
     VarveBlock, VarveDecode, VarveKeyedBlock, format::ReadLimitKey,
 };
 
+/// The ceiling `max_materialized_bytes` puts on decoded payload bytes.
+///
+/// **Where a budget is cumulative and where it is per record.** One budget
+/// threaded through a loop bounds the *sum* over that loop; a budget rebuilt
+/// (or [`reset`](Self::reset)) per iteration bounds the *peak* of one step. The
+/// deciding rule is what the loop keeps:
+///
+/// - **Cumulative where the results are retained.** `all_metadata`,
+///   `blocks_migrated`, `materialized_keyed_blocks` and the merge/compact and
+///   manifest decodes each build a `Vec`/`HashMap` of decoded values whose live
+///   size really is the sum, so the sum is the thing to bound.
+/// - **Per record where each value is yielded and dropped.** `BlockVec::get`,
+///   `KeyedBlockVec::get`, `VarveFile::read_block_at` and
+///   `StreamingBlocks::next` have always worked this way: peak residency is one
+///   payload, and charging the sum refuses a healthy file for reading too much
+///   of it *over time* rather than at once.
+///
+/// [`BlockVec::iter`], `VarveFile::metadata`, `VarveFile::keyed_blocks` and
+/// `VarveFile::key_tail_offsets` were on the wrong side of that line: each
+/// decodes a record, extracts something small (or nothing) from it and drops
+/// the payload, but charged the whole walk to one budget. `key_tail_offsets` is
+/// the sharpest case because it is reached from `push_keyed`, so the cumulative
+/// drain could refuse an *append* to an undamaged file.
+///
+/// One site is knowingly still cumulative: `diagnostics::diagnose_file`'s loop
+/// over `index_entries()`, which retains nothing and so belongs in the second
+/// group. It is left alone here only because the shipped test
+/// `diagnostics_enforce_cumulative_materialization_limit` pins the present
+/// behaviour and rewriting it was out of scope for this change.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MaterializationBudget {
     limit: u64,
@@ -25,6 +54,16 @@ impl MaterializationBudget {
             limit,
             remaining: limit,
         }
+    }
+
+    /// Returns the budget to its declared ceiling.
+    ///
+    /// The cheap form of "a fresh budget for this record": equivalent to
+    /// [`Self::new`] without re-resolving the spec's limit profile, so a loop
+    /// that bounds the peak of one step rather than the sum over the walk costs
+    /// one store per record.
+    pub(crate) fn reset(&mut self) {
+        self.remaining = self.limit;
     }
 
     pub(crate) fn consume(&mut self, bytes: u64) -> Result<()> {
@@ -105,14 +144,6 @@ where
 
     pub fn get(&self, index: usize) -> Result<Option<T>> {
         let mut budget = MaterializationBudget::new(self.spec);
-        self.get_with_budget(index, &mut budget)
-    }
-
-    pub(crate) fn get_with_budget(
-        &self,
-        index: usize,
-        budget: &mut MaterializationBudget,
-    ) -> Result<Option<T>> {
         let Some(entry) = self.entries.get(index) else {
             return Ok(None);
         };
@@ -131,11 +162,19 @@ where
         ))
     }
 
+    /// Iterates the block's records, yielding one decoded value at a time.
+    ///
+    /// `max_materialized_bytes` bounds **one** record here, exactly as it does
+    /// in [`Self::get`] and `StreamingBlocks::next`: nothing is retained
+    /// between steps, so the peak is one payload however long the walk is. It
+    /// used to be a single budget threaded across the whole iteration, which
+    /// made `iter()` and a `for i in 0..len { get(i) }` loop over the same
+    /// records mean two different things and refused a healthy file whose total
+    /// payload merely exceeded the ceiling.
     pub fn iter(&self) -> BlockIter<'_, T> {
         BlockIter {
             collection: self,
             index: 0,
-            budget: MaterializationBudget::new(self.spec),
         }
     }
 }
@@ -143,7 +182,6 @@ where
 pub struct BlockIter<'a, T> {
     collection: &'a BlockVec<T>,
     index: usize,
-    budget: MaterializationBudget,
 }
 
 impl<T> Iterator for BlockIter<'_, T>
@@ -156,10 +194,9 @@ where
         if self.index >= self.collection.len() {
             return None;
         }
-        let result = self
-            .collection
-            .get_with_budget(self.index, &mut self.budget)
-            .transpose();
+        // `get` builds the budget, so one step of the iteration is charged
+        // exactly what the same `get(i)` call is charged.
+        let result = self.collection.get(self.index).transpose();
         self.index += 1;
         result
     }

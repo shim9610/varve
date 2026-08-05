@@ -914,6 +914,63 @@ where
     }
 }
 
+/// Ceiling, in bytes, on the transient `[Option<T>; N]` a fixed-array decode
+/// may build on the stack.
+///
+/// Above it the decode keeps the fallible heap reservation it has always used.
+/// A format author's declared array length must not be able to turn into an
+/// unbounded stack frame: that would trade a bounded, fallible heap allocation
+/// for an unbounded one that cannot be refused, which is the opposite of what
+/// this crate's allocation discipline exists for.
+const ARRAY_STACK_DECODE_BUDGET: usize = 16 * 1024;
+
+/// Decodes `[T; N]` through a stack `[Option<T>; N]`, allocating nothing.
+///
+/// `#[inline(never)]` is load-bearing here, not a hint. The budget test in
+/// `<[T; N] as VarveDecode>::decode_varve` is an ordinary runtime `if` over
+/// const-foldable operands, so were this body inlined the `[Option<T>; N]` slot
+/// would sit in that function's frame whichever branch runs — and a debug
+/// build, which is how `cargo test` runs, folds nothing away. Kept as its own
+/// non-inlinable function the slot exists only while this function is on the
+/// stack, which for an above-budget array is never, in debug and release
+/// alike.
+///
+/// `Option<T>` rather than `MaybeUninit<T>` is what keeps the crate's most
+/// adversarially fuzzed surface free of `unsafe`: an early `?` drops the
+/// partially filled array through its ordinary `Drop`, the initialised prefix
+/// as `Some` and the rest as `None`.
+#[inline(never)]
+fn decode_array_on_stack<T, const N: usize>(decoder: &mut Decoder<'_>) -> Result<[T; N]>
+where
+    T: VarveDecode,
+{
+    let mut slots: [Option<T>; N] = [const { None }; N];
+    for slot in &mut slots {
+        *slot = Some(T::decode_varve(decoder)?);
+    }
+    Ok(slots.map(|value| value.expect("every array slot was filled by the loop above")))
+}
+
+/// Decodes `[T; N]` through one fallible heap reservation — the behaviour every
+/// array decode had before the stack path, kept verbatim for arrays above
+/// `ARRAY_STACK_DECODE_BUDGET`.
+fn decode_array_on_heap<T, const N: usize>(decoder: &mut Decoder<'_>) -> Result<[T; N]>
+where
+    T: VarveDecode,
+{
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(N)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "array",
+            requested: allocation_request::<T>(N),
+        })?;
+    for _ in 0..N {
+        values.push(T::decode_varve(decoder)?);
+    }
+    values.try_into().map_err(|_| Error::UnexpectedEof)
+}
+
 impl<T, const N: usize> VarveDecode for [T; N]
 where
     T: VarveDecode,
@@ -922,18 +979,19 @@ where
     const SCHEMA_ID: u64 = container_schema_id_with_arity(b"array", N as u64, &[T::SCHEMA_ID]);
 
     fn decode_varve(decoder: &mut Decoder<'_>) -> Result<Self> {
+        // Unchanged: this is the EOF screen and the materialization charge, and
+        // the charge stays at `size_of::<T>()` rather than
+        // `size_of::<Option<T>>()`. The budget models retained heap
+        // materialization; the `Option` padding is transient stack already
+        // bounded by `ARRAY_STACK_DECODE_BUDGET`, and raising the charge would
+        // turn previously accepted decodes into `LimitExceeded` for niche-less
+        // `T` under a tight `max_materialized_bytes`.
         decoder.preflight_count(N, minimum_wire_size(T::WIRE_TYPE), size_of::<T>(), "array")?;
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(N)
-            .map_err(|_| Error::AllocationFailed {
-                resource: "array",
-                requested: allocation_request::<T>(N),
-            })?;
-        for _ in 0..N {
-            values.push(T::decode_varve(decoder)?);
+        if size_of::<Option<T>>().saturating_mul(N) <= ARRAY_STACK_DECODE_BUDGET {
+            decode_array_on_stack(decoder)
+        } else {
+            decode_array_on_heap(decoder)
         }
-        values.try_into().map_err(|_| Error::UnexpectedEof)
     }
 }
 

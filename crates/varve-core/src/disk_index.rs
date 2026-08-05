@@ -2179,6 +2179,29 @@ impl DiskIndexWriteBatch {
         self.lookup_pointer_canonical(block_id, &canonical)
     }
 
+    /// Builds the composite key this batch stores a row under.
+    ///
+    /// The only constructor of [`CompositeKey`], and the reason that type has a
+    /// private field: a caller who has one has it from here, with this batch's
+    /// `max_key_bytes`, so a canonical key cannot be passed where a composite is
+    /// required.
+    pub(crate) fn composite_key_for(
+        &self,
+        block_id: u32,
+        canonical_key: &[u8],
+    ) -> DiskIndexResult<CompositeKey> {
+        Ok(CompositeKey(composite_key(
+            block_id,
+            canonical_key,
+            self.options.max_key_bytes,
+        )?))
+    }
+
+    /// Kept as the single-call form the batch's own tests use. The append path
+    /// goes through [`Self::composite_key_for`] and
+    /// [`Self::lookup_pointer_composite`] instead, because it needs the
+    /// composite key afterwards and this would throw it away.
+    #[cfg(test)]
     pub(crate) fn lookup_pointer_canonical(
         &self,
         block_id: u32,
@@ -2188,9 +2211,26 @@ impl DiskIndexWriteBatch {
         if !matches!(self.metadata.mode, DiskIndexMode::DiskPlan(_)) {
             return Err(DiskIndexError::KeyTableUnavailable);
         }
-        let composite = composite_key(block_id, canonical_key, self.options.max_key_bytes)?;
+        let composite = self.composite_key_for(block_id, canonical_key)?;
+        self.lookup_pointer_composite(block_id, &composite)
+    }
+
+    /// The lookup, given a composite key that has already been built.
+    ///
+    /// Split out so that a caller which must build the composite anyway — the
+    /// keyed-offset-chain path, which looks the previous record up and then
+    /// stages a row under the same key — builds it once and hands the same
+    /// value on to [`Self::apply_update_with_tail`].
+    pub(crate) fn lookup_pointer_composite(
+        &self,
+        block_id: u32,
+        composite: &CompositeKey,
+    ) -> DiskIndexResult<DiskIndexRecordPointer> {
+        if !matches!(self.metadata.mode, DiskIndexMode::DiskPlan(_)) {
+            return Err(DiskIndexError::KeyTableUnavailable);
+        }
         // Rows staged by this batch shadow the last committed table row.
-        if let Some(value) = self.pending_latest.get(&composite) {
+        if let Some(value) = self.pending_latest.get(composite.as_slice()) {
             return latest_pointer(block_id, decode_latest(value)?);
         }
         let table = self.transaction.open_table(LATEST_TABLE).map_err(storage)?;
@@ -2211,15 +2251,21 @@ impl DiskIndexWriteBatch {
         new_covered_eof: u64,
         update: &DiskIndexUpdate,
     ) -> DiskIndexResult<DiskIndexMetadata> {
-        self.apply_update_with_tail(expected_covered_eof, new_covered_eof, update, None)
+        self.apply_update_with_tail(expected_covered_eof, new_covered_eof, update, None, None)
     }
 
+    /// `composite` is the row's key when the caller already built it — the
+    /// keyed-offset-chain path does, to look the previous record up — and
+    /// `None` when it did not, which is the default policy. Either way exactly
+    /// one composite key is built per staged row, and it is *moved* into
+    /// `pending_latest` rather than copied.
     pub(crate) fn apply_update_with_tail(
         &mut self,
         expected_covered_eof: u64,
         new_covered_eof: u64,
         update: &DiskIndexUpdate,
         tail: Option<DiskIndexTail>,
+        composite: Option<CompositeKey>,
     ) -> DiskIndexResult<DiskIndexMetadata> {
         if !matches!(self.metadata.mode, DiskIndexMode::DiskPlan(_)) {
             return Err(DiskIndexError::KeyTableUnavailable);
@@ -2235,11 +2281,27 @@ impl DiskIndexWriteBatch {
         let item_bytes = checked_item_bytes(update.canonical_key.len(), tail.is_some())?;
         self.ensure_batch_capacity(item_bytes)?;
 
-        let key = composite_key(
-            update.block_id,
-            &update.canonical_key,
-            self.options.max_key_bytes,
-        )?;
+        let key = match composite {
+            Some(key) => {
+                // Checked by inspection rather than by rebuilding: rebuilding
+                // would allocate the very key this parameter exists to avoid
+                // allocating, and `debug_assert` is live in every test run, so
+                // the measurement would report no improvement. Reading the
+                // three fields back out of the bytes tests the same claim for
+                // no allocation at all.
+                debug_assert!(
+                    composite_key_matches(key.as_slice(), update.block_id, &update.canonical_key),
+                    "a composite key built by the caller does not encode this update's \
+                     block id and canonical key"
+                );
+                key.into_vec()
+            }
+            None => composite_key(
+                update.block_id,
+                &update.canonical_key,
+                self.options.max_key_bytes,
+            )?,
+        };
         let value = encode_latest(
             kind,
             record_offset,
@@ -3129,6 +3191,46 @@ fn validate_metadata(metadata: DiskIndexMetadata) -> DiskIndexResult<()> {
     Ok(())
 }
 
+/// The bytes a row is stored under: `block_id`, the canonical key's length, and
+/// the canonical key.
+///
+/// A newtype rather than a `Vec<u8>` because the hazard this fix introduces is
+/// passing the *canonical* key where a composite is required, which would
+/// silently remap every row instead of failing. One private field and one
+/// constructor ([`DiskIndexBatch::composite_key_for`]) make that
+/// unrepresentable; [`DiskIndexBatch::apply_update_with_tail`] additionally
+/// `debug_assert`s any caller-supplied value against the one it would have
+/// built itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompositeKey(Vec<u8>);
+
+impl CompositeKey {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Consumes the key. The `Vec` moves on into the staged row, so building it
+    /// once and handing it over costs one allocation in total rather than two.
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+/// Whether `composite` is exactly what [`composite_key`] would have produced
+/// for `block_id` and `canonical_key`, decided by reading the encoding back
+/// rather than by building it again. Allocates nothing.
+fn composite_key_matches(composite: &[u8], block_id: u32, canonical_key: &[u8]) -> bool {
+    let Some((prefix, key)) = composite.split_at_checked(8) else {
+        return false;
+    };
+    let Ok(len) = u32::try_from(canonical_key.len()) else {
+        return false;
+    };
+    prefix[..4] == block_id.to_be_bytes()
+        && prefix[4..] == len.to_be_bytes()
+        && key == canonical_key
+}
+
 fn composite_key(block_id: u32, canonical_key: &[u8], limit: usize) -> DiskIndexResult<Vec<u8>> {
     ensure_key_limit(canonical_key.len(), limit)?;
     let len = u32::try_from(canonical_key.len()).map_err(|_| DiskIndexError::KeyTooLong {
@@ -3920,6 +4022,7 @@ mod tests {
                     record_offset: 64,
                     sequence: 0,
                 }),
+                None,
             )
             .unwrap();
         assert_eq!(batch.records(), 1);

@@ -853,13 +853,18 @@ fn parse_key_fields(value: &LitStr) -> Result<Vec<Ident>> {
                 "varve key contains an empty field name",
             ));
         }
-        let ident = syn::parse_str::<Ident>(name).map_err(|_| {
+        let mut ident = syn::parse_str::<Ident>(name).map_err(|_| {
             syn::Error::new(
                 value.span(),
                 format!("invalid varve key field {name:?}; expected a Rust identifier"),
             )
         })?;
-        fields.push(Ident::new(&ident.to_string(), value.span()));
+        // Re-span in place rather than rebuilding through `Ident::new`, which
+        // panics on a raw identifier ("r#type" is not a valid identifier).
+        // `set_span` preserves the raw flag and emits a bit-identical token for
+        // an ordinary identifier.
+        ident.set_span(value.span());
+        fields.push(ident);
     }
     Ok(fields)
 }
@@ -2520,18 +2525,24 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
         }
     });
     let typed_api = if typed_api_enabled {
-        typed_api_tokens(&name, &inline_blocks, matrix_commit.as_ref(), &matrix_aux)
+        typed_api_tokens(
+            &vis,
+            &name,
+            &inline_blocks,
+            matrix_commit.as_ref(),
+            &matrix_aux,
+        )
     } else {
         quote!()
     };
     let (high_cardinality_constructors, high_cardinality_api) =
         if typed_api_enabled && cfg!(feature = "high-cardinality-dev") {
-            high_cardinality_api_tokens(&name, &inline_blocks, keyed_offset_chain)
+            high_cardinality_api_tokens(&vis, &name, &inline_blocks, keyed_offset_chain)
         } else {
             (quote!(), quote!())
         };
     let layout_typed_api = if typed_api_enabled && !layout_segments.is_empty() {
-        layout_typed_api_tokens(&name, layout_file_header.as_ref(), &layout_segments)
+        layout_typed_api_tokens(&vis, &name, layout_file_header.as_ref(), &layout_segments)
     } else {
         quote!()
     };
@@ -3874,6 +3885,7 @@ fn inline_block_tokens(vis: &Visibility, block: &InlineBlock, dims: &[MatrixDim]
 }
 
 fn layout_typed_api_tokens(
+    vis: &Visibility,
     format_name: &Ident,
     file_header: Option<&LayoutFileHeader>,
     segments: &[LayoutSegment],
@@ -3881,14 +3893,14 @@ fn layout_typed_api_tokens(
     let reader_name = format_ident!("{}LayoutReader", format_name);
     let writer_name = format_ident!("{}LayoutWriter", format_name);
     let header_tokens = file_header
-        .map(|header| layout_header_typed_tokens(format_name, &writer_name, header))
+        .map(|header| layout_header_typed_tokens(vis, format_name, &writer_name, header))
         .unwrap_or_else(|| quote!());
     let reader_header_methods = file_header
         .map(|header| layout_reader_header_method_tokens(format_name, header))
         .unwrap_or_else(|| quote!());
     let segment_types = segments
         .iter()
-        .map(|segment| layout_segment_typed_tokens(format_name, segment));
+        .map(|segment| layout_segment_typed_tokens(vis, format_name, segment));
     let writer_segment_methods = segments
         .iter()
         .map(|segment| layout_writer_segment_method_tokens(format_name, segment));
@@ -3901,13 +3913,32 @@ fn layout_typed_api_tokens(
         #(#segment_types)*
 
         #[derive(Debug)]
-        pub struct #reader_name {
+        #vis struct #reader_name {
             inner: ::varve::__core::LayoutReader,
+            /// Per-name segment ordinal table. The OUTER vector holds one entry
+            /// per segment kind actually present in the file — a handful, fixed
+            /// by the format and independent of the segment count — and the
+            /// inner vector maps that kind's ordinal to the absolute segment
+            /// index. Without it every typed accessor re-derived the index by
+            /// scanning `segments()` from the start, so an ordered pass over N
+            /// segments cost O(N^2).
+            ///
+            /// Built on first typed access rather than at open: `LayoutReader`
+            /// exposes no `&mut self` method, so `segments()` cannot change
+            /// after open, and an open that never reaches a typed accessor pays
+            /// nothing. `OnceLock` is reached through `&self`, so every read
+            /// entry point keeps its `&self` receiver.
+            segment_ordinals: ::std::sync::OnceLock<
+                ::std::vec::Vec<(&'static str, ::std::vec::Vec<usize>)>,
+            >,
         }
 
         impl #reader_name {
             pub fn from_inner(inner: ::varve::__core::LayoutReader) -> Self {
-                Self { inner }
+                Self {
+                    inner,
+                    segment_ordinals: ::std::sync::OnceLock::new(),
+                }
             }
 
             pub fn into_inner(self) -> ::varve::__core::LayoutReader {
@@ -3956,18 +3987,36 @@ fn layout_typed_api_tokens(
                 self.inner.read_raw_range(index, offset, len)
             }
 
+            fn __varve_layout_segment_ordinals(
+                &self,
+            ) -> &[(&'static str, ::std::vec::Vec<usize>)] {
+                self.segment_ordinals.get_or_init(|| {
+                    let mut table: ::std::vec::Vec<
+                        (&'static str, ::std::vec::Vec<usize>),
+                    > = ::std::vec::Vec::new();
+                    for (index, segment) in self.inner.segments().iter().enumerate() {
+                        match table.iter_mut().find(|(name, _)| *name == segment.name) {
+                            ::core::option::Option::Some((_, ordinals)) => {
+                                ordinals.push(index);
+                            }
+                            ::core::option::Option::None => {
+                                table.push((segment.name, ::std::vec![index]));
+                            }
+                        }
+                    }
+                    table
+                })
+            }
+
             fn __varve_layout_segment_index(
                 &self,
                 name: &'static str,
                 ordinal: usize,
             ) -> ::varve::__core::Result<usize> {
-                self.inner
-                    .segments()
+                self.__varve_layout_segment_ordinals()
                     .iter()
-                    .enumerate()
-                    .filter(|(_, segment)| segment.name == name)
-                    .nth(ordinal)
-                    .map(|(index, _)| index)
+                    .find(|(entry, _)| *entry == name)
+                    .and_then(|(_, ordinals)| ordinals.get(ordinal).copied())
                     .ok_or_else(|| ::varve::__core::Error::LayoutSegmentIndexOutOfBounds {
                         segment: name.to_string(),
                         index: ordinal,
@@ -3979,7 +4028,7 @@ fn layout_typed_api_tokens(
         }
 
         #[derive(Debug)]
-        pub struct #writer_name {
+        #vis struct #writer_name {
             inner: ::varve::__core::LayoutWriter,
         }
 
@@ -4032,13 +4081,14 @@ fn layout_typed_api_tokens(
 }
 
 fn layout_header_typed_tokens(
+    vis: &Visibility,
     format_name: &Ident,
     writer_name: &Ident,
     header: &LayoutFileHeader,
 ) -> TokenStream2 {
     let fields_name = format_ident!("{}{}LayoutFields", format_name, header.name);
     let info_name = format_ident!("{}{}LayoutInfo", format_name, header.name);
-    let field_struct = layout_field_struct_tokens(&fields_name, &header.fields);
+    let field_struct = layout_field_struct_tokens(vis, &fields_name, &header.fields);
     let getters = header
         .fields
         .iter()
@@ -4047,7 +4097,7 @@ fn layout_header_typed_tokens(
         #field_struct
 
         #[derive(Clone, Debug, PartialEq, Eq)]
-        pub struct #info_name {
+        #vis struct #info_name {
             fields: ::std::vec::Vec<::varve::__core::LayoutFieldValue>,
         }
 
@@ -4107,18 +4157,22 @@ fn layout_reader_header_method_tokens(
     }
 }
 
-fn layout_segment_typed_tokens(format_name: &Ident, segment: &LayoutSegment) -> TokenStream2 {
+fn layout_segment_typed_tokens(
+    vis: &Visibility,
+    format_name: &Ident,
+    segment: &LayoutSegment,
+) -> TokenStream2 {
     let field_type = format_ident!("{}{}LayoutFields", format_name, segment.name);
     let footer_field_type = format_ident!("{}{}LayoutFooterFields", format_name, segment.name);
     let write_type = format_ident!("{}{}LayoutWrite", format_name, segment.name);
     let info_type = format_ident!("{}{}LayoutInfo", format_name, segment.name);
-    let field_struct = layout_field_struct_tokens(&field_type, &segment.lead_in.fields);
+    let field_struct = layout_field_struct_tokens(vis, &field_type, &segment.lead_in.fields);
     let footer_fields = segment
         .footer
         .as_ref()
         .map(|footer| footer.fields.as_slice())
         .unwrap_or(&[]);
-    let footer_field_struct = layout_field_struct_tokens(&footer_field_type, footer_fields);
+    let footer_field_struct = layout_field_struct_tokens(vis, &footer_field_type, footer_fields);
     let lead_in_getters = segment.lead_in.fields.iter().map(layout_info_field_getter);
     let footer_getters = footer_fields.iter().map(layout_info_footer_field_getter);
 
@@ -4127,7 +4181,7 @@ fn layout_segment_typed_tokens(format_name: &Ident, segment: &LayoutSegment) -> 
         #footer_field_struct
 
         #[derive(Clone, Debug)]
-        pub struct #write_type<'a> {
+        #vis struct #write_type<'a> {
             pub fields: #field_type,
             pub footer_fields: #footer_field_type,
             pub metadata: &'a [u8],
@@ -4135,7 +4189,7 @@ fn layout_segment_typed_tokens(format_name: &Ident, segment: &LayoutSegment) -> 
         }
 
         #[derive(Clone, Debug, PartialEq, Eq)]
-        pub struct #info_type {
+        #vis struct #info_type {
             inner: ::varve::__core::LayoutSegmentInfo,
         }
 
@@ -4296,7 +4350,11 @@ fn layout_reader_segment_methods_tokens(
     }
 }
 
-fn layout_field_struct_tokens(name: &Ident, fields: &[LayoutField]) -> TokenStream2 {
+fn layout_field_struct_tokens(
+    vis: &Visibility,
+    name: &Ident,
+    fields: &[LayoutField],
+) -> TokenStream2 {
     let caller_fields: Vec<_> = fields
         .iter()
         .filter(|field| matches!(&field.source, LayoutFieldSourceChoice::Caller))
@@ -4304,7 +4362,7 @@ fn layout_field_struct_tokens(name: &Ident, fields: &[LayoutField]) -> TokenStre
     if caller_fields.is_empty() {
         return quote! {
             #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-            pub struct #name;
+            #vis struct #name;
 
             impl #name {
                 fn __varve_layout_values(&self) -> ::std::vec::Vec<::varve::__core::LayoutFieldValue> {
@@ -4333,7 +4391,7 @@ fn layout_field_struct_tokens(name: &Ident, fields: &[LayoutField]) -> TokenStre
 
     quote! {
         #[derive(Clone, Debug, Default, PartialEq, Eq)]
-        pub struct #name {
+        #vis struct #name {
             #(#struct_fields)*
         }
 
@@ -4434,6 +4492,7 @@ fn layout_value_conversion_tokens(
 }
 
 fn high_cardinality_api_tokens(
+    vis: &Visibility,
     format_name: &Ident,
     blocks: &[InlineBlock],
     keyed_offset_chain: bool,
@@ -4578,7 +4637,7 @@ fn high_cardinality_api_tokens(
         }
     };
     let stream_api = quote! {
-        pub struct #stream_reader_name {
+        #vis struct #stream_reader_name {
             inner: ::varve::__core::VarveStreamReader,
         }
 
@@ -4617,7 +4676,7 @@ fn high_cardinality_api_tokens(
             #(#stream_reader_methods)*
         }
 
-        pub struct #stream_writer_name {
+        #vis struct #stream_writer_name {
             inner: ::varve::__core::VarveStreamWriter,
         }
 
@@ -4867,7 +4926,7 @@ fn high_cardinality_api_tokens(
         }
     };
     let indexed_api = quote! {
-        pub struct #indexed_reader_name {
+        #vis struct #indexed_reader_name {
             inner: ::varve::__core::VarveIndexedReader,
         }
 
@@ -4907,7 +4966,7 @@ fn high_cardinality_api_tokens(
             #(#indexed_reader_methods)*
         }
 
-        pub struct #indexed_writer_name {
+        #vis struct #indexed_writer_name {
             inner: ::varve::__core::VarveIndexedWriter,
         }
 
@@ -5021,6 +5080,7 @@ fn generated_writer_construction_doc(keyed_blocks: &[&InlineBlock]) -> String {
 }
 
 fn typed_api_tokens(
+    vis: &Visibility,
     format_name: &Ident,
     blocks: &[InlineBlock],
     matrix_commit: Option<&MatrixCommit>,
@@ -5119,13 +5179,13 @@ fn typed_api_tokens(
         matrix_writer_aux_methods(matrix_aux, MatrixMethodTarget::TraitImpl);
 
     quote! {
-        pub trait #read_trait {
+        #vis trait #read_trait {
             #(#reader_trait_methods)*
             #matrix_reader_trait_methods
             #matrix_reader_aux_trait_methods
         }
 
-        pub trait #write_trait {
+        #vis trait #write_trait {
             #(#writer_trait_methods)*
             #matrix_writer_trait_methods
             #matrix_writer_aux_trait_methods
@@ -5137,7 +5197,7 @@ fn typed_api_tokens(
         }
 
         #[derive(Debug)]
-        pub struct #reader_name {
+        #vis struct #reader_name {
             inner: ::varve::__core::VarveReader,
         }
 
@@ -5171,7 +5231,7 @@ fn typed_api_tokens(
 
         #[doc = #writer_doc]
         #[derive(Debug)]
-        pub struct #writer_name {
+        #vis struct #writer_name {
             inner: ::varve::__core::VarveWriter,
         }
 
@@ -5260,7 +5320,7 @@ fn matrix_reader_aux_methods(aux: &[MatrixAux], target: MatrixMethodTarget) -> T
                 }
 
                 pub fn #read_method(
-                    &mut self,
+                    &self,
                     offset: u64,
                     len: u64,
                 ) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
@@ -5271,7 +5331,7 @@ fn matrix_reader_aux_methods(aux: &[MatrixAux], target: MatrixMethodTarget) -> T
                 fn #len_method(&self) -> ::varve::__core::Result<u64>;
 
                 fn #read_method(
-                    &mut self,
+                    &self,
                     offset: u64,
                     len: u64,
                 ) -> ::varve::__core::Result<::std::vec::Vec<u8>>;
@@ -5282,7 +5342,7 @@ fn matrix_reader_aux_methods(aux: &[MatrixAux], target: MatrixMethodTarget) -> T
                 }
 
                 fn #read_method(
-                    &mut self,
+                    &self,
                     offset: u64,
                     len: u64,
                 ) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
@@ -5309,7 +5369,7 @@ fn matrix_writer_aux_methods(aux: &[MatrixAux], target: MatrixMethodTarget) -> T
                 }
 
                 pub fn #read_method(
-                    &mut self,
+                    &self,
                     offset: u64,
                     len: u64,
                 ) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
@@ -5328,7 +5388,7 @@ fn matrix_writer_aux_methods(aux: &[MatrixAux], target: MatrixMethodTarget) -> T
                 fn #len_method(&self) -> ::varve::__core::Result<u64>;
 
                 fn #read_method(
-                    &mut self,
+                    &self,
                     offset: u64,
                     len: u64,
                 ) -> ::varve::__core::Result<::std::vec::Vec<u8>>;
@@ -5345,7 +5405,7 @@ fn matrix_writer_aux_methods(aux: &[MatrixAux], target: MatrixMethodTarget) -> T
                 }
 
                 fn #read_method(
-                    &mut self,
+                    &self,
                     offset: u64,
                     len: u64,
                 ) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
@@ -5379,7 +5439,7 @@ fn matrix_reader_methods(
         let status = format_ident!("{}_status", singular_method_name(ty));
         match target {
             MatrixMethodTarget::Inherent => quote! {
-                pub fn #method(&mut self, key: #key_ty) -> ::varve::__core::Result<#ty> {
+                pub fn #method(&self, key: #key_ty) -> ::varve::__core::Result<#ty> {
                     self.inner.read_matrix_cell::<#ty>(key.into())
                 }
 
@@ -5391,7 +5451,7 @@ fn matrix_reader_methods(
                 }
             },
             MatrixMethodTarget::Trait => quote! {
-                fn #method(&mut self, key: #key_ty) -> ::varve::__core::Result<#ty>;
+                fn #method(&self, key: #key_ty) -> ::varve::__core::Result<#ty>;
 
                 fn #status(
                     &self,
@@ -5399,7 +5459,7 @@ fn matrix_reader_methods(
                 ) -> ::varve::__core::Result<::varve::__core::MatrixCellStatus>;
             },
             MatrixMethodTarget::TraitImpl => quote! {
-                fn #method(&mut self, key: #key_ty) -> ::varve::__core::Result<#ty> {
+                fn #method(&self, key: #key_ty) -> ::varve::__core::Result<#ty> {
                     self.inner.read_matrix_cell::<#ty>(key.into())
                 }
 
@@ -6039,6 +6099,148 @@ mod tests {
         syn::parse::Parser::parse2(parser, block)
     }
 
+    fn expand_format_source(tokens: TokenStream2) -> String {
+        let input: FormatInput = syn::parse2(tokens).expect("format input parses");
+        expand_format(input).to_string()
+    }
+
+    /// F36: the reader, the writer and BOTH generated traits carry the
+    /// visibility the format was declared with. Emitting `pub` unconditionally
+    /// made a non-`pub` format's handles reachable from outside the module the
+    /// author put them in.
+    #[test]
+    fn declared_visibility_reaches_the_generated_record_api() {
+        let rendered = expand_format_source(quote! {
+            pub(crate) format Scoped {
+                magic: b"SCOP";
+                version: 1;
+                endian: little;
+                blocks {
+                    fixed Point(id = 1) {
+                        x: u32,
+                    }
+                }
+            }
+        });
+
+        for item in [
+            "pub (crate) struct Scoped",
+            "pub (crate) trait ScopedRead",
+            "pub (crate) trait ScopedWrite",
+            "pub (crate) struct ScopedReader",
+            "pub (crate) struct ScopedWriter",
+        ] {
+            assert!(
+                rendered.contains(item),
+                "expected `{item}` in the expansion"
+            );
+        }
+        // The two traits are the ones a partial fix leaves behind: relaxing the
+        // structs alone still exports `ScopedRead`/`ScopedWrite`.
+        for leaked in [
+            "pub trait ScopedRead",
+            "pub trait ScopedWrite",
+            "pub struct ScopedReader",
+            "pub struct ScopedWriter",
+        ] {
+            assert!(
+                !rendered.contains(leaked),
+                "`{leaked}` ignores the declared visibility"
+            );
+        }
+    }
+
+    /// F36, layout surface: the typed layout reader/writer, the per-segment
+    /// info and write types, and the caller-field structs they expose.
+    #[test]
+    fn declared_visibility_reaches_the_generated_layout_api() {
+        let rendered = expand_format_source(quote! {
+            pub(crate) format ScopedLayout {
+                magic: b"SCPL";
+                version: 1;
+                endian: little;
+                preset: none;
+
+                layout {
+                    file_header ScopedHeader {
+                        bytes signature = b"SCP!";
+                        u16 header_version = 1;
+                    }
+
+                    segment Chunk repeat until_eof {
+                        lead_in ChunkLeadIn {
+                            bytes tag = b"CHNK";
+                            u32 kind;
+                            i64 next_segment_offset =
+                                finalize(target = segment_end, relative_to = after_lead_in);
+                            i64 raw_data_offset =
+                                finalize(target = raw_region_start, relative_to = after_lead_in);
+                        }
+
+                        metadata ChunkMetadata;
+                        raw_region ChunkRaw;
+                    }
+                }
+            }
+        });
+
+        for item in [
+            "pub (crate) struct ScopedLayoutLayoutReader",
+            "pub (crate) struct ScopedLayoutLayoutWriter",
+            "pub (crate) struct ScopedLayoutScopedHeaderLayoutInfo",
+            "pub (crate) struct ScopedLayoutChunkLayoutInfo",
+            "pub (crate) struct ScopedLayoutChunkLayoutWrite",
+            "pub (crate) struct ScopedLayoutChunkLayoutFields",
+        ] {
+            assert!(
+                rendered.contains(item),
+                "expected `{item}` in the expansion"
+            );
+        }
+        for leaked in [
+            "pub struct ScopedLayoutLayoutReader",
+            "pub struct ScopedLayoutLayoutWriter",
+            "pub struct ScopedLayoutChunkLayoutInfo",
+            "pub struct ScopedLayoutChunkLayoutWrite",
+        ] {
+            assert!(
+                !rendered.contains(leaked),
+                "`{leaked}` ignores the declared visibility"
+            );
+        }
+    }
+
+    /// F36 control: a format declared `pub` still generates `pub` items, so the
+    /// substitution threads the declaration through rather than narrowing
+    /// everything.
+    #[test]
+    fn public_format_still_generates_public_handles() {
+        let rendered = expand_format_source(quote! {
+            pub format Open {
+                magic: b"OPEN";
+                version: 1;
+                endian: little;
+                blocks {
+                    fixed Point(id = 1) {
+                        x: u32,
+                    }
+                }
+            }
+        });
+
+        for item in [
+            "pub trait OpenRead",
+            "pub trait OpenWrite",
+            "pub struct OpenReader",
+            "pub struct OpenWriter",
+        ] {
+            assert!(
+                rendered.contains(item),
+                "expected `{item}` in the expansion"
+            );
+        }
+    }
+
     /// API2-05: absolute facade paths are rewritten to the renamed dependency.
     #[test]
     fn rebrand_rewrites_absolute_facade_paths() {
@@ -6192,8 +6394,12 @@ mod tests {
             variable Item(id = 1, key = [id], key_index = disk) { id: u64 }
         })
         .expect("disk key_index should parse with the feature");
-        let (constructors, api) =
-            high_cardinality_api_tokens(&format_ident!("Test"), &[block], false);
+        let (constructors, api) = high_cardinality_api_tokens(
+            &syn::parse_quote!(pub),
+            &format_ident!("Test"),
+            &[block],
+            false,
+        );
         let tokens = format!("{constructors} {api}");
 
         assert!(tokens.contains("TestStreamReader"));
@@ -6223,8 +6429,12 @@ mod tests {
             variable Earlier(id = 2, key = [id], key_index = disk) { id: u64 }
         })
         .expect("earlier disk block should parse");
-        let (constructors, _) =
-            high_cardinality_api_tokens(&format_ident!("Test"), &[later, earlier], false);
+        let (constructors, _) = high_cardinality_api_tokens(
+            &syn::parse_quote!(pub),
+            &format_ident!("Test"),
+            &[later, earlier],
+            false,
+        );
         let tokens = constructors.to_string();
         let plan_start = tokens
             .find("pub fn disk_index_plan")
@@ -6249,7 +6459,12 @@ mod tests {
             variable Frame(id = 1) { payload: Vec<u8> }
         })
         .expect("variable block should parse");
-        let (_, api) = high_cardinality_api_tokens(&format_ident!("Test"), &[block], false);
+        let (_, api) = high_cardinality_api_tokens(
+            &syn::parse_quote!(pub),
+            &format_ident!("Test"),
+            &[block],
+            false,
+        );
         let tokens = api.to_string();
 
         assert!(tokens.contains("push_frames"));
@@ -6275,8 +6490,12 @@ mod tests {
             fixed Metadata(id = 3) { value: u64 }
         })
         .expect("unkeyed block should parse");
-        let (_, api) =
-            high_cardinality_api_tokens(&format_ident!("Test"), &[account, frame, metadata], true);
+        let (_, api) = high_cardinality_api_tokens(
+            &syn::parse_quote!(pub),
+            &format_ident!("Test"),
+            &[account, frame, metadata],
+            true,
+        );
         let tokens = api.to_string();
         let stream_start = tokens
             .find("impl TestStreamWriter")
@@ -6310,8 +6529,12 @@ mod tests {
             variable Item(id = 1, key = [id]) { id: u64 }
         })
         .expect("default key index should parse");
-        let (constructors, api) =
-            high_cardinality_api_tokens(&format_ident!("Test"), &[block], false);
+        let (constructors, api) = high_cardinality_api_tokens(
+            &syn::parse_quote!(pub),
+            &format_ident!("Test"),
+            &[block],
+            false,
+        );
         let tokens = format!("{constructors} {api}");
 
         assert!(tokens.contains("TestStreamReader"));

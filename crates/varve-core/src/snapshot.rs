@@ -17,6 +17,30 @@ pub(crate) struct SnapshotFile {
     bounds: SnapshotBounds,
 }
 
+/// Proof that the backing file physically reaches an offset.
+///
+/// The field is private to this module and the only constructor names the
+/// obligation: a `write_all` of `B` bytes that started at `start` and returned
+/// `Ok` implies `physical_len >= start + B`, because `write_all` is
+/// all-or-error. It is a `u64` newtype, so producing one costs no allocation
+/// and no syscall — which is the entire point on the append path.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WrittenThrough(u64);
+
+impl WrittenThrough {
+    /// Records that a completed write reached `end_offset`.
+    ///
+    /// Call sites must have observed the write return `Ok`; passing a
+    /// prospective offset is what this type exists to make visible in review.
+    pub(crate) const fn after_write(end_offset: u64) -> Self {
+        Self(end_offset)
+    }
+
+    pub(crate) const fn end_offset(self) -> u64 {
+        self.0
+    }
+}
+
 impl SnapshotFile {
     pub(crate) fn new(file: File) -> Result<Self> {
         Self::from_file(file)
@@ -44,6 +68,41 @@ impl SnapshotFile {
         Ok(Self {
             file: Arc::clone(&self.file),
             bounds,
+        })
+    }
+
+    /// Rebinds to the end of a write that has already completed.
+    ///
+    /// [`Self::with_len`] establishes exactly one fact — `len <= physical_len`
+    /// — and the only way to learn `physical_len` from nothing is an `fstat`.
+    /// A caller that has just returned from `write_all` knows the fact for
+    /// free, so it hands over a [`WrittenThrough`] instead of a bare `u64` and
+    /// no metadata syscall is issued. That is one of the two per-record
+    /// syscalls the append hot path used to pay.
+    ///
+    /// Still fallible, and still growth-only: a witness is proof that the file
+    /// reaches `end_offset`, never proof that a *shorter* snapshot is right, so
+    /// this refuses to shrink. Shrinking a snapshot needs `with_len`, which
+    /// pays the `fstat` and is not on the append path.
+    ///
+    /// What is given up relative to `with_len` is an incidental side effect of
+    /// the `fstat`: it also noticed a file truncated under the writer by
+    /// something outside this process. That now surfaces on the next read as
+    /// `UnexpectedEof` / `SnapshotRangeOutOfBounds` rather than at append time
+    /// — still an error, never silently wrong data — and the writer holds the
+    /// single-writer advisory lock that puts the scenario out of contract.
+    pub(crate) fn with_written_len(&self, written: WrittenThrough) -> Result<Self> {
+        let len = written.end_offset();
+        if len < self.len() {
+            return Err(Error::SnapshotRangeOutOfBounds {
+                offset: 0,
+                len,
+                snapshot_len: self.len(),
+            });
+        }
+        Ok(Self {
+            file: Arc::clone(&self.file),
+            bounds: SnapshotBounds::new(ByteLength::new(len)),
         })
     }
 
@@ -241,7 +300,34 @@ impl SnapshotCursor {
     }
 }
 
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+std::thread_local! {
+    /// Metadata syscalls this thread has issued from
+    /// [`checked_snapshot_bounds`].
+    ///
+    /// Fault-testing hook only. The append path must not advance it at all —
+    /// it rebinds through [`SnapshotFile::with_written_len`], which proves the
+    /// same fact from the write that just returned — so a regression test can
+    /// delta-measure an append window and assert zero for any record count.
+    static SNAPSHOT_BOUNDS_FSTATS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one `checked_snapshot_bounds` metadata syscall on this thread. Inert
+/// outside tests and without the `scalable-fault-injection` feature.
+#[inline]
+fn count_snapshot_bounds_fstat() {
+    #[cfg(any(test, feature = "scalable-fault-injection"))]
+    SNAPSHOT_BOUNDS_FSTATS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+/// Reads and clears this thread's `checked_snapshot_bounds` syscall count.
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+pub(crate) fn take_snapshot_bounds_fstats() -> u64 {
+    SNAPSHOT_BOUNDS_FSTATS.with(|count| count.replace(0))
+}
+
 fn checked_snapshot_bounds(file: &File, len: u64) -> Result<SnapshotBounds> {
+    count_snapshot_bounds_fstat();
     let physical_len = file.metadata()?.len();
     SnapshotBounds::new(ByteLength::new(physical_len))
         .validate_range(FileOffset::ZERO, ByteLength::new(len))?;

@@ -4,8 +4,8 @@ use std::path::Path;
 
 use crate::collections::{MaterializationBudget, ensure_registered_block};
 use crate::disk_index::{
-    DiskIndexDescriptor as DiskIndexedBlock, DiskIndexEntry, DiskIndexError, DiskIndexFrontier,
-    DiskIndexMetadata, DiskIndexOptions, DiskIndexPhysicalRecord, DiskIndexPlan,
+    CompositeKey, DiskIndexDescriptor as DiskIndexedBlock, DiskIndexEntry, DiskIndexError,
+    DiskIndexFrontier, DiskIndexMetadata, DiskIndexOptions, DiskIndexPhysicalRecord, DiskIndexPlan,
     DiskIndexRecordPointer, DiskIndexState, DiskIndexStore, DiskIndexTail, DiskIndexUpdate,
     DiskIndexWriteBatch, PRIMARY_GENERATION_WINDOW, VarveDiskKey, read_metadata_read_only,
     sidecar_path, tail_limit_for_spec,
@@ -530,17 +530,24 @@ impl VarveIndexedWriter {
         self.ensure_batch()?;
         let canonical_key =
             DiskIndexUpdate::encode_key(&key, self.index.max_key_bytes()).map_err(index_error)?;
-        let previous = if self.stream.spec().index_policy.keyed_offset_chain {
-            previous_offset(
-                self.batch
-                    .as_ref()
-                    .expect("batch initialized")
-                    .lookup_pointer_canonical(T::ID, &canonical_key)
+        // Built once here when the chain policy needs the lookup, and moved on
+        // into the staged row below; `None` when it does not, in which case the
+        // row's key is built where it always was, inside
+        // `apply_update_with_tail`. Either way, one build per record.
+        let (previous, composite) = if self.stream.spec().index_policy.keyed_offset_chain {
+            let batch = self.batch.as_ref().expect("batch initialized");
+            let composite = batch
+                .composite_key_for(T::ID, &canonical_key)
+                .map_err(index_error)?;
+            let previous = previous_offset(
+                batch
+                    .lookup_pointer_composite(T::ID, &composite)
                     .map_err(index_error)?
                     .entry,
-            )
+            );
+            (previous, Some(composite))
         } else {
-            None
+            (None, None)
         };
         let old_eof = self.stream.snapshot().len();
         let sequence = self.stream.next_sequence()?;
@@ -573,7 +580,7 @@ impl VarveIndexedWriter {
         let permit = self.ensure_not_poisoned()?;
         self.stream
             .append_prepared_chunk(permit, &record.bytes, &[(T::ID, info)])?;
-        self.publish_update(old_eof, info, update, tail)
+        self.publish_update(old_eof, info, update, tail, composite)
     }
 
     pub fn delete_info<T>(&mut self, key: &T::Key) -> Result<AppendInfo>
@@ -587,17 +594,22 @@ impl VarveIndexedWriter {
         self.ensure_batch()?;
         let canonical_key =
             DiskIndexUpdate::encode_key(key, self.index.max_key_bytes()).map_err(index_error)?;
-        let previous = if self.stream.spec().index_policy.keyed_offset_chain {
-            previous_offset(
-                self.batch
-                    .as_ref()
-                    .expect("batch initialized")
-                    .lookup_pointer_canonical(T::ID, &canonical_key)
+        // As in `push_info`: one composite key per staged row, built here only
+        // when the chain policy makes the lookup necessary.
+        let (previous, composite) = if self.stream.spec().index_policy.keyed_offset_chain {
+            let batch = self.batch.as_ref().expect("batch initialized");
+            let composite = batch
+                .composite_key_for(T::ID, &canonical_key)
+                .map_err(index_error)?;
+            let previous = previous_offset(
+                batch
+                    .lookup_pointer_composite(T::ID, &composite)
                     .map_err(index_error)?
                     .entry,
-            )
+            );
+            (previous, Some(composite))
         } else {
-            None
+            (None, None)
         };
         let old_eof = self.stream.snapshot().len();
         let sequence = self.stream.next_sequence()?;
@@ -627,7 +639,7 @@ impl VarveIndexedWriter {
         let permit = self.ensure_not_poisoned()?;
         self.stream
             .append_prepared_chunk(permit, &record.bytes, &[(TOMBSTONE_BLOCK_ID, info)])?;
-        self.publish_update(old_eof, info, update, tail)
+        self.publish_update(old_eof, info, update, tail, composite)
     }
 
     pub fn push_iter<T, I>(
@@ -782,17 +794,25 @@ impl VarveIndexedWriter {
             let key = value.key();
             let canonical_key = DiskIndexUpdate::encode_key(&key, self.index.max_key_bytes())
                 .map_err(index_error)?;
-            let previous_key = if self.stream.spec().index_policy.keyed_offset_chain {
-                previous_offset(
-                    self.batch
-                        .as_ref()
-                        .expect("batch initialized")
-                        .lookup_pointer_canonical(T::ID, &canonical_key)
+            // One composite key per record here too. It stays valid across the
+            // `publish_prepared_chunk` below that may commit this batch and
+            // start another: the bytes are `(block_id, key length, key)` and
+            // `max_key_bytes` is the store's, not the batch's, so a new batch
+            // stores the same row under the same key.
+            let (previous_key, composite) = if self.stream.spec().index_policy.keyed_offset_chain {
+                let batch = self.batch.as_ref().expect("batch initialized");
+                let composite = batch
+                    .composite_key_for(T::ID, &canonical_key)
+                    .map_err(index_error)?;
+                let previous = previous_offset(
+                    batch
+                        .lookup_pointer_composite(T::ID, &composite)
                         .map_err(index_error)?
                         .entry,
-                )
+                );
+                (previous, Some(composite))
             } else {
-                None
+                (None, None)
             };
             let sequence = next_sequence.ok_or(Error::SequenceExhausted)?;
             let record = prepare_stream_user_record(
@@ -850,7 +870,7 @@ impl VarveIndexedWriter {
             self.batch
                 .as_mut()
                 .expect("batch initialized")
-                .apply_update_with_tail(old_eof, next_offset, &update, tail)
+                .apply_update_with_tail(old_eof, next_offset, &update, tail, composite)
                 .map_err(index_error)?;
 
             next_sequence = sequence.checked_add(1);
@@ -1057,12 +1077,19 @@ impl VarveIndexedWriter {
         info: AppendInfo,
         update: DiskIndexUpdate,
         tail: Option<DiskIndexTail>,
+        composite: Option<CompositeKey>,
     ) -> Result<AppendInfo> {
         if let Err(error) = self
             .batch
             .as_mut()
             .expect("batch initialized")
-            .apply_update_with_tail(old_eof, self.stream.snapshot().len(), &update, tail)
+            .apply_update_with_tail(
+                old_eof,
+                self.stream.snapshot().len(),
+                &update,
+                tail,
+                composite,
+            )
         {
             self.stream.poison();
             return Err(Error::PublishedButIndexStale {
@@ -1322,8 +1349,11 @@ where
             ));
         }
         if let Some(update) = update {
+            // Rebuild: no lookup happened, so there is no key already in hand
+            // and `apply_update_with_tail` builds the one it needs, exactly as
+            // it always did.
             batch
-                .apply_update_with_tail(covered, end, &update, tail)
+                .apply_update_with_tail(covered, end, &update, tail, None)
                 .map_err(index_error)?;
         } else {
             batch

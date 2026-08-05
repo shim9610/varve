@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -394,7 +394,7 @@ mod region_reader {
         pub(crate) fn read_exact_at(&self, offset: u64, buffer: &mut [u8]) -> Result<()> {
             // One count per logical read, not per retry: the subject is whether
             // a read was *issued* while a bitmap page-store lock was held.
-            super::count_matrix_region_read();
+            super::count_matrix_region_read(self.pool.is_some());
             let private = self.pool.and_then(|pool| pool.private_handle(self.file));
             let file: &File = private.as_deref().unwrap_or(self.file);
             let mut consumed = 0usize;
@@ -1006,6 +1006,18 @@ mod scaling_counters {
         pub(super) static LAZY_FAULT_BYTES_READ: Cell<u64> = const { Cell::new(0) };
         /// Payload bytes the demand caches currently hold.
         pub(super) static LAZY_CACHED_BYTES_RESIDENT: Cell<u64> = const { Cell::new(0) };
+        /// Hash-map probes spent maintaining the demand cache's recency order
+        /// ([`super::PageStore::note_used`] and its two link helpers).
+        ///
+        /// The unit is deliberately "one map probe", because that is what the
+        /// linear predecessor spent per *comparison*: it makes "constant per
+        /// touch" and "proportional to the cached page count" the same
+        /// measurement in the same units.
+        pub(super) static LRU_TOUCH_STEPS: Cell<u64> = const { Cell::new(0) };
+        /// Bitmap bytes actually written to the file by
+        /// [`super::write_bitmap_byte`] — one per `seek` + one-byte `write_all`
+        /// pair that was issued rather than skipped.
+        pub(super) static BITMAP_BYTE_WRITES: Cell<u64> = const { Cell::new(0) };
         /// F-02: countdown to an injected page-index entry-write failure.
         /// Zero is inert; `n` fails the `n`-th write from now.
         pub(super) static PAGE_INDEX_ENTRY_WRITE_FAILURE: Cell<u64> = const { Cell::new(0) };
@@ -1027,6 +1039,11 @@ mod scaling_counters {
         /// Page-store locks this thread holds *right now*
         /// ([`super::PageStoreGuard`]). Not a total: it rises and falls.
         pub(super) static BITMAP_STORE_GUARDS_HELD: Cell<u64> = const { Cell::new(0) };
+        /// Slot bytes the explicit CRC commit-map rebuild fed to `crc32` on
+        /// this thread. The rebuild's I/O follows the CRC-validity evidence, so
+        /// this measures the sweep's cost against the *set* bits rather than
+        /// against the whole keyspace it still visits.
+        pub(super) static REBUILD_SLOT_BYTES_READ: Cell<u64> = const { Cell::new(0) };
         /// Positional matrix-region reads issued on this thread
         /// ([`super::MatrixRegionReader::read_exact_at`]).
         pub(super) static MATRIX_REGION_READS: Cell<u64> = const { Cell::new(0) };
@@ -1034,6 +1051,10 @@ mod scaling_counters {
         /// read-path contract is that this stays zero; see
         /// [`super::MatrixRecoveryReport::matrix_region_reads_under_bitmap_lock`].
         pub(super) static MATRIX_REGION_READS_UNDER_LOCK: Cell<u64> = const { Cell::new(0) };
+        /// Of those, the ones issued by a reader built without the file's
+        /// [`super::MatrixReadPool`]. See
+        /// [`super::MatrixRecoveryReport::matrix_region_reads_without_pool`].
+        pub(super) static MATRIX_REGION_READS_WITHOUT_POOL: Cell<u64> = const { Cell::new(0) };
     }
 
     pub(super) fn add(cell: &'static std::thread::LocalKey<Cell<u64>>, value: u64) {
@@ -1067,12 +1088,36 @@ fn count_bitmap_bytes_hashed(bytes: u64) {
 fn count_bitmap_bytes_hashed(_bytes: u64) {}
 
 #[cfg(any(test, feature = "scalable-fault-injection"))]
+fn count_lru_touch_steps(steps: u64) {
+    scaling_counters::add(&scaling_counters::LRU_TOUCH_STEPS, steps);
+}
+
+#[cfg(not(any(test, feature = "scalable-fault-injection")))]
+fn count_lru_touch_steps(_steps: u64) {}
+
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+fn count_bitmap_byte_write() {
+    scaling_counters::add(&scaling_counters::BITMAP_BYTE_WRITES, 1);
+}
+
+#[cfg(not(any(test, feature = "scalable-fault-injection")))]
+fn count_bitmap_byte_write() {}
+
+#[cfg(any(test, feature = "scalable-fault-injection"))]
 fn count_open_bitmap_pages_visited(pages: u64) {
     scaling_counters::add(&scaling_counters::OPEN_BITMAP_PAGES_VISITED, pages);
 }
 
 #[cfg(not(any(test, feature = "scalable-fault-injection")))]
 fn count_open_bitmap_pages_visited(_pages: u64) {}
+
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+fn count_rebuild_slot_bytes_read(bytes: u64) {
+    scaling_counters::add(&scaling_counters::REBUILD_SLOT_BYTES_READ, bytes);
+}
+
+#[cfg(not(any(test, feature = "scalable-fault-injection")))]
+fn count_rebuild_slot_bytes_read(_bytes: u64) {}
 
 /// True when a test has asked open to behave as if the platform reported no
 /// allocation map at all, which is also what a file fragmented past
@@ -1171,16 +1216,25 @@ fn leave_page_store_guard() {}
 /// performs. What it does not see is I/O issued through any other handle:
 /// `SnapshotFile` reads of the *record* region, and the writer's
 /// cursor-relative `&mut File` writes.
+///
+/// `pooled` is whether the reader that issued it carries the file's
+/// [`MatrixReadPool`]. A read issued without one is not wrong — it returns the
+/// same bytes — but on Windows it goes through the shared file object, which is
+/// what convoys concurrent readers, so a site that *has* a pool and drops it is
+/// a defect this counts rather than argues about.
 #[cfg(any(test, feature = "scalable-fault-injection"))]
-fn count_matrix_region_read() {
+fn count_matrix_region_read(pooled: bool) {
     scaling_counters::add(&scaling_counters::MATRIX_REGION_READS, 1);
+    if !pooled {
+        scaling_counters::add(&scaling_counters::MATRIX_REGION_READS_WITHOUT_POOL, 1);
+    }
     if scaling_counters::get_always(&scaling_counters::BITMAP_STORE_GUARDS_HELD) != 0 {
         scaling_counters::add(&scaling_counters::MATRIX_REGION_READS_UNDER_LOCK, 1);
     }
 }
 
 #[cfg(not(any(test, feature = "scalable-fault-injection")))]
-fn count_matrix_region_read() {}
+fn count_matrix_region_read(_pooled: bool) {}
 
 /// Tracks the live demand-cache total, so criterion (B)'s "residency tracks the
 /// working set, in both directions" is a measured number rather than a claim.
@@ -1686,6 +1740,48 @@ impl MatrixRecoveryReport {
         scaling_counters::get(&scaling_counters::LAZY_FAULT_BYTES_READ)
     }
 
+    /// Hash-map probes spent keeping the demand cache's recency order, on this
+    /// thread.
+    ///
+    /// The recency update runs on **every** matrix cell read and write that
+    /// touches a demand-cached page — `cell_status` reaches it through
+    /// `SparseBitmap::byte`, and so does the first statement of
+    /// `prepare_byte_write` — so its per-touch cost is the one term in the
+    /// matrix hot path that used to follow the *cache size* rather than the
+    /// working set. It is now bounded by a small constant: the recency order is
+    /// an intrusive doubly-linked list threaded through the cached pages
+    /// themselves, so a touch is at most six map probes and a re-read of the
+    /// most recently used page is none at all.
+    ///
+    /// The unit is one probe, which is also what the linear predecessor spent
+    /// per comparison of its `VecDeque` scan, so the two are directly
+    /// comparable: 512 cached pages cost ~256 there and at most 6 here.
+    pub fn matrix_lru_touch_steps() -> u64 {
+        scaling_counters::get(&scaling_counters::LRU_TOUCH_STEPS)
+    }
+
+    /// Bitmap bytes this thread actually wrote to a matrix file.
+    ///
+    /// One per `seek` + one-byte `write_all` pair that `write_bitmap_byte`
+    /// issued. A mutation whose byte already holds the value being written
+    /// stores nothing and counts nothing, so the difference between this and
+    /// the number of bit mutations attempted is exactly the redundant I/O.
+    pub fn matrix_bitmap_byte_writes() -> u64 {
+        scaling_counters::get(&scaling_counters::BITMAP_BYTE_WRITES)
+    }
+
+    /// Slot bytes read and hashed by the explicit CRC commit-map rebuild
+    /// ([`crate::VarveFile::rebuild_matrix_commit_from_crc`]) on this thread.
+    ///
+    /// The rebuild visits the whole keyspace — the published recovery model
+    /// requires it — but a cell whose CRC-validity bit is clear cannot be
+    /// rebuilt as committed whatever its slot holds, so its slot is not read.
+    /// This counter is therefore `set bits * slot_stride`, not
+    /// `cell count * slot_stride`, and where every bit is set the two coincide.
+    pub fn matrix_rebuild_slot_bytes_read() -> u64 {
+        scaling_counters::get(&scaling_counters::REBUILD_SLOT_BYTES_READ)
+    }
+
     /// Positional matrix-region reads issued on this thread.
     ///
     /// Every byte the matrix reads — cell payloads, per-cell checksums, aux
@@ -1724,6 +1820,26 @@ impl MatrixRecoveryReport {
         scaling_counters::get(&scaling_counters::MATRIX_REGION_READS_UNDER_LOCK)
     }
 
+    /// Of those reads, the number issued by a reader that carried no
+    /// [`MatrixReadPool`].
+    ///
+    /// Not every such read is a defect: the open, verify and rebuild paths hold
+    /// the file as `&mut File`, so no other reader can be in flight and no pool
+    /// exists to hand them. What this catches is a `&self` read path that *is*
+    /// holding a pool — every backed commit map holds one in its `LazyBacking`
+    /// — and issues its reads through the shared file object anyway, which is
+    /// the Windows convoy the pool exists to break.
+    ///
+    /// It is a count of issued reads, not of contention: on Unix
+    /// `MatrixReadPool::reopen` returns `None` by design (`pread` does not
+    /// serialise on the file object), so a pooled read there is byte-identical
+    /// and costs one thread-local lookup for a handle it will never get. This
+    /// counter is about which reader was used, and is meaningful on both
+    /// platforms for that reason; the throughput it protects is Windows-only.
+    pub fn matrix_region_reads_without_pool() -> u64 {
+        scaling_counters::get(&scaling_counters::MATRIX_REGION_READS_WITHOUT_POOL)
+    }
+
     /// Commit-map page-store locks this thread holds at this instant.
     ///
     /// Zero at every point outside `varve-core`'s own matrix code, so a test can
@@ -1741,6 +1857,7 @@ impl MatrixRecoveryReport {
     pub fn reset_matrix_lock_audit_counters() {
         scaling_counters::set(&scaling_counters::MATRIX_REGION_READS, 0);
         scaling_counters::set(&scaling_counters::MATRIX_REGION_READS_UNDER_LOCK, 0);
+        scaling_counters::set(&scaling_counters::MATRIX_REGION_READS_WITHOUT_POOL, 0);
     }
 
     /// Resets the two demand-loading counters, so a test can measure one phase
@@ -1826,6 +1943,9 @@ impl MatrixRecoveryReport {
         scaling_counters::set(&scaling_counters::PAGE_INDEX_BYTES_RESIDENT, 0);
         scaling_counters::set(&scaling_counters::LAZY_FAULT_BYTES_READ, 0);
         scaling_counters::set(&scaling_counters::LAZY_CACHED_BYTES_RESIDENT, 0);
+        scaling_counters::set(&scaling_counters::LRU_TOUCH_STEPS, 0);
+        scaling_counters::set(&scaling_counters::BITMAP_BYTE_WRITES, 0);
+        scaling_counters::set(&scaling_counters::REBUILD_SLOT_BYTES_READ, 0);
     }
 }
 
@@ -1853,7 +1973,26 @@ struct BitmapPage {
     /// that total, so counting it there would underflow the subtraction and
     /// turn a legal clear into `InvalidMatrixLayout`.
     cached: bool,
+    /// Neighbours in the demand cache's recency chain, or [`NO_PAGE`].
+    ///
+    /// The chain is intrusive: it lives in the pages themselves rather than in
+    /// a side container, which is what makes "this page was just used" and
+    /// "this page is gone" both `O(1)` and both impossible to get out of step
+    /// with `PageStore::pages` — the entry *is* the page.
+    ///
+    /// Meaningful only while `cached` is true. A page the writer materialised
+    /// carries `cached: false` and is never linked, so [`PageStore::evict_one`]
+    /// cannot reach it.
+    lru_prev: u64,
+    lru_next: u64,
 }
+
+/// Sentinel end of the recency chain in [`BitmapPage::lru_prev`] /
+/// [`BitmapPage::lru_next`] and [`PageStore::lru_head`] / [`PageStore::lru_tail`].
+///
+/// Legal page numbers are bounded by `SparseBitmap::page_count` and by
+/// [`PAGE_INDEX_MAX_ENTRIES`], so `u64::MAX` is never one of them.
+const NO_PAGE: u64 = u64::MAX;
 
 /// Where a lazily loaded bitmap's pages come from (PERF-01 / criterion B).
 ///
@@ -1897,6 +2036,17 @@ struct LazyBacking {
 /// matrix read path" was true of round 16 and is no longer true of this one:
 /// there is one, and it is per-bitmap.
 ///
+/// The `O(1)` in that first sentence is a claim about the *recency update*, and
+/// it was false until the demand cache's least-recently-used order stopped
+/// being a `VecDeque` beside the map. A touch scanned the deque for the page
+/// and then memmoved it, under this lock, on every cell read and every cell
+/// write — `O(cached pages)`, up to the 512-page default cache and up to 16,384
+/// at the ceiling a 64 MiB `max_matrix_bitmap_bytes` admits. The order is now an
+/// intrusive doubly-linked list threaded through [`BitmapPage`] itself
+/// ([`PageStore::note_used`]), so the critical section really is a bounded
+/// number of map probes; [`MatrixRecoveryReport::matrix_lru_touch_steps`]
+/// counts them so the sentence is measured rather than asserted.
+///
 /// That "never" is *counted*, not argued: acquiring the lock goes through
 /// [`PageStoreGuard`], every matrix read goes through
 /// [`MatrixRegionReader::read_exact_at`], and the second increments a violation
@@ -1908,7 +2058,7 @@ struct LazyBacking {
 /// `crates/varve/tests/matrix_concurrent_reads.rs`, because two runs of it on
 /// identical code differ by 1.4x versus 2.1x on a shared CI runner and a
 /// threshold that survives that noise would also pass a real convoy.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PageStore {
     pages: HashMap<u64, BitmapPage>,
     ones: u64,
@@ -1916,15 +2066,112 @@ struct PageStore {
     charged_bytes: u64,
     /// Payload bytes held by the demand cache.
     cached_bytes: u64,
-    /// Demand-cached pages in least-recently-used order.
-    lru: VecDeque<u64>,
+    /// Least-recently-used end of the intrusive recency chain, or [`NO_PAGE`].
+    ///
+    /// This and [`Self::lru_tail`] replace the `VecDeque<u64>` this store used
+    /// to keep beside `pages`. Two things were wrong with that, and they were
+    /// the same thing: the order lived in a container of its own. Finding the
+    /// entry for a page was `O(cached pages)` — a scan plus a memmove on
+    /// *every* cell read and write, since `SparseBitmap::byte` is the first
+    /// statement of both paths — and releasing a page from `pages` did not
+    /// release its entry, so the deque grew without bound over set/clear churn
+    /// and was charged against no limit. Threading the links through the pages
+    /// themselves removes both: a touch is a fixed number of map probes, and
+    /// there is no second container left to fall out of step.
+    lru_head: u64,
+    lru_tail: u64,
+}
+
+impl Default for PageStore {
+    fn default() -> Self {
+        Self {
+            pages: HashMap::new(),
+            ones: 0,
+            charged_bytes: 0,
+            cached_bytes: 0,
+            lru_head: NO_PAGE,
+            lru_tail: NO_PAGE,
+        }
+    }
 }
 
 impl PageStore {
+    /// Removes `page` from the recency chain, if it is on it.
+    ///
+    /// Three map probes at most: the page, its predecessor and its successor.
+    /// Idempotent — an unlinked page has both neighbours set to [`NO_PAGE`] and
+    /// is not the head, which is the state this leaves behind.
+    fn lru_unlink(&mut self, page: u64) {
+        count_lru_touch_steps(1);
+        let (prev, next) = {
+            let Some(held) = self.pages.get_mut(&page) else {
+                return;
+            };
+            if held.lru_prev == NO_PAGE && held.lru_next == NO_PAGE && self.lru_head != page {
+                return;
+            }
+            let prev = std::mem::replace(&mut held.lru_prev, NO_PAGE);
+            let next = std::mem::replace(&mut held.lru_next, NO_PAGE);
+            (prev, next)
+        };
+        if prev == NO_PAGE {
+            self.lru_head = next;
+        } else {
+            count_lru_touch_steps(1);
+            if let Some(before) = self.pages.get_mut(&prev) {
+                before.lru_next = next;
+            }
+        }
+        if next == NO_PAGE {
+            self.lru_tail = prev;
+        } else {
+            count_lru_touch_steps(1);
+            if let Some(after) = self.pages.get_mut(&next) {
+                after.lru_prev = prev;
+            }
+        }
+    }
+
+    /// Links `page` at the most-recently-used end. Two map probes at most.
+    ///
+    /// The caller must have unlinked it first; only `cached` pages are ever
+    /// passed here, which is what keeps a writer-materialised page out of
+    /// [`Self::evict_one`]'s reach.
+    fn lru_push_back(&mut self, page: u64) {
+        let tail = self.lru_tail;
+        count_lru_touch_steps(1);
+        let Some(held) = self.pages.get_mut(&page) else {
+            return;
+        };
+        held.lru_prev = tail;
+        held.lru_next = NO_PAGE;
+        if tail == NO_PAGE {
+            self.lru_head = page;
+        } else {
+            count_lru_touch_steps(1);
+            if let Some(before) = self.pages.get_mut(&tail) {
+                before.lru_next = page;
+            }
+        }
+        self.lru_tail = page;
+    }
+
+    /// Moves `page` to the most-recently-used end.
+    ///
+    /// On the hot path by construction: every matrix cell read reaches it
+    /// through `SparseBitmap::byte`, and so does every cell write, because
+    /// `prepare_byte_write` reads the current byte first. The tail test makes
+    /// the commonest case — re-reading the page just read — cost nothing at
+    /// all, and the rest is bounded by six map probes whatever the cache
+    /// holds.
     fn note_used(&mut self, page: u64) {
-        if let Some(at) = self.lru.iter().position(|held| *held == page) {
-            self.lru.remove(at);
-            self.lru.push_back(page);
+        if self.lru_tail == page {
+            return;
+        }
+        count_lru_touch_steps(1);
+        if self.pages.get(&page).is_some_and(|held| held.cached) {
+            self.lru_unlink(page);
+            self.lru_push_back(page);
         }
     }
 
@@ -1933,22 +2180,77 @@ impl PageStore {
     /// Safe because demand-cached pages are write-through: every mutation
     /// writes the bitmap byte to disk before `commit_byte_write` updates
     /// memory, so a cached page never holds state the file does not.
+    ///
+    /// No skip loop: the chain holds exactly the demand-cached pages `pages`
+    /// currently holds, so its head is always evictable.
     fn evict_one(&mut self) -> bool {
-        while let Some(page) = self.lru.pop_front() {
-            let Some(held) = self.pages.get(&page) else {
-                continue;
-            };
-            if !held.cached {
-                continue;
-            }
-            let held = self.pages.remove(&page).expect("page present");
-            self.cached_bytes = self
-                .cached_bytes
-                .saturating_sub(usize_to_u64(held.bytes.len()).unwrap_or(0));
-            self.ones = self.ones.saturating_sub(held.ones);
-            return true;
+        let page = self.lru_head;
+        if page == NO_PAGE {
+            return false;
         }
-        false
+        self.lru_unlink(page);
+        let Some(held) = self.pages.remove(&page) else {
+            // Unreachable: the chain names only pages `pages` holds.
+            return false;
+        };
+        self.cached_bytes = self
+            .cached_bytes
+            .saturating_sub(usize_to_u64(held.bytes.len()).unwrap_or(0));
+        self.ones = self.ones.saturating_sub(held.ones);
+        true
+    }
+
+    /// Pages currently on the recency chain, walked forwards.
+    ///
+    /// Test-only, and deliberately bounded by `pages.len()`: a chain longer
+    /// than the map it is threaded through is the corruption this
+    /// representation has to be proved free of, and an unbounded walk would
+    /// hang instead of failing.
+    #[cfg(test)]
+    fn lru_len(&self) -> usize {
+        let mut len = 0;
+        let mut page = self.lru_head;
+        while page != NO_PAGE {
+            len += 1;
+            assert!(
+                len <= self.pages.len(),
+                "recency chain is longer than the page map it is threaded through"
+            );
+            page = self.pages.get(&page).map_or(NO_PAGE, |held| held.lru_next)
+        }
+        len
+    }
+
+    /// Asserts the chain is a well-formed doubly-linked list over exactly the
+    /// demand-cached pages of `pages`.
+    #[cfg(test)]
+    fn assert_lru_consistent(&self) {
+        let forwards = self.lru_len();
+        let cached = self.pages.values().filter(|held| held.cached).count();
+        assert_eq!(
+            forwards, cached,
+            "the recency chain and the cached page set disagree"
+        );
+        let mut backwards = 0;
+        let mut page = self.lru_tail;
+        let mut seen_next = NO_PAGE;
+        while page != NO_PAGE {
+            backwards += 1;
+            let held = self.pages.get(&page).expect("chain names a resident page");
+            assert!(held.cached, "the recency chain names an uncached page");
+            assert_eq!(held.lru_next, seen_next, "forward link disagrees");
+            seen_next = page;
+            page = held.lru_prev;
+            assert!(backwards <= cached, "the recency chain loops");
+        }
+        assert_eq!(
+            forwards, backwards,
+            "the chain has different lengths by end"
+        );
+        assert_eq!(
+            self.lru_head, seen_next,
+            "head is not the chain's first page"
+        );
     }
 }
 
@@ -2123,7 +2425,11 @@ impl Clone for SparseBitmap {
                 ones: source.ones,
                 charged_bytes: source.charged_bytes,
                 cached_bytes: source.cached_bytes,
-                lru: source.lru.clone(),
+                // The recency chain rides along inside `pages`: its links are
+                // page numbers, which are stable across the clone, so copying
+                // the two ends is the whole of it.
+                lru_head: source.lru_head,
+                lru_tail: source.lru_tail,
             }),
             backing: self.backing.clone(),
             index_slots: self.index_slots.clone(),
@@ -2285,15 +2591,19 @@ impl SparseBitmap {
             1,
             ReadLimitKey::MatrixBitmapBytes.resource(),
         )?;
-        store.lru.push_back(page);
         store.pages.insert(
             page,
             BitmapPage {
                 bytes: Arc::new(bytes),
                 ones,
                 cached: true,
+                lru_prev: NO_PAGE,
+                lru_next: NO_PAGE,
             },
         );
+        // After the insert, not before: the recency chain is threaded through
+        // the pages themselves, so the page has to exist to be linked.
+        store.lru_push_back(page);
         store.cached_bytes = store.cached_bytes.saturating_add(len);
         store.ones = store.ones.saturating_add(ones);
         record_lazy_cached_bytes(store.cached_bytes);
@@ -2545,6 +2855,10 @@ impl SparseBitmap {
                     bytes: Arc::new(bytes),
                     ones: 0,
                     cached: false,
+                    // Never linked: `cached: false` keeps it out of the
+                    // recency chain and therefore out of `evict_one`'s reach.
+                    lru_prev: NO_PAGE,
+                    lru_next: NO_PAGE,
                 });
                 materialised = page_len;
             }
@@ -2604,6 +2918,15 @@ impl SparseBitmap {
         if prepared.page_ones_after == 0 {
             // The page is now byte-for-byte the zero page that a non-resident
             // page already answers with, so holding it would be pure overhead.
+            //
+            // Unlink first, and unconditionally. The recency chain is threaded
+            // through the pages, so dropping a page without taking it off the
+            // chain would leave its neighbours pointing at nothing — which is
+            // also the reason the old side-container form leaked: it released
+            // the page and kept the entry, and a later re-fault of the same
+            // page pushed a *second* one, so the deque grew with clear-to-zero
+            // events without bound and against no limit.
+            store.lru_unlink(prepared.page);
             let dropped = store.pages.remove(&prepared.page);
             let released = match dropped {
                 // A demand-cached page was never charged to the layout's
@@ -2675,7 +2998,8 @@ impl SparseBitmap {
     fn clear(&mut self) {
         let store = self.store_mut();
         store.pages.clear();
-        store.lru.clear();
+        store.lru_head = NO_PAGE;
+        store.lru_tail = NO_PAGE;
         store.ones = 0;
         store.charged_bytes = 0;
         store.cached_bytes = 0;
@@ -2726,7 +3050,11 @@ impl SparseBitmap {
         let Some(backing) = self.backing.as_ref() else {
             return Ok(self.ones());
         };
-        let reader = MatrixRegionReader::new(backing.file.as_ref());
+        // Through the backing's own pool, exactly as the sibling fault-in at
+        // `load_page` does. This aggregate is reachable from the `&self` entry
+        // point `resume_signal`, so two readers really can be in this loop at
+        // once; the pool is what keeps them off one shared file object.
+        let reader = MatrixRegionReader::with_pool(backing.file.as_ref(), backing.pool.as_ref());
         let mut total = 0u64;
         let mut buffer: Option<PageVerifyBuffer> = None;
         for page in self.indexed_pages.keys().copied() {
@@ -5173,13 +5501,27 @@ pub(crate) fn rebuild_commit_map_from_crc<T: VarveMatrixBlock>(
     let mut rebuilt = SparseBitmap::new(layout.commits[commit_index].bit_count)?;
     let mut committed = 0u64;
     for ordinal in 0..block.cell_count {
-        let slot_offset = layout.slot_offset(block_index, ordinal)?;
-        let actual = crc32_file_range(file, slot_offset, block.slot_stride)?;
-        let stored = read_crc_at(
-            MatrixRegionReader::new(&*file),
-            indexed_crc_offset(crc_offset, ordinal)?,
-        )?;
-        let valid = evidence.get(ordinal)? && actual == stored;
+        // The validity bit is consulted first because it *decides* the outcome
+        // on its own: a cell whose bit is clear is not committed however its
+        // slot hashes, so hashing the slot to discover that answers a question
+        // already answered. The whole keyspace is still visited and every
+        // ordinal still gets its bit written below, so the rebuilt map is
+        // bit-identical; only the I/O follows the evidence instead of the cell
+        // count. One consequence stated plainly: an I/O error on the slot or
+        // CRC region of a cell whose bit is already clear is no longer
+        // surfaced here, and that cell's rebuilt outcome is the same either way.
+        let valid = if evidence.get(ordinal)? {
+            let slot_offset = layout.slot_offset(block_index, ordinal)?;
+            let actual = crc32_file_range(file, slot_offset, block.slot_stride)?;
+            count_rebuild_slot_bytes_read(block.slot_stride);
+            let stored = read_crc_at(
+                MatrixRegionReader::new(&*file),
+                indexed_crc_offset(crc_offset, ordinal)?,
+            )?;
+            actual == stored
+        } else {
+            false
+        };
         if valid {
             committed += 1;
         }
@@ -5415,6 +5757,17 @@ struct BitmapByteUpdate {
     byte_index: u64,
     byte_offset: u64,
     byte_value: u8,
+    /// False when the byte already holds `byte_value`, so storing it would
+    /// write back the value that is already there.
+    ///
+    /// [`prepare_bitmap_update`] has both operands in hand and never compared
+    /// them, so every first write of a matrix cell paid a `seek` and a one-byte
+    /// `write_all` to clear a commit bit that was already clear — and again for
+    /// the validity bit under a checksum policy. The in-memory half of the same
+    /// mutation has always treated this as a no-op (`PreparedByteWrite::changes`
+    /// and the short-circuit at the top of `SparseBitmap::commit_byte_write`);
+    /// this is the disk half agreeing with it.
+    changes: bool,
 }
 
 struct CommitBitUpdate {
@@ -5447,9 +5800,24 @@ fn prepare_bitmap_update(
         byte_index,
         byte_offset,
         byte_value,
+        changes: byte_value != current,
     })
 }
 
+/// Stores one bitmap byte, unless the byte already holds that value.
+///
+/// The skip is byte-identical, not merely equivalent. `current` in
+/// [`prepare_bitmap_update`] comes from [`SparseBitmap::byte`], which
+/// demand-faults the page through [`SparseBitmap::faulted_store`] and
+/// authenticates it against its stored digest before believing it, and answers
+/// `0` only for a page that is not materialised — which is a `set_len` hole and
+/// reads back as zero. So `current` *is* the durable byte, and writing
+/// `byte_value == current` stores the value already on disk.
+///
+/// What does change is the allocation map: a bitmap page that only ever
+/// received redundant writes now stays the hole `create` left, instead of being
+/// allocated to hold zeros. The file's content and length are unchanged; its
+/// `st_blocks` is smaller, and open can skip the page.
 fn write_bitmap_byte(file: &mut File, update: &BitmapByteUpdate) -> Result<()> {
     #[cfg(test)]
     if FAIL_NEXT_BITMAP_WRITE.replace(false) {
@@ -5458,6 +5826,10 @@ fn write_bitmap_byte(file: &mut File, update: &BitmapByteUpdate) -> Result<()> {
         )));
     }
 
+    if !update.changes {
+        return Ok(());
+    }
+    count_bitmap_byte_write();
     file.seek(SeekFrom::Start(update.byte_offset))?;
     file.write_all(&[update.byte_value])?;
     Ok(())
@@ -9118,9 +9490,14 @@ mod page_store_lock_audit_tests {
         scaling_counters::get_always(&scaling_counters::BITMAP_STORE_GUARDS_HELD)
     }
 
+    fn reads_without_pool() -> u64 {
+        scaling_counters::get_always(&scaling_counters::MATRIX_REGION_READS_WITHOUT_POOL)
+    }
+
     fn reset() {
         scaling_counters::set(&scaling_counters::MATRIX_REGION_READS, 0);
         scaling_counters::set(&scaling_counters::MATRIX_REGION_READS_UNDER_LOCK, 0);
+        scaling_counters::set(&scaling_counters::MATRIX_REGION_READS_WITHOUT_POOL, 0);
     }
 
     /// A lazily backed bitmap over a real file, every page live with one set
@@ -9211,6 +9588,45 @@ mod page_store_lock_audit_tests {
         assert_eq!(guards_held(), 0, "a page-store guard outlived its scope");
     }
 
+    /// The other half of the same read path: not only must the aggregate hold
+    /// no lock across its reads, it must issue them through the private-handle
+    /// pool its own `LazyBacking` is already carrying. Holding the pool and
+    /// reading through the shared file object is the Windows convoy in the one
+    /// place it is least affordable — an `O(live pages)` loop reachable under
+    /// `&self` from `resume_signal`.
+    #[test]
+    fn the_aggregate_reads_through_the_pool_it_holds() {
+        let (_directory, _file, map) = backed_bitmap(BITMAP_PAGE_BYTES * PAGES);
+        reset();
+        assert_eq!(map.ones_total().expect("aggregate"), PAGES);
+        assert!(
+            reads() >= PAGES,
+            "the aggregate read nothing, so the next assertion means nothing: {} reads",
+            reads()
+        );
+        assert_eq!(
+            reads_without_pool(),
+            0,
+            "`ones_total` dropped the `LazyBacking` pool it is holding and read through \
+             the shared file object"
+        );
+    }
+
+    /// The same question for the demand fault-in, which has been correct since
+    /// the pool landed. Its value here is as the control: a fix that swaps only
+    /// `load_page` leaves the aggregate's count nonzero and fails the test
+    /// above while this one passes both before and after.
+    #[test]
+    fn a_fault_in_reads_through_the_pool_it_holds() {
+        let (_directory, _file, map) = backed_bitmap(BITMAP_PAGE_BYTES * PAGES);
+        reset();
+        for page in 0..PAGES {
+            assert!(map.get(first_bit_of(page)).expect("committed bit"));
+        }
+        assert!(reads() >= PAGES, "no fault-in happened: {} reads", reads());
+        assert_eq!(reads_without_pool(), 0, "a fault-in dropped its pool");
+    }
+
     /// The audit itself, which the two tests above are worthless without: a
     /// counter that can never rise proves nothing by staying at zero.
     ///
@@ -9242,6 +9658,204 @@ mod page_store_lock_audit_tests {
             reads_under_lock(),
             1,
             "a read outside the lock was counted as a violation"
+        );
+        // The pool counter has to be shown able to rise for the same reason the
+        // lock counter does: this reader was deliberately built with
+        // `MatrixRegionReader::new`, so both of its reads are pool-less and a
+        // counter stuck at zero would make the assertions above worthless.
+        assert_eq!(
+            reads_without_pool(),
+            2,
+            "the audit did not notice a read issued without the pool, so its zero \
+             elsewhere means nothing"
+        );
+    }
+}
+
+/// The demand cache's recency order: bounded to maintain, and naming exactly
+/// the pages the store holds.
+///
+/// Both properties used to fail, and for the same reason — the order lived in a
+/// `VecDeque` beside the page map. Finding a page in it was a scan plus a
+/// memmove on every cell read and write, and releasing a page from the map left
+/// its entry behind, so a set/clear/re-read cycle on one page grew the deque
+/// without bound against no limit.
+#[cfg(test)]
+mod page_store_lru_tests {
+    use super::*;
+
+    /// Published pages in the fixture. The default demand cache is 512 pages,
+    /// so this is the size at which "constant per touch" and "half the cache
+    /// per touch" are two orders of magnitude apart.
+    const PAGES: u64 = 512;
+
+    /// A lazily backed bitmap over a real file: pages `0..PAGES` published with
+    /// one set bit each, page `PAGES` present in the address space but never
+    /// published, and `cache_limit` bytes of demand cache.
+    ///
+    /// `digest_base: None` because the subject is the recency order, and
+    /// without digests this fixture holds in builds without the `integrity`
+    /// feature too.
+    fn backed_bitmap(cache_limit: u64) -> (tempfile::TempDir, SparseBitmap) {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("commit-map");
+        let mut bytes = vec![0u8; ((PAGES + 1) * BITMAP_PAGE_BYTES) as usize];
+        for page in 0..PAGES {
+            bytes[(page * BITMAP_PAGE_BYTES) as usize] = 0b0000_0001;
+        }
+        std::fs::write(&path, &bytes).expect("write map");
+        let file = Arc::new(File::open(&path).expect("open map"));
+        let mut map = SparseBitmap::new((PAGES + 1) * BITMAP_PAGE_BYTES * 8).expect("bitmap");
+        map.backing = Some(LazyBacking {
+            file,
+            pool: Arc::new(MatrixReadPool::new()),
+            base_offset: 0,
+            digest_base: None,
+            cache_limit,
+        });
+        for page in 0..PAGES {
+            map.indexed_pages.insert(page, page + 1);
+            map.index_slots.push(page);
+        }
+        (directory, map)
+    }
+
+    /// The first bit of `page`, which `backed_bitmap` leaves set for a
+    /// published page.
+    fn first_bit_of(page: u64) -> u64 {
+        page * BITMAP_PAGE_BYTES * 8
+    }
+
+    fn touch_steps() -> u64 {
+        scaling_counters::get_always(&scaling_counters::LRU_TOUCH_STEPS)
+    }
+
+    /// THE LEAK. A page that clears to zero is released from the store, and its
+    /// place in the recency order must go with it.
+    ///
+    /// The cycle is the ordinary resume-and-clear one: fault a published page
+    /// in, clear its last set bit so the store drops it, then read it again so
+    /// it faults in afresh. `install_faulted_page` re-checks the page map and
+    /// not the order, so with the order in a side container each cycle pushed a
+    /// *second* entry and nothing ever removed either: growth followed
+    /// clear-to-zero events, not matrix size, and `evict_one` — the only drain
+    /// — never runs at all in the default profile, where the cache holds the
+    /// whole commit map.
+    #[test]
+    fn a_page_released_by_a_clear_leaves_the_recency_order() {
+        let (_directory, mut map) = backed_bitmap(BITMAP_PAGE_BYTES * PAGES);
+        for round in 0..2_000 {
+            assert!(
+                map.get(first_bit_of(0)).expect("published bit"),
+                "round {round}: the published page did not fault in"
+            );
+            map.set(first_bit_of(0), false).expect("clear the last bit");
+            let store = map.store();
+            assert!(
+                !store.pages.contains_key(&0),
+                "round {round}: an emptied page was retained"
+            );
+            store.assert_lru_consistent();
+            assert_eq!(
+                store.lru_len(),
+                0,
+                "round {round}: the recency order kept an entry for a released page"
+            );
+        }
+    }
+
+    /// THE SCAN. A touch costs a bounded number of map probes whatever the
+    /// cache holds.
+    ///
+    /// Every page is cached before the measurement starts, so the only work
+    /// each read performs is the recency update itself.
+    ///
+    /// The access order matters and it is deliberately not a sweep. The deque
+    /// was kept least-recently-used first, so `0, 1, 2, …` always asked for the
+    /// page at its *front* and found it in one comparison — the cheapest order
+    /// for the form being replaced, not the dearest. This alternates one hot
+    /// page with a sweep of the rest, which keeps the hot page near the far end
+    /// of that scan.
+    #[test]
+    fn a_recency_touch_costs_a_bounded_number_of_probes() {
+        const READS: u64 = 4_096;
+        let (_directory, map) = backed_bitmap(BITMAP_PAGE_BYTES * PAGES);
+        for page in 0..PAGES {
+            assert!(map.get(first_bit_of(page)).expect("published bit"));
+        }
+        assert_eq!(
+            map.store().lru_len(),
+            PAGES as usize,
+            "the fixture did not warm the whole cache"
+        );
+
+        scaling_counters::set(&scaling_counters::LRU_TOUCH_STEPS, 0);
+        for read in 0..READS {
+            let page = if read % 2 == 0 {
+                0
+            } else {
+                1 + (read / 2) % (PAGES - 1)
+            };
+            assert!(map.get(first_bit_of(page)).expect("published bit"));
+        }
+        let steps = touch_steps();
+        assert!(
+            steps <= 8 * READS,
+            "{READS} reads across a {PAGES}-page cache spent {steps} recency probes; the bound \
+             is {} — a probe count that follows the cache size is the linear scan back",
+            8 * READS
+        );
+        map.store().assert_lru_consistent();
+    }
+
+    /// A re-read really does make a page the most recently used, so the
+    /// cheapest way to satisfy the bound above — do nothing at all — is
+    /// excluded.
+    #[test]
+    fn eviction_drops_the_least_recently_used_page() {
+        let (_directory, map) = backed_bitmap(BITMAP_PAGE_BYTES * 4);
+        for page in 0..4 {
+            assert!(map.get(first_bit_of(page)).expect("published bit"));
+        }
+        // Page 0 was the least recently used; this makes page 1 so.
+        assert!(map.get(first_bit_of(0)).expect("published bit"));
+        // A fifth page does not fit, so exactly one page is evicted.
+        assert!(map.get(first_bit_of(4)).expect("published bit"));
+
+        let store = map.store();
+        store.assert_lru_consistent();
+        assert_eq!(store.lru_len(), 4, "the cache grew past its limit");
+        assert!(
+            !store.pages.contains_key(&1),
+            "eviction dropped a page other than the least recently used one"
+        );
+        assert!(
+            store.pages.contains_key(&0),
+            "the page the re-read made most recently used was evicted anyway"
+        );
+    }
+
+    /// A page the writer materialised is not demand-cached, so it is not in the
+    /// recency order and eviction cannot reach it — the property that keeps a
+    /// clear of a whole category from underflowing the budget subtraction.
+    #[test]
+    fn a_writer_materialised_page_is_never_evicted() {
+        let (_directory, mut map) = backed_bitmap(BITMAP_PAGE_BYTES * 2);
+        map.set(first_bit_of(PAGES), true)
+            .expect("materialise an unpublished page");
+        for page in 0..PAGES {
+            assert!(map.get(first_bit_of(page)).expect("published bit"));
+        }
+        let store = map.store();
+        store.assert_lru_consistent();
+        assert!(
+            store.pages.contains_key(&PAGES),
+            "cache pressure evicted a page the writer materialised"
+        );
+        assert_eq!(
+            store.lru_len(),
+            2,
+            "the recency order does not hold exactly the demand-cached pages"
         );
     }
 }

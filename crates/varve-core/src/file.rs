@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions, remove_file};
@@ -498,8 +499,34 @@ use replacement_target::{RecordOverwrite, ReplacementTarget};
 /// `crates/varve/tests/enforcement_gates.rs::the_primary_handle_escape_is_only_for_the_matrix_region`.
 mod record_file {
     use super::{Error, RecordOverwrite, ReservedIndexSlot, Result, opened_file_identity};
+    use crate::snapshot::WrittenThrough;
     use std::fs::{File, Metadata};
     use std::io::{Seek, SeekFrom, Write};
+
+    #[cfg(any(test, feature = "scalable-fault-injection"))]
+    std::thread_local! {
+        /// `fstat`s this thread has issued through [`RecordFile::metadata`].
+        ///
+        /// Fault-testing hook only. The append path must not advance it: it
+        /// takes the end of file from the snapshot the writer already
+        /// maintains, and `append_record_at_end`'s `SEEK_END` check is what
+        /// keeps that value honest.
+        static RECORD_FILE_METADATA_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Counts one `RecordFile::metadata` syscall on this thread. Inert outside
+    /// tests and without the `scalable-fault-injection` feature.
+    #[inline]
+    fn count_metadata_call() {
+        #[cfg(any(test, feature = "scalable-fault-injection"))]
+        RECORD_FILE_METADATA_CALLS.with(|count| count.set(count.get().saturating_add(1)));
+    }
+
+    /// Reads and clears this thread's `RecordFile::metadata` syscall count.
+    #[cfg(any(test, feature = "scalable-fault-injection"))]
+    pub(super) fn take_record_file_metadata_calls() -> u64 {
+        RECORD_FILE_METADATA_CALLS.with(|count| count.replace(0))
+    }
 
     #[derive(Debug)]
     pub struct RecordFile {
@@ -520,6 +547,7 @@ mod record_file {
         }
 
         pub(super) fn metadata(&self) -> std::io::Result<Metadata> {
+            count_metadata_call();
             self.file.metadata()
         }
 
@@ -608,6 +636,18 @@ mod record_file {
         /// moved below the write. The token is zero-sized and is borrowed, not
         /// consumed, because the caller still needs it to install the entry
         /// afterwards.
+        ///
+        /// # Why it returns a [`WrittenThrough`]
+        ///
+        /// This function owns the offset the write actually went to and every
+        /// byte count it wrote, so the fact "the file physically reaches
+        /// `offset + bytes`" is created here, inside the module that owns the
+        /// raw handle. Handing it back as a witness is what lets the caller
+        /// rebind its snapshot without an `fstat` — see
+        /// [`crate::snapshot::SnapshotFile::with_written_len`]. It is built
+        /// from `offset`, the value `SEEK_END` returned, not from
+        /// `expected_offset`: it describes where the bytes went, not where
+        /// they were meant to go.
         pub(super) fn append_record_at_end(
             &mut self,
             _reserved: &ReservedIndexSlot,
@@ -616,7 +656,7 @@ mod record_file {
             payload: &[u8],
             footer: Option<&[u8]>,
             after_header: impl FnOnce() -> Result<()>,
-        ) -> Result<()> {
+        ) -> Result<WrittenThrough> {
             let offset = self.file.seek(SeekFrom::End(0))?;
             if offset != expected_offset {
                 return Err(Error::Io(std::io::Error::new(
@@ -630,7 +670,21 @@ mod record_file {
             if let Some(footer) = footer {
                 self.file.write_all(footer)?;
             }
-            Ok(())
+            let written = [
+                header_bytes.len(),
+                payload.len(),
+                footer.map_or(0, <[u8]>::len),
+            ]
+            .into_iter()
+            .try_fold(offset, |end, part| {
+                u64::try_from(part)
+                    .ok()
+                    .and_then(|part| end.checked_add(part))
+            })
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "appended record extent",
+            })?;
+            Ok(WrittenThrough::after_write(written))
         }
 
         /// Rewrites an already-indexed record's header and payload in place.
@@ -1091,11 +1145,22 @@ pub enum WriterLockBreakPolicy {
     BreakIfProcessAbsentAndOlderThan(Duration),
 }
 
+/// What one user record actually stores, and where those bytes live.
+///
+/// `bytes` is a [`Cow`] rather than a `Vec` because the four uncompressed
+/// routes through [`prepare_user_record_payload`] — no compression declared for
+/// the block (the default), a non-`Variable` block kind, a payload under
+/// `min_uncompressed_len`, and `only_if_smaller` losing — store the caller's
+/// bytes unchanged. Owning them meant one payload-sized allocation, memcpy and
+/// free on every append of every default configuration, for a buffer every
+/// caller immediately reborrows as `&payload.bytes` and drops. Only the arm
+/// that actually produces new bytes (compression, and the envelope around it)
+/// owns them.
 #[derive(Clone, Debug)]
-struct StoredPayload {
+struct StoredPayload<'a> {
     flags: u16,
     uncompressed_len_hint: u32,
-    bytes: Vec<u8>,
+    bytes: Cow<'a, [u8]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3687,13 +3752,26 @@ impl VarveFile {
             captured_len,
         )?);
         let append_start = append_log_start(header_len, matrix.as_ref());
-        let index = load_index(spec, &mut file, append_start, ScanIntent::ReadOnly)?;
-        let sequence_state = index.sequence_state();
-        let block_tails = index.block_tails();
-        let index = index.entries;
+        let scanned = load_index(spec, &mut file, append_start, ScanIntent::ReadOnly)?;
+        let sequence_state = scanned.sequence_state();
+        let block_tails = scanned.block_tails();
+        // The snapshot comes from the scan, not from the resident list. The
+        // list is filtered — a non-resident block's records are on disk and not
+        // in it, exactly as `open_locked`'s comment says — so binding the
+        // snapshot to its last entry stopped a read-only handle at the last
+        // *resident* record. Under a markerless policy that ends on a
+        // non-resident block, that is before every record of that block, and
+        // `block_chain`, the published way to reach one, walks through the
+        // snapshot.
+        //
+        // It is still not the file's physical length: a torn trailing record
+        // must leave the snapshot at the end of the last complete record, and
+        // under a marker policy the uncommitted tail a writer open would delete
+        // must not be visible here either. Both facts belong to the scan.
+        let logical_len = scanned.physical_end(append_start);
+        let index = scanned.entries;
         let checkpoint_cadence = CheckpointCadence::from_index(&index);
         let segment_cursor = SegmentCursor::from_index(&index);
-        let logical_len = validated_snapshot_len(append_start, &index)?;
         let snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, logical_len)?;
         Ok(Self {
             spec,
@@ -4253,6 +4331,19 @@ impl VarveFile {
         self.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, &payload)
     }
 
+    /// The newest value written for `key`, or `None`.
+    ///
+    /// Visits every metadata record — latest-wins needs the whole walk, so
+    /// there is no early break — but only *materializes* the ones it returns.
+    /// [`split_metadata_payload`] compares the stored key against the borrowed
+    /// payload, and the decode that allocates a `String` and a `Vec<u8>` runs
+    /// only for a record that matches and wins.
+    ///
+    /// `max_materialized_bytes` bounds one record here, not the sum over the
+    /// walk: a lookup keeps at most one value alive, and charging the sum
+    /// refused a healthy file whose *total* metadata exceeded the ceiling
+    /// (`STANDARD` sets it to 1 GiB) even when the requested entry was the
+    /// first record in the file.
     pub fn metadata(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let mut found = None;
         let mut budget = MaterializationBudget::new(self.spec);
@@ -4260,19 +4351,23 @@ impl VarveFile {
             if entry.block_id != METADATA_BLOCK_ID {
                 continue;
             }
+            budget.reset();
             let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
             budget.consume(logical_len)?;
             let payload = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
-            let (stored_key, value): (String, Vec<u8>) =
-                budget.decode(&payload, self.spec.endian)?;
-            if stored_key == key {
-                let order = MergeOrder::for_record(0, entry.sequence, record_ordinal);
-                let should_replace = found
-                    .as_ref()
-                    .is_none_or(|(old_order, _): &(MergeOrder, Vec<u8>)| order >= *old_order);
-                if should_replace {
-                    found = Some((order, value));
-                }
+            let (stored_key, _) = split_metadata_payload(&payload, self.spec.endian)?;
+            if stored_key != key {
+                continue;
+            }
+            let order = MergeOrder::for_record(0, entry.sequence, record_ordinal);
+            let should_replace = found
+                .as_ref()
+                .is_none_or(|(old_order, _): &(MergeOrder, Vec<u8>)| order >= *old_order);
+            if should_replace {
+                // Decoded through the accounted decoder exactly as before, so
+                // what a returned value costs the budget is unchanged.
+                let (_, value): (String, Vec<u8>) = budget.decode(&payload, self.spec.endian)?;
+                found = Some((order, value));
             }
         }
         Ok(found.map(|(_, value)| value))
@@ -4461,6 +4556,17 @@ impl VarveFile {
                     segment_covered_start = Some(updated.checked_physical_end()?);
                     segment_start = new_index.len() + 1;
                 }
+                // What makes `find_rewritten_by_offset`'s binary search legal:
+                // each record is written at `output.stream_position()` and
+                // pushed in that order, so the prefix is strictly increasing in
+                // `record_offset`. Asserted here, where the invariant is made,
+                // because that is O(1) — asserting sortedness inside the lookup
+                // would reintroduce the O(N) it exists to remove.
+                debug_assert!(
+                    new_index
+                        .last()
+                        .is_none_or(|last| last.record_offset < updated.record_offset)
+                );
                 new_index.push(updated);
             }
             temp_file.flush()?;
@@ -4822,8 +4928,8 @@ impl VarveFile {
         let target_position = ReplacementTarget::resolve::<T>(&self.index, index)?.position();
         let sequence = self.sequence_state.available()?;
         let endian = T::ENDIAN.unwrap_or(self.spec.endian);
-        let replacement = encode_logical_payload_limited(self.spec, block, endian)?;
-        let replacement = prepare_user_record_payload(self.spec, T::ID, T::KIND, &replacement)?;
+        let encoded = encode_logical_payload_limited(self.spec, block, endian)?;
+        let replacement = prepare_user_record_payload(self.spec, T::ID, T::KIND, &encoded)?;
         let replacement_len = u64::try_from(replacement.bytes.len())
             .map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
         self.spec
@@ -5228,6 +5334,11 @@ impl VarveFile {
         let mut state: HashMap<T::Key, (MergeOrder, Option<RecordIndexEntry>)> = HashMap::new();
         let mut budget = MaterializationBudget::new(self.spec);
         for (record_ordinal, entry) in self.index.iter().enumerate() {
+            // One record's materialization at a time. Every decoded block is
+            // dropped once its key is taken; what survives the loop is index
+            // entries and keys, each charged as it is taken through
+            // `index_bytes_for_count`. See `MaterializationBudget`.
+            budget.reset();
             let order = MergeOrder::for_record(0, entry.sequence, record_ordinal);
             match entry.block_id {
                 id if id == T::ID => {
@@ -5338,14 +5449,46 @@ impl VarveFile {
 
     /// Verifies every record's stored checksum against its bytes.
     ///
-    /// This is the pass [`IntegrityVerification::AtOpen`] runs while opening,
-    /// available on demand so that choosing [`IntegrityVerification::OnDemand`]
-    /// defers the announcement rather than losing it. Reads every payload, so
-    /// it costs a full pass over the file; that cost is the reason it is not
-    /// the default at open.
+    /// Available on demand so that choosing
+    /// [`IntegrityVerification::OnDemand`] defers the announcement
+    /// [`IntegrityVerification::AtOpen`] makes while opening, rather than
+    /// losing it. Reads every payload, so it costs a full pass over the file;
+    /// that cost is the reason it is not the default at open.
+    ///
+    /// **What "every record" covers.** Two passes, because two things hold the
+    /// records: the resident index, and — for a block declared
+    /// `resident: false` — that block's footer chain, which is the only way
+    /// back to records the index deliberately does not mirror
+    /// ([`Self::block_chain`]). The chain pass used to be missing, so a
+    /// non-resident block's records were silently omitted; a file whose only
+    /// appends were non-resident reported `Ok(0)`, indistinguishable from an
+    /// empty file. Both passes call the same `read_payload_snapshot` the read
+    /// path calls, so there is still exactly one verification in the crate.
+    ///
+    /// This is *not* bit-for-bit what `AtOpen` does. `AtOpen` verifies every
+    /// physical record as scan frames it, including records after the commit
+    /// boundary that this handle excludes; this pass answers for the records
+    /// the handle can see.
+    ///
+    /// **Bounded by the snapshot.** The chain pass reads through the same
+    /// snapshot as every other read on this handle, and a read-only handle
+    /// sizes that snapshot from the last *resident* record. Under a commit
+    /// policy that leaves no resident record after the block's newest one —
+    /// [`CommitPolicy::None`], which is what a format declaring no commit
+    /// policy gets — the walk therefore reports
+    /// [`Error::SnapshotRangeOutOfBounds`] rather than a clean verdict over
+    /// bytes it never read. That is the refusal [`Self::block_chain`] already
+    /// gives on the same handle: such a block is unreachable read-only in that
+    /// configuration, and only `verify_all`'s `Ok` said otherwise. A read-write
+    /// handle sizes the snapshot from the file and is unaffected, as is any
+    /// policy that ends the file with a resident record
+    /// (`transaction_marker`). Measured, 12 non-resident records under
+    /// `CommitPolicy::None`: read-write `Ok(12)`, read-only
+    /// `Err(SnapshotRangeOutOfBounds { offset: 1347, len: 32, snapshot_len: 27 })`.
     ///
     /// Takes `&self` and reads positionally, so it can run on a shared handle
-    /// while other readers use it.
+    /// while other readers use it. One entry and one payload are materialised
+    /// at a time; nothing enters the resident index.
     ///
     /// Returns the number of records verified. A mismatch is
     /// [`Error::ChecksumMismatch`] naming the offending record's offset.
@@ -5361,6 +5504,24 @@ impl VarveFile {
             // second copy of it.
             let _ = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
             verified += 1;
+        }
+        // A non-resident block's records are never in `self.index` (a
+        // descriptor may only name a declared user block, and only ids below
+        // `RESERVED_BLOCK_ID_START` can be declared), so this adds to the pass
+        // above and cannot double-count it.
+        for descriptor in self.spec.block_residency {
+            if descriptor.resident {
+                continue;
+            }
+            // `FormatSpec::validate` refuses a non-resident block without
+            // `block_offset_chain`, so this cannot be the refusal `block_chain`
+            // raises for a format that has no chain; it is propagated rather
+            // than asserted away.
+            for entry in self.block_chain(descriptor.block_id)? {
+                let entry = entry?;
+                let _ = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
+                verified += 1;
+            }
         }
         Ok(verified)
     }
@@ -5414,6 +5575,17 @@ impl VarveFile {
         let mut tails: HashMap<T::Key, (MergeOrder, u64)> = HashMap::new();
         let mut budget = MaterializationBudget::new(self.spec);
         for (record_ordinal, entry) in self.index.iter().enumerate() {
+            // One record's materialization at a time (see
+            // `MaterializationBudget`). Every decoded block is dropped once its
+            // key is taken, so the peak here is one payload however many
+            // records the block has; what the build retains is keys and
+            // offsets, and those are charged to `max_keyed_tail_bytes` below.
+            //
+            // This is on the *write* path — `push_keyed` seeds the tail cache
+            // from here — so a budget that drained across the walk could refuse
+            // the first append to an undamaged file whose records for `T` total
+            // more than `max_materialized_bytes` (`STANDARD`: 1 GiB).
+            budget.reset();
             let order = MergeOrder::for_record(0, entry.sequence, record_ordinal);
             match entry.block_id {
                 id if id == T::ID => {
@@ -7423,6 +7595,46 @@ impl VarveFile {
         RECORDS_FRAMED.with(|framed| framed.get())
     }
 
+    /// Reads and clears the number of index-entry comparisons this thread has
+    /// made resolving a rewritten record's chain predecessor.
+    ///
+    /// Fault-testing hook only. `replace_block` validates every rewritten
+    /// record's predecessor against the prefix it has already written; a
+    /// front-to-back scan of that growing prefix costs `Theta(N^2)` and the
+    /// sorted lookup that replaced it costs `O(N log N)`, which a regression
+    /// test tells apart by this count rather than by the clock.
+    #[cfg(any(test, feature = "scalable-fault-injection"))]
+    #[doc(hidden)]
+    pub fn take_replacement_predecessor_probes() -> u64 {
+        REPLACEMENT_PREDECESSOR_PROBES.with(|probes| probes.replace(0))
+    }
+
+    /// Reads and clears the number of `fstat`s this thread has issued to bind
+    /// a snapshot's length (`snapshot.rs`'s `checked_snapshot_bounds`).
+    ///
+    /// Fault-testing hook only. The append path rebinds through
+    /// `SnapshotFile::with_written_len`, which proves `len <= physical_len`
+    /// from the write that just returned, so an append window must leave this
+    /// at zero for any record count. Open still pays one per snapshot bind,
+    /// which is what tells a real fix apart from a neutered counter.
+    #[cfg(any(test, feature = "scalable-fault-injection"))]
+    #[doc(hidden)]
+    pub fn take_snapshot_bounds_fstats() -> u64 {
+        crate::snapshot::take_snapshot_bounds_fstats()
+    }
+
+    /// Reads and clears the number of `fstat`s this thread has issued through
+    /// the writer's own record handle (`RecordFile::metadata`).
+    ///
+    /// Fault-testing hook only, and a sibling of the counter above rather than
+    /// the same one: this is the `AppendSnapshot` end-of-file probe, which the
+    /// writer now answers from the snapshot it maintains.
+    #[cfg(any(test, feature = "scalable-fault-injection"))]
+    #[doc(hidden)]
+    pub fn take_record_file_metadata_calls() -> u64 {
+        record_file::take_record_file_metadata_calls()
+    }
+
     /// Cumulative bytes this thread has read to answer chunked cell reads.
     ///
     /// Fault-testing hook only. This is the unit a growing matrix's read path
@@ -7970,7 +8182,22 @@ impl VarveFile {
 
         let sequence = self.sequence_state.available()?;
         let snapshot = AppendSnapshot {
-            eof: self.file.metadata()?.len(),
+            // PERF: the end of file is state this writer already maintains, so
+            // asking the kernel for it once per record bought nothing. Every
+            // construction of `self.snapshot` seeds it from the PHYSICAL length
+            // (`SnapshotFile::new` at create, at `open_locked`, at
+            // `open_recover_locked` and at both rebind sites) and every
+            // successful append rewrites it from the witness the write itself
+            // produced; `rollback_append` truncates back to the same `eof` it
+            // started from and leaves `self.snapshot` alone.
+            //
+            // This is not blind trust. `RecordFile::append_record_at_end` still
+            // performs its own `seek(SeekFrom::End(0))` and refuses any offset
+            // that is not the one budgeted here, so a value that ever drifted
+            // yields the existing typed refusal and a rollback — never a write
+            // over live data. Removing that check along with the syscall is the
+            // positional-write redesign, and is deliberately not what this is.
+            eof: self.snapshot.len(),
             cursor: self.file.stream_position()?,
             sequence_state: self.sequence_state,
             index_len: self.index.len(),
@@ -8061,11 +8288,21 @@ impl VarveFile {
                 Ok(())
             },
         );
-        if let Err(error) = write_result {
-            return Err(self.rollback_append(snapshot, error));
-        }
+        let written = match write_result {
+            Ok(written) => written,
+            Err(error) => return Err(self.rollback_append(snapshot, error)),
+        };
 
-        let new_snapshot = match self.snapshot.with_len(prospective_len) {
+        // The budgeted extent and the extent actually written are computed
+        // independently — one from the header/payload/footer lengths above, the
+        // other from the offset `SEEK_END` returned plus the bytes `write_all`
+        // took — so they agreeing is a real check on both.
+        debug_assert_eq!(written.end_offset(), prospective_len);
+        // The write above is the proof that the file reaches this offset, so
+        // the rebind needs no `fstat` of its own — that was the second
+        // per-record metadata syscall on this path. `with_written_len` is still
+        // fallible and still growth-only, so the rollback arm is unchanged.
+        let new_snapshot = match self.snapshot.with_written_len(written) {
             Ok(snapshot) => snapshot,
             Err(error) => return Err(self.rollback_append(snapshot, error)),
         };
@@ -8860,16 +9097,47 @@ fn rewrite_replacement_record_streaming(
     Ok(entry)
 }
 
+/// Finds the already-rewritten record that sits at `offset`.
+///
+/// `rewritten_prefix` is `replace_block`'s `new_index` under construction. Each
+/// entry is written at `output.stream_position()` and pushed in that order, so
+/// the slice is strictly increasing in `record_offset` — the `debug_assert!` at
+/// the `push` states that where the invariant is created, which is O(1), unlike
+/// asserting sortedness here on every lookup.
+///
+/// This used to be `iter().find(..)`, which made `replace_block` quadratic in
+/// the record count for any spec that carries a record footer with a
+/// predecessor offset (`block_offset_chain`, `keyed_offset_chain`,
+/// `segment_on_flush`). A `HashMap<u64, usize>` was the obvious alternative and
+/// is worse here: it adds uncharged bytes per record to a path that already
+/// materialises the whole index, while the sortedness makes an
+/// allocation-free `O(log N)` lookup available for nothing.
+///
+/// Bounded failure mode if that sortedness were ever broken: `binary_search_by`
+/// returns `Ok` only when a comparison answered `Equal`, so the entry it hands
+/// back always satisfies `record_offset == offset` and can never substitute a
+/// different record's predecessor. The worst it can do is miss an entry that is
+/// present, which is the existing `Error::InvalidRecordFooter` refusal.
+fn find_rewritten_by_offset(
+    rewritten_prefix: &[RecordIndexEntry],
+    offset: u64,
+) -> Option<&RecordIndexEntry> {
+    rewritten_prefix
+        .binary_search_by(|candidate| {
+            note_replacement_predecessor_probe();
+            candidate.record_offset.cmp(&offset)
+        })
+        .ok()
+        .map(|position| &rewritten_prefix[position])
+}
+
 fn validate_replacement_predecessors(
     output: &mut File,
     entry: &RecordIndexEntry,
     rewritten_prefix: &[RecordIndexEntry],
 ) -> Result<()> {
     if let Some(offset) = entry.prev_same_block_offset {
-        let Some(previous) = rewritten_prefix
-            .iter()
-            .find(|candidate| candidate.record_offset == offset)
-        else {
+        let Some(previous) = find_rewritten_by_offset(rewritten_prefix, offset) else {
             return Err(Error::InvalidRecordFooter { offset });
         };
         if offset >= entry.record_offset || previous.block_id != entry.block_id {
@@ -8877,10 +9145,7 @@ fn validate_replacement_predecessors(
         }
     }
     if let Some(offset) = entry.prev_same_key_offset {
-        let Some(previous) = rewritten_prefix
-            .iter()
-            .find(|candidate| candidate.record_offset == offset)
-        else {
+        let Some(previous) = find_rewritten_by_offset(rewritten_prefix, offset) else {
             return Err(Error::InvalidRecordFooter { offset });
         };
         if offset >= entry.record_offset
@@ -9555,12 +9820,12 @@ fn decode_manifest_compression_policy(
     }
 }
 
-fn prepare_user_record_payload(
+fn prepare_user_record_payload<'a>(
     spec: FormatSpec,
     block_id: u32,
     kind: BlockKind,
-    logical_payload: &[u8],
-) -> Result<StoredPayload> {
+    logical_payload: &'a [u8],
+) -> Result<StoredPayload<'a>> {
     spec.read_limits.check(
         ReadLimitKey::LogicalPayloadLen,
         u64::try_from(logical_payload.len())
@@ -9605,15 +9870,20 @@ fn prepare_user_record_payload(
     Ok(StoredPayload {
         flags: RECORD_FLAG_COMPRESSED,
         uncompressed_len_hint,
-        bytes: stored_bytes,
+        bytes: Cow::Owned(stored_bytes),
     })
 }
 
-fn uncompressed_user_payload(logical_payload: &[u8]) -> StoredPayload {
+/// The stored form of a payload that is stored exactly as it was handed in.
+///
+/// Borrows. The bytes are the caller's and are read, not kept: every caller
+/// reborrows `&payload.bytes` into the record writer and drops the
+/// `StoredPayload` on the same statement.
+fn uncompressed_user_payload(logical_payload: &[u8]) -> StoredPayload<'_> {
     StoredPayload {
         flags: 0,
         uncompressed_len_hint: 0,
-        bytes: logical_payload.to_vec(),
+        bytes: Cow::Borrowed(logical_payload),
     }
 }
 
@@ -10644,6 +10914,45 @@ fn should_apply<T>(current: Option<&(MergeOrder, Option<T>)>, order: MergeOrder)
     current.is_none_or(|(old_order, _)| order >= *old_order)
 }
 
+/// Frames a metadata record's payload as `(key, value)` without copying either.
+///
+/// [`VarveFile::write_metadata`] encodes `(String, Vec<u8>)` through the tuple
+/// codec, which is exactly `u64 key_len | key | u64 value_len | value`, and
+/// metadata goes through `write_record` rather than `write_user_record`, so it
+/// is never compressed. That framing is what the borrowed pair reads back.
+///
+/// It exists so a lookup can compare the key *before* deciding to materialize
+/// the value: the decoder allocates a `String` and a `Vec<u8>` per record,
+/// which for a lookup is one copy per record that is thrown away. The errors
+/// are the ones `decode_complete` raises on the same bytes —
+/// [`Error::UnexpectedEof`], [`Error::LengthOverflow`], [`Error::InvalidUtf8`]
+/// and [`Error::TrailingBytes`] — because the byte-for-byte answer must not
+/// depend on which of the two readers looked.
+///
+/// The `0` materialization allowance is not a limit being enforced: nothing is
+/// materialized here, so nothing is charged. Callers charge the record they
+/// then decode.
+fn split_metadata_payload(payload: &[u8], endian: Endian) -> Result<(&str, &[u8])> {
+    let mut decoder = crate::Decoder::new_limited(payload, endian, 0);
+    let key_len = decoder.read_len()?;
+    if key_len > decoder.remaining() {
+        return Err(Error::UnexpectedEof);
+    }
+    let key = decoder.read_exact(key_len)?;
+    let key = std::str::from_utf8(key).map_err(|_| Error::InvalidUtf8)?;
+    let value_len = decoder.read_len()?;
+    if value_len > decoder.remaining() {
+        return Err(Error::UnexpectedEof);
+    }
+    let value = decoder.read_exact(value_len)?;
+    if decoder.remaining() != 0 {
+        return Err(Error::TrailingBytes {
+            remaining: decoder.remaining(),
+        });
+    }
+    Ok((key, value))
+}
+
 /// Encodes a writer-supplied value with the format's logical-payload limit as
 /// the encode hard bound (DEF-02).
 ///
@@ -11127,6 +11436,26 @@ fn note_chunk_bytes_read(bytes: u64) {
 fn note_record_framed() {
     #[cfg(feature = "scalable-fault-injection")]
     RECORDS_FRAMED.with(|framed| framed.set(framed.get().saturating_add(1)));
+}
+
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+std::thread_local! {
+    /// Entry comparisons this thread has made looking up a rewritten record's
+    /// chain predecessor (`find_rewritten_by_offset`).
+    ///
+    /// Fault-testing hook only. This is the unit the front-to-back scan made
+    /// quadratic: a `replace_block` over N records probed ~N^2/2 times and now
+    /// probes at most `N * ceil(log2 N)`. A regression test asserts the count,
+    /// not the wall clock.
+    static REPLACEMENT_PREDECESSOR_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one predecessor-lookup comparison on this thread. Inert outside tests
+/// and without the `scalable-fault-injection` feature.
+#[inline]
+fn note_replacement_predecessor_probe() {
+    #[cfg(any(test, feature = "scalable-fault-injection"))]
+    REPLACEMENT_PREDECESSOR_PROBES.with(|probes| probes.set(probes.get().saturating_add(1)));
 }
 
 fn read_record_entry_at(
@@ -11751,18 +12080,47 @@ struct ScannedIndex {
     /// a per-record `note_appended` reintroduces the `Theta(B^2)` sorted-vector
     /// insertion term PERF3-03 removed.
     newest: HashMap<u32, u64>,
+    /// Where the last record the walk accepted physically ends, resident or
+    /// not.
+    ///
+    /// The fourth thing derived from a filtered list, and the one that did not
+    /// get this treatment until now. `open_readonly` used to bind its snapshot
+    /// to the last *resident* entry's end, so under a markerless policy that
+    /// ends on a non-resident block the snapshot stopped before every record of
+    /// that block — not merely before the tail. `block_chain` is the published
+    /// way to reach a non-resident block and it walks through the snapshot, so
+    /// the whole chain became unreachable through a read-only handle.
+    ///
+    /// It is deliberately NOT `file.metadata()?.len()`: a torn trailing record
+    /// must still leave the snapshot at the end of the last *complete* record,
+    /// which is a fact only the scan has.
+    physical_end: Option<u64>,
+    /// The same, as of the newest commit marker.
+    ///
+    /// A marker format discards everything after that marker, and a read-only
+    /// handle must not expose records a writer open would delete. Uncommitted
+    /// non-resident records past the marker are dropped with it, which is what
+    /// stops this from becoming "the physical end of the file".
+    physical_end_at_commit: Option<u64>,
 }
 
 impl ScannedIndex {
     /// Records one record's contribution to the parts that outlive filtering.
-    fn note(&mut self, entry: &RecordIndexEntry) {
+    ///
+    /// `physical_end` is where this record ends, which both call sites already
+    /// hold: the segment walk computes it one statement earlier as the offset
+    /// the next record must begin at, and the scan assigns it to `offset` five
+    /// lines earlier for the same reason. Neither pays a new computation.
+    fn note(&mut self, entry: &RecordIndexEntry, physical_end: u64) {
         self.sequence_high_water = Some(match self.sequence_high_water {
             Some(seen) => seen.max(entry.sequence),
             None => entry.sequence,
         });
         self.newest.insert(entry.block_id, entry.record_offset);
+        self.physical_end = Some(physical_end);
         if entry.block_id == COMMIT_BLOCK_ID {
             self.sequence_high_water_at_commit = self.sequence_high_water;
+            self.physical_end_at_commit = self.physical_end;
             // O(B) and allocation-free after the first marker: the keys are
             // already there, only the values move.
             self.newest_at_commit.clear();
@@ -11777,9 +12135,20 @@ impl ScannedIndex {
     /// survives sits at or before the newest commit marker, so the snapshots
     /// taken there bound it; the one record that survives *past* the marker is
     /// the trailing segment, which is resident and therefore in `entries`.
-    fn commit_boundary_applied(&mut self, entries: &[RecordIndexEntry]) {
+    fn commit_boundary_applied(&mut self, entries: &[RecordIndexEntry]) -> Result<()> {
         let surviving = entries.iter().map(|entry| entry.sequence).max();
         self.sequence_high_water = match (self.sequence_high_water_at_commit, surviving) {
+            (Some(at_commit), Some(resident)) => Some(at_commit.max(resident)),
+            (at_commit, resident) => at_commit.or(resident),
+        };
+        // `max`, not "take the marker's end": `committed_prefix_len`
+        // deliberately keeps one trailing SEGMENT_BLOCK_ID record past the
+        // marker, and that record's bytes are inside the boundary too.
+        let surviving_end = entries
+            .last()
+            .map(RecordIndexEntry::checked_physical_end)
+            .transpose()?;
+        self.physical_end = match (self.physical_end_at_commit, surviving_end) {
             (Some(at_commit), Some(resident)) => Some(at_commit.max(resident)),
             (at_commit, resident) => at_commit.or(resident),
         };
@@ -11792,6 +12161,7 @@ impl ScannedIndex {
         for entry in entries {
             self.newest.insert(entry.block_id, entry.record_offset);
         }
+        Ok(())
     }
 
     /// Orders the collected tails exactly once (PERF3-03).
@@ -11805,6 +12175,14 @@ impl ScannedIndex {
             Some(u64::MAX) => SequenceState::Exhausted,
             Some(sequence) => SequenceState::Available(sequence + 1),
         }
+    }
+
+    /// The byte range a handle opened on this scan may read.
+    ///
+    /// `append_start` is the answer for a file whose append log the walk found
+    /// empty — the header is all there is.
+    fn physical_end(&self, append_start: u64) -> u64 {
+        self.physical_end.unwrap_or(append_start)
     }
 }
 
@@ -12010,6 +12388,8 @@ fn walk_segment_chain(
         sequence_high_water_at_commit: None,
         newest: HashMap::new(),
         newest_at_commit: HashMap::new(),
+        physical_end: None,
+        physical_end_at_commit: None,
     };
     let mut running = append_start;
     for (link, segment) in chain.into_iter().rev() {
@@ -12076,10 +12456,11 @@ fn push_scanned_entry(
         return Err(Error::InvalidIndexSegment);
     }
     let end = entry.checked_physical_end()?;
-    // Every record contributes its sequence and its block tail; only a resident
-    // one is materialised. The chain carries every record precisely so this
-    // filter can happen here rather than on disk.
-    scanned.note(&entry);
+    // Every record contributes its sequence, its block tail and the physical
+    // end of the walk; only a resident one is materialised. The chain carries
+    // every record precisely so this filter can happen here rather than on
+    // disk.
+    scanned.note(&entry, end);
     if record_is_resident(spec, entry.block_id) {
         reserve_scanned_entry(spec, &mut scanned.entries)?;
         scanned.entries.push(entry);
@@ -12119,13 +12500,6 @@ fn reserve_scanned_entry(spec: FormatSpec, entries: &mut Vec<RecordIndexEntry>) 
         resource: "record index",
         requested: index_bytes,
     })
-}
-
-fn validated_snapshot_len(append_start: u64, entries: &[RecordIndexEntry]) -> Result<u64> {
-    match entries.last() {
-        Some(entry) => entry.checked_physical_end(),
-        None => Ok(append_start),
-    }
 }
 
 /// How many leading entries a transaction-marker format treats as committed.
@@ -12444,6 +12818,8 @@ fn scan_records_from(
         sequence_high_water_at_commit: None,
         newest: HashMap::new(),
         newest_at_commit: HashMap::new(),
+        physical_end: None,
+        physical_end_at_commit: None,
     };
     let mut latest_commit_end = None;
     let mut accounting = ScanAccounting::default();
@@ -12508,11 +12884,13 @@ fn scan_records_from(
             .map_err(|_| Error::ResourceArithmeticOverflow {
                 resource: "record extent",
             })?;
-        // Every record contributes its sequence and its block tail even when it
-        // is not materialised: the high-water mark is what the next append
-        // continues from, and the tail is the only way back to a non-resident
-        // record.
-        scanned.note(&entry);
+        // Every record contributes its sequence, its block tail and the
+        // physical end of the walk even when it is not materialised: the
+        // high-water mark is what the next append continues from, the tail is
+        // the only way back to a non-resident record, and the end is the byte
+        // range a read-only handle may look at. `offset` was just advanced to
+        // this record's end.
+        scanned.note(&entry, offset);
         let resident = record_is_resident(spec, entry.block_id);
         if resident {
             reserve_scanned_entry(spec, &mut entries)?;
@@ -12537,7 +12915,7 @@ fn scan_records_from(
     validate_unique_sequences(&entries)?;
     if spec.commit_policy.is_transaction_marker() {
         let Some(committed) = committed_prefix_len(&entries) else {
-            scanned.commit_boundary_applied(&[]);
+            scanned.commit_boundary_applied(&[])?;
             return Ok(ScannedIndex {
                 entries: Vec::new(),
                 ..scanned
@@ -12547,7 +12925,7 @@ fn scan_records_from(
         for entry in &mut entries {
             entry.committed = true;
         }
-        scanned.commit_boundary_applied(&entries);
+        scanned.commit_boundary_applied(&entries)?;
     }
     Ok(ScannedIndex { entries, ..scanned })
 }
@@ -16335,6 +16713,138 @@ mod tests {
 
         assert_eq!(parent_directory_sync_calls(), 1);
         assert_eq!(std::fs::read(new_target)?, b"first");
+        Ok(())
+    }
+
+    /// PERF: an append must ask the kernel for nothing it already knows.
+    ///
+    /// Two distinct per-record metadata syscalls used to sit on
+    /// `write_record_with_prev_key`: `self.file.metadata()?.len()` for the
+    /// `AppendSnapshot`'s end of file, and a second one inside
+    /// `checked_snapshot_bounds` reached through `self.snapshot.with_len(..)`.
+    /// Both facts are now taken from state the writer maintains and from the
+    /// write that just returned, so both counters must stay at zero across the
+    /// whole append window whatever the record count.
+    ///
+    /// The open at the top is not incidental: it pins the snapshot counter
+    /// *nonzero* where the fstat is still correct, so a "fix" that simply
+    /// stopped incrementing the counter fails here rather than passing.
+    #[test]
+    fn an_append_window_issues_no_metadata_syscall() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("append-syscalls.varve");
+
+        let _ = VarveFile::take_snapshot_bounds_fstats();
+        let mut file = VarveFile::create(test_spec(), &path)?;
+        assert!(
+            VarveFile::take_snapshot_bounds_fstats() > 0,
+            "binding a snapshot at open must still cost the fstat that proves the length",
+        );
+
+        let _ = VarveFile::take_record_file_metadata_calls();
+        for index in 0..1_000u32 {
+            file.push_info_for_test(METADATA_BLOCK_ID, &index.to_le_bytes())?;
+        }
+
+        assert_eq!(
+            VarveFile::take_record_file_metadata_calls(),
+            0,
+            "the append took the end of file from the snapshot it maintains, not from an fstat",
+        );
+        assert_eq!(
+            VarveFile::take_snapshot_bounds_fstats(),
+            0,
+            "the snapshot rebind took the completed write as its proof, not an fstat",
+        );
+
+        // The records really are there and really are readable through the
+        // rebound snapshot, so this is not "no syscalls because no work".
+        assert_eq!(file.index_entries().len(), 1_000);
+        let last = file
+            .index_entries()
+            .last()
+            .expect("appended record")
+            .clone();
+        assert_eq!(file.snapshot.len(), last.checked_physical_end()?);
+        Ok(())
+    }
+
+    /// The witness must not be usable to shorten a snapshot past bytes it has
+    /// not proven: `with_written_len` is growth-only, which is what keeps it
+    /// safe to hand a value the filesystem was never asked about.
+    #[test]
+    fn a_written_witness_cannot_shrink_a_snapshot() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("witness-shrink.varve");
+        let mut file = VarveFile::create(test_spec(), &path)?;
+        file.push_info_for_test(METADATA_BLOCK_ID, b"payload")?;
+
+        let len = file.snapshot.len();
+        assert!(
+            file.snapshot
+                .with_written_len(crate::snapshot::WrittenThrough::after_write(len))
+                .is_ok()
+        );
+        assert!(matches!(
+            file.snapshot
+                .with_written_len(crate::snapshot::WrittenThrough::after_write(len - 1)),
+            Err(Error::SnapshotRangeOutOfBounds { .. }),
+        ));
+        Ok(())
+    }
+
+    /// PERF: `replace_block` must not rescan the prefix it has already written.
+    ///
+    /// Every rewritten record validates its chain predecessor against the
+    /// prefix already in the new generation. That prefix is built in strictly
+    /// increasing `record_offset` order, so the lookup is a binary search; it
+    /// used to be `iter().find(..)`, which made the whole call `Theta(N^2)` for
+    /// any spec carrying a predecessor offset in its footer.
+    ///
+    /// The assertion is a comparison count, not a wall clock. At N = 4096 the
+    /// two are ~50k against ~8.4M, and the gap grows by 2x per doubling.
+    #[test]
+    fn replace_block_finds_predecessors_without_rescanning_the_prefix() -> Result<()> {
+        const RECORDS: u64 = 4096;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("replace-probes.varve");
+        let spec = replacement_policy_spec();
+        assert!(
+            spec.index_policy.block_offset_chain,
+            "without a predecessor offset in the footer both lookup arms are skipped and there \
+             is nothing to measure",
+        );
+        let mut writer = VarveFile::create(spec, &path)?;
+        for index in 0..RECORDS {
+            writer.push(&ReplaceString(format!("v{index}")))?;
+        }
+        writer.flush()?;
+        let entries = writer.index_entries().len() as u64;
+
+        let _ = VarveFile::take_replacement_predecessor_probes();
+        writer.replace_block(0, &ReplaceString("replaced".into()))?;
+        let probes = VarveFile::take_replacement_predecessor_probes();
+
+        // At most ceil(log2 N) = 12 probes per chained record; 32 leaves room
+        // for the internal records the rewrite also carries.
+        let ceiling = 32 * entries;
+        assert!(
+            probes <= ceiling,
+            "predecessor lookup cost {probes} probes over {entries} entries, ceiling {ceiling}; \
+             a front-to-back scan of the growing prefix costs ~N^2/2",
+        );
+
+        // And the replacement actually happened, so this is not "cheap because
+        // the validation was deleted".
+        let replaced = VarveFile::open_readonly(spec, &path)?;
+        let values = replaced.blocks::<ReplaceString>()?;
+        assert_eq!(values.len() as u64, RECORDS);
+        assert_eq!(values.get(0)?.expect("record 0").0, "replaced");
+        assert_eq!(
+            values.get(RECORDS as usize - 1)?.expect("last record").0,
+            format!("v{}", RECORDS - 1),
+        );
         Ok(())
     }
 }

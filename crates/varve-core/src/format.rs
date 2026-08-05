@@ -656,11 +656,6 @@ impl ReadLimits {
         }
     }
 
-    /// The verification policy an open actually uses.
-    ///
-    /// [`MatrixMetadataVerification::Missing`] resolves here, and only here, to
-    /// [`MatrixMetadataVerification::DEFAULT`]. A declared policy is returned
-    /// unchanged.
     /// The verification policy in force: the declared one, or
     /// [`IntegrityVerification::DEFAULT`] when nobody declared one.
     pub const fn effective_integrity_verification(self) -> IntegrityVerification {
@@ -676,6 +671,11 @@ impl ReadLimits {
         self
     }
 
+    /// The verification policy an open actually uses.
+    ///
+    /// [`MatrixMetadataVerification::Missing`] resolves here, and only here, to
+    /// [`MatrixMetadataVerification::DEFAULT`]. A declared policy is returned
+    /// unchanged.
     pub const fn effective_matrix_metadata_verification(self) -> MatrixMetadataVerification {
         match self.matrix_metadata_verification {
             MatrixMetadataVerification::Missing => MatrixMetadataVerification::DEFAULT,

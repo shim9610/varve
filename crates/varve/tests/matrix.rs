@@ -700,7 +700,7 @@ fn format_first_matrix_dsl_generates_typed_api() -> varve::Result<()> {
     }
 
     {
-        let mut reader = GeneratedMatrixFormat::open_reader(&path)?;
+        let reader = GeneratedMatrixFormat::open_reader(&path)?;
         let key = GeneratedCellKey { scan: 1, ch: 0 };
         assert_eq!(reader.thumbnail_aux_len()?, 16);
         assert_eq!(reader.read_thumbnail_aux(2, 3)?, vec![5, 6, 7]);

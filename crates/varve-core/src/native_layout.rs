@@ -38,6 +38,42 @@ struct NativeField {
     source: NativeFieldSource,
 }
 
+/// Which record field an entry of `RECORD_HEADER_FIELDS` /
+/// `RECORD_FOOTER_FIELDS` *is*.
+///
+/// `NativeField::name` stays what it was — it is what
+/// `native_field_source_to_plan` publishes into `LayoutPlanField` and what
+/// `Error::LayoutFieldTypeMismatch` / `Error::LayoutFieldMissing` carry — but
+/// it is no longer what encode and decode dispatch on. The four dispatch sites
+/// match this enum exhaustively, so a table entry added without a role is a
+/// compile error instead of an `Error::InvalidFormatSpec` raised once per
+/// record framed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeRecordField {
+    BlockId,
+    BlockVersion,
+    RecordFlags,
+    Sequence,
+    PayloadLen,
+    Checksum,
+    UncompressedLenHint,
+    FooterMagic,
+    FooterVersion,
+    FooterFlags,
+    PrevSameBlockOffset,
+    PrevSameKeyOffset,
+    FooterCrc32,
+    FooterReserved,
+}
+
+/// A record header/footer table entry: the wire description plus the role that
+/// selects the value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeRecordFieldDef {
+    role: NativeRecordField,
+    field: NativeField,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeFieldType {
     Bytes { len: u64 },
@@ -85,84 +121,155 @@ enum NativeFileHeaderField {
     Extensions,
 }
 
-const RECORD_HEADER_FIELDS: &[NativeField] = &[
-    NativeField {
-        name: "block_id",
-        ty: NativeFieldType::U32,
-        source: NativeFieldSource::Caller,
+const RECORD_HEADER_FIELDS: &[NativeRecordFieldDef] = &[
+    NativeRecordFieldDef {
+        role: NativeRecordField::BlockId,
+        field: NativeField {
+            name: "block_id",
+            ty: NativeFieldType::U32,
+            source: NativeFieldSource::Caller,
+        },
     },
-    NativeField {
-        name: "block_version",
-        ty: NativeFieldType::U16,
-        source: NativeFieldSource::Caller,
+    NativeRecordFieldDef {
+        role: NativeRecordField::BlockVersion,
+        field: NativeField {
+            name: "block_version",
+            ty: NativeFieldType::U16,
+            source: NativeFieldSource::Caller,
+        },
     },
-    NativeField {
-        name: "flags",
-        ty: NativeFieldType::U16,
-        source: NativeFieldSource::Native("record_flags"),
+    NativeRecordFieldDef {
+        role: NativeRecordField::RecordFlags,
+        field: NativeField {
+            name: "flags",
+            ty: NativeFieldType::U16,
+            source: NativeFieldSource::Native("record_flags"),
+        },
     },
-    NativeField {
-        name: "sequence",
-        ty: NativeFieldType::U64,
-        source: NativeFieldSource::Native("sequence"),
+    NativeRecordFieldDef {
+        role: NativeRecordField::Sequence,
+        field: NativeField {
+            name: "sequence",
+            ty: NativeFieldType::U64,
+            source: NativeFieldSource::Native("sequence"),
+        },
     },
-    NativeField {
-        name: "payload_len",
-        ty: NativeFieldType::U64,
-        source: NativeFieldSource::Finalize(LayoutFinalize {
-            target: LayoutAnchor::FooterStart,
-            relative_to: LayoutAnchor::RawRegionStart,
-        }),
+    NativeRecordFieldDef {
+        role: NativeRecordField::PayloadLen,
+        field: NativeField {
+            name: "payload_len",
+            ty: NativeFieldType::U64,
+            source: NativeFieldSource::Finalize(LayoutFinalize {
+                target: LayoutAnchor::FooterStart,
+                relative_to: LayoutAnchor::RawRegionStart,
+            }),
+        },
     },
-    NativeField {
-        name: "checksum",
-        ty: NativeFieldType::U32,
-        source: NativeFieldSource::Native("checksum"),
+    NativeRecordFieldDef {
+        role: NativeRecordField::Checksum,
+        field: NativeField {
+            name: "checksum",
+            ty: NativeFieldType::U32,
+            source: NativeFieldSource::Native("checksum"),
+        },
     },
-    NativeField {
-        name: "uncompressed_len_hint",
-        ty: NativeFieldType::U32,
-        source: NativeFieldSource::Native("uncompressed_len_hint"),
+    NativeRecordFieldDef {
+        role: NativeRecordField::UncompressedLenHint,
+        field: NativeField {
+            name: "uncompressed_len_hint",
+            ty: NativeFieldType::U32,
+            source: NativeFieldSource::Native("uncompressed_len_hint"),
+        },
     },
 ];
 
-const RECORD_FOOTER_FIELDS: &[NativeField] = &[
-    NativeField {
-        name: "magic",
-        ty: NativeFieldType::Bytes { len: 4 },
-        source: NativeFieldSource::LiteralBytes(crate::file::RECORD_FOOTER_MAGIC),
+const RECORD_FOOTER_FIELDS: &[NativeRecordFieldDef] = &[
+    NativeRecordFieldDef {
+        role: NativeRecordField::FooterMagic,
+        field: NativeField {
+            name: "magic",
+            ty: NativeFieldType::Bytes { len: 4 },
+            source: NativeFieldSource::LiteralBytes(crate::file::RECORD_FOOTER_MAGIC),
+        },
     },
-    NativeField {
-        name: "footer_version",
-        ty: NativeFieldType::U16,
-        source: NativeFieldSource::LiteralU64(crate::file::RECORD_FOOTER_VERSION as u64),
+    NativeRecordFieldDef {
+        role: NativeRecordField::FooterVersion,
+        field: NativeField {
+            name: "footer_version",
+            ty: NativeFieldType::U16,
+            source: NativeFieldSource::LiteralU64(crate::file::RECORD_FOOTER_VERSION as u64),
+        },
     },
-    NativeField {
-        name: "footer_flags",
-        ty: NativeFieldType::U16,
-        source: NativeFieldSource::Native("footer_flags"),
+    NativeRecordFieldDef {
+        role: NativeRecordField::FooterFlags,
+        field: NativeField {
+            name: "footer_flags",
+            ty: NativeFieldType::U16,
+            source: NativeFieldSource::Native("footer_flags"),
+        },
     },
-    NativeField {
-        name: "prev_same_block_offset",
-        ty: NativeFieldType::U64,
-        source: NativeFieldSource::Native("prev_same_block_offset"),
+    NativeRecordFieldDef {
+        role: NativeRecordField::PrevSameBlockOffset,
+        field: NativeField {
+            name: "prev_same_block_offset",
+            ty: NativeFieldType::U64,
+            source: NativeFieldSource::Native("prev_same_block_offset"),
+        },
     },
-    NativeField {
-        name: "prev_same_key_offset",
-        ty: NativeFieldType::U64,
-        source: NativeFieldSource::Native("prev_same_key_offset"),
+    NativeRecordFieldDef {
+        role: NativeRecordField::PrevSameKeyOffset,
+        field: NativeField {
+            name: "prev_same_key_offset",
+            ty: NativeFieldType::U64,
+            source: NativeFieldSource::Native("prev_same_key_offset"),
+        },
     },
-    NativeField {
-        name: "footer_crc32",
-        ty: NativeFieldType::U32,
-        source: NativeFieldSource::LiteralU64(0),
+    NativeRecordFieldDef {
+        role: NativeRecordField::FooterCrc32,
+        field: NativeField {
+            name: "footer_crc32",
+            ty: NativeFieldType::U32,
+            source: NativeFieldSource::LiteralU64(0),
+        },
     },
-    NativeField {
-        name: "reserved",
-        ty: NativeFieldType::U32,
-        source: NativeFieldSource::LiteralU64(0),
+    NativeRecordFieldDef {
+        role: NativeRecordField::FooterReserved,
+        field: NativeField {
+            name: "reserved",
+            ty: NativeFieldType::U32,
+            source: NativeFieldSource::LiteralU64(0),
+        },
     },
 ];
+
+/// Sum of the declared field widths, folded at compile time.
+///
+/// `NativeFieldType::byte_len` is already `const fn`, so the two per-record
+/// folds this used to drive — `read_native_record_header`'s `lead_in_len` and
+/// `NativeRecordAnchors::new` — become constants.
+const fn native_record_fields_len(fields: &[NativeRecordFieldDef]) -> u64 {
+    let mut total = 0;
+    let mut index = 0;
+    while index < fields.len() {
+        total += fields[index].field.ty.byte_len();
+        index += 1;
+    }
+    total
+}
+
+const RECORD_HEADER_FIELDS_LEN: u64 = native_record_fields_len(RECORD_HEADER_FIELDS);
+const RECORD_FOOTER_FIELDS_LEN: u64 = native_record_fields_len(RECORD_FOOTER_FIELDS);
+
+/// The length contract, discharged by the compiler.
+///
+/// This used to be `ensure_native_record_layout_contract`, re-derived from the
+/// tables on every encode and every decode. A table that no longer sums to the
+/// published 32-byte header or footer now fails the build instead of failing
+/// `FormatSpec::validate` at open.
+const _: () = {
+    assert!(RECORD_HEADER_FIELDS_LEN == crate::file::RECORD_HEADER_LEN);
+    assert!(RECORD_FOOTER_FIELDS_LEN == crate::file::RECORD_FOOTER_LEN);
+};
 
 pub(crate) fn native_file_header_plan_fields(spec: FormatSpec) -> Vec<LayoutPlanField> {
     let extension_len = native_file_header_plan_extension_len(spec);
@@ -332,25 +439,18 @@ pub(crate) fn native_record_footer_plan_fields() -> Vec<LayoutPlanField> {
     native_fields_to_plan(RECORD_FOOTER_FIELDS)
 }
 
-pub(crate) fn native_record_header_len() -> u64 {
-    native_fields_len(RECORD_HEADER_FIELDS)
+pub(crate) const fn native_record_header_len() -> u64 {
+    RECORD_HEADER_FIELDS_LEN
 }
 
-pub(crate) fn native_record_footer_len() -> u64 {
-    native_fields_len(RECORD_FOOTER_FIELDS)
+pub(crate) const fn native_record_footer_len() -> u64 {
+    RECORD_FOOTER_FIELDS_LEN
 }
 
+/// Kept so `FormatSpec::validate` keeps its call site; the check itself now
+/// lives in the `const _: ()` assertion beside the field tables, which the
+/// compiler discharges once instead of this running per encode and per decode.
 pub(crate) fn ensure_native_record_layout_contract() -> Result<()> {
-    if native_record_header_len() != crate::file::RECORD_HEADER_LEN {
-        return Err(Error::InvalidFormatSpec(
-            "native record header layout length mismatch",
-        ));
-    }
-    if native_record_footer_len() != crate::file::RECORD_FOOTER_LEN {
-        return Err(Error::InvalidFormatSpec(
-            "native record footer layout length mismatch",
-        ));
-    }
     Ok(())
 }
 
@@ -393,13 +493,12 @@ pub(crate) fn encode_native_record_header(
     record_offset: u64,
     footer_len: u64,
 ) -> Result<[u8; crate::file::RECORD_HEADER_LEN as usize]> {
-    ensure_native_record_layout_contract()?;
     let anchors = NativeRecordAnchors::new(record_offset, header.payload_len, footer_len)?;
     let mut bytes = [0; crate::file::RECORD_HEADER_LEN as usize];
     let mut cursor = &mut bytes[..];
-    for field in RECORD_HEADER_FIELDS {
-        let value = native_header_value(*field, header, anchors)?;
-        write_native_value(&mut cursor, *field, &value)?;
+    for def in RECORD_HEADER_FIELDS {
+        let value = native_header_value(*def, header, anchors)?;
+        write_native_value(&mut cursor, def.field, &value)?;
     }
     Ok(bytes)
 }
@@ -408,7 +507,6 @@ pub(crate) fn read_native_record_header<R: Read>(
     reader: &mut R,
     _offset: u64,
 ) -> Result<DecodedRecordHeader> {
-    ensure_native_record_layout_contract()?;
     let mut bytes = [0; crate::file::RECORD_HEADER_LEN as usize];
     reader.read_exact(&mut bytes)?;
     let mut cursor = bytes.as_slice();
@@ -421,21 +519,28 @@ pub(crate) fn read_native_record_header<R: Read>(
     let mut checksum = None;
     let mut uncompressed_len_hint = None;
 
-    for field in RECORD_HEADER_FIELDS {
-        let value = read_native_value(&mut cursor, *field)?;
-        match field.name {
-            "block_id" => block_id = Some(value_as_u32(field.name, &value)?),
-            "block_version" => block_version = Some(value_as_u16(field.name, &value)?),
-            "flags" => flags = Some(value_as_u16(field.name, &value)?),
-            "sequence" => sequence = Some(value_as_u64(field.name, &value)?),
-            "payload_len" => payload_len = Some(value_as_u64(field.name, &value)?),
-            "checksum" => checksum = Some(value_as_u32(field.name, &value)?),
-            "uncompressed_len_hint" => {
-                uncompressed_len_hint = Some(value_as_u32(field.name, &value)?);
+    for def in RECORD_HEADER_FIELDS {
+        let name = def.field.name;
+        let value = read_native_value(&mut cursor, def.field)?;
+        match def.role {
+            NativeRecordField::BlockId => block_id = Some(value_as_u32(name, &value)?),
+            NativeRecordField::BlockVersion => block_version = Some(value_as_u16(name, &value)?),
+            NativeRecordField::RecordFlags => flags = Some(value_as_u16(name, &value)?),
+            NativeRecordField::Sequence => sequence = Some(value_as_u64(name, &value)?),
+            NativeRecordField::PayloadLen => payload_len = Some(value_as_u64(name, &value)?),
+            NativeRecordField::Checksum => checksum = Some(value_as_u32(name, &value)?),
+            NativeRecordField::UncompressedLenHint => {
+                uncompressed_len_hint = Some(value_as_u32(name, &value)?);
             }
-            _ => {
+            NativeRecordField::FooterMagic
+            | NativeRecordField::FooterVersion
+            | NativeRecordField::FooterFlags
+            | NativeRecordField::PrevSameBlockOffset
+            | NativeRecordField::PrevSameKeyOffset
+            | NativeRecordField::FooterCrc32
+            | NativeRecordField::FooterReserved => {
                 return Err(Error::InvalidFormatSpec(
-                    "unknown native record header field",
+                    "footer role in the native record header table",
                 ));
             }
         }
@@ -472,9 +577,9 @@ pub(crate) fn encode_native_record_footer(footer: RecordFooterFields) -> Result<
             resource: "native record footer",
             requested: u64::try_from(footer_len).unwrap_or(u64::MAX),
         })?;
-    for field in RECORD_FOOTER_FIELDS {
-        let value = native_footer_value(*field, footer)?;
-        write_native_value(&mut bytes, *field, &value)?;
+    for def in RECORD_FOOTER_FIELDS {
+        let value = native_footer_value(*def, footer)?;
+        write_native_value(&mut bytes, def.field, &value)?;
     }
     Ok(bytes)
 }
@@ -499,51 +604,51 @@ pub(crate) fn decode_native_record_footer(
     let mut prev_same_block_offset = None;
     let mut prev_same_key_offset = None;
 
-    for field in RECORD_FOOTER_FIELDS {
+    for def in RECORD_FOOTER_FIELDS {
+        let name = def.field.name;
         let value =
-            read_native_value(&mut cursor, *field).map_err(|_| Error::InvalidRecordFooter {
+            read_native_value(&mut cursor, def.field).map_err(|_| Error::InvalidRecordFooter {
                 offset: footer_offset,
             })?;
-        match field.source {
-            NativeFieldSource::LiteralBytes(expected) => {
+        let invalid = || Error::InvalidRecordFooter {
+            offset: footer_offset,
+        };
+        match def.role {
+            NativeRecordField::FooterMagic => {
+                let NativeFieldSource::LiteralBytes(expected) = def.field.source else {
+                    return Err(invalid());
+                };
                 if !matches!(value, LayoutValue::Bytes(actual) if actual == expected) {
-                    return Err(Error::InvalidRecordFooter {
-                        offset: footer_offset,
-                    });
+                    return Err(invalid());
                 }
             }
-            NativeFieldSource::LiteralU64(expected) => {
-                if value_as_u64(field.name, &value).ok() != Some(expected) {
-                    return Err(Error::InvalidRecordFooter {
-                        offset: footer_offset,
-                    });
+            NativeRecordField::FooterVersion
+            | NativeRecordField::FooterCrc32
+            | NativeRecordField::FooterReserved => {
+                let NativeFieldSource::LiteralU64(expected) = def.field.source else {
+                    return Err(invalid());
+                };
+                if value_as_u64(name, &value).ok() != Some(expected) {
+                    return Err(invalid());
                 }
             }
-            NativeFieldSource::Native("footer_flags") => {
-                flags = Some(value_as_u16(field.name, &value).map_err(|_| {
-                    Error::InvalidRecordFooter {
-                        offset: footer_offset,
-                    }
-                })?);
+            NativeRecordField::FooterFlags => {
+                flags = Some(value_as_u16(name, &value).map_err(|_| invalid())?);
             }
-            NativeFieldSource::Native("prev_same_block_offset") => {
-                prev_same_block_offset = Some(value_as_u64(field.name, &value).map_err(|_| {
-                    Error::InvalidRecordFooter {
-                        offset: footer_offset,
-                    }
-                })?);
+            NativeRecordField::PrevSameBlockOffset => {
+                prev_same_block_offset = Some(value_as_u64(name, &value).map_err(|_| invalid())?);
             }
-            NativeFieldSource::Native("prev_same_key_offset") => {
-                prev_same_key_offset = Some(value_as_u64(field.name, &value).map_err(|_| {
-                    Error::InvalidRecordFooter {
-                        offset: footer_offset,
-                    }
-                })?);
+            NativeRecordField::PrevSameKeyOffset => {
+                prev_same_key_offset = Some(value_as_u64(name, &value).map_err(|_| invalid())?);
             }
-            _ => {
-                return Err(Error::InvalidRecordFooter {
-                    offset: footer_offset,
-                });
+            NativeRecordField::BlockId
+            | NativeRecordField::BlockVersion
+            | NativeRecordField::RecordFlags
+            | NativeRecordField::Sequence
+            | NativeRecordField::PayloadLen
+            | NativeRecordField::Checksum
+            | NativeRecordField::UncompressedLenHint => {
+                return Err(invalid());
             }
         }
     }
@@ -623,41 +728,67 @@ impl NativeRecordAnchors {
 }
 
 fn native_header_value(
-    field: NativeField,
+    def: NativeRecordFieldDef,
     header: RecordHeaderFields,
     anchors: NativeRecordAnchors,
 ) -> Result<LayoutValue> {
-    match field.source {
-        NativeFieldSource::Caller if field.name == "block_id" => {
-            Ok(LayoutValue::U32(header.block_id))
-        }
-        NativeFieldSource::Caller if field.name == "block_version" => {
-            Ok(LayoutValue::U16(header.block_version))
-        }
-        NativeFieldSource::Native("record_flags") => Ok(LayoutValue::U16(header.flags)),
-        NativeFieldSource::Native("sequence") => Ok(LayoutValue::U64(header.sequence)),
-        NativeFieldSource::Native("checksum") => Ok(LayoutValue::U32(header.checksum)),
-        NativeFieldSource::Native("uncompressed_len_hint") => {
-            Ok(LayoutValue::U32(header.uncompressed_len_hint))
-        }
-        NativeFieldSource::Finalize(finalize) => {
+    match def.role {
+        NativeRecordField::BlockId => Ok(LayoutValue::U32(header.block_id)),
+        NativeRecordField::BlockVersion => Ok(LayoutValue::U16(header.block_version)),
+        NativeRecordField::RecordFlags => Ok(LayoutValue::U16(header.flags)),
+        NativeRecordField::Sequence => Ok(LayoutValue::U64(header.sequence)),
+        NativeRecordField::PayloadLen => {
+            let NativeFieldSource::Finalize(finalize) = def.field.source else {
+                return Err(Error::InvalidFormatSpec(
+                    "native record payload_len must be a finalize field",
+                ));
+            };
             let target = anchors.value(finalize.target)?;
             let relative = anchors.value(finalize.relative_to)?;
             Ok(LayoutValue::U64(target.checked_sub(relative).ok_or(
                 Error::LayoutInvalidSegmentBounds { offset: target },
             )?))
         }
-        _ => Err(Error::InvalidFormatSpec(
-            "unknown native record header source",
+        NativeRecordField::Checksum => Ok(LayoutValue::U32(header.checksum)),
+        NativeRecordField::UncompressedLenHint => {
+            Ok(LayoutValue::U32(header.uncompressed_len_hint))
+        }
+        NativeRecordField::FooterMagic
+        | NativeRecordField::FooterVersion
+        | NativeRecordField::FooterFlags
+        | NativeRecordField::PrevSameBlockOffset
+        | NativeRecordField::PrevSameKeyOffset
+        | NativeRecordField::FooterCrc32
+        | NativeRecordField::FooterReserved => Err(Error::InvalidFormatSpec(
+            "footer role in the native record header table",
         )),
     }
 }
 
-fn native_footer_value(field: NativeField, footer: RecordFooterFields) -> Result<LayoutValue> {
-    match field.source {
-        NativeFieldSource::LiteralBytes(bytes) => Ok(LayoutValue::Bytes(bytes.to_vec())),
-        NativeFieldSource::LiteralU64(value) => Ok(LayoutValue::U64(value)),
-        NativeFieldSource::Native("footer_flags") => {
+fn native_footer_value(
+    def: NativeRecordFieldDef,
+    footer: RecordFooterFields,
+) -> Result<LayoutValue> {
+    match def.role {
+        NativeRecordField::FooterMagic => {
+            let NativeFieldSource::LiteralBytes(bytes) = def.field.source else {
+                return Err(Error::InvalidFormatSpec(
+                    "native record footer magic must be a literal",
+                ));
+            };
+            Ok(LayoutValue::Bytes(bytes.to_vec()))
+        }
+        NativeRecordField::FooterVersion
+        | NativeRecordField::FooterCrc32
+        | NativeRecordField::FooterReserved => {
+            let NativeFieldSource::LiteralU64(value) = def.field.source else {
+                return Err(Error::InvalidFormatSpec(
+                    "native record footer constant must be a literal",
+                ));
+            };
+            Ok(LayoutValue::U64(value))
+        }
+        NativeRecordField::FooterFlags => {
             let mut flags = 0u16;
             if footer.prev_same_block_offset.is_some() {
                 flags |= crate::file::RECORD_FOOTER_FLAG_PREV_SAME_BLOCK;
@@ -667,14 +798,20 @@ fn native_footer_value(field: NativeField, footer: RecordFooterFields) -> Result
             }
             Ok(LayoutValue::U16(flags))
         }
-        NativeFieldSource::Native("prev_same_block_offset") => {
+        NativeRecordField::PrevSameBlockOffset => {
             Ok(LayoutValue::U64(footer.prev_same_block_offset.unwrap_or(0)))
         }
-        NativeFieldSource::Native("prev_same_key_offset") => {
+        NativeRecordField::PrevSameKeyOffset => {
             Ok(LayoutValue::U64(footer.prev_same_key_offset.unwrap_or(0)))
         }
-        _ => Err(Error::InvalidFormatSpec(
-            "unknown native record footer source",
+        NativeRecordField::BlockId
+        | NativeRecordField::BlockVersion
+        | NativeRecordField::RecordFlags
+        | NativeRecordField::Sequence
+        | NativeRecordField::PayloadLen
+        | NativeRecordField::Checksum
+        | NativeRecordField::UncompressedLenHint => Err(Error::InvalidFormatSpec(
+            "header role in the native record footer table",
         )),
     }
 }
@@ -977,13 +1114,13 @@ fn native_uses_file_explicit_compression(spec: FormatSpec) -> bool {
     )
 }
 
-fn native_fields_to_plan(fields: &[NativeField]) -> Vec<LayoutPlanField> {
+fn native_fields_to_plan(fields: &[NativeRecordFieldDef]) -> Vec<LayoutPlanField> {
     fields
         .iter()
-        .map(|field| LayoutPlanField {
-            name: field.name.to_string(),
-            ty: native_field_type_to_plan(field.ty),
-            source: native_field_source_to_plan(field.source),
+        .map(|def| LayoutPlanField {
+            name: def.field.name.to_string(),
+            ty: native_field_type_to_plan(def.field.ty),
+            source: native_field_source_to_plan(def.field.source),
             endian: Some(Endian::Little),
         })
         .collect()
@@ -1011,10 +1148,6 @@ fn native_field_source_to_plan(source: NativeFieldSource) -> LayoutPlanFieldSour
         NativeFieldSource::Native(name) => LayoutPlanFieldSource::Native(name),
         NativeFieldSource::Finalize(finalize) => LayoutPlanFieldSource::Finalize(finalize),
     }
-}
-
-fn native_fields_len(fields: &[NativeField]) -> u64 {
-    fields.iter().map(|field| field.ty.byte_len()).sum()
 }
 
 fn write_native_value<W: Write>(
@@ -1145,5 +1278,97 @@ fn value_as_u64(field: &'static str, value: &LayoutValue) -> Result<u64> {
         LayoutValue::U32(value) => Ok(u64::from(*value)),
         LayoutValue::U64(value) => Ok(*value),
         _ => Err(Error::LayoutFieldTypeMismatch(field)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Distinct, non-symmetric values in every field: a transposition of two
+    /// roles moves at least two bytes.
+    const PROBE_HEADER: RecordHeaderFields = RecordHeaderFields {
+        block_id: 0x1122_3344,
+        block_version: 0x5566,
+        flags: 0x7788,
+        sequence: 0x99AA_BBCC_DDEE_FF00,
+        payload_len: 0,
+        checksum: 0x0102_0304,
+        uncompressed_len_hint: 0x0506_0708,
+    };
+
+    const PROBE_FOOTER: RecordFooterFields = RecordFooterFields {
+        prev_same_block_offset: Some(0x1122_3344_5566_7788),
+        prev_same_key_offset: Some(0x0102_0304_0506_0708),
+    };
+
+    /// Captured from the build before the role dispatch replaced the
+    /// field-name dispatch, by printing `encode_native_record_header`'s output
+    /// for `PROBE_HEADER`.
+    const PROBE_HEADER_BYTES: [u8; crate::file::RECORD_HEADER_LEN as usize] = [
+        0x44, 0x33, 0x22, 0x11, // block_id
+        0x66, 0x55, // block_version
+        0x88, 0x77, // flags
+        0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, // sequence
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // payload_len
+        0x04, 0x03, 0x02, 0x01, // checksum
+        0x08, 0x07, 0x06, 0x05, // uncompressed_len_hint
+    ];
+
+    /// Same capture, for `encode_native_record_footer(PROBE_FOOTER)`.
+    const PROBE_FOOTER_BYTES: [u8; crate::file::RECORD_FOOTER_LEN as usize] = [
+        0x56, 0x52, 0x46, 0x31, // magic "VRF1"
+        0x01, 0x00, // footer_version
+        0x03, 0x00, // footer_flags: prev_same_block | prev_same_key
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // prev_same_block_offset
+        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // prev_same_key_offset
+        0x00, 0x00, 0x00, 0x00, // footer_crc32
+        0x00, 0x00, 0x00, 0x00, // reserved
+    ];
+
+    /// The safety assertion for the role dispatch, not a speed assertion.
+    ///
+    /// A `role` transposed between two same-width adjacent fields — `checksum`
+    /// and `uncompressed_len_hint`, say — round-trips symmetrically and is
+    /// invisible to every encode/decode test in the workspace. It is not
+    /// invisible here: every probe field holds a distinct, non-symmetric value,
+    /// so any transposition moves at least two bytes away from the literal
+    /// captured from the pre-change build.
+    #[test]
+    fn native_record_header_bytes_are_unchanged_by_the_role_dispatch() {
+        let header = encode_native_record_header(PROBE_HEADER, 0x40, 32)
+            .expect("probe header encodes within a 32-byte header");
+        assert_eq!(header, PROBE_HEADER_BYTES);
+
+        let footer = encode_native_record_footer(PROBE_FOOTER).expect("probe footer encodes");
+        assert_eq!(footer.as_slice(), PROBE_FOOTER_BYTES.as_slice());
+    }
+
+    /// The decoders must read back exactly what the byte literals hold, so a
+    /// role transposed on the *decode* side alone is caught too.
+    #[test]
+    fn native_record_header_and_footer_decode_the_captured_bytes() {
+        let decoded = read_native_record_header(&mut PROBE_HEADER_BYTES.as_slice(), 0x40)
+            .expect("captured header decodes");
+        assert_eq!(decoded.fields, PROBE_HEADER);
+        assert_eq!(decoded.lead_in_len, crate::file::RECORD_HEADER_LEN);
+
+        let record_offset = 0x1122_3344_5566_7789;
+        let footer = decode_native_record_footer(
+            PROBE_FOOTER_BYTES.as_slice(),
+            record_offset + 64,
+            record_offset,
+        )
+        .expect("captured footer decodes");
+        assert_eq!(footer, PROBE_FOOTER);
+    }
+
+    /// The length contract is discharged at compile time; assert that the two
+    /// published constants are what the tables actually sum to, so a reader of
+    /// this module does not have to trust the `const _: ()` block alone.
+    #[test]
+    fn record_field_tables_sum_to_the_published_lengths() {
+        assert_eq!(native_record_header_len(), crate::file::RECORD_HEADER_LEN);
+        assert_eq!(native_record_footer_len(), crate::file::RECORD_FOOTER_LEN);
     }
 }

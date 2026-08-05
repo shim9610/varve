@@ -604,6 +604,25 @@ impl SidecarPolicy {
         })
     }
 
+    /// The full report: presence, status, and the main file's identity as it is
+    /// on disk right now.
+    ///
+    /// # Cost
+    ///
+    /// Whenever the sidecar exists this fingerprints the main file — the whole
+    /// captured extent — **regardless of `verify_main_len` and
+    /// `verify_main_fingerprint`, and regardless of whether `expected` is
+    /// `Some`**. That is not an oversight to be optimised away: the returned
+    /// [`SidecarReport::actual`] publishes a [`SidecarIdentity`] whose
+    /// `main_fingerprint` is a plain `u64`, so there is no value it could carry
+    /// for a fingerprint that was never computed.
+    ///
+    /// The consequence is a hard ceiling: a main file longer than
+    /// `max_scan_bytes` (256 MiB by default) makes this return
+    /// [`Error::LimitExceeded`] rather than a report. When the answer wanted is
+    /// a verdict rather than an identity, call [`Self::verify`] instead — it
+    /// reads only what the policy's own flags consult, which for a
+    /// length-only policy is one `metadata()` at any file size.
     pub fn inspect<P: AsRef<Path>>(
         &self,
         main: P,
@@ -612,6 +631,9 @@ impl SidecarPolicy {
         self.inspect_with_scan_limit(main, expected, DEFAULT_SIDECAR_FINGERPRINT_SCAN_LIMIT)
     }
 
+    /// [`Self::inspect`] with an explicit fingerprint I/O ceiling. The cost note
+    /// on `inspect` applies here too: raising the ceiling does not skip the
+    /// hash, it pays for it.
     pub fn inspect_with_scan_limit<P: AsRef<Path>>(
         &self,
         main: P,
@@ -651,6 +673,74 @@ impl SidecarPolicy {
             status,
             actual,
         })
+    }
+
+    /// The verdict alone, reading only what this policy's own flags consult.
+    ///
+    /// Same status table as [`Self::inspect`], row for row, but the identity is
+    /// never published — so nothing forces a fingerprint that no flag asked
+    /// for. What that buys, stated as a cost:
+    ///
+    /// | policy | what is read | ceiling |
+    /// | --- | --- | --- |
+    /// | sidecar absent | nothing | none |
+    /// | `expected: None` | nothing | none |
+    /// | both flags false | nothing | none |
+    /// | `verify_main_len` only | one `metadata()` | none — any file size |
+    /// | `verify_main_fingerprint` | the captured extent, hashed | the scan limit, exactly as `inspect` |
+    ///
+    /// The fourth row is the capability `inspect` cannot offer: a policy that
+    /// asked for a length comparison gets its answer on a 4 TB main file, for
+    /// one `stat`.
+    ///
+    /// One deliberate difference from `inspect` beyond the status table, in the
+    /// *error* cases rather than the verdicts: where `inspect` opens the main
+    /// file whenever the sidecar exists, this touches it only when a flag needs
+    /// it, so a missing or unreadable main file is reported by `inspect` and
+    /// not by a `verify` whose flags are both false.
+    pub fn verify<P: AsRef<Path>>(
+        &self,
+        main: P,
+        expected: Option<&SidecarIdentity>,
+    ) -> Result<AdapterCheckStatus> {
+        self.verify_with_scan_limit(main, expected, DEFAULT_SIDECAR_FINGERPRINT_SCAN_LIMIT)
+    }
+
+    /// [`Self::verify`] with an explicit fingerprint I/O ceiling.
+    ///
+    /// The ceiling is consulted only on the row that hashes: with
+    /// `verify_main_fingerprint` false it is never reached, however small it is
+    /// and however large the main file is.
+    pub fn verify_with_scan_limit<P: AsRef<Path>>(
+        &self,
+        main: P,
+        expected: Option<&SidecarIdentity>,
+        max_scan_bytes: u64,
+    ) -> Result<AdapterCheckStatus> {
+        let main = main.as_ref();
+        // Mirrors `inspect_with_scan_limit`'s table branch for branch, in its
+        // order, so the two cannot disagree on a verdict. `adapter_sidecar_verify`
+        // sweeps every row of it against `inspect` for that reason.
+        if !self.sidecar_path(main).exists() {
+            return Ok(if self.mode == SidecarMode::Required {
+                AdapterCheckStatus::Failed
+            } else {
+                AdapterCheckStatus::Warning
+            });
+        }
+        let Some(expected) = expected else {
+            return Ok(AdapterCheckStatus::Passed);
+        };
+        if self.verify_main_len && fs::metadata(main)?.len() != expected.main_len {
+            return Ok(AdapterCheckStatus::Failed);
+        }
+        if self.verify_main_fingerprint {
+            let actual = SidecarIdentity::from_main_file_with_scan_limit(main, max_scan_bytes)?;
+            if actual.main_fingerprint != expected.main_fingerprint {
+                return Ok(AdapterCheckStatus::Failed);
+            }
+        }
+        Ok(AdapterCheckStatus::Passed)
     }
 }
 

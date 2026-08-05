@@ -1037,6 +1037,8 @@ formats provide their own domain codecs and models.
 | `reduce_segments_by_ref::<R, _>(...)` | run a reducer over segment metadata without copying segment info |
 | `SidecarPolicy` | derive/check companion sidecar paths and main-file identity |
 | `SidecarPolicy::inspect_with_scan_limit(...)` | inspect with an explicit fingerprint I/O ceiling |
+| `SidecarPolicy::verify(main, expected)` | the verdict alone, reading only what the policy's flags consult: with `verify_main_fingerprint` off, one `metadata()` at any main-file size; `inspect` fingerprints whenever the sidecar exists, because its report publishes the identity |
+| `SidecarPolicy::verify_with_scan_limit(...)` | the same, with an explicit fingerprint I/O ceiling — reached only when `verify_main_fingerprint` is set |
 | `SidecarIdentity::from_main_file(...)` | fingerprint the captured extent up to the finite 256 MiB default |
 | `SidecarIdentity::from_main_file_with_scan_limit(...)` | fingerprint with a caller-selected scan ceiling |
 | `AdapterCheckReport` | compose physical tail status and adapter diagnostics |
