@@ -239,7 +239,6 @@ fn reopened_writer_recovers_checkpoint_cadence() -> varve::Result<()> {
 #[test]
 fn checkpoint_cadence_touches_grow_linearly() -> varve::Result<()> {
     use varve::VarveFile;
-
     fn measure(records: u32, name: &str) -> varve::Result<u64> {
         let path = temp_path(name);
         cleanup(&path);
@@ -340,8 +339,6 @@ fn cleanup(path: &PathBuf) {
 #[cfg(feature = "scalable-fault-injection")]
 #[test]
 fn opening_a_checkpointed_file_does_not_read_the_checkpoints() -> varve::Result<()> {
-    use varve::VarveFile;
-
     const RECORDS: u32 = 512;
     let path = temp_path("checkpoint_open_reads");
     cleanup(&path);
