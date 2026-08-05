@@ -210,3 +210,84 @@ fn a_successful_get_does_not_build_the_key_to_compare_it() -> varve::Result<()> 
     );
     Ok(())
 }
+
+/// **The cost.** Staging a record for append does not allocate per record.
+///
+/// `prepare_stream_record` built a fresh `Vec` for every record — reserve,
+/// three `extend_from_slice`, write, drop — so continuous append took one
+/// allocation and one full payload copy per record on the path the project's
+/// design policy names as sacred. The batch path was worse: that per-record
+/// `Vec` was then copied *again* into the chunk buffer and dropped.
+///
+/// Both now stage straight into a buffer that outlives the record: the writer
+/// keeps one for single puts and clears it per record, and the batch loop
+/// appends record after record into the chunk it is about to write.
+///
+/// Measured on this tree at 500 records:
+///
+/// |                | allocations/record |
+/// | ---            | ---                |
+/// | single, before | 9.16               |
+/// | single, after  | **8.16**           |
+/// | batch, before  | 15.26              |
+/// | batch, after   | **14.26**          |
+///
+/// Exactly one per record on each path. The ceilings are literals captured
+/// from the pre-change build; what remains is other work — the logical encode's
+/// buffer, the disk-index row — that these fixes do not claim.
+#[test]
+fn staging_a_record_for_append_does_not_allocate_per_record() -> varve::Result<()> {
+    const N: u32 = 500;
+    let directory = tempfile::tempdir()?;
+
+    let single_path = directory.path().join("single.varve");
+    let mut writer = ScalarKeyFormat::create_indexed_writer(&single_path, options())?;
+    // Warm: the first record pays for the buffer the rest reuse, which is the
+    // whole point, and measuring it would hide the effect in an average.
+    writer.push_row(&Row { id: 0, value: 0 })?;
+    let start = allocations();
+    for id in 1..=N {
+        writer.push_row(&Row { id, value: id })?;
+    }
+    let single = (allocations() - start) as f64 / N as f64;
+    writer.sync()?;
+    drop(writer);
+
+    let batch_path = directory.path().join("batch.varve");
+    let mut writer = ScalarKeyFormat::create_indexed_writer(&batch_path, options())?;
+    writer.push_row(&Row { id: 0, value: 0 })?;
+    let rows: Vec<Row> = (1..=N).map(|id| Row { id, value: id }).collect();
+    let start = allocations();
+    writer
+        .push_rows(&rows, varve::BatchOptions::default())
+        .map_err(|error| error.source)?;
+    let batch = (allocations() - start) as f64 / N as f64;
+    writer.sync()?;
+    drop(writer);
+    println!("(staging) single={single:.2}/record batch={batch:.2}/record");
+
+    assert!(
+        single < 9.0,
+        "a single put allocated {single:.2} times per record; before this fix it was 9.16, of \
+         which one was the per-record staging Vec"
+    );
+    assert!(
+        batch < 15.0,
+        "a batched put allocated {batch:.2} times per record; before this fix it was 15.26, of \
+         which one was the per-record staging Vec that was then copied into the chunk"
+    );
+
+    // And the records are all there and readable, so the staging did not lose
+    // or reorder anything.
+    for path in [&single_path, &batch_path] {
+        let reader = ScalarKeyFormat::open_indexed_reader(path, options())?;
+        for id in 0..=N {
+            assert_eq!(
+                reader.get_row(&id)?.expect("record present").value,
+                id,
+                "record {id} did not survive staging in {path:?}"
+            );
+        }
+    }
+    Ok(())
+}

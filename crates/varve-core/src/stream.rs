@@ -14,8 +14,9 @@ use crate::disk_index::{
 use crate::file::{
     NativeStreamScanner, PreparedStreamRecord, ReplaceDurability, WriterLock,
     fresh_stream_creation_nonce, prepare_stream_creation_nonce_record,
-    prepare_stream_manifest_record, prepare_stream_tombstone_record, prepare_stream_user_record,
-    publish_temp_path_atomically, read_file_header, read_stream_creation_nonce, write_file_header,
+    prepare_stream_manifest_record, prepare_stream_tombstone_record,
+    prepare_stream_user_record_into, publish_temp_path_atomically, read_file_header,
+    read_stream_creation_nonce, write_file_header,
 };
 use crate::scan_control::{ScanCancelled, ScanProgressDriver};
 use crate::traits::KeyedBlockContract;
@@ -657,6 +658,14 @@ pub struct VarveStreamWriter {
     block_tails: Vec<(u32, Option<StreamTail>)>,
     state: Option<StreamWriterState>,
     poison: PoisonFlag,
+    /// Staging buffer for the single-record append path, reused for the life of
+    /// the writer.
+    ///
+    /// The record is built here and written from here, so continuous append
+    /// takes one allocation in total rather than one per record. It is cleared
+    /// at the start of each record and never read across calls, so nothing
+    /// depends on what it last held; it is a buffer, not state.
+    record_buffer: Vec<u8>,
     _lock: WriterLock,
 }
 
@@ -793,6 +802,7 @@ impl VarveStreamWriter {
             block_tails: initial_block_tails(spec),
             state: None,
             poison: PoisonFlag::healthy(),
+            record_buffer: Vec::new(),
             _lock: lock,
         };
         // STO-01: stamp the per-create nonce as the very first record of the
@@ -884,6 +894,7 @@ impl VarveStreamWriter {
                 block_tails: block_tails_from_checkpoint(spec, &checkpoint.block_tails),
                 state: None,
                 poison: PoisonFlag::healthy(),
+                record_buffer: Vec::new(),
                 _lock: lock,
             },
             loaded,
@@ -943,6 +954,7 @@ impl VarveStreamWriter {
                 block_tails: block_tails_from_checkpoint(spec, &checkpoint.block_tails),
                 state: None,
                 poison: PoisonFlag::healthy(),
+                record_buffer: Vec::new(),
                 _lock: lock,
             },
             store,
@@ -1008,15 +1020,29 @@ impl VarveStreamWriter {
         let sequence = self.next_sequence()?;
         let offset = self.snapshot.len();
         let previous_block = self.previous_block(T::ID);
-        let record = prepare_stream_user_record(
+        let mut buffer = std::mem::take(&mut self.record_buffer);
+        buffer.clear();
+        let prepared = prepare_stream_user_record_into(
             self.spec,
             value,
             sequence,
             offset,
             previous_block,
             previous,
-        )?;
-        self.append_prepared(permit, T::ID, record)
+            &mut buffer,
+        );
+        // Taken out and put back on every path, including the error one: the
+        // buffer belongs to the writer, and a failed encode must not cost it.
+        let result = match prepared {
+            Ok(parts) => {
+                let info = parts.info;
+                self.append_prepared_chunk(permit, &buffer, &[(T::ID, info)])
+                    .map(|()| info)
+            }
+            Err(err) => Err(err),
+        };
+        self.record_buffer = buffer;
+        result
     }
 
     pub fn delete_with_prev_key_info<T: VarveKeyedBlock>(
@@ -1131,48 +1157,52 @@ impl VarveStreamWriter {
 
         for value in values {
             let sequence = next_sequence.ok_or(Error::SequenceExhausted)?;
-            let record = prepare_stream_user_record(
+            // Straight into the chunk buffer. This used to encode into a
+            // per-record `Vec`, copy it in here and drop it, so a batch of N
+            // records took N allocations and N payload copies it did not need.
+            let before = bytes.len();
+            let parts = prepare_stream_user_record_into(
                 self.spec,
                 value.borrow(),
                 sequence,
                 next_offset,
                 previous_block,
                 None,
+                &mut bytes,
             )?;
             let exceeds_records = records.len() >= max_records;
-            let exceeds_bytes = !bytes.is_empty()
-                && bytes
-                    .len()
-                    .checked_add(record.bytes.len())
-                    .is_none_or(|len| len > options.max_bytes);
+            let exceeds_bytes = before != 0 && bytes.len() > options.max_bytes;
             if exceeds_records || exceeds_bytes {
+                // Flush what preceded this record and keep this one as the head
+                // of the next chunk. Its offset is still right: the flush
+                // advances the native eof to exactly `next_offset`, which is
+                // what it was prepared against.
+                //
+                // The move is one record wide, and it is the price of staging
+                // in place — the alternative is knowing the encoded length
+                // before encoding, which is what the per-record `Vec` was
+                // really buying.
                 let permit = self.ensure_writable()?;
-                self.append_prepared_chunk_summarized(permit, &bytes, &records, written)?;
-                bytes.clear();
+                self.append_prepared_chunk_summarized(permit, &bytes[..before], &records, written)?;
                 records.clear();
+                bytes.copy_within(before.., 0);
+                bytes.truncate(parts.len);
             }
 
-            next_offset = next_offset.checked_add(record.bytes.len() as u64).ok_or(
+            next_offset = next_offset.checked_add(parts.len as u64).ok_or(
                 Error::ResourceArithmeticOverflow {
                     resource: "batch native offset",
                 },
             )?;
             next_sequence = sequence.checked_add(1);
-            previous_block = Some(record.info.record_offset);
-            bytes
-                .try_reserve(record.bytes.len())
-                .map_err(|_| Error::AllocationFailed {
-                    resource: "batch record bytes",
-                    requested: record.bytes.len() as u64,
-                })?;
+            previous_block = Some(parts.info.record_offset);
             records
                 .try_reserve(1)
                 .map_err(|_| Error::AllocationFailed {
                     resource: "batch record descriptors",
                     requested: std::mem::size_of::<(u32, AppendInfo)>() as u64,
                 })?;
-            bytes.extend_from_slice(&record.bytes);
-            records.push((T::ID, record.info));
+            records.push((T::ID, parts.info));
 
             if bytes.len() >= options.max_bytes || records.len() >= max_records {
                 let permit = self.ensure_writable()?;
@@ -2067,6 +2097,9 @@ fn opened_file_identity(file: &std::fs::File) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The owning form exists for these tests and the in-crate probe; every
+    // production path stages through the `_into` form.
+    use crate::file::prepare_stream_user_record;
     use crate::{
         BlockDescriptor, Decoder, Encoder, Endian, IndexPolicy, IntegrityPolicy, ReadLimits,
         RecoveryPolicy, TransactionMarkerMode, VarveDecode, VarveEncode, WireType,

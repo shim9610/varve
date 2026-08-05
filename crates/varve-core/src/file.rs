@@ -11767,7 +11767,126 @@ pub(crate) struct PreparedStreamRecord {
     pub(crate) checksum: u32,
 }
 
+/// What [`prepare_stream_record_into`] knows about the record it just appended
+/// to the caller's buffer.
+///
+/// The same fields as [`PreparedStreamRecord`] with the buffer taken out, plus
+/// `len` — because a caller staging several records into one buffer needs to
+/// know where this one ended, and `bytes.len()` is the answer it no longer has.
+pub(crate) struct PreparedRecordParts {
+    pub(crate) len: usize,
+    pub(crate) info: AppendInfo,
+    pub(crate) block_id: u32,
+    pub(crate) block_version: u16,
+    pub(crate) flags: u16,
+    pub(crate) checksum: u32,
+}
+
+impl PreparedStreamRecord {
+    /// The same record described as [`PreparedRecordParts`], for the callers
+    /// that still take the owning form.
+    pub(crate) fn parts(&self) -> PreparedRecordParts {
+        PreparedRecordParts {
+            len: self.bytes.len(),
+            info: self.info,
+            block_id: self.block_id,
+            block_version: self.block_version,
+            flags: self.flags,
+            checksum: self.checksum,
+        }
+    }
+}
+
+/// The owning form, for the callers that want a record and nothing else: the
+/// creation nonce, the manifest, a tombstone, the probe. None of them is a hot
+/// path, and each allocates exactly the buffer it hands back.
+#[allow(clippy::too_many_arguments)]
+fn prepare_stream_record(
+    spec: FormatSpec,
+    block_id: u32,
+    block_version: u16,
+    flags: u16,
+    uncompressed_len_hint: u32,
+    payload: &[u8],
+    sequence: u64,
+    record_offset: u64,
+    prev_same_block_offset: Option<u64>,
+    prev_same_key_offset: Option<u64>,
+) -> Result<PreparedStreamRecord> {
+    let mut bytes = Vec::new();
+    let parts = prepare_stream_record_into(
+        spec,
+        block_id,
+        block_version,
+        flags,
+        uncompressed_len_hint,
+        payload,
+        sequence,
+        record_offset,
+        prev_same_block_offset,
+        prev_same_key_offset,
+        &mut bytes,
+    )?;
+    debug_assert_eq!(bytes.len(), parts.len);
+    Ok(PreparedStreamRecord {
+        bytes,
+        info: parts.info,
+        block_id: parts.block_id,
+        block_version: parts.block_version,
+        flags: parts.flags,
+        checksum: parts.checksum,
+    })
+}
+
+/// [`prepare_stream_user_record`], staging into the caller's buffer.
+///
+/// The single-record push path holds one buffer for the life of the writer and
+/// clears it per record; the batch path appends record after record into the
+/// chunk it is about to write. Both used to take a fresh `Vec` per record from
+/// the owning form below, and the batch path then copied it into the chunk
+/// buffer and dropped it.
 #[cfg(feature = "high-cardinality-dev")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_stream_user_record_into<T: VarveBlock>(
+    spec: FormatSpec,
+    value: &T,
+    sequence: u64,
+    record_offset: u64,
+    prev_same_block_offset: Option<u64>,
+    prev_same_key_offset: Option<u64>,
+    out: &mut Vec<u8>,
+) -> Result<PreparedRecordParts> {
+    let endian = T::ENDIAN.unwrap_or(spec.endian);
+    let logical_limit = spec
+        .read_limits
+        .require(ReadLimitKey::LogicalPayloadLen)?
+        .unwrap_or(u64::MAX);
+    let logical = encode_to_vec_limited(
+        value,
+        endian,
+        logical_limit,
+        ReadLimitKey::LogicalPayloadLen.resource(),
+    )?;
+    let stored = prepare_user_record_payload(spec, T::ID, T::KIND, &logical)?;
+    prepare_stream_record_into(
+        spec,
+        T::ID,
+        T::VERSION,
+        stored.flags,
+        stored.uncompressed_len_hint,
+        &stored.bytes,
+        sequence,
+        record_offset,
+        prev_same_block_offset,
+        prev_same_key_offset,
+        out,
+    )
+}
+
+/// The owning form. Only the in-crate probe and the unit tests below want a
+/// record they can hold; every production path stages through
+/// [`prepare_stream_user_record_into`].
+#[cfg(all(test, feature = "high-cardinality-dev"))]
 pub(crate) fn prepare_stream_user_record<T: VarveBlock>(
     spec: FormatSpec,
     value: &T,
@@ -11926,8 +12045,19 @@ pub(crate) fn read_stream_creation_nonce(
 }
 
 #[cfg(feature = "high-cardinality-dev")]
+/// Appends one encoded record to `out` and returns what the writer needs to
+/// know about it.
+///
+/// **Appends rather than replaces**, which is what lets the batch path stage a
+/// whole chunk through one buffer: each record lands directly where it will be
+/// written from, instead of into a per-record `Vec` that is copied into the
+/// chunk and dropped.
+///
+/// This used to build that per-record `Vec` itself — `try_reserve_exact` plus
+/// three `extend_from_slice` — so continuous append allocated once per record,
+/// on the path the project's design policy names as sacred.
 #[allow(clippy::too_many_arguments)]
-fn prepare_stream_record(
+fn prepare_stream_record_into(
     spec: FormatSpec,
     block_id: u32,
     block_version: u16,
@@ -11938,7 +12068,8 @@ fn prepare_stream_record(
     record_offset: u64,
     prev_same_block_offset: Option<u64>,
     prev_same_key_offset: Option<u64>,
-) -> Result<PreparedStreamRecord> {
+    out: &mut Vec<u8>,
+) -> Result<PreparedRecordParts> {
     let prev_same_block_offset = spec
         .index_policy
         .block_offset_chain
@@ -12006,18 +12137,21 @@ fn prepare_stream_record(
         .ok_or(Error::ResourceArithmeticOverflow {
             resource: "record buffer length",
         })?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(total_len)
+    // `try_reserve` and not `try_reserve_exact`: `out` is the caller's buffer
+    // and outlives this record, so exact-fitting it to one record is what would
+    // make the next record reallocate. A fresh `Vec` reserves exactly `total_len`
+    // on its first record either way, because `try_reserve` on an empty `Vec`
+    // asks the allocator for what was requested.
+    out.try_reserve(total_len)
         .map_err(|_| Error::AllocationFailed {
             resource: "record buffer",
             requested: total_len as u64,
         })?;
-    bytes.extend_from_slice(&header);
-    bytes.extend_from_slice(payload);
-    bytes.extend_from_slice(footer);
-    Ok(PreparedStreamRecord {
-        bytes,
+    out.extend_from_slice(&header);
+    out.extend_from_slice(payload);
+    out.extend_from_slice(footer);
+    Ok(PreparedRecordParts {
+        len: total_len,
         block_id,
         block_version,
         flags,

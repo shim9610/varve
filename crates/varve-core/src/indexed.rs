@@ -12,7 +12,7 @@ use crate::disk_index::{
 };
 use crate::file::{
     NativeStreamScanner, RECORD_FOOTER_LEN, RECORD_HEADER_LEN, ReplaceDurability, WriterLock,
-    decode_stream_tombstone_key, prepare_stream_tombstone_record, prepare_stream_user_record,
+    decode_stream_tombstone_key, prepare_stream_tombstone_record, prepare_stream_user_record_into,
     publish_temp_path_atomically, read_file_header, read_stream_entry_at,
 };
 use crate::native_layout::{decode_native_record_footer, read_native_record_header};
@@ -396,6 +396,9 @@ pub struct VarveIndexedWriter {
     stream: VarveStreamWriter,
     index: DiskIndexStore,
     indexed_blocks: Vec<u32>,
+    /// Staging buffer for the single-record put path, reused for the life of
+    /// the writer. Cleared per record and never read across calls.
+    record_buffer: Vec<u8>,
     batch: Option<DiskIndexWriteBatch>,
     batch_records: usize,
     batch_last_sequence: Option<u64>,
@@ -508,6 +511,7 @@ impl VarveIndexedWriter {
 
     fn new(stream: VarveStreamWriter, index: DiskIndexStore, blocks: &[DiskIndexedBlock]) -> Self {
         Self {
+            record_buffer: Vec::new(),
             stream,
             index,
             indexed_blocks: blocks.iter().map(|block| block.block_id).collect(),
@@ -551,14 +555,25 @@ impl VarveIndexedWriter {
         };
         let old_eof = self.stream.snapshot().len();
         let sequence = self.stream.next_sequence()?;
-        let record = prepare_stream_user_record(
+        // Staged in the writer's own buffer, cleared per record rather than
+        // allocated per record.
+        let mut bytes = std::mem::take(&mut self.record_buffer);
+        bytes.clear();
+        let record = match prepare_stream_user_record_into(
             self.stream.spec(),
             value,
             sequence,
             old_eof,
             self.stream.previous_block(T::ID),
             previous,
-        )?;
+            &mut bytes,
+        ) {
+            Ok(record) => record,
+            Err(err) => {
+                self.record_buffer = bytes;
+                return Err(err);
+            }
+        };
         let info = record.info;
         let physical = prepared_physical(self.stream.spec(), &record)?;
         let update = DiskIndexUpdate::from_canonical_with_record(
@@ -578,8 +593,13 @@ impl VarveIndexedWriter {
         // guard: `ensure_update_capacity` can commit a sidecar chunk, which is
         // itself a step that can poison this writer.
         let permit = self.ensure_not_poisoned()?;
-        self.stream
-            .append_prepared_chunk(permit, &record.bytes, &[(T::ID, info)])?;
+        let appended = self
+            .stream
+            .append_prepared_chunk(permit, &bytes, &[(T::ID, info)]);
+        // Back to the writer on both paths; the buffer is the writer's, not
+        // this call's.
+        self.record_buffer = bytes;
+        appended?;
         self.publish_update(old_eof, info, update, tail, composite)
     }
 
@@ -622,7 +642,7 @@ impl VarveIndexedWriter {
             previous,
         )?;
         let info = record.info;
-        let physical = prepared_physical(self.stream.spec(), &record)?;
+        let physical = prepared_physical(self.stream.spec(), &record.parts())?;
         let update = DiskIndexUpdate::from_canonical_with_record(
             T::ID,
             canonical_key,
@@ -815,29 +835,36 @@ impl VarveIndexedWriter {
                 (None, None)
             };
             let sequence = next_sequence.ok_or(Error::SequenceExhausted)?;
-            let record = prepare_stream_user_record(
+            // Straight into the chunk buffer: no per-record `Vec` to copy in
+            // and drop.
+            let mut record_start = bytes.len();
+            let record = prepare_stream_user_record_into(
                 self.stream.spec(),
                 value,
                 sequence,
                 next_offset,
                 previous_block,
                 previous_key,
+                &mut bytes,
             )?;
             let exceeds_records = records.len() >= max_records;
-            let exceeds_bytes = !bytes.is_empty()
-                && bytes
-                    .len()
-                    .checked_add(record.bytes.len())
-                    .is_none_or(|len| len > options.max_bytes);
+            let exceeds_bytes = record_start != 0 && bytes.len() > options.max_bytes;
             if exceeds_records || exceeds_bytes {
-                self.publish_prepared_chunk(&bytes, &records, written)?;
-                bytes.clear();
-                records.clear();
+                // Publish what preceded this record and keep it as the head of
+                // the next chunk; the flush advances the native eof to exactly
+                // `next_offset`, which is what it was prepared against.
+                self.publish_staged_prefix(
+                    &mut bytes,
+                    &mut records,
+                    &mut record_start,
+                    record.len,
+                    written,
+                )?;
                 self.ensure_batch()?;
             }
 
             let old_eof = next_offset;
-            next_offset = next_offset.checked_add(record.bytes.len() as u64).ok_or(
+            next_offset = next_offset.checked_add(record.len as u64).ok_or(
                 Error::ResourceArithmeticOverflow {
                     resource: "indexed batch native offset",
                 },
@@ -862,9 +889,15 @@ impl VarveIndexedWriter {
                 .can_accept_update(&update, tail.is_some())
                 .map_err(index_error)?;
             if !fits_index && !records.is_empty() {
-                self.publish_prepared_chunk(&bytes, &records, written)?;
-                bytes.clear();
-                records.clear();
+                // `bytes` already holds this record and `records` does not
+                // describe it, so only the prefix may go.
+                self.publish_staged_prefix(
+                    &mut bytes,
+                    &mut records,
+                    &mut record_start,
+                    record.len,
+                    written,
+                )?;
                 self.ensure_batch()?;
             }
             self.batch
@@ -875,8 +908,8 @@ impl VarveIndexedWriter {
 
             next_sequence = sequence.checked_add(1);
             previous_block = Some(record.info.record_offset);
-            reserve_prepared(&mut bytes, &mut records, record.bytes.len())?;
-            bytes.extend_from_slice(&record.bytes);
+            // The bytes are already staged; only the descriptor is left.
+            reserve_records(&mut records)?;
             records.push((T::ID, record.info));
             self.batch_records += 1;
             self.batch_last_sequence = Some(sequence);
@@ -927,29 +960,36 @@ impl VarveIndexedWriter {
         for value in values {
             self.ensure_batch()?;
             let sequence = next_sequence.ok_or(Error::SequenceExhausted)?;
-            let record = prepare_stream_user_record(
+            // Straight into the chunk buffer: no per-record `Vec` to copy in
+            // and drop.
+            let mut record_start = bytes.len();
+            let record = prepare_stream_user_record_into(
                 self.stream.spec(),
                 value.borrow(),
                 sequence,
                 next_offset,
                 previous_block,
                 None,
+                &mut bytes,
             )?;
             let exceeds_records = records.len() >= max_records;
-            let exceeds_bytes = !bytes.is_empty()
-                && bytes
-                    .len()
-                    .checked_add(record.bytes.len())
-                    .is_none_or(|len| len > options.max_bytes);
+            let exceeds_bytes = record_start != 0 && bytes.len() > options.max_bytes;
             if exceeds_records || exceeds_bytes {
-                self.publish_prepared_chunk(&bytes, &records, written)?;
-                bytes.clear();
-                records.clear();
+                // Publish what preceded this record and keep it as the head of
+                // the next chunk; the flush advances the native eof to exactly
+                // `next_offset`, which is what it was prepared against.
+                self.publish_staged_prefix(
+                    &mut bytes,
+                    &mut records,
+                    &mut record_start,
+                    record.len,
+                    written,
+                )?;
                 self.ensure_batch()?;
             }
 
             let old_eof = next_offset;
-            next_offset = next_offset.checked_add(record.bytes.len() as u64).ok_or(
+            next_offset = next_offset.checked_add(record.len as u64).ok_or(
                 Error::ResourceArithmeticOverflow {
                     resource: "unindexed batch native offset",
                 },
@@ -962,9 +1002,15 @@ impl VarveIndexedWriter {
                 .can_accept_coverage(tail.is_some())
                 .map_err(index_error)?;
             if !fits_index && !records.is_empty() {
-                self.publish_prepared_chunk(&bytes, &records, written)?;
-                bytes.clear();
-                records.clear();
+                // `bytes` already holds this record and `records` does not
+                // describe it, so only the prefix may go.
+                self.publish_staged_prefix(
+                    &mut bytes,
+                    &mut records,
+                    &mut record_start,
+                    record.len,
+                    written,
+                )?;
                 self.ensure_batch()?;
             }
             self.batch
@@ -975,8 +1021,8 @@ impl VarveIndexedWriter {
 
             next_sequence = sequence.checked_add(1);
             previous_block = Some(record.info.record_offset);
-            reserve_prepared(&mut bytes, &mut records, record.bytes.len())?;
-            bytes.extend_from_slice(&record.bytes);
+            // The bytes are already staged; only the descriptor is left.
+            reserve_records(&mut records)?;
             records.push((T::ID, record.info));
             self.batch_records += 1;
             self.batch_last_sequence = Some(sequence);
@@ -990,6 +1036,32 @@ impl VarveIndexedWriter {
         if !records.is_empty() {
             self.publish_prepared_chunk(&bytes, &records, written)?;
         }
+        Ok(())
+    }
+
+    /// Publishes everything staged *before* the record now at the head of
+    /// `bytes`, and moves that record to the front.
+    ///
+    /// Staging in place means the record being built is already in the buffer
+    /// while `records` still describes only its predecessors, so a mid-loop
+    /// publish must not send the whole buffer — the chunk and its descriptor
+    /// list would disagree, and the disk index refuses the generation window
+    /// that results. Publishing the prefix keeps them in step, and the record
+    /// stays valid where it is: the publish advances the native eof to exactly
+    /// the offset it was prepared against.
+    fn publish_staged_prefix(
+        &mut self,
+        bytes: &mut Vec<u8>,
+        records: &mut Vec<(u32, AppendInfo)>,
+        record_start: &mut usize,
+        record_len: usize,
+        written: &mut BatchAppendInfo,
+    ) -> Result<()> {
+        self.publish_prepared_chunk(&bytes[..*record_start], records, written)?;
+        records.clear();
+        bytes.copy_within(*record_start.., 0);
+        bytes.truncate(record_len);
+        *record_start = 0;
         Ok(())
     }
 
@@ -1642,10 +1714,10 @@ fn validate_physical_candidate(
 
 fn prepared_physical(
     spec: FormatSpec,
-    record: &crate::file::PreparedStreamRecord,
+    record: &crate::file::PreparedRecordParts,
 ) -> Result<DiskIndexPhysicalRecord> {
     let physical_len =
-        u64::try_from(record.bytes.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+        u64::try_from(record.len).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
     Ok(DiskIndexPhysicalRecord {
         physical_len,
         block_id: record.block_id,
@@ -1666,17 +1738,7 @@ fn record_tail(spec: FormatSpec, block_id: u32, info: AppendInfo) -> Option<Disk
         })
 }
 
-fn reserve_prepared(
-    bytes: &mut Vec<u8>,
-    records: &mut Vec<(u32, AppendInfo)>,
-    record_len: usize,
-) -> Result<()> {
-    bytes
-        .try_reserve(record_len)
-        .map_err(|_| Error::AllocationFailed {
-            resource: "indexed batch record bytes",
-            requested: record_len as u64,
-        })?;
+fn reserve_records(records: &mut Vec<(u32, AppendInfo)>) -> Result<()> {
     records
         .try_reserve(1)
         .map_err(|_| Error::AllocationFailed {
