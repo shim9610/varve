@@ -4314,8 +4314,6 @@ pub(crate) fn create_layout(
     } else {
         page_index_end
     };
-    spec.read_limits
-        .check(ReadLimitKey::FileLen, append_log_start)?;
 
     let dimension_table = encode_dimension_table(&dimensions, dimension_table_len)?;
     let mut dimension_index = HashMap::new();
@@ -4469,7 +4467,6 @@ pub(crate) fn read_layout_at_len(
     header_len: u64,
     file_len: u64,
 ) -> Result<MatrixLayout> {
-    spec.read_limits.check(ReadLimitKey::FileLen, file_len)?;
     validate_range(header_len, u64::from(VMAT_HEADER_LEN), file_len)?;
     let crc_enabled = matrix_crc_enabled(spec)?;
     let header = read_header(file, header_len)?;
@@ -5137,9 +5134,6 @@ pub(crate) fn read_aux_at_len(
     layout.ensure_fatal_access_allowed()?;
     layout
         .read_limits
-        .check(ReadLimitKey::FileLen, logical_file_len)?;
-    layout
-        .read_limits
         .check(ReadLimitKey::RecordPayloadLen, len)?;
     layout
         .read_limits
@@ -5164,9 +5158,6 @@ pub(crate) fn write_aux_at_len(
         .try_into()
         .map_err(|_| Error::InvalidMatrixLayout)?;
     layout.ensure_fatal_access_allowed()?;
-    layout
-        .read_limits
-        .check(ReadLimitKey::FileLen, logical_file_len)?;
     layout
         .read_limits
         .check(ReadLimitKey::RecordPayloadLen, len)?;

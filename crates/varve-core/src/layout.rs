@@ -294,7 +294,6 @@ struct CountingWriter<'a, W: Write> {
     bytes_written: u64,
     start_offset: u64,
     max_region_len: Option<u64>,
-    max_file_len: Option<u64>,
     max_scan_len: Option<u64>,
     failure: Option<CountingWriteFailure>,
 }
@@ -304,7 +303,6 @@ impl<'a, W: Write> CountingWriter<'a, W> {
         inner: &'a mut W,
         start_offset: u64,
         max_region_len: Option<u64>,
-        max_file_len: Option<u64>,
         max_scan_len: Option<u64>,
     ) -> Self {
         Self {
@@ -312,7 +310,6 @@ impl<'a, W: Write> CountingWriter<'a, W> {
             bytes_written: 0,
             start_offset,
             max_region_len,
-            max_file_len,
             max_scan_len,
             failure: None,
         }
@@ -396,15 +393,10 @@ impl<W: Write> Write for CountingWriter<'_, W> {
                 });
             }
         };
-        if let Some(limit) = self.max_file_len
-            && prospective_file_len > limit
-        {
-            return self.reject(CountingWriteFailure::LimitExceeded {
-                resource: "file length",
-                actual: prospective_file_len,
-                limit,
-            });
-        }
+        // No file-length ceiling. A segment write is refused for exceeding
+        // what it actually consumes — its own payload, and the scan a later
+        // open will have to do — not for making the file longer. `max_scan_len`
+        // below is the bound that follows a resource.
         if let Some(limit) = self.max_scan_len
             && prospective_file_len > limit
         {
@@ -658,8 +650,6 @@ fn inspect_layout_file_report_inner<P: AsRef<Path>>(
     ensure_custom_layout_spec(spec)?;
     ensure_layout_open_limits(spec)?;
     let snapshot = SnapshotFile::new(File::open(path.as_ref())?)?;
-    spec.read_limits
-        .check(ReadLimitKey::FileLen, snapshot.len())?;
     let file_len = snapshot.len();
     let header = match read_file_header(spec, &snapshot) {
         Ok(header) => header,
@@ -876,8 +866,6 @@ impl LayoutWriter {
                 let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
                 lock.bind_native(&file, &path)?;
                 let snapshot = SnapshotFile::new(file.try_clone()?)?;
-                spec.read_limits
-                    .check(ReadLimitKey::FileLen, snapshot.len())?;
                 let header = read_file_header(spec, &snapshot)?;
                 // Counting, not retaining: the writer's only use for the scan is
                 // the per-name tally the walk already maintains, so nothing here
@@ -949,9 +937,6 @@ impl LayoutWriter {
         let original_eof = self.file.metadata()?.len();
         self.spec
             .read_limits
-            .check(ReadLimitKey::FileLen, original_eof)?;
-        self.spec
-            .read_limits
             .check(ReadLimitKey::ScanBytes, original_eof)?;
         let original_cursor = self.file.stream_position()?;
         let after_lead_in =
@@ -968,9 +953,6 @@ impl LayoutWriter {
                 })?;
         self.spec
             .read_limits
-            .check(ReadLimitKey::FileLen, minimum_segment_end)?;
-        self.spec
-            .read_limits
             .check(ReadLimitKey::ScanBytes, minimum_segment_end)?;
         let next_index_bytes = self
             .index_bytes
@@ -985,7 +967,6 @@ impl LayoutWriter {
             .spec
             .read_limits
             .require(ReadLimitKey::RecordPayloadLen)?;
-        let max_file_len = self.spec.read_limits.require(ReadLimitKey::FileLen)?;
         let max_scan_len = self.spec.read_limits.require(ReadLimitKey::ScanBytes)?;
         let (segment_count_index, original_segment_count, next_segment_count) =
             self.segment_count_checkpoint(descriptor.name)?;
@@ -1014,7 +995,6 @@ impl LayoutWriter {
                 &mut self.file,
                 metadata_offset,
                 max_payload_len,
-                max_file_len,
                 max_scan_len,
             );
             let metadata_result = (segment.write_metadata)(&mut metadata_writer);
@@ -1028,13 +1008,8 @@ impl LayoutWriter {
                     resource: "layout file growth",
                 },
             )?;
-            let mut raw_writer = CountingWriter::new(
-                &mut self.file,
-                raw_offset,
-                max_payload_len,
-                max_file_len,
-                max_scan_len,
-            );
+            let mut raw_writer =
+                CountingWriter::new(&mut self.file, raw_offset, max_payload_len, max_scan_len);
             let raw_result = (segment.write_raw)(&mut raw_writer);
             if let Some(error) = raw_writer.take_failure() {
                 return Err(error);
@@ -1053,9 +1028,6 @@ impl LayoutWriter {
                     .ok_or(Error::ResourceArithmeticOverflow {
                         resource: "layout file growth",
                     })?;
-            self.spec
-                .read_limits
-                .check(ReadLimitKey::FileLen, footer_end)?;
             self.spec
                 .read_limits
                 .check(ReadLimitKey::ScanBytes, footer_end)?;
@@ -1259,8 +1231,6 @@ impl LayoutReader {
         ensure_layout_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
         let snapshot = SnapshotFile::new(File::open(&path)?)?;
-        spec.read_limits
-            .check(ReadLimitKey::FileLen, snapshot.len())?;
         let header = read_file_header(spec, &snapshot)?;
         let (segments, _) = scan_layout_segments(spec, &snapshot, header.len, header.index_bytes)?;
         Ok(Self {

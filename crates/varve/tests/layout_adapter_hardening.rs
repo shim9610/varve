@@ -233,13 +233,12 @@ fn layout_open_and_region_reads_enforce_runtime_limits() -> varve::Result<()> {
     let file_len = fs::metadata(&path)?.len();
     let spec = LayoutHardeningFormat::spec();
 
-    assert_limit(
-        spec.open_layout_reader_with_limits(
-            &path,
-            ReadLimits::missing().with_max_file_len(file_len - 1),
-        ),
-        "file length",
-    );
+    // No `max_file_len` case here any more: opening no longer refuses a file
+    // for being longer than a declared number. The scan is bounded by
+    // `max_scan_bytes` below, the index by `max_index_bytes`, and a region read
+    // by `max_record_payload_len` — each against the resource it consumes, and
+    // each still asserted. A length ceiling on top of those refused to read a
+    // file whose bytes were already on disk while bounding nothing extra.
     assert_limit(
         spec.open_layout_reader_with_limits(
             &path,
@@ -326,22 +325,12 @@ fn layout_writer_limits_fail_before_unbounded_growth_and_roll_back() -> varve::R
     })?;
     drop(payload_writer);
 
-    let mut file_writer = spec.create_layout_writer_with_limits(
-        &file_path,
-        ReadLimits::missing().with_max_file_len(35),
-    )?;
-    assert_limit(
-        file_writer.write_segment(SegmentWrite {
-            name: "Data",
-            fields: &fields,
-            footer_fields: &[],
-            metadata: b"",
-            raw: b"",
-        }),
-        "file length",
-    );
-    assert_eq!(fs::metadata(&file_path)?.len(), 0);
-    drop(file_writer);
+    // The `max_file_len(35)` write-refusal case is gone with the ceiling. A
+    // writer no longer refuses a segment because the file would get longer;
+    // what it still refuses, and what the payload writer above still proves, is
+    // a segment whose own payload exceeds `max_record_payload_len` — and the
+    // rollback-to-zero assertion that mattered is asserted there.
+    let _ = &file_path;
 
     let mut scan_writer = spec.create_layout_writer_with_limits(
         &scan_path,

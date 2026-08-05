@@ -3839,8 +3839,6 @@ impl VarveFile {
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
         lock.bind_native(&file, &path)?;
         let original_len = file.metadata()?.len();
-        spec.read_limits
-            .check(ReadLimitKey::FileLen, original_len)?;
         let (header_len, header_extensions) = read_file_header_parts(spec, &mut file)?;
         let (matrix, matrix_creation_nonce) = split_matrix_state(read_matrix_layout_if_needed(
             spec,
@@ -4706,9 +4704,6 @@ impl VarveFile {
                 new: payload_len,
             });
         }
-        self.spec
-            .read_limits
-            .check(ReadLimitKey::FileLen, self.snapshot.len())?;
         self.ensure_generation_rewrite_allowed()?;
         self.validate_source_generation()?;
 
@@ -8274,9 +8269,13 @@ impl VarveFile {
             .ok_or(Error::ResourceArithmeticOverflow {
                 resource: "file length",
             })?;
-        self.spec
-            .read_limits
-            .check(ReadLimitKey::FileLen, prospective_len)?;
+        // No file-length ceiling here. `max_file_len` refuses on a number
+        // rather than on a resource: the scan is bounded incrementally by
+        // `ScanBytes`, the index by `Records` and `IndexBytes`, and a mapping
+        // by `MmapLen`, each against the thing it actually consumes. A length
+        // check on top of those refuses to touch a file whose data is already
+        // there, and on the append path it bounds nothing at all — appending to
+        // a 1 TB file costs exactly what appending to a 1 GB file costs.
         // PERF2-05: the predecessor comes from the maintained tail table, not
         // from a reverse scan of the resident index.
         let prev_same_block_offset = if self.spec.index_policy.block_offset_chain {
@@ -9004,7 +9003,6 @@ fn rewrite_record_streaming(
             .ok_or(Error::ResourceArithmeticOverflow {
                 resource: "rewrite file length",
             })?;
-    spec.read_limits.check(ReadLimitKey::FileLen, record_end)?;
     let header = RecordHeaderFields {
         block_id: entry.block_id,
         block_version: entry.block_version,
@@ -9096,7 +9094,6 @@ fn rewrite_replacement_record_streaming(
             resource: "replacement file length",
         },
     )?;
-    spec.read_limits.check(ReadLimitKey::FileLen, record_end)?;
 
     entry.record_offset = record_offset;
     entry.payload_offset = payload_offset;
@@ -11421,10 +11418,8 @@ pub(crate) fn check_initial_native_file_len(spec: FormatSpec) -> Result<()> {
     spec.read_limits.check(ReadLimitKey::FileLen, header_len)
 }
 
-pub(crate) fn check_open_file_len(spec: FormatSpec, file: &File) -> Result<u64> {
-    let file_len = file.metadata()?.len();
-    spec.read_limits.check(ReadLimitKey::FileLen, file_len)?;
-    Ok(file_len)
+pub(crate) fn check_open_file_len(_spec: FormatSpec, file: &File) -> Result<u64> {
+    Ok(file.metadata()?.len())
 }
 
 fn ensure_matrix_byte_copy_compatible<From, To>() -> Result<()>
@@ -12588,7 +12583,6 @@ fn walk_segment_chain(
     append_start: u64,
 ) -> Result<ScannedIndex> {
     let file_len = file.metadata()?.len();
-    spec.read_limits.check(ReadLimitKey::FileLen, file_len)?;
     let mut accounting = ScanAccounting::default();
     accounting.advance(spec, append_start)?;
 
@@ -13142,7 +13136,6 @@ fn scan_records_from(
     intent: ScanIntent,
 ) -> Result<ScannedIndex> {
     let file_len = file.metadata()?.len();
-    spec.read_limits.check(ReadLimitKey::FileLen, file_len)?;
     let mut offset = header_len;
     let mut entries = Vec::new();
     let mut scanned = ScannedIndex {
