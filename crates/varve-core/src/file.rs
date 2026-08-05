@@ -1221,6 +1221,13 @@ impl CheckpointCadence {
     /// Recovers the cadence with a single reverse walk that stops at the last
     /// checkpoint record, so reopen pays the live-tail length exactly once
     /// instead of every flush paying it again.
+    /// The rule, kept as the specification `derive_index_state` must match.
+    ///
+    /// No longer called in production — one forward pass now derives this and
+    /// the two structures beside it — but it is what the invariant above names,
+    /// and `derived_state_matches_the_three_rules_it_replaced` compares the two
+    /// on every shape that distinguishes them.
+    #[cfg(test)]
     fn from_index(index: &[RecordIndexEntry]) -> Self {
         let mut eligible: usize = 0;
         let mut touched: u64 = 0;
@@ -1783,6 +1790,8 @@ impl SegmentCursor {
     /// in practice; if it ever did, the next segment would record a coverage
     /// start the following open cannot match, and that open falls back to the
     /// full scan rather than trusting the chain.
+    /// The rule, kept as the specification `derive_index_state` must match.
+    #[cfg(test)]
     fn from_index(entries: &[RecordIndexEntry]) -> Self {
         match entries
             .iter()
@@ -1852,6 +1861,8 @@ impl BlockTails {
     /// insertion: it pays at most one insertion per distinct id over the whole
     /// life of the file and buys `O(log B)` lookups with no hashing on the hot
     /// path.
+    /// The rule, kept as the specification `derive_index_state` must match.
+    #[cfg(test)]
     fn from_index(index: &[RecordIndexEntry]) -> Self {
         note_block_tail_index_touches(index.len() as u64);
         let mut newest: HashMap<u32, u64> = HashMap::new();
@@ -3695,8 +3706,9 @@ impl VarveFile {
         let block_tails = index.block_tails();
         let index = index.entries;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
-        let checkpoint_cadence = CheckpointCadence::from_index(&index);
-        let segment_cursor = SegmentCursor::from_index(&index);
+        let derived = derive_index_state(&index, false);
+        let checkpoint_cadence = derived.checkpoint_cadence;
+        let segment_cursor = derived.segment_cursor;
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         Ok(Self {
             spec,
@@ -3770,8 +3782,9 @@ impl VarveFile {
         // must not be visible here either. Both facts belong to the scan.
         let logical_len = scanned.physical_end(append_start);
         let index = scanned.entries;
-        let checkpoint_cadence = CheckpointCadence::from_index(&index);
-        let segment_cursor = SegmentCursor::from_index(&index);
+        let derived = derive_index_state(&index, false);
+        let checkpoint_cadence = derived.checkpoint_cadence;
+        let segment_cursor = derived.segment_cursor;
         let snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, logical_len)?;
         Ok(Self {
             spec,
@@ -3842,8 +3855,9 @@ impl VarveFile {
         let index = index.entries;
         truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, &index)?;
         let recovered_len = file.metadata()?.len();
-        let checkpoint_cadence = CheckpointCadence::from_index(&index);
-        let segment_cursor = SegmentCursor::from_index(&index);
+        let derived = derive_index_state(&index, false);
+        let checkpoint_cadence = derived.checkpoint_cadence;
+        let segment_cursor = derived.segment_cursor;
         let records_preserved = index.len();
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         Ok((
@@ -7925,9 +7939,10 @@ impl VarveFile {
                 // flush-cadence state once for the new generation (PERF2-02)
                 // and the O(1) block tails with it (PERF2-05). Record offsets
                 // moved, so every cached generic keyed tail is stale (API2-05).
-                self.checkpoint_cadence = CheckpointCadence::from_index(&self.index);
-                self.block_tails = BlockTails::from_index(&self.index);
-                self.segment_cursor = SegmentCursor::from_index(&self.index);
+                let derived = derive_index_state(&self.index, true);
+                self.checkpoint_cadence = derived.checkpoint_cadence;
+                self.block_tails = derived.block_tails.expect("tails were requested");
+                self.segment_cursor = derived.segment_cursor;
                 self.keyed_tails.invalidate_all();
                 self.publish_sequence(sequence);
                 Ok(sequence)
@@ -7972,9 +7987,10 @@ impl VarveFile {
                 // flush-cadence state once for the new generation (PERF2-02)
                 // and the O(1) block tails with it (PERF2-05). Record offsets
                 // moved, so every cached generic keyed tail is stale (API2-05).
-                self.checkpoint_cadence = CheckpointCadence::from_index(&self.index);
-                self.block_tails = BlockTails::from_index(&self.index);
-                self.segment_cursor = SegmentCursor::from_index(&self.index);
+                let derived = derive_index_state(&self.index, true);
+                self.checkpoint_cadence = derived.checkpoint_cadence;
+                self.block_tails = derived.block_tails.expect("tails were requested");
+                self.segment_cursor = derived.segment_cursor;
                 self.keyed_tails.invalidate_all();
                 Ok(info)
             }
@@ -13546,6 +13562,78 @@ where
     Ok(entries)
 }
 
+/// The three per-handle structures every open and every generation rebind
+/// derives from the resident index.
+struct DerivedIndexState {
+    checkpoint_cadence: CheckpointCadence,
+    segment_cursor: SegmentCursor,
+    /// `None` when the caller did not ask for tails, which an open does not:
+    /// it already has them from the scan or the chain walk, and building the
+    /// newest-per-block map here would be work thrown away.
+    block_tails: Option<BlockTails>,
+}
+
+/// Derives all three in ONE forward pass.
+///
+/// They used to be three separate walks of the same entries — one forward
+/// (`BlockTails`) and two reverse (`CheckpointCadence`, `SegmentCursor`) — run
+/// back to back at every open and at both generation rebinds. The two reverse
+/// walks stop at the newest checkpoint and the newest segment respectively, so
+/// on a file that carries neither they each walk the whole index; the forward
+/// one has no early exit at all. Three traversals, and a single forward pass
+/// answers all of them, because "the last entry with this block id" is just the
+/// last one a forward pass saw.
+///
+/// Each field is still computed by exactly the rule its own `from_index`
+/// states, so the invariants those doc comments assert are unchanged. The unit
+/// tests below compare this against all three.
+fn derive_index_state(index: &[RecordIndexEntry], with_tails: bool) -> DerivedIndexState {
+    if with_tails {
+        note_block_tail_index_touches(index.len() as u64);
+    }
+    note_checkpoint_cadence_index_touches(index.len() as u64);
+    let mut newest: HashMap<u32, u64> = HashMap::new();
+    // Position of, and entry at, the newest record of each kind the derived
+    // structures key on.
+    let mut newest_checkpoint: Option<usize> = None;
+    let mut newest_segment: Option<(usize, u64)> = None;
+    // Eligible records since the newest checkpoint, counted forward: reset each
+    // time a checkpoint is seen, which leaves exactly the tail the reverse walk
+    // used to accumulate.
+    let mut eligible: usize = 0;
+    for (position, entry) in index.iter().enumerate() {
+        if with_tails {
+            newest.insert(entry.block_id, entry.record_offset);
+        }
+        match entry.block_id {
+            INDEX_BLOCK_ID => {
+                newest_checkpoint = Some(position);
+                eligible = 0;
+            }
+            SEGMENT_BLOCK_ID => newest_segment = Some((position, entry.physical_end())),
+            COMMIT_BLOCK_ID => {}
+            _ => eligible = eligible.saturating_add(1),
+        }
+    }
+    DerivedIndexState {
+        checkpoint_cadence: CheckpointCadence {
+            eligible_since_checkpoint: eligible,
+            next_threshold: match newest_checkpoint {
+                Some(position) => core::cmp::max(INDEX_CHECKPOINT_MIN_RECORDS, position / 2),
+                None => INDEX_CHECKPOINT_MIN_RECORDS,
+            },
+        },
+        segment_cursor: match newest_segment {
+            Some((position, physical_end)) => SegmentCursor {
+                next_position: position + 1,
+                covered_start: Some(physical_end),
+            },
+            None => SegmentCursor::new_empty(),
+        },
+        block_tails: with_tails.then(|| BlockTails::from_newest(&newest)),
+    }
+}
+
 fn read_record_header(file: &mut File, _spec: FormatSpec, offset: u64) -> Result<RecordIndexEntry> {
     let decoded = read_native_record_header(file, offset)?;
     debug_assert_eq!(decoded.lead_in_len, RECORD_HEADER_LEN);
@@ -15525,6 +15613,117 @@ struct TypedMarker<T>(PhantomData<T>);
 
 #[cfg(test)]
 mod tests {
+    /// One forward pass must answer exactly what the three walks it replaced
+    /// answered, on every shape that tells them apart.
+    ///
+    /// `derive_index_state` folds `CheckpointCadence::from_index` (a reverse
+    /// walk stopping at the newest checkpoint), `SegmentCursor::from_index` (an
+    /// `rposition` for the newest segment) and `BlockTails::from_index` (a full
+    /// forward pass) into one traversal. The three rules are kept beside it as
+    /// `#[cfg(test)]` specifications precisely so this can compare against
+    /// them rather than against a restatement of the new code.
+    ///
+    /// The shapes matter more than the count. An index with no checkpoint and
+    /// no segment is the case where both reverse walks degenerate to full
+    /// walks; a checkpoint at the very end and one at the very start bracket
+    /// the `position / 2` threshold; interleaved commit and segment records are
+    /// what separate "eligible" from "seen", since those two ids are the ones
+    /// the cadence does not count.
+    #[test]
+    fn derived_state_matches_the_three_rules_it_replaced() {
+        fn entry(block_id: u32, sequence: u64) -> RecordIndexEntry {
+            RecordIndexEntry {
+                block_id,
+                block_version: 1,
+                flags: 0,
+                sequence,
+                record_offset: sequence * 16,
+                payload_offset: sequence * 16 + 8,
+                payload_len: 8,
+                checksum: 0,
+                uncompressed_len_hint: 0,
+                footer_offset: None,
+                prev_same_block_offset: None,
+                prev_same_key_offset: None,
+                committed: false,
+            }
+        }
+        fn build(ids: &[u32]) -> Vec<RecordIndexEntry> {
+            ids.iter()
+                .enumerate()
+                .map(|(position, id)| entry(*id, position as u64))
+                .collect()
+        }
+
+        const USER: u32 = 7;
+        let shapes: Vec<(&str, Vec<RecordIndexEntry>)> = vec![
+            ("empty", build(&[])),
+            (
+                "no checkpoint, no segment",
+                build(&[USER, USER, USER, USER]),
+            ),
+            ("checkpoint last", build(&[USER, USER, INDEX_BLOCK_ID])),
+            (
+                "checkpoint first",
+                build(&[INDEX_BLOCK_ID, USER, USER, USER]),
+            ),
+            (
+                "two checkpoints, newest wins",
+                build(&[INDEX_BLOCK_ID, USER, INDEX_BLOCK_ID, USER, USER]),
+            ),
+            ("segment only", build(&[USER, SEGMENT_BLOCK_ID, USER])),
+            (
+                "segment last, so the cursor sits past the end",
+                build(&[USER, USER, SEGMENT_BLOCK_ID]),
+            ),
+            (
+                "commit and segment interleaved, neither is eligible",
+                build(&[
+                    USER,
+                    COMMIT_BLOCK_ID,
+                    SEGMENT_BLOCK_ID,
+                    USER,
+                    COMMIT_BLOCK_ID,
+                    INDEX_BLOCK_ID,
+                    USER,
+                    SEGMENT_BLOCK_ID,
+                    USER,
+                ]),
+            ),
+        ];
+
+        for (name, index) in shapes {
+            let derived = derive_index_state(&index, true);
+            let cadence = CheckpointCadence::from_index(&index);
+            assert_eq!(
+                derived.checkpoint_cadence.eligible_since_checkpoint,
+                cadence.eligible_since_checkpoint,
+                "{name}: eligible count diverged from the reverse walk"
+            );
+            assert_eq!(
+                derived.checkpoint_cadence.next_threshold, cadence.next_threshold,
+                "{name}: next threshold diverged from the reverse walk"
+            );
+            let cursor = SegmentCursor::from_index(&index);
+            assert_eq!(
+                derived.segment_cursor.next_position, cursor.next_position,
+                "{name}: segment cursor position diverged from the rposition"
+            );
+            assert_eq!(
+                derived.segment_cursor.covered_start, cursor.covered_start,
+                "{name}: segment coverage diverged from the rposition"
+            );
+            // `BlockTails` is `PartialEq`, so this compares the whole
+            // structure — the ordered table as well as the tails — rather than
+            // spot-checking ids the fused pass happens to get right.
+            assert_eq!(
+                derived.block_tails.as_ref().expect("tails were requested"),
+                &BlockTails::from_index(&index),
+                "{name}: block tails diverged from the forward walk"
+            );
+        }
+    }
+
     use super::*;
     use crate::{VarveDecode, VarveEncode};
 
