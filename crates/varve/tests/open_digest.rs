@@ -15,6 +15,10 @@
 //! every way it can fail degrades to the scan with an identical answer; and a
 //! digest open plus a `RecordMap` is a complete lazy path.
 
+// Every case here declares `integrity: crc32`, so without the `integrity`
+// feature the format is refused at create with `IntegrityFeatureDisabled`.
+#![cfg(feature = "integrity")]
+
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
@@ -95,6 +99,7 @@ fn write_lines(spec: FormatSpec, path: &Path, lines: u32, per_flush: u32) -> var
     Ok(())
 }
 
+#[cfg(feature = "scalable-fault-injection")]
 fn framed<T>(body: impl FnOnce() -> T) -> (T, u64) {
     let before = VarveFile::records_framed();
     let value = body();
@@ -134,6 +139,7 @@ fn the_option_is_inert_when_it_is_off() -> varve::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "scalable-fault-injection")]
 #[test]
 fn a_digest_open_frames_no_record_at_all() -> varve::Result<()> {
     let directory = tempfile::tempdir()?;
@@ -392,6 +398,7 @@ fn a_digest_requires_the_chain_it_hands_out_entry_points_to() {
 /// a digest, which pushes the cursor again. The commit that introduced the
 /// digest claimed this was fixed and tested only the digest alone; this is the
 /// measurement that claim needed.
+#[cfg(feature = "scalable-fault-injection")]
 #[test]
 fn both_tail_records_at_once_do_not_grow_an_idle_file() -> varve::Result<()> {
     let directory = tempfile::tempdir()?;

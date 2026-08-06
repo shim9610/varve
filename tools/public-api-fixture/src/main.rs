@@ -449,7 +449,8 @@ fn check_format_roundtrip(dir: &std::path::Path) {
         writer.flush().expect("flush");
     }
 
-    let mut reader = PublicApiFormat::open_reader(&path).expect("reopen");
+    // Matrix reads take `&self`, so this binding no longer needs `mut`.
+    let reader = PublicApiFormat::open_reader(&path).expect("reopen");
     let samples: Vec<Sample> = reader
         .samples()
         .expect("fixed collection")

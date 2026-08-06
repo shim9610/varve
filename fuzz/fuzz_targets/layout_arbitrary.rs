@@ -10,7 +10,11 @@ fuzz_target!(|data: &[u8]| {
 
     let _ = FuzzLayoutFormat::inspect_layout_file_report(&path);
     if let Ok(reader) = FuzzLayoutFormat::open_layout_reader(&path) {
-        for index in 0..reader.segments().len().min(16) {
+        // `segments()` is a lazy iterator now rather than a materialized list,
+        // so the count is not available without walking it. Walking at most 16
+        // keeps the per-input work bounded, which is what the old `.min(16)`
+        // was for.
+        for index in 0..reader.segments().take(16).count() {
             let _ = reader.read_metadata(index);
             let _ = reader.read_raw(index);
         }

@@ -14,6 +14,10 @@
 //! 2. Recovery verifies regardless of the policy, because a checksum mismatch
 //!    is the evidence `truncate_tail` truncates on.
 
+// Every case here declares `integrity: crc32`, so without the `integrity`
+// feature the format is refused at create with `IntegrityFeatureDisabled`.
+#![cfg(feature = "integrity")]
+
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};

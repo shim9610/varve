@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "integrity")]
 use varve::Error;
-use varve::{
-    COMMIT_BLOCK_ID, CommitPolicy, IndexPolicy, IntegrityVerification, ReadLimits, VarveBlock,
-    VarveFile, varve_format,
-};
+use varve::{COMMIT_BLOCK_ID, CommitPolicy, IndexPolicy, VarveBlock, varve_format};
+// Named only by the verification contracts, which are `integrity`-gated.
+#[cfg(feature = "integrity")]
+use varve::{IntegrityVerification, ReadLimits, VarveFile};
 
 /// Opens read-only with verification forced on at open.
 ///
@@ -18,6 +18,7 @@ use varve::{
 /// which moves the refusal from the open to the read that returns the damaged
 /// record -- so each contract below now asserts *both*: that declaring `AtOpen`
 /// still refuses at open, and that the default still refuses the record.
+#[cfg(feature = "integrity")]
 fn open_verified_at_open(
     spec: varve::FormatSpec,
     path: &std::path::Path,

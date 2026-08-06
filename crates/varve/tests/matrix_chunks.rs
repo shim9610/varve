@@ -13,6 +13,13 @@
 //! into a sealed chunk is refused rather than dropped; and a cell read does not
 //! materialise the chunk it lives in.
 
+// The shared fixtures here build their specs with `IntegrityPolicy::Crc32`, so
+// without the `integrity` feature 35 of the 47 cases fail at create with
+// `IntegrityFeatureDisabled`. Gating them individually leaves the shared
+// helpers dead, so the file moves as a unit and runs in the `all-features`
+// CI job.
+#![cfg(feature = "integrity")]
+
 use std::path::{Path, PathBuf};
 
 use varve::{

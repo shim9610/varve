@@ -1846,7 +1846,7 @@ impl MatrixRecoveryReport {
     }
 
     /// Of those reads, the number issued by a reader that carried no
-    /// [`MatrixReadPool`].
+    /// `MatrixReadPool`.
     ///
     /// Not every such read is a defect: the open, verify and rebuild paths hold
     /// the file as `&mut File`, so no other reader can be in flight and no pool

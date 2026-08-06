@@ -23,6 +23,10 @@
 // Plus a no-regression guard: with no `block_residency` declared, the value is
 // the one the old code computed, because nothing is filtered.
 
+// Every case here declares `integrity: crc32`, so without the `integrity`
+// feature the format is refused at create with `IntegrityFeatureDisabled`.
+#![cfg(feature = "integrity")]
+
 use std::path::{Path, PathBuf};
 
 use varve::{BlockResidencyDescriptor, CommitPolicy, FormatSpec, VarveBlock, varve_format};

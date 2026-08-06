@@ -245,7 +245,7 @@ fn decode_digest_payload(
 ///
 /// A chunk is what makes a matrix dimension grow past the extent declared at
 /// create. Chunk 0 *is* the matrix region; chunk `k > 0` is a record with the
-/// region's layout. See [`GrowingMatrixDimension`].
+/// region's layout. See [`crate::GrowingMatrixDimension`].
 pub const MATRIX_CHUNK_BLOCK_ID: u32 = 0xFFFF_FFF6;
 const MATRIX_CHUNK_MAGIC: &[u8; 4] = b"VMCK";
 const MATRIX_CHUNK_VERSION: u16 = 1;
@@ -1293,7 +1293,7 @@ enum DirectoryRetention {
 ///
 /// Two implementations, and they are the two answers to "who holds it":
 ///
-/// * [`ResidentIndex`] — varve holds it, and `record_at` faults the entry off
+/// * `ResidentIndex` — varve holds it, and `record_at` faults the entry off
 ///   disk from a 16-byte slot.
 /// * `[RecordIndexEntry]` — the host holds it, as
 ///   [`VarveFile::index_entries_into`] or
@@ -5737,7 +5737,7 @@ impl VarveFile {
     ///
     /// Visits every metadata record — latest-wins needs the whole walk, so
     /// there is no early break — but only *materializes* the ones it returns.
-    /// [`split_metadata_payload`] compares the stored key against the borrowed
+    /// `split_metadata_payload` compares the stored key against the borrowed
     /// payload, and the decode that allocates a `String` and a `Vec<u8>` runs
     /// only for a record that matches and wins.
     ///

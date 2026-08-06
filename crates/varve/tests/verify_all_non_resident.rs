@@ -11,6 +11,10 @@
 //! record (c) — which fails an implementation that *replaced* the index pass
 //! with the chain pass rather than adding to it — and an empty chain (d).
 
+// Every case here declares `integrity: crc32`, so without the `integrity`
+// feature the format is refused at create with `IntegrityFeatureDisabled`.
+#![cfg(feature = "integrity")]
+
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};

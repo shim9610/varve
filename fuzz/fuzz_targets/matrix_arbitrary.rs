@@ -17,7 +17,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    if let Ok(mut reader) = FuzzMatrixFormat::open_reader(&matrix_path) {
+    if let Ok(reader) = FuzzMatrixFormat::open_reader(&matrix_path) {
         let key = FuzzCellKey { row: 0, column: 0 };
         let _ = reader.fuzz_cell_status(key);
         let _ = reader.fuzz_cell(key);

@@ -15,7 +15,11 @@
 //! is that check, and it is the reason the walk skips non-resident blocks and
 //! stops at the snapshot end rather than the file length.
 
-use varve::{RecordDirectory, RecordIndexEntry, VarveBlock, VarveFile, varve_format};
+use varve::{RecordDirectory, VarveBlock, VarveFile, varve_format};
+// Only the frame-counted tests below name this type; `records_framed` is behind
+// the same feature, so the import has to move with them.
+#[cfg(feature = "scalable-fault-injection")]
+use varve::RecordIndexEntry;
 
 #[derive(Clone, Debug, PartialEq, VarveBlock)]
 #[varve(id = 1, version = 1, kind = "variable", key = "id")]
@@ -59,6 +63,7 @@ fn build(path: &std::path::Path, ticks: u64) -> varve::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "scalable-fault-injection")]
 fn framed<T>(body: impl FnOnce() -> T) -> (T, u64) {
     let before = VarveFile::records_framed();
     let value = body();
@@ -85,6 +90,7 @@ fn a_completed_map_is_the_open_scans_index() -> varve::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "scalable-fault-injection")]
 #[test]
 fn find_stops_at_the_answer_instead_of_at_the_end() -> varve::Result<()> {
     let directory = tempfile::tempdir()?;
@@ -125,6 +131,7 @@ fn find_stops_at_the_answer_instead_of_at_the_end() -> varve::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "scalable-fault-injection")]
 #[test]
 fn a_second_question_resumes_and_a_repeat_reads_nothing() -> varve::Result<()> {
     let directory = tempfile::tempdir()?;
@@ -205,6 +212,7 @@ fn the_map_is_a_directory_every_read_already_understands() -> varve::Result<()> 
     Ok(())
 }
 
+#[cfg(feature = "scalable-fault-injection")]
 #[test]
 fn clear_rewinds_and_release_keeps_the_ground_covered() -> varve::Result<()> {
     let directory = tempfile::tempdir()?;
@@ -255,6 +263,7 @@ fn clear_rewinds_and_release_keeps_the_ground_covered() -> varve::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "scalable-fault-injection")]
 #[test]
 fn the_map_never_allocates_a_buffer_of_its_own() -> varve::Result<()> {
     let directory = tempfile::tempdir()?;

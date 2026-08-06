@@ -11,6 +11,12 @@
 // path degrades to the scan and produces the identical index; and the two
 // pre-existing checkpoint defects §4A.6 records are fixed.
 
+// 22 of the 30 cases here declare `integrity: crc32` and fail at create with
+// `IntegrityFeatureDisabled` without the feature. Gating them one by one left
+// every shared helper dead under `default`, so the file moves as a unit; the
+// `all-features` CI job is where it runs.
+#![cfg(feature = "integrity")]
+
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -19,8 +25,11 @@ use varve::{
     BlockDescriptor, BlockKind, COMMIT_BLOCK_ID, CommitPolicy, Endian, FormatSpec, IndexPolicy,
     IntegrityPolicy, MatrixBlockDescriptor, MatrixCommitDescriptor, MatrixCommitKind,
     MatrixDimensionDescriptor, MatrixDimensions, MatrixKey, RecordIndexEntry, SEGMENT_BLOCK_ID,
-    TransactionMarkerMode, VarveBlock, VarveFile, VarveMatrixBlock, varve_format,
+    TransactionMarkerMode, VarveBlock, VarveMatrixBlock, varve_format,
 };
+// Only the frame-counted tests below open a file through this type directly.
+#[cfg(feature = "scalable-fault-injection")]
+use varve::VarveFile;
 
 #[derive(Clone, Debug, PartialEq, VarveBlock)]
 #[varve(id = 60, version = 1, kind = "fixed")]
@@ -208,6 +217,7 @@ fn a_flush_that_added_nothing_writes_no_segment() -> varve::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "scalable-fault-injection")]
 #[cfg(feature = "scalable-fault-injection")]
 #[test]
 fn open_frames_commit_points_not_records() -> varve::Result<()> {
@@ -1138,6 +1148,7 @@ fn a_checkpoint_and_a_segment_chain_cannot_both_be_declared() {
 /// the index and what the scan walks follows the data. The assertion is
 /// therefore strict inequality and not a factor — a factor here would be a
 /// number invented from one fixture.
+#[cfg(feature = "scalable-fault-injection")]
 #[test]
 fn a_chained_file_opens_without_scanning_it_whatever_the_reader_declared() -> varve::Result<()> {
     let path = temp_path("chain_decided_by_the_file");

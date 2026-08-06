@@ -6,6 +6,13 @@
 // sequenced, chained and recoverable exactly as before; they are simply not
 // mirrored in memory, at write *and* at open.
 
+// The format these tests declare asks for `integrity: crc32`, which the
+// `integrity` feature provides; without it every case here fails at create
+// with `IntegrityFeatureDisabled`. The residency behaviour under test is
+// independent of the checksum, but the fixture is not, so the file moves
+// with the feature rather than the fixture being rewritten.
+#![cfg(feature = "integrity")]
+
 use std::path::{Path, PathBuf};
 
 use varve::{BlockResidencyDescriptor, FormatSpec, VarveBlock, varve_format};

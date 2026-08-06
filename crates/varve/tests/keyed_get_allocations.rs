@@ -311,6 +311,9 @@ fn staging_a_record_for_append_does_not_allocate_per_record() -> varve::Result<(
 /// out short — `NativeTooShort { required: 14542, actual: 14526 }`. The seek is
 /// what makes the append independent of that, and it stays until the second
 /// writer is part of the accounting.
+// `take_snapshot_bounds_fstats` is behind the fault-injection feature, so the
+// syscall count this asserts on only exists there.
+#[cfg(feature = "scalable-fault-injection")]
 #[test]
 fn a_run_of_scalable_appends_pays_no_per_record_metadata_syscall() -> varve::Result<()> {
     const N: u32 = 200;
