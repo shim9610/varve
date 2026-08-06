@@ -3085,6 +3085,29 @@ impl VarveReader {
         self.file.index_entries_into(out)
     }
 
+    /// See [`VarveFile::read_payload_into`].
+    pub fn read_payload_into(&self, entry: &RecordIndexEntry, out: &mut Vec<u8>) -> Result<()> {
+        self.file.read_payload_into(entry, out)
+    }
+
+    /// See [`VarveFile::read_logical_payload_into`].
+    pub fn read_logical_payload_into(
+        &self,
+        entry: &RecordIndexEntry,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.file.read_logical_payload_into(entry, out)
+    }
+
+    /// See [`VarveFile::decode_block_into`].
+    pub fn decode_block_into<T: VarveBlock>(
+        &self,
+        entry: &RecordIndexEntry,
+        scratch: &mut Vec<u8>,
+    ) -> Result<T> {
+        self.file.decode_block_into::<T>(entry, scratch)
+    }
+
     pub fn key_tail_offsets<T>(&self) -> Result<HashMap<T::Key, u64>>
     where
         T: VarveKeyedBlock,
@@ -3353,6 +3376,29 @@ impl VarveWriter {
     /// [`VarveFile::index_entries_into`].
     pub fn index_entries_into(&self, out: &mut Vec<RecordIndexEntry>) -> Result<()> {
         self.file.index_entries_into(out)
+    }
+
+    /// See [`VarveFile::read_payload_into`].
+    pub fn read_payload_into(&self, entry: &RecordIndexEntry, out: &mut Vec<u8>) -> Result<()> {
+        self.file.read_payload_into(entry, out)
+    }
+
+    /// See [`VarveFile::read_logical_payload_into`].
+    pub fn read_logical_payload_into(
+        &self,
+        entry: &RecordIndexEntry,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.file.read_logical_payload_into(entry, out)
+    }
+
+    /// See [`VarveFile::decode_block_into`].
+    pub fn decode_block_into<T: VarveBlock>(
+        &self,
+        entry: &RecordIndexEntry,
+        scratch: &mut Vec<u8>,
+    ) -> Result<T> {
+        self.file.decode_block_into::<T>(entry, scratch)
     }
 
     pub fn key_tail_offsets<T>(&self) -> Result<HashMap<T::Key, u64>>
@@ -5745,6 +5791,81 @@ impl VarveFile {
         budget.consume(logical_len)?;
         let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
         budget.decode(&payload, T::ENDIAN.unwrap_or(self.spec.endian))
+    }
+
+    /// Reads the stored bytes of a record the caller already holds an entry
+    /// for, into a buffer the caller already owns.
+    ///
+    /// This is the half of "the host manages the memory" that the `_into`
+    /// family alone does not give you. [`index_entries_into`](Self::index_entries_into)
+    /// hands a host the index; without this, using one of those entries meant
+    /// [`RecordIndexEntry::read_payload`], which reopens the file **by path** —
+    /// a different object if the path was replaced — and allocates. So the two
+    /// halves of the pattern are: take the index into your buffer once, then
+    /// read through it into your buffer as often as you like, both bound to
+    /// this open handle.
+    ///
+    /// `out` ends exactly the record's stored length, and the checksum is
+    /// verified over it, identically to every internal read.
+    ///
+    /// **The entry is not trusted.** It is the caller's, so it may name
+    /// anything: an extent past the end of the snapshot is refused, and bytes
+    /// that do not match the entry's checksum are refused. What it cannot do is
+    /// reach outside this file — every offset is validated against this
+    /// handle's snapshot bounds — so the worst a wrong entry buys is an error
+    /// or some other record of the same file.
+    pub fn read_payload_into(&self, entry: &RecordIndexEntry, out: &mut Vec<u8>) -> Result<()> {
+        entry.read_payload_snapshot_into(self.spec, &self.snapshot, out)
+    }
+
+    /// The same, decompressed if the record is compressed.
+    ///
+    /// For an uncompressed record this is a read straight into `out` with no
+    /// copy. For a compressed one the decompressor produces its own buffer and
+    /// `out` is replaced — said here because it is the one case where handing
+    /// in a buffer does not save the allocation.
+    pub fn read_logical_payload_into(
+        &self,
+        entry: &RecordIndexEntry,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        entry.read_logical_payload_snapshot_into(self.spec, &self.snapshot, out)
+    }
+
+    /// Decodes a record the caller already holds an entry for, reading its
+    /// bytes through the caller's buffer.
+    ///
+    /// `scratch` is scratch, not output: the decoded value is returned and the
+    /// buffer keeps the last record's bytes. Reusing it across a walk is the
+    /// difference between one allocation and one per record — which is what
+    /// makes "cache the index, then read through it" cost no more than the
+    /// reads themselves.
+    ///
+    /// Refuses an entry whose block id or version is not `T`'s, exactly as
+    /// [`read_block_at`](Self::read_block_at) does. Unlike `read_block_at` it
+    /// does not re-read the record header to find that out — the caller's entry
+    /// already says it, which is the point of having kept the entry.
+    pub fn decode_block_into<T: VarveBlock>(
+        &self,
+        entry: &RecordIndexEntry,
+        scratch: &mut Vec<u8>,
+    ) -> Result<T> {
+        crate::collections::ensure_registered_block::<T>(self.spec)?;
+        if entry.block_id != T::ID {
+            return Err(Error::UnregisteredBlock(entry.block_id));
+        }
+        if entry.block_version != T::VERSION {
+            return Err(Error::BlockVersionMismatch {
+                block_id: T::ID,
+                expected: T::VERSION,
+                actual: entry.block_version,
+            });
+        }
+        let mut budget = MaterializationBudget::new(self.spec);
+        let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
+        budget.consume(logical_len)?;
+        entry.read_logical_payload_snapshot_into(self.spec, &self.snapshot, scratch)?;
+        budget.decode(scratch, T::ENDIAN.unwrap_or(self.spec.endian))
     }
 
     /// The block's records as a lazy collection: one decoded value at a time.

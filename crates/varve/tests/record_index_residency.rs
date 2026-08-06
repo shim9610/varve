@@ -43,7 +43,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
-use varve::varve_format;
+use varve::{VarveBlock, varve_format};
 
 struct CountingAllocator;
 
@@ -341,6 +341,103 @@ fn a_walk_of_n_records_allocates_one_payload_buffer_not_n() -> varve::Result<()>
         "verifying {LARGE} records made {allocs_per_record:.2} allocations per record \
          ({small_allocs} at {SMALL}, {large_allocs} at {LARGE}, {bytes_per_record:.1} B/record). \
          Above ~1.0 means the per-record payload buffer is back."
+    );
+    Ok(())
+}
+
+/// The pattern the owner asked for, end to end: **the host owns every buffer,
+/// and chooses whether to keep the index or throw it away.**
+///
+/// Two shapes, both measured here:
+///
+/// * *keep it* — take the index into your own `Vec` once, then read records
+///   through those entries as often as you like. After the index is taken,
+///   further reads allocate nothing.
+/// * *throw it away* — open, read, drop. Reuse one scan buffer and one payload
+///   buffer across files and the whole loop allocates a fixed amount however
+///   many files or records there are.
+///
+/// What varve still allocates on its own, and the host cannot decline: the
+/// 16-byte-per-record directory the handle keeps so that positions resolve.
+/// That is measured by `an_open_handle_keeps_a_record_directory_and_not_the_records`
+/// and is NOT claimed to be zero here.
+#[test]
+fn the_host_owns_the_buffers_and_chooses_whether_to_keep_the_index() -> varve::Result<()> {
+    const RECORDS: u32 = 20_000;
+
+    let directory = tempfile::tempdir()?;
+    let path = path_in(&directory, "host-owned.idxres");
+    build(&path, RECORDS)?;
+    let spec = IndexResidencyFormat::spec();
+
+    // --- shape 1: keep the index, read through it ---
+    let mut scan_scratch = Vec::new();
+    let file = varve::VarveFile::open_readonly_with_scratch(spec, &path, &mut scan_scratch)?;
+
+    let mut index = Vec::new();
+    file.index_entries_into(&mut index)?;
+    assert_eq!(index.len() as u32, RECORDS, "one entry per record");
+
+    let mut payload = Vec::new();
+    // Warm both buffers on the first record, then measure the rest: what is
+    // being asserted is that steady-state reads allocate nothing, not that the
+    // very first one does.
+    let _: Sample = file.decode_block_into(&index[0], &mut payload)?;
+
+    let (bytes_before, allocs_before) = totals();
+    let mut decoded = 0usize;
+    for entry in &index {
+        if entry.block_id != Sample::ID {
+            continue;
+        }
+        let sample: Sample = file.decode_block_into(entry, &mut payload)?;
+        decoded += usize::from(sample.value < u64::from(RECORDS));
+    }
+    let (bytes_after, allocs_after) = totals();
+    let read_allocs = allocs_after - allocs_before;
+    let read_bytes = bytes_after - bytes_before;
+
+    assert_eq!(decoded as u32, RECORDS, "every record must decode");
+    // Measured 2026-08-05, Linux/ext4: 0 allocations, 0 bytes for 20,000 reads.
+    assert_eq!(
+        read_allocs, 0,
+        "reading {RECORDS} records through a cached index made {read_allocs} allocations \
+         ({read_bytes} bytes). The host supplied both buffers, so varve must allocate nothing."
+    );
+    drop(file);
+
+    // --- shape 2: open, read, drop — repeatedly, through the same buffers ---
+    let (bytes_before, allocs_before) = totals();
+    for _ in 0..4 {
+        let file = varve::VarveFile::open_readonly_with_scratch(spec, &path, &mut scan_scratch)?;
+        file.index_entries_into(&mut index)?;
+        let _: Sample = file.decode_block_into(&index[1], &mut payload)?;
+        drop(file);
+    }
+    let (bytes_after, allocs_after) = totals();
+    let loop_allocs = allocs_after - allocs_before;
+    let loop_bytes = bytes_after - bytes_before;
+
+    // Measured 2026-08-05, Linux/ext4: 28 allocations / 1,280,868 bytes for
+    // four opens — 320,217 bytes each. The record directory alone is
+    // 20,000 x 16 = 320,000 of that, so everything else an open does comes to
+    // 217 bytes, and the scan buffer, the index snapshot and the payload
+    // buffer contribute nothing at all: they are the host's and are reused
+    // across all four.
+    //
+    // The counterfactual is the test above: without `_with_scratch` the same
+    // loop re-allocates the scan's entry array every time, which is 3,407,872
+    // bytes per open rather than 0.
+    //
+    // So the honest statement is: everything the host can own, the host owns.
+    // What remains is the directory — 16 B per record, per open — and the host
+    // cannot decline it, because it is what makes a position resolve.
+    let directory_bytes = 4 * 16 * isize::try_from(RECORDS).expect("record count fits");
+    assert!(
+        loop_bytes < directory_bytes + directory_bytes / 4,
+        "four open/read/drop cycles through one set of host buffers allocated {loop_bytes} \
+         bytes over {loop_allocs} allocations, against {directory_bytes} for the record \
+         directories alone. The excess means a host buffer stopped being reused."
     );
     Ok(())
 }
