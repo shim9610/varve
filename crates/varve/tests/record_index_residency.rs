@@ -555,6 +555,45 @@ fn a_handle_can_keep_no_directory_and_still_answer_every_read() -> varve::Result
     build(&large_path, LARGE)?;
     let spec = IndexResidencyFormat::spec();
 
+    // --- 0. varve never ALLOCATES the directory, it does not merely free it ---
+    //
+    // Cumulative bytes, because live and peak both go back down when a buffer
+    // is dropped: a version that built the slot array and then released it
+    // measures identically to one that never built it, on every metric except
+    // this one. That is exactly the mistake this checks for.
+    let allocated_by_open = |path: &Path, keep: bool| -> varve::Result<isize> {
+        let mut index = Vec::with_capacity(LARGE as usize + 8);
+        // Pre-sized so the caller's own buffer contributes nothing to the
+        // window; what is left is what varve allocated.
+        let (before, _) = totals();
+        let file = if keep {
+            varve::VarveFile::open_readonly_with_scratch(spec, path, &mut index)?
+        } else {
+            varve::VarveFile::open_readonly_without_directory(spec, path, &mut index)?
+        };
+        let (after, _) = totals();
+        drop(file);
+        Ok(after - before)
+    };
+
+    let _ = allocated_by_open(&large_path, true)?; // warm
+    let with_directory_bytes = allocated_by_open(&large_path, true)?;
+    let without_directory_bytes = allocated_by_open(&large_path, false)?;
+    let slot_array = isize::try_from(LARGE).expect("count fits") * 16;
+
+    println!(
+        "MEASURED with {with_directory_bytes} without {without_directory_bytes} slot_array {slot_array}"
+    );
+    // Measured 2026-08-05, Linux/ext4, 20,000 records:
+    // The slot array is not allocated at all; the remainder is the header
+    // extensions and the block-tail table, both O(schema).
+    assert!(
+        without_directory_bytes < slot_array / 100,
+        "opening without a directory allocated {without_directory_bytes} bytes against \
+         {with_directory_bytes} with one; the slot array is {slot_array} bytes. Anything \
+         near that means it is still being built and then dropped."
+    );
+
     // --- 1. retained bytes do not scale ---
     let retained = |path: &Path| -> varve::Result<isize> {
         let mut index = Vec::new();

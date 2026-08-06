@@ -1092,6 +1092,18 @@ pub(crate) mod resident_index {
 
 use resident_index::{ReservedIndexSlot, ResidentIndex};
 
+/// Whether an open keeps a record directory of its own.
+///
+/// Not a policy on the format: two callers of the same file want different
+/// answers, and the one that wants none has to take the directory in the same
+/// call or it could not read positionally at all. See
+/// [`VarveFile::open_readonly_without_directory`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectoryRetention {
+    Keep,
+    None,
+}
+
 /// Where a read resolves a record *position* to a record.
 ///
 /// Every position-based read — `blocks`, `scan`, `keyed_blocks`, `metadata`,
@@ -4355,13 +4367,7 @@ impl VarveFile {
         path: P,
         index: &mut Vec<RecordIndexEntry>,
     ) -> Result<Self> {
-        let mut file = Self::open_readonly_with_scratch(spec, path, index)?;
-        // The scan already filled `index`; drop varve's copy of it. Built and
-        // then released rather than never built, because the open path derives
-        // the checkpoint cadence, the segment cursor and the snapshot bound
-        // from the same walk — this option is about what the handle *keeps*.
-        file.index = ResidentIndex::none_retained(file.snapshot.clone(), file.spec);
-        Ok(file)
+        Self::open_readonly_inner(spec, path, index, DirectoryRetention::None)
     }
 
     /// Opens a read-write handle.
@@ -4502,6 +4508,15 @@ impl VarveFile {
         path: P,
         scratch: &mut Vec<RecordIndexEntry>,
     ) -> Result<Self> {
+        Self::open_readonly_inner(spec, path, scratch, DirectoryRetention::Keep)
+    }
+
+    fn open_readonly_inner<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        scratch: &mut Vec<RecordIndexEntry>,
+        retention: DirectoryRetention,
+    ) -> Result<Self> {
         let spec = spec.resolve_entrypoint();
         spec.validate()?;
         ensure_native_open_limits(spec)?;
@@ -4542,7 +4557,16 @@ impl VarveFile {
             spec,
             path,
             file: RecordFile::new(file),
-            index: ResidentIndex::adopt_generation(index, snapshot.clone(), spec)?,
+            index: match retention {
+                // Not "built and then dropped": a caller that asked for no
+                // directory never has one allocated on its behalf. `N` slots is
+                // the largest thing an open would have taken, and the point of
+                // the option is that varve does not take it.
+                DirectoryRetention::None => ResidentIndex::none_retained(snapshot.clone(), spec),
+                DirectoryRetention::Keep => {
+                    ResidentIndex::adopt_generation(index, snapshot.clone(), spec)?
+                }
+            },
             snapshot,
             mode: OpenMode::ReadOnly,
             header_extensions,
