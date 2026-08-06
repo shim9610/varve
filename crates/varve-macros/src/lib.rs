@@ -5799,75 +5799,129 @@ fn matrix_writer_flag_methods(
     }
 }
 
-fn reader_methods(block: &InlineBlock) -> Vec<TokenStream2> {
+/// Which of the three places a reader method is emitted into.
+///
+/// The unkeyed/keyed accessor and both its `_into` twins are emitted three
+/// times — the inherent impl, the trait declaration and the trait impl — and the
+/// survey that prompted the `_into` work flagged exactly this as the way to
+/// ship a half-change: miss the trait declaration and the trait route silently
+/// lacks the method while the inherent route has it. One function emits all
+/// three, so a method added here cannot appear in two of them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReaderMethodTarget {
+    Inherent,
+    TraitDecl,
+    TraitImpl,
+}
+
+fn reader_block_methods(block: &InlineBlock, target: ReaderMethodTarget) -> Vec<TokenStream2> {
     let ty = &block.name;
     let plural = plural_method_ident(ty);
+    let entries_into = format_ident!("{}_entries_into", plural_method_ident(ty));
+    let decoded_into = format_ident!("{}_decoded_into", plural_method_ident(ty));
+    let plural_into = format_ident!("{}_into", plural_method_ident(ty));
+    let vis = match target {
+        ReaderMethodTarget::Inherent => quote! { pub },
+        ReaderMethodTarget::TraitDecl | ReaderMethodTarget::TraitImpl => quote! {},
+    };
+
+    // `(signature, body)`; a declaration takes the signature and a semicolon,
+    // the other two take the signature and the body.
+    let mut methods: Vec<(TokenStream2, TokenStream2)> = Vec::new();
+
     if block.key_fields.is_empty() {
-        vec![quote! {
-            pub fn #plural(&self) -> ::varve::__core::Result<::varve::__core::BlockVec<#ty>> {
-                self.inner.blocks::<#ty>()
-            }
-        }]
+        methods.push((
+            quote! {
+                #vis fn #plural(&self) -> ::varve::__core::Result<::varve::__core::BlockVec<#ty>>
+            },
+            quote! { { self.inner.blocks::<#ty>() } },
+        ));
+        methods.push((
+            quote! {
+                #vis fn #entries_into(
+                    &self,
+                    out: &mut ::std::vec::Vec<::varve::__core::RecordIndexEntry>,
+                ) -> ::varve::__core::Result<()>
+            },
+            quote! { { self.inner.block_entries_into::<#ty>(out) } },
+        ));
+        methods.push((
+            quote! {
+                #vis fn #decoded_into(
+                    &self,
+                    out: &mut ::std::vec::Vec<#ty>,
+                ) -> ::varve::__core::Result<()>
+            },
+            quote! { { self.inner.decode_blocks_into::<#ty>(out) } },
+        ));
     } else {
-        vec![quote! {
-            pub fn #plural(
-                &self,
-            ) -> ::varve::__core::Result<
-                ::varve::__core::KeyedBlockVec<
-                    <#ty as ::varve::__core::VarveKeyedBlock>::Key,
-                    #ty,
+        methods.push((
+            quote! {
+                #vis fn #plural(
+                    &self,
+                ) -> ::varve::__core::Result<
+                    ::varve::__core::KeyedBlockVec<
+                        <#ty as ::varve::__core::VarveKeyedBlock>::Key,
+                        #ty,
+                    >
                 >
-            > {
-                self.inner.keyed_blocks::<#ty>()
-            }
-        }]
+            },
+            quote! { { self.inner.keyed_blocks::<#ty>() } },
+        ));
+        methods.push((
+            quote! {
+                #vis fn #plural_into(
+                    &self,
+                    entries: &mut ::std::vec::Vec<::varve::__core::RecordIndexEntry>,
+                    by_key: &mut ::std::collections::HashMap<
+                        <#ty as ::varve::__core::VarveKeyedBlock>::Key,
+                        ::varve::__core::RecordIndexEntry,
+                    >,
+                ) -> ::varve::__core::Result<()>
+            },
+            quote! { { self.inner.keyed_blocks_into::<#ty>(entries, by_key) } },
+        ));
+        methods.push((
+            quote! {
+                #vis fn #entries_into(
+                    &self,
+                    out: &mut ::std::vec::Vec<::varve::__core::RecordIndexEntry>,
+                ) -> ::varve::__core::Result<()>
+            },
+            quote! { { self.inner.block_entries_into::<#ty>(out) } },
+        ));
+        methods.push((
+            quote! {
+                #vis fn #decoded_into(
+                    &self,
+                    out: &mut ::std::vec::Vec<#ty>,
+                ) -> ::varve::__core::Result<()>
+            },
+            quote! { { self.inner.decode_blocks_into::<#ty>(out) } },
+        ));
     }
+
+    methods
+        .into_iter()
+        .map(|(signature, body)| match target {
+            ReaderMethodTarget::TraitDecl => quote! { #signature; },
+            ReaderMethodTarget::Inherent | ReaderMethodTarget::TraitImpl => {
+                quote! { #signature #body }
+            }
+        })
+        .collect()
+}
+
+fn reader_methods(block: &InlineBlock) -> Vec<TokenStream2> {
+    reader_block_methods(block, ReaderMethodTarget::Inherent)
 }
 
 fn reader_trait_methods(block: &InlineBlock) -> Vec<TokenStream2> {
-    let ty = &block.name;
-    let plural = plural_method_ident(ty);
-    if block.key_fields.is_empty() {
-        vec![quote! {
-            fn #plural(&self) -> ::varve::__core::Result<::varve::__core::BlockVec<#ty>>;
-        }]
-    } else {
-        vec![quote! {
-            fn #plural(
-                &self,
-            ) -> ::varve::__core::Result<
-                ::varve::__core::KeyedBlockVec<
-                    <#ty as ::varve::__core::VarveKeyedBlock>::Key,
-                    #ty,
-                >
-            >;
-        }]
-    }
+    reader_block_methods(block, ReaderMethodTarget::TraitDecl)
 }
 
 fn reader_trait_impl_methods(block: &InlineBlock) -> Vec<TokenStream2> {
-    let ty = &block.name;
-    let plural = plural_method_ident(ty);
-    if block.key_fields.is_empty() {
-        vec![quote! {
-            fn #plural(&self) -> ::varve::__core::Result<::varve::__core::BlockVec<#ty>> {
-                self.inner.blocks::<#ty>()
-            }
-        }]
-    } else {
-        vec![quote! {
-            fn #plural(
-                &self,
-            ) -> ::varve::__core::Result<
-                ::varve::__core::KeyedBlockVec<
-                    <#ty as ::varve::__core::VarveKeyedBlock>::Key,
-                    #ty,
-                >
-            > {
-                self.inner.keyed_blocks::<#ty>()
-            }
-        }]
-    }
+    reader_block_methods(block, ReaderMethodTarget::TraitImpl)
 }
 
 fn writer_methods(block: &InlineBlock) -> Vec<TokenStream2> {

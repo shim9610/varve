@@ -1403,3 +1403,76 @@ fn a_file_within_the_tail_budget_still_opens_and_then_binds_on_growth() -> varve
     );
     Ok(())
 }
+
+/// The generated `_into` twins exist on the inherent route **and** the trait
+/// route, for keyed and unkeyed blocks alike.
+///
+/// The survey that prompted this named the failure mode exactly: each block
+/// accessor is emitted three times — inherent impl, trait declaration, trait
+/// impl — so a method added to two of the three compiles and is silently
+/// missing from the third. One function now emits all three; this is the test
+/// that says so from the outside.
+///
+/// It is a compile-time assertion wearing a `#[test]`: every call below is
+/// resolved through a route that would not exist if the emission had drifted.
+/// `ResidentChainFormat` has both an unkeyed block (`Marker`) and a keyed one
+/// (`Item`), so both branches of the generator are covered.
+#[test]
+fn the_generated_into_twins_exist_on_both_routes() -> varve::Result<()> {
+    use varve::RecordIndexEntry;
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("into-twins.varve");
+    {
+        let mut writer = ResidentChainFormat::create(&path)?;
+        writer.push(&Marker { tag: 7 })?;
+        // Keyed blocks on a keyed-chaining format must go through the
+        // maintaining path; `push` refuses them (API2-05, asserted above).
+        writer.push_keyed(&Item { id: 1, value: 10 })?;
+        writer.push_keyed(&Item { id: 2, value: 20 })?;
+        writer.flush()?;
+    }
+
+    let reader = ResidentChainFormat::open_reader(&path)?;
+
+    // --- inherent route ---
+    let mut entries: Vec<RecordIndexEntry> = Vec::new();
+    let mut markers: Vec<Marker> = Vec::new();
+    reader.markers_entries_into(&mut entries)?;
+    reader.markers_decoded_into(&mut markers)?;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(markers, vec![Marker { tag: 7 }]);
+
+    let mut item_entries: Vec<RecordIndexEntry> = Vec::new();
+    let mut by_key = std::collections::HashMap::new();
+    reader.items_into(&mut item_entries, &mut by_key)?;
+    assert_eq!(item_entries.len(), 2);
+    assert_eq!(by_key.len(), 2);
+
+    let mut items: Vec<Item> = Vec::new();
+    reader.items_decoded_into(&mut items)?;
+    assert_eq!(items.len(), 2);
+
+    // --- trait route: same calls, resolved through the generated trait ---
+    fn through_the_trait<R: ResidentChainFormatRead>(reader: &R) -> varve::Result<(usize, usize)> {
+        let mut entries: Vec<RecordIndexEntry> = Vec::new();
+        let mut markers: Vec<Marker> = Vec::new();
+        reader.markers_entries_into(&mut entries)?;
+        reader.markers_decoded_into(&mut markers)?;
+
+        let mut item_entries: Vec<RecordIndexEntry> = Vec::new();
+        let mut by_key = std::collections::HashMap::new();
+        reader.items_into(&mut item_entries, &mut by_key)?;
+        let mut items: Vec<Item> = Vec::new();
+        reader.items_decoded_into(&mut items)?;
+        Ok((markers.len() + entries.len(), items.len() + by_key.len()))
+    }
+    assert_eq!(through_the_trait(&reader)?, (2, 4));
+
+    // Reuse is the point: filling an already-populated buffer clears it first
+    // rather than appending, so a loop over many files does not grow without
+    // bound.
+    reader.items_decoded_into(&mut items)?;
+    assert_eq!(items.len(), 2, "`_into` must clear before it fills");
+    Ok(())
+}
