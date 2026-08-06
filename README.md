@@ -57,10 +57,14 @@ is covered in **[API Changes](docs/api-changes.md)**.
 
 **Not ready for:**
 
-- **Windows-only assurance.** Every number in the documentation, and every
-  executed test, comes from Windows x86_64. Unix is compile-verified only; other
-  targets additionally lose the allocation map and hole punching by construction.
-  CI has never run on this code.
+- **Measurements from one platform.** The test suite is executed on both Linux
+  and Windows — CI runs `ubuntu-latest` and `windows-latest` on every push to
+  `main`, and both were green — so behaviour is no longer Windows-only. The
+  *numbers* still are: every syscall count, residency figure and open cost in
+  these documents was measured on Windows x86_64, and the constants differ on a
+  filesystem with different extent and allocation behaviour. Targets other than
+  those two remain compile-verified only, and additionally lose the allocation
+  map and hole punching by construction.
 - **Matrices larger than 16,000,000 cells out of the box.** That is the default
   `max_matrix_cells`, checked per matrix block **and** as a running aggregate
   across all of them, so a 4096 x 4096 matrix fails at *create* with
@@ -198,8 +202,8 @@ confidence in it:**
 
 | Target | Status |
 | --- | --- |
-| Windows x86_64 MSVC | the only executed platform. Every measured number in these documents comes from here. |
-| Linux | compile-verified only. Has an allocation map and hole punching, so the same cost model applies with different constants; no test has run. |
+| Windows x86_64 MSVC | executed, and the platform every measured number in these documents comes from. |
+| Linux x86_64 | executed. Three defects were found here that every Windows run had passed: advisory locks belong to the open file description and `fork` duplicates it, ext4 hands a just-freed inode straight back to the next create, and extent reporting is precise where NTFS rounds to the allocation run. The allocation map and hole punching exist here too, so the same cost model applies — with **different constants, none of them measured**. |
 | macOS and other targets | no allocation map (matrix open visits only pages the index names) and no hole punch (`clear_category` writes `cells / 8` bytes). Compile paths exist; nothing executed. |
 
 Full numbers, arithmetic you can apply to your own cell count, and the trade-offs
@@ -451,8 +455,8 @@ validation, sidecar and lock bounds, and generated API trust boundaries. **That
 review predates 0.4.0 and every hardening round recorded in the changelog, and it
 is not a substitute for the fuzz, Miri and ASan runs that have not happened.**
 
-For the full assurance picture — including that CI has never run on this code and
-that no fuzz, Miri or ASan run covers it — see
+For the full assurance picture — including that no fuzz, Miri or ASan run covers
+this code, and which platform each number came from — see
 [Known Limitations §6](docs/known-limitations.md#6-not-verified).
 
 ## Local Verification

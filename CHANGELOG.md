@@ -594,7 +594,7 @@ Each links to the section of the migration document that tells you what to edit.
   (**0.44x**); both are contract-asserted at `<= 1.0x`. The private-handle pool is
   `#[cfg(windows)]`, and **the concurrent-read scaling contracts have never been
   executed on Unix** — see
-  [docs/known-limitations.md §6.1](docs/known-limitations.md#61-the-unix-code-paths-have-never-been-executed).
+  [docs/known-limitations.md §6.1](docs/known-limitations.md#61-the-unix-code-paths-and-what-the-first-linux-run-found).
 
 - One lock now exists in the matrix read path: `SparseBitmap` holds a
   `Mutex<PageStore>` so a demand fault-in can happen under `&self`. It is taken
@@ -621,13 +621,19 @@ Each links to the section of the migration document that tells you what to edit.
 
 Stated here rather than left to be discovered:
 
-- **CI has never run on this code**, on either operating system. The Unix
-  `openat`/`unlinkat` and `O_NOFOLLOW` paths are compile-verified only. The two
-  gates that were red when this release was assembled — the Linux `dead_code`
-  lint on the Windows-only `MatrixReadPool::handles` field, and the
-  default-feature failure in `matrix_concurrent_reads` — are fixed and were
-  re-measured individually on Windows; the Linux one is a cross-compiled lint
-  pass, not an executed Linux test.
+- **The numbers in these documents are Windows numbers.** The suite is executed
+  on both operating systems — CI runs `ubuntu-latest` and `windows-latest`, and
+  the Unix `openat`/`unlinkat` and `O_NOFOLLOW` paths run there rather than being
+  compile-verified — but no measurement has been taken on Linux, and a
+  filesystem with different extent behaviour moves the constants. The two gates
+  that were red when this release was assembled, the Linux `dead_code` lint on
+  the Windows-only `MatrixReadPool::handles` field and the default-feature
+  failure in `matrix_concurrent_reads`, are both fixed and green.
+
+  This entry originally read "CI has never run on this code", which was true
+  when 0.5.0 was assembled and stopped being true on 2026-07-27. The first Linux
+  run found three defects every Windows run had passed; they are described in
+  [docs/known-limitations.md §6.1](docs/known-limitations.md#61-the-unix-code-paths-and-what-the-first-linux-run-found).
 - **No fuzz campaign, Miri run or ASan run has been performed against this
   release's code.** The recorded fuzz evidence predates rounds 12-16, and an
   unpromoted libFuzzer OOM reproducer for `codec_arbitrary` exists in the working

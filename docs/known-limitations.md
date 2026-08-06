@@ -1161,25 +1161,48 @@ Almost everything in this section is a statement about **assurance** rather than
 known defect: it is here because a user is entitled to know which claims rest on
 executed tests and which rest on inspection.
 
-Two exceptions, both defects in the project's own gates rather than in the
-library: the Linux Clippy lint failure in §6.1, and the default-feature test
-failure in §6.6. Neither changes any library behaviour, and both are named rather
-than omitted.
+This section used to carry two exceptions — defects in the project's own gates
+rather than in the library: a Linux Clippy failure and a default-feature test
+failure. Both are fixed, and every gate is green. What replaced them is not a
+shorter list of caveats but a sharper one: the suite now runs on Linux (§6.1),
+and running it there found three defects that every Windows run had passed. The
+distinction that matters throughout this section is **executed** versus
+**measured** — Linux is now the first, and is still not the second.
 
-### 6.1 The Unix code paths have never been executed
+### 6.1 The Unix code paths, and what the first Linux run found
 
-Nothing in this release has been pushed to any remote, so **CI has never run on
-this code, on either operating system**. The Linux job is the only thing that
-would exercise:
+This section used to say the Unix paths had never been executed. **That stopped
+being true on 2026-07-27, and what the first run found is why the section is
+still here.** The suite is executed on Linux as well as
+Windows: CI runs `ubuntu-latest` and `windows-latest` on every push to `main`,
+on every pull request, and on demand. The three paths this section used to name
+as unexecuted — `diagnostics.rs`'s `openat`/`unlinkat` exclusive-directory
+cleanup, `file.rs`'s `O_NOFOLLOW` lock-marker open, and the matrix
+concurrent-read path without the Windows private-handle pool (§4.1) — all run
+there now, `compression-zstd` included under `--all-features`.
 
-- `diagnostics.rs`'s `openat`/`unlinkat` exclusive-directory cleanup,
-- `file.rs`'s `O_NOFOLLOW` lock-marker open,
-- the matrix concurrent-read path without the Windows private-handle pool (§4.1).
+The first Linux run found **three defects that every Windows run had passed**,
+which is the reason to state the platform behind a claim rather than the claim
+alone:
 
-These are **compile-verified only** (open item 8). Cross-compilation to
-`x86_64-unknown-linux-gnu` succeeds except for `compression-zstd`, which needs a
-Linux C toolchain that was not available on the host that produced this document —
-so the zstd path on Unix is not even cross-compile-verified.
+- a writer lock leaked across `fork`: a POSIX advisory lock belongs to the open
+  file *description*, `Command::spawn` forks and duplicates it, and dropping the
+  guard released nothing until the child execed. Dropping is not releasing, so
+  the release is now explicit.
+- identity-checked deletion compared recycled inode numbers. Identity bytes read
+  from a handle that is then closed name nothing: ext4 hands a just-freed inode
+  straight back to the next create, and the check said "same object" about a file
+  it had never seen. A handle is now held open for as long as the identity is
+  used, which pins the inode.
+- an open-cost assertion hard-coded NTFS's ~128 KiB allocation-run granularity.
+  ext4 reports extents precisely, so the same file measured 2 pages and 8,240
+  bytes where Windows measured at least 4 and 64 KiB.
+
+What this section still says, unchanged: **the numbers are Windows numbers.**
+Executed on Linux is not measured on Linux. Every syscall count, residency
+figure and open cost in these documents was taken on Windows x86_64, and the
+third defect above is exactly what a different filesystem does to such a
+constant. No Linux measurement has been published.
 
 `cargo clippy --target x86_64-unknown-linux-gnu -p varve --no-default-features
 --lib -- -D warnings` previously failed with `field 'handles' is never read` at
@@ -1188,9 +1211,9 @@ so the zstd path on Unix is not even cross-compile-verified.
 field is an ownership anchor rather than dead weight — it holds the `Arc<File>`s
 whose `Weak`s live in the thread-local cache — so it now carries
 `#[cfg_attr(not(any(windows, test)), allow(dead_code))]` with that reason
-recorded at the declaration. The invocation passes on both targets as of
-2026-07-25. That is a cross-compiled lint pass, not an executed Linux test: the
-paths listed above are still compile-verified only.
+recorded at the declaration. That was a cross-compiled lint pass when it was
+written; Clippy now runs natively on Linux in CI, across nine feature
+configurations, and is green.
 
 ### 6.2 The petabyte-scale positional-I/O probe has never run
 
@@ -1374,8 +1397,8 @@ it; the matrix and sidecar refusal claims still rest on inspection.**
 
 | Target | Status |
 | --- | --- |
-| Windows x86_64 MSVC | the only platform on which anything in this release has been executed. Every number in this document is from here. |
-| Unix (Linux) | **compile-verified only** (§6.1). Cross-compilation succeeds except `compression-zstd`. No test, gate or measurement has run. |
+| Windows x86_64 MSVC | executed, and the platform every number in this document is from. |
+| Unix (Linux) | **executed**, including `compression-zstd`, and green: tests, Clippy and fmt run natively on `ubuntu-latest` in CI (§6.1). The first such run found three defects every Windows run had passed. **No measurement has been taken here** — the numbers above are not Linux numbers. |
 | macOS / other targets | compile paths exist, nothing executed. Two behaviours differ by construction rather than by accident: no allocation map (§1.1) and no hole punch (§1.7). |
 
 ### 6.9 CI reproducibility is bounded

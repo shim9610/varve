@@ -885,10 +885,10 @@ module that owns them, and are closed when the file handle is dropped. On Unix
 clock, not by counting readers.
 
 **Every number above is a Windows number, and the private-handle pool is
-`#[cfg(windows)]`.** The Unix path — a shared handle plus `pread` — is reasoned
-about rather than measured: the two wall-clock scaling contracts have never been
-executed on Unix, because CI has never run on this code. See
-[Known Limitations §6.1](known-limitations.md#61-the-unix-code-paths-have-never-been-executed).
+`#[cfg(windows)]`.** The Unix path — a shared handle plus `pread` — is executed
+but not measured: the suite runs on Linux in CI, so the path is exercised, while
+the two wall-clock scaling contracts have no Unix numbers behind them. See
+[Known Limitations §6.1](known-limitations.md#61-the-unix-code-paths-and-what-the-first-linux-run-found).
 
 There is one lock in the read path, stated because its absence used to be the
 claim: each commit bitmap holds a `Mutex` over its page map, so that a demand
