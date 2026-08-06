@@ -715,8 +715,8 @@ offered a mitigation that does not exist:
 
 - `IndexPolicy::CheckpointOnFlush` does **not** seed an open from a checkpoint.
   Every open path calls `load_index`, which calls `scan_records_from` for any
-  format without the segment chain, and that walks from `header_len` to
-  `file_len` unconditionally. A checkpoint met during that walk is *validated*
+  format without the segment chain, and that walks from `header_len` to the end
+  of the file unconditionally. A checkpoint met during that walk is *validated*
   (`inspect_index_checkpoint`) and its decoded entries are discarded. There is no public checkpoint-seeded open. What the policy actually
   bounds is the writer side: it spaces full index checkpoints geometrically, which
   bounds cumulative checkpoint **bytes written**, not open cost.
@@ -726,27 +726,65 @@ offered a mitigation that does not exist:
   the schema manifest and hash bytes and is consulted nowhere else in
   `varve-core`. Clearing it does not produce a non-scanning open.
 
-**How much RAM an open takes, so you can answer this before running it.** The
-resident index is a `Vec<RecordIndexEntry>`, and `index_bytes_for_count` — the
-same function that charges `max_index_bytes` — computes
-`count * size_of::<RecordIndexEntry>()`. On a 64-bit target that is **104 bytes
-per record**:
+**How much RAM an open takes, so you can answer this before running it.** An
+open handle keeps a **record directory**: one 16-byte slot per record — the
+record's offset and its committed bit, the two facts that are not in the record
+itself. Everything else an index entry carries is rebuilt from the record's own
+header and footer when a read asks for it.
 
 ```text
-resident_index_bytes ~= 104 * records
+resident_directory_bytes ~= 16 * records
 ```
 
-So 10,000,000 records is about 1.04 GB of index before any decoded payload, and a
-log with 400,000,000 records needs about 41.6 GB. Add transient growth slack: the
-`Vec` is grown incrementally, so the peak can be up to twice the resting size
-during the scan. That figure, not the file size, is what decides whether a
-resident open fits.
+So 10,000,000 records is about 160 MB, and 400,000,000 records about 6.4 GB.
 
-`ReadLimits::STANDARD` leaves `max_file_len`, `max_records`, `max_index_bytes`
-and `max_scan_bytes` at `u64::MAX`, so the **default profile places no ceiling on
-resident index size**. `ReadLimits::UNTRUSTED` makes them finite (16 GiB file,
-16,000,000 records, 1 GiB index, 16 GiB scan, 65,536 segments, 256 MiB keyed
-tail) and is the right default for attacker-supplied input.
+This used to be `104 * records` — a full `Vec<RecordIndexEntry>` — which is
+where the figures in older copies of this document come from. Measured across
+2,000 → 20,000 records: **177.5 bytes per record retained before, 16.00 after.**
+
+**Three ways to pay for it, and you choose:**
+
+| | who holds the directory | per-record cost to the handle |
+| --- | --- | --- |
+| `open_readonly` / `open` | varve | 16 B |
+| `open_readonly_without_directory(spec, path, &mut index)` | you | **0** |
+| `VarveStreamReader` (`high-cardinality-dev`) | nobody — sequential walk only | 0 |
+
+The middle row is not a reduction in capability. `blocks`, `scan`,
+`keyed_blocks`, `metadata`, `verify_all` and the rest all still work — through
+`file.with_directory(&index)`, where `index` is the `Vec<RecordIndexEntry>` that
+same call handed you. Calling one of them on the handle itself returns
+`Error::NoResidentDirectory { operation }`, naming both the read and the way to
+answer it; it does **not** answer as an empty file would, which would be
+indistinguishable from the truth for a caller who forgot.
+
+Measured: opening a 20,000-record file allocates **320,218 bytes with a
+directory and 218 without** — the 320,000-byte slot array is not built, not
+built-and-freed.
+
+**The peak of a single open is a separate figure and is larger.** The scan still
+materialises one `RecordIndexEntry` per record before the directory is taken
+from it, so an open transiently reaches about `170 * records` live. Pass your own
+buffer — `open_readonly_with_scratch`, or `open_readonly_without_directory`,
+which take one — and that allocation happens once for any number of files rather
+than once per open: measured 29,824,680 bytes over eight opens against
+**5,969,576** through one buffer.
+
+`ReadLimits::STANDARD` leaves `max_records`, `max_index_bytes` and
+`max_scan_bytes` at `u64::MAX`, so the **default profile places no ceiling on
+resident index size**. `ReadLimits::UNTRUSTED` makes them finite (16,000,000
+records, 1 GiB index, 16 GiB scan, 65,536 segments, 256 MiB keyed tail) and is
+the right default for attacker-supplied input.
+
+**`max_file_len` is no longer enforced anywhere, and no longer has to be
+declared.** A ceiling on how large a *file* may be bounded nothing the reader
+allocates: what it allocates is bounded by `max_records`, `max_index_bytes`,
+`max_scan_bytes`, `max_record_payload_len` and `max_logical_payload_len`, each
+of which has a check that consults it. All twenty-two enforcement sites were
+removed and `file_len` came off both required-declaration lists. The field and
+the DSL's `limits { file_len: .. }` remain so that existing format definitions
+keep parsing; the value is inert. A format that relied on it to refuse a large
+file must state one of the limits above instead.
 
 **This is not the petabyte-scale path.** The petabyte-scale path is the
 `high-cardinality-dev` **stream/indexed** family: `VarveStreamWriter`,
@@ -930,6 +968,7 @@ concurrently issuable through a shared handle.
 | --- | --- | --- |
 | Matrix — all six read entry points above, on `VarveReader`, `VarveWriter`, `VarveFile` | `&self` | yes — the handle is `Send + Sync` |
 | Resident record reads (`blocks`, `keyed_blocks`, `materialized_keyed_blocks`, `scan`, `index_entries`, `metadata`) on `VarveReader` | `&self` | yes |
+| The same reads resolved through a caller-supplied directory (`with_directory(..)`) | `&self` | yes |
 | All mutation (`push*`, `delete*`, `replace_*`, `write_matrix_cell*`, `commit_matrix_cell`, `clear_matrix_*`, `flush`, `commit`, `sync`) | `&mut self` | no |
 
 The three relaxations are source-compatible — an existing call through a `&mut`

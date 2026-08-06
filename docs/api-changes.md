@@ -1,10 +1,12 @@
-# API Changes — 0.3.0 to 0.4.0, and 0.4.0 to 0.5.0
+# API Changes — 0.3.0 to 0.4.0, 0.4.0 to 0.5.0, and unreleased
 
 Migration document. Companion to [Known Limitations](known-limitations.md)
 and the [Changelog](../CHANGELOG.md).
 
-Section **A** is the 0.4.0 → 0.5.0 migration: four changes, all about matrix
-commit-metadata residency and verification. Everything numbered 1 through 5 is the
+Section **B** is the unreleased migration: two changed signatures, both from the
+reader no longer keeping a copy of the file's index. Section **A** is the
+0.4.0 → 0.5.0 migration: four changes, all about matrix commit-metadata
+residency and verification. Everything numbered 1 through 5 is the
 0.3.0 → 0.4.0 migration and is unchanged except where a section says 0.5.0
 corrected it — §5.12 in particular now describes a bug that **no longer exists**,
 and says so in place.
@@ -12,6 +14,100 @@ and says so in place.
 No on-disk byte changes in 0.5.0. A 0.4.0 file reads unchanged; no encoder,
 decoder, header field or version constant was touched. If you are coming from
 0.3.0 or earlier, read "Read this first" below — that guidance is unchanged.
+
+---
+
+## B. Unreleased: two signatures changed
+
+Both come from the same change — the reader stopped keeping a copy of the file's
+index — and both are source-level only. **No on-disk byte changed.**
+
+### B.1 `scan()` yields `Result<BlockEvent>`
+
+```rust
+// before
+pub fn scan(&self) -> impl Iterator<Item = BlockEvent> + '_
+
+// after
+pub fn scan(&self) -> impl Iterator<Item = Result<BlockEvent>> + '_
+```
+
+On `VarveFile`, `VarveReader` and the generated readers.
+
+```rust
+// before
+let ids: Vec<_> = file.scan().map(|event| event.block_id).collect();
+assert_eq!(file.scan().count(), records);
+
+// after
+let ids = file.scan().map(|e| Ok(e?.block_id)).collect::<Result<Vec<_>>>()?;
+assert_eq!(file.scan().collect::<Result<Vec<_>>>()?.len(), records);
+```
+
+**Why it could not stay.** Producing an event now means producing the index
+entry behind it, and that is a read of a file. The two ways to hide that were to
+materialise the whole scan into a `Vec` first — the eager load the change exists
+to remove — or to end the iterator on a read error, which reports a truncated
+file as a short one. Neither is acceptable, so the `Result` is on each item and
+nothing is read until the item is asked for.
+
+### B.2 `LayoutReader::segments()` yields owned segments
+
+```rust
+// before
+pub fn segments(&self) -> &[LayoutSegmentInfo]
+
+// after
+pub fn segment_count(&self) -> usize
+pub fn segment(&self, index: usize) -> Result<Option<LayoutSegmentInfo>>
+pub fn segments(&self) -> impl Iterator<Item = Result<LayoutSegmentInfo>> + '_
+pub fn segments_into(&self, out: &mut Vec<LayoutSegmentInfo>) -> Result<()>
+```
+
+```rust
+// before
+assert_eq!(reader.segments().len(), 5);
+let name = reader.segments()[0].name;
+
+// after
+assert_eq!(reader.segment_count(), 5);
+let name = reader.segment(0)?.expect("segment 0").name;
+```
+
+`.segments().len()` happens to still compile — the iterator is `ExactSizeIterator`
+— so a mechanical sweep for `[..]` indexing is what finds the breakages.
+
+**Why it could not stay.** A `&[LayoutSegmentInfo]` promises the caller that
+every segment exists, contiguously, for as long as the borrow lives. That is the
+one shape a reader which rebuilds a segment from the file cannot offer, and it
+was what kept the whole array resident.
+
+The generated per-kind accessors are unchanged in shape and gained `_into`
+twins.
+
+### B.3 Unchanged signatures, changed behaviour
+
+- **`max_file_len` is inert.** Nothing enforces a file-length ceiling and no
+  format is required to declare one. `limits { file_len: .. }` still parses; it
+  no longer refuses anything. A format that relied on it must state
+  `max_records`, `max_index_bytes`, `max_scan_bytes`,
+  `max_record_payload_len` or `max_logical_payload_len` instead.
+- **`TrustedUnboundedRequiresExplicitApi` names a different resource.** It used
+  to name `file length`, which was the first required limit; it now names
+  `record count` (native) or `scan bytes` (layout). The refusal itself is
+  unchanged. Match on the variant, not on the string.
+- **`diagnose_file` and `inspect_layout_file` surface a refused index.** Both
+  previously reported a file refused by `max_index_bytes` as a file with no
+  records / no segments.
+
+### B.4 Nothing to migrate, but worth knowing
+
+Everything else is additive: the `_into` family, `open_*_with_scratch`,
+`read_payload_into` / `read_logical_payload_into` / `decode_block_into`,
+`with_directory` / `RecordDirectory` / `DirectoryRead`,
+`open_readonly_without_directory`, `BlockVec::get_into`, and the generated
+`_entries_into` / `_decoded_into` / `_into` twins. See
+[API Reference](api-reference.md#reads-that-fill-a-buffer-you-own).
 
 ---
 

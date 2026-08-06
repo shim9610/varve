@@ -6,6 +6,83 @@ increment the minor version.
 
 ## Unreleased
 
+### The reader stops keeping a copy of the file
+
+**Breaking, source-level.** Two signatures changed; both are listed in
+[API Changes §B](docs/api-changes.md).
+
+An open handle used to keep one `RecordIndexEntry` per record — 104 bytes, for
+the life of the handle, growing with the file. It now keeps a 16-byte directory
+slot (the record's offset and its committed bit, the two facts not in the
+record) and rebuilds the entry from the record's own header and footer when a
+read asks. Measured across 2,000 → 20,000 records: **177.5 bytes per record
+retained before, 16.00 after.**
+
+`LayoutReader` had the same shape and got the same treatment: a
+`Vec<LayoutSegmentInfo>` — a struct plus two `Vec`s of decoded field values per
+segment — became a 16-byte slot. Measured 1,000 → 50,000 segments: **343.05
+bytes per segment before, 21.07 after.**
+
+The peak of a single open is a separate figure and is unchanged: the scan still
+materialises the entries before the directory is taken from them.
+
+### The caller owns the buffers
+
+Every read that returned a collection has an `_into` twin that fills a buffer
+you supply — `index_entries_into`, `all_metadata_into`, `block_entries_into`,
+`decode_blocks_into`, `blocks_migrated_into`, `keyed_blocks_into`,
+`materialized_keyed_blocks_into`, `key_tail_offsets_into`, `segments_into`, and
+the generated per-block twins on both the inherent and the trait route. The
+allocating forms remain as thin wrappers.
+
+`open_readonly_with_scratch` and `open_with_scratch` take the scan's entry
+buffer. Measured, eight opens of a 20,000-record file: **29,824,680 bytes
+against 5,969,576** through one buffer — the difference is exactly seven further
+copies of the entry array.
+
+Reading one record through an entry you already hold, into a buffer you own:
+`read_payload_into`, `read_logical_payload_into`, `decode_block_into`. Measured:
+**0 allocations for 20,000 reads** through a cached index.
+
+Internally the per-record read loops now share one payload buffer per walk
+rather than allocating one per record. Measured: **1.00 allocations per record
+before, 0.00 after** (one for the whole walk).
+
+### A handle can keep no directory at all
+
+`open_readonly_without_directory(spec, path, &mut index)` keeps nothing that
+scales with the file and hands you the directory instead. Measured: opening a
+20,000-record file allocates **320,218 bytes with a directory and 218 without** —
+the slot array is not built, not built-and-freed.
+
+No read is withdrawn in that mode. `with_directory(&index)` answers all of them
+against the directory you hold; `RecordDirectory` is implemented for
+`ResidentIndex` and for `[RecordIndexEntry]`. Calling a read on the handle
+itself returns the new `Error::NoResidentDirectory { operation }`, naming both
+the read and the way to answer it — deliberately an error rather than an empty
+answer, which would be indistinguishable from an empty file.
+
+### `max_file_len` no longer does anything
+
+All twenty-two file-length enforcement sites were removed, and `file_len` came
+off both required-declaration lists — a format that omits it now opens. A
+ceiling on how large a *file* may be bounded nothing the reader allocates; what
+it allocates is bounded by `max_records`, `max_index_bytes`, `max_scan_bytes`,
+`max_record_payload_len` and `max_logical_payload_len`, each of which has a check
+that consults it.
+
+The field and the DSL's `limits { file_len: .. }` remain so existing format
+definitions keep parsing. The value is inert. A format that relied on it to
+refuse a large file must state one of the limits above instead.
+
+### Fixed
+
+- `diagnose_file` and `inspect_layout_file` read the record index through
+  `index_entries()`, whose infallible surface swallows a refused `IndexBytes`
+  charge and returns an empty snapshot. Both reported a refused file as a file
+  with **no records** / **no segments**; both now surface the refusal.
+
+
 ### Internal segments: open can stop reading every record
 
 `IndexPolicy::segment_on_flush` makes every commit point append an internal

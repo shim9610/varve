@@ -126,8 +126,8 @@ and materialization. Compatibility `*_with_limits` methods perform a meet, so
 
 `ReadLimits::UNTRUSTED` (`ReadLimits::untrusted()`) is the finite companion to
 `STANDARD` for input from untrusted sources. Every aggregate dimension that
-`STANDARD` leaves effectively unbounded is finite: `max_file_len` 16 GiB,
-`max_records` 16,000,000, `max_scan_bytes` 16 GiB, `max_index_bytes` 1 GiB,
+`STANDARD` leaves effectively unbounded is finite: `max_records` 16,000,000,
+`max_scan_bytes` 16 GiB, `max_index_bytes` 1 GiB,
 `max_segments` 65,536, and `max_keyed_tail_bytes` 256 MiB, inheriting the
 `STANDARD` per-item caps for everything else. Use it when a resident open must not let a hostile file choose the reader's
 CPU, I/O, or memory; large trusted files should use the scalable APIs or explicit
@@ -343,15 +343,81 @@ index per record** (`size_of::<RecordIndexEntry>()`).
   schema manifest and hash bytes and is consulted nowhere else in `varve-core`, so
   clearing it does not produce a non-scanning open.
 
-`ReadLimits::STANDARD` leaves `max_file_len`, `max_records`, `max_index_bytes`
-and `max_scan_bytes` at `u64::MAX`, so the default profile places no ceiling on
+`ReadLimits::STANDARD` leaves `max_records`, `max_index_bytes` and
+`max_scan_bytes` at `u64::MAX`, so the default profile places no ceiling on
 resident index size; use `ReadLimits::UNTRUSTED` for input you did not produce.
+`max_file_len` is accepted and inert — nothing enforces a file-length ceiling;
+see [Known Limitations](known-limitations.md).
 
 The petabyte-scale path is [Scalable Stream And Indexed
 Handles](#scalable-stream-and-indexed-handles) below, behind
 `high-cardinality-dev`. `VarveReader` is a snapshot as of its own open: records
 another handle appends afterwards are not visible without reopening. See
 [Known Limitations §2.1](known-limitations.md#21-varvefile-scans-the-whole-file-at-open-and-holds-a-record-index).
+
+### Reads that fill a buffer you own
+
+Every read that returns a collection has an `_into` twin taking the buffer
+instead. `out` is cleared and then filled, so a caller that reuses one buffer
+across calls or across files allocates once and never again. The allocating form
+stays as a thin wrapper — nothing breaks.
+
+| allocating | caller-supplied |
+| --- | --- |
+| `index_entries()` | `index_entries_into(&mut Vec<RecordIndexEntry>)` |
+| `all_metadata()` | `all_metadata_into(&mut Vec<(String, Vec<u8>)>)` |
+| `blocks::<T>()` | `block_entries_into::<T>(&mut Vec<RecordIndexEntry>)` |
+| — | `decode_blocks_into::<T>(&mut Vec<T>)` — decodes **every** matching record; bounded by your buffer, not by the file |
+| `blocks_migrated::<F, T, M>()` | `blocks_migrated_into::<F, T, M>(&mut Vec<T>)` |
+| `keyed_blocks::<T>()` | `keyed_blocks_into::<T>(&mut Vec<RecordIndexEntry>, &mut HashMap<..>)` |
+| `materialized_keyed_blocks::<T>()` | `materialized_keyed_blocks_into::<T>(&mut HashMap<..>)` |
+| `key_tail_offsets::<T>()` | `key_tail_offsets_into::<T>(&mut HashMap<..>)` |
+| `open_readonly(spec, path)` | `open_readonly_with_scratch(spec, path, &mut Vec<RecordIndexEntry>)` |
+| `open(spec, path)` | `open_with_scratch(spec, path, &mut Vec<RecordIndexEntry>)` |
+
+`decode_blocks_into` is deliberately **not** named as the twin of `blocks()`:
+`blocks()` returns a lazy collection whose peak is one payload however many
+records it covers, and this one materialises all of them.
+
+The generated per-block accessors carry the same pair — `<plural>_entries_into`,
+`<plural>_decoded_into`, and `<plural>_into` for a keyed block — on both the
+inherent and the trait route.
+
+Reading one record you already hold an entry for, into a buffer you own:
+
+| API | Meaning |
+| --- | --- |
+| `read_payload_into(&entry, &mut Vec<u8>)` | stored bytes, checksum-verified |
+| `read_logical_payload_into(&entry, &mut Vec<u8>)` | decompressed if the record is compressed |
+| `decode_block_into::<T>(&entry, &mut scratch)` | decode, reading the bytes through `scratch` |
+
+All three are bound to this open handle's snapshot, not to a path. The entry is
+yours and is therefore not trusted: an extent past the snapshot is refused, and
+bytes that do not match the entry's checksum are refused.
+
+### Reads resolved through a directory you supply
+
+`with_directory(&directory)` returns the same reads answered against a directory
+of your own instead of the handle's. A directory is anything implementing
+`RecordDirectory` — in practice the `Vec<RecordIndexEntry>` that
+`index_entries_into` or `open_readonly_with_scratch` filled, or a subslice of
+it.
+
+```rust
+let mut index = Vec::new();
+let file = VarveFile::open_readonly_with_scratch(spec, path, &mut index)?;
+let points = file.with_directory(&index).blocks::<Point>()?;
+```
+
+`open_readonly_without_directory(spec, path, &mut index)` opens a handle that
+keeps **no** directory — nothing that scales with the file — and hands you the
+one the scan produced. The `index` parameter is output, not scratch, and is not
+optional: a handle that keeps no directory cannot produce one afterwards.
+
+The reads are not withdrawn in that mode. They are answered through
+`with_directory`; calling one on the handle itself returns
+`Error::NoResidentDirectory { operation }`, which names the read and the way to
+answer it, rather than answering as an empty file would.
 
 Common `VarveWriter` APIs:
 
@@ -887,7 +953,10 @@ metadata and raw regions.
 | `LayoutReader::file_header_len()` | validated header length before the first segment |
 | `LayoutReader::file_header_fields()` | validated declared file-header values |
 | `LayoutReader::file_header_field(name)` | read one validated file-header value |
-| `LayoutReader::segments()` | inspect validated physical segment ranges |
+| `LayoutReader::segment_count()` | how many segments the file holds |
+| `LayoutReader::segment(index)` | one validated physical segment range, by value |
+| `LayoutReader::segments()` | every segment in order, `Iterator<Item = Result<LayoutSegmentInfo>>` |
+| `LayoutReader::segments_into(&mut Vec<..>)` | the same into a buffer you own |
 | `LayoutSegmentInfo::field(name)` | read validated lead-in values such as ToC mask or version |
 | `LayoutSegmentInfo::footer_field(name)` | read validated footer values |
 | `LayoutReader::read_metadata(index)` | read opaque metadata bytes for a segment |
