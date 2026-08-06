@@ -5,8 +5,21 @@ Varve path intended for very large append logs. Its normal open and append
 costs do not grow with native file size or record count.
 
 The resident `create_writer`, `open_reader`, `blocks`, and `keyed_blocks`
-APIs remain useful for bounded files. They scan the file and retain a record
-index at open, and are not the petabyte-scale path.
+APIs remain useful for bounded files. By default they scan the file and retain a
+16-byte directory slot per record at open, and are not the petabyte-scale path.
+
+Two opt-in policies narrow that gap without closing it. `segment_on_flush` makes
+open frame one record per commit point instead of one per record;
+`open_digest_on_flush` plus `VarveFile::open_readonly_lazy` makes open frame one
+record and retain **nothing**, leaving the caller to build only the part of the
+index its question needs with `record_map`. Measured on a 50,000-record file:
+100,316 read syscalls at open by default, 516 chained, 20 from a digest.
+
+What that does *not* give you is this family's other two properties. A resident
+open still has no bounded-memory keyed merge or compact, and a `record_map` walk
+is still a forward walk of the record chain — `O(records before the answer)`,
+not a keyed lookup. Choose this family when key cardinality is the problem;
+choose the digest when open cost is.
 
 > **Status.** This family has never shipped in a released version, its wire
 > artifacts (`.vks`, `.vki`) are at their first public versions, and the feature

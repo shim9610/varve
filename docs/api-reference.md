@@ -1103,7 +1103,6 @@ varve_format! {
         magic: b"FRAM";
         version: 1;
         limits {
-            file_len: 1_073_741_824;
             scan_bytes: 1_073_741_824;
             segments: 1_000_000;
             index_bytes: 134_217_728;

@@ -138,7 +138,7 @@ Typed reads reverse the process:
 ```mermaid
 flowchart TD
     A["open_reader(path)"] --> B["read header and validate spec"]
-    B --> C["scan or load checkpoint index"]
+    B --> C["build the record directory"]
     C --> D["reader.users()?"]
     D --> E["select records by block id"]
     E --> F["read payload bytes on demand"]
@@ -148,6 +148,49 @@ flowchart TD
 
 Physical APIs such as `scan()`, `RecordIndexEntry::read_payload`, and mmap
 payload windows expose stored bytes. Typed APIs expose logical decoded values.
+
+### How Open Builds The Directory
+
+Step C above is the one with a policy behind it. A **record directory** is one
+16-byte slot per record — the record's offset and its committed bit, the only
+two facts about a record that are not in the record. Everything else an index
+entry carries is rebuilt from the record's own header and footer when a read
+asks.
+
+By default open builds that directory by framing every record in the file. Two
+opt-in policies change it, and they change different things:
+
+```mermaid
+flowchart TD
+    A["open"] --> B{"index policy"}
+    B -->|default| C["frame every record"]
+    B -->|segment_on_flush| D["walk the segment chain<br/>one record per commit point"]
+    B -->|open_digest_on_flush<br/>+ open_readonly_lazy| E["read the digest<br/>one record, no directory"]
+    C --> F["16 B per record resident"]
+    D --> F
+    E --> G["nothing resident;<br/>record_map builds what you ask for"]
+```
+
+- A **segment** record carries the index entries for the records one commit
+  point added, chained backwards through the record footer. Open follows the
+  chain and reads no data record, so it still builds the whole directory but
+  frames one record per commit point instead of one per record. It costs an
+  index entry per record *on disk*.
+- An **open digest** record carries the three facts an open needs that are in no
+  single record: where the committed file ends, the next append's sequence, and
+  each block's newest record offset. `open_readonly_lazy` reads it, frames one
+  record, and builds **no directory at all** — the caller builds whatever part of
+  the index its question needs with `record_map`. It costs twelve bytes per
+  distinct block id on disk, whatever the record count.
+
+Both are found by probing the end of the file, so both are appended last at a
+commit point and both need the writing session to end with `flush` or `commit`.
+Both fall back to the full scan for a file they cannot account for, and produce
+the identical answer when they do.
+
+A **checkpoint** record (`checkpoint_on_flush`) is a third internal record and is
+*not* one of these: open validates one it meets during the scan and discards the
+entries. It bounds writer-side checkpoint bytes, not open cost.
 
 ## Fixed Blocks
 

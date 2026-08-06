@@ -21,7 +21,6 @@ varve_format! {
         magic: b"APPDATA";
         version: 1;
         limits {
-            file_len: 8_589_934_592;
             records: 4_000_000;
             index_bytes: 536_870_912;
             scan_bytes: 8_589_934_592;
@@ -62,6 +61,15 @@ offset chains in normal use.
 The `limits` block is optional operational policy, not wire schema. Prefer
 choosing limits where a reader or writer is opened. Standard policy leaves the
 append log itself uncapped and bounds one-shot payload/materialization work.
+
+**`file_len` is gone from the examples in this guide, deliberately.** It is
+still accepted so that existing definitions keep parsing, but nothing enforces
+it: a ceiling on how large a *file* may be bounded nothing a reader allocates.
+What a reader allocates is bounded by `records`, `index_bytes`, `scan_bytes`,
+`record_payload` and `logical_payload`, each of which has a check that consults
+it. A format that relied on `file_len` to refuse a large file must state one of
+those instead. See [Known Limitations
+§2.1](known-limitations.md#21-varvefile-scans-the-whole-file-at-open-and-holds-a-record-index).
 Generated `*_with_resource_limits` methods may raise or lower optional format
 defaults; compatibility `*_with_limits` methods only tighten. Do not use
 trusted-unbounded methods for files supplied by users, networks, or other
@@ -88,7 +96,6 @@ varve_format! {
         magic: b"ANALYSIS";
         version: 1;
         limits {
-            file_len: 8_589_934_592;
             record_payload: 67_108_864;
             materialized_bytes: 268_435_456;
             matrix_dimension: 16_000_000;
@@ -104,22 +111,38 @@ varve_format! {
         dims {
             n_scans: u32,
             n_channels: u32,
-            n_wells_max: u32,
         }
 
         commit: cell_bitmap {
             keyspace = [scan, ch];
             categories = [analysis];
-        }
+        };
 
         blocks {
             matrix AnalysisCell(id = 10, dims = [scan, ch], category = analysis) {
-                rfu: [f32; n_wells_max],
+                rfu: [f32; WELLS_PER_CELL],
             }
         }
     }
 }
 ```
+
+**A cell's own shape is compile-time; the grid's shape is runtime.** `dims`
+declares the matrix's runtime dimensions, chosen when the file is created, and
+those names address cells — they are what `dims = [scan, ch]` selects from. A
+cell's *payload* is an ordinary canonical-codec field, so an array in one needs
+a length Rust can see:
+
+```rust
+const WELLS_PER_CELL: usize = 96;
+```
+
+An earlier version of this example wrote `rfu: [f32; n_wells_max]` with
+`n_wells_max` declared under `dims`. That does not compile — a runtime dimension
+is not a constant — and it is the exact confusion this paragraph exists to
+prevent. If the per-cell length is genuinely not known until create time, it is
+not a fixed array in a cell; make it a third matrix dimension, or an append-log
+variable block.
 
 The first implementation focuses on dense `(scan, ch)` addressing, bounded slot
 payloads, `NotCommitted` reads, and same-size in-place overwrites. Append-log
@@ -172,7 +195,6 @@ varve_format! {
         magic: b"APPDATA";
         version: 1;
         limits {
-            file_len: 8_589_934_592;
             records: 4_000_000;
             index_bytes: 536_870_912;
             scan_bytes: 8_589_934_592;
@@ -243,7 +265,6 @@ varve_format! {
         magic: b"APPDATA";
         version: 1;
         limits {
-            file_len: 8_589_934_592;
             records: 4_000_000;
             index_bytes: 536_870_912;
             scan_bytes: 8_589_934_592;
@@ -501,7 +522,6 @@ varve_format! {
         magic: b"PHYS";
         version: 1;
         limits {
-            file_len: 8_589_934_592;
             scan_bytes: 8_589_934_592;
             segments: 4_000_000;
             index_bytes: 536_870_912;

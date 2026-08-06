@@ -156,7 +156,6 @@ varve_format! {
         magic: b"ANL";
         version: 1;
         limits {
-            file_len: 8_589_934_592;
             record_payload: 67_108_864;
             materialized_bytes: 268_435_456;
             matrix_dimension: 16_000_000;
