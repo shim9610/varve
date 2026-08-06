@@ -1,4 +1,4 @@
-//! Growing matrix dimensions (`.internal-docs/matrix-chunk-spec.md`).
+//! Growing matrix dimensions (internal design note: the matrix-chunk spec).
 //!
 //! A matrix's dimensions are otherwise fixed at create, which cannot model a
 //! stream whose extent is unknown when the file is made — you learn a grid is
@@ -1141,8 +1141,8 @@ fn a_chunked_read_does_not_pay_for_records_it_does_not_touch() -> varve::Result<
     // exist to remove, in a file where all three are already written down.
     //
     // Measured as a ratio *and* as an absolute byte count, because a ratio
-    // alone is satisfied by any large constant — see
-    // `.internal-docs/index-residency-spec.md` §4.6.1.
+    // alone is satisfied by any large constant (internal design note: the
+    // index-residency spec, section 4.6.1).
     fn build(path: &Path, chunks: u64) -> varve::Result<()> {
         let mut writer = growing_spec().create_writer_with_dims(path, dims())?;
         for chunk in 1..=chunks {
