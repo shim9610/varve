@@ -36,8 +36,8 @@ scalable-fault-injection = [
 ]
 
 [dependencies]
-varve-core = { path = "../varve-core", version = "0.5.0" }
-varve-macros = { path = "../varve-macros", version = "0.5.0" }
+varve-core = { path = "../varve-core", version = "0.6.0" }
+varve-macros = { path = "../varve-macros", version = "0.6.0" }
 
 [dev-dependencies]
 proptest.workspace = true

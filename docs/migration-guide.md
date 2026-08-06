@@ -4,9 +4,9 @@ Varve migrations are explicit. Normal typed reads reject block version
 mismatches; migration code names both the source and target block types and
 performs semantic conversion in Rust.
 
-## Unreleased Pre-1.0 Wire Changes
+## 0.6.0 Pre-1.0 Wire Changes
 
-The current unreleased changes are wire-breaking under the pre-1.0 policy;
+The 0.6.0 changes are wire-breaking under the pre-1.0 policy;
 there is no automatic migration path for these surfaces:
 
 - The computed schema hash algorithm moved to version 3

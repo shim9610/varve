@@ -1,9 +1,9 @@
-# API Changes — 0.3.0 to 0.4.0, 0.4.0 to 0.5.0, and unreleased
+# API Changes — 0.3.0 to 0.4.0, 0.4.0 to 0.5.0, and 0.5.0 to 0.6.0
 
 Migration document. Companion to [Known Limitations](known-limitations.md)
 and the [Changelog](../CHANGELOG.md).
 
-Section **B** is the unreleased migration: two changed signatures, both from the
+Section **B** is the 0.5.0 → 0.6.0 migration: two changed signatures, both from the
 reader no longer keeping a copy of the file's index. Section **A** is the
 0.4.0 → 0.5.0 migration: four changes, all about matrix commit-metadata
 residency and verification. Everything numbered 1 through 5 is the
@@ -17,14 +17,14 @@ decoder, header field or version constant was touched. If you are coming from
 
 ---
 
-## B. Unreleased: two signatures changed, and one struct gained a field
+## B. From 0.5.0 to 0.6.0: two signatures changed, and one struct gained a field
 
 The two signatures come from the same change — the reader stopped keeping a copy
 of the file's index — and are source-level only. The field is
 `IndexPolicy::open_digest_on_flush` (B.4), which breaks struct-literal
 construction and nothing else.
 
-**No on-disk byte changed for a format that adds nothing.** The unreleased round
+**No on-disk byte changed for a format that adds nothing.** The 0.6.0 round
 does add one new on-disk record — the open digest, internal block id
 `0xFFFF_FFF5` — but only for a format that declares
 `open_digest_on_flush`, which is off by default. A spec that leaves it off
