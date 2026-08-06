@@ -964,6 +964,24 @@ pub type ResourceLimits = ReadLimits;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadLimitKey {
+    /// **Deliberately never constructed outside tests.**
+    ///
+    /// A file-length ceiling bounded nothing: it refused a whole file for its
+    /// size while every allocation the reader actually makes is bounded by
+    /// `Records`, `IndexBytes`, `ScanBytes`, `RecordPayloadLen` and
+    /// `LogicalPayloadLen` — each of which has a check that consults it. All
+    /// twenty-two enforcement sites (twenty-one native, one layout) were
+    /// removed, and neither `ensure_native_write_limits` nor
+    /// `ensure_layout_open_limits` requires it to be declared any more.
+    ///
+    /// The variant and `ReadLimits::max_file_len` stay so that
+    /// `limits { file_len: .. }` keeps parsing in every format already written.
+    /// The value is inert. `no_file_length_ceiling_is_enforced` in
+    /// `tests/enforcement_gates.rs` is what keeps it that way.
+    #[allow(
+        dead_code,
+        reason = "kept so existing `file_len:` declarations parse; inert"
+    )]
     FileLen,
     Records,
     IndexBytes,

@@ -1214,3 +1214,54 @@ fn the_in_crate_bypass_catalogues_are_still_there() {
         );
     }
 }
+
+/// No file-length ceiling is enforced, and none is required to be declared.
+///
+/// A `max_file_len` refused a whole file for its size while bounding no
+/// allocation the reader actually makes — those are bounded by `Records`,
+/// `IndexBytes`, `ScanBytes`, `RecordPayloadLen` and `LogicalPayloadLen`, each
+/// with a check that consults it. All twenty-two enforcement sites were
+/// removed. The variant and the field remain only so that existing
+/// `limits { file_len: .. }` declarations keep parsing.
+///
+/// This is a source gate rather than a behavioural one because the property is
+/// "the code does not do X". A behavioural test would have to guess which
+/// operation a reintroduced ceiling was attached to; this cannot miss one.
+#[test]
+fn no_file_length_ceiling_is_enforced() {
+    for module in [
+        "file.rs",
+        "layout.rs",
+        "matrix.rs",
+        "stream.rs",
+        "indexed.rs",
+    ] {
+        let source = crate_source(module);
+        assert!(
+            !source.contains("ReadLimitKey::FileLen"),
+            "{module} names `ReadLimitKey::FileLen`. A file-length ceiling bounds no \
+             allocation the reader makes; the limits that do are `Records`, `IndexBytes`, \
+             `ScanBytes`, `RecordPayloadLen` and `LogicalPayloadLen`."
+        );
+    }
+    let format = crate_source("format.rs");
+    assert!(
+        format.contains("dead_code,")
+            && format.contains("kept so existing `file_len:` declarations parse; inert"),
+        "`ReadLimitKey::FileLen` must stay marked as deliberately unconstructed; if that \
+         `allow` was removed because the variant became live again, a ceiling came back"
+    );
+    // And it must not be back on either required-declaration list.
+    let file = crate_source("file.rs");
+    let layout = crate_source("layout.rs");
+    assert!(
+        !file.contains("ensure_native_write_limits")
+            || !file.contains("        ReadLimitKey::FileLen,"),
+        "`ensure_native_write_limits` must not require a `file_len` declaration for a \
+         ceiling nothing consults"
+    );
+    assert!(
+        !layout.contains("        ReadLimitKey::FileLen,"),
+        "`ensure_layout_open_limits` must not require a `file_len` declaration"
+    );
+}

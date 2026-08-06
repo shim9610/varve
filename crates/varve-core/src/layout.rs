@@ -801,7 +801,10 @@ impl LayoutWriter {
             None if fields.is_empty() => (0, 0),
             None => return Err(Error::LayoutFieldUnexpected(fields[0].name.to_string())),
         };
-        spec.read_limits.check(ReadLimitKey::FileLen, header_len)?;
+        // No file-length ceiling: `ScanBytes` below bounds the same number and
+        // is the one that bounds a read, so charging both refused a file twice
+        // for one fact. The native side dropped its twenty-one `FileLen` checks
+        // in this round; this was the last one on the layout side.
         spec.read_limits
             .check(ReadLimitKey::ScanBytes, header_len)?;
         spec.read_limits
@@ -1456,9 +1459,14 @@ fn ordinary_layout_spec(spec: FormatSpec) -> FormatSpec {
     spec.ordinary_read()
 }
 
+/// The limits a custom-layout format must declare before it may be opened.
+///
+/// `FileLen` is not among them, for the reason given at
+/// `crate::file::ensure_native_write_limits`: nothing enforces it any more, and
+/// requiring a declaration that no check consults refuses a format for a number
+/// that could not have changed any outcome.
 fn ensure_layout_open_limits(spec: FormatSpec) -> Result<()> {
     for key in [
-        ReadLimitKey::FileLen,
         ReadLimitKey::ScanBytes,
         ReadLimitKey::Segments,
         ReadLimitKey::IndexBytes,

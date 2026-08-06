@@ -398,10 +398,14 @@ fn ordinary_layout_open_resolves_missing_and_handle_specs_sanitize_trust() -> va
     write_layout_data(&path, b"metadata", b"raw")?;
     let unbounded = LayoutHardeningFormat::spec().with_read_limits(ReadLimits::trusted_unbounded());
 
+    // The refusal is unchanged; the resource it names is not. `file length`
+    // used to be the first required limit, and it is no longer required at all
+    // — nothing enforces a file-length ceiling. `scan bytes` is now the first,
+    // and it does bound a read.
     assert!(matches!(
         unbounded.open_layout_reader(&path),
         Err(Error::TrustedUnboundedRequiresExplicitApi {
-            resource: "file length"
+            resource: "scan bytes"
         })
     ));
     let reader = unbounded.open_layout_reader_trusted_unbounded(&path)?;
@@ -411,7 +415,7 @@ fn ordinary_layout_open_resolves_missing_and_handle_specs_sanitize_trust() -> va
     assert!(matches!(
         reader_spec.open_layout_reader(&path),
         Err(Error::TrustedUnboundedRequiresExplicitApi {
-            resource: "file length"
+            resource: "scan bytes"
         })
     ));
 
@@ -421,7 +425,7 @@ fn ordinary_layout_open_resolves_missing_and_handle_specs_sanitize_trust() -> va
     assert!(matches!(
         writer_spec.open_layout_writer(&path),
         Err(Error::TrustedUnboundedRequiresExplicitApi {
-            resource: "file length"
+            resource: "scan bytes"
         })
     ));
 

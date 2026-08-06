@@ -251,7 +251,11 @@ fn create_checks_all_non_crc_matrix_limits_before_preallocation() {
             "matrix slot region length",
             63,
         ),
-        (high_limits().with_max_file_len(1), "file length", 1),
+        // A `with_max_file_len(1)` case sat here. It is gone because the
+        // ceiling is: no file-length limit is enforced anywhere any more, so a
+        // create can no longer be refused for one, and a case asserting that it
+        // is would be asserting a behaviour that was deliberately removed. The
+        // limits above each bound a real allocation and each still refuse.
     ];
 
     for (index, (limits, resource, limit)) in cases.into_iter().enumerate() {

@@ -328,7 +328,11 @@ fn trusted_handle_spec_is_sanitized_before_it_can_escape() -> varve::Result<()> 
     assert!(matches!(
         VarveFile::open_readonly(escaped_create_spec, &path),
         Err(Error::TrustedUnboundedRequiresExplicitApi {
-            resource: "file length"
+            // `record count`, not `file length`: a file-length ceiling is no
+            // longer required or enforced, so it is no longer the first
+            // required limit a sanitized spec trips on. The refusal itself is
+            // the property, and it is unchanged.
+            resource: "record count"
         })
     ));
 
@@ -337,7 +341,11 @@ fn trusted_handle_spec_is_sanitized_before_it_can_escape() -> varve::Result<()> 
     assert!(matches!(
         VarveFile::open_readonly(escaped, &path),
         Err(Error::TrustedUnboundedRequiresExplicitApi {
-            resource: "file length"
+            // `record count`, not `file length`: a file-length ceiling is no
+            // longer required or enforced, so it is no longer the first
+            // required limit a sanitized spec trips on. The refusal itself is
+            // the property, and it is unchanged.
+            resource: "record count"
         })
     ));
 

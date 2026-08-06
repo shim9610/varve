@@ -3894,7 +3894,6 @@ impl VarveFile {
         let spec = spec.resolve_entrypoint();
         spec.validate()?;
         ensure_native_write_limits(spec)?;
-        check_initial_native_file_len(spec)?;
         if spec.has_matrix_blocks() {
             return Err(Error::MatrixDimensionsRequired);
         }
@@ -3993,7 +3992,6 @@ impl VarveFile {
         let spec = spec.resolve_entrypoint();
         spec.validate()?;
         ensure_native_write_limits(spec)?;
-        check_initial_native_file_len(spec)?;
         if !spec.has_matrix_blocks() {
             return Self::create_impl(spec, path, exclusive);
         }
@@ -12344,9 +12342,20 @@ fn read_matrix_creation_nonce_region(
     Ok(nonce)
 }
 
+/// The limits a native format must declare before it may be written or opened.
+///
+/// **`FileLen` is not among them, and that is the point.** Requiring a
+/// declaration for a ceiling that nothing enforces is ceremony: the twenty-one
+/// enforcement sites were removed in this round, and a required declaration
+/// that no check consults refuses a format for a number that could not have
+/// changed any outcome. `max_file_len` remains on `FormatSpec` and the DSL
+/// still accepts `limits { file_len: .. }`, so no format definition breaks —
+/// the value is simply inert.
+///
+/// The four that remain each bound a real allocation, and each has a check that
+/// consults it.
 pub(crate) fn ensure_native_write_limits(spec: FormatSpec) -> Result<()> {
     for key in [
-        ReadLimitKey::FileLen,
         ReadLimitKey::Records,
         ReadLimitKey::IndexBytes,
         ReadLimitKey::RecordPayloadLen,
@@ -12361,23 +12370,6 @@ pub(crate) fn ensure_native_open_limits(spec: FormatSpec) -> Result<()> {
     ensure_native_write_limits(spec)?;
     spec.read_limits.require(ReadLimitKey::ScanBytes)?;
     Ok(())
-}
-
-pub(crate) fn check_initial_native_file_len(spec: FormatSpec) -> Result<()> {
-    let extension_len = u64::try_from(file_header_extensions(spec)?.len()).map_err(|_| {
-        Error::ResourceArithmeticOverflow {
-            resource: "file length",
-        }
-    })?;
-    let mut header_len = native_file_header_len(spec, extension_len);
-    if spec.has_matrix_blocks() {
-        header_len = header_len
-            .checked_add(MATRIX_CREATION_NONCE_REGION_LEN as u64)
-            .ok_or(Error::ResourceArithmeticOverflow {
-                resource: "file length",
-            })?;
-    }
-    spec.read_limits.check(ReadLimitKey::FileLen, header_len)
 }
 
 pub(crate) fn check_open_file_len(_spec: FormatSpec, file: &File) -> Result<u64> {
