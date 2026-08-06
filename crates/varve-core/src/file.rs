@@ -1063,6 +1063,77 @@ pub(crate) mod resident_index {
 
 use resident_index::{ReservedIndexSlot, ResidentIndex};
 
+/// Where a read resolves a record *position* to a record.
+///
+/// Every position-based read — `blocks`, `scan`, `keyed_blocks`, `metadata`,
+/// `verify_all` and the rest — needs exactly two things from a directory: how
+/// many records there are, and the entry at position `i`. Nothing else. Making
+/// that a parameter rather than a field is what lets the directory stop being
+/// the handle's business without any of those reads stopping working.
+///
+/// Two implementations, and they are the two answers to "who holds it":
+///
+/// * [`ResidentIndex`] — varve holds it, and `record_at` faults the entry off
+///   disk from a 16-byte slot.
+/// * `[RecordIndexEntry]` — the host holds it, as
+///   [`VarveFile::index_entries_into`] or
+///   [`VarveFile::open_readonly_with_scratch`] left it. `record_at` is a
+///   memcpy.
+///
+/// The second is the point, and it is stated plainly because the alternative
+/// was nearly shipped: a handle that keeps no directory must not *lose* these
+/// reads, it must *demand the directory from whoever has it*. That is the
+/// difference between a capability with a cost and a capability withdrawn.
+pub trait RecordDirectory {
+    /// How many records this directory describes.
+    fn record_count(&self) -> usize;
+
+    /// The entry at `position`, or `UnexpectedEof` if there is none.
+    fn record_at(&self, position: usize) -> Result<RecordIndexEntry>;
+}
+
+/// Every entry of `dir` in order, fallible per item for the same reason
+/// [`ResidentIndex::iter`] is: producing one may read a file.
+///
+/// A free function rather than a trait method with a default body, because a
+/// `-> impl Iterator` method forces `Self: Sized` and the most useful directory
+/// of all is `&[RecordIndexEntry]`, which is not.
+pub fn directory_records<D: RecordDirectory + ?Sized>(
+    dir: &D,
+) -> impl Iterator<Item = Result<RecordIndexEntry>> + '_ {
+    (0..dir.record_count()).map(|position| dir.record_at(position))
+}
+
+impl RecordDirectory for ResidentIndex {
+    fn record_count(&self) -> usize {
+        self.len()
+    }
+
+    fn record_at(&self, position: usize) -> Result<RecordIndexEntry> {
+        self.entry_at(position)
+    }
+}
+
+impl RecordDirectory for [RecordIndexEntry] {
+    fn record_count(&self) -> usize {
+        self.len()
+    }
+
+    fn record_at(&self, position: usize) -> Result<RecordIndexEntry> {
+        self.get(position).cloned().ok_or(Error::UnexpectedEof)
+    }
+}
+
+impl RecordDirectory for Vec<RecordIndexEntry> {
+    fn record_count(&self) -> usize {
+        self.len()
+    }
+
+    fn record_at(&self, position: usize) -> Result<RecordIndexEntry> {
+        self.as_slice().record_at(position)
+    }
+}
+
 /// An owned snapshot of a file's record index.
 ///
 /// Derefs to `[RecordIndexEntry]`, so it reads exactly like the borrowed slice
@@ -1095,6 +1166,112 @@ impl<'a> IntoIterator for &'a IndexEntries {
 
     fn into_iter(self) -> Self::IntoIter {
         self.entries.iter()
+    }
+}
+
+/// A [`VarveFile`]'s reads, resolved through a caller-supplied directory.
+///
+/// Built by [`VarveFile::with_directory`]. Every method is the handle's method
+/// of the same name, answered against the borrowed directory; nothing here
+/// allocates a directory of its own.
+#[derive(Debug)]
+pub struct DirectoryRead<'a, D: RecordDirectory + ?Sized> {
+    file: &'a VarveFile,
+    directory: &'a D,
+}
+
+impl<D: RecordDirectory + ?Sized> DirectoryRead<'_, D> {
+    /// How many records the supplied directory describes.
+    pub fn record_count(&self) -> usize {
+        self.directory.record_count()
+    }
+
+    pub fn scan(&self) -> impl Iterator<Item = Result<BlockEvent>> + '_ {
+        VarveFile::scan_in(self.directory)
+    }
+
+    pub fn metadata(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.file.metadata_in(self.directory, key)
+    }
+
+    pub fn all_metadata_into(&self, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
+        self.file.all_metadata_into_in(self.directory, out)
+    }
+
+    pub fn schema_manifest(&self) -> Result<Option<SchemaManifest>> {
+        self.file.schema_manifest_in(self.directory)
+    }
+
+    pub fn blocks<T: VarveBlock>(&self) -> Result<BlockVec<T>> {
+        self.file.blocks_in(self.directory)
+    }
+
+    pub fn block_entries_into<T: VarveBlock>(&self, out: &mut Vec<RecordIndexEntry>) -> Result<()> {
+        self.file.block_entries_into_in::<T, _>(self.directory, out)
+    }
+
+    pub fn decode_blocks_into<T: VarveBlock>(&self, out: &mut Vec<T>) -> Result<()> {
+        self.file.decode_blocks_into_in::<T, _>(self.directory, out)
+    }
+
+    pub fn blocks_migrated_into<From, To, M>(&self, out: &mut Vec<To>) -> Result<()>
+    where
+        From: VarveBlock,
+        To: VarveBlock,
+        M: VarveMigration<From, To>,
+    {
+        self.file
+            .blocks_migrated_into_in::<From, To, M, _>(self.directory, out)
+    }
+
+    pub fn keyed_blocks_into<T>(
+        &self,
+        entries: &mut Vec<RecordIndexEntry>,
+        by_key: &mut HashMap<T::Key, RecordIndexEntry>,
+    ) -> Result<()>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash + Clone,
+    {
+        self.file
+            .keyed_blocks_into_in::<T, _>(self.directory, entries, by_key)
+    }
+
+    pub fn materialized_keyed_blocks_into<T>(&self, out: &mut HashMap<T::Key, T>) -> Result<()>
+    where
+        T: VarveMerge,
+        T::Key: Eq + Hash,
+    {
+        self.file
+            .materialized_keyed_blocks_into_in::<T, _>(self.directory, out)
+    }
+
+    pub fn key_tail_offsets_into<T>(&self, out: &mut HashMap<T::Key, u64>) -> Result<()>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
+    {
+        self.file
+            .key_tail_offsets_into_in::<T, _>(self.directory, out)
+    }
+
+    pub fn index_entries_into(&self, out: &mut Vec<RecordIndexEntry>) -> Result<()> {
+        self.file.index_entries_into_in(self.directory, out)
+    }
+
+    pub fn verify_all(&self) -> Result<usize> {
+        self.file.verify_all_in(self.directory)
+    }
+
+    /// Reads through an entry the caller holds; see
+    /// [`VarveFile::decode_block_into`]. Present here so a directory-supplied
+    /// walk needs no second handle.
+    pub fn decode_block_into<T: VarveBlock>(
+        &self,
+        entry: &RecordIndexEntry,
+        scratch: &mut Vec<u8>,
+    ) -> Result<T> {
+        self.file.decode_block_into::<T>(entry, scratch)
     }
 }
 
@@ -3085,6 +3262,14 @@ impl VarveReader {
         self.file.index_entries_into(out)
     }
 
+    /// See [`VarveFile::with_directory`].
+    pub fn with_directory<'a, D: RecordDirectory + ?Sized>(
+        &'a self,
+        directory: &'a D,
+    ) -> DirectoryRead<'a, D> {
+        self.file.with_directory(directory)
+    }
+
     /// See [`VarveFile::read_payload_into`].
     pub fn read_payload_into(&self, entry: &RecordIndexEntry, out: &mut Vec<u8>) -> Result<()> {
         self.file.read_payload_into(entry, out)
@@ -3376,6 +3561,14 @@ impl VarveWriter {
     /// [`VarveFile::index_entries_into`].
     pub fn index_entries_into(&self, out: &mut Vec<RecordIndexEntry>) -> Result<()> {
         self.file.index_entries_into(out)
+    }
+
+    /// See [`VarveFile::with_directory`].
+    pub fn with_directory<'a, D: RecordDirectory + ?Sized>(
+        &'a self,
+        directory: &'a D,
+    ) -> DirectoryRead<'a, D> {
+        self.file.with_directory(directory)
     }
 
     /// See [`VarveFile::read_payload_into`].
@@ -4844,12 +5037,20 @@ impl VarveFile {
     /// (`STANDARD` sets it to 1 GiB) even when the requested entry was the
     /// first record in the file.
     pub fn metadata(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.metadata_in(&self.index, key)
+    }
+
+    fn metadata_in<D: RecordDirectory + ?Sized>(
+        &self,
+        dir: &D,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>> {
         let mut found = None;
         let mut budget = MaterializationBudget::new(self.spec);
         // One payload buffer for the whole walk. It used to be one per record,
         // and the walk is over every record in the file.
         let mut payload = Vec::new();
-        for (record_ordinal, entry) in self.index.iter().enumerate() {
+        for (record_ordinal, entry) in directory_records(dir).enumerate() {
             let entry = entry?;
             if entry.block_id != METADATA_BLOCK_ID {
                 continue;
@@ -4889,10 +5090,18 @@ impl VarveFile {
     /// `out` is cleared and then extended, so a caller that reuses one buffer
     /// across calls allocates once and never again.
     pub fn all_metadata_into(&self, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
+        self.all_metadata_into_in(&self.index, out)
+    }
+
+    fn all_metadata_into_in<D: RecordDirectory + ?Sized>(
+        &self,
+        dir: &D,
+        out: &mut Vec<(String, Vec<u8>)>,
+    ) -> Result<()> {
         out.clear();
         let mut budget = MaterializationBudget::new(self.spec);
         let mut payload = Vec::new();
-        for entry in self.index.iter() {
+        for entry in directory_records(dir) {
             let entry = entry?;
             if entry.block_id != METADATA_BLOCK_ID {
                 continue;
@@ -4910,8 +5119,15 @@ impl VarveFile {
     }
 
     pub fn schema_manifest(&self) -> Result<Option<SchemaManifest>> {
+        self.schema_manifest_in(&self.index)
+    }
+
+    fn schema_manifest_in<D: RecordDirectory + ?Sized>(
+        &self,
+        dir: &D,
+    ) -> Result<Option<SchemaManifest>> {
         let mut newest: Option<(MergeOrder, RecordIndexEntry)> = None;
-        for (record_ordinal, entry) in self.index.iter().enumerate() {
+        for (record_ordinal, entry) in directory_records(dir).enumerate() {
             let entry = entry?;
             if entry.block_id != MANIFEST_BLOCK_ID {
                 continue;
@@ -5866,6 +6082,38 @@ impl VarveFile {
         budget.decode(scratch, T::ENDIAN.unwrap_or(self.spec.endian))
     }
 
+    /// Reads that resolve positions through a directory **the caller supplies**.
+    ///
+    /// Every method on the returned view is the same read the handle offers,
+    /// answered against `directory` instead of against the handle's own. The
+    /// directory is anything implementing [`RecordDirectory`] — in practice the
+    /// `Vec<RecordIndexEntry>` that [`index_entries_into`](Self::index_entries_into)
+    /// or [`open_readonly_with_scratch`](Self::open_readonly_with_scratch)
+    /// filled.
+    ///
+    /// ```ignore
+    /// let mut index = Vec::new();
+    /// let file = VarveFile::open_readonly_with_scratch(spec, path, &mut index)?;
+    /// // `index` is the file's record index; the handle has its own copy too.
+    /// let blocks = file.with_directory(&index).blocks::<Point>()?;
+    /// ```
+    ///
+    /// **Why this exists.** The handle keeps a 16-byte directory slot per
+    /// record, and that is the last thing about a read that still scales with
+    /// the file. A handle that stopped keeping it must not lose `blocks`,
+    /// `scan` and the rest — it must ask whoever has the directory for it.
+    /// This is that ask, and it is available whether or not the handle also
+    /// has one, so the two can be compared on the same file.
+    pub fn with_directory<'a, D: RecordDirectory + ?Sized>(
+        &'a self,
+        directory: &'a D,
+    ) -> DirectoryRead<'a, D> {
+        DirectoryRead {
+            file: self,
+            directory,
+        }
+    }
+
     /// The block's records as a lazy collection: one decoded value at a time.
     ///
     /// **This allocates** one index entry per matching record, which is what
@@ -5878,6 +6126,13 @@ impl VarveFile {
     /// matching record, so it is bounded by the caller's buffer and not by the
     /// file, which is the opposite of what this collection is for.
     pub fn blocks<T: VarveBlock>(&self) -> Result<BlockVec<T>> {
+        self.blocks_in(&self.index)
+    }
+
+    fn blocks_in<T: VarveBlock, D: RecordDirectory + ?Sized>(
+        &self,
+        dir: &D,
+    ) -> Result<BlockVec<T>> {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         // A non-resident block has no entries here, and an empty collection
         // would say "nothing was written" rather than "not through this door".
@@ -5894,7 +6149,7 @@ impl VarveFile {
         // exceeds the ceiling is still refused during the build rather than
         // after the whole array is resident.
         let mut entries: Vec<RecordIndexEntry> = Vec::new();
-        for entry in self.index.iter() {
+        for entry in directory_records(dir) {
             let entry = entry?;
             if entry.block_id != T::ID {
                 continue;
@@ -5921,10 +6176,18 @@ impl VarveFile {
     /// form of `blocks()`: same entries, same per-entry `IndexBytes` charge,
     /// same laziness — no payload is read and nothing is decoded.
     pub fn block_entries_into<T: VarveBlock>(&self, out: &mut Vec<RecordIndexEntry>) -> Result<()> {
+        self.block_entries_into_in::<T, _>(&self.index, out)
+    }
+
+    fn block_entries_into_in<T: VarveBlock, D: RecordDirectory + ?Sized>(
+        &self,
+        dir: &D,
+        out: &mut Vec<RecordIndexEntry>,
+    ) -> Result<()> {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         crate::collections::ensure_resident_block::<T>(self.spec)?;
         out.clear();
-        for entry in self.index.iter() {
+        for entry in directory_records(dir) {
             let entry = entry?;
             if entry.block_id != T::ID {
                 continue;
@@ -5962,12 +6225,20 @@ impl VarveFile {
     /// The per-record charge is unchanged from `BlockVec::get`: the
     /// materialization ceiling bounds one payload, not the sum over the walk.
     pub fn decode_blocks_into<T: VarveBlock>(&self, out: &mut Vec<T>) -> Result<()> {
+        self.decode_blocks_into_in::<T, _>(&self.index, out)
+    }
+
+    fn decode_blocks_into_in<T: VarveBlock, D: RecordDirectory + ?Sized>(
+        &self,
+        dir: &D,
+        out: &mut Vec<T>,
+    ) -> Result<()> {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         crate::collections::ensure_resident_block::<T>(self.spec)?;
         out.clear();
         let mut budget = MaterializationBudget::new(self.spec);
         let mut payload = Vec::new();
-        for entry in self.index.iter() {
+        for entry in directory_records(dir) {
             let entry = entry?;
             if entry.block_id != T::ID {
                 continue;
@@ -6019,6 +6290,19 @@ impl VarveFile {
         To: VarveBlock,
         M: VarveMigration<From, To>,
     {
+        self.blocks_migrated_into_in::<From, To, M, _>(&self.index, out)
+    }
+
+    fn blocks_migrated_into_in<From, To, M, D: RecordDirectory + ?Sized>(
+        &self,
+        dir: &D,
+        out: &mut Vec<To>,
+    ) -> Result<()>
+    where
+        From: VarveBlock,
+        To: VarveBlock,
+        M: VarveMigration<From, To>,
+    {
         if From::ID != To::ID {
             return Err(Error::MigrationBlockIdMismatch {
                 from: From::ID,
@@ -6028,7 +6312,7 @@ impl VarveFile {
         out.clear();
         let mut budget = MaterializationBudget::new(self.spec);
         let mut payload = Vec::new();
-        for entry in self.index.iter() {
+        for entry in directory_records(dir) {
             let entry = entry?;
             if entry.block_id != From::ID || entry.block_version != From::VERSION {
                 continue;
@@ -6092,6 +6376,19 @@ impl VarveFile {
         T: VarveKeyedBlock,
         T::Key: Eq + Hash + Clone,
     {
+        self.keyed_blocks_into_in::<T, _>(&self.index, entries, by_key)
+    }
+
+    fn keyed_blocks_into_in<T, D: RecordDirectory + ?Sized>(
+        &self,
+        dir: &D,
+        entries: &mut Vec<RecordIndexEntry>,
+        by_key: &mut HashMap<T::Key, RecordIndexEntry>,
+    ) -> Result<()>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash + Clone,
+    {
         // API2-03: compile-time keyedness contract (also covers the
         // VarveReader::keyed_blocks wrapper); registration is the runtime
         // backstop.
@@ -6103,7 +6400,7 @@ impl VarveFile {
         let mut budget = MaterializationBudget::new(self.spec);
         // One payload buffer for the whole walk, not one per record.
         let mut payload = Vec::new();
-        for (record_ordinal, entry) in self.index.iter().enumerate() {
+        for (record_ordinal, entry) in directory_records(dir).enumerate() {
             let entry = entry?;
             // One record's materialization at a time. Every decoded block is
             // dropped once its key is taken; what survives the loop is index
@@ -6209,13 +6506,25 @@ impl VarveFile {
         T: VarveMerge,
         T::Key: Eq + Hash,
     {
+        self.materialized_keyed_blocks_into_in::<T, _>(&self.index, out)
+    }
+
+    fn materialized_keyed_blocks_into_in<T, D: RecordDirectory + ?Sized>(
+        &self,
+        dir: &D,
+        out: &mut HashMap<T::Key, T>,
+    ) -> Result<()>
+    where
+        T: VarveMerge,
+        T::Key: Eq + Hash,
+    {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         let mut state: HashMap<T::Key, (MergeOrder, Option<T>)> = HashMap::new();
         let mut budget = MaterializationBudget::new(self.spec);
-        apply_merge_entries::<T>(
+        apply_merge_entries::<T, _>(
             self.spec,
             &self.snapshot,
-            &self.index,
+            dir,
             MergeShard::single_file(),
             &mut state,
             &mut budget,
@@ -6246,9 +6555,13 @@ impl VarveFile {
     /// would report a truncated file as a short one. So the `Result` is here,
     /// on each item, and nothing is read until the item is asked for.
     pub fn scan(&self) -> impl Iterator<Item = Result<BlockEvent>> + '_ {
-        self.index
-            .iter()
-            .map(|entry| entry.map(|entry| BlockEvent::from(&entry)))
+        Self::scan_in(&self.index)
+    }
+
+    fn scan_in<D: RecordDirectory + ?Sized>(
+        dir: &D,
+    ) -> impl Iterator<Item = Result<BlockEvent>> + '_ {
+        directory_records(dir).map(|entry| entry.map(|entry| BlockEvent::from(&entry)))
     }
 
     /// Verifies every record's stored checksum against its bytes.
@@ -6297,6 +6610,10 @@ impl VarveFile {
     /// Returns the number of records verified. A mismatch is
     /// [`Error::ChecksumMismatch`] naming the offending record's offset.
     pub fn verify_all(&self) -> Result<usize> {
+        self.verify_all_in(&self.index)
+    }
+
+    fn verify_all_in<D: RecordDirectory + ?Sized>(&self, dir: &D) -> Result<usize> {
         if self.spec.integrity_policy == IntegrityPolicy::None {
             return Ok(0);
         }
@@ -6304,7 +6621,7 @@ impl VarveFile {
         // The bytes are read to check their checksum and then dropped, so one
         // buffer serves the whole pass. This was an allocation per record.
         let mut payload = Vec::new();
-        for entry in self.index.iter() {
+        for entry in directory_records(dir) {
             let entry = entry?;
             // `read_payload_snapshot` is the same check the read path performs,
             // which is exactly the point: there is one verification in the
@@ -6369,8 +6686,16 @@ impl VarveFile {
     /// The copy is charged against `ReadLimitKey::IndexBytes`, like the index
     /// it copies.
     pub fn index_entries_into(&self, out: &mut Vec<RecordIndexEntry>) -> Result<()> {
+        self.index_entries_into_in(&self.index, out)
+    }
+
+    fn index_entries_into_in<D: RecordDirectory + ?Sized>(
+        &self,
+        dir: &D,
+        out: &mut Vec<RecordIndexEntry>,
+    ) -> Result<()> {
         out.clear();
-        let count = self.index.len();
+        let count = dir.record_count();
         let requested = index_bytes_for_count(count)?;
         self.spec
             .read_limits
@@ -6380,7 +6705,7 @@ impl VarveFile {
                 resource: "index entry snapshot",
                 requested,
             })?;
-        for entry in self.index.iter() {
+        for entry in directory_records(dir) {
             out.push(entry?);
         }
         Ok(())
@@ -6444,6 +6769,18 @@ impl VarveFile {
         T: VarveKeyedBlock,
         T::Key: Eq + Hash,
     {
+        self.key_tail_offsets_into_in::<T, _>(&self.index, out)
+    }
+
+    fn key_tail_offsets_into_in<T, D: RecordDirectory + ?Sized>(
+        &self,
+        dir: &D,
+        out: &mut HashMap<T::Key, u64>,
+    ) -> Result<()>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash,
+    {
         // API2-03: compile-time keyedness contract (also covers the
         // VarveReader/VarveWriter key_tail_offsets wrappers); registration is
         // the runtime backstop.
@@ -6453,7 +6790,7 @@ impl VarveFile {
         let mut budget = MaterializationBudget::new(self.spec);
         // One payload buffer for the whole walk, not one per record.
         let mut payload = Vec::new();
-        for (record_ordinal, entry) in self.index.iter().enumerate() {
+        for (record_ordinal, entry) in directory_records(dir).enumerate() {
             let entry = entry?;
             // One record's materialization at a time (see
             // `MaterializationBudget`). Every decoded block is dropped once its
@@ -11813,7 +12150,7 @@ where
     P: AsRef<Path>,
 {
     let file = VarveFile::open_readonly(spec, path)?;
-    apply_merge_entries::<T>(
+    apply_merge_entries::<T, _>(
         spec,
         &file.snapshot,
         &file.index,
@@ -11852,10 +12189,10 @@ where
     Ok(())
 }
 
-fn apply_merge_entries<T>(
+fn apply_merge_entries<T, D: RecordDirectory + ?Sized>(
     spec: FormatSpec,
     snapshot: &SnapshotFile,
-    entries: &ResidentIndex,
+    entries: &D,
     shard: MergeShard,
     state: &mut HashMap<T::Key, (MergeOrder, Option<T>)>,
     budget: &mut MaterializationBudget,
@@ -11867,7 +12204,7 @@ where
 {
     // One payload buffer for the whole merge walk, not one per record.
     let mut payload = Vec::new();
-    for (record_ordinal, entry) in entries.iter().enumerate() {
+    for (record_ordinal, entry) in directory_records(entries).enumerate() {
         let entry = entry?;
         let order = MergeOrder::for_record(shard.ordinal, entry.sequence, record_ordinal);
         match entry.block_id {

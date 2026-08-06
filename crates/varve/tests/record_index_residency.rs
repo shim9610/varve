@@ -441,3 +441,93 @@ fn the_host_owns_the_buffers_and_chooses_whether_to_keep_the_index() -> varve::R
     );
     Ok(())
 }
+
+/// A directory the **host** supplies answers every position-based read exactly
+/// as varve's own does.
+///
+/// This is the contract that makes "varve stops keeping the directory" a
+/// capability with a cost rather than a capability withdrawn. `blocks`, `scan`,
+/// `keyed_blocks`, `metadata`, `verify_all` and the rest do not disappear when
+/// the handle has no directory — they ask for one.
+///
+/// Asserted as *equality against the resident answer*, not as "it returns
+/// something": a supplied directory that silently answered a shorter file
+/// would pass any weaker check.
+#[test]
+fn a_host_supplied_directory_answers_every_read_the_same() -> varve::Result<()> {
+    const RECORDS: u32 = 500;
+
+    let directory = tempfile::tempdir()?;
+    let path = path_in(&directory, "supplied.idxres");
+    build(&path, RECORDS)?;
+    let spec = IndexResidencyFormat::spec();
+
+    // The scan buffer IS the index after open — the host already has it, for
+    // free, without a second pass over the file.
+    let mut index = Vec::new();
+    let file = varve::VarveFile::open_readonly_with_scratch(spec, &path, &mut index)?;
+    assert_eq!(index.len() as u32, RECORDS);
+
+    let supplied = file.with_directory(&index);
+    assert_eq!(supplied.record_count(), index.len());
+
+    // scan
+    // `BlockEvent` is not `PartialEq`, so compare the fields that identify a
+    // record: its block id and where it sits.
+    let project = |events: Vec<varve::BlockEvent>| -> Vec<(u32, u64, u64)> {
+        events
+            .into_iter()
+            .map(|event| (event.block_id, event.record_offset, event.payload_len))
+            .collect()
+    };
+    let resident_scan = project(file.scan().collect::<varve::Result<Vec<_>>>()?);
+    let supplied_scan = project(supplied.scan().collect::<varve::Result<Vec<_>>>()?);
+    assert_eq!(resident_scan.len(), RECORDS as usize);
+    assert_eq!(resident_scan, supplied_scan);
+
+    // blocks, decoded through both
+    let mut resident_blocks: Vec<Sample> = Vec::new();
+    let mut supplied_blocks: Vec<Sample> = Vec::new();
+    file.decode_blocks_into(&mut resident_blocks)?;
+    supplied.decode_blocks_into(&mut supplied_blocks)?;
+    assert_eq!(resident_blocks.len(), RECORDS as usize);
+    assert_eq!(resident_blocks, supplied_blocks);
+
+    // block entries
+    let mut resident_entries = Vec::new();
+    let mut supplied_entries = Vec::new();
+    file.block_entries_into::<Sample>(&mut resident_entries)?;
+    supplied.block_entries_into::<Sample>(&mut supplied_entries)?;
+    assert_eq!(resident_entries, supplied_entries);
+
+    // the index itself, round-tripped through the supplied directory
+    let mut round_tripped = Vec::new();
+    supplied.index_entries_into(&mut round_tripped)?;
+    assert_eq!(round_tripped, index);
+
+    // and the lazy collection resolves positions identically
+    let resident_vec = file.blocks::<Sample>()?;
+    let supplied_vec = supplied.blocks::<Sample>()?;
+    assert_eq!(resident_vec.len(), supplied_vec.len());
+    assert_eq!(
+        resident_vec.get(RECORDS as usize - 1)?,
+        supplied_vec.get(RECORDS as usize - 1)?
+    );
+
+    // metadata and manifest, which walk the same directory for a different
+    // block id
+    assert_eq!(file.metadata("absent")?, supplied.metadata("absent")?);
+    assert_eq!(
+        file.schema_manifest()?.is_some(),
+        supplied.schema_manifest()?.is_some()
+    );
+
+    // A *shorter* directory must be answered as a shorter file, not silently
+    // padded from the handle's own. This is what proves the reads really go
+    // through the parameter.
+    let truncated: &[varve::RecordIndexEntry] = &index[..10];
+    let short = file.with_directory(truncated);
+    assert_eq!(short.record_count(), 10);
+    assert_eq!(short.scan().collect::<varve::Result<Vec<_>>>()?.len(), 10);
+    Ok(())
+}
