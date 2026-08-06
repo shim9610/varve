@@ -72,6 +72,175 @@ const SEGMENT_TRAILER_LEN: u64 = 8;
 /// One serialized index entry, in the layout `read_index_entry_payload`
 /// decodes at checkpoint version 3.
 const SEGMENT_ENTRY_LEN: u64 = 4 + 2 + 2 + 8 + 8 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 1;
+/// Carries the three facts an open needs that live in no single record.
+///
+/// A segment says *where every record is*, so it costs an entry per record. A
+/// digest says only what an open cannot compute without walking: the sequence
+/// the next append takes, and each block's newest record. It costs twelve bytes
+/// per distinct block id and nothing per record. See
+/// [`IndexPolicy::open_digest_on_flush`].
+pub const OPEN_DIGEST_BLOCK_ID: u32 = 0xFFFF_FFF5;
+const DIGEST_MAGIC: &[u8; 4] = b"VDIG";
+const DIGEST_VERSION: u16 = 1;
+/// magic(4) + version(2) + flags(2) + sequence_high_water(8) + tail_count(4).
+///
+/// `physical_end` is deliberately *not* in here. The digest is the last record
+/// in the file, so the committed end is its own end — a number open already
+/// holds once it has framed the digest, and one that cannot disagree with the
+/// bytes the way a stored copy could.
+const DIGEST_PREFIX_LEN: u64 = 4 + 2 + 2 + 8 + 4;
+/// One block tail: the block id and its newest record's offset.
+const DIGEST_TAIL_LEN: u64 = 4 + 8;
+/// The digest record's own start offset, closing the same circle
+/// [`SEGMENT_TRAILER_LEN`] closes: open arrives at EOF holding a footer, and
+/// the header that would give the record's start is `payload_len` bytes back.
+const DIGEST_TRAILER_LEN: u64 = 8;
+/// `sequence_high_water` when the file holds no record that carries a sequence.
+///
+/// A sentinel rather than a flag bit because the value it stands in for is
+/// "there is no high-water mark", and `SequenceState` already spells that
+/// `Available(0)`. `u64::MAX` cannot be a real high-water mark: a writer that
+/// reached it is `Exhausted`, which the digest reports as the mark itself.
+const DIGEST_NO_SEQUENCE: u64 = u64::MAX;
+
+/// What one digest record says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OpenDigest {
+    /// The end of the digest record itself, which is the committed end of the
+    /// file it describes.
+    physical_end: u64,
+    sequence_high_water: Option<u64>,
+    block_tails: BlockTails,
+}
+
+/// The payload length a digest covering `tails` distinct blocks occupies.
+fn digest_payload_len(tails: u64) -> Result<u64> {
+    tails
+        .checked_mul(DIGEST_TAIL_LEN)
+        .and_then(|bytes| bytes.checked_add(DIGEST_PREFIX_LEN))
+        .and_then(|bytes| bytes.checked_add(DIGEST_TRAILER_LEN))
+        .ok_or(Error::ResourceArithmeticOverflow {
+            resource: "digest payload length",
+        })
+}
+
+/// Serializes the digest for a file whose last committed record is already
+/// down, and whose next record will be the digest itself at `record_offset`.
+fn encode_digest_payload(
+    spec: FormatSpec,
+    sequence_high_water: Option<u64>,
+    tails: &[(u32, u64)],
+    record_offset: u64,
+) -> Result<Vec<u8>> {
+    let count = u32::try_from(tails.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+        resource: "digest block count",
+    })?;
+    let payload_len = digest_payload_len(u64::from(count))?;
+    spec.read_limits
+        .check(ReadLimitKey::RecordPayloadLen, payload_len)?;
+    spec.read_limits
+        .check(ReadLimitKey::LogicalPayloadLen, payload_len)?;
+    let capacity =
+        usize::try_from(payload_len).map_err(|_| Error::LengthOverflow { value: payload_len })?;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(capacity)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "digest payload",
+            requested: payload_len,
+        })?;
+    payload.extend_from_slice(DIGEST_MAGIC);
+    payload.extend_from_slice(&DIGEST_VERSION.to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(
+        &sequence_high_water
+            .unwrap_or(DIGEST_NO_SEQUENCE)
+            .to_le_bytes(),
+    );
+    payload.extend_from_slice(&count.to_le_bytes());
+    for (block_id, offset) in tails {
+        payload.extend_from_slice(&block_id.to_le_bytes());
+        payload.extend_from_slice(&offset.to_le_bytes());
+    }
+    payload.extend_from_slice(&record_offset.to_le_bytes());
+    Ok(payload)
+}
+
+/// Reads a digest out of a payload the caller has already framed and
+/// checksum-verified, or reports that these bytes are not one.
+///
+/// Every field is checked against the file rather than trusted: the tail
+/// offsets must name records inside the append log and before the digest, and
+/// the ids must be strictly ascending so a corrupt count cannot make the walk
+/// revisit. A payload that fails any of it is not a digest, and the caller
+/// answers that with the scan.
+fn decode_digest_payload(
+    payload: &[u8],
+    append_start: u64,
+    record_offset: u64,
+    physical_end: u64,
+) -> Result<OpenDigest> {
+    let prefix_len = DIGEST_PREFIX_LEN as usize;
+    let trailer_len = DIGEST_TRAILER_LEN as usize;
+    if payload.len() < prefix_len + trailer_len {
+        return Err(Error::InvalidIndexSegment);
+    }
+    if &payload[..4] != DIGEST_MAGIC {
+        return Err(Error::InvalidIndexSegment);
+    }
+    let mut u16_buf = [0; 2];
+    u16_buf.copy_from_slice(&payload[4..6]);
+    if u16::from_le_bytes(u16_buf) != DIGEST_VERSION {
+        return Err(Error::InvalidIndexSegment);
+    }
+    let mut u64_buf = [0; 8];
+    u64_buf.copy_from_slice(&payload[8..16]);
+    let stored_sequence = u64::from_le_bytes(u64_buf);
+    let mut u32_buf = [0; 4];
+    u32_buf.copy_from_slice(&payload[16..20]);
+    let count = u32::from_le_bytes(u32_buf) as usize;
+    let body_len = count
+        .checked_mul(DIGEST_TAIL_LEN as usize)
+        .ok_or(Error::InvalidIndexSegment)?;
+    if payload.len() != prefix_len + body_len + trailer_len {
+        return Err(Error::InvalidIndexSegment);
+    }
+    u64_buf.copy_from_slice(&payload[payload.len() - trailer_len..]);
+    if u64::from_le_bytes(u64_buf) != record_offset {
+        return Err(Error::InvalidIndexSegment);
+    }
+    let mut tails: Vec<(u32, u64)> = Vec::new();
+    tails
+        .try_reserve_exact(count)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "digest block tails",
+            requested: body_len as u64,
+        })?;
+    let mut previous: Option<u32> = None;
+    for index in 0..count {
+        let at = prefix_len + index * DIGEST_TAIL_LEN as usize;
+        u32_buf.copy_from_slice(&payload[at..at + 4]);
+        let block_id = u32::from_le_bytes(u32_buf);
+        u64_buf.copy_from_slice(&payload[at + 4..at + 12]);
+        let offset = u64::from_le_bytes(u64_buf);
+        if previous.is_some_and(|last| block_id <= last) {
+            return Err(Error::InvalidIndexSegment);
+        }
+        // A tail must name a record of this file that is behind the digest.
+        // The digest is the last record, so "before it" and "inside the append
+        // log" together are the whole of what an offset can be here.
+        if offset < append_start || offset >= record_offset {
+            return Err(Error::InvalidIndexSegment);
+        }
+        previous = Some(block_id);
+        tails.push((block_id, offset));
+    }
+    Ok(OpenDigest {
+        physical_end,
+        sequence_high_water: (stored_sequence != DIGEST_NO_SEQUENCE).then_some(stored_sequence),
+        block_tails: BlockTails::from_sorted(tails),
+    })
+}
 /// Carries one matrix chunk: `rows_per_chunk` rows of every matrix block.
 ///
 /// A chunk is what makes a matrix dimension grow past the extent declared at
@@ -1029,8 +1198,6 @@ pub(crate) mod resident_index {
             self.slots.len()
         }
 
-        /// Only the unit tests ask; production code asks `len`.
-        #[cfg(test)]
         pub(crate) fn is_empty(&self) -> bool {
             self.slots.is_empty()
         }
@@ -1089,6 +1256,20 @@ pub(crate) mod resident_index {
 }
 
 use resident_index::{ReservedIndexSlot, ResidentIndex};
+
+/// Which route [`VarveFile::open_readonly_lazy`] actually took.
+///
+/// Both open the same file and answer the same reads. They differ by roughly
+/// four orders of magnitude in syscalls, which is a difference a caller that
+/// asked for the lazy open is entitled to notice rather than infer from a
+/// stopwatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LazyOpenSource {
+    /// The digest at the end of the file was read. No record was framed.
+    Digest,
+    /// No usable digest, so every record was framed. Correct, and expensive.
+    FullScan,
+}
 
 /// Whether an open keeps a record directory of its own.
 ///
@@ -2606,6 +2787,17 @@ impl BlockTails {
     /// the reason `from_index` does: replaying inserts every first-seen id into
     /// the sorted vector, and an index whose first appearances are in descending
     /// id order moves `0 + 1 + ... + (B - 1)` tuples (PERF3-03).
+    /// Adopts a table a digest already ordered.
+    ///
+    /// `decode_digest_payload` rejects a non-ascending id, so this cannot adopt
+    /// an out-of-order table — which matters, because every lookup here is a
+    /// binary search and an unsorted table would answer wrong rather than
+    /// slowly.
+    fn from_sorted(tails: Vec<(u32, u64)>) -> Self {
+        debug_assert!(tails.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        Self { tails }
+    }
+
     fn from_newest(newest: &HashMap<u32, u64>) -> Self {
         let mut tails: Vec<(u32, u64)> = newest.iter().map(|(id, offset)| (*id, *offset)).collect();
         tails.sort_unstable_by_key(|(block_id, _)| *block_id);
@@ -2615,6 +2807,11 @@ impl BlockTails {
     fn tail(&self, block_id: u32) -> Option<u64> {
         self.position(block_id)
             .map(|position| self.tails[position].1)
+    }
+
+    /// The table itself, sorted by block id, for the digest encoder.
+    fn as_slice(&self) -> &[(u32, u64)] {
+        &self.tails
     }
 
     fn position(&self, block_id: u32) -> Option<usize> {
@@ -2862,6 +3059,15 @@ struct AppendSnapshot {
     block_id: u32,
     previous_block_tail: Option<u64>,
     uncommitted_since_commit: bool,
+    /// The block id of the newest resident entry, maintained at the single
+    /// index append site.
+    ///
+    /// Exists so that `needs_index_segment` and `needs_open_digest` can ask
+    /// "is the last thing in this file already the record I am about to write"
+    /// without faulting an entry off disk on every flush. A slot holds an
+    /// offset and a committed bit, so the block id is not otherwise knowable
+    /// without a read, and both predicates run on the append path.
+    last_resident_block_id: Option<u32>,
 }
 
 #[cfg(test)]
@@ -3383,6 +3589,15 @@ pub struct VarveFile {
     // the marker, which left every such record permanently uncommitted and
     // invisible to every reader.
     uncommitted_since_commit: bool,
+    /// The block id of the newest resident entry, maintained at the single
+    /// index append site.
+    ///
+    /// Exists so that `needs_index_segment` and `needs_open_digest` can ask
+    /// "is the last thing in this file already the record I am about to write"
+    /// without faulting an entry off disk on every flush. A slot holds an
+    /// offset and a committed bit, so the block id is not otherwise knowable
+    /// without a read, and both predicates run on the append path.
+    last_resident_block_id: Option<u32>,
     // Lazily built keyed-offset-chain predecessors for the generic keyed
     // append path; a cached map is either absent or exact (API2-05).
     keyed_tails: KeyedTails,
@@ -4438,6 +4653,7 @@ impl VarveFile {
             block_tails: BlockTails::new_empty(),
             segment_cursor: SegmentCursor::new_empty(),
             uncommitted_since_commit: false,
+            last_resident_block_id: None,
             keyed_tails: KeyedTails::new_empty(),
             // DUR3-01: this handle established the pathname, so its
             // directory entry is not durable until the first durability
@@ -4568,6 +4784,7 @@ impl VarveFile {
             block_tails: BlockTails::new_empty(),
             segment_cursor: SegmentCursor::new_empty(),
             uncommitted_since_commit: false,
+            last_resident_block_id: None,
             keyed_tails: KeyedTails::new_empty(),
             // DUR3-01: this handle established the pathname, so its
             // directory entry is not durable until the first durability
@@ -4703,6 +4920,7 @@ impl VarveFile {
             chunk_directory: std::sync::OnceLock::new(),
             segment_cursor,
             uncommitted_since_commit: false,
+            last_resident_block_id: index.last().map(|entry| entry.block_id),
             keyed_tails: KeyedTails::new_empty(),
             pending_pathname_parent_sync: false,
             poison: PoisonFlag::healthy(),
@@ -4827,6 +5045,134 @@ impl VarveFile {
             chunk_directory: std::sync::OnceLock::new(),
             segment_cursor,
             uncommitted_since_commit: false,
+            last_resident_block_id: index.last().map(|entry| entry.block_id),
+            keyed_tails: KeyedTails::new_empty(),
+            pending_pathname_parent_sync: false,
+            poison: PoisonFlag::healthy(),
+            _lock: None,
+        })
+    }
+
+    /// Opens read-only **without reading the records at all**, using the open
+    /// digest at the end of the file.
+    ///
+    /// The three facts an open needs — where the committed file ends, the next
+    /// append's sequence, each block's newest record — are the by-product of
+    /// walking every record, and that walk is the only reason an open that keeps
+    /// no index still reads the whole file. `IndexPolicy::open_digest_on_flush`
+    /// writes them down at each commit point; this reads them back.
+    ///
+    /// Measured, 50,000 records:
+    ///
+    /// | open | read syscalls | bytes read | file overhead |
+    /// | --- | --- | --- | --- |
+    /// | `open_readonly` (scan) | 100,316 | 3,207,102 | — |
+    /// | `open_readonly` (segment chain) | 516 | 7,332,522 | +3.67 MB |
+    /// | this, from a digest | **20** | **516** | **+12.8 KB** |
+    ///
+    /// The last column is the one that decides which of the two tail records a
+    /// format wants. A segment writes an entry per record it covers, so its
+    /// overhead grows with the file; a digest writes twelve bytes per distinct
+    /// block id, so the 12.8 KB above is a hundred flushes' worth and would be
+    /// the same at a billion records. What the segment buys for its size is an
+    /// open that *builds the index*; a digest deliberately does not.
+    ///
+    /// The handle keeps **no directory**, because there is none to keep — no
+    /// record was framed. Position-based reads (`blocks`, `scan`,
+    /// `keyed_blocks`) refuse with `NoResidentDirectory` naming
+    /// [`with_directory`](Self::with_directory), and the index the caller
+    /// actually needs is built with [`record_map`](Self::record_map), which
+    /// walks only as far as the question. That pairing is the point: an open
+    /// that reads nothing, and an index that reads only what was asked for.
+    ///
+    /// What still works with no directory at all, because none of it goes
+    /// through positions: [`block_chain`](Self::block_chain) and
+    /// [`block_tail_offset`](Self::block_tail_offset) — the digest carries the
+    /// tails, which is why it carries them — [`read_block_at`](Self::read_block_at),
+    /// and every `_into` read that takes an entry.
+    ///
+    /// **Falls back to the full scan** when the file has no usable digest: one
+    /// written before the option was enabled, one whose writer appended past
+    /// its last commit, one truncated or rotted. That is not an error — the
+    /// file is readable and this opens it — but it is the difference between
+    /// eleven syscalls and a hundred thousand, so
+    /// [`open_readonly_lazy_with_report`](Self::open_readonly_lazy_with_report)
+    /// says which happened.
+    pub fn open_readonly_lazy<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        Ok(Self::open_readonly_lazy_with_report(spec, path)?.0)
+    }
+
+    /// [`open_readonly_lazy`](Self::open_readonly_lazy), and which of the two
+    /// routes it took.
+    pub fn open_readonly_lazy_with_report<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+    ) -> Result<(Self, LazyOpenSource)> {
+        let spec = spec.resolve_entrypoint();
+        spec.validate()?;
+        ensure_native_open_limits(spec)?;
+        let path = path.as_ref().to_path_buf();
+        match Self::open_readonly_from_digest(spec, &path) {
+            Ok(file) => Ok((file, LazyOpenSource::Digest)),
+            // Only a *spec-level* refusal propagates, exactly as it does for
+            // the segment chain: those describe the caller's configuration and
+            // the scan would give the same answer.
+            Err(error @ Error::MissingResourceLimit { .. })
+            | Err(error @ Error::TrustedUnboundedRequiresExplicitApi { .. }) => Err(error),
+            Err(_) => {
+                // The scan needs somewhere to put the entries it frames. This
+                // buffer is transient — the handle keeps no directory either
+                // way — but it is `N` entries while it lives, which is the cost
+                // of the fallback and is why the report exists.
+                let mut scratch = Vec::new();
+                let file =
+                    Self::open_readonly_inner(spec, path, &mut scratch, DirectoryRetention::None)?;
+                Ok((file, LazyOpenSource::FullScan))
+            }
+        }
+    }
+
+    fn open_readonly_from_digest(spec: FormatSpec, path: &Path) -> Result<Self> {
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let captured_len = check_open_file_len(spec, &file)?;
+        let (header_len, header_extensions) = read_file_header_parts(spec, &mut file)?;
+        let (matrix, matrix_creation_nonce) = split_matrix_state(read_matrix_layout_if_needed(
+            spec,
+            &mut file,
+            header_len,
+            captured_len,
+        )?);
+        let append_start = append_log_start(header_len, matrix.as_ref());
+        let digest = read_open_digest(spec, &mut file, append_start, captured_len)?;
+        let snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, digest.physical_end)?;
+        Ok(Self {
+            spec,
+            path: path.to_path_buf(),
+            file: RecordFile::new(file),
+            index: ResidentIndex::none_retained(snapshot.clone(), spec),
+            snapshot,
+            mode: OpenMode::ReadOnly,
+            header_extensions,
+            matrix,
+            matrix_creation_nonce,
+            sequence_state: match digest.sequence_high_water {
+                None => SequenceState::Available(0),
+                Some(u64::MAX) => SequenceState::Exhausted,
+                Some(sequence) => SequenceState::Available(sequence + 1),
+            },
+            // Both are writer state — when the next checkpoint is due, which
+            // records the next segment covers — and this handle is read-only.
+            // Recovering them is what would have required the walk.
+            checkpoint_cadence: CheckpointCadence::new_empty(),
+            segment_cursor: SegmentCursor::new_empty(),
+            block_tails: digest.block_tails,
+            open_chunk: None,
+            chunk_directory: std::sync::OnceLock::new(),
+            uncommitted_since_commit: false,
+            // No record was framed, so there is nothing to seed this from — and
+            // nothing to seed it for: it is append-path state and this handle is
+            // read-only.
+            last_resident_block_id: None,
             keyed_tails: KeyedTails::new_empty(),
             pending_pathname_parent_sync: false,
             poison: PoisonFlag::healthy(),
@@ -4910,6 +5256,7 @@ impl VarveFile {
                 chunk_directory: std::sync::OnceLock::new(),
                 segment_cursor,
                 uncommitted_since_commit: false,
+                last_resident_block_id: index.last().map(|entry| entry.block_id),
                 keyed_tails: KeyedTails::new_empty(),
                 pending_pathname_parent_sync: false,
                 poison: PoisonFlag::healthy(),
@@ -6160,7 +6507,7 @@ impl VarveFile {
         }
         // Last, and after the marker: the chain is found from the end of the
         // file, so anything appended behind this record hides it.
-        self.write_index_segment_if_needed();
+        self.close_commit_point();
         self.file.flush()?;
         Ok(())
     }
@@ -6181,11 +6528,11 @@ impl VarveFile {
             && let Some(entry) = self.index.last_entry_of_block(COMMIT_BLOCK_ID)?
         {
             let info = AppendInfo::from(&entry);
-            self.write_index_segment_if_needed();
+            self.close_commit_point();
             return Ok(info);
         }
         let info = self.write_commit_marker()?;
-        self.write_index_segment_if_needed();
+        self.close_commit_point();
         Ok(info)
     }
 
@@ -6205,7 +6552,7 @@ impl VarveFile {
             && let Some(entry) = self.index.last_entry_of_block(COMMIT_BLOCK_ID)?
         {
             let info = AppendInfo::from(&entry);
-            self.write_index_segment_if_needed();
+            self.close_commit_point();
             self.file.flush()?;
             self.file.sync_all()?;
             // DUR3-01: a durable commit on a file this handle created must
@@ -6218,10 +6565,10 @@ impl VarveFile {
         let info = self.write_commit_marker()?;
         // The segment closes the commit point, so it is appended after the
         // marker and before the durability request that makes both durable.
-        // `write_index_segment_if_needed` cannot report a failure for the same
+        // `close_commit_point` cannot report a failure for the same
         // reason the two steps below do not report theirs as a bare `Err`: the
         // commit has happened.
-        self.write_index_segment_if_needed();
+        self.close_commit_point();
         // INVARIANT 3: `write_commit_marker` is the authoritative commit. From
         // here the marker record is in the file and a reader that opens it
         // after a clean process exit sees the transaction as committed, so a
@@ -9550,6 +9897,10 @@ impl VarveFile {
                 self.checkpoint_cadence = derived.checkpoint_cadence;
                 self.block_tails = derived.block_tails.expect("tails were requested");
                 self.segment_cursor = derived.segment_cursor;
+                // The same wholesale replacement: the newest entry is a
+                // different record now, so the append-path shortcut that names
+                // its block id is stale too.
+                self.last_resident_block_id = new_index.last().map(|entry| entry.block_id);
                 self.keyed_tails.invalidate_all();
                 self.publish_sequence(sequence);
                 Ok(sequence)
@@ -9599,6 +9950,10 @@ impl VarveFile {
                 self.checkpoint_cadence = derived.checkpoint_cadence;
                 self.block_tails = derived.block_tails.expect("tails were requested");
                 self.segment_cursor = derived.segment_cursor;
+                // The same wholesale replacement: the newest entry is a
+                // different record now, so the append-path shortcut that names
+                // its block id is stale too.
+                self.last_resident_block_id = new_index.last().map(|entry| entry.block_id);
                 self.keyed_tails.invalidate_all();
                 Ok(info)
             }
@@ -9864,6 +10219,7 @@ impl VarveFile {
             block_id,
             previous_block_tail: self.block_tails.tail(block_id),
             uncommitted_since_commit: self.uncommitted_since_commit,
+            last_resident_block_id: self.last_resident_block_id,
         };
         let record_offset = snapshot.eof;
         let payload_offset = record_offset.checked_add(RECORD_HEADER_LEN).ok_or(
@@ -9998,6 +10354,7 @@ impl VarveFile {
         // non-resident record, so it is maintained for every block. And the
         // record's own footer chain went to disk above, not to memory.
         if resident {
+            self.last_resident_block_id = Some(block_id);
             self.index.install(index_slot, &entry);
             // Single index append site: keep the O(1) flush-cadence state in
             // lockstep with the resident index (PERF2-02). It counts resident
@@ -10015,7 +10372,12 @@ impl VarveFile {
         // flush would write marker, segment, marker, segment forever.
         self.uncommitted_since_commit = match block_id {
             COMMIT_BLOCK_ID => false,
-            SEGMENT_BLOCK_ID => self.uncommitted_since_commit,
+            // A digest is written after the marker it describes, for the same
+            // reason a segment is, so it needs the same exemption. Without it
+            // the digest sets the flag, the next idle flush writes a marker
+            // because the flag is set, and the file grows forever on a handle
+            // nothing is appending to.
+            SEGMENT_BLOCK_ID | OPEN_DIGEST_BLOCK_ID => self.uncommitted_since_commit,
             _ => true,
         };
         self.snapshot = new_snapshot;
@@ -10052,6 +10414,7 @@ impl VarveFile {
         self.block_tails
             .restore(snapshot.block_id, snapshot.previous_block_tail);
         self.uncommitted_since_commit = snapshot.uncommitted_since_commit;
+        self.last_resident_block_id = snapshot.last_resident_block_id;
         if truncated {
             self.keyed_tails.invalidate_all();
         }
@@ -10209,8 +10572,17 @@ impl VarveFile {
     /// writer open truncates them — and would then describe a file that no
     /// longer exists.
     fn needs_index_segment(&self) -> bool {
+        // The digest, when both options are on, is appended *after* the segment
+        // and is itself a resident record — so it advances `index.len()` past
+        // the cursor and would make the next idle flush think a commit point
+        // was left uncovered. It would then write a segment, which makes the
+        // digest stale, which writes another digest, and the file grows forever
+        // on a handle nothing is appending to. Only a trailing digest can be in
+        // this position, so subtracting it is the whole correction.
+        let trailing_digest =
+            usize::from(self.last_resident_block_id == Some(OPEN_DIGEST_BLOCK_ID));
         self.spec.index_policy.segment_on_flush
-            && self.segment_cursor.next_position < self.index.len()
+            && self.segment_cursor.next_position < self.index.len() - trailing_digest
             && !(self.spec.commit_policy.is_transaction_marker()
                 && self.has_uncommitted_since_last_commit())
     }
@@ -10234,6 +10606,83 @@ impl VarveFile {
             return;
         }
         let _ = self.write_segment_record();
+    }
+
+    /// Appends whatever this commit point owes the *next open*, in the order
+    /// the next open looks for it.
+    ///
+    /// Both are found from the end of the file, so both are last and their
+    /// order is the reverse of the order they are read: the digest goes after
+    /// the segment because the digest is the one probed at `file_len`. A
+    /// segment appended behind it would hide it, which is the same reason both
+    /// come after the commit marker.
+    ///
+    /// INVARIANT 3, inherited from `write_index_segment_if_needed`: every
+    /// caller runs this after the record its operation is accountable for is in
+    /// the file, and neither of these can make that record not have happened.
+    /// A missing or torn one is answered by the next open with the full scan.
+    fn close_commit_point(&mut self) {
+        self.write_index_segment_if_needed();
+        self.write_open_digest_if_needed();
+    }
+
+    /// Whether this commit point should write an open digest.
+    ///
+    /// The third condition is the one that took a bug to learn on the segment
+    /// path: a digest is itself a record, so "is there anything to describe"
+    /// has to mean "anything other than the digest I already wrote", or every
+    /// idle flush appends another one and the file grows while nothing happens.
+    fn needs_open_digest(&self) -> bool {
+        if !self.spec.index_policy.open_digest_on_flush || self.index.is_empty() {
+            return false;
+        }
+        if self.spec.commit_policy.is_transaction_marker()
+            && self.has_uncommitted_since_last_commit()
+        {
+            return false;
+        }
+        self.last_resident_block_id != Some(OPEN_DIGEST_BLOCK_ID)
+    }
+
+    fn write_open_digest_if_needed(&mut self) {
+        if self.mode != OpenMode::ReadWrite || !self.needs_open_digest() {
+            return;
+        }
+        let _ = self.write_open_digest_record();
+    }
+
+    fn write_open_digest_record(&mut self) -> Result<()> {
+        let record_offset = self.file.metadata()?.len();
+        // The high-water mark as it will stand *once this record is down*: the
+        // digest takes the next sequence itself, so reporting the state before
+        // it would send the next writer back over a number this record used.
+        let sequence_high_water = match self.sequence_state {
+            SequenceState::Available(next) => next.checked_sub(1),
+            SequenceState::Exhausted => Some(u64::MAX),
+        };
+        // Its own tail is not in the table it writes — it cannot be, the record
+        // does not exist yet — so an open that reads this digest learns every
+        // block's tail except the digest block's own. Nothing walks the digest
+        // chain: the digest is found at the end of the file, not by following
+        // one.
+        let payload = encode_digest_payload(
+            self.spec,
+            sequence_high_water,
+            self.block_tails.as_slice(),
+            record_offset,
+        )?;
+        let permit = self.ensure_write()?;
+        let info = self.write_record_with_prev_key(
+            &permit,
+            OPEN_DIGEST_BLOCK_ID,
+            DIGEST_VERSION,
+            RECORD_FLAG_INTERNAL,
+            0,
+            &payload,
+            None,
+        )?;
+        debug_assert_eq!(info.record_offset, record_offset);
+        Ok(())
     }
 
     fn write_embedded_manifest_if_needed(&mut self) -> Result<()> {
@@ -11480,19 +11929,25 @@ fn index_policy_byte(policy: IndexPolicy) -> u8 {
         | (if policy.block_offset_chain { 1 << 2 } else { 0 })
         | (if policy.keyed_offset_chain { 1 << 3 } else { 0 })
         | (if policy.segment_on_flush { 1 << 4 } else { 0 })
+        | (if policy.open_digest_on_flush {
+            1 << 5
+        } else {
+            0
+        })
 }
 
 fn index_policy_from_byte(value: u8) -> Result<IndexPolicy> {
     match value {
         1 => Ok(IndexPolicy::ScanOnOpen),
         2 => Ok(IndexPolicy::CheckpointOnFlush),
-        3..=31 => Ok(IndexPolicy::new(
+        3..=63 => Ok(IndexPolicy::new(
             value & 0x01 != 0,
             value & 0x02 != 0,
             value & 0x04 != 0,
             value & 0x08 != 0,
         )
-        .with_segment_on_flush(value & 0x10 != 0)),
+        .with_segment_on_flush(value & 0x10 != 0)
+        .with_open_digest_on_flush(value & 0x20 != 0)),
         _ => Err(Error::InvalidSchemaManifest),
     }
 }
@@ -14269,6 +14724,82 @@ fn read_segment_tip_offset(file: &mut File, append_start: u64, file_len: u64) ->
     Ok(record_offset)
 }
 
+/// Reads the open digest sitting at the end of the file, or reports that this
+/// file's last record is not one.
+///
+/// The probe is the segment tip's, for the reason that one exists: open arrives
+/// at EOF holding a record footer, and the header that would say where the
+/// record starts is `payload_len` bytes further back. The trailer closes it.
+///
+/// Every claim is checked against the file rather than trusted. The record at
+/// the trailer's offset must *be* a digest record — right block id, right
+/// version, internal flag — its extent must end exactly at the end of the file,
+/// and its checksum must verify, which is what stops a digest whose bytes rotted
+/// from misreporting a block tail that nothing else would contradict. Any
+/// failure is `Err`, and the caller answers it with the scan.
+fn read_open_digest(
+    spec: FormatSpec,
+    file: &mut File,
+    append_start: u64,
+    file_len: u64,
+) -> Result<OpenDigest> {
+    let probe_len = DIGEST_TRAILER_LEN + RECORD_FOOTER_LEN;
+    let minimum = RECORD_HEADER_LEN + DIGEST_PREFIX_LEN + probe_len;
+    if file_len
+        .checked_sub(append_start)
+        .is_none_or(|available| available < minimum)
+    {
+        return Err(Error::InvalidIndexSegment);
+    }
+    let probe_offset = file_len - probe_len;
+    let mut probe = [0u8; (DIGEST_TRAILER_LEN + RECORD_FOOTER_LEN) as usize];
+    file.seek(SeekFrom::Start(probe_offset))?;
+    file.read_exact(&mut probe)?;
+    let trailer_len = DIGEST_TRAILER_LEN as usize;
+    if &probe[trailer_len..trailer_len + 4] != RECORD_FOOTER_MAGIC {
+        return Err(Error::InvalidIndexSegment);
+    }
+    let mut version = [0; 2];
+    version.copy_from_slice(&probe[trailer_len + 4..trailer_len + 6]);
+    if u16::from_le_bytes(version) != RECORD_FOOTER_VERSION {
+        return Err(Error::InvalidIndexSegment);
+    }
+    let mut trailer = [0; DIGEST_TRAILER_LEN as usize];
+    trailer.copy_from_slice(&probe[..trailer_len]);
+    let record_offset = u64::from_le_bytes(trailer);
+    if record_offset < append_start || record_offset > probe_offset - DIGEST_PREFIX_LEN {
+        return Err(Error::InvalidIndexSegment);
+    }
+    let mut accounting = ScanAccounting::default();
+    let entry = match read_record_entry_at(
+        spec,
+        file,
+        file_len,
+        record_offset,
+        // A digest is either wholly there or it is not a digest. There is no
+        // recoverable tail here and no boundary to truncate back to: the scan
+        // owns that decision, and this defers to it by failing.
+        ScanChecks {
+            partial_boundary: None,
+            checksum_boundary: None,
+            verify_checksums: true,
+        },
+        &mut accounting,
+    )? {
+        RecordRead::Entry(entry) => entry,
+        RecordRead::RecoverableTail(_) => return Err(Error::InvalidIndexSegment),
+    };
+    if entry.block_id != OPEN_DIGEST_BLOCK_ID
+        || entry.block_version != DIGEST_VERSION
+        || entry.flags != RECORD_FLAG_INTERNAL
+        || entry.checked_physical_end()? != file_len
+    {
+        return Err(Error::InvalidIndexSegment);
+    }
+    let payload = entry.read_payload_file_with_len(file, file_len)?;
+    decode_digest_payload(&payload, append_start, record_offset, file_len)
+}
+
 /// Walks the segment chain backwards from the end of the file and materializes
 /// the index it describes.
 ///
@@ -14519,11 +15050,21 @@ fn committed_prefix_len(entries: &[RecordIndexEntry]) -> Option<usize> {
     // stopped being written at all, silently. The segment describes only
     // records the marker already committed, so keeping it is exactly as safe
     // whatever follows it.
+    // The same argument extends to the digest, which is written after the
+    // segment for the same reason the segment is written after the marker: both
+    // describe only records the marker already committed, so keeping them is
+    // exactly as safe whatever follows. The shapes the writer can produce are
+    // `[SEGMENT]`, `[DIGEST]` and `[SEGMENT, DIGEST]`, and only those are
+    // accepted — a longer run is a file this did not write, and truncating back
+    // to the marker is the safe answer for one.
+    let mut kept = kept;
     if entries.len() > kept && entries[kept].block_id == SEGMENT_BLOCK_ID {
-        Some(kept + 1)
-    } else {
-        Some(kept)
+        kept += 1;
     }
+    if entries.len() > kept && entries[kept].block_id == OPEN_DIGEST_BLOCK_ID {
+        kept += 1;
+    }
+    Some(kept)
 }
 
 fn truncate_uncommitted_tail_if_needed(

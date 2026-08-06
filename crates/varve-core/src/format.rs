@@ -1138,6 +1138,25 @@ pub struct IndexPolicy {
     /// declares; segment granularity is varve's decision, so there is nothing
     /// here for a declaration to choose.
     pub segment_on_flush: bool,
+    /// Whether a commit point appends an internal *open digest* record.
+    ///
+    /// The three facts an open needs that are not in any one record: where the
+    /// committed file ends, what the next append's sequence is, and where each
+    /// block's newest record sits. Today they are the by-product of walking
+    /// every record, which is the only reason an open that keeps no index still
+    /// reads the whole file.
+    ///
+    /// A digest is those three facts written down. It is **constant size in the
+    /// record count** — a header plus twelve bytes per distinct block id —
+    /// where a segment writes an entry per record it covers. That is the whole
+    /// difference between the two, and it is why this one can be on for a file
+    /// that gets a billion records.
+    ///
+    /// It does not build an index and is not a substitute for one:
+    /// [`VarveFile::open_readonly_lazy`] is the open it serves, and the caller
+    /// builds whatever index it needs with `record_map`. An open that wants the
+    /// index still scans or walks the segment chain.
+    pub open_digest_on_flush: bool,
 }
 
 #[allow(non_upper_case_globals)]
@@ -1148,6 +1167,7 @@ impl IndexPolicy {
         block_offset_chain: false,
         keyed_offset_chain: false,
         segment_on_flush: false,
+        open_digest_on_flush: false,
     };
 
     pub const CheckpointOnFlush: Self = Self {
@@ -1156,6 +1176,7 @@ impl IndexPolicy {
         block_offset_chain: false,
         keyed_offset_chain: false,
         segment_on_flush: false,
+        open_digest_on_flush: false,
     };
 
     pub const BlockOffsetChain: Self = Self {
@@ -1164,6 +1185,7 @@ impl IndexPolicy {
         block_offset_chain: true,
         keyed_offset_chain: false,
         segment_on_flush: false,
+        open_digest_on_flush: false,
     };
 
     pub const KeyedOffsetChain: Self = Self {
@@ -1172,6 +1194,7 @@ impl IndexPolicy {
         block_offset_chain: true,
         keyed_offset_chain: true,
         segment_on_flush: false,
+        open_digest_on_flush: false,
     };
 
     /// Segment-chained open, built on the block offset chain it needs.
@@ -1181,6 +1204,7 @@ impl IndexPolicy {
         block_offset_chain: true,
         keyed_offset_chain: false,
         segment_on_flush: true,
+        open_digest_on_flush: false,
     };
 
     pub const fn new(
@@ -1195,6 +1219,7 @@ impl IndexPolicy {
             block_offset_chain,
             keyed_offset_chain,
             segment_on_flush: false,
+            open_digest_on_flush: false,
         }
     }
 
@@ -1235,6 +1260,22 @@ impl IndexPolicy {
     /// without a footer to carry it.
     pub const fn with_segment_on_flush(mut self, enabled: bool) -> Self {
         self.segment_on_flush = enabled;
+        if enabled {
+            self.scan_on_open = true;
+            self.block_offset_chain = true;
+        }
+        self
+    }
+
+    /// Enables the open digest.
+    ///
+    /// Turns the block offset chain on with it, for the same reason
+    /// `segment_on_flush` does and for one more: the digest hands out each
+    /// block's tail offset, and the only thing to do with a tail offset is walk
+    /// back through `prev_same_block_offset`. Handing out an entry point to a
+    /// chain that is not there would be handing out a dead end.
+    pub const fn with_open_digest_on_flush(mut self, enabled: bool) -> Self {
+        self.open_digest_on_flush = enabled;
         if enabled {
             self.scan_on_open = true;
             self.block_offset_chain = true;
@@ -2776,6 +2817,16 @@ impl FormatSpec {
         if self.index_policy.segment_on_flush && !self.index_policy.block_offset_chain {
             return Err(Error::InvalidFormatSpec(
                 "segment_on_flush requires block_offset_chain",
+            ));
+        }
+        // The digest hands out each block's tail offset, and the only way to
+        // use one is to walk back through `prev_same_block_offset`. Without the
+        // chain those offsets name a record with no predecessor link, so the
+        // digest would be answering "where does this block end" with something
+        // nothing can follow.
+        if self.index_policy.open_digest_on_flush && !self.index_policy.block_offset_chain {
+            return Err(Error::InvalidFormatSpec(
+                "open_digest_on_flush requires block_offset_chain",
             ));
         }
         // A record scan reads each record's own header, so damage to one record
