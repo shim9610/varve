@@ -309,14 +309,23 @@ bytes.
 | `VarveFile` | lower-level read/write type used by both wrappers |
 
 **This is the resident family, and it is not the petabyte-scale path.** Opening
-one of these handles scans the file and builds a **resident record index** that
-lives for the life of the handle: `Theta(records + decoded bytes)` plus an
+one of these handles scans the file and builds a **resident record directory**
+that lives for the life of the handle: `Theta(records + decoded bytes)` plus an
 `O(N log N)` per-open sequence-uniqueness sort over `N` records (which degrades
 to `Theta(N)` for a file a Varve writer produced; the `N log N` bound is the
-guarantee for reordered or hostile input). Budget about **104 bytes of resident
-index per record** (`size_of::<RecordIndexEntry>()`).
+guarantee for reordered or hostile input). Budget **16 bytes of resident
+directory per record** — the record's offset and its committed bit, the two
+facts that are not in the record itself. Everything else in a
+`RecordIndexEntry` is rebuilt from the record's own header and footer when a
+read asks for it. Measured across 2,000 → 20,000 records: 16.00 bytes per
+record retained.
 
-**One policy avoids the scan, and two that look as though they might do not.**
+Two other ways to pay for that directory, both of which cost the handle
+nothing: hold it yourself (`open_readonly_without_directory`, below), or build
+only the part your question needs (`record_map`, below).
+
+**Three policies avoid the open-time scan; two that look as though they might
+do not.**
 
 - `IndexPolicy::segment_on_flush` **does** avoid it. Each commit point appends an
   internal *segment* record covering the records that commit point added, chained
@@ -325,13 +334,22 @@ index per record** (`size_of::<RecordIndexEntry>()`).
   reading one record per commit point and **no data record at all**. Measured on
   one Linux host with a commit point every 256 records: an 852 MB, 200,000-record
   file opens in 370 ms chained against 5,867 ms scanning, framing 782 records
-  instead of 200,782. What it removes is the open-time walk, not the index: the
-  resident index it produces is the same `Vec<RecordIndexEntry>`, so the
-  104-bytes-per-record figure above is unchanged. **A writing session must end
+  instead of 200,782. What it removes is the open-time walk, not the directory:
+  the index it produces is the same one a scan produces, so the
+  16-bytes-per-record figure above is unchanged. Its cost is on disk — a segment
+  carries an index entry per record it covers, so the file grows with the
+  record count (measured: +3.67 MB on a 31 MB, 50,000-record file). **A writing
+  session must end
   with `flush` or `commit`** — a data record at the end of the file leaves open
   no chain to start from, and it silently scans instead. See [Known Limitations
   §2.1](known-limitations.md#21-varvefile-scans-the-whole-file-at-open-and-holds-a-record-index)
   for the full table, the other costs, and every fallback.
+- `IndexPolicy::open_digest_on_flush` avoids it **completely**, by not building
+  an index at all. See [An open that reads no
+  record](#an-open-that-reads-no-record) below: `open_readonly_lazy` frames one
+  record, the digest, and the caller builds whatever index it needs with
+  `record_map`. This is the only one of the three whose on-disk cost does not
+  grow with the record count.
 - `IndexPolicy::CheckpointOnFlush` does **not** seed an open from a checkpoint.
   Every open without the segment chain calls `load_index` → `scan_records_from`,
   which walks from the header to the file length; a checkpoint met on the way is
@@ -418,6 +436,100 @@ The reads are not withdrawn in that mode. They are answered through
 `with_directory`; calling one on the handle itself returns
 `Error::NoResidentDirectory { operation }`, which names the read and the way to
 answer it, rather than answering as an empty file would.
+
+### An index you build only as far as the question
+
+`record_map(&mut buffer)` returns a `RecordMap<'_>` over a
+`Vec<RecordIndexEntry>` you own. It **reads nothing** when it is created and
+walks the record chain forward one record at a time, only when asked.
+
+| Method | Meaning |
+| --- | --- |
+| `find(predicate)` | walk until a record matches, and stop there |
+| `fill_to(k)` | walk until the map holds `k` entries, or the file ends |
+| `fill()` | walk to the end — this is `index_entries_into`, spelled as the case it is |
+| `advance()` | walk exactly one record |
+| `entries()` / `len()` / `is_complete()` / `resume_offset()` | what has been walked |
+| `clear()` | empty the buffer and rewind to the start of the file |
+| `release()` | empty the buffer and keep the position |
+
+```rust
+let mut buffer = Vec::new();
+let mut map = file.record_map(&mut buffer)?;          // no read yet
+let hit = map.find(|entry| entry.block_id == Note::ID)?;
+if let Some(entry) = hit {
+    let note: Note = file.decode_block_into(&entry, &mut payload)?;
+}
+let points = file.with_directory(&map).blocks::<Point>()?;   // the prefix walked
+map.clear();
+```
+
+It implements `RecordDirectory`, so a map **is** a directory and every read
+`with_directory` serves is answered against the prefix walked so far. It borrows
+the *buffer*, not the handle, so reads through the handle stay available while
+the map is alive.
+
+A second question resumes where the first stopped, and `find` searches what is
+already framed before it reads anything, so asking twice costs the records
+between the two answers. `release()` is the bounded-memory pass: `fill_to(k)`,
+use them, `release()`, repeat — memory is your `k` entries however long the
+file is, and no record is read twice.
+
+Measured on a 50,000-record, 31 MB file, wanting ten records at position 25,000:
+
+| route | read syscalls |
+| --- | --- |
+| `index_entries_into` (all `N`) then read | 100,238 |
+| `blocks::<T>()` then `get(i)` ×10 | 100,238 |
+| `scan()`, break at 25,010 | 50,028 |
+| `record_map` `fill_to(25_010)` then read | 50,058 |
+| `record_map` `find` the first record | **13** |
+
+**What a partial index does not check.** A full open validates sequence
+uniqueness across every record in the file; a map validates nothing beyond the
+prefix it has read. A duplicate sequence past the stopping point is not detected
+until a walk reaches it. A map walked to completion (`fill()`) is the open
+scan's index, entry for entry.
+
+### An open that reads no record
+
+`open_readonly_lazy(spec, path)` opens from the **open digest** at the end of
+the file: the three facts an open needs that live in no single record — where
+the committed file ends, what sequence the next append takes, and where each
+block's newest record sits. `IndexPolicy::with_open_digest_on_flush(true)`
+writes them at each commit point.
+
+Measured, 50,000 records / 31 MB:
+
+| open | read syscalls | bytes read | file overhead |
+| --- | --- | --- | --- |
+| `open_readonly` (scan) | 100,316 | 3,207,102 | — |
+| `open_readonly` (segment chain) | 516 | 7,332,522 | +3.67 MB |
+| `open_readonly_lazy` (digest) | **20** | **516** | **+12.8 KB** |
+
+The last column is how a format chooses between the two tail records. A segment
+writes an entry per record it covers, so its overhead grows with the file; a
+digest writes twelve bytes per distinct block id, so the 12.8 KB above is a
+hundred flushes' worth and would be the same at a billion records. What a
+segment buys for its size is an open that *builds the index*; a digest
+deliberately does not, and pairs with `record_map` instead.
+
+The handle keeps no directory. `blocks`, `scan` and `keyed_blocks` return
+`Error::NoResidentDirectory` and are answered through `with_directory(&map)`;
+`block_chain`, `block_tail_offset`, `read_block_at` and every entry-taking
+`_into` read need no directory and work directly — which is what the block tails
+are in the digest for.
+
+**It falls back to the full scan** for a file with no usable digest: one written
+before the option was enabled, one whose writer appended past its last commit,
+one truncated or rotted. That is not an error and the answer is identical, but
+it is four orders of magnitude, so `open_readonly_lazy_with_report` returns
+`LazyOpenSource::{Digest, FullScan}` rather than leaving it to a stopwatch.
+
+The option requires `block_offset_chain` and composes with both
+`segment_on_flush` and `checkpoint_on_flush` — the three answer different
+questions. It is off by default and a file written without it is byte-identical
+to one written before it existed.
 
 Common `VarveWriter` APIs:
 

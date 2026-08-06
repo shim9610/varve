@@ -45,7 +45,7 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - The final record header word is `uncompressed_len_hint` for compressed records and `0` otherwise. `payload length` is always the physical stored byte length.
 - `VARVE1` is used for plain records, `VARVE2` is used for file-header extensions such as file-explicit compression, and `VARVE3` is used when `record_footer`/`transaction_marker` commit policy or block/keyed offset chains are enabled.
 - A `VARVE3` record has a fixed 32-byte footer after the stored payload: `b"VRF1"`, footer version, footer flags, `prev_same_block_offset`, `prev_same_key_offset`, reserved `footer_crc32`, and reserved bytes. Offset fields are `0` when absent.
-- User block ids are explicit `u32` values below `0xFFFF_FF00`; higher ids are reserved for internal records. `0xFFFF_FFF7` is the segment record.
+- User block ids are explicit `u32` values below `0xFFFF_FF00`; higher ids are reserved for internal records. `0xFFFF_FFF7` is the segment record and `0xFFFF_FFF5` is the open digest.
 - Fixed blocks use canonical field encoding, not raw Rust memory layout.
 - Variable blocks encode fields as `field_id + wire_type + length + payload`, allowing unknown fields to be skipped.
 - Variable user blocks may be compressed after canonical field encoding and before record write. A format may set one global variable-block compression policy, or opt individual variable block ids into record-explicit compression with `BlockCompressionDescriptor`. Fixed blocks and internal records are not compressed.
@@ -475,6 +475,14 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
   coverage began, the entries of each link tile that coverage with no gap and no
   overlap, the oldest link reaches the append-log start, and the whole walk ends
   at the file length. No link may cover another segment record.
+- **When `open_digest_on_flush` is also declared, "the file length" above means
+  the digest's start offset**, and the walk indexes the digest record itself to
+  reach the file length. The digest closes the same commit point the newest
+  segment does and is written after it, so the newest segment does not end at
+  the file length — a walk that demanded it would reject a perfectly good chain
+  and fall back to the scan, which is the segment chain silently turning off.
+  The digest is a resident record, so a walk that stopped at the newest segment
+  would also hand back an index one entry shorter than a scan of the same bytes.
 - Under a transaction-marker policy a chain is additionally refused unless the
   index it produces is **wholly inside the committed prefix**. A chain can tile
   the whole append log and still contain no commit marker — structurally
@@ -502,6 +510,95 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
   reach are `MatrixLayout::append_log_start()`. A matrix format may declare
   `segment_on_flush` and gets the same chain; measured on a 4x4 matrix with 128
   append-log records over 8 commit points, open framed 8 records.
+
+### Open Digest
+
+- An **open digest** is the three facts an open needs that live in no single
+  record: where the committed file ends, what sequence the next append takes,
+  and where each block's newest record sits. Today they are the by-product of
+  framing every record, and that walk is the only reason an open that builds no
+  index still reads the whole file.
+- Enabled by `IndexPolicy::open_digest_on_flush`, which is off by default. A
+  file written with it off is byte-identical to one written before the option
+  existed, and `computed_schema_hash()` is unchanged.
+- It requires `block_offset_chain`. The digest hands out each block's tail
+  offset and the only thing to do with a tail offset is walk back through
+  `prev_same_block_offset`; without the chain it would be handing out an entry
+  point to a dead end.
+- It is **not** mutually exclusive with `segment_on_flush` or
+  `checkpoint_on_flush`. The three answer different questions: a checkpoint and
+  a segment chain both let open *build the index* cheaply, a digest lets open
+  skip building one at all. A format may declare a digest with either.
+- Digest records use internal block id `OPEN_DIGEST_BLOCK_ID` (`0xFFFF_FFF5`),
+  block version `1`, and the internal record flag.
+- The payload layout is:
+  - magic bytes `b"VDIG"`,
+  - payload version `u16 = 1`,
+  - flags `u16`, currently `0`,
+  - sequence high-water `u64` — the newest sequence in the file as it stands
+    once this record is down, or `u64::MAX` for "no record carries one",
+  - block tail count `u32`,
+  - `count` pairs of block id `u32` and newest record offset `u64`, **strictly
+    ascending by block id**,
+  - the digest record's own start offset `u64`.
+- **The committed file end is deliberately not stored.** The digest is the last
+  record in the file, so the committed end is the digest's own end — a number
+  open holds as soon as it has framed the record, and one that cannot disagree
+  with the bytes the way a stored copy could.
+- The digest does not carry its own block's tail. It cannot: the record does not
+  exist when its payload is built. Nothing walks a digest chain — a digest is
+  found at the end of the file, never by following one.
+- The size is **constant in the record count**: 20 bytes of prefix, 12 per
+  distinct block id, an 8-byte trailer, inside a 32-byte header and a 32-byte
+  footer. A file with three block ids carries a 128-byte digest whether it holds
+  two hundred records or two billion. A segment, by contrast, carries an entry
+  per record it covers.
+- A commit point writes its digest **last** — after any commit marker and after
+  any segment record — because it is found by probing the end of the file and
+  anything appended behind it hides it.
+- A digest record that follows the latest commit marker is inside the committed
+  prefix, on the same grounds a segment record is: it describes only records
+  that marker already committed. The shapes a writer produces after a marker are
+  `[SEGMENT]`, `[DIGEST]` and `[SEGMENT, DIGEST]`; a longer run is a file varve
+  did not write, and the prefix is cut back to the marker.
+- A commit point whose file already ends in a digest writes no new one, so idle
+  flushes do not grow the file.
+- A digest is exempt from the `checkpoint_on_flush` cadence's eligible-record
+  tail, as the commit marker and the segment record are: it is written because a
+  commit point closed, not because a record was added. It is **not** exempt from
+  the checkpoint's geometric threshold, which is a function of index position —
+  a digest is a resident record and enlarges the index the checkpoint must
+  serialise, exactly as a commit marker does.
+- `VarveFile::open_readonly_lazy` reads the digest and frames **no other
+  record**. The handle it returns keeps no record directory, because none was
+  built: position-based reads (`blocks`, `scan`, `keyed_blocks`) return
+  `Error::NoResidentDirectory`, and the caller supplies a directory with
+  `with_directory` — typically one built incrementally by `record_map`.
+  `block_chain`, `block_tail_offset`, `read_block_at` and every entry-taking
+  `_into` read need no directory and work directly, which is what the block
+  tails are in the digest for.
+- Open reads the last 32 bytes, confirms the record footer magic and version,
+  reads the eight bytes before them as the candidate record offset, and confirms
+  a digest record there whose extent ends at the file length and whose checksum
+  verifies. The payload's trailing self offset must equal that record offset,
+  the block ids must ascend strictly, and every tail offset must name a position
+  at or after the append-log start and strictly before the digest.
+- A digest that fails any of this is not an error: open falls back to the full
+  record scan and produces the identical answer. Only `MissingResourceLimit` and
+  `TrustedUnboundedRequiresExplicitApi` propagate, for the reason they propagate
+  out of the segment walk. `open_readonly_lazy_with_report` returns
+  `LazyOpenSource::{Digest, FullScan}` so the fallback is observable — the two
+  differ by about four orders of magnitude in read syscalls and by nothing at
+  all in the answer.
+- A writer that stops without a commit point leaves a data record at the end of
+  the file, so the probe finds no digest and the next open scans. This is the
+  fallback, not an error, but it costs the whole benefit.
+- `replace_block` re-encodes every digest payload against the published
+  generation's offsets, as it does every segment payload. A digest payload is
+  block tails and a self offset, and a rewrite moves both; copying it would
+  publish a generation whose digest describes the file it replaced.
+  `replace_rewrite` refuses record-footer formats outright, and a digest
+  requires the footer, so that path is unreachable for a digest format.
 
 ### Checkpoint Index
 

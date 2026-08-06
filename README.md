@@ -22,8 +22,15 @@ is covered in **[API Changes](docs/api-changes.md)**.
 - Declaring a custom binary format and getting typed readers and writers for it.
 - Append-log files whose record count and distinct-key count fit comfortably in
   RAM alongside the application. This is the default path, and the only part of
-  the library with an executed test history behind it. Budget about **104 bytes of
-  resident index per record**; open scans the whole file.
+  the library with an executed test history behind it. Budget **16 bytes of
+  resident directory per record** — the record's offset and its committed bit;
+  everything else is rebuilt from the record when a read asks. By default open
+  scans the whole file to build it, and two opt-in policies change that:
+  `segment_on_flush` makes the open walk one record per commit point, and
+  `open_digest_on_flush` plus `open_readonly_lazy` makes it frame one record and
+  build no directory at all, leaving the caller to build only the part it needs
+  with `record_map`. Measured on a 50,000-record file: **100,316 read syscalls
+  at open, 516, and 20.**
 - Bounded-memory ingest and point lookup over data far larger than RAM — with two
   caveats that a reader should weigh before choosing Varve for this workload.
   It is behind the `high-cardinality-dev` feature, has never shipped in a released

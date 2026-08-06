@@ -17,10 +17,23 @@ decoder, header field or version constant was touched. If you are coming from
 
 ---
 
-## B. Unreleased: two signatures changed
+## B. Unreleased: two signatures changed, and one struct gained a field
 
-Both come from the same change — the reader stopped keeping a copy of the file's
-index — and both are source-level only. **No on-disk byte changed.**
+The two signatures come from the same change — the reader stopped keeping a copy
+of the file's index — and are source-level only. The field is
+`IndexPolicy::open_digest_on_flush` (B.4), which breaks struct-literal
+construction and nothing else.
+
+**No on-disk byte changed for a format that adds nothing.** The unreleased round
+does add one new on-disk record — the open digest, internal block id
+`0xFFFF_FFF5` — but only for a format that declares
+`open_digest_on_flush`, which is off by default. A spec that leaves it off
+writes byte-identical files and hashes to the same `computed_schema_hash()` as
+before. A reader whose spec does not declare the digest indexes it as
+an internal record at a reserved block id, exactly as it indexes a segment
+record: present in `scan()` and `index_entries()`, invisible to `blocks::<T>()`.
+Measured — the same file indexed by an aware and an unaware reader produces the
+identical entry list.
 
 ### B.1 `scan()` yields `Result<BlockEvent>`
 
@@ -108,6 +121,29 @@ Everything else is additive: the `_into` family, `open_*_with_scratch`,
 `open_readonly_without_directory`, `BlockVec::get_into`, and the generated
 `_entries_into` / `_decoded_into` / `_into` twins. See
 [API Reference](api-reference.md#reads-that-fill-a-buffer-you-own).
+
+So are the two that came after them, and they are the pair worth reading
+together:
+
+| New | What it is |
+| --- | --- |
+| `VarveFile::record_map(&mut Vec<RecordIndexEntry>)` → `RecordMap<'_>` | an index over your buffer, walked only as far as you ask; implements `RecordDirectory` |
+| `VarveFile::open_readonly_lazy(spec, path)` | an open that frames one record — the digest — and builds no index |
+| `VarveFile::open_readonly_lazy_with_report(..)` → `(Self, LazyOpenSource)` | the same, and which route it took |
+| `IndexPolicy::with_open_digest_on_flush(bool)` | writes the digest the lazy open reads |
+| `OPEN_DIGEST_BLOCK_ID`, `LazyOpenSource` | the internal block id and the report enum |
+
+`IndexPolicy` gained a public field, `open_digest_on_flush`. It is `pub` on a
+non-`#[non_exhaustive]` struct, so **code that constructs an `IndexPolicy` with
+a struct literal will not compile** until the field is added; `IndexPolicy::new`
+and the `with_*` builders are unaffected, and every associated constant
+(`ScanOnOpen`, `SegmentOnFlush`, …) is unchanged. The field defaults to `false`
+everywhere, and a file written with it off is byte-identical to one written
+before it existed.
+
+See [API Reference](api-reference.md#an-open-that-reads-no-record) for the
+measurements and [Format Author Guide](format-author-guide.md) for how to choose
+between `segment_on_flush` and `open_digest_on_flush`.
 
 ---
 

@@ -424,6 +424,61 @@ A file it cannot account for — one written before you enabled it, one whose
 writer appended past its last commit point, a truncated tail — opens by the old
 scan and produces the identical index. See `docs/known-limitations.md` §2.1.
 
+### Making Open Stop Building An Index
+
+`segment_on_flush` makes the open-time walk cheap. `open_digest_on_flush` asks a
+different question: what if the open does not build an index at all?
+
+Three facts are the only reason an open reads a file it is not indexing — where
+the committed file ends, what sequence the next append takes, and where each
+block's newest record sits. None of them is in any single record. A **digest** is
+those three, written at each commit point:
+
+```rust
+const SPEC: FormatSpec = MyFormat::SPEC
+    .with_index_policy(MyFormat::SPEC.index_policy.with_open_digest_on_flush(true));
+```
+
+```rust
+let file = VarveFile::open_readonly_lazy(SPEC, path)?;   // frames one record
+let mut buffer = Vec::new();
+let mut map = file.record_map(&mut buffer)?;             // reads nothing yet
+let hit = map.find(|entry| entry.block_id == Note::ID)?; // walks until it finds
+```
+
+**Which of the two you want is a disk-size question**, and it is the only
+question. Measured on a 31 MB, 50,000-record file with a commit point every 500
+records:
+
+| | read syscalls at open | on-disk cost | builds an index? |
+| --- | --- | --- | --- |
+| neither (scan) | 100,316 | — | yes |
+| `segment_on_flush` | 516 | **+3.67 MB** | yes |
+| `open_digest_on_flush` | **20** | **+12.8 KB** | no |
+
+A segment carries an index entry per record it covers, so what it costs on disk
+tracks your record count. A digest carries 12 bytes per *distinct block id*, so
+it does not: the same format at 200 and at 2,000 records writes exactly the same
+128-byte digest. That is what makes the digest the one you can leave on for a
+file that will hold a billion records.
+
+The two are not alternatives — declare both if some of your readers want the
+index cheaply and others want no index at all. A digest also composes with
+`checkpoint_on_flush`, which a segment does not.
+
+The trade is that a digest open has **no record directory**, so `blocks`,
+`scan` and `keyed_blocks` return `Error::NoResidentDirectory` rather than
+answering. They are not withdrawn: `with_directory(&map)` answers all of them
+against whatever prefix the map has walked, and `block_chain`,
+`block_tail_offset`, `read_block_at` and every entry-taking `_into` read need no
+directory at all — which is why the digest carries the block tails.
+
+It requires `block_offset_chain` (which it turns on for you). A file it cannot
+account for falls back to the scan, and unlike the segment chain that fallback
+is reportable: `open_readonly_lazy_with_report` returns
+`LazyOpenSource::{Digest, FullScan}`. **Finish writing with `flush()`** here
+too, and for the same reason.
+
 ## Custom Physical Layout
 
 Most formats should use the Varve-native append log. Use custom physical layout

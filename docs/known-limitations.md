@@ -653,13 +653,16 @@ ratio is 16x-29x here, but this host's scan timings vary by about 2x run to
 run — read it as an order of magnitude, not a factor. Nothing above was measured
 on Windows, and nothing above was measured beyond 200,000 records.
 
-What it does **not** change is the paragraph below: the index it produces is the
-same `Vec<RecordIndexEntry>` with one entry per record, so `104 * records` is
-still what a handle holds for the blocks that are in it.
+What it does **not** change is the residency below: the index it produces is the
+same one a scan produces, so the 16-byte directory slot per record is still what
+a handle holds for the blocks that are in it. What it costs instead is **disk** —
+a segment carries an index entry per record it covers, so the file grows with
+the record count. Measured on a 31 MB, 50,000-record file with a commit point
+every 500 records: **+3.67 MB**.
 
 **`BlockResidencyDescriptor` is the mechanism that reduces that**, per block. A
 block declared `resident: false` is written, sequenced, chained and recovered
-exactly as before and is not mirrored in memory, so `104 * records` counts only
+exactly as before and is not mirrored in memory, so `16 * records` counts only
 the blocks you kept. It requires `block_offset_chain`, and it gives up
 `blocks::<T>()` (a typed `Error::BlockNotResident`, not an empty collection),
 replacement, and whole-generation rewrite for the whole format. Reach the block
@@ -709,9 +712,49 @@ and truncate on the mismatch, and any open under
 > feature doing nothing. End a writing session with `flush`, and check that a
 > loop like `if i % 256 == 255 { flush() }` is followed by one.
 
-**Otherwise every open scans the whole record region, and no policy changes
-that.** This correction matters because the previous version of this document
-offered a mitigation that does not exist:
+**A second policy changes the walk, and this one does not build an index at
+all.** `IndexPolicy::open_digest_on_flush` makes each commit point append an
+internal *open digest* record carrying the only three facts an open needs that
+live in no single record: where the committed file ends, what sequence the next
+append takes, and where each block's newest record sits. `open_readonly_lazy`
+reads it and frames **one record**.
+
+Measured, 50,000 records / 31 MB, same host:
+
+| open | read syscalls | bytes read | file overhead |
+| --- | --- | --- | --- |
+| `open_readonly` (scan) | 100,316 | 3,207,102 | — |
+| `open_readonly` (segment chain) | 516 | 7,332,522 | +3.67 MB |
+| `open_readonly_lazy` (digest) | **20** | **516** | **+12.8 KB** |
+
+The last column is the difference between the two tail records, and it is the
+whole reason both exist. A segment writes an entry per record it covers, so its
+overhead tracks the record count; a digest writes 12 bytes per *distinct block
+id*, so it is constant. Measured directly: the same format at 200 and at 2,000
+records carries a digest of exactly the same 128 bytes. What a segment buys for
+its size is an open that *builds the index*, which a digest deliberately does
+not.
+
+The handle a digest open returns keeps **no directory**, because none was built.
+`blocks`, `scan` and `keyed_blocks` return `Error::NoResidentDirectory` and are
+answered through `with_directory`; `block_chain`, `block_tail_offset`,
+`read_block_at` and every entry-taking `_into` read need no directory and work
+directly. The index the caller actually wants is built with `record_map`, which
+walks forward only as far as the question — measured, finding the first record
+of a block in that same 50,000-record file: **13 read syscalls**.
+
+Like the chain, the digest is derived: anything it cannot account for falls back
+to the full scan and produces the identical answer. Unlike the chain, the
+fallback is *reportable* — `open_readonly_lazy_with_report` returns
+`LazyOpenSource::{Digest, FullScan}`, because four orders of magnitude is not
+something a caller should have to infer from a stopwatch.
+
+It requires `block_offset_chain` and composes with `segment_on_flush` and
+`checkpoint_on_flush` alike; the three answer different questions.
+
+**Otherwise every open scans the whole record region.** This correction matters
+because the previous version of this document offered a mitigation that does not
+exist:
 
 - `IndexPolicy::CheckpointOnFlush` does **not** seed an open from a checkpoint.
   Every open path calls `load_index`, which calls `scan_records_from` for any
@@ -747,7 +790,8 @@ where the figures in older copies of this document come from. Measured across
 | | who holds the directory | per-record cost to the handle |
 | --- | --- | --- |
 | `open_readonly` / `open` | varve | 16 B |
-| `open_readonly_without_directory(spec, path, &mut index)` | you | **0** |
+| `open_readonly_without_directory(spec, path, &mut index)` | you, in full | **0** |
+| `open_readonly_lazy` + `record_map` (needs `open_digest_on_flush`) | you, only the part you walked | **0** |
 | `VarveStreamReader` (`high-cardinality-dev`) | nobody — sequential walk only | 0 |
 
 The middle row is not a reduction in capability. `blocks`, `scan`,
@@ -769,6 +813,10 @@ buffer — `open_readonly_with_scratch`, or `open_readonly_without_directory`,
 which take one — and that allocation happens once for any number of files rather
 than once per open: measured 29,824,680 bytes over eight opens against
 **5,969,576** through one buffer.
+
+That peak is a property of the *scan*, so the third row above is the only one
+that avoids it rather than amortising it: `open_readonly_lazy` from a digest
+never builds the array, because it never frames a record.
 
 `ReadLimits::STANDARD` leaves `max_records`, `max_index_bytes` and
 `max_scan_bytes` at `u64::MAX`, so the **default profile places no ceiling on

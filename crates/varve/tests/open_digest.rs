@@ -694,3 +694,53 @@ fn a_replacement_generation_re_encodes_the_digest() -> varve::Result<()> {
     assert_eq!(source, LazyOpenSource::Digest);
     Ok(())
 }
+
+/// A reader whose spec does not declare the digest, on a file that has one.
+///
+/// This is the compatibility question the docs make a claim about, and the
+/// claim was written before it was measured. A digest is an internal record at
+/// a reserved block id, so a reader that never looks for one should index it
+/// the way it indexes a segment record — present in `scan()` and
+/// `index_entries()`, invisible to `blocks::<T>()` — and read the file
+/// correctly either way.
+#[test]
+fn a_reader_that_does_not_declare_the_digest_still_reads_the_file() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("compat.varve");
+    write_lines(digest_spec(), &path, 120, 40)?;
+
+    // Same format, digest not declared — which is what a build from before the
+    // option existed sees.
+    let unaware = VarveFile::open_readonly(plain_spec(), &path)?;
+    let aware = VarveFile::open_readonly(digest_spec(), &path)?;
+
+    assert_eq!(
+        unaware
+            .index_entries()
+            .iter()
+            .map(|entry| (entry.block_id, entry.record_offset))
+            .collect::<Vec<_>>(),
+        aware
+            .index_entries()
+            .iter()
+            .map(|entry| (entry.block_id, entry.record_offset))
+            .collect::<Vec<_>>(),
+        "the two must index the same file identically"
+    );
+
+    // The digests are there, and they are invisible to a typed read.
+    let digests = unaware
+        .index_entries()
+        .iter()
+        .filter(|entry| entry.block_id == varve::OPEN_DIGEST_BLOCK_ID)
+        .count();
+    assert!(digests > 0, "the fixture must actually contain digests");
+    assert_eq!(unaware.blocks::<Line>()?.len(), 120);
+    assert_eq!(unaware.blocks::<Note>()?.len(), 2);
+
+    // And the values decode.
+    let lines = unaware.blocks::<Line>()?;
+    assert_eq!(lines.get(0)?, Some(Line { value: 0 }));
+    assert_eq!(lines.get(119)?, Some(Line { value: 119 }));
+    Ok(())
+}

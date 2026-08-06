@@ -62,6 +62,79 @@ itself returns the new `Error::NoResidentDirectory { operation }`, naming both
 the read and the way to answer it — deliberately an error rather than an empty
 answer, which would be indistinguishable from an empty file.
 
+### An index you build only as far as the question
+
+`file.record_map(&mut buffer)` returns a `RecordMap<'_>` over a
+`Vec<RecordIndexEntry>` you own. It reads nothing when created and walks the
+record chain forward only when asked: `find(predicate)` stops at the first
+match, `fill_to(k)` stops at `k` entries, `fill()` goes to the end. A second
+question resumes where the first stopped, `clear()` empties and rewinds,
+`release()` empties and keeps the position.
+
+It implements `RecordDirectory`, so a map *is* a directory —
+`with_directory(&map)` answers `blocks`, `scan`, `keyed_blocks` and the rest
+against the prefix walked so far. It borrows the buffer, not the handle, so
+reads through the handle stay available while the map is alive.
+
+Measured on a 50,000-record, 31 MB file, wanting ten records at position 25,000:
+**100,238 read syscalls** through `index_entries_into`, **50,058** through
+`record_map` `fill_to`, and **13** to find the first record of a block. A
+bounded-memory pass (`fill_to(64)` / `release()` / repeat) covers every record
+with 64 entries live instead of 50,100 — 6.6 KB rather than 5.2 MB — and reads
+no record twice.
+
+A map walked to completion is the open scan's index, entry for entry. What a
+partial one does not do is validate sequence uniqueness past its stopping point.
+
+### An open that reads no record
+
+`IndexPolicy::open_digest_on_flush` makes each commit point append an internal
+**open digest** record carrying the three facts an open needs that live in no
+single record: where the committed file ends, what sequence the next append
+takes, and where each block's newest record sits. `VarveFile::open_readonly_lazy`
+reads it and frames **one record**.
+
+Measured, 50,000 records / 31 MB:
+
+| open | read syscalls | bytes read | file overhead |
+| --- | --- | --- | --- |
+| `open_readonly` (scan) | 100,316 | 3,207,102 | — |
+| `open_readonly` (segment chain) | 516 | 7,332,522 | +3.67 MB |
+| `open_readonly_lazy` (digest) | **20** | **516** | **+12.8 KB** |
+
+The last column is how a format chooses between the two tail records. A segment
+carries an index entry per record it covers, so its overhead tracks the record
+count; a digest carries twelve bytes per *distinct block id*, so it is constant —
+measured directly, the same format at 200 and at 2,000 records writes exactly
+the same 128-byte digest. What a segment buys for its size is an open that
+*builds the index*; a digest deliberately does not, and pairs with `record_map`.
+
+The handle keeps no directory. `blocks`, `scan` and `keyed_blocks` return
+`Error::NoResidentDirectory` and are answered through `with_directory`;
+`block_chain`, `block_tail_offset`, `read_block_at` and every entry-taking
+`_into` read need no directory and work directly, which is what the block tails
+are in the digest for.
+
+**It falls back to the full scan** for a file with no usable digest — written
+before the option, appended past its last commit, truncated, rotted. Not an
+error and the answer is identical, but four orders of magnitude, so
+`open_readonly_lazy_with_report` returns `LazyOpenSource::{Digest, FullScan}`.
+Every field is validated against the file: flipping one bit in the trailer, a
+tail offset, a block id or the sequence each falls back and answers what the
+file actually holds.
+
+Requires `block_offset_chain`. Composes with `segment_on_flush` and
+`checkpoint_on_flush` alike — the three answer different questions. Off by
+default; a file written without it is byte-identical to one written before it
+existed, and `computed_schema_hash()` is unchanged. `IndexPolicy` gained a
+public field, so struct-literal construction of one needs updating; `new` and
+the `with_*` builders do not.
+
+New on disk: internal block id `OPEN_DIGEST_BLOCK_ID` (`0xFFFF_FFF5`), payload
+magic `b"VDIG"`. See [Spec](docs/spec.md) for the layout and the acceptance
+rules. A reader whose spec does not declare it indexes it as an internal record
+exactly as it indexes a segment record; measured, the entry lists are identical.
+
 ### `max_file_len` no longer does anything
 
 All twenty-two file-length enforcement sites were removed, and `file_len` came
