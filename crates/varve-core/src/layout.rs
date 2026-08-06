@@ -219,6 +219,21 @@ pub struct LayoutWriter {
     _lock: crate::file::WriterLock,
 }
 
+/// Where one segment starts, and which declared kind it is.
+///
+/// Sixteen bytes, against a `LayoutSegmentInfo` that carries two
+/// `Vec<LayoutFieldValue>` and eight offsets — several heap allocations per
+/// segment, retained for the life of the reader. Everything the info holds is
+/// derived from the segment's own lead-in and footer at this offset, so keeping
+/// it in memory is keeping a second copy of the file. This is the same change
+/// the record index went through, and for a varve-native spec these segments
+/// *are* records.
+#[derive(Clone, Copy, Debug)]
+struct SegmentSlot {
+    segment_start: u64,
+    dispatch_index: u32,
+}
+
 #[derive(Debug)]
 pub struct LayoutReader {
     spec: FormatSpec,
@@ -226,7 +241,7 @@ pub struct LayoutReader {
     snapshot: SnapshotFile,
     file_header_len: u64,
     file_header_fields: Vec<LayoutFieldValue>,
-    segments: Vec<LayoutSegmentInfo>,
+    slots: Vec<SegmentSlot>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -623,11 +638,16 @@ fn inspect_layout_file_inner<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Resul
         inspect_native_layout_file(spec, path)
     } else {
         let reader = LayoutReader::open_inner(spec, path)?;
+        // This one materialises every segment on purpose — it is the whole
+        // point of `inspect_layout_file` — so it is the caller who chooses to
+        // pay it, not the reader.
+        let mut segments = Vec::new();
+        reader.segments_into(&mut segments)?;
         Ok(LayoutFileInfo {
             plan: spec.effective_layout(),
             file_header_len: reader.file_header_len,
             file_header_fields: reader.file_header_fields,
-            segments: reader.segments,
+            segments,
         })
     }
 }
@@ -1232,14 +1252,14 @@ impl LayoutReader {
         let path = path.as_ref().to_path_buf();
         let snapshot = SnapshotFile::new(File::open(&path)?)?;
         let header = read_file_header(spec, &snapshot)?;
-        let (segments, _) = scan_layout_segments(spec, &snapshot, header.len, header.index_bytes)?;
+        let slots = scan_layout_segment_slots(spec, &snapshot, header.len, header.index_bytes)?;
         Ok(Self {
             spec,
             path,
             snapshot,
             file_header_len: header.len,
             file_header_fields: header.fields,
-            segments,
+            slots,
         })
     }
 
@@ -1266,22 +1286,103 @@ impl LayoutReader {
             .map(|field| &field.value)
     }
 
-    pub fn segments(&self) -> &[LayoutSegmentInfo] {
-        &self.segments
+    /// How many segments the file holds.
+    pub fn segment_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The segment at `index`, by value.
+    ///
+    /// Owned and fallible, not a borrow out of a retained array. A borrow is
+    /// the shape that keeps every segment resident: it promises the caller that
+    /// all of them exist, contiguously, for as long as the borrow lives — which
+    /// is the one thing a reader that rebuilds a segment from the file cannot
+    /// offer. This is the same change the record index went through, for the
+    /// same reason, and `LayoutSegmentInfo` carries two `Vec<LayoutFieldValue>`
+    /// so the array it replaces is several allocations per segment.
+    pub fn segment(&self, index: usize) -> Result<Option<LayoutSegmentInfo>> {
+        let Some(slot) = self.slots.get(index).copied() else {
+            return Ok(None);
+        };
+        let dispatch = segment_dispatch_table(self.spec)?;
+        let mut cursor = self.snapshot.cursor_at(slot.segment_start)?;
+        self.rebuild_segment(&mut cursor, &dispatch, slot).map(Some)
+    }
+
+    /// Rebuilds one segment from its own bytes.
+    ///
+    /// The cursor is the caller's so a walk can reuse one: it wraps a
+    /// `BufReader` over a duplicated descriptor, and minting one per segment
+    /// would be a `dup` syscall per segment.
+    fn rebuild_segment(
+        &self,
+        cursor: &mut SnapshotCursor,
+        dispatch: &[SegmentDispatch],
+        slot: SegmentSlot,
+    ) -> Result<LayoutSegmentInfo> {
+        let descriptor = dispatch
+            .get(slot.dispatch_index as usize)
+            .ok_or(Error::LayoutInvalidSegmentBounds {
+                offset: slot.segment_start,
+            })?
+            .descriptor;
+        read_layout_segment_at(
+            self.spec,
+            cursor,
+            descriptor,
+            slot.segment_start,
+            self.snapshot.len(),
+        )
+        .map_err(|failure| failure.error)
+    }
+
+    /// Every segment in file order, each one fallible.
+    /// One dispatch table and one cursor for the whole walk, not one per
+    /// segment. Both are built on the first `next()` so that `segments()`
+    /// itself stays infallible.
+    pub fn segments(&self) -> impl Iterator<Item = Result<LayoutSegmentInfo>> + '_ {
+        let mut state: Option<(Vec<SegmentDispatch>, SnapshotCursor)> = None;
+        self.slots.iter().copied().map(move |slot| {
+            if state.is_none() {
+                state = Some((
+                    segment_dispatch_table(self.spec)?,
+                    self.snapshot.cursor_at(self.file_header_len)?,
+                ));
+            }
+            let (dispatch, cursor) = state.as_mut().expect("built immediately above");
+            self.rebuild_segment(cursor, dispatch, slot)
+        })
+    }
+
+    /// Fills the caller's buffer with every segment.
+    ///
+    /// `out` is cleared and then extended, so a caller that reuses one buffer
+    /// allocates once and never again.
+    pub fn segments_into(&self, out: &mut Vec<LayoutSegmentInfo>) -> Result<()> {
+        out.clear();
+        let count = self.segment_count();
+        out.try_reserve(count)
+            .map_err(|_| Error::AllocationFailed {
+                resource: "layout segments",
+                requested: u64::try_from(count.saturating_mul(size_of::<LayoutSegmentInfo>()))
+                    .unwrap_or(u64::MAX),
+            })?;
+        for segment in self.segments() {
+            out.push(segment?);
+        }
+        Ok(())
     }
 
     pub fn read_metadata(&self, index: usize) -> Result<Vec<u8>> {
         let segment = self
-            .segments
-            .get(index)
+            .segment(index)?
             .ok_or(Error::LayoutInvalidSegmentBounds { offset: 0 })?;
         self.read_snapshot_range(segment.metadata_offset, segment.metadata_len)
     }
 
     pub fn read_metadata_range(&self, index: usize, offset: u64, len: u64) -> Result<Vec<u8>> {
         let segment = self
-            .segments
-            .get(index)
+            .segment(index)?
             .ok_or(Error::LayoutInvalidSegmentBounds { offset: 0 })?;
         let absolute = checked_subrange(
             segment.metadata_offset,
@@ -1295,16 +1396,14 @@ impl LayoutReader {
 
     pub fn read_raw(&self, index: usize) -> Result<Vec<u8>> {
         let segment = self
-            .segments
-            .get(index)
+            .segment(index)?
             .ok_or(Error::LayoutInvalidSegmentBounds { offset: 0 })?;
         self.read_snapshot_range(segment.raw_offset, segment.raw_len)
     }
 
     pub fn read_raw_range(&self, index: usize, offset: u64, len: u64) -> Result<Vec<u8>> {
         let segment = self
-            .segments
-            .get(index)
+            .segment(index)?
             .ok_or(Error::LayoutInvalidSegmentBounds { offset: 0 })?;
         let absolute = checked_subrange(
             segment.raw_offset,
@@ -1942,29 +2041,7 @@ trait LayoutScanSink {
         index_bytes: u64,
     ) -> Result<u64>;
 
-    fn accept(&mut self, info: LayoutSegmentInfo);
-}
-
-/// Keeps every segment. What `LayoutReader::open` needs.
-struct RetainSegments(Vec<LayoutSegmentInfo>);
-
-impl LayoutScanSink for RetainSegments {
-    fn accepted(&self) -> usize {
-        self.0.len()
-    }
-
-    fn reserve(
-        &mut self,
-        spec: FormatSpec,
-        descriptor: SegmentDescriptor,
-        index_bytes: u64,
-    ) -> Result<u64> {
-        reserve_layout_segment(spec, &mut self.0, descriptor, index_bytes)
-    }
-
-    fn accept(&mut self, info: LayoutSegmentInfo) {
-        self.0.push(info);
-    }
+    fn accept(&mut self, dispatch_index: usize, info: LayoutSegmentInfo);
 }
 
 /// Keeps nothing but the tally. What `LayoutWriter::open` needs: it discarded
@@ -1986,9 +2063,62 @@ impl LayoutScanSink for CountSegments {
         charge_layout_segment(spec, self.0, descriptor, index_bytes)
     }
 
-    fn accept(&mut self, _info: LayoutSegmentInfo) {
+    fn accept(&mut self, _dispatch_index: usize, _info: LayoutSegmentInfo) {
         self.0 += 1;
     }
+}
+
+/// Keeps only where each segment starts and which kind it is. What
+/// `LayoutReader::open` needs now: the info itself is rebuilt from the file
+/// when a caller asks for it.
+///
+/// This replaced `RetainSegments`, which kept every `LayoutSegmentInfo` and was
+/// the layout family's version of the resident record index. `CountSegments`
+/// below is unchanged — the writer never wanted the infos either.
+struct RetainSlots(Vec<SegmentSlot>);
+
+impl LayoutScanSink for RetainSlots {
+    fn accepted(&self) -> usize {
+        self.0.len()
+    }
+
+    fn reserve(
+        &mut self,
+        spec: FormatSpec,
+        descriptor: SegmentDescriptor,
+        index_bytes: u64,
+    ) -> Result<u64> {
+        // The same charge a retaining scan makes, deliberately. `IndexBytes` is
+        // stated in `LayoutSegmentInfo`s, and it is what refuses an oversized
+        // file; charging the directory's smaller footprint instead would let a
+        // file open here that `inspect_layout_file` — which still materialises
+        // every segment — would refuse. One ceiling, one answer.
+        let charged = charge_layout_segment(spec, self.0.len(), descriptor, index_bytes)?;
+        self.0.try_reserve(1).map_err(|_| Error::AllocationFailed {
+            resource: "layout segment directory",
+            requested: u64::try_from(size_of::<SegmentSlot>()).unwrap_or(u64::MAX),
+        })?;
+        Ok(charged)
+    }
+
+    fn accept(&mut self, dispatch_index: usize, info: LayoutSegmentInfo) {
+        self.0.push(SegmentSlot {
+            segment_start: info.segment_start,
+            dispatch_index: u32::try_from(dispatch_index).unwrap_or(u32::MAX),
+        });
+    }
+}
+
+/// The walk, keeping the directory only.
+fn scan_layout_segment_slots(
+    spec: FormatSpec,
+    snapshot: &SnapshotFile,
+    start_offset: u64,
+    initial_index_bytes: u64,
+) -> Result<Vec<SegmentSlot>> {
+    let mut sink = RetainSlots(Vec::new());
+    scan_layout_segments_into(spec, snapshot, start_offset, initial_index_bytes, &mut sink)?;
+    Ok(sink.0)
 }
 
 /// The layout segment walk. Returns the per-name counts it maintains as it goes
@@ -2034,25 +2164,13 @@ fn scan_layout_segments_into<S: LayoutScanSink>(
         }
         offset = info.segment_end;
         increment_segment_count(&mut segment_counts, descriptor.name)?;
-        sink.accept(info);
+        sink.accept(dispatch_index, info);
         index_bytes = next_index_bytes;
     }
     if offset != file_len {
         return Err(Error::LayoutInvalidSegmentBounds { offset });
     }
     Ok((segment_counts, index_bytes))
-}
-
-fn scan_layout_segments(
-    spec: FormatSpec,
-    snapshot: &SnapshotFile,
-    start_offset: u64,
-    initial_index_bytes: u64,
-) -> Result<(Vec<LayoutSegmentInfo>, u64)> {
-    let mut sink = RetainSegments(Vec::new());
-    let (_counts, index_bytes) =
-        scan_layout_segments_into(spec, snapshot, start_offset, initial_index_bytes, &mut sink)?;
-    Ok((sink.0, index_bytes))
 }
 
 /// The same walk, retaining nothing. The counts are maintained by the walk

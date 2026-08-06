@@ -421,13 +421,13 @@ fn layout_create_over_live_alias_is_refused_before_truncation() -> Result<()> {
     drop(writer);
 
     let reader = LockLayoutFormat::open_layout_reader(&original)?;
-    assert_eq!(reader.segments().len(), 2);
+    assert_eq!(reader.segment_count(), 2);
     assert_eq!(
-        reader.segments()[0].field("kind"),
+        reader.segment(0)?.expect("segment 0").field("kind"),
         Some(&LayoutValue::U32(7))
     );
     assert_eq!(
-        reader.segments()[1].field("kind"),
+        reader.segment(1)?.expect("segment 1").field("kind"),
         Some(&LayoutValue::U32(8))
     );
     Ok(())
@@ -455,9 +455,9 @@ fn layout_create_over_stale_file_truncates_through_bound_handle() -> Result<()> 
         "stale bytes survived the create-path truncation"
     );
     let reader = LockLayoutFormat::open_layout_reader(&stale)?;
-    assert_eq!(reader.segments().len(), 1);
+    assert_eq!(reader.segment_count(), 1);
     assert_eq!(
-        reader.segments()[0].field("kind"),
+        reader.segment(0)?.expect("segment 0").field("kind"),
         Some(&LayoutValue::U32(9))
     );
     Ok(())

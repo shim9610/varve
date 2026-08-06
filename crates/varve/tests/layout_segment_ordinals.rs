@@ -100,7 +100,7 @@ fn typed_layout_segment_lookup_is_not_quadratic() -> varve::Result<()> {
     build(&path)?;
 
     let reader = OrdinalLayoutFormat::open_layout_reader(&path)?;
-    assert_eq!(reader.segments().len(), SEGMENTS);
+    assert_eq!(reader.segment_count(), SEGMENTS);
 
     // ---- behaviour: identical to what the linear scan returned ----
     for index in 0..SEGMENTS {

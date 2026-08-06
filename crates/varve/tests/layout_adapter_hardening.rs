@@ -108,7 +108,7 @@ fn returned_stream_error_rolls_back_and_writer_is_reusable() -> varve::Result<()
     drop(writer);
 
     let reader = LayoutHardeningFormat::open_layout_reader(&path)?;
-    assert_eq!(reader.segments().len(), 1);
+    assert_eq!(reader.segment_count(), 1);
     assert_eq!(reader.read_metadata(0)?, b"metadata");
     assert_eq!(reader.read_raw(0)?, b"raw");
     drop(reader);

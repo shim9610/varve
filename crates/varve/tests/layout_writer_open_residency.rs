@@ -177,6 +177,19 @@ fn build(path: &Path, data_segments: u32) -> varve::Result<()> {
     Ok(())
 }
 
+/// `(retained, peak)` bytes for an open `LayoutReader`, on this thread.
+///
+/// The handle is alive when `retained` is read and is dropped afterwards, so a
+/// reader that frees its segments on drop cannot hide behind the drop.
+fn reader_cost(path: &Path) -> varve::Result<(isize, isize)> {
+    let baseline = begin_window();
+    let reader = ResidencyLayoutFormat::open_layout_reader(path)?;
+    let retained = LIVE_BYTES.with(Cell::get) - baseline;
+    let peak = peak_above(baseline);
+    drop(reader);
+    Ok((retained, peak))
+}
+
 /// Peak live bytes during `open_layout_writer`, measured on this thread.
 ///
 /// The handle is dropped *after* the peak is read, so a writer that frees its
@@ -259,13 +272,83 @@ fn a_reopened_writer_still_knows_which_segments_it_has() -> varve::Result<()> {
     }
 
     let reader = ResidencyLayoutFormat::open_layout_reader(&path)?;
-    assert_eq!(reader.segments().len(), 5);
-    assert_eq!(reader.segments()[0].name, "ControlSegment");
+    assert_eq!(reader.segment_count(), 5);
+    assert_eq!(
+        reader.segment(0)?.expect("first segment").name,
+        "ControlSegment"
+    );
     assert_eq!(reader.control_segments()?.len(), 1);
     assert_eq!(reader.data_segments()?.len(), 4);
     assert_eq!(
         reader.data_segment(3)?.expect("last segment").channel()?,
         99
+    );
+    Ok(())
+}
+
+/// A `LayoutReader` must not hold the file's segments either.
+///
+/// The writer stopped retaining them when `CountSegments` was written; the
+/// reader kept a `Vec<LayoutSegmentInfo>` — a struct plus two `Vec`s of decoded
+/// field values, several heap allocations each — for the life of the handle.
+/// For a varve-native spec those segments are records, so this failed the
+/// TB-scale requirement the same way the record index did.
+///
+/// It now keeps a 16-byte directory slot per segment (start offset, kind) and
+/// rebuilds the info from the segment's own lead-in and footer on demand. Same
+/// discriminator as the writer test above: the slope across two sizes, not one
+/// number.
+#[test]
+fn opening_a_layout_reader_keeps_a_directory_and_not_the_segments() -> varve::Result<()> {
+    const SMALL: u32 = 1_000;
+    const LARGE: u32 = 50_000;
+
+    let directory = tempfile::tempdir()?;
+    let small_path = path_in(&directory, "reader-small.resl");
+    let large_path = path_in(&directory, "reader-large.resl");
+    build(&small_path, SMALL)?;
+    build(&large_path, LARGE)?;
+
+    reader_cost(&small_path)?; // warm
+
+    let (small_retained, small_peak) = reader_cost(&small_path)?;
+    let (large_retained, large_peak) = reader_cost(&large_path)?;
+
+    let added = isize::try_from(LARGE - SMALL).expect("segment count fits");
+    let retained_per_segment = (large_retained - small_retained) as f64 / added as f64;
+    let peak_per_segment = (large_peak - small_peak) as f64 / added as f64;
+
+    // Measured 2026-08-05, Linux/ext4, 1,000 -> 50,000 segments:
+    //
+    //   before  retained 303,485 -> 17,113,117 B   343.05 B/segment
+    //           peak     370,537 -> 17,180,169 B   343.05 B/segment
+    //   after   retained  16,441 ->  1,048,633 B    21.07 B/segment
+    //           peak       83,657 -> 1,115,849 B    21.07 B/segment
+    //
+    // 16.3x. The 21.07 is the 16-byte slot plus the directory `Vec`'s doubling
+    // slack: 65,536 slots x 16 = 1,048,576, which is the retained figure to
+    // within the fixed per-open cost. Peak tracks retained exactly, before and
+    // after, because the layout scan accepts one segment at a time and never
+    // held the whole array — unlike the record index, whose peak had to be
+    // reported separately.
+
+    assert!(
+        small_retained > 0,
+        "the allocator window measured nothing at all, so the comparison below \
+         would pass vacuously"
+    );
+    assert!(
+        retained_per_segment < 32.0,
+        "an open reader retains {retained_per_segment:.2} bytes per segment \
+         ({small_retained} at {SMALL}, {large_retained} at {LARGE}). A directory slot is 16 \
+         bytes; anything above that means the `LayoutSegmentInfo`s are resident again."
+    );
+    assert!(
+        peak_per_segment < 32.0,
+        "opening a reader peaks at {peak_per_segment:.2} bytes per segment ({small_peak} at \
+         {SMALL}, {large_peak} at {LARGE}). Unlike the record index, the layout scan never \
+         materialised the whole array — it accepts one segment at a time — so peak and \
+         retained should agree here."
     );
     Ok(())
 }

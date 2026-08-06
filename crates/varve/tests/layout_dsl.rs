@@ -804,13 +804,16 @@ fn custom_layout_writes_file_header_and_segment_footer() -> varve::Result<()> {
 
     let reader = FramedPhysicalFormat::open_layout_reader(&path)?;
     assert_eq!(reader.file_header_len(), 6);
-    assert_eq!(reader.segments().len(), 1);
+    assert_eq!(reader.segment_count(), 1);
     assert_eq!(
-        reader.segments()[0].field("kind"),
+        reader.segment(0)?.expect("segment 0").field("kind"),
         Some(&LayoutValue::U32(7))
     );
     assert_eq!(
-        reader.segments()[0].footer_field("segment_len"),
+        reader
+            .segment(0)?
+            .expect("segment 0")
+            .footer_field("segment_len"),
         Some(&LayoutValue::U64(43))
     );
     assert_eq!(reader.read_metadata(0)?, b"abc");
@@ -825,7 +828,9 @@ fn custom_layout_writes_file_header_and_segment_footer() -> varve::Result<()> {
     let inspected = FramedPhysicalFormat::inspect_layout_file(&path)?;
     assert_eq!(inspected.plan.preset, LayoutPreset::None);
     assert_eq!(inspected.file_header_len, 6);
-    assert_eq!(inspected.segments.as_slice(), reader.segments());
+    let mut from_reader = Vec::new();
+    reader.segments_into(&mut from_reader)?;
+    assert_eq!(inspected.segments, from_reader);
 
     cleanup(&path);
     Ok(())
@@ -1123,9 +1128,7 @@ fn custom_layout_declaration_defaults_to_byte_zero_physical_layout() -> varve::R
     assert_eq!(u32_at(&bytes, 4), 9);
     assert_eq!(&bytes[24..27], b"abc");
     assert_eq!(
-        ImplicitPhysicalFormat::open_layout_reader(&path)?
-            .segments()
-            .len(),
+        ImplicitPhysicalFormat::open_layout_reader(&path)?.segment_count(),
         1
     );
 
@@ -1177,10 +1180,13 @@ fn multi_segment_layout_dispatches_by_leading_literal_tag() -> varve::Result<()>
     }
 
     let reader = MultiPhysicalFormat::open_layout_reader(&path)?;
-    assert_eq!(reader.segments().len(), 3);
-    assert_eq!(reader.segments()[0].name, "ControlSegment");
-    assert_eq!(reader.segments()[1].name, "DataSegment");
-    assert_eq!(reader.segments()[2].name, "DataSegment");
+    assert_eq!(reader.segment_count(), 3);
+    assert_eq!(
+        reader.segment(0)?.expect("segment 0").name,
+        "ControlSegment"
+    );
+    assert_eq!(reader.segment(1)?.expect("segment 1").name, "DataSegment");
+    assert_eq!(reader.segment(2)?.expect("segment 2").name, "DataSegment");
     assert_eq!(reader.read_metadata(1)?, b"data-a");
     assert_eq!(reader.read_data_segment_metadata(0)?, b"data-a");
     assert_eq!(reader.read_data_segment_metadata(1)?, b"data-bb");
@@ -1227,9 +1233,9 @@ fn multi_segment_layout_dispatches_by_extended_literal_prefix() -> varve::Result
     assert_eq!(u16_at(&bytes, 4), 2);
 
     let reader = SameTagPhysicalFormat::open_layout_reader(&path)?;
-    assert_eq!(reader.segments().len(), 2);
-    assert_eq!(reader.segments()[0].name, "RawSegment");
-    assert_eq!(reader.segments()[1].name, "MetaSegment");
+    assert_eq!(reader.segment_count(), 2);
+    assert_eq!(reader.segment(0)?.expect("segment 0").name, "RawSegment");
+    assert_eq!(reader.segment(1)?.expect("segment 1").name, "MetaSegment");
     assert_eq!(reader.read_raw_segment_raw(0)?, b"raw");
     assert_eq!(reader.read_meta_segment_raw(0)?, b"meta");
     assert_eq!(reader.raw_segment(0)?.unwrap().kind()?, 2);
@@ -1307,8 +1313,8 @@ fn tdms_style_layout_writes_physical_leadin_offsets_and_raw_region() -> varve::R
     assert_eq!(f64_values(&bytes[raw_start..]), vec![0.25, 0.50, 0.75]);
 
     let reader = TdmsPhysicalFormat::open_layout_reader(&path)?;
-    assert_eq!(reader.segments().len(), 1);
-    let segment = &reader.segments()[0];
+    assert_eq!(reader.segment_count(), 1);
+    let segment = &reader.segment(0)?.expect("segment 0");
     assert_eq!(segment.field("toc_mask"), Some(&LayoutValue::U32(0x1110)));
     assert_eq!(segment.field("version"), Some(&LayoutValue::U32(4713)));
     assert_eq!(
@@ -1373,18 +1379,18 @@ fn tdms_style_layout_reopens_and_appends_multiple_segments() -> varve::Result<()
     }
 
     let reader = TdmsPhysicalFormat::open_layout_reader(&path)?;
-    assert_eq!(reader.segments().len(), 2);
+    assert_eq!(reader.segment_count(), 2);
     assert_eq!(reader.read_metadata(0)?, b"meta-a");
     assert_eq!(f64_values(&reader.read_raw(0)?), vec![1.0, 2.0]);
     assert_eq!(reader.read_metadata(1)?, b"meta-bb");
     assert_eq!(f64_values(&reader.read_raw(1)?), vec![3.0]);
     assert_eq!(
-        reader.segments()[1].field("toc_mask"),
+        reader.segment(1)?.expect("segment 1").field("toc_mask"),
         Some(&LayoutValue::U32(0x1108))
     );
     assert_eq!(
-        reader.segments()[1].segment_start,
-        reader.segments()[0].segment_end
+        reader.segment(1)?.expect("segment 1").segment_start,
+        reader.segment(0)?.expect("segment 0").segment_end
     );
 
     cleanup(&path);
@@ -1597,7 +1603,9 @@ fn custom_layout_rejects_corrupt_declared_file_header_and_footer() -> varve::Res
     }
 
     let mut bytes = read(&good_footer)?;
-    let footer_offset = FramedPhysicalFormat::open_layout_reader(&good_footer)?.segments()[0]
+    let footer_offset = FramedPhysicalFormat::open_layout_reader(&good_footer)?
+        .segment(0)?
+        .expect("segment 0")
         .footer_offset as usize;
     bytes[footer_offset..footer_offset + 4].copy_from_slice(b"BAD!");
     write(&bad_footer, &bytes)?;

@@ -477,7 +477,7 @@ fn physical_layout_segments(case: PerfCase) -> varve::Result<()> {
     let elapsed = timed(|| {
         let reader = PerfPhysicalLayoutFormat::open_layout_reader(&path)?;
         assert_eq!(reader.file_header_len(), 6);
-        assert_eq!(reader.segments().len(), case.records);
+        assert_eq!(reader.segment_count(), case.records);
         let raw = reader.read_raw(case.records - 1)?;
         assert_eq!(
             u64::from_le_bytes(raw[..8].try_into().expect("raw prefix")),

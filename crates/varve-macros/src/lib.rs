@@ -3976,8 +3976,32 @@ fn layout_typed_api_tokens(
                 self.inner.file_header_len()
             }
 
-            pub fn segments(&self) -> &[::varve::__core::LayoutSegmentInfo] {
+            pub fn segment_count(&self) -> usize {
+                self.inner.segment_count()
+            }
+
+            pub fn segment(
+                &self,
+                index: usize,
+            ) -> ::varve::__core::Result<
+                ::core::option::Option<::varve::__core::LayoutSegmentInfo>,
+            > {
+                self.inner.segment(index)
+            }
+
+            pub fn segments(
+                &self,
+            ) -> impl ::core::iter::Iterator<
+                Item = ::varve::__core::Result<::varve::__core::LayoutSegmentInfo>,
+            > + '_ {
                 self.inner.segments()
+            }
+
+            pub fn segments_into(
+                &self,
+                out: &mut ::std::vec::Vec<::varve::__core::LayoutSegmentInfo>,
+            ) -> ::varve::__core::Result<()> {
+                self.inner.segments_into(out)
             }
 
             pub fn read_metadata(&self, index: usize) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
@@ -4013,7 +4037,15 @@ fn layout_typed_api_tokens(
                     let mut table: ::std::vec::Vec<
                         (&'static str, ::std::vec::Vec<usize>),
                     > = ::std::vec::Vec::new();
-                    for (index, segment) in self.inner.segments().iter().enumerate() {
+                    for (index, segment) in self.inner.segments().enumerate() {
+                        let ::core::result::Result::Ok(segment) = segment else {
+                            // A segment that cannot be produced stops the table
+                            // here. The per-segment accessors below then report
+                            // `None` past this point rather than a wrong
+                            // ordinal, which is the same answer they gave for a
+                            // file with fewer segments.
+                            break;
+                        };
                         match table.iter_mut().find(|(name, _)| *name == segment.name) {
                             ::core::option::Option::Some((_, ordinals)) => {
                                 ordinals.push(index);
@@ -4305,6 +4337,7 @@ fn layout_reader_segment_methods_tokens(
     segment: &LayoutSegment,
 ) -> TokenStream2 {
     let plural = plural_method_ident(&segment.name);
+    let plural_into = format_ident!("{}_into", plural_method_ident(&segment.name));
     let singular = format_ident!("{}", singular_method_name(&segment.name));
     let read_metadata = format_ident!("read_{}_metadata", singular_method_name(&segment.name));
     let read_metadata_range = format_ident!(
@@ -4317,24 +4350,38 @@ fn layout_reader_segment_methods_tokens(
     let segment_name = segment.name.to_string();
     quote! {
         pub fn #plural(&self) -> ::varve::__core::Result<::std::vec::Vec<#info_type>> {
-            self.inner
-                .segments()
-                .iter()
-                .filter(|segment| segment.name == #segment_name)
-                .cloned()
-                .map(#info_type::from_inner)
-                .map(::core::result::Result::Ok)
-                .collect()
+            let mut out = ::std::vec::Vec::new();
+            self.#plural_into(&mut out)?;
+            ::core::result::Result::Ok(out)
+        }
+
+        /// Fills the caller's buffer. `out` is cleared and then extended.
+        ///
+        /// This also stopped deep-cloning: the segment is produced once and
+        /// moved, where the allocating form used to clone every matching
+        /// segment on top of the reader's own copy of it.
+        pub fn #plural_into(
+            &self,
+            out: &mut ::std::vec::Vec<#info_type>,
+        ) -> ::varve::__core::Result<()> {
+            out.clear();
+            for segment in self.inner.segments() {
+                let segment = segment?;
+                if segment.name == #segment_name {
+                    out.push(#info_type::from_inner(segment));
+                }
+            }
+            ::core::result::Result::Ok(())
         }
 
         pub fn #singular(&self, index: usize) -> ::varve::__core::Result<::core::option::Option<#info_type>> {
             let ::core::result::Result::Ok(index) = self.__varve_layout_segment_index(#segment_name, index) else {
                 return ::core::result::Result::Ok(::core::option::Option::None);
             };
-            let ::core::option::Option::Some(segment) = self.inner.segments().get(index) else {
+            let ::core::option::Option::Some(segment) = self.inner.segment(index)? else {
                 return ::core::result::Result::Ok(::core::option::Option::None);
             };
-            ::core::result::Result::Ok(::core::option::Option::Some(#info_type::from_inner(segment.clone())))
+            ::core::result::Result::Ok(::core::option::Option::Some(#info_type::from_inner(segment)))
         }
 
         pub fn #read_metadata(&self, index: usize) -> ::varve::__core::Result<::std::vec::Vec<u8>> {
