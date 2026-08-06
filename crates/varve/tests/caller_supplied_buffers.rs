@@ -1,8 +1,8 @@
 //! The `_into` family: every one of them, and the property that makes reuse
 //! safe rather than merely cheap.
 //!
-//! Nine of these entry points shipped with **no test at all** — they were
-//! measured for allocation count and never checked for what they return. The
+//! These entry points shipped with no test of their own — they were measured
+//! for allocation count and never checked for what they return. The
 //! measurements are in `record_index_residency.rs`; this file is the
 //! correctness half.
 //!
@@ -19,6 +19,41 @@
 //! held before. The callers hand that buffer straight to the checksum, so a
 //! buffer left long after a bigger record would verify trailing bytes from the
 //! previous read and report a healthy file as corrupt.
+//!
+//! # What these assertions were measured to catch
+//!
+//! A test that passes proves nothing about a test that would fail. Twelve
+//! mutations were applied to the implementations one at a time — each `clear()`
+//! deleted in turn, the block-id check deleted, `read_into_at` made grow-only,
+//! `get_into` given an off-by-one, `open_with_scratch` made to scan into its
+//! own buffer — and the suite run under each. **All twelve are caught here.**
+//!
+//! The same twelve were then run against the workspace with *this file
+//! removed*, which is what says whether these tests were needed rather than
+//! merely correct:
+//!
+//! | mutation | pre-existing suite |
+//! | --- | --- |
+//! | `decode_block_into` ignores the entry's block id | 853 passed, 0 failed |
+//! | `block_entries_into` appends | 853 passed, 0 failed |
+//! | `blocks_migrated_into` appends | 853 passed, 0 failed |
+//! | `keyed_blocks_into` leaves the key map populated | 853 passed, 0 failed |
+//! | `materialized_keyed_blocks_into` merges into the caller's map | 853 passed, 0 failed |
+//! | `key_tail_offsets_into` leaves the map populated | 853 passed, 0 failed |
+//! | `all_metadata_into` appends | 853 passed, 0 failed |
+//! | `VarveWriter::open_with_scratch` ignores the caller's buffer | 853 passed, 0 failed |
+//!
+//! Eight of the twelve shipped with nothing anywhere in the workspace that
+//! would notice them. The other four were caught incidentally and are named so
+//! the claim is not overstated: the grow-only `read_into_at` by
+//! `format_first_dsl_generates_typed_api_and_offset_chains` and
+//! `typed_replacement_translates_keyed_tails_after_resize`, a
+//! `decode_blocks_into` that appends by `the_generated_into_twins_exist_on_both_routes`,
+//! an `index_entries_into` that appends by
+//! `the_host_owns_the_buffers_and_chooses_whether_to_keep_the_index`, and the
+//! `get_into` off-by-one by three checkpoint-recovery tests. Those four were
+//! caught by tests that are about something else entirely, which is coverage by
+//! luck; the assertions here name the property instead.
 
 use std::collections::HashMap;
 
