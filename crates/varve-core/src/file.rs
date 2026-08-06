@@ -1173,6 +1173,246 @@ impl RecordDirectory for Vec<RecordIndexEntry> {
     }
 }
 
+/// A record index the caller owns the memory for, walked only as far as the
+/// caller's question needed.
+///
+/// [`VarveFile::index_entries_into`] answers one question — "give me the whole
+/// index" — and it answers it the same way whatever was actually being looked
+/// for: `N` entries and two positional reads per record, to the end of the
+/// file. This answers "walk until you find it, then stop". A map that finds its
+/// record at position 12 of a million has read twelve records.
+///
+/// Three things make it the caller's rather than varve's:
+///
+/// * **The buffer comes in.** `record_map` takes `&mut Vec<RecordIndexEntry>`
+///   and never allocates one. Nothing is copied out of it either — the map
+///   *is* the buffer, viewed.
+/// * **The walk resumes.** A second question continues from where the first
+///   stopped, so asking twice costs the records between the two answers, not
+///   two walks. [`find`](Self::find) searches what is already framed before it
+///   reads anything at all.
+/// * **The caller decides when it goes away.** [`clear`](Self::clear) empties
+///   it and rewinds; [`release`](Self::release) empties it and keeps walking
+///   forward, which is how a bounded-memory pass over a file larger than RAM is
+///   written. Dropping the map hands the buffer straight back.
+///
+/// It implements [`RecordDirectory`], so a map is a directory: everything
+/// [`VarveFile::with_directory`] serves — `blocks`, `scan`, `keyed_blocks`, the
+/// rest — is answered against the prefix walked so far. That is what the trait
+/// being the currency, rather than `Vec`, buys.
+///
+/// ```ignore
+/// let mut buffer = Vec::new();
+/// let mut map = file.record_map(&mut buffer)?;         // no read yet
+/// let hit = map.find(|entry| entry.block_id == Note::ID)?;
+/// if let Some(entry) = hit {
+///     let note: Note = file.decode_block_into(&entry, &mut payload)?;
+/// }
+/// let points = file.with_directory(&map).block_entries_into::<Note>(&mut out)?;
+/// map.clear();                                         // the caller's call
+/// ```
+///
+/// **What it walks, and what it therefore cannot see.** Records in file order,
+/// from the start of the append log to the handle's snapshot end. That end is
+/// already the committed, complete one — the open scan established it — so a
+/// torn trailing record, and under a transaction-marker policy an uncommitted
+/// tail, are outside the walk rather than filtered out of it. Non-resident
+/// blocks are framed and skipped, exactly as the open scan skips them, so a
+/// completed map equals [`VarveFile::index_entries`] entry for entry.
+///
+/// **What a partial index does not check.** A full open validates sequence
+/// uniqueness across every record in the file. A map validates nothing beyond
+/// the prefix it has read, because that is all it has read: a duplicate
+/// sequence past the stopping point is not detected until a walk reaches it.
+/// That is the cost of not reading the rest, and it is the only correctness
+/// difference between a completed map and an open scan.
+pub struct RecordMap<'a> {
+    entries: &'a mut Vec<RecordIndexEntry>,
+    spec: FormatSpec,
+    snapshot: SnapshotFile,
+    /// Where the append log begins, and where [`Self::clear`] rewinds to.
+    start: u64,
+    /// The offset the next [`Self::advance`] will frame.
+    next: u64,
+    /// One past the last byte the walk may touch: the handle's snapshot end.
+    end: u64,
+    accounting: ScanAccounting,
+}
+
+impl<'a> RecordMap<'a> {
+    fn new(file: &VarveFile, entries: &'a mut Vec<RecordIndexEntry>) -> Result<Self> {
+        let start = append_log_start_for_file(file)?;
+        entries.clear();
+        let mut accounting = ScanAccounting::default();
+        // The header bytes the walk skips are charged the way the open scan
+        // charges them, so a `ScanBytes` ceiling means the same number of bytes
+        // whichever route reached the record.
+        accounting.advance(file.spec, start)?;
+        Ok(Self {
+            entries,
+            spec: file.spec,
+            snapshot: file.snapshot.clone(),
+            start,
+            next: start,
+            end: file.snapshot.len(),
+            accounting,
+        })
+    }
+
+    /// Frames the next record, appends it, and returns it; `None` at the end of
+    /// the walk.
+    ///
+    /// One record, two positional reads — the header, and the footer if the
+    /// format has one. Nothing else is touched: a record's payload is not read
+    /// to frame it, whatever its size.
+    pub fn advance(&mut self) -> Result<Option<RecordIndexEntry>> {
+        loop {
+            if self.next >= self.end {
+                return Ok(None);
+            }
+            // Counted the way the open scan counts, because this is the same
+            // unit of work: a header, an extent and a footer read to *build* an
+            // index. `ResidentIndex::fault` deliberately does not count — it
+            // rebuilds an entry of an index that already exists, and conflating
+            // the two would make every `index_entries()` call look like a scan.
+            note_record_framed();
+            let entry = fault_record_entry(&self.snapshot, self.spec, self.next, true)?;
+            let record_end =
+                entry
+                    .checked_physical_end()
+                    .map_err(|_| Error::ResourceArithmeticOverflow {
+                        resource: "record extent",
+                    })?;
+            // A record whose extent runs past the snapshot end is not a record
+            // this handle may see. The open scan cannot produce one — its end
+            // *is* a record boundary — so this is a torn-file guard, not a
+            // routine branch, and it stops rather than reporting corruption
+            // the scan already decided to tolerate.
+            if record_end > self.end {
+                self.next = self.end;
+                return Ok(None);
+            }
+            self.accounting
+                .advance(self.spec, record_end.saturating_sub(self.next))?;
+            self.next = record_end;
+            // Framed and skipped, exactly as the open scan skips it: a
+            // non-resident block's records are on disk and not in the index.
+            if !record_is_resident(self.spec, entry.block_id) {
+                continue;
+            }
+            reserve_scanned_entry(self.spec, self.entries)?;
+            self.entries.push(entry.clone());
+            return Ok(Some(entry));
+        }
+    }
+
+    /// Walks forward until `want` accepts a record, and stops there.
+    ///
+    /// Searches what is already framed first, so a question the last one
+    /// already paid for costs no read at all.
+    pub fn find(
+        &mut self,
+        mut want: impl FnMut(&RecordIndexEntry) -> bool,
+    ) -> Result<Option<RecordIndexEntry>> {
+        if let Some(found) = self.entries.iter().find(|entry| want(entry)) {
+            return Ok(Some(found.clone()));
+        }
+        while let Some(entry) = self.advance()? {
+            if want(&entry) {
+                return Ok(Some(entry));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Walks until the map holds `count` entries, or the file ends first.
+    ///
+    /// Returns how many it holds, which is `count` unless the file ran out.
+    pub fn fill_to(&mut self, count: usize) -> Result<usize> {
+        while self.entries.len() < count {
+            if self.advance()?.is_none() {
+                break;
+            }
+        }
+        Ok(self.entries.len())
+    }
+
+    /// Walks to the end of the file.
+    ///
+    /// This is [`VarveFile::index_entries_into`] spelled as the case it is —
+    /// the one where the answer really is every record — and it costs the same.
+    pub fn fill(&mut self) -> Result<usize> {
+        while self.advance()?.is_some() {}
+        Ok(self.entries.len())
+    }
+
+    /// The records framed so far, in file order.
+    pub fn entries(&self) -> &[RecordIndexEntry] {
+        self.entries
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Whether the walk has reached the end of the file.
+    ///
+    /// A complete map is the whole index; an incomplete one is a prefix, and
+    /// every read answered against it is answered against that prefix.
+    pub fn is_complete(&self) -> bool {
+        self.next >= self.end
+    }
+
+    /// The file offset the next [`Self::advance`] will frame.
+    pub fn resume_offset(&self) -> u64 {
+        self.next
+    }
+
+    /// Empties the buffer and rewinds the walk to the start of the file.
+    ///
+    /// The map is then what [`VarveFile::record_map`] just returned. Use
+    /// [`release`](Self::release) to free the entries without giving up the
+    /// ground already covered.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.next = self.start;
+    }
+
+    /// Empties the buffer but keeps the walk where it is.
+    ///
+    /// This is the bounded-memory pass: `fill_to(k)`, use them, `release()`,
+    /// repeat. Memory is the caller's `k` entries however long the file is, and
+    /// no record is read twice.
+    pub fn release(&mut self) {
+        self.entries.clear();
+    }
+}
+
+impl RecordDirectory for RecordMap<'_> {
+    fn record_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn record_at(&self, position: usize) -> Result<RecordIndexEntry> {
+        self.entries.as_slice().record_at(position)
+    }
+}
+
+impl std::fmt::Debug for RecordMap<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecordMap")
+            .field("framed", &self.entries.len())
+            .field("resume_offset", &self.next)
+            .field("complete", &self.is_complete())
+            .finish()
+    }
+}
+
 /// An owned snapshot of a file's record index.
 ///
 /// Derefs to `[RecordIndexEntry]`, so it reads exactly like the borrowed slice
@@ -3320,6 +3560,11 @@ impl VarveReader {
         self.file.with_directory(directory)
     }
 
+    /// See [`VarveFile::record_map`].
+    pub fn record_map<'a>(&self, buffer: &'a mut Vec<RecordIndexEntry>) -> Result<RecordMap<'a>> {
+        self.file.record_map(buffer)
+    }
+
     /// See [`VarveFile::read_payload_into`].
     pub fn read_payload_into(&self, entry: &RecordIndexEntry, out: &mut Vec<u8>) -> Result<()> {
         self.file.read_payload_into(entry, out)
@@ -3619,6 +3864,11 @@ impl VarveWriter {
         directory: &'a D,
     ) -> DirectoryRead<'a, D> {
         self.file.with_directory(directory)
+    }
+
+    /// See [`VarveFile::record_map`].
+    pub fn record_map<'a>(&self, buffer: &'a mut Vec<RecordIndexEntry>) -> Result<RecordMap<'a>> {
+        self.file.record_map(buffer)
     }
 
     /// See [`VarveFile::read_payload_into`].
@@ -6230,6 +6480,30 @@ impl VarveFile {
             file: self,
             directory,
         }
+    }
+
+    /// A [`RecordMap`] over the caller's buffer: an index built one record at a
+    /// time, only as far as the caller asks.
+    ///
+    /// **Reads nothing.** The walk starts on the first
+    /// [`advance`](RecordMap::advance), [`find`](RecordMap::find) or
+    /// [`fill_to`](RecordMap::fill_to), so a map that is never asked a question
+    /// costs one `Vec::clear`.
+    ///
+    /// This is the third answer to "who holds the index", next to the handle's
+    /// own 16-byte directory and the caller's full
+    /// [`index_entries_into`](Self::index_entries_into) buffer: **nobody holds
+    /// all of it, because nobody read all of it.** The map borrows the buffer
+    /// rather than the handle, so reads through the handle
+    /// (`read_payload_into`, `decode_block_into`) stay available while the map
+    /// is alive.
+    ///
+    /// Available on a handle opened without a directory
+    /// ([`open_readonly_without_directory`](Self::open_readonly_without_directory)),
+    /// which is the pairing it exists for: the handle keeps nothing, and the
+    /// caller builds exactly the part of the index its question needed.
+    pub fn record_map<'a>(&self, buffer: &'a mut Vec<RecordIndexEntry>) -> Result<RecordMap<'a>> {
+        RecordMap::new(self, buffer)
     }
 
     /// The block's records as a lazy collection: one decoded value at a time.
