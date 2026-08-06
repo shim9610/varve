@@ -4,19 +4,17 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions, remove_file};
 use std::hash::Hash;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::marker::PhantomData;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::{
-    BlockDescriptor, BlockKind, BlockVec, CommitPolicy, CompressionAlgorithm,
-    CompressionHeaderMode, CompressionLevel, CompressionPolicy, Endian, Error, FormatSpec,
-    IndexPolicy, IntegrityPolicy, IntegrityVerification, KeyedBlockVec, ManifestPolicy,
-    MatrixCellStatus, MatrixCommitEvent, MatrixDimensions, MatrixKey, MatrixRecoveryAction,
-    MatrixRecoveryReport, MatrixResumeSignal, RecoveryPolicy, Result, SnapshotFile,
-    VariableCompression, VarveBlock, VarveEncode, VarveKeyedBlock, VarveMatrixBlock, VarveMerge,
-    VarveMigration, VarveReplaceBlock, WireType,
+    BlockKind, BlockVec, CommitPolicy, CompressionAlgorithm, CompressionHeaderMode,
+    CompressionLevel, CompressionPolicy, Endian, Error, FormatSpec, IndexPolicy, IntegrityPolicy,
+    IntegrityVerification, KeyedBlockVec, ManifestPolicy, MatrixCellStatus, MatrixCommitEvent,
+    MatrixDimensions, MatrixKey, MatrixRecoveryAction, MatrixRecoveryReport, MatrixResumeSignal,
+    RecoveryPolicy, Result, SnapshotFile, VariableCompression, VarveBlock, VarveEncode,
+    VarveKeyedBlock, VarveMatrixBlock, VarveMerge, VarveMigration, VarveReplaceBlock, WireType,
     codec::encode_to_vec_limited,
     collections::MaterializationBudget,
     format::ReadLimitKey,
@@ -17165,20 +17163,6 @@ fn lock_path(path: &Path) -> PathBuf {
     PathBuf::from(lock_name)
 }
 
-#[allow(dead_code)]
-fn _descriptor_for<T: VarveBlock>() -> BlockDescriptor {
-    BlockDescriptor {
-        id: T::ID,
-        name: std::any::type_name::<T>(),
-        version: T::VERSION,
-        kind: T::KIND,
-        fields: &[],
-    }
-}
-
-#[allow(dead_code)]
-struct TypedMarker<T>(PhantomData<T>);
-
 #[cfg(test)]
 mod tests {
     /// One forward pass must answer exactly what the three walks it replaced
@@ -17294,6 +17278,10 @@ mod tests {
     }
 
     use super::*;
+    // Only the fixtures below need it, so importing it at module scope
+    // would be an unused import in the non-test build — which is what it
+    // became when `_descriptor_for` was deleted as dead.
+    use crate::format::BlockDescriptor;
     use crate::{VarveDecode, VarveEncode};
 
     /// One index entry for a record of `payload_len` bytes at `record_offset`,

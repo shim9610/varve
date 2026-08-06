@@ -111,7 +111,6 @@ const MATRIX_DESCRIPTOR_RESOURCE: &str = "matrix descriptors";
 /// Allocation resource for the ordinary `PackedBitmap` codec, which is usable
 /// in plain variable fields and must not report matrix-shaped failures there.
 const PACKED_BITMAP_RESOURCE: &str = "packed bitmap bytes";
-#[allow(dead_code)]
 const MATRIX_SIDECAR_RESOURCE: &str = "matrix sidecar";
 
 pub(crate) use region_reader::{MatrixReadPool, MatrixRegionReader};
@@ -5255,7 +5254,6 @@ pub(crate) fn sidecar_resume_signal(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct MatrixSidecarReadPlan {
     pub(crate) format_magic_offset: u64,
     pub(crate) category_offset: u64,
@@ -5264,12 +5262,10 @@ pub(crate) struct MatrixSidecarReadPlan {
     pub(crate) total_len: u64,
 }
 
-#[allow(dead_code)]
 pub(crate) fn check_matrix_sidecar_file_len(spec: FormatSpec, file_len: u64) -> Result<()> {
     spec.read_limits.check(ReadLimitKey::SidecarLen, file_len)
 }
 
-#[allow(dead_code)]
 pub(crate) fn matrix_sidecar_write_len(
     spec: FormatSpec,
     fixed_header_len: u64,
@@ -5296,7 +5292,6 @@ pub(crate) fn matrix_sidecar_write_len(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 pub(crate) fn matrix_sidecar_read_plan(
     spec: FormatSpec,
     file_len: u64,
