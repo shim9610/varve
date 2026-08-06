@@ -271,3 +271,76 @@ fn opening_many_files_through_one_buffer_allocates_the_entry_array_once() -> var
     );
     Ok(())
 }
+
+/// A walk of `N` records allocates **one** payload buffer, not `N`.
+///
+/// Every typed read bottoms out in
+/// `RecordIndexEntry::read_logical_payload_snapshot`, which allocated a fresh
+/// buffer per record. The loops now hand it one buffer and reuse it, so what
+/// scales with record count is the reads, not the allocations.
+///
+/// Cumulative again, for the same reason as the test above: each buffer was
+/// freed at the end of its iteration, so live and peak bytes never saw this.
+#[test]
+fn a_walk_of_n_records_allocates_one_payload_buffer_not_n() -> varve::Result<()> {
+    const SMALL: u32 = 2_000;
+    const LARGE: u32 = 20_000;
+
+    let directory = tempfile::tempdir()?;
+    let small_path = path_in(&directory, "walk-small.idxres");
+    let large_path = path_in(&directory, "walk-large.idxres");
+    build(&small_path, SMALL)?;
+    build(&large_path, LARGE)?;
+    let spec = IndexResidencyFormat::spec();
+
+    // `blocks().iter()` is the probe: the collection is built BEFORE the
+    // window opens, so the only allocations inside it are the per-record
+    // payload buffers this test is about. `Sample` is all scalars, so decoding
+    // one allocates nothing of its own and cannot mask the result.
+    //
+    // `verify_all` would have been the cleaner probe, but this fixture declares
+    // no integrity policy and `verify_all` returns 0 without reading anything.
+    let walk = |path: &Path| -> varve::Result<(isize, isize)> {
+        let file = varve::VarveFile::open_readonly(spec, path)?;
+        let blocks = file.blocks::<Sample>()?;
+        let (bytes_before, allocs_before) = totals();
+        let mut seen = 0usize;
+        for value in blocks.iter() {
+            let _ = value?;
+            seen += 1;
+        }
+        let (bytes_after, allocs_after) = totals();
+        assert!(seen > 0, "the fixture must contain records");
+        Ok((bytes_after - bytes_before, allocs_after - allocs_before))
+    };
+
+    let _ = walk(&small_path)?; // warm
+    let (small_bytes, small_allocs) = walk(&small_path)?;
+    let (large_bytes, large_allocs) = walk(&large_path)?;
+
+    let added = isize::try_from(LARGE - SMALL).expect("record count fits");
+    let allocs_per_record = (large_allocs - small_allocs) as f64 / added as f64;
+    let bytes_per_record = (large_bytes - small_bytes) as f64 / added as f64;
+
+    // Measured 2026-08-05, Linux/ext4, iterating `blocks::<Sample>()`:
+    //
+    //                                2,000 records      20,000 records
+    //   before (one Vec per record)  2,000 allocs /     20,000 allocs /
+    //                                16,000 B           160,000 B
+    //   after  (one Vec per walk)        1 alloc  /          1 alloc  /
+    //                                     8 B                  8 B
+    //
+    // Zero per record, not "fewer": the buffer is grown once by the first
+    // record — `Sample` is one `u64`, hence 8 bytes — and never again, so the
+    // walk's allocation count does not depend on the record count at all. The
+    // before column is 1.00 allocations per record exactly, which is what makes
+    // this test discriminating: run against the previous commit it reports
+    // 1.00 and fails.
+    assert!(
+        allocs_per_record < 0.1,
+        "verifying {LARGE} records made {allocs_per_record:.2} allocations per record \
+         ({small_allocs} at {SMALL}, {large_allocs} at {LARGE}, {bytes_per_record:.1} B/record). \
+         Above ~1.0 means the per-record payload buffer is back."
+    );
+    Ok(())
+}

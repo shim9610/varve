@@ -142,7 +142,20 @@ where
         self.entries.is_empty()
     }
 
+    /// **This allocates** a payload buffer per call. [`get_into`](Self::get_into)
+    /// reuses the caller's, which is what [`Self::iter`] does.
     pub fn get(&self, index: usize) -> Result<Option<T>> {
+        let mut payload = Vec::new();
+        self.get_into(index, &mut payload)
+    }
+
+    /// Decodes the record at `index`, reading its bytes through the caller's
+    /// buffer.
+    ///
+    /// `payload` is scratch, not output: the decoded value is returned and the
+    /// buffer holds whatever the last record's bytes were. Reusing it across a
+    /// walk is the difference between one allocation and one per record.
+    pub fn get_into(&self, index: usize, payload: &mut Vec<u8>) -> Result<Option<T>> {
         let mut budget = MaterializationBudget::new(self.spec);
         let Some(entry) = self.entries.get(index) else {
             return Ok(None);
@@ -156,9 +169,9 @@ where
         }
         let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
         budget.consume(logical_len)?;
-        let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
+        entry.read_logical_payload_snapshot_into(self.spec, &self.snapshot, payload)?;
         Ok(Some(
-            budget.decode(&payload, T::ENDIAN.unwrap_or(self.spec.endian))?,
+            budget.decode(payload, T::ENDIAN.unwrap_or(self.spec.endian))?,
         ))
     }
 
@@ -171,10 +184,16 @@ where
     /// made `iter()` and a `for i in 0..len { get(i) }` loop over the same
     /// records mean two different things and refused a healthy file whose total
     /// payload merely exceeded the ceiling.
+    /// The iterator owns one payload buffer and reuses it for every step, so a
+    /// walk of `N` records allocates one payload rather than `N`. That is the
+    /// only difference from `for i in 0..len { get(i) }`; the per-record
+    /// materialization charge is identical, because `get_into` builds the same
+    /// budget the same way.
     pub fn iter(&self) -> BlockIter<'_, T> {
         BlockIter {
             collection: self,
             index: 0,
+            payload: Vec::new(),
         }
     }
 }
@@ -182,6 +201,8 @@ where
 pub struct BlockIter<'a, T> {
     collection: &'a BlockVec<T>,
     index: usize,
+    /// Reused across steps. See [`BlockVec::iter`].
+    payload: Vec<u8>,
 }
 
 impl<T> Iterator for BlockIter<'_, T>
@@ -194,9 +215,12 @@ where
         if self.index >= self.collection.len() {
             return None;
         }
-        // `get` builds the budget, so one step of the iteration is charged
+        // `get_into` builds the budget, so one step of the iteration is charged
         // exactly what the same `get(i)` call is charged.
-        let result = self.collection.get(self.index).transpose();
+        let result = self
+            .collection
+            .get_into(self.index, &mut self.payload)
+            .transpose();
         self.index += 1;
         result
     }
@@ -245,7 +269,12 @@ where
         let logical_len =
             entry.logical_payload_len_snapshot(self.inner.spec, &self.inner.snapshot)?;
         budget.consume(logical_len)?;
-        let payload = entry.read_logical_payload_snapshot(self.inner.spec, &self.inner.snapshot)?;
+        let mut payload = Vec::new();
+        entry.read_logical_payload_snapshot_into(
+            self.inner.spec,
+            &self.inner.snapshot,
+            &mut payload,
+        )?;
         Ok(Some(budget.decode(
             &payload,
             T::ENDIAN.unwrap_or(self.inner.spec.endian),

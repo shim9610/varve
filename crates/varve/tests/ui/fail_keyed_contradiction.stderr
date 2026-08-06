@@ -26,6 +26,12 @@ note: the above error was encountered while instantiating `fn VarveFile::keyed_b
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 note: erroneous constant encountered
+ --> $WORKSPACE/crates/varve-core/src/file.rs
+  |
+  |         let () = crate::traits::KeyedBlockContract::<T>::OK;
+  |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: erroneous constant encountered
  --> $WORKSPACE/crates/varve-core/src/collections.rs
   |
   |         let () = KeyedBlockContract::<T>::OK;

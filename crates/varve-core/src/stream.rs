@@ -539,6 +539,7 @@ impl VarveStreamReader {
         // `verify_all` remains the whole-file integrity scan.
         let scan_spec = self.spec.with_integrity_policy(IntegrityPolicy::None);
         Ok(StreamingBlocks {
+            payload: Vec::new(),
             scanner: NativeStreamScanner::from_snapshot(scan_spec, self.snapshot.clone())?,
             spec: self.spec,
             finished: false,
@@ -594,6 +595,10 @@ pub struct StreamingBlocks<T> {
     /// each decoded record's checksum against this spec instead.
     spec: FormatSpec,
     finished: bool,
+    /// Reused across steps, so a walk of `N` records allocates one payload
+    /// rather than `N`. This is the scalable family's per-record read, so it is
+    /// the one place on it where that difference is unbounded.
+    payload: Vec<u8>,
     _marker: PhantomData<T>,
 }
 
@@ -641,9 +646,12 @@ impl<T: VarveBlock> Iterator for StreamingBlocks<T> {
                 budget.consume(logical_len)?;
                 // The single payload read: verifies the record checksum over
                 // the in-memory buffer and hands that buffer to typed decode.
-                let payload =
-                    entry.read_logical_payload_snapshot(self.spec, self.scanner.snapshot())?;
-                budget.decode(&payload, T::ENDIAN.unwrap_or(self.spec.endian))
+                entry.read_logical_payload_snapshot_into(
+                    self.spec,
+                    self.scanner.snapshot(),
+                    &mut self.payload,
+                )?;
+                budget.decode(&self.payload, T::ENDIAN.unwrap_or(self.spec.endian))
             })();
             return Some(result);
         }

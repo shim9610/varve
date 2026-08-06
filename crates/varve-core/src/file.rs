@@ -1209,41 +1209,92 @@ impl RecordIndexEntry {
         Ok(logical_len)
     }
 
+    /// **This allocates.**
+    /// [`read_payload_snapshot_into`](Self::read_payload_snapshot_into) takes
+    /// the caller's buffer, which is what the per-record loops use.
     pub(crate) fn read_payload_snapshot(
         &self,
         spec: FormatSpec,
         snapshot: &SnapshotFile,
     ) -> Result<Vec<u8>> {
+        let mut payload = Vec::new();
+        self.read_payload_snapshot_into(spec, snapshot, &mut payload)?;
+        Ok(payload)
+    }
+
+    /// Reads this record's stored bytes into the caller's buffer, verified.
+    ///
+    /// `out` ends exactly `payload_len` bytes long; see
+    /// [`SnapshotFile::read_into_at`] for why that matters to the checksum.
+    pub(crate) fn read_payload_snapshot_into(
+        &self,
+        spec: FormatSpec,
+        snapshot: &SnapshotFile,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         spec.read_limits
             .check(ReadLimitKey::RecordPayloadLen, self.payload_len)?;
         self.validate_payload_extent(snapshot.len())?;
-        let payload = snapshot.read_vec_at(
+        snapshot.read_into_at(
             self.payload_offset,
             self.payload_len,
             limit_or_max(spec.read_limits.require(ReadLimitKey::RecordPayloadLen)?),
             ReadLimitKey::RecordPayloadLen.resource(),
+            out,
         )?;
-        self.verify_snapshot_record(spec, snapshot, &payload)?;
-        Ok(payload)
+        self.verify_snapshot_record(spec, snapshot, out)
     }
 
+    /// **This allocates.**
+    /// [`read_logical_payload_snapshot_into`](Self::read_logical_payload_snapshot_into)
+    /// takes the caller's buffer.
     pub(crate) fn read_logical_payload_snapshot(
         &self,
         spec: FormatSpec,
         snapshot: &SnapshotFile,
     ) -> Result<Vec<u8>> {
+        let mut decoded = Vec::new();
+        self.read_logical_payload_snapshot_into(spec, snapshot, &mut decoded)?;
+        Ok(decoded)
+    }
+
+    /// Reads this record's logical bytes into the caller's buffer.
+    ///
+    /// **Uncompressed records cost no copy.** That is the case worth designing
+    /// for — it is every record of a format that declares no compression — and
+    /// the obvious `_into` gets it wrong: reading into a scratch and copying
+    /// into `out` adds a full `memcpy` per record to a path that today moves
+    /// the buffer straight out. So the uncompressed arm reads directly into
+    /// `out` and stops there.
+    ///
+    /// **Compressed records are unchanged, and no better.** The decompressor
+    /// produces its own buffer, so `out`'s allocation is replaced rather than
+    /// reused. That is what happens today too; this does not regress it, and it
+    /// does not improve it either. Making it reuse `out` needs a decompression
+    /// entry point that writes into a caller buffer, which is a change to
+    /// `decompress_with_algorithm` and is not made here.
+    pub(crate) fn read_logical_payload_snapshot_into(
+        &self,
+        spec: FormatSpec,
+        snapshot: &SnapshotFile,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         let logical_len = self.logical_payload_len_snapshot(spec, snapshot)?;
-        let payload = self.read_payload_snapshot(spec, snapshot)?;
-        let decoded = decode_record_payload(spec, self, payload)?;
+        if self.is_compressed() {
+            let physical = self.read_payload_snapshot(spec, snapshot)?;
+            *out = decode_record_payload(spec, self, physical)?;
+        } else {
+            self.read_payload_snapshot_into(spec, snapshot, out)?;
+        }
         let actual =
-            u64::try_from(decoded.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
+            u64::try_from(out.len()).map_err(|_| Error::LengthOverflow { value: u64::MAX })?;
         if actual != logical_len {
             return Err(Error::DecompressedLengthMismatch {
                 expected: logical_len,
                 actual,
             });
         }
-        Ok(decoded)
+        Ok(())
     }
 
     pub fn checked_physical_end(&self) -> Result<u64> {
@@ -2983,6 +3034,19 @@ impl VarveReader {
         T: VarveKeyedBlock,
     {
         self.file.keyed_blocks::<T>()
+    }
+
+    /// See [`VarveFile::keyed_blocks_into`], including which of the three
+    /// collections it does not hand over.
+    pub fn keyed_blocks_into<T>(
+        &self,
+        entries: &mut Vec<RecordIndexEntry>,
+        by_key: &mut HashMap<T::Key, RecordIndexEntry>,
+    ) -> Result<()>
+    where
+        T: VarveKeyedBlock,
+    {
+        self.file.keyed_blocks_into::<T>(entries, by_key)
     }
 
     pub fn materialized_keyed_blocks<T>(&self) -> Result<HashMap<T::Key, T>>
@@ -4738,6 +4802,9 @@ impl VarveFile {
     pub fn metadata(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let mut found = None;
         let mut budget = MaterializationBudget::new(self.spec);
+        // One payload buffer for the whole walk. It used to be one per record,
+        // and the walk is over every record in the file.
+        let mut payload = Vec::new();
         for (record_ordinal, entry) in self.index.iter().enumerate() {
             let entry = entry?;
             if entry.block_id != METADATA_BLOCK_ID {
@@ -4746,7 +4813,7 @@ impl VarveFile {
             budget.reset();
             let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
             budget.consume(logical_len)?;
-            let payload = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
+            entry.read_payload_snapshot_into(self.spec, &self.snapshot, &mut payload)?;
             let (stored_key, _) = split_metadata_payload(&payload, self.spec.endian)?;
             if stored_key != key {
                 continue;
@@ -4780,6 +4847,7 @@ impl VarveFile {
     pub fn all_metadata_into(&self, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
         out.clear();
         let mut budget = MaterializationBudget::new(self.spec);
+        let mut payload = Vec::new();
         for entry in self.index.iter() {
             let entry = entry?;
             if entry.block_id != METADATA_BLOCK_ID {
@@ -4787,7 +4855,7 @@ impl VarveFile {
             }
             let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
             budget.consume(logical_len)?;
-            let payload = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
+            entry.read_payload_snapshot_into(self.spec, &self.snapshot, &mut payload)?;
             out.try_reserve(1).map_err(|_| Error::AllocationFailed {
                 resource: "metadata entries",
                 requested: logical_len,
@@ -5779,6 +5847,7 @@ impl VarveFile {
         crate::collections::ensure_resident_block::<T>(self.spec)?;
         out.clear();
         let mut budget = MaterializationBudget::new(self.spec);
+        let mut payload = Vec::new();
         for entry in self.index.iter() {
             let entry = entry?;
             if entry.block_id != T::ID {
@@ -5797,7 +5866,7 @@ impl VarveFile {
             budget.reset();
             let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
             budget.consume(logical_len)?;
-            let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
+            entry.read_logical_payload_snapshot_into(self.spec, &self.snapshot, &mut payload)?;
             out.try_reserve(1).map_err(|_| Error::AllocationFailed {
                 resource: "decoded blocks",
                 requested: logical_len,
@@ -5839,6 +5908,7 @@ impl VarveFile {
         }
         out.clear();
         let mut budget = MaterializationBudget::new(self.spec);
+        let mut payload = Vec::new();
         for entry in self.index.iter() {
             let entry = entry?;
             if entry.block_id != From::ID || entry.block_version != From::VERSION {
@@ -5846,7 +5916,7 @@ impl VarveFile {
             }
             let logical_len = entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
             budget.consume(logical_len)?;
-            let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
+            entry.read_logical_payload_snapshot_into(self.spec, &self.snapshot, &mut payload)?;
             let from: From = budget.decode(&payload, From::ENDIAN.unwrap_or(self.spec.endian))?;
             out.try_reserve(1).map_err(|_| Error::AllocationFailed {
                 resource: "migrated blocks",
@@ -5857,7 +5927,48 @@ impl VarveFile {
         Ok(())
     }
 
+    /// **This allocates** two collections that scale with the file: an index
+    /// entry per matching record, and a map entry per distinct key.
+    /// [`keyed_blocks_into`](Self::keyed_blocks_into) fills the caller's.
     pub fn keyed_blocks<T>(&self) -> Result<KeyedBlockVec<T::Key, T>>
+    where
+        T: VarveKeyedBlock,
+        T::Key: Eq + Hash + Clone,
+    {
+        // API2-03, evaluated here as well as in `keyed_blocks_into`. It is not
+        // redundant: this is a `const` assertion, and the compile error names
+        // the function whose instantiation first forced it. Leaving it only in
+        // the callee moved `fail_keyed_contradiction`'s diagnostic off the
+        // user's own call and into this file, which is a worse error for a
+        // mistake the user made.
+        let () = crate::traits::KeyedBlockContract::<T>::OK;
+        let mut entries = Vec::new();
+        let mut by_key = HashMap::new();
+        self.keyed_blocks_into::<T>(&mut entries, &mut by_key)?;
+        let blocks = BlockVec::new(self.spec, self.snapshot.clone(), entries);
+        Ok(KeyedBlockVec::from_parts(blocks, by_key))
+    }
+
+    /// Fills the caller's two collections: the block's index entries in file
+    /// order, and the newest entry per key.
+    ///
+    /// Both are cleared and then filled. They are exactly what
+    /// [`keyed_blocks`](Self::keyed_blocks) would have allocated, and
+    /// `KeyedBlockVec::from_parts` reassembles a collection from them if that
+    /// is what the caller wants.
+    ///
+    /// **Two of three, and here is the third.** The walk also builds a
+    /// transient `HashMap<T::Key, (MergeOrder, Option<RecordIndexEntry>)>`,
+    /// which is what decides "newest" when a key repeats. It cannot be the
+    /// caller's without putting `MergeOrder` — a private ordering type — into a
+    /// public signature. So this removes one map of `distinct keys` and the
+    /// entry vector, and leaves that one. Stated rather than implied, because
+    /// the saving is two thirds and not all of it.
+    pub fn keyed_blocks_into<T>(
+        &self,
+        entries: &mut Vec<RecordIndexEntry>,
+        by_key: &mut HashMap<T::Key, RecordIndexEntry>,
+    ) -> Result<()>
     where
         T: VarveKeyedBlock,
         T::Key: Eq + Hash + Clone,
@@ -5867,9 +5978,12 @@ impl VarveFile {
         // backstop.
         let () = crate::traits::KeyedBlockContract::<T>::OK;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
-        let mut entries = Vec::new();
+        entries.clear();
+        by_key.clear();
         let mut state: HashMap<T::Key, (MergeOrder, Option<RecordIndexEntry>)> = HashMap::new();
         let mut budget = MaterializationBudget::new(self.spec);
+        // One payload buffer for the whole walk, not one per record.
+        let mut payload = Vec::new();
         for (record_ordinal, entry) in self.index.iter().enumerate() {
             let entry = entry?;
             // One record's materialization at a time. Every decoded block is
@@ -5890,7 +6004,11 @@ impl VarveFile {
                     let logical_len =
                         entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
                     budget.consume(logical_len)?;
-                    let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
+                    entry.read_logical_payload_snapshot_into(
+                        self.spec,
+                        &self.snapshot,
+                        &mut payload,
+                    )?;
                     let block: T =
                         budget.decode(&payload, T::ENDIAN.unwrap_or(self.spec.endian))?;
                     let key = block.key();
@@ -5915,7 +6033,7 @@ impl VarveFile {
                     let logical_len =
                         entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
                     budget.consume(logical_len)?;
-                    let payload = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
+                    entry.read_payload_snapshot_into(self.spec, &self.snapshot, &mut payload)?;
                     if let Some(key) =
                         decode_internal_key_payload::<T>(self.spec.endian, &payload, &mut budget)?
                         && should_apply(state.get(&key), order)
@@ -5931,7 +6049,6 @@ impl VarveFile {
                 _ => {}
             }
         }
-        let mut by_key = HashMap::new();
         let requested = index_bytes_for_count(state.len())?;
         by_key
             .try_reserve(state.len())
@@ -5944,8 +6061,7 @@ impl VarveFile {
                 by_key.insert(key, entry);
             }
         }
-        let blocks = BlockVec::new(self.spec, self.snapshot.clone(), entries);
-        Ok(KeyedBlockVec::from_parts(blocks, by_key))
+        Ok(())
     }
 
     /// **This allocates.**
@@ -6066,13 +6182,16 @@ impl VarveFile {
             return Ok(0);
         }
         let mut verified = 0usize;
+        // The bytes are read to check their checksum and then dropped, so one
+        // buffer serves the whole pass. This was an allocation per record.
+        let mut payload = Vec::new();
         for entry in self.index.iter() {
             let entry = entry?;
             // `read_payload_snapshot` is the same check the read path performs,
             // which is exactly the point: there is one verification in the
             // crate, and this method chooses when it runs rather than adding a
             // second copy of it.
-            let _ = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
+            entry.read_payload_snapshot_into(self.spec, &self.snapshot, &mut payload)?;
             verified += 1;
         }
         // A non-resident block's records are never in `self.index` (a
@@ -6089,7 +6208,7 @@ impl VarveFile {
             // than asserted away.
             for entry in self.block_chain(descriptor.block_id)? {
                 let entry = entry?;
-                let _ = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
+                entry.read_payload_snapshot_into(self.spec, &self.snapshot, &mut payload)?;
                 verified += 1;
             }
         }
@@ -6213,6 +6332,8 @@ impl VarveFile {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         let mut tails: HashMap<T::Key, (MergeOrder, u64)> = HashMap::new();
         let mut budget = MaterializationBudget::new(self.spec);
+        // One payload buffer for the whole walk, not one per record.
+        let mut payload = Vec::new();
         for (record_ordinal, entry) in self.index.iter().enumerate() {
             let entry = entry?;
             // One record's materialization at a time (see
@@ -6232,7 +6353,11 @@ impl VarveFile {
                     let logical_len =
                         entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
                     budget.consume(logical_len)?;
-                    let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
+                    entry.read_logical_payload_snapshot_into(
+                        self.spec,
+                        &self.snapshot,
+                        &mut payload,
+                    )?;
                     let block: T =
                         budget.decode(&payload, T::ENDIAN.unwrap_or(self.spec.endian))?;
                     let key = block.key();
@@ -6259,7 +6384,7 @@ impl VarveFile {
                     let logical_len =
                         entry.logical_payload_len_snapshot(self.spec, &self.snapshot)?;
                     budget.consume(logical_len)?;
-                    let payload = entry.read_payload_snapshot(self.spec, &self.snapshot)?;
+                    entry.read_payload_snapshot_into(self.spec, &self.snapshot, &mut payload)?;
                     if let Some(key) =
                         decode_internal_key_payload::<T>(self.spec.endian, &payload, &mut budget)?
                         && tails.get(&key).is_none_or(|(old, _)| order >= *old)
@@ -11621,6 +11746,8 @@ where
     T: VarveMerge,
     T::Key: Eq + Hash,
 {
+    // One payload buffer for the whole merge walk, not one per record.
+    let mut payload = Vec::new();
     for (record_ordinal, entry) in entries.iter().enumerate() {
         let entry = entry?;
         let order = MergeOrder::for_record(shard.ordinal, entry.sequence, record_ordinal);
@@ -11635,7 +11762,7 @@ where
                 }
                 let logical_len = entry.logical_payload_len_snapshot(spec, snapshot)?;
                 budget.consume(logical_len)?;
-                let payload = entry.read_logical_payload_snapshot(spec, snapshot)?;
+                entry.read_logical_payload_snapshot_into(spec, snapshot, &mut payload)?;
                 let block: T = budget.decode(&payload, T::ENDIAN.unwrap_or(spec.endian))?;
                 let key = block.key();
                 if should_apply(state.get(&key), order) {
@@ -11650,7 +11777,7 @@ where
             TOMBSTONE_BLOCK_ID => {
                 let logical_len = entry.logical_payload_len_snapshot(spec, snapshot)?;
                 budget.consume(logical_len)?;
-                let payload = entry.read_payload_snapshot(spec, snapshot)?;
+                entry.read_payload_snapshot_into(spec, snapshot, &mut payload)?;
                 let Some(key) = decode_internal_key_payload::<T>(spec.endian, &payload, budget)?
                 else {
                     continue;
@@ -11667,7 +11794,7 @@ where
             OP_BLOCK_ID => {
                 let logical_len = entry.logical_payload_len_snapshot(spec, snapshot)?;
                 budget.consume(logical_len)?;
-                let payload = entry.read_payload_snapshot(spec, snapshot)?;
+                entry.read_payload_snapshot_into(spec, snapshot, &mut payload)?;
                 let Some((key, op)) =
                     decode_internal_op_payload::<T>(spec.endian, &payload, budget)?
                 else {

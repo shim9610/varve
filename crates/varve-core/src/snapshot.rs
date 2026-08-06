@@ -155,6 +155,9 @@ impl SnapshotFile {
         Ok(())
     }
 
+    /// **This allocates.** [`read_into_at`](Self::read_into_at) takes the
+    /// caller's buffer instead, which is the form the per-record read loops
+    /// use: one buffer for the whole walk rather than one per record.
     pub(crate) fn read_vec_at(
         &self,
         offset: u64,
@@ -162,6 +165,32 @@ impl SnapshotFile {
         limit: u64,
         resource: &'static str,
     ) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.read_into_at(offset, len, limit, resource, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Reads `len` bytes at `offset` into the caller's buffer.
+    ///
+    /// `out` ends **exactly** `len` bytes long, whatever it held before. That
+    /// is load-bearing rather than tidy: the callers hand `out` straight to
+    /// `verify_snapshot_record`, and a buffer left longer than the record —
+    /// which a reused buffer is, after any larger record — would checksum
+    /// trailing bytes from the previous read and report a healthy file as
+    /// corrupt.
+    ///
+    /// The limit refusal and the fallible reservation both still precede the
+    /// first byte written, so an oversized read is refused before the memory is
+    /// taken. A buffer that already has the capacity keeps it: `try_reserve` is
+    /// a no-op then, which is the whole reason the caller supplies one.
+    pub(crate) fn read_into_at(
+        &self,
+        offset: u64,
+        len: u64,
+        limit: u64,
+        resource: &'static str,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         if len > limit {
             return Err(Error::LimitExceeded {
                 resource,
@@ -171,16 +200,13 @@ impl SnapshotFile {
         }
         self.check_range(offset, len)?;
         let len = ByteLength::new(len).try_usize()?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(len)
-            .map_err(|_| Error::AllocationFailed {
-                resource,
-                requested: u64::try_from(len).unwrap_or(u64::MAX),
-            })?;
-        bytes.resize(len, 0);
-        self.read_exact_at(offset, &mut bytes)?;
-        Ok(bytes)
+        out.clear();
+        out.try_reserve(len).map_err(|_| Error::AllocationFailed {
+            resource,
+            requested: u64::try_from(len).unwrap_or(u64::MAX),
+        })?;
+        out.resize(len, 0);
+        self.read_exact_at(offset, out)
     }
 
     pub(crate) fn copy_range_to<W: Write>(
