@@ -2163,14 +2163,23 @@ impl CheckpointCadence {
     /// Advances the cadence for the entry just pushed at `position` in the
     /// resident index. A checkpoint record resets the tail count and derives
     /// the next geometric threshold from its own position (the number of
-    /// entries it serialized); commit markers and segment records never alter
-    /// checkpoint identity; every other record grows the eligible tail by one.
+    /// entries it serialized); commit markers, segment records and open digests
+    /// never alter checkpoint identity; every other record grows the eligible
+    /// tail by one.
+    ///
+    /// The digest belongs in that exemption for the reason the other two do: it
+    /// is written *because* a commit point closed, not because a record was
+    /// added, so counting it would make the checkpoint cadence a function of how
+    /// often the file is flushed rather than of how much was written.
     fn note_appended(&mut self, position: usize, block_id: u32) {
         note_checkpoint_cadence_index_touches(1);
         if block_id == INDEX_BLOCK_ID {
             self.eligible_since_checkpoint = 0;
             self.next_threshold = core::cmp::max(INDEX_CHECKPOINT_MIN_RECORDS, position / 2);
-        } else if !matches!(block_id, COMMIT_BLOCK_ID | SEGMENT_BLOCK_ID) {
+        } else if !matches!(
+            block_id,
+            COMMIT_BLOCK_ID | SEGMENT_BLOCK_ID | OPEN_DIGEST_BLOCK_ID
+        ) {
             self.eligible_since_checkpoint = self.eligible_since_checkpoint.saturating_add(1);
         }
     }
@@ -5975,6 +5984,26 @@ impl VarveFile {
                         record_offset,
                     )?;
                     RewritePayload::Bytes(&checkpoint_payload)
+                } else if source_entry.block_id == OPEN_DIGEST_BLOCK_ID {
+                    // A digest payload is block-tail offsets and its own start
+                    // offset, and a rewrite moves both. Copying the bytes would
+                    // publish a generation whose digest describes the file it
+                    // replaced. The trailer check at the next open catches that
+                    // — by falling back to the scan, which is the capability
+                    // silently going away rather than a failure anyone sees.
+                    //
+                    // Rebuilt from the records already written, which is
+                    // exactly what the writer held when it wrote the original:
+                    // a digest closes a commit point and never describes
+                    // itself.
+                    let record_offset = temp_file.stream_position()?;
+                    checkpoint_payload = encode_digest_payload(
+                        self.spec,
+                        new_index.iter().map(|entry| entry.sequence).max(),
+                        rewritten_block_tails(&new_index).as_slice(),
+                        record_offset,
+                    )?;
+                    RewritePayload::Bytes(&checkpoint_payload)
                 } else {
                     RewritePayload::Snapshot {
                         offset: source_entry.payload_offset,
@@ -6412,6 +6441,26 @@ impl VarveFile {
                         self.spec,
                         &new_index,
                         temp_file.stream_position()?,
+                    )?;
+                    RewritePayload::Bytes(&checkpoint_payload)
+                } else if source_entry.block_id == OPEN_DIGEST_BLOCK_ID {
+                    // A digest payload is block-tail offsets and its own start
+                    // offset, and a rewrite moves both. Copying the bytes would
+                    // publish a generation whose digest describes the file it
+                    // replaced. The trailer check at the next open catches that
+                    // — by falling back to the scan, which is the capability
+                    // silently going away rather than a failure anyone sees.
+                    //
+                    // Rebuilt from the records already written, which is
+                    // exactly what the writer held when it wrote the original:
+                    // a digest closes a commit point and never describes
+                    // itself.
+                    let record_offset = temp_file.stream_position()?;
+                    checkpoint_payload = encode_digest_payload(
+                        self.spec,
+                        new_index.iter().map(|entry| entry.sequence).max(),
+                        rewritten_block_tails(&new_index).as_slice(),
+                        record_offset,
                     )?;
                     RewritePayload::Bytes(&checkpoint_payload)
                 } else {
@@ -15048,6 +15097,23 @@ fn push_scanned_entry(
 ///
 /// varve's own bookkeeping is always resident: the manifest, commit markers,
 /// checkpoints and segment records are what the open paths navigate by.
+/// The block tails of a generation being rewritten, as of the records already
+/// written into it.
+///
+/// One forward pass into a map and one ordering — the shape
+/// [`BlockTails::from_newest`] exists for, and the same shape the open scan
+/// uses. It runs once per digest record in the source, so a rewrite of a file
+/// with `S` commit points pays `O(S * N)`; that is the order the rewrite's
+/// segment re-encoding already pays, on the path that is already the expensive
+/// one.
+fn rewritten_block_tails(entries: &[RecordIndexEntry]) -> BlockTails {
+    let mut newest: HashMap<u32, u64> = HashMap::new();
+    for entry in entries {
+        newest.insert(entry.block_id, entry.record_offset);
+    }
+    BlockTails::from_newest(&newest)
+}
+
 fn record_is_resident(spec: FormatSpec, block_id: u32) -> bool {
     block_id >= RESERVED_BLOCK_ID_START || spec.block_is_resident(block_id)
 }

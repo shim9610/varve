@@ -460,3 +460,237 @@ fn both_tail_records_at_once_do_not_grow_an_idle_file() -> varve::Result<()> {
     );
     Ok(())
 }
+
+/// The digest next to a checkpoint.
+///
+/// `checkpoint_on_flush` fires on a count of records written since the last
+/// checkpoint. A digest is written because a commit point closed, not because a
+/// record was added, so counting it in that tail would make the cadence a
+/// function of how often the file is flushed. It is exempted along with the
+/// commit marker and the segment record.
+///
+/// What it is *not* exempted from, and must not be: the threshold is geometric
+/// in the checkpoint's own index position, and a digest is a resident record, so
+/// it enlarges the index and widens the next threshold. That is the same effect
+/// a commit marker has and is the correct one — the checkpoint has to serialize
+/// the larger index too. So the direction here is one-sided on purpose: digests
+/// may make checkpoints rarer, never more frequent.
+#[test]
+fn a_digest_does_not_advance_the_checkpoint_cadence() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let with = directory.path().join("cadence-with.varve");
+    let without = directory.path().join("cadence-without.varve");
+
+    let checkpointed = DigestFormat::spec().with_index_policy(
+        DigestFormat::spec()
+            .index_policy
+            .with_checkpoint_on_flush(true),
+    );
+    let both =
+        checkpointed.with_index_policy(checkpointed.index_policy.with_open_digest_on_flush(true));
+
+    // Flush per record, so the cadence sees the maximum number of digests it
+    // could possibly be confused by.
+    let count = |spec: FormatSpec, path: &Path| -> varve::Result<usize> {
+        let mut file = spec.create(path)?;
+        for value in 0..300 {
+            file.push(&Line { value })?;
+            file.flush()?;
+        }
+        drop(file);
+        Ok(VarveFile::open_readonly(spec, path)?
+            .index_entries()
+            .iter()
+            .filter(|entry| entry.block_id == varve::INDEX_BLOCK_ID)
+            .count())
+    };
+    let (checkpoints_with, checkpoints_without) =
+        (count(both, &with)?, count(checkpointed, &without)?);
+    assert!(
+        checkpoints_without > 0,
+        "the fixture must checkpoint at all"
+    );
+    assert!(
+        checkpoints_with <= checkpoints_without,
+        "a digest must never make checkpoints more frequent: \
+         {checkpoints_with} with, {checkpoints_without} without"
+    );
+    // And the digest is still usable on a file that also checkpoints.
+    let (_handle, source) = VarveFile::open_readonly_lazy_with_report(both, &with)?;
+    assert_eq!(source, LazyOpenSource::Digest);
+    Ok(())
+}
+
+/// A writer reopening a file that ends in a digest.
+#[test]
+fn a_reopened_writer_does_not_pile_up_digests() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("reopen.varve");
+    let spec = digest_spec();
+    write_lines(spec, &path, 40, 0)?;
+
+    let digests = |path: &Path| -> varve::Result<usize> {
+        Ok(VarveFile::open_readonly(spec, path)?
+            .index_entries()
+            .iter()
+            .filter(|entry| entry.block_id == varve::OPEN_DIGEST_BLOCK_ID)
+            .count())
+    };
+    assert_eq!(digests(&path)?, 1);
+
+    // Reopen and flush without writing anything: the seeded
+    // `last_resident_block_id` must say the file already ends in a digest.
+    for _ in 0..3 {
+        let mut writer = VarveWriter::open(spec, &path)?;
+        writer.flush()?;
+    }
+    assert_eq!(digests(&path)?, 1, "an idle reopen must write no digest");
+
+    // A reopen that actually appends closes its own commit point once.
+    {
+        let mut writer = VarveWriter::open(spec, &path)?;
+        writer.push(&Line { value: 77 })?;
+        writer.flush()?;
+        writer.flush()?;
+    }
+    assert_eq!(digests(&path)?, 2);
+    let (_handle, source) = VarveFile::open_readonly_lazy_with_report(spec, &path)?;
+    assert_eq!(source, LazyOpenSource::Digest);
+    Ok(())
+}
+
+/// Recovery over a file whose last record is a digest.
+#[test]
+fn open_recover_accepts_a_file_that_ends_in_a_digest() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("recover.varve");
+    let spec = digest_spec();
+    write_lines(spec, &path, 80, 40)?;
+    let before = scanned_shape(spec, &path)?;
+    let before_len = std::fs::metadata(&path)?.len();
+
+    // The digest sits after the commit marker, so a recovery that treated it as
+    // an uncommitted tail would truncate the file back past it.
+    {
+        let recovered = VarveFile::open_recover(spec, &path)?;
+        drop(recovered);
+    }
+    assert_eq!(std::fs::metadata(&path)?.len(), before_len);
+    assert_eq!(scanned_shape(spec, &path)?, before);
+    let (_handle, source) = VarveFile::open_readonly_lazy_with_report(spec, &path)?;
+    assert_eq!(source, LazyOpenSource::Digest);
+    Ok(())
+}
+
+/// `replace_rewrite` is not the rewrite a digest format can reach.
+///
+/// A digest requires `block_offset_chain`, which requires a record footer, and
+/// `replace_rewrite` refuses record-footer formats outright. Pinned here
+/// because the digest branch in that loop would otherwise look like tested code
+/// and is in fact unreachable: it is there so the two rewrite loops do not
+/// disagree if the refusal is ever lifted.
+#[test]
+fn replace_rewrite_is_unreachable_for_a_digest_format() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("no-rewrite.varve");
+    let spec = digest_spec();
+    write_lines(spec, &path, 10, 0)?;
+    let mut file = spec.open(&path)?;
+    assert!(matches!(
+        file.replace_rewrite(0, &Line { value: 1 }),
+        Err(varve::Error::InvalidFormatSpec(
+            "replace is not supported for record-footer formats"
+        ))
+    ));
+    Ok(())
+}
+
+/// The rewrite a digest format *can* reach, and a digest is nothing but offsets.
+///
+/// `replace_block` republishes a whole generation. Its loop already re-encodes
+/// segment payloads because they are record offsets; a digest payload is block
+/// tails and its own start offset, so it needs the same.
+///
+/// **Two things had to be right for this to test anything**, and neither was
+/// obvious — the first two versions of it passed against an implementation that
+/// copied the digest verbatim:
+///
+/// 1. The replacement has to change a length. A same-size one moves no offset,
+///    so a copied digest stays valid.
+/// 2. The published generation has to be read *as published*. Appending and
+///    flushing after the replacement writes a fresh, correct digest at the end
+///    of the file, which is what the next open finds — the stale one is still
+///    in there and no longer the last record, so nothing looks at it.
+#[test]
+fn a_replacement_generation_re_encodes_the_digest() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("replace.varve");
+    let spec = digest_spec();
+
+    let mut file = spec.create(&path)?;
+    for value in 0..24 {
+        file.push(&Line { value })?;
+        if value == 4 {
+            file.push(&Note {
+                body: "x".repeat(512),
+            })?;
+        }
+    }
+    file.flush()?;
+    // The `Line` tail, not the `Note` tail: the note sits near the front, so
+    // shortening it moves everything *behind* it and leaves its own offset
+    // where it was.
+    let old_line_tail = VarveFile::open_readonly(spec, &path)?
+        .block_tail_offset(Line::ID)
+        .expect("a line tail");
+
+    // Block-relative: the first (and only) `Note`, replaced with a much shorter
+    // body so every record behind it moves.
+    file.replace_block(
+        0,
+        &Note {
+            body: "y".to_string(),
+        },
+    )?;
+    // Closed here, with no further append: the last record in the published
+    // generation is the digest the rewrite produced, and that is the one under
+    // test.
+    drop(file);
+
+    let scanned = VarveFile::open_readonly(spec, &path)?;
+    assert_ne!(
+        scanned.block_tail_offset(Line::ID),
+        Some(old_line_tail),
+        "the fixture must actually move offsets, or a copied digest would \
+         still be valid and this proves nothing"
+    );
+
+    let (handle, source) = VarveFile::open_readonly_lazy_with_report(spec, &path)?;
+    assert_eq!(
+        source,
+        LazyOpenSource::Digest,
+        "the digest must describe the generation it was published in"
+    );
+    assert_eq!(
+        handle.block_tail_offset(Line::ID),
+        scanned.block_tail_offset(Line::ID)
+    );
+    assert_eq!(
+        handle.block_tail_offset(Note::ID),
+        scanned.block_tail_offset(Note::ID)
+    );
+    // And the tails point into the rewritten generation, not the old one.
+    let note: Note =
+        handle.read_block_at::<Note>(handle.block_tail_offset(Note::ID).expect("a note tail"))?;
+    assert_eq!(note.body, "y");
+
+    // The writer's own state survived the rebind: the next commit point closes
+    // onto the new generation rather than repeating it.
+    let mut file = spec.open(&path)?;
+    file.push(&Line { value: 24 })?;
+    file.flush()?;
+    drop(file);
+    let (_handle, source) = VarveFile::open_readonly_lazy_with_report(spec, &path)?;
+    assert_eq!(source, LazyOpenSource::Digest);
+    Ok(())
+}
