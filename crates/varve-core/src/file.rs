@@ -14693,16 +14693,16 @@ fn load_index_from_segments(
 /// is a segment. Neither alone is proof — the footer carries no block id and
 /// the trailer is only eight bytes of payload — so the offset this returns is a
 /// candidate that the caller confirms by reading the header there.
-fn read_segment_tip_offset(file: &mut File, append_start: u64, file_len: u64) -> Result<u64> {
+fn read_segment_tip_offset(file: &mut File, append_start: u64, chain_end: u64) -> Result<u64> {
     let probe_len = SEGMENT_TRAILER_LEN + RECORD_FOOTER_LEN;
     let minimum = RECORD_HEADER_LEN + SEGMENT_PREFIX_LEN + probe_len;
-    if file_len
+    if chain_end
         .checked_sub(append_start)
         .is_none_or(|available| available < minimum)
     {
         return Err(Error::InvalidIndexSegment);
     }
-    let probe_offset = file_len - probe_len;
+    let probe_offset = chain_end - probe_len;
     let mut probe = [0u8; (SEGMENT_TRAILER_LEN + RECORD_FOOTER_LEN) as usize];
     file.seek(SeekFrom::Start(probe_offset))?;
     file.read_exact(&mut probe)?;
@@ -14737,12 +14737,12 @@ fn read_segment_tip_offset(file: &mut File, append_start: u64, file_len: u64) ->
 /// and its checksum must verify, which is what stops a digest whose bytes rotted
 /// from misreporting a block tail that nothing else would contradict. Any
 /// failure is `Err`, and the caller answers it with the scan.
-fn read_open_digest(
+fn frame_open_digest(
     spec: FormatSpec,
     file: &mut File,
     append_start: u64,
     file_len: u64,
-) -> Result<OpenDigest> {
+) -> Result<RecordIndexEntry> {
     let probe_len = DIGEST_TRAILER_LEN + RECORD_FOOTER_LEN;
     let minimum = RECORD_HEADER_LEN + DIGEST_PREFIX_LEN + probe_len;
     if file_len
@@ -14796,8 +14796,43 @@ fn read_open_digest(
     {
         return Err(Error::InvalidIndexSegment);
     }
+    Ok(entry)
+}
+
+/// The digest record sitting past the end of the segment chain, if there is one.
+///
+/// A digest is appended *after* the segment that closes the same commit point,
+/// so with both options on the newest segment does not end at `file_len` and
+/// the chain walk — which checks exactly that — rejects a chain that is
+/// perfectly good. Enabling the digest would silently turn the segment chain
+/// off, which is the sort of interaction that shows up as a performance
+/// mystery rather than as a failure.
+///
+/// Costs one 40-byte probe and one record frame, and only for a format that
+/// declared the digest. A file that has no digest answers `file_len`, which is
+/// what the walk assumed before this existed.
+fn trailing_open_digest(
+    spec: FormatSpec,
+    file: &mut File,
+    append_start: u64,
+    file_len: u64,
+) -> Option<RecordIndexEntry> {
+    if !spec.index_policy.open_digest_on_flush {
+        return None;
+    }
+    frame_open_digest(spec, file, append_start, file_len).ok()
+}
+
+/// Reads the digest at the end of the file: the record, then what it says.
+fn read_open_digest(
+    spec: FormatSpec,
+    file: &mut File,
+    append_start: u64,
+    file_len: u64,
+) -> Result<OpenDigest> {
+    let entry = frame_open_digest(spec, file, append_start, file_len)?;
     let payload = entry.read_payload_file_with_len(file, file_len)?;
-    decode_digest_payload(&payload, append_start, record_offset, file_len)
+    decode_digest_payload(&payload, append_start, entry.record_offset, file_len)
 }
 
 /// Walks the segment chain backwards from the end of the file and materializes
@@ -14839,10 +14874,18 @@ fn walk_segment_chain(
     // Keeping the entry also keeps the accounting honest: each segment record's
     // header is read and charged exactly once, as before.
     let mut links: Vec<RecordIndexEntry> = Vec::new();
-    let mut next = Some(read_segment_tip_offset(file, append_start, file_len)?);
-    // What the link being read must end at: the end of the file for the tip,
+    // Not `file_len`: with the digest option on, the newest segment is followed
+    // by the digest record that closes the same commit point. The digest is
+    // kept, not just measured — it is a resident record, so the index this walk
+    // produces has to contain it or it is not the index the scan produces.
+    let digest = trailing_open_digest(spec, file, append_start, file_len);
+    let chain_end = digest
+        .as_ref()
+        .map_or(file_len, |entry| entry.record_offset);
+    let mut next = Some(read_segment_tip_offset(file, append_start, chain_end)?);
+    // What the link being read must end at: the end of the chain for the tip,
     // and the coverage start of its successor for every link behind it.
-    let mut expected_end = file_len;
+    let mut expected_end = chain_end;
     while let Some(record_offset) = next {
         let entry = match read_record_entry_at(
             spec,
@@ -14936,6 +14979,16 @@ fn walk_segment_chain(
             return Err(Error::InvalidIndexSegment);
         }
         running = push_scanned_entry(spec, &mut scanned, entries, link, running)?;
+    }
+    // The digest closes the file the way the tip segment closes the chain, and
+    // it is indexed here for the same reason every link is: a scan of these
+    // bytes reports it, so a walk that dropped it would hand back a different
+    // index for the same file.
+    if let Some(digest) = digest {
+        if digest.record_offset != running {
+            return Err(Error::InvalidIndexSegment);
+        }
+        running = push_scanned_entry(spec, &mut scanned, entries, digest, running)?;
     }
     if running != file_len {
         return Err(Error::InvalidIndexSegment);

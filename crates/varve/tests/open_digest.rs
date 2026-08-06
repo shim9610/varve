@@ -382,3 +382,81 @@ fn a_digest_requires_the_chain_it_hands_out_entry_points_to() {
         ))
     ));
 }
+
+/// Both tail records at once.
+///
+/// The digest is written after the segment and is itself a resident record, so
+/// it pushes `index.len()` past the segment cursor — and an unguarded
+/// `needs_index_segment` then reads that as "a commit point was left
+/// uncovered". It writes a segment, which makes the digest stale, which writes
+/// a digest, which pushes the cursor again. The commit that introduced the
+/// digest claimed this was fixed and tested only the digest alone; this is the
+/// measurement that claim needed.
+#[test]
+fn both_tail_records_at_once_do_not_grow_an_idle_file() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("both.varve");
+    let spec = DigestFormat::spec().with_index_policy(
+        DigestFormat::spec()
+            .index_policy
+            .with_segment_on_flush(true)
+            .with_open_digest_on_flush(true),
+    );
+
+    let mut file = spec.create(&path)?;
+    for value in 0..60 {
+        file.push(&Line { value })?;
+    }
+    file.flush()?;
+    let after_first = std::fs::metadata(&path)?.len();
+
+    for _ in 0..8 {
+        file.flush()?;
+    }
+    assert_eq!(
+        std::fs::metadata(&path)?.len(),
+        after_first,
+        "eight idle flushes must write nothing"
+    );
+
+    // And a real append after them still closes the commit point once.
+    file.push(&Line { value: 999 })?;
+    file.flush()?;
+    let after_second = std::fs::metadata(&path)?.len();
+    assert!(after_second > after_first);
+    for _ in 0..8 {
+        file.flush()?;
+    }
+    assert_eq!(std::fs::metadata(&path)?.len(), after_second);
+    drop(file);
+
+    // Both routes still work on the same file, and agree.
+    let (lazy, source) = VarveFile::open_readonly_lazy_with_report(spec, &path)?;
+    assert_eq!(source, LazyOpenSource::Digest);
+    let scanned = VarveFile::open_readonly(spec, &path)?;
+    assert_eq!(
+        lazy.block_tail_offset(Line::ID),
+        scanned.block_tail_offset(Line::ID)
+    );
+
+    // The segment chain must still describe the file: a chained open frames one
+    // record per commit point, and the digest must not have broken that.
+    let (chained, frames) = framed(|| VarveFile::open_readonly(spec, &path).expect("chained open"));
+    assert!(
+        frames < 20,
+        "the segment chain must still be taken, not fallen back from: {frames} framed"
+    );
+    assert_eq!(
+        chained
+            .index_entries()
+            .iter()
+            .map(|entry| (entry.block_id, entry.record_offset))
+            .collect::<Vec<_>>(),
+        scanned
+            .index_entries()
+            .iter()
+            .map(|entry| (entry.block_id, entry.record_offset))
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
