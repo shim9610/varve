@@ -28,6 +28,23 @@ pub enum Error {
     #[error("payload ended before a full value could be decoded")]
     UnexpectedEof,
 
+    /// A position-based read was asked of a handle that keeps no record
+    /// directory.
+    ///
+    /// The handle was opened through `open_readonly_without_directory`, which
+    /// hands the directory to the caller instead of keeping one. The reads are
+    /// not gone — they need to be told where the directory is:
+    /// `file.with_directory(&index).blocks::<T>()`.
+    ///
+    /// Deliberately an error and not an empty answer. An empty `BlockVec` here
+    /// would be indistinguishable from an empty file, which is the one way a
+    /// missing directory could corrupt a caller's conclusions rather than
+    /// merely inconvenience them.
+    #[error(
+        "this handle keeps no record directory; pass the one you were given to          `with_directory(..)` and repeat the {operation} there"
+    )]
+    NoResidentDirectory { operation: &'static str },
+
     #[error("length value {value} does not fit on this platform")]
     LengthOverflow { value: u64 },
 

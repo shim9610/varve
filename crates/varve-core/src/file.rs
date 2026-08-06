@@ -868,6 +868,15 @@ pub(crate) mod resident_index {
     pub struct ResidentIndex {
         slots: Vec<IndexSlot>,
         source: IndexSource,
+        /// Whether this handle keeps a directory at all.
+        ///
+        /// `false` only for `open_readonly_without_directory`, where `slots` is
+        /// empty by construction and the caller holds the directory. It is a
+        /// flag rather than "slots is empty" because those two must not be
+        /// confused: an empty file also has no slots, and answering a read of a
+        /// directory-less handle the way an empty file is answered is exactly
+        /// the confusion `Error::NoResidentDirectory` exists to prevent.
+        retained: bool,
     }
 
     impl ResidentIndex {
@@ -900,7 +909,26 @@ pub(crate) mod resident_index {
             Ok(Self {
                 slots,
                 source: IndexSource { snapshot, spec },
+                retained: true,
             })
+        }
+
+        /// A handle that keeps no directory: the caller holds it.
+        ///
+        /// The entries are still needed to build one — the caller was handed
+        /// them — so this takes none. What it produces answers `len() == 0`,
+        /// and [`Self::is_retained`] is what tells a read that this means
+        /// "somebody else has it" rather than "the file is empty".
+        pub(crate) fn none_retained(snapshot: SnapshotFile, spec: FormatSpec) -> Self {
+            Self {
+                slots: Vec::new(),
+                source: IndexSource { snapshot, spec },
+                retained: false,
+            }
+        }
+
+        pub(crate) fn is_retained(&self) -> bool {
+            self.retained
         }
 
         /// An empty directory, for a file that has just been created.
@@ -908,6 +936,7 @@ pub(crate) mod resident_index {
             Self {
                 slots: Vec::new(),
                 source: IndexSource { snapshot, spec },
+                retained: true,
             }
         }
 
@@ -3139,6 +3168,17 @@ impl VarveReader {
         })
     }
 
+    /// See [`VarveFile::open_readonly_without_directory`].
+    pub fn open_without_directory<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        index: &mut Vec<RecordIndexEntry>,
+    ) -> Result<Self> {
+        Ok(Self {
+            file: VarveFile::open_readonly_without_directory(spec, path, index)?,
+        })
+    }
+
     pub fn into_inner(self) -> VarveFile {
         self.file
     }
@@ -4282,6 +4322,48 @@ impl VarveFile {
         Ok(file)
     }
 
+    /// Opens a read-only handle that keeps **no** record directory, and hands
+    /// the directory to the caller.
+    ///
+    /// The last thing about an open that still scales with the file is the
+    /// 16-byte directory slot per record. This is the option that removes it
+    /// from varve's side. It is not a reduction in capability: `blocks`,
+    /// `scan`, `keyed_blocks`, `metadata`, `verify_all` and the rest all still
+    /// work — through [`with_directory`](Self::with_directory), which is where
+    /// the directory now is.
+    ///
+    /// ```ignore
+    /// let mut index = Vec::new();
+    /// let file = VarveFile::open_readonly_without_directory(spec, path, &mut index)?;
+    /// let points = file.with_directory(&index).blocks::<Point>()?;
+    /// // and `file.blocks::<Point>()` refuses with `NoResidentDirectory`,
+    /// // naming `with_directory`, rather than answering as if empty.
+    /// ```
+    ///
+    /// **`index` is output, not scratch** — the one place in this crate where a
+    /// caller-supplied buffer is kept rather than reused. That is deliberate
+    /// and it is why the parameter is not optional: a handle that keeps no
+    /// directory cannot produce one afterwards, so a caller who did not take it
+    /// here would have no way to read the file positionally at all. Taking the
+    /// buffer is what makes the option impossible to half-use.
+    ///
+    /// Read-only. A writer keeps its directory unconditionally: the checkpoint
+    /// cadence, the segment cursor and the append rollback all resolve
+    /// positions through it, so there is nothing to hand over.
+    pub fn open_readonly_without_directory<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+        index: &mut Vec<RecordIndexEntry>,
+    ) -> Result<Self> {
+        let mut file = Self::open_readonly_with_scratch(spec, path, index)?;
+        // The scan already filled `index`; drop varve's copy of it. Built and
+        // then released rather than never built, because the open path derives
+        // the checkpoint cadence, the segment cursor and the snapshot bound
+        // from the same walk — this option is about what the handle *keeps*.
+        file.index = ResidentIndex::none_retained(file.snapshot.clone(), file.spec);
+        Ok(file)
+    }
+
     /// Opens a read-write handle.
     ///
     /// **This allocates the scan's entry buffer.**
@@ -5037,7 +5119,7 @@ impl VarveFile {
     /// (`STANDARD` sets it to 1 GiB) even when the requested entry was the
     /// first record in the file.
     pub fn metadata(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        self.metadata_in(&self.index, key)
+        self.metadata_in(self.resident_directory("metadata")?, key)
     }
 
     fn metadata_in<D: RecordDirectory + ?Sized>(
@@ -5090,7 +5172,7 @@ impl VarveFile {
     /// `out` is cleared and then extended, so a caller that reuses one buffer
     /// across calls allocates once and never again.
     pub fn all_metadata_into(&self, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
-        self.all_metadata_into_in(&self.index, out)
+        self.all_metadata_into_in(self.resident_directory("all_metadata")?, out)
     }
 
     fn all_metadata_into_in<D: RecordDirectory + ?Sized>(
@@ -5119,7 +5201,7 @@ impl VarveFile {
     }
 
     pub fn schema_manifest(&self) -> Result<Option<SchemaManifest>> {
-        self.schema_manifest_in(&self.index)
+        self.schema_manifest_in(self.resident_directory("schema_manifest")?)
     }
 
     fn schema_manifest_in<D: RecordDirectory + ?Sized>(
@@ -6082,6 +6164,20 @@ impl VarveFile {
         budget.decode(scratch, T::ENDIAN.unwrap_or(self.spec.endian))
     }
 
+    /// This handle's own record directory, or the typed refusal that says who
+    /// has it instead.
+    ///
+    /// Every position-based read goes through here rather than touching
+    /// `self.index`, so a handle opened without a directory refuses by name
+    /// instead of answering as though the file were empty.
+    fn resident_directory(&self, operation: &'static str) -> Result<&ResidentIndex> {
+        if self.index.is_retained() {
+            Ok(&self.index)
+        } else {
+            Err(Error::NoResidentDirectory { operation })
+        }
+    }
+
     /// Reads that resolve positions through a directory **the caller supplies**.
     ///
     /// Every method on the returned view is the same read the handle offers,
@@ -6126,7 +6222,7 @@ impl VarveFile {
     /// matching record, so it is bounded by the caller's buffer and not by the
     /// file, which is the opposite of what this collection is for.
     pub fn blocks<T: VarveBlock>(&self) -> Result<BlockVec<T>> {
-        self.blocks_in(&self.index)
+        self.blocks_in(self.resident_directory("blocks")?)
     }
 
     fn blocks_in<T: VarveBlock, D: RecordDirectory + ?Sized>(
@@ -6176,7 +6272,7 @@ impl VarveFile {
     /// form of `blocks()`: same entries, same per-entry `IndexBytes` charge,
     /// same laziness — no payload is read and nothing is decoded.
     pub fn block_entries_into<T: VarveBlock>(&self, out: &mut Vec<RecordIndexEntry>) -> Result<()> {
-        self.block_entries_into_in::<T, _>(&self.index, out)
+        self.block_entries_into_in::<T, _>(self.resident_directory("block_entries_into")?, out)
     }
 
     fn block_entries_into_in<T: VarveBlock, D: RecordDirectory + ?Sized>(
@@ -6225,7 +6321,7 @@ impl VarveFile {
     /// The per-record charge is unchanged from `BlockVec::get`: the
     /// materialization ceiling bounds one payload, not the sum over the walk.
     pub fn decode_blocks_into<T: VarveBlock>(&self, out: &mut Vec<T>) -> Result<()> {
-        self.decode_blocks_into_in::<T, _>(&self.index, out)
+        self.decode_blocks_into_in::<T, _>(self.resident_directory("decode_blocks_into")?, out)
     }
 
     fn decode_blocks_into_in<T: VarveBlock, D: RecordDirectory + ?Sized>(
@@ -6290,7 +6386,10 @@ impl VarveFile {
         To: VarveBlock,
         M: VarveMigration<From, To>,
     {
-        self.blocks_migrated_into_in::<From, To, M, _>(&self.index, out)
+        self.blocks_migrated_into_in::<From, To, M, _>(
+            self.resident_directory("blocks_migrated")?,
+            out,
+        )
     }
 
     fn blocks_migrated_into_in<From, To, M, D: RecordDirectory + ?Sized>(
@@ -6376,7 +6475,7 @@ impl VarveFile {
         T: VarveKeyedBlock,
         T::Key: Eq + Hash + Clone,
     {
-        self.keyed_blocks_into_in::<T, _>(&self.index, entries, by_key)
+        self.keyed_blocks_into_in::<T, _>(self.resident_directory("keyed_blocks")?, entries, by_key)
     }
 
     fn keyed_blocks_into_in<T, D: RecordDirectory + ?Sized>(
@@ -6506,7 +6605,10 @@ impl VarveFile {
         T: VarveMerge,
         T::Key: Eq + Hash,
     {
-        self.materialized_keyed_blocks_into_in::<T, _>(&self.index, out)
+        self.materialized_keyed_blocks_into_in::<T, _>(
+            self.resident_directory("materialized_keyed_blocks")?,
+            out,
+        )
     }
 
     fn materialized_keyed_blocks_into_in<T, D: RecordDirectory + ?Sized>(
@@ -6554,8 +6656,19 @@ impl VarveFile {
     /// exists not to do — or to swallow a read error as an early `None`, which
     /// would report a truncated file as a short one. So the `Result` is here,
     /// on each item, and nothing is read until the item is asked for.
+    /// **One item, and it is the refusal**, when this handle keeps no directory.
+    /// `scan` returns an iterator rather than a `Result`, so there is nowhere
+    /// else to put it — and an empty iterator would say "no records", which is
+    /// the answer a directory-less handle must never give.
     pub fn scan(&self) -> impl Iterator<Item = Result<BlockEvent>> + '_ {
-        Self::scan_in(&self.index)
+        let refusal = self.resident_directory("scan").err().map(Err).into_iter();
+        let events = self
+            .index
+            .is_retained()
+            .then(|| Self::scan_in(&self.index))
+            .into_iter()
+            .flatten();
+        refusal.chain(events)
     }
 
     fn scan_in<D: RecordDirectory + ?Sized>(
@@ -6610,7 +6723,7 @@ impl VarveFile {
     /// Returns the number of records verified. A mismatch is
     /// [`Error::ChecksumMismatch`] naming the offending record's offset.
     pub fn verify_all(&self) -> Result<usize> {
-        self.verify_all_in(&self.index)
+        self.verify_all_in(self.resident_directory("verify_all")?)
     }
 
     fn verify_all_in<D: RecordDirectory + ?Sized>(&self, dir: &D) -> Result<usize> {
@@ -6686,7 +6799,7 @@ impl VarveFile {
     /// The copy is charged against `ReadLimitKey::IndexBytes`, like the index
     /// it copies.
     pub fn index_entries_into(&self, out: &mut Vec<RecordIndexEntry>) -> Result<()> {
-        self.index_entries_into_in(&self.index, out)
+        self.index_entries_into_in(self.resident_directory("index_entries")?, out)
     }
 
     fn index_entries_into_in<D: RecordDirectory + ?Sized>(
@@ -6769,7 +6882,7 @@ impl VarveFile {
         T: VarveKeyedBlock,
         T::Key: Eq + Hash,
     {
-        self.key_tail_offsets_into_in::<T, _>(&self.index, out)
+        self.key_tail_offsets_into_in::<T, _>(self.resident_directory("key_tail_offsets")?, out)
     }
 
     fn key_tail_offsets_into_in<T, D: RecordDirectory + ?Sized>(

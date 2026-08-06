@@ -531,3 +531,111 @@ fn a_host_supplied_directory_answers_every_read_the_same() -> varve::Result<()> 
     assert_eq!(short.scan().collect::<varve::Result<Vec<_>>>()?.len(), 10);
     Ok(())
 }
+
+/// The switch: a handle that keeps **no** directory, and loses no read.
+///
+/// Three things must all hold, and the third is the one that makes the option
+/// safe rather than merely small:
+///
+/// 1. the handle retains nothing that scales with the file;
+/// 2. every position-based read still works, through the directory the caller
+///    was handed;
+/// 3. calling one of those reads *on the handle* refuses by name — it does not
+///    answer as though the file were empty, which would be indistinguishable
+///    from the truth for a caller who forgot.
+#[test]
+fn a_handle_can_keep_no_directory_and_still_answer_every_read() -> varve::Result<()> {
+    const SMALL: u32 = 2_000;
+    const LARGE: u32 = 20_000;
+
+    let directory = tempfile::tempdir()?;
+    let small_path = path_in(&directory, "nodir-small.idxres");
+    let large_path = path_in(&directory, "nodir-large.idxres");
+    build(&small_path, SMALL)?;
+    build(&large_path, LARGE)?;
+    let spec = IndexResidencyFormat::spec();
+
+    // --- 1. retained bytes do not scale ---
+    let retained = |path: &Path| -> varve::Result<isize> {
+        let mut index = Vec::new();
+        let baseline = begin_window();
+        let file = varve::VarveFile::open_readonly_without_directory(spec, path, &mut index)?;
+        // Measure the HANDLE, not the caller's index: drop the index's
+        // contribution by taking the reading before it would be freed and
+        // subtracting its own allocation.
+        let live = LIVE_BYTES.with(Cell::get) - baseline;
+        let index_bytes =
+            isize::try_from(index.capacity() * std::mem::size_of::<varve::RecordIndexEntry>())
+                .expect("index size fits");
+        drop(file);
+        Ok(live - index_bytes)
+    };
+
+    let _ = retained(&small_path)?; // warm
+    let small = retained(&small_path)?;
+    let large = retained(&large_path)?;
+    let per_record = (large - small) as f64 / (LARGE - SMALL) as f64;
+
+    // Measured 2026-08-05, Linux/ext4: 0.00 bytes per record. The handle keeps
+    // the header extensions, the block tails and the snapshot — all O(schema)
+    // — and nothing per record. With a directory it is 16.00.
+    assert!(
+        per_record.abs() < 1.0,
+        "a directory-less handle retained {per_record:.2} bytes per record \
+         ({small} at {SMALL}, {large} at {LARGE}); it must retain nothing that scales"
+    );
+
+    // --- 2. every read still answers, through the caller's directory ---
+    let mut index = Vec::new();
+    let file = varve::VarveFile::open_readonly_without_directory(spec, &large_path, &mut index)?;
+    assert_eq!(index.len() as u32, LARGE);
+
+    let view = file.with_directory(&index);
+    assert_eq!(view.record_count(), LARGE as usize);
+    assert_eq!(
+        view.scan().collect::<varve::Result<Vec<_>>>()?.len(),
+        LARGE as usize
+    );
+    let mut decoded: Vec<Sample> = Vec::new();
+    view.decode_blocks_into(&mut decoded)?;
+    assert_eq!(decoded.len(), LARGE as usize);
+    assert_eq!(view.blocks::<Sample>()?.len(), LARGE as usize);
+    let mut entries = Vec::new();
+    view.index_entries_into(&mut entries)?;
+    assert_eq!(entries, index);
+
+    // and reading one record through an entry the caller holds
+    let mut payload = Vec::new();
+    let sample: Sample = file.decode_block_into(&index[7], &mut payload)?;
+    assert_eq!(sample.value, 7);
+
+    // --- 3. the handle's own reads refuse by name, not by emptiness ---
+    fn refused<T>(result: varve::Result<T>, expected: &str) {
+        match result {
+            Err(varve::Error::NoResidentDirectory { operation }) => {
+                assert_eq!(operation, expected)
+            }
+            Err(other) => panic!("expected NoResidentDirectory, got {other}"),
+            Ok(_) => panic!("a directory-less handle answered `{expected}` instead of refusing"),
+        }
+    }
+    refused(file.blocks::<Sample>().map(|_| ()), "blocks");
+    refused(file.verify_all().map(|_| ()), "verify_all");
+    refused(file.metadata("owner").map(|_| ()), "metadata");
+    refused(file.index_entries_into(&mut entries), "index_entries");
+    refused(
+        file.decode_blocks_into::<Sample>(&mut decoded),
+        "decode_blocks_into",
+    );
+
+    // `scan` returns an iterator, so its refusal is the first item rather than
+    // an empty walk.
+    let scanned = file.scan().collect::<Vec<_>>();
+    assert_eq!(
+        scanned.len(),
+        1,
+        "the refusal must not look like an empty file"
+    );
+    refused(scanned.into_iter().next().expect("one item"), "scan");
+    Ok(())
+}

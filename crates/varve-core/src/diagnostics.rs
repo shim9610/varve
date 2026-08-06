@@ -823,7 +823,8 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::ZeroCopyEndianMismatch { .. }
         | Error::ZeroCopyPayloadSizeMismatch { .. }
         | Error::ZeroCopyAlignmentMismatch { .. }
-        | Error::KeyedChainRequiresKeyedApi { .. } => DiagnosticDomain::CallerUsage,
+        | Error::KeyedChainRequiresKeyedApi { .. }
+        | Error::NoResidentDirectory { .. } => DiagnosticDomain::CallerUsage,
 
         #[cfg(feature = "high-cardinality-dev")]
         Error::StreamingUnsupported => DiagnosticDomain::FeatureGate,

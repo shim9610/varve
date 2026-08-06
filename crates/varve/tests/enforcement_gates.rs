@@ -909,11 +909,13 @@ fn the_resident_record_index_cannot_be_grown_or_outrun() {
          lines, and the reservation token then binds nothing"
     );
     assert!(
-        source.contains(
-            "    pub struct ResidentIndex {\n        slots: Vec<IndexSlot>,\n        source: \
-             IndexSource,\n    }"
-        ),
-        "the directory's `Vec` must stay a private field of `ResidentIndex`"
+        source.contains("    pub struct ResidentIndex {\n        slots: Vec<IndexSlot>,"),
+        "the directory's `Vec` must stay the first private field of `ResidentIndex`"
+    );
+    assert!(
+        source.contains("        retained: bool,\n    }"),
+        "`ResidentIndex` must keep the `retained` flag as its last field: \"no directory\" \
+         and \"empty file\" are different answers and must not collapse into `slots.is_empty()`"
     );
     assert!(
         !source.contains("impl DerefMut for ResidentIndex")
