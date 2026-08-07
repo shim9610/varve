@@ -168,6 +168,60 @@ fn hash_map_rejects_duplicate_key_before_decoding_its_value() {
     ));
 }
 
+/// The 2026-07-20 libFuzzer OOM reproducer, promoted from an artifact to a
+/// test.
+///
+/// Eleven bytes that claimed a `HashMap<(), ()>` of 587,203,068 entries. The
+/// artifact was triaged as not reproducing against this code and then left in
+/// `fuzz/artifacts/`, where it blocked `run-security-fuzz.ps1` (which refuses
+/// to start while an unpromoted artifact exists) and, worse, pinned nothing:
+/// the behaviour that fixed it had no test, so it was correct by accident from
+/// the suite's point of view.
+///
+/// The bytes are inlined rather than read from the artifact so that deleting
+/// the artifact does not delete the regression. Selector 105 is the fuzz
+/// target's own dispatch: `105 % 12 == 9` selects `HashMap<(), ()>`.
+///
+/// Zero-sized keys and values are what make this shape reachable at all -- the
+/// wire-length screen cannot bound a declared count when each entry claims zero
+/// bytes, so the materialization budget and the 1024-entry preallocation cap
+/// are the only two things standing between a declaration and an allocation.
+/// Both are asserted here, at the boundary and on either side of it.
+#[test]
+fn the_2026_07_20_oom_reproducer_stays_refused() {
+    const ARTIFACT: [u8; 11] = [
+        0x69, 0xfc, 0x01, 0x00, 0x23, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfd,
+    ];
+    let (&selector, payload) = ARTIFACT.split_first().expect("the artifact is not empty");
+    assert_eq!(selector % 12, 9, "the reproducer selects HashMap<(), ()>");
+    assert_eq!(
+        u64::from_le_bytes(payload[..8].try_into().expect("eight declared-count bytes")),
+        587_203_068,
+        "the declared entry count is the number the OOM was reported for",
+    );
+
+    // Verbatim: refused by the standard 1 GiB materialization budget, because
+    // the table this count would reserve is 1,073,741,888 bytes -- 64 over.
+    assert!(matches!(
+        decode_from_slice::<HashMap<(), ()>>(payload, Endian::Little),
+        Err(Error::LimitExceeded {
+            resource: "HashMap entries",
+            actual: 1_073_741_888,
+            limit: 1_073_741_824,
+        })
+    ));
+
+    // The largest count the same budget admits reaches the decoder proper and
+    // is refused on content, not on size. This is the assertion that would fail
+    // if the budget stopped being the thing that refuses the reproducer.
+    let mut admitted = 293_601_534u64.to_le_bytes().to_vec();
+    admitted.extend_from_slice(&payload[8..]);
+    assert_invalid_canonical(decode_from_slice::<HashMap<(), ()>>(
+        &admitted,
+        Endian::Little,
+    ));
+}
+
 #[test]
 fn zero_width_maps_terminate_on_hostile_counts() {
     let hostile_count = (usize::MAX as u64).to_le_bytes();
