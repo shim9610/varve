@@ -1704,6 +1704,9 @@ fn initial_block_tails(spec: FormatSpec) -> Vec<(u32, Option<StreamTail>)> {
     if !spec.index_policy.block_offset_chain {
         return Vec::new();
     }
+    // Uncharged by the same exception as `disk_index::compute_plan_digest`:
+    // both terms are compile-time shape -- the declared block count and a fixed
+    // array of internal ids -- so no file content can size this.
     let mut tails = Vec::with_capacity(spec.blocks.len() + INTERNAL_BLOCK_IDS.len());
     tails.extend(spec.blocks.iter().map(|block| (block.id, None)));
     tails.extend(INTERNAL_BLOCK_IDS.map(|block_id| (block_id, None)));

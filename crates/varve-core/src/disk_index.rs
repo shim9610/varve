@@ -957,6 +957,12 @@ fn compute_plan_digest(descriptors: &[DiskIndexDescriptor]) -> DiskIndexResult<D
         u32::try_from(descriptors.len()).map_err(|_| DiskIndexError::PlanNotCanonical)?;
     // Materialize each codec identity once instead of re-allocating the
     // string for every digest lane.
+    //
+    // Uncharged on purpose, and it is the exception invariant 1 names rather
+    // than an oversight: `descriptors` is the declared disk plan, so its length
+    // is the format's own block count, fixed by the program at compile time. No
+    // file content and no caller-supplied count reaches it. Anything sized from
+    // a *decoded* count belongs on the charged path instead.
     let mut codecs = Vec::with_capacity(descriptors.len());
     for descriptor in descriptors {
         let codec = descriptor.key_codec_identity();
@@ -1534,6 +1540,17 @@ fn open_shared_database(
     // reach redb while opens of unrelated sidecars proceed concurrently.
     let slot = shared_sidecar_slot(&identity);
     let mut shared = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    // A hit returns without re-probing the pathname, and that is sound for a
+    // reason worth stating, because the miss path below *does* re-probe.
+    //
+    // Identity bytes read from a handle that is then closed name nothing on
+    // their own: a filesystem hands a just-freed inode straight back to the
+    // next create, so equal bytes can mean a different object. What rules that
+    // out here is the upgrade itself. A live `Database` holds the sidecar open,
+    // an open handle pins its inode, and a pinned inode cannot be handed to
+    // anything else -- so a successful upgrade is the proof a re-probe would be
+    // looking for. The miss path has no such handle, which is why it pays for
+    // one.
     if let Some(database) = shared.database.upgrade() {
         return Ok((database, Arc::clone(&shared.write_gate)));
     }
