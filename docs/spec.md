@@ -258,7 +258,7 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   `layout { file_header Header { bytes sig = b"..."; } segment Name repeat
   until_eof { lead_in Name { bytes tag = b"..."; u32 caller_field; i64 offset =
   finalize(target = segment_end, relative_to = after_lead_in); } metadata Name;
-  raw_region Name; footer Footer { bytes seal = b"..."; u64 len =
+  raw_region Name; footer Footer { bytes write = b"..."; u64 len =
   finalize(target = segment_end, relative_to = segment_start); } } }`.
 - Custom physical layout scanning accepts numeric finalized fields with the
   target format's required integer width. Segment `raw_region_start` may be

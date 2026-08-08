@@ -271,7 +271,7 @@ const MATRIX_CHUNK_VERSION: u16 = 1;
 /// Set when the format's integrity policy is a crc32 one. A chunk read
 /// otherwise has nothing to check: the record footer's crc covers the whole
 /// payload and is verified on a *record* read, which a positional cell read is
-/// not, so a single flipped bit in a sealed chunk came back as data. The matrix
+/// not, so a single flipped bit in a written chunk came back as data. The matrix
 /// region solves this with a per-cell checksum and so does a chunk.
 const MATRIX_CHUNK_FLAG_CELL_CRC: u16 = 0x0001;
 /// Prefix flag: every block's slot region is a sub-block index followed by
@@ -2221,11 +2221,11 @@ fn note_checkpoint_cadence_index_touches(count: u64) {
     let _ = count;
 }
 
-/// The payload one sealed chunk occupies, given the declared dimensions.
+/// The payload one written chunk occupies, given the declared dimensions.
 ///
 /// Computed at create so the two ceilings a chunk crosses — the buffer it is
 /// held in and the record it is written as — are reconciled before any write is
-/// accepted rather than at the first seal.
+/// accepted rather than at the first write.
 fn chunk_payload_len_for(spec: FormatSpec, dims: &MatrixDimensions) -> Result<u64> {
     let Some(growing) = spec.growing_matrix else {
         return Ok(0);
@@ -2269,7 +2269,7 @@ fn chunk_payload_len_for(spec: FormatSpec, dims: &MatrixDimensions) -> Result<u6
             0
         };
         // The uncompressed size plus the sub-block index. Compression can only
-        // make the sealed record smaller, so bounding the uncompressed form is
+        // make the written record smaller, so bounding the uncompressed form is
         // the conservative check — a spec must not depend on its data
         // compressing in order to fit.
         let index = if spec.chunk_compression.is_some() {
@@ -2454,7 +2454,7 @@ struct ChunkPrefix {
     compressed_slots: bool,
 }
 
-/// One sealed chunk, located.
+/// One written chunk, located.
 ///
 /// `block_count` is carried so a cell lookup does not re-read the prefix that
 /// finding the chunk already read.
@@ -2468,7 +2468,7 @@ struct ChunkLocator {
     compressed_slots: bool,
 }
 
-/// Every sealed chunk, by chunk index, ordered once.
+/// Every written chunk, by chunk index, ordered once.
 ///
 /// **This exists because the first version did not have it, and that is the
 /// mistake this project keeps making.** `find_chunk_record` filtered the whole
@@ -2480,7 +2480,7 @@ struct ChunkLocator {
 /// already written down.
 ///
 /// Built at most once per handle, on the first chunked access rather than at
-/// open, and extended in place when the writer seals. Lookup is a binary search
+/// open, and extended in place when the writer writes one. Lookup is a binary search
 /// over memory: no walk, no allocation, no read.
 ///
 /// Invariant: equals the `MATRIX_CHUNK_BLOCK_ID` entries of the resident index,
@@ -2498,8 +2498,8 @@ impl ChunkDirectory {
             .map(|position| self.chunks[position])
     }
 
-    /// The newest sealed chunk index, which is the last element because chunks
-    /// are sealed in increasing order.
+    /// The newest written chunk index, which is the last element because chunks
+    /// are written in increasing order.
     fn newest(&self) -> Option<u64> {
         self.chunks.last().map(|locator| locator.index)
     }
@@ -2508,26 +2508,26 @@ impl ChunkDirectory {
         self.chunks.is_empty()
     }
 
-    fn note_sealed(&mut self, locator: ChunkLocator) {
+    fn note_written(&mut self, locator: ChunkLocator) {
         self.chunks.push(locator);
     }
 }
 
 /// The chunk a growing matrix is currently filling.
 ///
-/// Held in memory until sealed, which is the one cost this design has and the
+/// Held in memory until it is written, which is the one cost this design has and the
 /// reason `rows_per_chunk` is a declared knob rather than a constant. Sealing
 /// writes it as one ordinary record, so nothing else in the file format learns
 /// that chunks exist.
 ///
 /// Only the newest chunk is open. A write addressing an older one is refused
-/// rather than dropped — see `Error::MatrixChunkSealed`.
+/// rather than dropped — see `Error::MatrixChunkClosed`.
 #[derive(Debug)]
 struct OpenChunk {
     index: u64,
     first_row: u64,
     rows: u64,
-    /// How the slot regions are stored when this chunk is sealed.
+    /// How the slot regions are stored when this chunk is written.
     compression: Option<VariableCompression>,
     blocks: Vec<OpenChunkBlock>,
     /// Whether any cell has been committed since the chunk was opened. A chunk
@@ -3557,20 +3557,20 @@ fn validate_mmap_index_entry(entry: &RecordIndexEntry, mapped_len: u64) -> Resul
 /// Seals the open chunk on the way out.
 ///
 /// **Every other byte a writer accepts is on disk before the call returns.** A
-/// chunked cell is the one exception: it lives in the open chunk until a seal.
+/// chunked cell is the one exception: it lives in the open chunk until it is written.
 /// Without this, dropping a writer without `flush` lost every committed cell in
 /// that chunk, silently, and this library had no other way to lose committed
 /// data.
 ///
 /// Best effort, and that is a real limitation rather than a hedge: `drop`
-/// cannot report a failure, so a caller who needs to know the seal succeeded
+/// cannot report a failure, so a caller who needs to know the write succeeded
 /// must call `flush`, `commit` or `sync` and read the error. What this
 /// guarantees is that the ordinary case — a writer that goes out of scope —
 /// does not lose data.
 impl Drop for VarveFile {
     fn drop(&mut self) {
         if self.mode == OpenMode::ReadWrite && self.open_chunk.is_some() {
-            let _ = self.seal_open_chunk();
+            let _ = self.write_open_chunk_record();
         }
     }
 }
@@ -3608,7 +3608,7 @@ pub struct VarveFile {
     // The matrix chunk being filled, when a growing dimension is declared. See
     // `OpenChunk`; `None` until a write lands past the declared extent.
     open_chunk: Option<OpenChunk>,
-    // Every sealed chunk, ordered once and searched in memory. Empty until the
+    // Every written chunk, ordered once and searched in memory. Empty until the
     // first chunked access, so a handle that never touches a chunk builds
     // nothing. See `ChunkDirectory` for why this is not derived per read.
     //
@@ -4779,16 +4779,16 @@ impl VarveFile {
                     actual: declared,
                 });
             }
-            // A chunk is buffered against `MatrixSlotRegionLen` and sealed
+            // A chunk is buffered against `MatrixSlotRegionLen` and written
             // against `RecordPayloadLen`, and nothing reconciled them: a spec
             // could pass `validate`, accept writes, and then die at the first
-            // seal with the data already in RAM and no way to get it out.
+            // write with the data already in RAM and no way to get it out.
             // Refused here, before a byte is accepted.
-            let sealed = chunk_payload_len_for(spec, &dims)?;
+            let written = chunk_payload_len_for(spec, &dims)?;
             spec.read_limits
-                .check(ReadLimitKey::RecordPayloadLen, sealed)?;
+                .check(ReadLimitKey::RecordPayloadLen, written)?;
             spec.read_limits
-                .check(ReadLimitKey::MatrixSlotRegionLen, sealed)?;
+                .check(ReadLimitKey::MatrixSlotRegionLen, written)?;
         }
         let path = path.to_path_buf();
         let lock = WriterLock::acquire(&path)?;
@@ -6605,11 +6605,11 @@ impl VarveFile {
         let _permit = self.ensure_not_poisoned()?;
         self.write_embedded_manifest_if_needed()?;
         // First, before the checkpoint and before the marker. A chunk is an
-        // ordinary record: sealing after the marker would leave it outside the
-        // committed prefix, and sealing after the checkpoint would leave it out
+        // ordinary record: writing the chunk after the marker would leave it outside the
+        // committed prefix, and writing it after the checkpoint would leave it out
         // of the index that checkpoint serialises.
         if self.mode == OpenMode::ReadWrite {
-            self.seal_open_chunk()?;
+            self.write_open_chunk_record()?;
         }
         if self.mode == OpenMode::ReadWrite
             && self.spec.index_policy.checkpoint_on_flush
@@ -6638,7 +6638,7 @@ impl VarveFile {
             ));
         }
         self.write_embedded_manifest_if_needed()?;
-        self.seal_open_chunk()?;
+        self.write_open_chunk_record()?;
         if self.spec.index_policy.checkpoint_on_flush && self.needs_index_checkpoint() {
             self.write_index_checkpoint()?;
         }
@@ -6662,7 +6662,7 @@ impl VarveFile {
             ));
         }
         self.write_embedded_manifest_if_needed()?;
-        self.seal_open_chunk()?;
+        self.write_open_chunk_record()?;
         if self.spec.index_policy.checkpoint_on_flush && self.needs_index_checkpoint() {
             self.write_index_checkpoint()?;
         }
@@ -6738,18 +6738,18 @@ impl VarveFile {
     /// it.
     pub fn sync(&mut self) -> Result<()> {
         let _permit = self.ensure_not_poisoned()?;
-        // A committed chunked cell lives in memory until its chunk is sealed,
-        // so syncing the file without sealing made `sync()` return `Ok` having
+        // A committed chunked cell lives in memory until its chunk is written,
+        // so syncing the file without writing the chunk made `sync()` return `Ok` having
         // made nothing durable — while the same call on a region row did.
         if self.mode == OpenMode::ReadWrite {
-            self.seal_open_chunk()?;
-            // The seal is an ordinary record append, so it lands *past* any
+            self.write_open_chunk_record()?;
+            // The write is an ordinary record append, so it lands *past* any
             // digest or segment this file already ends with — and a digest that
-            // is not the last record is one no lazy open can use. `flush` seals
+            // is not the last record is one no lazy open can use. `flush` writes out
             // before it closes the commit point for exactly this reason; `sync`
-            // sealed and stopped, silently demoting every later
+            // written and stopped, silently demoting every later
             // `open_readonly_lazy` on the file to a full scan. Re-closing costs
-            // nothing when nothing was sealed: both writers are predicated on
+            // nothing when nothing was written: both writers are predicated on
             // there being something new to describe.
             self.close_commit_point();
         }
@@ -7839,27 +7839,27 @@ impl VarveFile {
             .ok_or_else(|| Error::MatrixDimensionMissing(block.dimensions[1].to_string()))
     }
 
-    /// Opens chunk `index`, sealing whatever chunk was open before it.
+    /// Opens chunk `index`, writing the chunk whatever chunk was open before it.
     ///
     /// Refuses a chunk older than the open one. That refusal is the whole
-    /// contract of sealing: a value that arrives late is reported, not dropped.
+    /// contract of writing the chunk: a value that arrives late is reported, not dropped.
     fn open_chunk_at(&mut self, index: u64) -> Result<()> {
         match &self.open_chunk {
             Some(open) if open.index == index => return Ok(()),
             Some(open) if open.index > index => {
-                return Err(Error::MatrixChunkSealed {
+                return Err(Error::MatrixChunkClosed {
                     chunk: index,
                     open: Some(open.index),
                 });
             }
-            Some(_) => self.seal_open_chunk()?,
+            Some(_) => self.write_open_chunk_record()?,
             None => {}
         }
-        let sealed = self.sealed_chunk_through_now()?;
-        if let Some(sealed) = sealed
-            && index <= sealed
+        let newest = self.newest_written_chunk()?;
+        if let Some(newest) = newest
+            && index <= newest
         {
-            return Err(Error::MatrixChunkSealed {
+            return Err(Error::MatrixChunkClosed {
                 chunk: index,
                 open: self.open_chunk.as_ref().map(|open| open.index),
             });
@@ -7932,13 +7932,13 @@ impl VarveFile {
         Ok(())
     }
 
-    /// The newest sealed chunk index.
+    /// The newest written chunk index.
     ///
     /// The directory's last element. The first version walked the resident
     /// index in reverse on every chunk transition and cached only a *positive*
-    /// answer, so a writer whose chunks were never dirty-sealed repeated the
+    /// answer, so a writer whose chunks were never dirty-written repeated the
     /// full walk at every chunk boundary — on the append path.
-    fn sealed_chunk_through_now(&mut self) -> Result<Option<u64>> {
+    fn newest_written_chunk(&mut self) -> Result<Option<u64>> {
         Ok(self.chunk_directory()?.newest())
     }
 
@@ -7954,11 +7954,11 @@ impl VarveFile {
     /// **A chunk with no committed cell stays open rather than being dropped.**
     /// It was dropped before, so `write` → `flush` → `commit` lost the write on
     /// a chunked row while working on a region row, and the row could become
-    /// permanently unwritable once a later chunk sealed past it. There is
+    /// permanently unwritable once a later chunk written past it. There is
     /// nothing to publish — a reader cannot see an uncommitted cell — so
     /// holding it costs a commit point nothing, and an idle flush still writes
     /// no record, which is the property this guard was for.
-    fn seal_open_chunk(&mut self) -> Result<()> {
+    fn write_open_chunk_record(&mut self) -> Result<()> {
         let (payload, index, block_count, cell_crc, compressed_slots) = {
             let Some(chunk) = self.open_chunk.as_ref() else {
                 return Ok(());
@@ -7997,11 +7997,11 @@ impl VarveFile {
         let record_offset = info.record_offset;
         // On disk. Only now does the handle stop holding it.
         self.open_chunk = None;
-        // Extend the directory rather than invalidate it: a writer sealing its
+        // Extend the directory rather than invalidate it: a writer writing the chunk its
         // millionth chunk must not pay a rebuild, and the newest entry is what
-        // answers "which chunks are sealed" on the next write.
+        // answers "which chunks are written" on the next write.
         if let Some(directory) = self.chunk_directory.get_mut() {
-            directory.note_sealed(ChunkLocator {
+            directory.note_written(ChunkLocator {
                 index,
                 record_offset,
                 payload_len,
@@ -8235,13 +8235,13 @@ impl VarveFile {
         F: FnOnce(MatrixCommitEvent) -> Result<()>,
     {
         // A chunked row has no durability point of its own: the cell lives in
-        // memory until its chunk is sealed, and the seal is what a barrier
+        // memory until its chunk is written, and the write is what a barrier
         // could make durable. Refused by name rather than left to fail as
         // `MatrixKeyOutOfBounds`, which said nothing about why.
         if self.chunk_for_row(key.scan).is_some() {
             return Err(Error::InvalidFormatSpec(
                 "a per-cell durability barrier does not apply to a chunked row; \
-                 a chunk becomes durable when it is sealed",
+                 a chunk becomes durable when it is written",
             ));
         }
         // INVARIANT 3 (F-04). The commit event is pure layout geometry - block
@@ -8319,7 +8319,7 @@ impl VarveFile {
         })
     }
 
-    /// Every sealed chunk as `(record offset, payload length)`, oldest first.
+    /// Every written chunk as `(record offset, payload length)`, oldest first.
     ///
     /// Chunks are written in increasing index order — only the newest is open —
     /// so this list is sorted by chunk index, which is what makes the binary
@@ -8364,7 +8364,7 @@ impl VarveFile {
                 return Err(Error::InvalidMatrixChunk);
             }
             // The binary search below is only legal on an ordered list, and
-            // the writer's ordering is a property of *this* build's sealing
+            // the writer's ordering is a property of *this* build's writing the chunk
             // rule, not of the bytes. A file from anywhere else must be
             // refused rather than searched.
             if chunks
@@ -8389,7 +8389,7 @@ impl VarveFile {
         Ok(ChunkDirectory { chunks })
     }
 
-    /// The sealed-chunk directory, built at most once per handle.
+    /// The written-chunk directory, built at most once per handle.
     ///
     /// On failure nothing is cached, so a later call retries rather than
     /// caching a half-built answer.
@@ -8451,7 +8451,7 @@ impl VarveFile {
         })
     }
 
-    /// Finds the sealed chunk with this index, by binary search over the chunk
+    /// Finds the written chunk with this index, by binary search over the chunk
     /// records — `O(log chunks)` prefix reads, and no state built at open.
     fn find_chunk_record(&self, chunk_index: u64) -> Result<Option<ChunkLocator>> {
         Ok(self.chunk_directory()?.find(chunk_index))
@@ -8685,7 +8685,7 @@ impl VarveFile {
     ///
     /// **The open chunk is not on disk.** Without this, a writer could not read
     /// back a cell it had just written and committed — `read_matrix_cell` said
-    /// `MatrixNotCommitted` until the next seal, which is a write-then-read
+    /// `MatrixNotCommitted` until the next write, which is a write-then-read
     /// inconsistency and not a property anyone would want. Found by sweeping
     /// every matrix entry point against a chunked row; the tests that existed
     /// all read through a fresh reader after a flush and could not see it.
@@ -8753,7 +8753,7 @@ impl VarveFile {
 
     /// Whether the open chunk holds a committed value for this cell.
     ///
-    /// `Ok(None)` means the row is not in the open chunk, so the sealed records
+    /// `Ok(None)` means the row is not in the open chunk, so the written records
     /// own the answer.
     fn open_chunk_cell_status<T: VarveMatrixBlock>(
         &self,
@@ -8776,7 +8776,7 @@ impl VarveFile {
         }))
     }
 
-    /// One cell out of a sealed chunk, read positionally.
+    /// One cell out of a written chunk, read positionally.
     ///
     /// Two small reads and one `stride`-byte read. The chunk itself is never
     /// materialised, whatever it holds.
@@ -8956,7 +8956,7 @@ impl VarveFile {
     /// **The record footer's crc does not cover this read.** It covers the
     /// record, and it is verified on a *record* read; a positional cell read is
     /// not one, so under the default `IntegrityVerification::OnDemand` a single
-    /// flipped bit in a sealed chunk came back as data with no error, while the
+    /// flipped bit in a written chunk came back as data with no error, while the
     /// identical flip one row earlier — in the matrix region, which keeps
     /// per-cell checksums — was refused. A chunk keeps them now, for the same
     /// reason and in the same shape.
@@ -9135,7 +9135,7 @@ impl VarveFile {
 
     /// Clears one chunked cell: its commit bit and its slot bytes.
     ///
-    /// Only in the open chunk. A sealed chunk is a written record, and a record
+    /// Only in the open chunk. A written chunk is a written record, and a record
     /// is not rewritten — the same refusal a late write gets, for the same
     /// reason.
     fn clear_chunk_cell<T: VarveMatrixBlock>(
@@ -9151,7 +9151,7 @@ impl VarveFile {
                 // open there is none, and the first version reported the
                 // refused chunk as its own opener — `{ chunk: 3, open: 3 }`,
                 // which reads as a contradiction.
-                return Err(Error::MatrixChunkSealed {
+                return Err(Error::MatrixChunkClosed {
                     chunk: chunk_index,
                     open: self.open_chunk.as_ref().map(|open| open.index),
                 });
@@ -9194,7 +9194,7 @@ impl VarveFile {
                 // open there is none, and the first version reported the
                 // refused chunk as its own opener — `{ chunk: 3, open: 3 }`,
                 // which reads as a contradiction.
-                return Err(Error::MatrixChunkSealed {
+                return Err(Error::MatrixChunkClosed {
                     chunk: chunk_index,
                     open: self.open_chunk.as_ref().map(|open| open.index),
                 });
@@ -9274,10 +9274,10 @@ impl VarveFile {
 
     /// Clears every committed cell of a category and reports how many.
     ///
-    /// **Refused for a growing matrix with sealed chunks.** It cleared the
+    /// **Refused for a growing matrix with written chunks.** It cleared the
     /// matrix region only, so a caller asking for a clean category got one
     /// silently: chunked rows stayed committed, stayed readable, and were not
-    /// in the count. A sealed chunk is a written record and records are not
+    /// in the count. A written chunk is a written record and records are not
     /// rewritten, so there is no clearing it — saying so is the only honest
     /// answer. The open chunk *is* cleared, and counted.
     pub fn clear_matrix_category(&mut self, category: &str) -> Result<u64> {
@@ -9286,7 +9286,7 @@ impl VarveFile {
         if self.spec.growing_matrix.is_some() {
             if !self.chunk_directory()?.is_empty() {
                 return Err(Error::InvalidFormatSpec(
-                    "clear_matrix_category cannot clear a sealed chunk; a sealed chunk is a \
+                    "clear_matrix_category cannot clear a written chunk; a written chunk is a \
                      written record",
                 ));
             }
@@ -9333,9 +9333,9 @@ impl VarveFile {
         block.slots.fill(0);
         block.crc.fill(0);
         // `dirty` means "some cell was committed", and it is what makes the
-        // next flush seal this chunk. Leaving it set after clearing every bit
-        // sealed an all-uncommitted record — which then refused every later
-        // write to those rows with `MatrixChunkSealed`, permanently, and cost a
+        // next flush write this chunk. Leaving it set after clearing every bit
+        // written an all-uncommitted record — which then refused every later
+        // write to those rows with `MatrixChunkClosed`, permanently, and cost a
         // full-size dead record for rows that hold nothing. Recompute it from
         // what is actually left rather than clearing it outright: another
         // block in the same chunk may still hold committed cells.
@@ -9431,7 +9431,7 @@ impl VarveFile {
 
     /// What a resumed writer should do with this category.
     ///
-    /// A growing matrix with an unsealed chunk is never `Clean`: the chunk is
+    /// A growing matrix with an still-open chunk is never `Clean`: the chunk is
     /// live state this handle holds and the next handle will not, so reporting
     /// a clean category over it told a caller the acquisition had finished when
     /// it had not.
@@ -18743,25 +18743,25 @@ mod tests {
 
     /// A format with one declared block kept out of the resident index, and the
     /// footer chain that makes it reachable.
-    /// A failed seal must leave the chunk where it was.
+    /// A failed write must leave the chunk where it was.
     ///
-    /// `seal_open_chunk` `take()`d the chunk and *then* ran three fallible
+    /// `write_open_chunk_record` `take()`d the chunk and *then* ran three fallible
     /// steps, so any failure destroyed the data and emptied `open_chunk` — and
     /// the retry a caller would naturally make returned `Ok(())` for a chunk
     /// that no longer existed anywhere. Silent loss reported as success.
     ///
     /// **The state is constructed rather than reached through the API, and the
-    /// reason is worth stating.** The reachable way to make a seal fail was a
-    /// record payload ceiling below the chunk's sealed size, and `create` now
+    /// reason is worth stating.** The reachable way to make a write fail was a
+    /// record payload ceiling below the chunk's written size, and `create` now
     /// refuses that pairing outright — fixing a different defect closed the
-    /// public route to this one. `a_chunk_that_could_never_be_sealed_is_refused_at_create`
-    /// covers the refusal; this covers what happens if a seal fails anyway,
+    /// public route to this one. `a_chunk_that_could_never_be_written_is_refused_at_create`
+    /// covers the refusal; this covers what happens if a write fails anyway,
     /// which an I/O error still can.
     #[test]
-    fn a_failed_seal_keeps_the_chunk() {
+    fn a_failed_chunk_write_keeps_the_chunk() {
         let spec = residency_test_spec();
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("seal.varve");
+        let path = dir.path().join("chunk-write.varve");
         let mut file = VarveFile::create(spec, &path).expect("create");
 
         file.open_chunk = Some(OpenChunk {
@@ -18787,16 +18787,16 @@ mod tests {
             .with_read_limits(file.spec.read_limits.with_max_record_payload_len(16));
 
         assert!(matches!(
-            file.seal_open_chunk(),
+            file.write_open_chunk_record(),
             Err(Error::LimitExceeded { .. })
         ));
         assert!(
             file.open_chunk.is_some(),
-            "a failed seal must leave the chunk where it was",
+            "a failed chunk write must leave the chunk where it was",
         );
         // The retry reports the same failure rather than Ok.
         assert!(matches!(
-            file.seal_open_chunk(),
+            file.write_open_chunk_record(),
             Err(Error::LimitExceeded { .. })
         ));
 
@@ -18804,7 +18804,7 @@ mod tests {
         file.spec = file
             .spec
             .with_read_limits(file.spec.read_limits.with_max_record_payload_len(u64::MAX));
-        file.seal_open_chunk().expect("seal");
+        file.write_open_chunk_record().expect("write the chunk");
         assert!(file.open_chunk.is_none());
     }
 

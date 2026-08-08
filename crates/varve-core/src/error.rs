@@ -524,19 +524,26 @@ pub enum Error {
     #[error("matrix cell was not written before commit")]
     MatrixCellNotWritten,
 
-    /// A write addressed a chunk that has already been sealed.
+    /// A write or commit addressed a chunk that is no longer the open one.
     ///
-    /// Only the newest chunk accepts writes. Late data is refused rather than
-    /// dropped: a value that silently does not arrive is indistinguishable from
-    /// one that was never sent.
-    /// `open` is the chunk a caller may still write to, or `None` when there
-    /// is none. Reporting the refused chunk as its own opener read as a
-    /// contradiction.
-    #[error("matrix chunk {chunk} is sealed{}", match open {
+    /// Only the newest chunk accepts writes: one chunk is buffered at a time,
+    /// which is what bounds a growing matrix's memory. Late data is refused
+    /// rather than dropped — a value that silently does not arrive is
+    /// indistinguishable from one that was never sent. `open` is the chunk a
+    /// caller may still write to, or `None` when there is none.
+    ///
+    /// **Closed, not necessarily written.** This was `MatrixChunkSealed`, and
+    /// both the name and the message claimed the chunk had been written out as
+    /// a record. That is true only when it held a committed cell: a chunk the
+    /// writer moved past with nothing committed is dropped without a record
+    /// ever existing, and the old wording sent anyone debugging that case
+    /// looking through the file for a record that was never there. What the
+    /// refusal actually means is that this chunk is closed to writes.
+    #[error("matrix chunk {chunk} is closed{}", match open {
         Some(open) => format!("; the open chunk is {open}"),
         None => String::from("; no chunk is open"),
     })]
-    MatrixChunkSealed { chunk: u64, open: Option<u64> },
+    MatrixChunkClosed { chunk: u64, open: Option<u64> },
 
     #[error("invalid matrix chunk record")]
     InvalidMatrixChunk,

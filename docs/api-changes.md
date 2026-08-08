@@ -17,6 +17,30 @@ decoder, header field or version constant was touched. If you are coming from
 
 ---
 
+## B. From 0.5.0 to 0.6.0: two signatures changed, one struct gained a field, and one error was renamed
+
+### B.0 `Error::MatrixChunkSealed` is now `Error::MatrixChunkClosed`
+
+Same fields (`chunk`, `open`), same meaning, honest name. Match arms and any
+`matches!` on the variant need the new spelling; nothing else changes.
+
+The old name said the chunk had been written out as a record. That is true only
+when the chunk held a committed cell — a chunk the writer moved past with
+nothing committed is dropped without any record ever existing, and the error
+still fired. Anyone debugging that case went looking through the file for a
+record that was never there. What the refusal means is that the chunk is closed
+to writes, which is true either way, so that is what it now says. The `Display`
+text changed with it: "matrix chunk 1 is sealed" is now "matrix chunk 1 is
+closed".
+
+The same reasoning renamed the internals this error reports on —
+`seal_open_chunk` is `write_open_chunk_record`, and the surrounding prose says
+"written" rather than "sealed" — because the word bundled two things that are
+not the same: making a chunk durable, and closing it to further writes. Only
+the first is what the operation does; the second is a consequence of records
+being write-once today, not a property of the data model. The matrix region
+itself is rewritten in place all the time.
+
 ## B. From 0.5.0 to 0.6.0: two signatures changed, and one struct gained a field
 
 The two signatures come from the same change — the reader stopped keeping a copy

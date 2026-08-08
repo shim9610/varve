@@ -9,8 +9,8 @@
 //!
 //! What these tests pin, in the order §6 of the spec lists them: the option is
 //! inert when off; growth needs no advance knowledge; a value that never
-//! arrived stays absent across a seal rather than blocking it; a late write
-//! into a sealed chunk is refused rather than dropped; and a cell read does not
+//! arrived stays absent across a write rather than blocking it; a late write
+//! into a written chunk is refused rather than dropped; and a cell read does not
 //! materialise the chunk it lives in.
 
 // The shared fixtures here build their specs with `IntegrityPolicy::Crc32`, so
@@ -279,20 +279,20 @@ fn a_chunk_nothing_committed_is_not_written() -> varve::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// §6.3 Partial arrival survives sealing
+// §6.3 Partial arrival survives writing the chunk
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_block_that_never_arrived_reads_as_absent_across_a_seal() -> varve::Result<()> {
+fn a_block_that_never_arrived_reads_as_absent_across_a_write() -> varve::Result<()> {
     let path = temp_path("partial_arrival");
     let cell = key(ROWS_PER_CHUNK + 1, 3);
     {
         let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
-        // `Sample` arrives for this cell. `Marker` never does — and sealing asks
+        // `Sample` arrives for this cell. `Marker` never does — and writing the chunk asks
         // no question about that.
         writer.write_matrix_cell(cell, &Sample { value: 42 })?;
         writer.commit_matrix_cell::<Sample>(cell)?;
-        // Move past the chunk, which seals it with `Marker` still absent.
+        // Move past the chunk, which writes out it with `Marker` still absent.
         writer.write_matrix_cell(key(ROWS_PER_CHUNK * 2, 0), &Sample { value: 1 })?;
         writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK * 2, 0))?;
         writer.flush()?;
@@ -315,7 +315,7 @@ fn a_block_that_never_arrived_reads_as_absent_across_a_seal() -> varve::Result<(
 }
 
 #[test]
-fn an_uncommitted_cell_in_a_sealed_chunk_stays_uncommitted() -> varve::Result<()> {
+fn an_uncommitted_cell_in_a_written_chunk_stays_uncommitted() -> varve::Result<()> {
     let path = temp_path("uncommitted_cell");
     let written = key(ROWS_PER_CHUNK, 0);
     let never = key(ROWS_PER_CHUNK, 5);
@@ -338,16 +338,16 @@ fn an_uncommitted_cell_in_a_sealed_chunk_stays_uncommitted() -> varve::Result<()
 }
 
 // ---------------------------------------------------------------------------
-// §6.4 A late write into a sealed chunk is refused
+// §6.4 A late write into a written chunk is refused
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_write_into_a_sealed_chunk_is_refused_and_changes_nothing() -> varve::Result<()> {
-    let path = temp_path("sealed_refusal");
+fn a_write_into_a_written_chunk_is_refused_and_changes_nothing() -> varve::Result<()> {
+    let path = temp_path("closed_refusal");
     let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
     writer.write_matrix_cell(key(ROWS_PER_CHUNK, 0), &Sample { value: 1 })?;
     writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0))?;
-    // Opening chunk 2 seals chunk 1.
+    // Opening chunk 2 writes out chunk 1.
     writer.write_matrix_cell(key(ROWS_PER_CHUNK * 2, 0), &Sample { value: 2 })?;
     writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK * 2, 0))?;
     writer.flush()?;
@@ -356,12 +356,12 @@ fn a_write_into_a_sealed_chunk_is_refused_and_changes_nothing() -> varve::Result
     // Late data is reported, not dropped: a value that silently does not arrive
     // is indistinguishable from one that was never sent.
     //
-    // `open` is `None` because the flush above sealed chunk 2, so nothing is
+    // `open` is `None` because the flush above written chunk 2, so nothing is
     // open — which the error now says, rather than naming the refused chunk as
     // its own opener.
     assert!(matches!(
         writer.write_matrix_cell(key(ROWS_PER_CHUNK, 1), &Sample { value: 3 }),
-        Err(Error::MatrixChunkSealed {
+        Err(Error::MatrixChunkClosed {
             chunk: 1,
             open: None
         }),
@@ -534,7 +534,7 @@ fn the_segment_chain_still_frames_commit_points_not_chunks() -> varve::Result<()
 #[test]
 fn a_writer_reads_back_what_it_just_wrote_into_the_open_chunk() -> varve::Result<()> {
     // The open chunk is in memory, not on disk. Before this was routed,
-    // `read_matrix_cell` answered `MatrixNotCommitted` until the next seal —
+    // `read_matrix_cell` answered `MatrixNotCommitted` until the next write —
     // a write-then-read inconsistency that no test which flushes first can see.
     let path = temp_path("open_chunk_readback");
     let cell = key(ROWS_PER_CHUNK + 1, 2);
@@ -545,7 +545,7 @@ fn a_writer_reads_back_what_it_just_wrote_into_the_open_chunk() -> varve::Result
     assert_eq!(
         writer.read_matrix_cell::<Sample>(cell)?,
         Sample { value: 5 },
-        "the writer must see its own committed cell before the seal",
+        "the writer must see its own committed cell before it is written",
     );
     assert_eq!(
         writer.matrix_cell_payload::<Sample>(cell)?.len(),
@@ -556,7 +556,7 @@ fn a_writer_reads_back_what_it_just_wrote_into_the_open_chunk() -> varve::Result
         MatrixCellStatus::Committed,
     );
 
-    // And the same three answers after the seal, from the same handle.
+    // And the same three answers after the write, from the same handle.
     writer.flush()?;
     assert_eq!(
         writer.read_matrix_cell::<Sample>(cell)?,
@@ -610,13 +610,13 @@ fn the_payload_write_entry_point_routes_like_the_typed_one() -> varve::Result<()
 }
 
 #[test]
-fn clearing_a_cell_in_the_open_chunk_works_and_in_a_sealed_one_is_refused() -> varve::Result<()> {
+fn clearing_a_cell_in_the_open_chunk_works_and_in_a_written_one_is_refused() -> varve::Result<()> {
     let path = temp_path("clear");
-    let sealed_cell = key(ROWS_PER_CHUNK, 0);
+    let written_cell = key(ROWS_PER_CHUNK, 0);
     let open_cell = key(ROWS_PER_CHUNK * 2, 1);
     let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
-    writer.write_matrix_cell(sealed_cell, &Sample { value: 1 })?;
-    writer.commit_matrix_cell::<Sample>(sealed_cell)?;
+    writer.write_matrix_cell(written_cell, &Sample { value: 1 })?;
+    writer.commit_matrix_cell::<Sample>(written_cell)?;
     writer.write_matrix_cell(open_cell, &Sample { value: 2 })?;
     writer.commit_matrix_cell::<Sample>(open_cell)?;
 
@@ -625,15 +625,15 @@ fn clearing_a_cell_in_the_open_chunk_works_and_in_a_sealed_one_is_refused() -> v
         writer.matrix_cell_status::<Sample>(open_cell)?,
         MatrixCellStatus::NotCommitted,
     );
-    // A sealed chunk is a written record, and a record is not rewritten — the
+    // A written chunk is a written record, and a record is not rewritten — the
     // same refusal a late write gets, for the same reason.
     assert!(matches!(
-        writer.clear_matrix_cell::<Sample>(sealed_cell),
-        Err(Error::MatrixChunkSealed { chunk: 1, .. }),
+        writer.clear_matrix_cell::<Sample>(written_cell),
+        Err(Error::MatrixChunkClosed { chunk: 1, .. }),
     ));
     assert!(matches!(
-        writer.clear_matrix_cell_by_category(Sample::CATEGORY, sealed_cell),
-        Err(Error::MatrixChunkSealed { chunk: 1, .. }),
+        writer.clear_matrix_cell_by_category(Sample::CATEGORY, written_cell),
+        Err(Error::MatrixChunkClosed { chunk: 1, .. }),
     ));
     Ok(())
 }
@@ -661,7 +661,7 @@ fn the_entry_points_that_do_not_apply_say_so_by_name() -> varve::Result<()> {
 }
 
 #[test]
-fn a_reopened_writer_appends_to_a_later_chunk_and_still_refuses_the_sealed_one() -> varve::Result<()>
+fn a_reopened_writer_appends_to_a_later_chunk_and_still_refuses_the_closed_one() -> varve::Result<()>
 {
     let path = temp_path("reopen_append");
     let first = key(ROWS_PER_CHUNK, 0);
@@ -673,14 +673,14 @@ fn a_reopened_writer_appends_to_a_later_chunk_and_still_refuses_the_sealed_one()
         writer.flush()?;
     }
     let mut writer = growing_spec().open_writer(path.path())?;
-    // The sealed write comes **first**, while no chunk is open. Ordered the
+    // The written write comes **first**, while no chunk is open. Ordered the
     // other way this test proved nothing: opening chunk 3 first makes the
     // refusal come from the in-memory `open_chunk.index > index` branch, so a
     // build that forgot the watermark across a reopen still passed. Only the
     // crash sweep caught that, which is why the order here is deliberate.
     assert!(matches!(
         writer.write_matrix_cell(first, &Sample { value: 1 }),
-        Err(Error::MatrixChunkSealed {
+        Err(Error::MatrixChunkClosed {
             chunk: 1,
             open: None
         }),
@@ -689,7 +689,7 @@ fn a_reopened_writer_appends_to_a_later_chunk_and_still_refuses_the_sealed_one()
     writer.commit_matrix_cell::<Sample>(later)?;
     assert!(matches!(
         writer.write_matrix_cell(first, &Sample { value: 1 }),
-        Err(Error::MatrixChunkSealed {
+        Err(Error::MatrixChunkClosed {
             chunk: 1,
             open: Some(3)
         }),
@@ -802,13 +802,13 @@ fn a_truncated_file_loses_no_committed_cell_and_shows_no_half_chunk() -> varve::
                 survived.push(chunk);
             }
         }
-        // A surviving chunk is sealed: reopening it must be refused, not
+        // A surviving chunk is written: reopening it must be refused, not
         // silently duplicated.
         if let Some(newest) = survived.last() {
             assert!(
                 matches!(
                     writer.write_matrix_cell(key(newest * ROWS_PER_CHUNK, 1), &Sample { value: 0 }),
-                    Err(Error::MatrixChunkSealed { .. }),
+                    Err(Error::MatrixChunkClosed { .. }),
                 ),
                 "cut {cut}: chunk {newest} survived but was reopenable",
             );
@@ -894,7 +894,7 @@ fn a_cell_never_written_still_refuses_to_commit() -> varve::Result<()> {
 fn write_then_flush_then_commit_keeps_the_write() -> varve::Result<()> {
     // A chunk with no committed cell used to be *dropped* at flush, so this
     // sequence lost the write on a chunked row while working on a region row —
-    // and the row could become permanently unwritable once a later chunk sealed
+    // and the row could become permanently unwritable once a later chunk written
     // past it. It stays open now: there is nothing to publish, so a commit
     // point holding it costs nothing.
     let path = temp_path("write_flush_commit");
@@ -915,12 +915,12 @@ fn write_then_flush_then_commit_keeps_the_write() -> varve::Result<()> {
 }
 
 #[test]
-fn dropping_a_writer_seals_the_open_chunk() -> varve::Result<()> {
+fn dropping_a_writer_writes_the_open_chunk() -> varve::Result<()> {
     // Every other byte a writer accepts is on disk before the call returns; a
     // chunked cell was the one exception, and dropping the writer lost every
     // committed cell in the open chunk. Best effort — `drop` cannot report a
     // failure — but the ordinary case must not lose data.
-    let path = temp_path("drop_seals");
+    let path = temp_path("drop_writes");
     let cell = key(ROWS_PER_CHUNK, 0);
     {
         let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
@@ -957,16 +957,16 @@ fn sync_makes_a_committed_chunked_cell_durable() -> varve::Result<()> {
 }
 
 #[test]
-fn a_chunk_that_could_never_be_sealed_is_refused_at_create() -> varve::Result<()> {
-    // A chunk is buffered against `MatrixSlotRegionLen` and sealed against
+fn a_chunk_that_could_never_be_written_is_refused_at_create() -> varve::Result<()> {
+    // A chunk is buffered against `MatrixSlotRegionLen` and written against
     // `RecordPayloadLen`, and nothing reconciled them: a spec passed
-    // `validate`, accepted writes, and then died at the first seal with the
+    // `validate`, accepted writes, and then died at the first write with the
     // data already in RAM and no way to get it out. Refused at create now,
     // before a byte is accepted.
     //
-    // Closing this also closed the only public route to a failed seal, so the
-    // property that a failed seal keeps its chunk moved to a unit test in
-    // `file.rs` (`a_failed_seal_keeps_the_chunk`), which says so.
+    // Closing this also closed the only public route to a failed write, so the
+    // property that a failed write keeps its chunk moved to a unit test in
+    // `file.rs` (`a_failed_chunk_write_keeps_the_chunk`), which says so.
     let path = temp_path("ceiling_mismatch");
     let tight =
         growing_spec().with_read_limits(growing_spec().read_limits.with_max_record_payload_len(64));
@@ -985,7 +985,7 @@ fn a_chunk_that_could_never_be_sealed_is_refused_at_create() -> varve::Result<()
 // ---------------------------------------------------------------------------
 
 #[test]
-fn clearing_a_category_counts_the_open_chunk_and_refuses_a_sealed_one() -> varve::Result<()> {
+fn clearing_a_category_counts_the_open_chunk_and_refuses_a_written_one() -> varve::Result<()> {
     // `clear_matrix_category` cleared the matrix region only, so a caller
     // asking for a clean category got one silently: chunked rows stayed
     // committed, stayed readable, and were not in the count.
@@ -1009,20 +1009,20 @@ fn clearing_a_category_counts_the_open_chunk_and_refuses_a_sealed_one() -> varve
         MatrixCellStatus::NotCommitted,
     );
 
-    // Once a chunk is sealed it is a written record, and records are not
+    // Once a chunk is written it is a written record, and records are not
     // rewritten. Saying so is the only honest answer.
     writer.write_matrix_cell(chunked, &Sample { value: 3 })?;
     writer.commit_matrix_cell::<Sample>(chunked)?;
     writer.flush()?;
     assert!(matches!(
         writer.clear_matrix_category(Sample::CATEGORY),
-        Err(Error::InvalidFormatSpec(message)) if message.contains("sealed chunk"),
+        Err(Error::InvalidFormatSpec(message)) if message.contains("written chunk"),
     ));
     Ok(())
 }
 
 #[test]
-fn the_resume_signal_is_not_clean_over_an_unsealed_chunk() -> varve::Result<()> {
+fn the_resume_signal_is_not_clean_over_an_open_chunk() -> varve::Result<()> {
     // `Clean` told a caller the acquisition had finished. An open chunk is live
     // state this handle holds and the next one will not, so it never is.
     let path = temp_path("resume_signal");
@@ -1036,7 +1036,7 @@ fn the_resume_signal_is_not_clean_over_an_unsealed_chunk() -> varve::Result<()> 
     assert_ne!(
         writer.matrix_resume_signal(Sample::CATEGORY)?,
         varve::MatrixResumeSignal::Clean,
-        "an unsealed chunk is unfinished work",
+        "an open chunk is unfinished work",
     );
     writer.flush()?;
     assert_eq!(
@@ -1471,8 +1471,8 @@ fn two_chunk_file(path: &Path) -> varve::Result<()> {
 }
 
 #[test]
-fn a_flipped_bit_in_a_sealed_chunk_is_refused_not_returned() -> varve::Result<()> {
-    // The review reproduced this: flipping bytes in a sealed chunk's slot
+fn a_flipped_bit_in_a_written_chunk_is_refused_not_returned() -> varve::Result<()> {
+    // The review reproduced this: flipping bytes in a written chunk's slot
     // region made `read_matrix_cell` return the corrupted value with no error,
     // while `verify_all()` on the same handle reported ChecksumMismatch — the
     // record CRC existed and covered those bytes and was never consulted. The
@@ -1490,7 +1490,7 @@ fn a_flipped_bit_in_a_sealed_chunk_is_refused_not_returned() -> varve::Result<()
         writer.commit_matrix_cell::<Sample>(cell)?;
         writer.flush()?;
     }
-    // Find the value in the sealed chunk and corrupt it in place.
+    // Find the value in the written chunk and corrupt it in place.
     let bytes = std::fs::read(path.path())?;
     let (_, at) = first_chunk_payload(path.path())?;
     let needle = 0x1234_5678u32.to_le_bytes();
@@ -1714,7 +1714,7 @@ fn temp_path(name: &str) -> TempPath {
 // The gates, on the chunk path
 //
 // The eight invariants this file's earlier cases pin were all driven in on the
-// write/seal side. A later review found the read side had none of them: the
+// write/write side. A later review found the read side had none of them: the
 // only caller of the chunk access gate was `chunk_block_slice`, which only the
 // write paths use, so a quarantined category refused a region row and handed
 // back the bytes for a chunked one -- from the same call. This file had no
@@ -1881,8 +1881,8 @@ fn a_quarantined_category_refuses_the_category_clear() -> varve::Result<()> {
 }
 
 #[test]
-fn clearing_a_category_does_not_seal_a_dead_chunk() -> varve::Result<()> {
-    let path = temp_path("clear_then_seal");
+fn clearing_a_category_does_not_write_a_dead_chunk() -> varve::Result<()> {
+    let path = temp_path("clear_then_write");
     let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
     // One committed cell in chunk 1, then clear it away and flush.
     writer.write_matrix_cell(key(ROWS_PER_CHUNK, 0), &Sample { value: 3 })?;
@@ -1891,8 +1891,8 @@ fn clearing_a_category_does_not_seal_a_dead_chunk() -> varve::Result<()> {
     assert_eq!(cleared, 1, "the clear did not account for the chunked row");
     writer.flush()?;
 
-    // `dirty` used to survive the clear, so the flush sealed an
-    // all-uncommitted chunk record -- and a sealed chunk refuses every later
+    // `dirty` used to survive the clear, so the flush written an
+    // all-uncommitted chunk record -- and a written chunk refuses every later
     // write to its rows, permanently.
     writer.write_matrix_cell(key(ROWS_PER_CHUNK, 1), &Sample { value: 4 })?;
     writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 1))?;
@@ -1948,15 +1948,15 @@ fn digest_growing_spec() -> FormatSpec {
 ///
 /// Sealing the open chunk is an ordinary record append, so it lands past any
 /// digest the file already ends with — and a digest that is not the last
-/// record is one no lazy open can use. `flush` seals *before* it closes the
-/// commit point for exactly that reason; `sync` sealed and stopped, so this
+/// record is one no lazy open can use. `flush` writes out *before* it closes the
+/// commit point for exactly that reason; `sync` written and stopped, so this
 /// sequence silently demoted every later `open_readonly_lazy` to a full scan.
 ///
 /// Nothing is wrong with the file afterwards, which is what makes it worth a
 /// test: the fallback is exact, and the only symptom is the eleven-syscall
 /// open quietly becoming a hundred-thousand-syscall one.
 #[test]
-fn sync_after_a_chunk_seal_leaves_the_digest_usable() -> varve::Result<()> {
+fn sync_after_a_chunk_write_leaves_the_digest_usable() -> varve::Result<()> {
     let spec = digest_growing_spec();
     let path = temp_path("sync_digest");
     let mut writer = spec.create_writer_with_dims(path.path(), dims())?;
@@ -1964,8 +1964,8 @@ fn sync_after_a_chunk_seal_leaves_the_digest_usable() -> varve::Result<()> {
     writer.commit_matrix_cell::<Sample>(key(0, 0))?;
     writer.flush()?;
 
-    // A committed chunked cell lives in RAM until its chunk is sealed, and
-    // `sync` is what seals it here.
+    // A committed chunked cell lives in RAM until its chunk is written, and
+    // `sync` is what writes out it here.
     writer.write_matrix_cell(key(ROWS_PER_CHUNK, 0), &Sample { value: 2 })?;
     writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0))?;
     writer.sync()?;
@@ -1975,7 +1975,7 @@ fn sync_after_a_chunk_seal_leaves_the_digest_usable() -> varve::Result<()> {
     assert_eq!(
         source,
         LazyOpenSource::Digest,
-        "the chunk seal left the digest buried, so the lazy open fell back to the scan",
+        "writing the chunk left the digest buried, so the lazy open fell back to the scan",
     );
     Ok(())
 }

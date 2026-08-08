@@ -1129,7 +1129,7 @@ varve_format! {
                 metadata Metadata;
                 raw_region Raw;
                 footer Footer {
-                    bytes seal = b"END!";
+                    bytes write = b"END!";
                     u64 segment_len =
                         finalize(target = segment_end, relative_to = segment_start);
                 }

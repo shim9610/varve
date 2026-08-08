@@ -1435,9 +1435,9 @@ pub struct BlockResidencyDescriptor {
 /// equal `rows_per_chunk`, so the matrix region *is* the first chunk and every
 /// later chunk has its byte-for-byte layout. Nothing about the region changes.
 ///
-/// Only the newest chunk accepts writes. A write addressing a sealed chunk is
+/// Only the newest chunk accepts writes. A write addressing a written chunk is
 /// refused rather than dropped, and a cell that never received a value keeps
-/// its clear commit bit and reads as `MatrixNotCommitted` — sealing asks no
+/// its clear commit bit and reads as `MatrixNotCommitted` — writing the chunk asks no
 /// question about completeness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GrowingMatrixDimension {

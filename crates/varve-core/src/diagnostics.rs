@@ -806,7 +806,7 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::MatrixNumericOutOfBounds { .. }
         | Error::MatrixNotCommitted
         | Error::MatrixCellNotWritten
-        | Error::MatrixChunkSealed { .. }
+        | Error::MatrixChunkClosed { .. }
         | Error::InvalidMatrixChunk
         | Error::LayoutFieldMissing(_)
         | Error::LayoutFieldUnexpected(_)
