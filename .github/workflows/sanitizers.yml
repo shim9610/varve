@@ -144,10 +144,12 @@ jobs:
       #     they call libc directly to pin down inode-identity semantics, and
       #     Miri only shims std's file API, not raw libc.
       #   * four are performance-contract tests that drive thousands of reads
-      #     through a file-backed page cache; each ran past a 300-second cap,
-      #     and the LRU ones past 34 minutes, where the other 99 finished. They
-      #     assert probe-count bounds — algorithmic cost, no `unsafe` — so
-      #     skipping them costs Miri nothing it could have judged.
+      #     through a file-backed page cache; each ran past a 300-second cap
+      #     where the other 99 finished, and a 50-minute rerun of the three LRU
+      #     ones saw two PASS at the 35-45 minute mark with the third still
+      #     running when the cap fired — slow, not hung, and clean. They assert
+      #     probe-count bounds — algorithmic cost, no `unsafe` — so skipping
+      #     them costs Miri nothing it could have judged.
       #
       # `--skip` matches substrings; these names are long enough to be unique.
       - name: unit tests under Miri
