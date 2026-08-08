@@ -4634,8 +4634,8 @@ pub(crate) fn write_cell<T: VarveMatrixBlock>(
     key: MatrixKey,
     value: &T,
 ) -> Result<()> {
-    ensure_matrix_block::<T>(spec)?;
-    let allowed = ensure_commit_publishable(layout, T::CATEGORY)?;
+    let category = ensure_matrix_block::<T>(spec)?;
+    let allowed = ensure_commit_publishable(layout, category)?;
     let block_index = layout.block_index(&allowed, T::ID)?;
     let ordinal = layout.ordinal_for_block(block_index, key)?;
     let offset = layout.slot_offset(block_index, ordinal)?;
@@ -4673,7 +4673,7 @@ pub(crate) fn write_cell<T: VarveMatrixBlock>(
             actual: payload.len() as u64,
         });
     }
-    let (commit_index, commit_update) = prepare_cell_commit(layout, T::CATEGORY, ordinal, false)?;
+    let (commit_index, commit_update) = prepare_cell_commit(layout, category, ordinal, false)?;
     let crc_valid_update = prepare_cell_crc_valid(layout, block_index, ordinal, false)?;
     let write_bit = prepare_current_write_bit(layout, block_index, ordinal)?;
 
@@ -4759,8 +4759,8 @@ pub(crate) fn write_cell_payload<T: VarveMatrixBlock>(
     key: MatrixKey,
     payload: &[u8],
 ) -> Result<()> {
-    ensure_matrix_block::<T>(spec)?;
-    let allowed = ensure_commit_publishable(layout, T::CATEGORY)?;
+    let category = ensure_matrix_block::<T>(spec)?;
+    let allowed = ensure_commit_publishable(layout, category)?;
     let block_index = layout.block_index(&allowed, T::ID)?;
     let ordinal = layout.ordinal_for_block(block_index, key)?;
     let offset = layout.slot_offset(block_index, ordinal)?;
@@ -4771,7 +4771,7 @@ pub(crate) fn write_cell_payload<T: VarveMatrixBlock>(
             actual: payload.len() as u64,
         });
     }
-    let (commit_index, commit_update) = prepare_cell_commit(layout, T::CATEGORY, ordinal, false)?;
+    let (commit_index, commit_update) = prepare_cell_commit(layout, category, ordinal, false)?;
     let crc_valid_update = prepare_cell_crc_valid(layout, block_index, ordinal, false)?;
     let write_bit = prepare_current_write_bit(layout, block_index, ordinal)?;
 
@@ -4839,11 +4839,11 @@ pub(crate) fn cell_status<T: VarveMatrixBlock>(
     layout: &MatrixLayout,
     key: MatrixKey,
 ) -> Result<MatrixCellStatus> {
-    ensure_matrix_block::<T>(spec)?;
-    let allowed = ensure_commit_publishable(layout, T::CATEGORY)?;
+    let category = ensure_matrix_block::<T>(spec)?;
+    let allowed = ensure_commit_publishable(layout, category)?;
     let block_index = layout.block_index(&allowed, T::ID)?;
     let ordinal = layout.ordinal_for_block(block_index, key)?;
-    let commit_index = layout.commit_index(&allowed, T::CATEGORY)?;
+    let commit_index = layout.commit_index(&allowed, category)?;
     if layout.commits[commit_index].bits.get(ordinal)? {
         Ok(MatrixCellStatus::Committed)
     } else {
@@ -4857,8 +4857,8 @@ pub(crate) fn commit_cell<T: VarveMatrixBlock>(
     file: &mut File,
     key: MatrixKey,
 ) -> Result<()> {
-    ensure_matrix_block::<T>(spec)?;
-    let allowed = ensure_commit_publishable(layout, T::CATEGORY)?;
+    let category = ensure_matrix_block::<T>(spec)?;
+    let allowed = ensure_commit_publishable(layout, category)?;
     let block_index = layout.block_index(&allowed, T::ID)?;
     let ordinal = layout.ordinal_for_block(block_index, key)?;
     let written_this_session = layout.blocks[block_index].current_write_bits.get(ordinal)?;
@@ -4878,7 +4878,7 @@ pub(crate) fn commit_cell<T: VarveMatrixBlock>(
         Some(scanned)
     };
     let crc_valid_update = prepare_cell_crc_valid(layout, block_index, ordinal, true)?;
-    let (commit_index, commit_update) = prepare_cell_commit(layout, T::CATEGORY, ordinal, true)?;
+    let (commit_index, commit_update) = prepare_cell_commit(layout, category, ordinal, true)?;
     match scanned {
         Some(scanned) => write_cell_crc(layout, file, block_index, ordinal, scanned.crc)?,
         None => update_cell_crc(layout, file, block_index, ordinal)?,
@@ -4895,11 +4895,11 @@ pub(crate) fn clear_cell<T: VarveMatrixBlock>(
     file: &mut File,
     key: MatrixKey,
 ) -> Result<()> {
-    ensure_matrix_block::<T>(spec)?;
-    let allowed = ensure_commit_publishable(layout, T::CATEGORY)?;
+    let category = ensure_matrix_block::<T>(spec)?;
+    let allowed = ensure_commit_publishable(layout, category)?;
     let block_index = layout.block_index(&allowed, T::ID)?;
     let ordinal = layout.ordinal_for_block(block_index, key)?;
-    set_cell_commit(layout, file, T::CATEGORY, ordinal, false)?;
+    set_cell_commit(layout, file, category, ordinal, false)?;
     set_cell_crc_valid(layout, file, block_index, ordinal, false)?;
     clear_cell_crc(layout, file, block_index, ordinal)
 }
@@ -5074,14 +5074,14 @@ pub(crate) fn commit_event<T: VarveMatrixBlock>(
     layout: &MatrixLayout,
     key: MatrixKey,
 ) -> Result<MatrixCommitEvent> {
-    ensure_matrix_block::<T>(spec)?;
+    let category = ensure_matrix_block::<T>(spec)?;
     let allowed = layout.ensure_fatal_access_allowed()?;
     let block_index = layout.block_index(&allowed, T::ID)?;
     let ordinal = layout.ordinal_for_block(block_index, key)?;
     let offset = layout.slot_offset(block_index, ordinal)?;
     Ok(MatrixCommitEvent {
         block_id: T::ID,
-        category: T::CATEGORY,
+        category,
         key,
         slot_offset: offset,
         slot_len: layout.blocks[block_index].slot_stride,
@@ -5520,7 +5520,7 @@ pub(crate) fn rebuild_commit_map_from_crc<T: VarveMatrixBlock>(
     layout: &mut MatrixLayout,
     file: &mut File,
 ) -> Result<u64> {
-    ensure_matrix_block::<T>(spec)?;
+    let category = ensure_matrix_block::<T>(spec)?;
     let allowed = layout.ensure_fatal_access_allowed()?;
     let block_index = layout.block_index(&allowed, T::ID)?;
     let block = &layout.blocks[block_index];
@@ -5536,7 +5536,7 @@ pub(crate) fn rebuild_commit_map_from_crc<T: VarveMatrixBlock>(
     let Some(crc_offset) = block.crc_offset else {
         return Err(Error::IntegrityFeatureDisabled);
     };
-    let commit_index = layout.commit_index(&allowed, T::CATEGORY)?;
+    let commit_index = layout.commit_index(&allowed, category)?;
     if layout.commits[commit_index].kind != MatrixCommitKind::Cell
         || layout.commits[commit_index].bit_count != block.cell_count
     {
@@ -5697,7 +5697,25 @@ pub(crate) fn set_channel_committed(
     set_commit_bit(layout, file, index, channel, value)
 }
 
-fn ensure_matrix_block<T: VarveMatrixBlock>(spec: FormatSpec) -> Result<()> {
+/// Validates `T` against the block the spec declares for `T::ID`, and returns
+/// **the spec's category for that block** — which is the point, not a
+/// by-product.
+///
+/// `T::CATEGORY` used to be checked against the descriptor here and then
+/// trusted by thirteen call sites. That made a caller-declared constant the key
+/// that selects which commit quarantine and which fatal-access gate apply to a
+/// cell, and the check was the only thing holding it up — so the chunk path,
+/// which never called this function, keyed those gates on an unvalidated
+/// string. Returning the descriptor's category instead removes the load from
+/// `T::CATEGORY` altogether: it is now descriptive, no code path can act on a
+/// wrong value, and there is nothing left to check.
+///
+/// What stays checked is what a reader owes: `T` against the *file*. The spec's
+/// descriptor table is tied to the file by the schema hash (`file.rs`
+/// `SchemaHashMismatch`), so a `T::VERSION` or `T::DIMENSIONS` that disagrees
+/// with it is a type that disagrees with the bytes on disk — which must be
+/// refused rather than decoded into confidently wrong values.
+pub(crate) fn ensure_matrix_block<T: VarveMatrixBlock>(spec: FormatSpec) -> Result<&'static str> {
     // DEF-01: run the common registration gate first, exactly like the
     // fixed/variable block paths. It enforces the process-local first-seen
     // schema-fingerprint and keyedness contract, so a manual matrix type
@@ -5723,13 +5741,10 @@ fn ensure_matrix_block<T: VarveMatrixBlock>(spec: FormatSpec) -> Result<()> {
         .iter()
         .find(|block| block.block_id == T::ID)
         .ok_or(Error::MatrixBlockMissing(T::ID))?;
-    if matrix.dimensions != T::DIMENSIONS
-        || matrix.category != T::CATEGORY
-        || matrix.slot_stride != T::SLOT_STRIDE
-    {
+    if matrix.dimensions != T::DIMENSIONS || matrix.slot_stride != T::SLOT_STRIDE {
         return Err(Error::InvalidMatrixLayout);
     }
-    Ok(())
+    Ok(matrix.category)
 }
 
 fn block_index_for_category(

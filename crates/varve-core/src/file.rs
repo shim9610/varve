@@ -7710,6 +7710,35 @@ impl VarveFile {
         crate::matrix::ensure_chunk_access_allowed(matrix, category)
     }
 
+    /// The whole of what a region path does before it addresses a cell, for a
+    /// typed chunk path: validate `T` against the file's schema, then gate on
+    /// **the spec's** category for `T::ID`.
+    ///
+    /// Both halves were missing on the read side, and the fix for the write
+    /// side was itself incomplete: it gated on `T::CATEGORY`, a constant the
+    /// caller declares, so the type under inspection chose which quarantine
+    /// applied to it. `ensure_matrix_block` returns the descriptor's category,
+    /// which is the one the file's schema hash covers.
+    fn ensure_chunk_block_access<T: VarveMatrixBlock>(&self) -> Result<&'static str> {
+        let category = crate::matrix::ensure_matrix_block::<T>(self.spec)?;
+        self.ensure_chunk_access_allowed(category)?;
+        Ok(category)
+    }
+
+    /// The same gate for the paths that address a block by id rather than by
+    /// type — `clear_matrix_cell_by_category` reaches the chunk that way, and
+    /// went through no gate at all.
+    fn ensure_chunk_access_by_block_id(&self, block_id: u32) -> Result<()> {
+        let category = self
+            .spec
+            .matrix_blocks
+            .iter()
+            .find(|block| block.block_id == block_id)
+            .ok_or(Error::MatrixBlockMissing(block_id))?
+            .category;
+        self.ensure_chunk_access_allowed(category)
+    }
+
     /// Which chunk a row belongs to, and its row inside that chunk.
     ///
     /// `None` when no dimension grows, or when the row is inside the declared
@@ -7912,11 +7941,12 @@ impl VarveFile {
         local_row: u64,
         key: MatrixKey,
     ) -> Result<(usize, u64)> {
-        // Every region path goes through these two before touching a cell and
-        // the chunk path went through neither: a quarantined category stayed
-        // writable through a chunked row, and a layout whose fatal-access gate
-        // had fired was still addressable.
-        self.ensure_chunk_access_allowed(T::CATEGORY)?;
+        // Every region path goes through these before touching a cell and the
+        // chunk path went through none of them: a quarantined category stayed
+        // writable through a chunked row, a layout whose fatal-access gate had
+        // fired was still addressable, and `T` was never checked against the
+        // file's schema at all.
+        self.ensure_chunk_block_access::<T>()?;
         self.open_chunk_at(chunk_index)?;
         let width = self
             .spec
@@ -8678,6 +8708,7 @@ impl VarveFile {
         chunk_index: u64,
         local_row: u64,
     ) -> Result<Vec<u8>> {
+        self.ensure_chunk_block_access::<T>()?;
         if let Some(payload) =
             self.read_open_chunk_cell_payload::<T>(key, chunk_index, local_row)?
         {
@@ -8892,9 +8923,25 @@ impl VarveFile {
     pub fn read_matrix_cell<T: VarveMatrixBlock>(&self, key: MatrixKey) -> Result<T> {
         if let Some((chunk_index, local_row)) = self.chunk_for_row(key.scan) {
             let payload = self.read_chunk_cell_payload::<T>(key, chunk_index, local_row)?;
-            return crate::codec::decode_from_slice(
+            // Bounded exactly as the region twin bounds it (`matrix::read_cell`):
+            // the slot bytes are already charged against `MaterializedBytes`,
+            // so what remains of that budget is what the decode may materialize
+            // on top of them. Unbounded here, a decoder that expands past its
+            // stride was capped on a region row and uncapped on a chunked one.
+            let materialized_limit = self
+                .spec
+                .read_limits
+                .require(ReadLimitKey::MaterializedBytes)?
+                .unwrap_or(u64::MAX);
+            let decode_limit = materialized_limit.checked_sub(payload.len() as u64).ok_or(
+                Error::ResourceArithmeticOverflow {
+                    resource: "materialized bytes",
+                },
+            )?;
+            return crate::codec::Decoder::decode_from_slice_limited(
                 &payload,
                 T::ENDIAN.unwrap_or(self.spec.endian),
+                decode_limit,
             );
         }
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
@@ -8912,6 +8959,7 @@ impl VarveFile {
         chunk_index: u64,
         local_row: u64,
     ) -> Result<MatrixCellStatus> {
+        self.ensure_chunk_block_access::<T>()?;
         if let Some(status) = self.open_chunk_cell_status::<T>(key, chunk_index, local_row)? {
             return Ok(status);
         }
@@ -9057,6 +9105,10 @@ impl VarveFile {
         chunk_index: u64,
         local_row: u64,
     ) -> Result<()> {
+        // Its typed twin gates through `chunk_block_slice`; this one addresses
+        // the block by id and so went through nothing, leaving a quarantined
+        // category clearable through any chunked row.
+        self.ensure_chunk_access_by_block_id(block_id)?;
         match &self.open_chunk {
             Some(open) if open.index == chunk_index => {}
             _ => {
@@ -9160,6 +9212,12 @@ impl VarveFile {
                      written record",
                 ));
             }
+            // The gate first, then the destruction. Clearing the open chunk
+            // and *then* letting `clear_category` run its
+            // `ensure_fatal_access_allowed` meant a refused clear returned an
+            // error to a caller entitled to believe nothing had happened,
+            // after the chunk's committed cells were already gone.
+            self.ensure_chunk_access_allowed(category)?;
             cleared = self.clear_open_chunk_category(category)?;
         }
         let result = {
@@ -9196,6 +9254,17 @@ impl VarveFile {
         block.written.fill(0);
         block.slots.fill(0);
         block.crc.fill(0);
+        // `dirty` means "some cell was committed", and it is what makes the
+        // next flush seal this chunk. Leaving it set after clearing every bit
+        // sealed an all-uncommitted record — which then refused every later
+        // write to those rows with `MatrixChunkSealed`, permanently, and cost a
+        // full-size dead record for rows that hold nothing. Recompute it from
+        // what is actually left rather than clearing it outright: another
+        // block in the same chunk may still hold committed cells.
+        chunk.dirty = chunk
+            .blocks
+            .iter()
+            .any(|block| block.commit.iter().any(|byte| *byte != 0));
         Ok(cleared)
     }
 
