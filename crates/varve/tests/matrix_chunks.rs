@@ -24,9 +24,9 @@ use std::path::{Path, PathBuf};
 
 use varve::{
     BlockDescriptor, BlockKind, Endian, Error, FormatSpec, IndexPolicy, IntegrityPolicy,
-    MatrixBlockDescriptor, MatrixCellStatus, MatrixCommitDescriptor, MatrixCommitKind,
-    MatrixDimensionDescriptor, MatrixDimensions, MatrixKey, ReadLimits, VarveBlock,
-    VarveMatrixBlock,
+    LazyOpenSource, MatrixBlockDescriptor, MatrixCellStatus, MatrixCommitDescriptor,
+    MatrixCommitKind, MatrixDimensionDescriptor, MatrixDimensions, MatrixKey, ReadLimits,
+    VarveBlock, VarveFile, VarveMatrixBlock,
 };
 
 const CHANNELS: u64 = 8;
@@ -1935,4 +1935,47 @@ fn patch_byte(path: &Path, offset: u64, value: u8) {
         .expect("open matrix for mutation");
     std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset)).expect("seek");
     file.write_all(&[value]).expect("patch byte");
+}
+
+/// The growing spec with the open digest on. `with_open_digest_on_flush` turns
+/// the block-offset chain on itself, which the digest needs to be reachable.
+fn digest_growing_spec() -> FormatSpec {
+    let spec = growing_spec();
+    spec.with_index_policy(spec.index_policy.with_open_digest_on_flush(true))
+}
+
+/// `sync()` must leave the digest where a lazy open can still find it.
+///
+/// Sealing the open chunk is an ordinary record append, so it lands past any
+/// digest the file already ends with — and a digest that is not the last
+/// record is one no lazy open can use. `flush` seals *before* it closes the
+/// commit point for exactly that reason; `sync` sealed and stopped, so this
+/// sequence silently demoted every later `open_readonly_lazy` to a full scan.
+///
+/// Nothing is wrong with the file afterwards, which is what makes it worth a
+/// test: the fallback is exact, and the only symptom is the eleven-syscall
+/// open quietly becoming a hundred-thousand-syscall one.
+#[test]
+fn sync_after_a_chunk_seal_leaves_the_digest_usable() -> varve::Result<()> {
+    let spec = digest_growing_spec();
+    let path = temp_path("sync_digest");
+    let mut writer = spec.create_writer_with_dims(path.path(), dims())?;
+    writer.write_matrix_cell(key(0, 0), &Sample { value: 1 })?;
+    writer.commit_matrix_cell::<Sample>(key(0, 0))?;
+    writer.flush()?;
+
+    // A committed chunked cell lives in RAM until its chunk is sealed, and
+    // `sync` is what seals it here.
+    writer.write_matrix_cell(key(ROWS_PER_CHUNK, 0), &Sample { value: 2 })?;
+    writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0))?;
+    writer.sync()?;
+    drop(writer);
+
+    let (_file, source) = VarveFile::open_readonly_lazy_with_report(spec, path.path())?;
+    assert_eq!(
+        source,
+        LazyOpenSource::Digest,
+        "the chunk seal left the digest buried, so the lazy open fell back to the scan",
+    );
+    Ok(())
 }

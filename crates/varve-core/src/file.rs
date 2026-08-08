@@ -3085,6 +3085,17 @@ struct AppendSnapshot {
     block_id: u32,
     previous_block_tail: Option<u64>,
     uncommitted_since_commit: bool,
+    /// Whether any record has been appended since the last digest was written.
+    ///
+    /// `needs_open_digest` used to answer this with `last_resident_block_id`,
+    /// which only moves for records the resident index carries. A workload
+    /// flushing only non-resident records therefore left the flag reading
+    /// "the digest is still last" while records piled up behind it — the
+    /// digest went permanently stale and every `open_readonly_lazy` silently
+    /// full-scanned. Non-resident blocks are exactly what the digest's tail
+    /// table exists to reach, so that combination disabled the feature for its
+    /// own purpose.
+    appended_since_digest: bool,
     /// The block id of the newest resident entry, maintained at the single
     /// index append site.
     ///
@@ -3615,6 +3626,17 @@ pub struct VarveFile {
     // the marker, which left every such record permanently uncommitted and
     // invisible to every reader.
     uncommitted_since_commit: bool,
+    /// Whether any record has been appended since the last digest was written.
+    ///
+    /// `needs_open_digest` used to answer this with `last_resident_block_id`,
+    /// which only moves for records the resident index carries. A workload
+    /// flushing only non-resident records therefore left the flag reading
+    /// "the digest is still last" while records piled up behind it — the
+    /// digest went permanently stale and every `open_readonly_lazy` silently
+    /// full-scanned. Non-resident blocks are exactly what the digest's tail
+    /// table exists to reach, so that combination disabled the feature for its
+    /// own purpose.
+    appended_since_digest: bool,
     /// The block id of the newest resident entry, maintained at the single
     /// index append site.
     ///
@@ -4679,6 +4701,7 @@ impl VarveFile {
             block_tails: BlockTails::new_empty(),
             segment_cursor: SegmentCursor::new_empty(),
             uncommitted_since_commit: false,
+            appended_since_digest: false,
             last_resident_block_id: None,
             keyed_tails: KeyedTails::new_empty(),
             // DUR3-01: this handle established the pathname, so its
@@ -4810,6 +4833,7 @@ impl VarveFile {
             block_tails: BlockTails::new_empty(),
             segment_cursor: SegmentCursor::new_empty(),
             uncommitted_since_commit: false,
+            appended_since_digest: false,
             last_resident_block_id: None,
             keyed_tails: KeyedTails::new_empty(),
             // DUR3-01: this handle established the pathname, so its
@@ -4946,6 +4970,7 @@ impl VarveFile {
             chunk_directory: std::sync::OnceLock::new(),
             segment_cursor,
             uncommitted_since_commit: false,
+            appended_since_digest: false,
             last_resident_block_id: index.last().map(|entry| entry.block_id),
             keyed_tails: KeyedTails::new_empty(),
             pending_pathname_parent_sync: false,
@@ -5071,6 +5096,7 @@ impl VarveFile {
             chunk_directory: std::sync::OnceLock::new(),
             segment_cursor,
             uncommitted_since_commit: false,
+            appended_since_digest: false,
             last_resident_block_id: index.last().map(|entry| entry.block_id),
             keyed_tails: KeyedTails::new_empty(),
             pending_pathname_parent_sync: false,
@@ -5195,6 +5221,7 @@ impl VarveFile {
             open_chunk: None,
             chunk_directory: std::sync::OnceLock::new(),
             uncommitted_since_commit: false,
+            appended_since_digest: false,
             // No record was framed, so there is nothing to seed this from — and
             // nothing to seed it for: it is append-path state and this handle is
             // read-only.
@@ -5282,6 +5309,7 @@ impl VarveFile {
                 chunk_directory: std::sync::OnceLock::new(),
                 segment_cursor,
                 uncommitted_since_commit: false,
+                appended_since_digest: false,
                 last_resident_block_id: index.last().map(|entry| entry.block_id),
                 keyed_tails: KeyedTails::new_empty(),
                 pending_pathname_parent_sync: false,
@@ -6691,6 +6719,15 @@ impl VarveFile {
         // made nothing durable — while the same call on a region row did.
         if self.mode == OpenMode::ReadWrite {
             self.seal_open_chunk()?;
+            // The seal is an ordinary record append, so it lands *past* any
+            // digest or segment this file already ends with — and a digest that
+            // is not the last record is one no lazy open can use. `flush` seals
+            // before it closes the commit point for exactly this reason; `sync`
+            // sealed and stopped, silently demoting every later
+            // `open_readonly_lazy` on the file to a full scan. Re-closing costs
+            // nothing when nothing was sealed: both writers are predicated on
+            // there being something new to describe.
+            self.close_commit_point();
         }
         self.file.sync_all()?;
         self.sync_created_pathname_once()
@@ -10354,6 +10391,7 @@ impl VarveFile {
             block_id,
             previous_block_tail: self.block_tails.tail(block_id),
             uncommitted_since_commit: self.uncommitted_since_commit,
+            appended_since_digest: self.appended_since_digest,
             last_resident_block_id: self.last_resident_block_id,
         };
         let record_offset = snapshot.eof;
@@ -10515,6 +10553,10 @@ impl VarveFile {
             SEGMENT_BLOCK_ID | OPEN_DIGEST_BLOCK_ID => self.uncommitted_since_commit,
             _ => true,
         };
+        // Maintained for every record, resident or not — that is the whole
+        // point of it. The digest is the one record that clears it: it is
+        // written last and describes everything before it, including itself.
+        self.appended_since_digest = block_id != OPEN_DIGEST_BLOCK_ID;
         self.snapshot = new_snapshot;
         // The directory's entries are rebuilt from the file, and the record
         // just installed is past the end of the snapshot this handle held a
@@ -10549,6 +10591,7 @@ impl VarveFile {
         self.block_tails
             .restore(snapshot.block_id, snapshot.previous_block_tail);
         self.uncommitted_since_commit = snapshot.uncommitted_since_commit;
+        self.appended_since_digest = snapshot.appended_since_digest;
         self.last_resident_block_id = snapshot.last_resident_block_id;
         if truncated {
             self.keyed_tails.invalidate_all();
@@ -10776,7 +10819,11 @@ impl VarveFile {
         {
             return false;
         }
-        self.last_resident_block_id != Some(OPEN_DIGEST_BLOCK_ID)
+        // The flag answers for every record; the resident-id proxy is kept as
+        // the second term because it is what carries the *open* case — a handle
+        // that has appended nothing yet still needs a digest when the file it
+        // opened does not end with one.
+        self.appended_since_digest || self.last_resident_block_id != Some(OPEN_DIGEST_BLOCK_ID)
     }
 
     fn write_open_digest_if_needed(&mut self) {
@@ -18772,6 +18819,85 @@ mod tests {
         assert_eq!(
             lazy.sequence_state, scanned.sequence_state,
             "the digest open disagrees with the scan on the next sequence",
+        );
+        Ok(())
+    }
+
+    /// A non-resident append still earns a fresh digest.
+    ///
+    /// `needs_open_digest` answered "is the last thing in this file already a
+    /// digest" with `last_resident_block_id`, which a non-resident append does
+    /// not move. So after one digest, appending only non-resident records wrote
+    /// no further digest — and those records put the old digest out of last
+    /// place, which is the one thing that makes it unusable. Every
+    /// `open_readonly_lazy` from then on silently took the full scan.
+    ///
+    /// Silent is the operative word: the answer stays correct, the cost does
+    /// not, and the tail table the digest carries exists precisely to reach
+    /// non-resident blocks. `_with_report` is what makes it assertable.
+    ///
+    /// The fixture is deliberately *mixed* — one resident block, one not —
+    /// because an all-non-resident file exposes a second, separate gap this
+    /// case is not about: `needs_open_digest` also returns early on
+    /// `self.index.is_empty()`, and a file whose every block is non-resident
+    /// has an empty resident index, so it never gets a first digest at all.
+    /// That one is recorded, not fixed here.
+    #[test]
+    fn a_non_resident_append_still_earns_a_new_digest() -> Result<()> {
+        const BLOCKS: &[BlockDescriptor] = &[
+            BlockDescriptor {
+                id: 12,
+                name: "line",
+                version: 1,
+                kind: BlockKind::Variable,
+                fields: &[],
+            },
+            BlockDescriptor {
+                id: 13,
+                name: "mark",
+                version: 1,
+                kind: BlockKind::Variable,
+                fields: &[],
+            },
+        ];
+        const RESIDENCY: &[crate::BlockResidencyDescriptor] = &[crate::BlockResidencyDescriptor {
+            block_id: 12,
+            resident: false,
+        }];
+        let spec = FormatSpec::new(
+            b"VSDGN",
+            1,
+            Endian::Little,
+            0,
+            IndexPolicy::BlockOffsetChain,
+            IntegrityPolicy::None,
+            RecoveryPolicy::Strict,
+            ManifestPolicy::None,
+            BLOCKS,
+        )
+        .with_read_limits(crate::ReadLimits::finite_all(u64::MAX))
+        .with_block_residency(RESIDENCY);
+        let spec = spec.with_index_policy(spec.index_policy.with_open_digest_on_flush(true));
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("digest-non-resident.varve");
+        let mut file = VarveFile::create(spec, &path)?;
+        // A resident record first, so there is a digest for the non-resident
+        // appends to leave behind.
+        file.push_info_for_test(13, b"resident")?;
+        file.flush()?;
+
+        for _ in 0..3 {
+            file.push_info_for_test(12, b"more")?;
+        }
+        file.flush()?;
+        drop(file);
+
+        let (_lazy, source) = VarveFile::open_readonly_lazy_with_report(spec, &path)?;
+        assert_eq!(
+            source,
+            LazyOpenSource::Digest,
+            "the second flush wrote no digest, so the lazy open fell back to the scan",
         );
         Ok(())
     }
