@@ -29,6 +29,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "digest_arbitrary"
+path = "fuzz_targets/digest_arbitrary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "codec_arbitrary"
 path = "fuzz_targets/codec_arbitrary.rs"
 test = false
