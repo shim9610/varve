@@ -1215,6 +1215,13 @@ pub(crate) mod resident_index {
             self.slots.len()
         }
 
+        /// Only the unit tests below ask this now — `needs_open_digest` used to,
+        /// and stopped because an empty resident index is not the same question
+        /// as an empty file (a format whose every block is non-resident has one
+        /// forever). Gated rather than deleted: the tests do want it, and the
+        /// gate's `clippy -p varve` lints this crate's lib target without its
+        /// tests, so ungated it reads as dead code there.
+        #[cfg(test)]
         pub(crate) fn is_empty(&self) -> bool {
             self.slots.is_empty()
         }
@@ -10835,7 +10842,7 @@ impl VarveFile {
     /// has to mean "anything other than the digest I already wrote", or every
     /// idle flush appends another one and the file grows while nothing happens.
     fn needs_open_digest(&self) -> bool {
-        if !self.spec.index_policy.open_digest_on_flush || self.index.is_empty() {
+        if !self.spec.index_policy.open_digest_on_flush {
             return false;
         }
         if self.spec.commit_policy.is_transaction_marker()
@@ -10843,11 +10850,23 @@ impl VarveFile {
         {
             return false;
         }
-        // The flag answers for every record; the resident-id proxy is kept as
-        // the second term because it is what carries the *open* case — a handle
-        // that has appended nothing yet still needs a digest when the file it
-        // opened does not end with one.
-        self.appended_since_digest || self.last_resident_block_id != Some(OPEN_DIGEST_BLOCK_ID)
+        // Two terms, and neither may look at the resident index.
+        //
+        // The first answers for this handle's own appends, resident or not.
+        // The second carries the *open* case — a handle that has appended
+        // nothing yet still needs a digest when the file it opened does not end
+        // with one — and it must not fire when there is no last resident record
+        // at all, which is both a freshly created file and a file whose every
+        // block is non-resident.
+        //
+        // The guard this replaces was `self.index.is_empty()`, meaning "nothing
+        // has been written yet". Right intent, wrong instrument: the resident
+        // index is empty forever when every block is declared non-resident, so
+        // such a file never got a first digest — and a non-resident block
+        // reaches its records through the chain whose head the digest carries.
+        // The option was inert for exactly the file it exists to serve.
+        self.appended_since_digest
+            || matches!(self.last_resident_block_id, Some(id) if id != OPEN_DIGEST_BLOCK_ID)
     }
 
     fn write_open_digest_if_needed(&mut self) {
@@ -18863,6 +18882,50 @@ mod tests {
         assert_eq!(
             lazy.sequence_state, scanned.sequence_state,
             "the digest open disagrees with the scan on the next sequence",
+        );
+        Ok(())
+    }
+
+    /// A file whose every block is non-resident gets a digest at all.
+    ///
+    /// The guard was `self.index.is_empty()` — "nothing written yet", measured
+    /// on the resident index. Declare every block non-resident and that index
+    /// is empty forever, so the file never got a *first* digest however much
+    /// was appended to it. The irony is exact: a non-resident block gives up
+    /// the resident directory and reaches its records through the block offset
+    /// chain instead, and the head of that chain is what the digest carries.
+    /// The option was inert for the one file it exists to serve.
+    ///
+    /// Asserted through `_with_report` rather than by counting bytes, because
+    /// the symptom is silent — the fallback scan returns exactly the right
+    /// answer, just after framing every record in the file.
+    #[test]
+    fn an_all_non_resident_file_still_gets_a_digest() -> Result<()> {
+        const RESIDENCY: &[crate::BlockResidencyDescriptor] = &[crate::BlockResidencyDescriptor {
+            block_id: 12,
+            resident: false,
+        }];
+        let spec = digest_test_spec().with_block_residency(RESIDENCY);
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("digest-all-non-resident.varve");
+        let mut file = VarveFile::create(spec, &path)?;
+        for _ in 0..4 {
+            file.push_info_for_test(12, b"row")?;
+        }
+        file.flush()?;
+        drop(file);
+
+        let (lazy, source) = VarveFile::open_readonly_lazy_with_report(spec, &path)?;
+        assert_eq!(
+            source,
+            LazyOpenSource::Digest,
+            "a file with no resident block never wrote a digest",
+        );
+        // And the digest is worth having here: the tail is the only way in.
+        assert!(
+            lazy.block_tail_offset(12).is_some(),
+            "the digest carried no tail for the only block in the file",
         );
         Ok(())
     }
