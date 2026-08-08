@@ -1,0 +1,20 @@
+# LeakSanitizer suppressions.
+#
+# One entry, and it is a test's premise rather than a defect.
+#
+# `a_record_appended_past_the_digest_falls_back` asks what a *lazy* open does
+# with a file whose writer put a record down and then died before flushing —
+# the record is on disk, the digest at the end is stale, and the open must fall
+# back to the scan. The only way to produce that file is a writer that never
+# runs its `Drop`, because `Drop` is what flushes; the test does that with
+# `std::mem::forget`. The 3494 bytes LeakSanitizer reports across five
+# allocations are that forgotten writer's buffers, and a run that did not leak
+# them would be a run that did not test anything.
+#
+# Scoped to the test function, deliberately. The leaking allocation's stack runs
+# through `VarveFile::write_record_with_prev_key`, and suppressing *that* — the
+# obvious frame to reach for — would blind the whole append path, which is the
+# hottest allocating code in the library and exactly where a real leak would
+# matter. Naming the test instead means any new leak anywhere, including one in
+# `write_record_with_prev_key` reached from any other test, still fails the run.
+leak:a_record_appended_past_the_digest_falls_back
