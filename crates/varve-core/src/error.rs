@@ -524,6 +524,25 @@ pub enum Error {
     #[error("matrix cell was not written before commit")]
     MatrixCellNotWritten,
 
+    /// A lazy writer open was asked for on a spec that also writes an index
+    /// checkpoint or an index segment at each commit point.
+    ///
+    /// Both records serialize the resident index — a checkpoint writes the
+    /// whole of it, a segment one entry per record it covers — and a lazy
+    /// writer has no resident index to serialize. The refusal is up front
+    /// rather than a silent no-op because a format that declared either one
+    /// asked for a specific recovery shape, and quietly not writing it would
+    /// leave files that open slower than their spec says they should.
+    ///
+    /// A segment and a digest solve the same problem: what an open needs that
+    /// lives in no single record. Pick one. The table in
+    /// `VarveFile::open_readonly_lazy` measures both.
+    #[error(
+        "a lazy writer open cannot serve {policy}, which serializes the resident index it does \
+         not keep; a digest and an index segment answer the same question, so declare one"
+    )]
+    LazyWriterIndexPolicy { policy: &'static str },
+
     /// A write or commit addressed a chunk that is no longer the open one.
     ///
     /// Only the newest chunk accepts writes: one chunk is buffered at a time,

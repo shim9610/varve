@@ -778,9 +778,12 @@ pub fn diagnose_file<P: AsRef<Path>>(spec: FormatSpec, path: P) -> FormatDiagnos
 
 pub fn classify_error(error: &Error) -> DiagnosticDomain {
     match error {
-        Error::InvalidFormatSpec(_) | Error::ReservedBlockId(_) => {
-            DiagnosticDomain::FormatDefinition
-        }
+        // A spec that declares an index policy a lazy writer cannot serve is a
+        // format-definition problem: the combination is refused at open, and
+        // the fix is in the declaration.
+        Error::InvalidFormatSpec(_)
+        | Error::ReservedBlockId(_)
+        | Error::LazyWriterIndexPolicy { .. } => DiagnosticDomain::FormatDefinition,
 
         Error::UnregisteredBlock(_)
         | Error::BlockVersionMismatch { .. }

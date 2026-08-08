@@ -17,7 +17,37 @@ decoder, header field or version constant was touched. If you are coming from
 
 ---
 
-## B. From 0.5.0 to 0.6.0: two signatures changed, one struct gained a field, and one error was renamed
+## B. From 0.5.0 to 0.6.0: a writer open that does not scan, two changed signatures, one struct field, and one renamed error
+
+### B.-1 `VarveFile::open_lazy` / `VarveWriter::open_lazy` — a writer that does not scan
+
+New, additive; nothing to migrate. Every other writer open frames every record
+in the file, at any size, because it builds the resident index. `open_lazy`
+reads the digest instead — the same route `open_readonly_lazy` takes, with
+write access and the writer lock.
+
+Measured on this tree, 200 records: the scanning open frames **202**, the lazy
+open frames **1**. The difference is the file, not the constant: at a billion
+records the lazy open still frames one.
+
+    let mut writer = VarveWriter::open_lazy(spec, path)?;   // no scan
+    writer.push(&row)?;                                     // appends normally
+
+Two things it does not have, both inherited from the read-only digest open:
+
+* **No resident directory.** `blocks::<T>()` refuses with
+  `NoResidentDirectory`; `record_map` is the way to walk records. Appending is
+  unaffected — the append path maintains the block tails and the sequence
+  itself, and the digest supplied both.
+* **No checkpoint or segment.** A spec with `checkpoint_on_flush` or
+  `segment_on_flush` is refused with the new `Error::LazyWriterIndexPolicy`.
+  Both records serialize the resident index this handle does not keep, so there
+  is nothing to write; refusing at open beats writing nothing and leaving a
+  file that opens slower than its spec says. A segment and a digest answer the
+  same question — declare one.
+
+`open_lazy_with_report` returns `LazyOpenSource` like its read-only twin, and
+the fallback is the same: any file whose digest is not usable opens by scanning.
 
 ### B.0 `Error::MatrixChunkSealed` is now `Error::MatrixChunkClosed`
 

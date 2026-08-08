@@ -4071,6 +4071,22 @@ impl VarveWriter {
         })
     }
 
+    /// See [`VarveFile::open_lazy`].
+    pub fn open_lazy<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        Ok(Self {
+            file: VarveFile::open_lazy(spec, path)?,
+        })
+    }
+
+    /// See [`VarveFile::open_lazy_with_report`].
+    pub fn open_lazy_with_report<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+    ) -> Result<(Self, LazyOpenSource)> {
+        let (file, source) = VarveFile::open_lazy_with_report(spec, path)?;
+        Ok((Self { file }, source))
+    }
+
     /// See [`VarveFile::open_with_scratch`].
     pub fn open_with_scratch<P: AsRef<Path>>(
         spec: FormatSpec,
@@ -5202,6 +5218,153 @@ impl VarveFile {
                 Ok((file, LazyOpenSource::FullScan))
             }
         }
+    }
+
+    /// Opens a **read-write** handle from the digest, without scanning.
+    ///
+    /// The writer twin of [`open_readonly_lazy`](Self::open_readonly_lazy), and
+    /// the half that was missing. Every other writer open calls `load_index`
+    /// with `ScanIntent::Writer`, so it is `O(records)` in time and in retained
+    /// memory at any file size — which put the standing "TB-scale files must
+    /// work, memory bounded by the working set" requirement on the read side
+    /// only, while the workload that requirement names as primary is
+    /// continuous append, and a continuous appender reopens its writer on every
+    /// restart.
+    ///
+    /// **Falls back to the scanning open** on any file whose digest is not
+    /// usable, exactly as the read-only route does, and
+    /// [`open_lazy_with_report`](Self::open_lazy_with_report) says which
+    /// happened.
+    ///
+    /// # What this handle does not have
+    ///
+    /// No resident directory, the same as the read-only digest open:
+    /// `blocks::<T>()` refuses with `NoResidentDirectory` and
+    /// [`record_map`](Self::record_map) is the way to walk records. Appending
+    /// is unaffected — the append path maintains `block_tails` and the sequence
+    /// itself, and the digest supplied both.
+    ///
+    /// # Why `checkpoint_on_flush` and `segment_on_flush` are refused
+    ///
+    /// Not because their state is hard to recover — that was the reading of
+    /// `open_readonly_from_digest`'s comment about the walk, and it is the
+    /// wrong one. `CheckpointCadence` is two `usize`s and `SegmentCursor`'s
+    /// `next_position` is *a position in the resident index*. Both records
+    /// serialize that index: a checkpoint writes the whole of it, a segment one
+    /// entry per record. A handle that keeps no index has nothing to write, so
+    /// the cadence is not approximate here, it has no referent. Refusing the
+    /// combination at open is honest where writing nothing would leave files
+    /// that open slower than their spec claims.
+    pub fn open_lazy<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
+        Ok(Self::open_lazy_with_report(spec, path)?.0)
+    }
+
+    /// [`open_lazy`](Self::open_lazy), and which of the two routes it took.
+    pub fn open_lazy_with_report<P: AsRef<Path>>(
+        spec: FormatSpec,
+        path: P,
+    ) -> Result<(Self, LazyOpenSource)> {
+        let spec = spec.resolve_entrypoint();
+        spec.validate()?;
+        ensure_native_open_limits(spec)?;
+        if spec.index_policy.checkpoint_on_flush {
+            return Err(Error::LazyWriterIndexPolicy {
+                policy: "checkpoint_on_flush",
+            });
+        }
+        if spec.index_policy.segment_on_flush {
+            return Err(Error::LazyWriterIndexPolicy {
+                policy: "segment_on_flush",
+            });
+        }
+        let path = path.as_ref().to_path_buf();
+        let lock = WriterLock::acquire(&path)?;
+        // The claim is taken before either route runs and released by
+        // `with_writer_lock_value` on every failure, the same as the scanning
+        // open — a lazy attempt that falls back must not hold two claims, and a
+        // refused one must not leave a stale claim behind.
+        let ((mut file, source), lock) = with_writer_lock_value(lock, |lock| {
+            match Self::open_writer_from_digest(spec, &path, lock) {
+                Ok(file) => Ok((file, LazyOpenSource::Digest)),
+                // Only a spec-level refusal propagates, exactly as it does for
+                // the read-only route: those describe the caller's
+                // configuration and the scan would answer the same.
+                Err(error @ Error::MissingResourceLimit { .. })
+                | Err(error @ Error::TrustedUnboundedRequiresExplicitApi { .. }) => Err(error),
+                Err(_) => {
+                    let mut scratch = Vec::new();
+                    let file =
+                        Self::open_locked_with_scratch(spec, path.clone(), lock, &mut scratch)?;
+                    Ok((file, LazyOpenSource::FullScan))
+                }
+            }
+        })?;
+        // Installed here rather than inside the body, the same as
+        // `with_writer_lock` does it: the body runs twice on the fallback path
+        // and must not claim the lock either time.
+        file._lock = Some(lock);
+        Ok((file, source))
+    }
+
+    /// The digest route for a writer: no scan, no directory, and the writer
+    /// lock already bound by the caller.
+    fn open_writer_from_digest(
+        spec: FormatSpec,
+        path: &Path,
+        lock: &mut WriterLock,
+    ) -> Result<Self> {
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        lock.bind_native(&file, path)?;
+        let captured_len = check_open_file_len(spec, &file)?;
+        let (header_len, header_extensions) = read_file_header_parts(spec, &mut file)?;
+        let (matrix, matrix_creation_nonce) = split_matrix_state(read_matrix_layout_if_needed(
+            spec,
+            &mut file,
+            header_len,
+            captured_len,
+        )?);
+        let append_start = append_log_start(header_len, matrix.as_ref());
+        // The frame check inside this requires the digest's extent to end
+        // exactly at the file's length, so a file that reaches here has no
+        // uncommitted tail past the digest to truncate: the digest is written
+        // at a commit point and is the last record, or it is not found at all
+        // and this route has already failed into the scan.
+        let digest = read_open_digest(spec, &mut file, append_start, captured_len)?;
+        let snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, digest.physical_end)?;
+        Ok(Self {
+            spec,
+            path: path.to_path_buf(),
+            file: RecordFile::new(file),
+            index: ResidentIndex::none_retained(snapshot.clone(), spec),
+            snapshot,
+            mode: OpenMode::ReadWrite,
+            header_extensions,
+            matrix,
+            matrix_creation_nonce,
+            sequence_state: match digest.sequence_high_water {
+                None => SequenceState::Available(0),
+                Some(u64::MAX) => SequenceState::Exhausted,
+                Some(sequence) => SequenceState::Available(sequence + 1),
+            },
+            // Both are refused above rather than approximated: see
+            // `open_lazy`'s doc. Empty is what "never used" looks like.
+            checkpoint_cadence: CheckpointCadence::new_empty(),
+            segment_cursor: SegmentCursor::new_empty(),
+            block_tails: digest.block_tails,
+            open_chunk: None,
+            chunk_directory: std::sync::OnceLock::new(),
+            uncommitted_since_commit: false,
+            record_buffer: Vec::new(),
+            // The file ends with a digest describing everything before it, so
+            // there is nothing to describe until something is appended. Both
+            // terms of `needs_open_digest` are false here, which is right.
+            appended_since_digest: false,
+            last_resident_block_id: None,
+            keyed_tails: KeyedTails::new_empty(),
+            pending_pathname_parent_sync: false,
+            poison: PoisonFlag::healthy(),
+            _lock: None,
+        })
     }
 
     fn open_readonly_from_digest(spec: FormatSpec, path: &Path) -> Result<Self> {
@@ -18906,6 +19069,102 @@ mod tests {
             lazy.sequence_state, scanned.sequence_state,
             "the digest open disagrees with the scan on the next sequence",
         );
+        Ok(())
+    }
+
+    /// The writer half of the lazy open: no scan, and it can still append.
+    ///
+    /// Every other writer open calls `load_index` with `ScanIntent::Writer`, so
+    /// it frames every record in the file — at any size. The framing count is
+    /// the assertion because it is the cost: `records_framed` counts what the
+    /// scan does and the digest route does not.
+    #[cfg(feature = "scalable-fault-injection")]
+    #[test]
+    fn a_lazy_writer_open_frames_no_record_and_still_appends() -> Result<()> {
+        let spec = digest_test_spec();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("lazy-writer.varve");
+        let mut file = VarveFile::create(spec, &path)?;
+        for _ in 0..200 {
+            file.push_info_for_test(12, b"row")?;
+        }
+        file.flush()?;
+        drop(file);
+
+        let before = VarveFile::records_framed();
+        let scanned = VarveFile::open(spec, &path)?;
+        let scan_frames = VarveFile::records_framed() - before;
+        drop(scanned);
+        assert!(
+            scan_frames >= 200,
+            "the scanning writer open framed {scan_frames} records, so this case measures nothing",
+        );
+
+        let before = VarveFile::records_framed();
+        let (mut lazy, source) = VarveFile::open_lazy_with_report(spec, &path)?;
+        let lazy_frames = VarveFile::records_framed() - before;
+        assert_eq!(source, LazyOpenSource::Digest);
+        assert_eq!(
+            lazy_frames, 1,
+            "the lazy writer open frames the digest record and nothing else",
+        );
+
+        // And it is a writer: the append path takes the sequence and the tail
+        // the digest supplied, so the record lands where the scan says it does.
+        let info = lazy.push_info_for_test(12, b"appended")?;
+        lazy.flush()?;
+        drop(lazy);
+
+        let after = VarveFile::open_readonly(spec, &path)?;
+        assert_eq!(
+            after.block_tail_offset(12),
+            Some(info.record_offset),
+            "the record appended through the lazy writer is not the block's newest",
+        );
+        // 200 records took 0..=199 and the digest took 200 — counting its own
+        // sequence is what F1 fixed. A lazy writer seeded from a digest that
+        // still reported 199 would hand out 200 a second time, which is the
+        // reuse that fix was latent for until this open existed.
+        assert_eq!(
+            info.sequence, 201,
+            "the lazy writer did not continue the digest's sequence"
+        );
+        Ok(())
+    }
+
+    /// The two index policies a lazy writer cannot serve are refused at open.
+    ///
+    /// Both records serialize the resident index this handle does not keep, so
+    /// writing nothing would leave a file that opens slower than its spec says.
+    #[test]
+    fn a_lazy_writer_refuses_the_policies_it_cannot_serve() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("lazy-writer-policy.varve");
+        let base = digest_test_spec();
+        VarveFile::create(base, &path)?.flush()?;
+
+        let checkpointing =
+            base.with_index_policy(base.index_policy.with_checkpoint_on_flush(true));
+        assert!(matches!(
+            VarveFile::open_lazy(checkpointing, &path),
+            Err(Error::LazyWriterIndexPolicy {
+                policy: "checkpoint_on_flush"
+            })
+        ));
+
+        // `segment_on_flush` needs crc32, and the base spec here declares no
+        // integrity — without this the spec is refused by `validate` before the
+        // check under test is reached, which is how the first version of this
+        // case passed for the wrong reason.
+        let segmenting = base
+            .with_integrity_policy(IntegrityPolicy::Crc32)
+            .with_index_policy(base.index_policy.with_segment_on_flush(true));
+        assert!(matches!(
+            VarveFile::open_lazy(segmenting, &path),
+            Err(Error::LazyWriterIndexPolicy {
+                policy: "segment_on_flush"
+            })
+        ));
         Ok(())
     }
 
