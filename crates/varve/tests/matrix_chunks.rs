@@ -1709,3 +1709,230 @@ fn temp_path(name: &str) -> TempPath {
         .join(format!("varve_chunk_{name}_{}.vrv", std::process::id()));
     TempPath { path, _dir: dir }
 }
+
+// ---------------------------------------------------------------------------
+// The gates, on the chunk path
+//
+// The eight invariants this file's earlier cases pin were all driven in on the
+// write/seal side. A later review found the read side had none of them: the
+// only caller of the chunk access gate was `chunk_block_slice`, which only the
+// write paths use, so a quarantined category refused a region row and handed
+// back the bytes for a chunked one -- from the same call. This file had no
+// quarantine or fatal-gate case at all, which is exactly why that survived.
+//
+// A note on what these cost to write, because it is the reason they were
+// missing: a quarantine cannot be asked for through the API. It is a *finding*,
+// produced by the recovery pass when it reads damage off the disk, so the
+// fixture has to corrupt a commit map by hand and reopen. The three helpers at
+// the bottom do that.
+// ---------------------------------------------------------------------------
+
+/// The same block id and shape as `Sample`, one version later.
+///
+/// The descriptor table says block 810 is version 1, and the spec's schema hash
+/// ties that table to the file -- so this type disagrees with the bytes on
+/// disk. The region path has always refused it. The chunk path addressed the
+/// block by id alone and would decode v2 semantics over v1 cells, returning a
+/// confidently wrong value rather than an error.
+#[derive(Clone, Debug, PartialEq, Eq, VarveBlock)]
+#[varve(id = 810, version = 2, kind = "matrix")]
+struct SampleV2 {
+    value: u32,
+}
+
+impl VarveMatrixBlock for SampleV2 {
+    const DIMENSIONS: [&'static str; 2] = ["scan", "ch"];
+    const CATEGORY: &'static str = "sample";
+    const SLOT_STRIDE: u64 = 4;
+}
+
+#[test]
+fn a_type_that_disagrees_with_the_schema_is_refused_on_a_chunked_row() -> varve::Result<()> {
+    let path = temp_path("version_mismatch");
+    let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+    // One region row and one chunked row, both committed through the honest type.
+    for row in [0, ROWS_PER_CHUNK] {
+        writer.write_matrix_cell(key(row, 0), &Sample { value: 7 })?;
+        writer.commit_matrix_cell::<Sample>(key(row, 0))?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    let reader = growing_spec().open_reader(path.path())?;
+    // The region row is the control: this is the refusal that already worked.
+    assert!(
+        matches!(
+            reader.read_matrix_cell::<SampleV2>(key(0, 0)),
+            Err(Error::BlockVersionMismatch { block_id, .. }) if block_id == Sample::ID
+        ),
+        "the region row accepted a type that disagrees with the schema"
+    );
+    // The chunked row must answer the same. Before the gate was added it
+    // returned `Ok(SampleV2 { .. })`.
+    assert!(
+        matches!(
+            reader.read_matrix_cell::<SampleV2>(key(ROWS_PER_CHUNK, 0)),
+            Err(Error::BlockVersionMismatch { block_id, .. }) if block_id == Sample::ID
+        ),
+        "a chunked row decoded a type the file's schema does not describe"
+    );
+    assert!(
+        matches!(
+            reader.matrix_cell_status::<SampleV2>(key(ROWS_PER_CHUNK, 0)),
+            Err(Error::BlockVersionMismatch { .. })
+        ),
+        "the status query answered for a type the schema does not describe"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_quarantined_category_refuses_a_chunked_row_as_it_refuses_a_region_row() -> varve::Result<()> {
+    let path = temp_path("quarantine_chunked_read");
+    let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+    for row in [0, ROWS_PER_CHUNK] {
+        writer.write_matrix_cell(key(row, 0), &Sample { value: 11 })?;
+        writer.commit_matrix_cell::<Sample>(key(row, 0))?;
+        writer.write_matrix_cell(key(row, 1), &Marker { flag: 1 })?;
+        writer.commit_matrix_cell::<Marker>(key(row, 1))?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    // Damage the commit map so the recovery pass quarantines the category. This
+    // is the only way in: a quarantine is a finding, not a setting.
+    let map_off = commit_map_offset(path.path());
+    patch_byte(path.path(), map_off, 0x40);
+
+    let reader = growing_spec().open_readonly(path.path())?;
+    let quarantined = |result: varve::Result<Sample>| matches!(result, Err(Error::MatrixCommitQuarantined(name)) if name == Sample::CATEGORY);
+    assert!(
+        quarantined(reader.read_matrix_cell::<Sample>(key(0, 0))),
+        "the fixture did not produce a quarantine on the region row"
+    );
+    // The whole finding, in one line: this used to return the cell's bytes.
+    assert!(
+        quarantined(reader.read_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0))),
+        "a quarantined category was still readable through a chunked row"
+    );
+    assert!(
+        matches!(
+            reader.matrix_cell_status::<Sample>(key(ROWS_PER_CHUNK, 0)),
+            Err(Error::MatrixCommitQuarantined(name)) if name == Sample::CATEGORY
+        ),
+        "a quarantined category still answered a status query on a chunked row"
+    );
+    // An untouched category is unaffected -- the gate is per-category, and a
+    // gate that refused everything would pass the assertions above for the
+    // wrong reason.
+    assert!(
+        reader
+            .matrix_cell_status::<Marker>(key(ROWS_PER_CHUNK, 1))
+            .is_ok(),
+        "the quarantine spread to a category the damage did not touch"
+    );
+    Ok(())
+}
+
+/// The category clear consults the gate, which it did not.
+///
+/// The defect this replaces was an *ordering* one: `clear_open_chunk_category`
+/// zeroed the open chunk's commit/written/slot/crc arrays, and only then did
+/// `matrix::clear_category` reach its first gate — so a refused clear returned
+/// an error to a caller entitled to believe nothing had happened, after the
+/// chunk's cells were already gone.
+///
+/// **That ordering is no longer reachable through this trigger, and the honest
+/// consequence is that this case cannot pin it.** The gate now runs first, so
+/// a quarantined category is refused before anything is touched; and writing
+/// the chunked cell the old bug would have destroyed is itself refused now,
+/// which is what the first version of this test discovered by failing. Pinning
+/// the ordering directly would need a fault injected into the region clear
+/// after the gate passes.
+///
+/// What is assertable, and is new: the clear is refused at all. `clear_category`
+/// checks only the layout-wide fatal gate, never the per-category quarantine,
+/// so before this change a quarantined category was cleared — region and open
+/// chunk both — without complaint.
+#[test]
+fn a_quarantined_category_refuses_the_category_clear() -> varve::Result<()> {
+    let path = temp_path("quarantine_clear");
+    let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+    writer.write_matrix_cell(key(0, 0), &Sample { value: 5 })?;
+    writer.commit_matrix_cell::<Sample>(key(0, 0))?;
+    writer.flush()?;
+    drop(writer);
+
+    let map_off = commit_map_offset(path.path());
+    patch_byte(path.path(), map_off, 0x40);
+
+    let mut writer = growing_spec().open_writer(path.path())?;
+    assert!(
+        matches!(
+            writer.clear_matrix_category(Sample::CATEGORY),
+            Err(Error::MatrixCommitQuarantined(name)) if name == Sample::CATEGORY
+        ),
+        "a quarantined category was cleared without complaint"
+    );
+    // An untouched category still clears, so the refusal is the quarantine and
+    // not the clear having become inoperable.
+    assert_eq!(writer.clear_matrix_category(Marker::CATEGORY)?, 0);
+    Ok(())
+}
+
+#[test]
+fn clearing_a_category_does_not_seal_a_dead_chunk() -> varve::Result<()> {
+    let path = temp_path("clear_then_seal");
+    let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+    // One committed cell in chunk 1, then clear it away and flush.
+    writer.write_matrix_cell(key(ROWS_PER_CHUNK, 0), &Sample { value: 3 })?;
+    writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0))?;
+    let cleared = writer.clear_matrix_category(Sample::CATEGORY)?;
+    assert_eq!(cleared, 1, "the clear did not account for the chunked row");
+    writer.flush()?;
+
+    // `dirty` used to survive the clear, so the flush sealed an
+    // all-uncommitted chunk record -- and a sealed chunk refuses every later
+    // write to its rows, permanently.
+    writer.write_matrix_cell(key(ROWS_PER_CHUNK, 1), &Sample { value: 4 })?;
+    writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 1))?;
+    writer.flush()?;
+    drop(writer);
+
+    let reader = growing_spec().open_reader(path.path())?;
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 1))?,
+        Sample { value: 4 },
+        "the row written after the clear did not survive"
+    );
+    assert_eq!(
+        reader.matrix_cell_status::<Sample>(key(ROWS_PER_CHUNK, 0))?,
+        MatrixCellStatus::NotCommitted,
+        "the cleared cell came back"
+    );
+    Ok(())
+}
+
+/// Where the matrix header records the commit map. Ported from
+/// `matrix_lazy_residency.rs`: 18 + 24 bytes of native prefix, the magic, then
+/// 24 bytes into the `VMAT` header, field 6.
+fn commit_map_offset(path: &Path) -> u64 {
+    use std::io::Read;
+    let prefix = 18 + 24 + u64::try_from(growing_spec().magic.len()).expect("magic length");
+    let mut file = std::fs::File::open(path).expect("open matrix");
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(prefix + 24 + 6 * 8))
+        .expect("seek header field");
+    let mut bytes = [0; 8];
+    file.read_exact(&mut bytes).expect("read header field");
+    u64::from_le_bytes(bytes)
+}
+
+fn patch_byte(path: &Path, offset: u64, value: u8) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open matrix for mutation");
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset)).expect("seek");
+    file.write_all(&[value]).expect("patch byte");
+}
