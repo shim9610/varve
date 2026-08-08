@@ -235,12 +235,19 @@ const LARGE: usize = 256 * 1024;
 /// | ---                  | ---              | ---        | ---                       |
 /// | before (`to_vec`)    | 6.01             | 786,594    | 3.000                     |
 /// | after (`Cow`)        | 5.01             | 524,426    | 2.000                     |
+/// | after (writer scratch) | 2.01           | 262,168    | 1.000                     |
 ///
-/// So: exactly one allocation per push disappears, and it takes exactly one
-/// payload with it. Two payload-proportional allocations remain and are NOT
-/// this fix — the macro's per-field `Vec` and `encode_to_vec_limited`'s buffer,
-/// findings [5, 33, 54] and [45, 53], neither of which is touched here.
-const MAX_PAYLOAD_COPIES: f64 = 2.0;
+/// The `Cow` round removed exactly one allocation per push and one payload with
+/// it. The third row is `encode_to_vec_limited`'s buffer — findings [45, 53],
+/// left outstanding by that round and closed by giving `VarveFile` the
+/// reusable `record_buffer` the two stream writers already had. It takes three
+/// allocations per push, not one: the encode's own `Vec` plus the growth
+/// reallocations it made getting to 256 KiB, all of which a warmed buffer
+/// already has capacity for.
+///
+/// One payload-proportional allocation remains and is NOT this fix — the
+/// macro's per-field `Vec`, findings [5, 33, 54].
+const MAX_PAYLOAD_COPIES: f64 = 1.0;
 
 /// How many payloads' worth of bytes one push allocates, derived from the two
 /// sizes rather than from either alone.
@@ -268,7 +275,8 @@ fn a_default_append_copies_the_payload_no_more_than_the_encoder_does() {
     let copies = payload_copies_per_push(small, large);
     assert!(
         copies <= MAX_PAYLOAD_COPIES + 0.05,
-        "each push allocated {copies:.3} payloads' worth of bytes; before this fix it was 3.0",
+        "each push allocated {copies:.3} payloads' worth of bytes; before the writer \
+         scratch it was 2.0, and before the `Cow` 3.0",
     );
     assert!(
         large.large <= MAX_PAYLOAD_COPIES as u64 * PUSHES,
@@ -276,11 +284,12 @@ fn a_default_append_copies_the_payload_no_more_than_the_encoder_does() {
          was 3 per push",
         large.large as f64 / PUSHES as f64,
     );
-    // 5.01 after, 6.01 before. The ceiling is loose because the +0.01 is the
-    // resident index's amortised growth, not a per-record cost.
+    // 2.01 now, 5.01 before the writer scratch, 6.01 before the `Cow`. The
+    // ceiling is loose because the +0.01 is the resident index's amortised
+    // growth, not a per-record cost.
     assert!(
-        large.allocations <= 5 * PUSHES + PUSHES / 2,
-        "allocations/push was {:.2}; before this fix it was 6.01",
+        large.allocations <= 2 * PUSHES + PUSHES / 2,
+        "allocations/push was {:.2}; before the writer scratch it was 5.01",
         large.allocations as f64 / PUSHES as f64,
     );
     assert_eq!(
@@ -307,7 +316,7 @@ fn a_declared_compression_spec_below_the_minimum_copies_no_more_either() {
          {copies:.3} payloads' worth per push",
     );
     assert!(large.large <= MAX_PAYLOAD_COPIES as u64 * PUSHES);
-    assert!(large.allocations <= 5 * PUSHES + PUSHES / 2);
+    assert!(large.allocations <= 2 * PUSHES + PUSHES / 2);
     assert_eq!(small.large, 0);
 }
 

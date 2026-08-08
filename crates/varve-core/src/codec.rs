@@ -189,6 +189,47 @@ impl Encoder {
         }
     }
 
+    /// [`Encoder::new_limited`] over a buffer the caller owns and gets back.
+    ///
+    /// The writer-owned scratch that keeps a steady-state append from
+    /// allocating once per record: the capacity survives, only the length is
+    /// reset.
+    pub(crate) fn new_limited_with_buffer(
+        endian: Endian,
+        max_len: u64,
+        resource: &'static str,
+        mut output: Vec<u8>,
+    ) -> Self {
+        output.clear();
+        Self {
+            endian,
+            output,
+            max_len: Some(max_len),
+            limit_resource: resource,
+            overflow: None,
+        }
+    }
+
+    /// Hands the buffer back whichever way the encode went.
+    ///
+    /// [`Encoder::try_into_inner`] drops it on the error path, which is right
+    /// when the buffer is the encoder's own and wrong when it belongs to a
+    /// writer that needs it for the next record — a failed encode must not cost
+    /// the writer its scratch.
+    pub(crate) fn into_buffer_and_result(self) -> (Vec<u8>, Result<()>) {
+        match self.overflow {
+            Some((actual, limit)) => (
+                self.output,
+                Err(Error::LimitExceeded {
+                    resource: self.limit_resource,
+                    actual,
+                    limit,
+                }),
+            ),
+            None => (self.output, Ok(())),
+        }
+    }
+
     pub fn endian(&self) -> Endian {
         self.endian
     }
@@ -650,6 +691,24 @@ pub(crate) fn encode_to_vec_limited<T: VarveEncode>(
     let mut encoder = Encoder::new_limited(endian, max_len, resource);
     value.encode_varve(&mut encoder)?;
     encoder.try_into_inner()
+}
+
+/// [`encode_to_vec_limited`] into a caller-owned buffer.
+///
+/// `buffer` is restored on every path, including the error one.
+pub(crate) fn encode_into_limited<T: VarveEncode>(
+    value: &T,
+    endian: Endian,
+    max_len: u64,
+    resource: &'static str,
+    buffer: &mut Vec<u8>,
+) -> Result<()> {
+    let mut encoder =
+        Encoder::new_limited_with_buffer(endian, max_len, resource, std::mem::take(buffer));
+    let encoded = value.encode_varve(&mut encoder);
+    let (output, finished) = encoder.into_buffer_and_result();
+    *buffer = output;
+    encoded.and(finished)
 }
 
 pub fn decode_from_slice<T: VarveDecode>(bytes: &[u8], endian: Endian) -> Result<T> {

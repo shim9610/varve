@@ -3626,6 +3626,15 @@ pub struct VarveFile {
     // the marker, which left every such record permanently uncommitted and
     // invisible to every reader.
     uncommitted_since_commit: bool,
+    /// Scratch the logical payload is encoded into, reused across records.
+    ///
+    /// `StreamWriter` and `IndexedStreamWriter` have had this since their
+    /// allocation contracts were written; `VarveFile` never got it and
+    /// allocated a fresh `Vec` per push through `encode_to_vec_limited`. The
+    /// append hot path admits no per-record allocation, and this was one of the
+    /// two payload-proportional ones the allocation-contract test records as
+    /// outstanding.
+    record_buffer: Vec<u8>,
     /// Whether any record has been appended since the last digest was written.
     ///
     /// `needs_open_digest` used to answer this with `last_resident_block_id`,
@@ -4701,6 +4710,7 @@ impl VarveFile {
             block_tails: BlockTails::new_empty(),
             segment_cursor: SegmentCursor::new_empty(),
             uncommitted_since_commit: false,
+            record_buffer: Vec::new(),
             appended_since_digest: false,
             last_resident_block_id: None,
             keyed_tails: KeyedTails::new_empty(),
@@ -4833,6 +4843,7 @@ impl VarveFile {
             block_tails: BlockTails::new_empty(),
             segment_cursor: SegmentCursor::new_empty(),
             uncommitted_since_commit: false,
+            record_buffer: Vec::new(),
             appended_since_digest: false,
             last_resident_block_id: None,
             keyed_tails: KeyedTails::new_empty(),
@@ -4970,6 +4981,7 @@ impl VarveFile {
             chunk_directory: std::sync::OnceLock::new(),
             segment_cursor,
             uncommitted_since_commit: false,
+            record_buffer: Vec::new(),
             appended_since_digest: false,
             last_resident_block_id: index.last().map(|entry| entry.block_id),
             keyed_tails: KeyedTails::new_empty(),
@@ -5096,6 +5108,7 @@ impl VarveFile {
             chunk_directory: std::sync::OnceLock::new(),
             segment_cursor,
             uncommitted_since_commit: false,
+            record_buffer: Vec::new(),
             appended_since_digest: false,
             last_resident_block_id: index.last().map(|entry| entry.block_id),
             keyed_tails: KeyedTails::new_empty(),
@@ -5221,6 +5234,7 @@ impl VarveFile {
             open_chunk: None,
             chunk_directory: std::sync::OnceLock::new(),
             uncommitted_since_commit: false,
+            record_buffer: Vec::new(),
             appended_since_digest: false,
             // No record was framed, so there is nothing to seed this from — and
             // nothing to seed it for: it is append-path state and this handle is
@@ -5309,6 +5323,7 @@ impl VarveFile {
                 chunk_directory: std::sync::OnceLock::new(),
                 segment_cursor,
                 uncommitted_since_commit: false,
+                record_buffer: Vec::new(),
                 appended_since_digest: false,
                 last_resident_block_id: index.last().map(|entry| entry.block_id),
                 keyed_tails: KeyedTails::new_empty(),
@@ -5603,15 +5618,24 @@ impl VarveFile {
         }
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         let endian = T::ENDIAN.unwrap_or(self.spec.endian);
-        let payload = encode_logical_payload_limited(self.spec, block, endian)?;
-        self.write_user_record(
-            &permit,
-            T::ID,
-            T::VERSION,
-            T::KIND,
-            &payload,
-            prev_same_key_offset,
-        )
+        // Taken out and put back on every path, including the error one: the
+        // buffer belongs to the writer, and a failed encode must not cost it.
+        // Same shape as `StreamWriter::push_info`.
+        let mut buffer = std::mem::take(&mut self.record_buffer);
+        let result =
+            match encode_logical_payload_limited_into(self.spec, block, endian, &mut buffer) {
+                Ok(()) => self.write_user_record(
+                    &permit,
+                    T::ID,
+                    T::VERSION,
+                    T::KIND,
+                    &buffer,
+                    prev_same_key_offset,
+                ),
+                Err(error) => Err(error),
+            };
+        self.record_buffer = buffer;
+        result
     }
 
     /// Appends a tombstone for `key`, linking it to the previous record with
@@ -13424,6 +13448,26 @@ fn encode_logical_payload_limited<T: VarveEncode>(
         endian,
         logical_limit,
         ReadLimitKey::LogicalPayloadLen.resource(),
+    )
+}
+
+/// [`encode_logical_payload_limited`] into a caller-owned buffer.
+fn encode_logical_payload_limited_into<T: VarveEncode>(
+    spec: FormatSpec,
+    value: &T,
+    endian: Endian,
+    buffer: &mut Vec<u8>,
+) -> Result<()> {
+    let logical_limit = spec
+        .read_limits
+        .require(ReadLimitKey::LogicalPayloadLen)?
+        .unwrap_or(u64::MAX);
+    crate::codec::encode_into_limited(
+        value,
+        endian,
+        logical_limit,
+        ReadLimitKey::LogicalPayloadLen.resource(),
+        buffer,
     )
 }
 
