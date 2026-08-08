@@ -9290,6 +9290,7 @@ impl VarveFile {
     pub fn clear_matrix_category(&mut self, category: &str) -> Result<u64> {
         let _permit = self.ensure_write()?;
         let mut cleared = 0u64;
+        let mut chunk_block: Option<usize> = None;
         if self.spec.growing_matrix.is_some() {
             if !self.chunk_directory()?.is_empty() {
                 return Err(Error::InvalidFormatSpec(
@@ -9297,23 +9298,38 @@ impl VarveFile {
                      written record",
                 ));
             }
-            // The gate first, then the destruction. Clearing the open chunk
-            // and *then* letting `clear_category` run its
-            // `ensure_fatal_access_allowed` meant a refused clear returned an
-            // error to a caller entitled to believe nothing had happened,
-            // after the chunk's committed cells were already gone.
+            // Refused before anything is touched. `clear_category` reaches its
+            // own `ensure_fatal_access_allowed` only after the open chunk had
+            // already been zeroed, so a refusal returned an error to a caller
+            // entitled to believe nothing had happened.
             self.ensure_chunk_access_allowed(category)?;
-            cleared = self.clear_open_chunk_category(category)?;
+            // Resolved, not applied: everything that can fail about the chunk
+            // half happens here, so the destructive part below cannot be the
+            // thing that reports an error.
+            chunk_block = self.open_chunk_block_for(category)?;
         }
         let result = {
             let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
             crate::matrix::clear_category(self.spec, matrix, self.file.matrix_region(), category)
         };
-        Ok(cleared + self.finish_matrix_mutation(result)?)
+        let region_cleared = self.finish_matrix_mutation(result)?;
+        // Only now. The region clear writes to disk and can fail on I/O; the
+        // chunk clear is a memset over a buffer this handle owns and cannot.
+        // Doing the memset first meant a failed region clear left the chunk's
+        // committed cells destroyed behind an error that says nothing happened
+        // — the gate above covers a refusal, and this covers the write.
+        if let Some(position) = chunk_block {
+            cleared = self.clear_open_chunk_block(position);
+        }
+        Ok(cleared + region_cleared)
     }
 
-    /// Clears one category's cells in the open chunk, returning how many.
-    fn clear_open_chunk_category(&mut self, category: &str) -> Result<u64> {
+    /// Which block of the open chunk a category names, if any.
+    ///
+    /// The fallible half of clearing a chunk category, split out so the caller
+    /// can resolve before it destroys: every `None` here is "nothing to clear",
+    /// and the apply step that follows cannot fail at all.
+    fn open_chunk_block_for(&self, category: &str) -> Result<Option<usize>> {
         let Some(block_id) = self
             .spec
             .matrix_blocks
@@ -9321,13 +9337,20 @@ impl VarveFile {
             .find(|block| block.category == category)
             .map(|block| block.block_id)
         else {
-            return Ok(0);
+            return Ok(None);
         };
+        let Some(chunk) = self.open_chunk.as_ref() else {
+            return Ok(None);
+        };
+        Ok(chunk.block_position(block_id))
+    }
+
+    /// Clears one already-resolved block of the open chunk, returning how many
+    /// cells were committed in it. Infallible by construction — a memset over a
+    /// buffer this handle owns.
+    fn clear_open_chunk_block(&mut self, position: usize) -> u64 {
         let Some(chunk) = self.open_chunk.as_mut() else {
-            return Ok(0);
-        };
-        let Some(position) = chunk.block_position(block_id) else {
-            return Ok(0);
+            return 0;
         };
         let block = &mut chunk.blocks[position];
         let cleared = block
@@ -9350,7 +9373,7 @@ impl VarveFile {
             .blocks
             .iter()
             .any(|block| block.commit.iter().any(|byte| *byte != 0));
-        Ok(cleared)
+        cleared
     }
 
     pub fn apply_matrix_recovery_action(&mut self, action: &MatrixRecoveryAction) -> Result<()> {
