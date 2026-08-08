@@ -26,7 +26,7 @@
 use std::fs;
 use std::path::Path;
 
-use varve::{FormatSpec, LazyOpenSource, VarveBlock, VarveFile, varve_format};
+use varve::{FormatSpec, VarveBlock, VarveFile, varve_format};
 
 varve_format! {
     pub format FuzzDigestFormat {
@@ -80,9 +80,29 @@ fn digest_spec() -> FormatSpec {
 ///
 /// The digest record is last and small — a header, twelve bytes per block id,
 /// and a trailer — so a mutation aimed anywhere in the file would spend nearly
-/// all its budget on record bodies the decoder never sees. This is the window
-/// that makes the target about the decoder.
+/// all its budget on record bodies the decoder never sees. Mode 0 therefore
+/// writes so the mutation *ends at end-of-file*: the first version anchored at
+/// the window's start instead, and a typical short input then corrupted bytes
+/// five hundred before the digest and never touched it.
 const TAIL_WINDOW: usize = 512;
+
+/// How much the two routes owe each other on this file.
+#[derive(Clone, Copy, PartialEq)]
+enum Oracle {
+    /// The unmutated fixture, valid by construction: nothing may fail. The
+    /// scan, the lazy open, and the map walk must all succeed and agree. This
+    /// pass is the target's regression detector — without it, a lazy open that
+    /// started erroring on every valid file would silently turn the whole
+    /// target into one that asserts nothing.
+    Pristine,
+    /// Appended past the last commit — the case the digest's `physical_end`
+    /// exists for. Both routes see the same committed prefix, so they must
+    /// agree whenever the scan can read the file.
+    Appended,
+    /// Truncated or rotted: only soundness is owed. A lazy open cannot see
+    /// mid-file rot by construction, so equality is not.
+    Mutated,
+}
 
 /// The shape a scan says the file has, as the thing every other route answers to.
 fn scanned_shape(
@@ -142,16 +162,13 @@ fn mutate(path: &Path, control: u8, mutations: &[u8]) -> bool {
     }
 
     match control % 4 {
-        // Overwrite inside the digest window: the decoder's own fields.
+        // Overwrite ending at end-of-file, where the digest actually is: its
+        // trailer is the last eight bytes and the whole record is ~50, so a
+        // write that *ends* at EOF hits decoder fields with any input length.
         0 => {
-            let start = bytes.len().saturating_sub(TAIL_WINDOW);
-            for (index, byte) in mutations.iter().enumerate() {
-                let at = start + index;
-                if at >= bytes.len() {
-                    break;
-                }
-                bytes[at] = *byte;
-            }
+            let span = mutations.len().min(TAIL_WINDOW).min(bytes.len());
+            let start = bytes.len() - span;
+            bytes[start..].copy_from_slice(&mutations[..span]);
         }
         // Truncate: a digest cut short, and a file whose last commit is gone.
         1 => {
@@ -192,62 +209,80 @@ pub fn run_digest(data: &[u8]) {
 
     // The unmutated file first: this half is not about corruption at all, it is
     // the assertion that the fast route and the slow route agree on a file that
-    // is simply valid. A digest that were wrong here would never reach the
-    // mutation cases.
-    compare_routes(spec, &path, true);
+    // is simply valid — and that everything *works* on it, which is what keeps
+    // the mutation cases from becoming a target that silently asserts nothing.
+    compare_routes(spec, &path, Oracle::Pristine);
 
     let mode = control % 4;
     if !mutate(&path, control, mutations) {
         return;
     }
-    // Only the append case still owes the scan an identical answer; see
-    // `compare_routes`.
-    compare_routes(spec, &path, mode == 2);
+    compare_routes(
+        spec,
+        &path,
+        if mode == 2 {
+            Oracle::Appended
+        } else {
+            Oracle::Mutated
+        },
+    );
 }
 
 /// Opens the same bytes both ways.
 ///
-/// `strict` is the whole subtlety of this target, and getting it wrong is what
-/// the first run of it did. **A lazy open cannot agree with the scan on a file
-/// with mid-file rot, and that is not a defect.** The scan detects a corrupt
-/// record only because it frames every record; when it hits one it stops, and
-/// its idea of a block's tail becomes the last good record *before* the damage.
-/// The digest sits at the end, is checksummed independently, and reports the
-/// true tail past it. Measured: one flipped byte at offset 17969 put the scan's
-/// tail at 16804 and the digest's at 37868 — both correct for their own
-/// definition. Requiring equality there would be requiring the lazy open to do
-/// the hundred thousand syscalls it exists to avoid.
+/// The [`Oracle`] is the whole subtlety of this target, and getting it wrong
+/// is what the first run of it did. **A lazy open cannot agree with the scan
+/// on a file with mid-file rot, and that is not a defect.** The scan detects a
+/// corrupt record only because it frames every record; when it hits one it
+/// stops, and its idea of a block's tail becomes the last good record *before*
+/// the damage. The digest sits at the end, is checksummed independently, and
+/// reports the true tail past it. Measured: one flipped byte at offset 17969
+/// put the scan's tail at 16804 and the digest's at 37868 — both correct for
+/// their own definition. Requiring equality there would be requiring the lazy
+/// open to do the hundred thousand syscalls it exists to avoid.
 ///
-/// So equality is asserted exactly where it is owed:
+/// So equality is asserted exactly where it is owed — [`Oracle::Pristine`] and
+/// [`Oracle::Appended`] — and for truncation and rot the requirement is that
+/// the path be sound, which the sanitizers and the read-back below judge.
 ///
-/// * an unmutated file — the plain correctness of the fast route;
-/// * a file appended past its last commit — the case the digest's
-///   `physical_end` field exists for, where the two must still agree.
-///
-/// For truncation and rot the requirement is only that the path be sound, which
-/// the sanitizers and the read-back below judge.
-fn compare_routes(spec: FormatSpec, path: &Path, strict: bool) {
+/// One property holds in *every* mode: **the lazy open may not fail where the
+/// scan succeeds.** `open_readonly_lazy_with_report`'s contract is that every
+/// digest failure short of a spec-level refusal falls back to exactly the scan
+/// — so on a file the scan can read, `Err` is not a permitted degradation, it
+/// is the fallback broken. The first version of this function excused those
+/// errors in every mode, which would have hidden a lazy open regressed to
+/// erroring on every valid file.
+fn compare_routes(spec: FormatSpec, path: &Path, oracle: Oracle) {
     // The scan is read first and is never allowed to be the thing that changed
     // the file — `open_readonly` does not recover in place, so both routes see
     // identical bytes.
-    let Some((scanned_entries, scanned_tails)) = scanned_shape(spec, path) else {
-        // The scan itself refuses these bytes. Then the file has no defined
-        // content to compare against and the only requirement on the lazy open
-        // is that it not misbehave; libFuzzer's sanitizers judge that part.
+    let scanned = scanned_shape(spec, path);
+    if oracle == Oracle::Pristine {
+        assert!(
+            scanned.is_some(),
+            "the scan refused the unmutated fixture it just wrote"
+        );
+    }
+    let Some((scanned_entries, scanned_tails)) = scanned else {
+        // The scan refuses these bytes. The lazy open may still legitimately
+        // succeed — a digest at the end is checksummed independently of the
+        // mid-file damage that stopped the scan — so nothing further is owed
+        // beyond not misbehaving, which libFuzzer's sanitizers judge.
         let _ = VarveFile::open_readonly_lazy_with_report(spec, path);
         return;
     };
 
-    let Ok((file, source)) = VarveFile::open_readonly_lazy_with_report(spec, path) else {
-        // Degrading to an error where the scan succeeds is permitted and is the
-        // documented fallback's failure mode.
-        return;
+    let (file, source) = match VarveFile::open_readonly_lazy_with_report(spec, path) {
+        Ok(opened) => opened,
+        Err(error) => panic!(
+            "the lazy open failed where the scan succeeds; its fallback is that scan: {error:?}"
+        ),
     };
 
     let line_tail = file.block_tail_offset(DigestLine::ID);
     let note_tail = file.block_tail_offset(DigestNote::ID);
 
-    if strict {
+    if oracle != Oracle::Mutated {
         // Whichever route it took, the facts must be the scan's.
         assert_eq!(
             line_tail, scanned_tails[0],
@@ -275,30 +310,42 @@ fn compare_routes(spec: FormatSpec, path: &Path, strict: bool) {
 
     // A digest open keeps no directory, so the map is the only way to ask it
     // where the file ends. A handle that stopped one record short would show up
-    // here and nowhere else.
+    // here and nowhere else. On the unmutated fixture the walk itself must
+    // work — a broken `record_map` would otherwise skip this block silently on
+    // every input, and the comparison below would never run again.
     let mut buffer = Vec::new();
-    if let Ok(mut map) = file.record_map(&mut buffer)
-        && map.fill().is_ok()
-    {
-        let walked: Vec<_> = map
-            .entries()
-            .iter()
-            .map(|entry| (entry.block_id, entry.record_offset, entry.payload_len))
-            .collect();
-        if strict {
-            assert_eq!(
-                walked, scanned_entries,
-                "the map walked from a lazy open ({source:?}) is not the scan's index"
-            );
+    match file.record_map(&mut buffer) {
+        Ok(mut map) => {
+            let filled = map.fill();
+            if oracle == Oracle::Pristine {
+                filled
+                    .as_ref()
+                    .expect("the map walk failed on the unmutated fixture");
+            }
+            if filled.is_ok() && oracle != Oracle::Mutated {
+                let walked: Vec<_> = map
+                    .entries()
+                    .iter()
+                    .map(|entry| (entry.block_id, entry.record_offset, entry.payload_len))
+                    .collect();
+                assert_eq!(
+                    walked, scanned_entries,
+                    "the map walked from a lazy open ({source:?}) is not the scan's index"
+                );
+            }
+        }
+        Err(error) => {
+            if oracle == Oracle::Pristine {
+                panic!("record_map failed on the unmutated fixture: {error:?}");
+            }
         }
     }
 
-    // The report is a claim about which route ran, and a Digest answer on a
-    // file with no readable digest would be the fallback failing silently.
-    if source == LazyOpenSource::Digest {
-        assert!(
-            spec.index_policy.open_digest_on_flush,
-            "reported a digest open for a spec that never writes one"
-        );
-    }
+    // No assertion ties `source` to the file's tail, deliberately. The obvious
+    // one — "a truncated file must answer FullScan" — is wrong: a truncation
+    // that lands exactly on an earlier flush's boundary leaves that flush's
+    // digest as the last record, and a Digest answer is then correct. And
+    // re-checking the spec flag here would be a tautology; the spec never
+    // changes. What Digest-vs-FullScan is owed is already asserted above: the
+    // same answers as the scan, on any file the scan can read.
 }
