@@ -1,0 +1,165 @@
+name: Sanitizers
+
+# Fuzzing, Miri, and AddressSanitizer live outside `ci.yml` because they answer
+# a different question on a different clock. `ci.yml` gates every push and pull
+# request on "does this change break a contract"; these jobs ask "is there a
+# memory-safety defect nobody has noticed yet" — a property of the whole tree,
+# not of a diff, and one that costs hours rather than minutes. A weekly schedule
+# plus a manual trigger fits that: the answer does not change on every push, and
+# a red run here is investigated, not reverted.
+#
+# What each tool can actually see — measured on 2026-08-08, not assumed:
+#
+#   * ASan runs the real suite with the real syscalls under `--all-features`,
+#     so the mmap / zero-copy surface is exercised. It is the primary tool for
+#     this codebase.
+#   * Miri interprets the portable core only. Of the 28 `unsafe` sites in
+#     `file.rs`, 10 are `mmap`-gated — memmap2 issues the `mmap` syscall, a
+#     foreign function Miri refuses — and 11 are Windows-only, so Miri sees at
+#     most the remaining 7, plus everything in `matrix`, `codec`, `snapshot`.
+#     In exchange it is the one tool here that reports UB that does not crash.
+#   * The fuzz smoke run exists so a target that stops building, or crashes
+#     within its first minutes, is caught weekly instead of on the next manual
+#     campaign. It is not a campaign itself: 90 seconds per target finds smoke,
+#     not deep states.
+
+on:
+  schedule:
+    # Weekly, Monday 03:17 UTC. Scheduled workflows run on the default branch.
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI-03, same rule as ci.yml: installed cargo tools carry an exact version.
+  CARGO_FUZZ_VERSION: 0.13.2
+
+jobs:
+  fuzz-smoke:
+    # CI runs on the public repository only. `varve-dev` is private, so runner
+    # minutes there are metered against the account; this guard means the
+    # workflow file can live in a tree that is pushed to both remotes without
+    # ever spending a paid minute. Every job carries it because GitHub has no
+    # workflow-level `if`.
+    if: github.repository == 'shim9610/varve'
+    name: fuzz smoke (every target, 90s each)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: fuzz-smoke
+          workspaces: fuzz
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version "$CARGO_FUZZ_VERSION"
+      # The target list comes from `cargo fuzz list`, not from a list written
+      # here, so a target added to `fuzz/Cargo.toml` is in this job the same
+      # week — a hardcoded list is how a new target silently never runs.
+      # On a crash, libFuzzer prints the input (as a Debug value for arbitrary
+      # targets) and writes it under fuzz/artifacts/; the log is the artifact
+      # for a smoke job.
+      - name: build and run every target briefly
+        working-directory: fuzz
+        run: |
+          cargo fuzz build
+          for target in $(cargo fuzz list); do
+            echo "::group::${target}"
+            cargo fuzz run "$target" -- -max_total_time=90 -rss_limit_mb=4096
+            echo "::endgroup::"
+          done
+
+  asan:
+    # Same public-repository guard as above.
+    if: github.repository == 'shim9610/varve'
+    name: address sanitizer + leaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: nightly
+          # `-Zbuild-std` rebuilds the standard library under the sanitizer,
+          # which is what lets ASan see into std-owned allocations; it needs
+          # the source.
+          components: rust-src
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: asan
+      # Three env choices, each with a measured reason:
+      #
+      #   * `VARVE_SKIP_UI_SNAPSHOTS=1` — trybuild runs its fixtures by
+      #     spawning nested cargo builds, and the children inherit
+      #     `RUSTFLAGS=-Zsanitizer=address` without the `-Zbuild-std` that
+      #     makes it linkable: every fixture fails on build machinery, not on
+      #     the contract it pins. A sanitizer has nothing to observe in a
+      #     compile-time test; the plain CI jobs run them uninstrumented.
+      #   * `detect_leaks=1` — leak detection is part of the point, not an
+      #     extra. Without the suppression file the suite exits 101 while all
+      #     tests pass, because LeakSanitizer reports at process exit.
+      #   * the suppression file names ONE test function whose leak is its
+      #     premise (`std::mem::forget` of a writer, to model a writer that
+      #     died before flushing). It deliberately does not name the leaking
+      #     frame — that is the append hot path, where a real leak would
+      #     matter most. See the file's own comments.
+      #
+      # `--tests` runs the unit and integration test targets and not doctests;
+      # doctests compile as separate crates that do not get `-Zbuild-std`.
+      - name: test suite under AddressSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=1
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/.github/lsan-suppressions.txt
+          VARVE_SKIP_UI_SNAPSHOTS: "1"
+        run: |
+          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu \
+            -p varve -p varve-core --all-features --tests
+
+  miri:
+    # Same public-repository guard as above.
+    if: github.repository == 'shim9610/varve'
+    name: miri (varve-core portable unit tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: nightly
+          components: miri
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: miri
+      # `-Zmiri-disable-isolation` because these tests do real file I/O through
+      # std, which Miri shims once isolation is off.
+      #
+      # Eight tests are skipped, from a per-test classification of all 107 on
+      # 2026-08-08 — each name below is a measurement, not a guess:
+      #
+      #   * four `diagnostics` tests abort on the foreign function `openat`:
+      #     they call libc directly to pin down inode-identity semantics, and
+      #     Miri only shims std's file API, not raw libc.
+      #   * four are performance-contract tests that drive thousands of reads
+      #     through a file-backed page cache; each ran past a 300-second cap,
+      #     and the LRU ones past 34 minutes, where the other 99 finished. They
+      #     assert probe-count bounds — algorithmic cost, no `unsafe` — so
+      #     skipping them costs Miri nothing it could have judged.
+      #
+      # `--skip` matches substrings; these names are long enough to be unique.
+      - name: unit tests under Miri
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: |
+          cargo miri test -p varve-core --no-default-features --lib -- \
+            --skip cleanup_does_not_delete_a_file_interposed_before_the_unlink \
+            --skip cleanup_leaves_a_swapped_pathname_alone \
+            --skip cleanup_removes_the_verified_object \
+            --skip lock_marker_removal_leaves_a_swapped_object_alone \
+            --skip replace_block_finds_predecessors_without_rescanning_the_prefix \
+            --skip a_page_released_by_a_clear_leaves_the_recency_order \
+            --skip a_recency_touch_costs_a_bounded_number_of_probes \
+            --skip a_writer_materialised_page_is_never_evicted

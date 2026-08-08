@@ -14,6 +14,13 @@
 /// what it exists to catch is a break on a newer compiler, not a reworded
 /// diagnostic. Unset by default, so a plain `cargo test` still runs them.
 ///
+/// The sanitizer job sets it for a second, unrelated reason: `trybuild` runs
+/// the fixtures by spawning nested cargo builds, and those children inherit
+/// `RUSTFLAGS=-Zsanitizer=address` without the `-Zbuild-std` that makes it
+/// linkable — every fixture fails on build machinery, not on the contract it
+/// pins. A sanitizer has nothing to observe in a compile-time test anyway;
+/// the plain-CI jobs run these cases uninstrumented.
+///
 /// `pass` cases are unaffected — they assert compilation succeeds and compare no
 /// text — but they live in the same `TestCases` batch as the `compile_fail` ones,
 /// so a skipped test function skips both. The `msrv` job covers them.
