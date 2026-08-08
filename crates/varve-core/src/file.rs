@@ -97,11 +97,23 @@ const DIGEST_TAIL_LEN: u64 = 4 + 8;
 const DIGEST_TRAILER_LEN: u64 = 8;
 /// `sequence_high_water` when the file holds no record that carries a sequence.
 ///
-/// A sentinel rather than a flag bit because the value it stands in for is
-/// "there is no high-water mark", and `SequenceState` already spells that
-/// `Available(0)`. `u64::MAX` cannot be a real high-water mark: a writer that
-/// reached it is `Exhausted`, which the digest reports as the mark itself.
-const DIGEST_NO_SEQUENCE: u64 = u64::MAX;
+/// The sequence field carries a high-water mark; clear means there is none.
+///
+/// This was a `u64::MAX` sentinel in the value itself, on the reasoning that a
+/// writer which reached `u64::MAX` is `Exhausted` and so could never report it
+/// as a mark. Both halves of that were wrong. The digest takes a sequence of
+/// its own, so a digest written as the last available record *does* have
+/// `u64::MAX` as its mark — and `Exhausted` was then unrepresentable, colliding
+/// with "no mark" and leaving the decode arm that maps it dead code.
+///
+/// A flag costs nothing here: the field it lives in was written as zero and
+/// never read.
+const DIGEST_FLAG_SEQUENCE: u16 = 0x0001;
+
+/// Every flag bit this version defines. A digest that sets one outside this set
+/// was written by something that means more by it than this build knows, and is
+/// answered with the scan rather than half-understood.
+const DIGEST_FLAGS_KNOWN: u16 = DIGEST_FLAG_SEQUENCE;
 
 /// What one digest record says.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,12 +163,12 @@ fn encode_digest_payload(
         })?;
     payload.extend_from_slice(DIGEST_MAGIC);
     payload.extend_from_slice(&DIGEST_VERSION.to_le_bytes());
-    payload.extend_from_slice(&0u16.to_le_bytes());
-    payload.extend_from_slice(
-        &sequence_high_water
-            .unwrap_or(DIGEST_NO_SEQUENCE)
-            .to_le_bytes(),
-    );
+    let (flags, sequence) = match sequence_high_water {
+        Some(mark) => (DIGEST_FLAG_SEQUENCE, mark),
+        None => (0, 0),
+    };
+    payload.extend_from_slice(&flags.to_le_bytes());
+    payload.extend_from_slice(&sequence.to_le_bytes());
     payload.extend_from_slice(&count.to_le_bytes());
     for (block_id, offset) in tails {
         payload.extend_from_slice(&block_id.to_le_bytes());
@@ -191,6 +203,11 @@ fn decode_digest_payload(
     let mut u16_buf = [0; 2];
     u16_buf.copy_from_slice(&payload[4..6]);
     if u16::from_le_bytes(u16_buf) != DIGEST_VERSION {
+        return Err(Error::InvalidIndexSegment);
+    }
+    u16_buf.copy_from_slice(&payload[6..8]);
+    let flags = u16::from_le_bytes(u16_buf);
+    if flags & !DIGEST_FLAGS_KNOWN != 0 {
         return Err(Error::InvalidIndexSegment);
     }
     let mut u64_buf = [0; 8];
@@ -237,7 +254,7 @@ fn decode_digest_payload(
     }
     Ok(OpenDigest {
         physical_end,
-        sequence_high_water: (stored_sequence != DIGEST_NO_SEQUENCE).then_some(stored_sequence),
+        sequence_high_water: (flags & DIGEST_FLAG_SEQUENCE != 0).then_some(stored_sequence),
         block_tails: BlockTails::from_sorted(tails),
     })
 }
@@ -10775,12 +10792,27 @@ impl VarveFile {
         // digest takes the next sequence itself, so reporting the state before
         // it would send the next writer back over a number this record used.
         let sequence_high_water = match self.sequence_state {
-            SequenceState::Available(next) => next.checked_sub(1),
+            // `Available(next)` means `next` is the number this digest record is
+            // about to take, so once it is down the mark is `next` — not
+            // `next - 1`, which is the state *before* it and is what this
+            // computed for as long as the comment above forbade exactly that.
+            // Latent while the digest route builds read-only handles; sequence
+            // reuse the day a writer is seeded from one.
+            SequenceState::Available(next) => Some(next),
+            // Unreachable in practice — an exhausted writer cannot append the
+            // digest either, `available()` refuses first — but representable
+            // now, which it was not.
             SequenceState::Exhausted => Some(u64::MAX),
         };
         // Its own tail is not in the table it writes — it cannot be, the record
-        // does not exist yet — so an open that reads this digest learns every
-        // block's tail except the digest block's own. Nothing walks the digest
+        // does not exist yet. From the second digest onward the table does
+        // carry a digest tail: the *previous* one, because `block_tails` is
+        // maintained for every block. So a digest open answers
+        // `block_tail_offset(OPEN_DIGEST_BLOCK_ID)` with the previous digest
+        // where a scan answers with this one. The id is internal and nothing
+        // walks from it, so the two answers are equally usable — but they are
+        // not the same answer, and the claim that this table omits the digest
+        // entirely was true only of the first one. Nothing walks the digest
         // chain: the digest is found at the end of the file, not by following
         // one.
         let payload = encode_digest_payload(
@@ -18466,6 +18498,74 @@ mod tests {
         }
     }
 
+    /// The digest's sequence mark counts the digest record itself.
+    ///
+    /// `Available(next)` means `next` is the number the digest is about to
+    /// take, so the mark once it is down is `next`. Storing `next - 1` reported
+    /// the digest's own sequence as unused, and a writer seeded from that
+    /// digest would hand it out a second time. The encode/decode pair is the
+    /// whole of what can be checked here without a writer, and it is where the
+    /// off-by-one lived.
+    #[test]
+    fn a_digest_sequence_mark_survives_the_round_trip_including_the_last_number() {
+        for mark in [
+            None,
+            Some(0u64),
+            Some(1),
+            Some(u64::MAX - 1),
+            Some(u64::MAX),
+        ] {
+            let payload =
+                encode_digest_payload(test_spec(), mark, &[(7, 128)], 4096).expect("encode digest");
+            let decoded = decode_digest_payload(&payload, 64, 4096, 4200).expect("decode digest");
+            assert_eq!(
+                decoded.sequence_high_water, mark,
+                "a mark of {mark:?} did not survive the round trip"
+            );
+        }
+    }
+
+    /// `u64::MAX` is a real mark, not the absence of one.
+    ///
+    /// It used to be the sentinel for "no mark", which made the two
+    /// indistinguishable on the wire and left `SequenceState::Exhausted`
+    /// unrepresentable — the decode arm that maps it was unreachable.
+    #[test]
+    fn the_last_sequence_number_is_not_the_absence_of_one() {
+        let spec = test_spec();
+        let present =
+            encode_digest_payload(spec, Some(u64::MAX), &[(7, 128)], 4096).expect("encode present");
+        let absent = encode_digest_payload(spec, None, &[(7, 128)], 4096).expect("encode absent");
+        assert_ne!(present, absent, "a real u64::MAX mark encodes as no mark");
+        assert_eq!(
+            decode_digest_payload(&present, 64, 4096, 4200)
+                .expect("decode")
+                .sequence_high_water,
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            decode_digest_payload(&absent, 64, 4096, 4200)
+                .expect("decode")
+                .sequence_high_water,
+            None
+        );
+    }
+
+    /// A flag this build does not define means the writer meant more by this
+    /// record than this build knows, so it is answered with the scan rather
+    /// than half-understood. The field was written as zero and never read,
+    /// which foreclosed exactly this evolution path.
+    #[test]
+    fn a_digest_with_an_unknown_flag_is_refused() {
+        let mut payload =
+            encode_digest_payload(test_spec(), Some(9), &[(7, 128)], 4096).expect("encode digest");
+        payload[6..8].copy_from_slice(&(DIGEST_FLAGS_KNOWN | 0x0002).to_le_bytes());
+        assert!(matches!(
+            decode_digest_payload(&payload, 64, 4096, 4200),
+            Err(Error::InvalidIndexSegment)
+        ));
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct ReplaceString(String);
 
@@ -18615,6 +18715,65 @@ mod tests {
             .with_read_limits(file.spec.read_limits.with_max_record_payload_len(u64::MAX));
         file.seal_open_chunk().expect("seal");
         assert!(file.open_chunk.is_none());
+    }
+
+    fn digest_test_spec() -> FormatSpec {
+        const BLOCKS: &[BlockDescriptor] = &[BlockDescriptor {
+            id: 12,
+            name: "line",
+            version: 1,
+            kind: BlockKind::Variable,
+            fields: &[],
+        }];
+        let spec = FormatSpec::new(
+            b"VSDIG",
+            1,
+            Endian::Little,
+            0,
+            IndexPolicy::BlockOffsetChain,
+            IntegrityPolicy::None,
+            RecoveryPolicy::Strict,
+            ManifestPolicy::None,
+            BLOCKS,
+        )
+        .with_read_limits(crate::ReadLimits::finite_all(u64::MAX));
+        spec.with_index_policy(spec.index_policy.with_open_digest_on_flush(true))
+    }
+
+    /// The two open routes must agree on what sequence the next append takes.
+    ///
+    /// This is the assertion the encode/decode round trip cannot make, and it
+    /// is where the off-by-one actually lived: the digest stored the high-water
+    /// mark as it stood *before* its own record, so a digest open reported the
+    /// digest's own sequence as still unused. The scan open frames that record
+    /// like any other and counts it.
+    ///
+    /// Latent today only because the digest route builds read-only handles;
+    /// the day a writer is seeded from a digest it is a sequence handed out
+    /// twice. Pinned here rather than left to that day.
+    #[test]
+    fn the_digest_route_and_the_scan_route_agree_on_the_next_sequence() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("digest-sequence.varve");
+        let mut file = VarveFile::create(digest_test_spec(), &path)?;
+        for _ in 0..4 {
+            file.push_info_for_test(12, b"row")?;
+        }
+        file.flush()?;
+        drop(file);
+
+        let scanned = VarveFile::open_readonly(digest_test_spec(), &path)?;
+        let (lazy, source) = VarveFile::open_readonly_lazy_with_report(digest_test_spec(), &path)?;
+        assert_eq!(
+            source,
+            LazyOpenSource::Digest,
+            "the fixture fell back to the scan, so this case compares nothing",
+        );
+        assert_eq!(
+            lazy.sequence_state, scanned.sequence_state,
+            "the digest open disagrees with the scan on the next sequence",
+        );
+        Ok(())
     }
 
     fn residency_test_spec() -> FormatSpec {
