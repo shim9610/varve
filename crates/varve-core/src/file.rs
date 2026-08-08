@@ -711,6 +711,25 @@ mod record_file {
         /// maintains, and `append_record_at_end`'s `SEEK_END` check is what
         /// keeps that value honest.
         static RECORD_FILE_METADATA_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static RECORD_FILE_SEEKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Counts one `lseek` this type issued on its own handle.
+    ///
+    /// The append path's per-record `stream_position` was invisible to
+    /// `an_append_window_issues_no_metadata_syscall`, which counts `metadata`
+    /// only — so the syscall the PERF work removed had a twin the regression
+    /// test could not see.
+    #[inline]
+    fn count_record_file_seek() {
+        #[cfg(any(test, feature = "scalable-fault-injection"))]
+        RECORD_FILE_SEEKS.with(|count| count.set(count.get().saturating_add(1)));
+    }
+
+    /// Reads and clears this thread's `RecordFile` seek count.
+    #[cfg(any(test, feature = "scalable-fault-injection"))]
+    pub(super) fn take_record_file_seeks() -> u64 {
+        RECORD_FILE_SEEKS.with(|count| count.replace(0))
     }
 
     /// Counts one `RecordFile::metadata` syscall on this thread. Inert outside
@@ -730,6 +749,15 @@ mod record_file {
     #[derive(Debug)]
     pub struct RecordFile {
         file: File,
+        /// Where this handle's cursor is, when this type put it there.
+        ///
+        /// `stream_position` was a real `lseek` on the per-record append path,
+        /// asking the kernel for a number every mutator here already knows.
+        /// `None` is "someone else may have moved it": `matrix_region` hands
+        /// out the raw `&mut File`, and `crate::matrix` seeks it (`SEEK_DATA`
+        /// / `SEEK_HOLE` for extent queries), so that accessor invalidates and
+        /// the next ask pays one syscall to re-learn it.
+        cursor: Option<u64>,
         /// Owner of this file's per-thread private read handles. Holds only an
         /// id and a cold-path `Mutex<Vec<Arc<File>>>`, so `RecordFile` stays
         /// `Sync` and the read path stays lock-free; see
@@ -741,6 +769,7 @@ mod record_file {
         pub(super) fn new(file: File) -> Self {
             Self {
                 file,
+                cursor: None,
                 matrix_read_pool: crate::matrix::MatrixReadPool::new(),
             }
         }
@@ -751,13 +780,28 @@ mod record_file {
         }
 
         pub(super) fn stream_position(&mut self) -> std::io::Result<u64> {
-            self.file.stream_position()
+            if let Some(cursor) = self.cursor {
+                #[cfg(test)]
+                debug_assert_eq!(
+                    cursor,
+                    self.file.stream_position()?,
+                    "the tracked cursor drifted from the handle's real one",
+                );
+                return Ok(cursor);
+            }
+            count_record_file_seek();
+            let cursor = self.file.stream_position()?;
+            self.cursor = Some(cursor);
+            Ok(cursor)
         }
 
         /// Moves the handle's cursor. Reads and cursor restoration only: this
         /// type implements no write that follows the cursor.
         pub(super) fn seek_to(&mut self, offset: u64) -> std::io::Result<u64> {
-            self.file.seek(SeekFrom::Start(offset))
+            count_record_file_seek();
+            let landed = self.file.seek(SeekFrom::Start(offset))?;
+            self.cursor = Some(landed);
+            Ok(landed)
         }
 
         pub(super) fn set_len(&mut self, len: u64) -> std::io::Result<()> {
@@ -792,6 +836,10 @@ mod record_file {
         /// site of this accessor must be an argument to a `crate::matrix::`
         /// call, which `enforcement_gates.rs` asserts.
         pub(super) fn matrix_region(&mut self) -> &mut File {
+            // `crate::matrix` seeks this handle — `AllocatedExtents::query`
+            // restores what it took, but nothing here can verify that, so the
+            // tracked cursor stops being a fact the moment it is handed out.
+            self.cursor = None;
             &mut self.file
         }
 
@@ -856,6 +904,10 @@ mod record_file {
             footer: Option<&[u8]>,
             after_header: impl FnOnce() -> Result<()>,
         ) -> Result<WrittenThrough> {
+            count_record_file_seek();
+            // Invalidated first: every `?` between here and the assignment
+            // below leaves the cursor somewhere this type did not choose.
+            self.cursor = None;
             let offset = self.file.seek(SeekFrom::End(0))?;
             if offset != expected_offset {
                 return Err(Error::Io(std::io::Error::new(
@@ -883,6 +935,7 @@ mod record_file {
             .ok_or(Error::ResourceArithmeticOverflow {
                 resource: "appended record extent",
             })?;
+            self.cursor = Some(written);
             Ok(WrittenThrough::after_write(written))
         }
 
@@ -897,11 +950,18 @@ mod record_file {
             header_bytes: &[u8],
             payload: &[u8],
         ) -> Result<()> {
+            count_record_file_seek();
+            count_record_file_seek();
+            self.cursor = None;
             self.file.seek(SeekFrom::Start(write.record_offset()))?;
             self.file.write_all(header_bytes)?;
             self.file.seek(SeekFrom::Start(write.payload_offset()))?;
             self.file.write_all(payload)?;
             self.file.flush()?;
+            let end = u64::try_from(payload.len())
+                .ok()
+                .and_then(|len| write.payload_offset().checked_add(len));
+            self.cursor = end;
             Ok(())
         }
     }
@@ -10011,6 +10071,20 @@ impl VarveFile {
         record_file::take_record_file_metadata_calls()
     }
 
+    /// Reads and clears this thread's count of `lseek`s `RecordFile` issued on
+    /// its own handle.
+    ///
+    /// The sibling the metadata counter did not have. The append path's
+    /// `AppendSnapshot` took its rollback cursor with a per-record
+    /// `stream_position`, which is an `lseek`, which
+    /// `an_append_window_issues_no_metadata_syscall` could not see because it
+    /// counts `metadata` only.
+    #[cfg(any(test, feature = "scalable-fault-injection"))]
+    #[doc(hidden)]
+    pub fn take_record_file_seeks() -> u64 {
+        record_file::take_record_file_seeks()
+    }
+
     /// Cumulative bytes this thread has read to answer chunked cell reads.
     ///
     /// Fault-testing hook only. This is the unit a growing matrix's read path
@@ -19068,6 +19142,49 @@ mod tests {
         assert_eq!(
             lazy.sequence_state, scanned.sequence_state,
             "the digest open disagrees with the scan on the next sequence",
+        );
+        Ok(())
+    }
+
+    /// The append path issues no `lseek` per record either.
+    ///
+    /// `an_append_window_issues_no_metadata_syscall` pins the `fstat` half and
+    /// counts `metadata` only, so the `stream_position` the `AppendSnapshot`
+    /// took for its rollback cursor — an `lseek`, once per record — was
+    /// invisible to it. It is answered from the tracked cursor now.
+    ///
+    /// Measured at 1,000 records: **2,000 seeks before, 1,000 after.** The one
+    /// that remains is `append_record_at_end`'s own `seek(SeekFrom::End(0))`,
+    /// which is the check that refuses an append at any offset but the end and
+    /// is deliberately kept — removing it is the positional-write redesign, as
+    /// the comment there says. What went is the second one.
+    ///
+    /// And it went by being tracked, not by being dropped. The cursor and the
+    /// snapshot's `eof` are **not** the same number: on the first append after
+    /// a reopen they were 5493 and 9143, because the open scan leaves the
+    /// handle where it stopped reading while `eof` is the committed end.
+    /// Restoring `eof` on rollback would have been a different behaviour, not a
+    /// cheaper spelling of the same one.
+    #[cfg(feature = "scalable-fault-injection")]
+    #[test]
+    fn an_append_window_issues_no_seek_per_record() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("append-seeks.varve");
+        let mut file = VarveFile::create(test_spec(), &path)?;
+
+        // Warm-up: the first append after any open re-learns the cursor once.
+        file.push_info_for_test(12, b"warm")?;
+        let _ = VarveFile::take_record_file_seeks();
+
+        const RECORDS: u64 = 1_000;
+        for _ in 0..RECORDS {
+            file.push_info_for_test(12, b"row")?;
+        }
+        let seeks = VarveFile::take_record_file_seeks();
+        assert!(
+            seeks <= RECORDS,
+            "the append window issued {seeks} seeks for {RECORDS} records; the per-record \
+             `stream_position` is back",
         );
         Ok(())
     }

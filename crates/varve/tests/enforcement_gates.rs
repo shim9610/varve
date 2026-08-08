@@ -464,14 +464,19 @@ fn the_primary_record_handle_is_only_written_through_its_two_gated_operations() 
         .join("\n");
     assert!(
         gate_code.contains(
-            "    pub struct RecordFile {\n        file: File,\n        matrix_read_pool: \
-             crate::matrix::MatrixReadPool,\n    }"
+            "    pub struct RecordFile {\n        file: File,\n        cursor: \
+             Option<u64>,\n        matrix_read_pool: crate::matrix::MatrixReadPool,\n    }"
         ),
-        "the wrapped handle must stay a private field of `RecordFile`, and the only other field \
-         may be the read-only `MatrixReadPool` (whose own handles are opened `FILE_GENERIC_READ` \
-         and never leave `mod region_reader` — see \
-         `the_private_matrix_read_handles_are_read_only_and_never_lent_out`); any further field \
-         has to be argued for here"
+        "the wrapped handle must stay a private field of `RecordFile`, and the other fields are \
+         the two argued for here; any further one has to be argued for the same way. \
+         `MatrixReadPool` is read-only — its handles are opened `FILE_GENERIC_READ` and never \
+         leave `mod region_reader`, see \
+         `the_private_matrix_read_handles_are_read_only_and_never_lent_out`. `cursor` is a cache \
+         of where this type last put the handle, carrying no capability: it is written only by \
+         the same operations this gate already permits to move the handle, and set to `None` by \
+         `matrix_region`, which lends the raw `&mut File` out and so ends the type's knowledge of \
+         where the cursor is. It exists because the per-record `stream_position` on the append \
+         path was an `lseek` asking the kernel for a number those operations already knew"
     );
     assert!(
         !gate.contains("impl Write for RecordFile")
