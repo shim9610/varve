@@ -1162,15 +1162,72 @@ fn clearing_a_category_counts_the_open_chunk_and_refuses_a_written_one() -> varv
         MatrixCellStatus::NotCommitted,
     );
 
-    // Once a chunk is written it is a written record, and records are not
-    // rewritten. Saying so is the only honest answer.
+    // A written chunk is reached too, and counted. This asserted a refusal
+    // until 2026-08-09: "a written chunk is a written record, and records are
+    // not rewritten" stopped being true when a chunk record became rewritable
+    // in place, and the cost of reaching them — a reload and a rewrite per
+    // chunk — is what clearing a category is, not a reason to refuse it.
     writer.write_matrix_cell(chunked, &Sample { value: 3 })?;
     writer.commit_matrix_cell::<Sample>(chunked)?;
     writer.flush()?;
-    assert!(matches!(
-        writer.clear_matrix_category(Sample::CATEGORY),
-        Err(Error::InvalidFormatSpec(message)) if message.contains("written chunk"),
-    ));
+    assert_eq!(writer.clear_matrix_category(Sample::CATEGORY)?, 1);
+    assert_eq!(
+        writer.matrix_cell_status::<Sample>(chunked)?,
+        MatrixCellStatus::NotCommitted,
+    );
+    // Idempotent, which is what stands in for atomicity: a call that failed
+    // part-way is answered by calling again, and an already-clear category
+    // counts nothing.
+    assert_eq!(writer.clear_matrix_category(Sample::CATEGORY)?, 0);
+    Ok(())
+}
+
+/// The bulk clear reaches every written chunk, not just the newest, and the
+/// clear reaches the file rather than living in the buffer.
+///
+/// Three chunks written before the clear, so a walk that stops at the first or
+/// only handles the open one fails. The reopen after `drop` is the half that
+/// catches the `dirty` landmine: `clear_open_chunk_block` recomputes `dirty`
+/// from the commit bits it just zeroed, so a chunk loaded back from a record
+/// went *non*-dirty on being cleared and was never written out — leaving the
+/// record on disk serving the very cells the call reported clearing.
+#[test]
+fn the_bulk_clear_reaches_every_written_chunk_and_reaches_the_file() -> varve::Result<()> {
+    let path = temp_path("clear_category_written");
+    let cells = [
+        key(ROWS_PER_CHUNK, 0),
+        key(ROWS_PER_CHUNK * 2, 1),
+        key(ROWS_PER_CHUNK * 3, 2),
+    ];
+    {
+        let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+        for (value, cell) in cells.iter().enumerate() {
+            writer.write_matrix_cell(
+                *cell,
+                &Sample {
+                    value: value as u32,
+                },
+            )?;
+            writer.commit_matrix_cell::<Sample>(*cell)?;
+        }
+        // Move past the last one so all three have records.
+        let far = key(ROWS_PER_CHUNK * 9, 0);
+        writer.write_matrix_cell(far, &Sample { value: 9 })?;
+        writer.commit_matrix_cell::<Sample>(far)?;
+        writer.flush()?;
+
+        // Three chunked cells plus the one that opened chunk 9.
+        assert_eq!(writer.clear_matrix_category(Sample::CATEGORY)?, 4);
+        writer.flush()?;
+    }
+    let reader = growing_spec().open_reader(path.path())?;
+    for cell in cells {
+        assert_eq!(
+            reader.matrix_cell_status::<Sample>(cell)?,
+            MatrixCellStatus::NotCommitted,
+            "a cleared cell came back after a reopen",
+        );
+    }
     Ok(())
 }
 

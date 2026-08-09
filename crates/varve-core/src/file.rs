@@ -2642,10 +2642,6 @@ impl ChunkDirectory {
             .map(|position| self.chunks[position])
     }
 
-    fn is_empty(&self) -> bool {
-        self.chunks.is_empty()
-    }
-
     /// Files a chunk record that was just appended.
     ///
     /// Inserted at its index position rather than pushed, because a chunk is no
@@ -9900,41 +9896,110 @@ impl VarveFile {
     /// in the count. A written chunk is a written record and records are not
     /// rewritten, so there is no clearing it — saying so is the only honest
     /// answer. The open chunk *is* cleared, and counted.
+    /// Clears every committed cell of a category and reports how many.
+    ///
+    /// **Covers written chunks, which it refused to until 2026-08-09.** The
+    /// refusal read "a written chunk is a written record", and that stopped
+    /// being true when a chunk record became rewritable in place; the fallback
+    /// argument — that reaching them costs a reload and a rewrite per chunk — is
+    /// not an argument, because that is what clearing a category *is*. Before
+    /// the refusal existed the function cleared the matrix region only and
+    /// returned a count that omitted the chunked rows it had silently left
+    /// committed, which is the failure the refusal replaced and this replaces
+    /// properly.
+    ///
+    /// # What it costs, and what it does not promise
+    ///
+    /// One reload and one record rewrite per written chunk holding the
+    /// category, plus the region clear. Memory is one chunk at a time, as
+    /// everywhere else.
+    ///
+    /// It is **not atomic**, and cannot be: each chunk is its own record write,
+    /// so the fifth can fail after four have landed. What replaces atomicity is
+    /// idempotence — clearing an already-clear category clears nothing and
+    /// counts nothing — so the answer to a failure part-way is to call it again,
+    /// and the count from the retry plus the count from the failed attempt is
+    /// the total. A torn write inside one record still poisons the handle, as
+    /// it does on every other write path.
     pub fn clear_matrix_category(&mut self, category: &str) -> Result<u64> {
         let _permit = self.ensure_write()?;
         let mut cleared = 0u64;
-        let mut chunk_block: Option<usize> = None;
         if self.spec.growing_matrix.is_some() {
-            if !self.chunk_directory()?.is_empty() {
-                return Err(Error::InvalidFormatSpec(
-                    "clear_matrix_category cannot clear a written chunk; a written chunk is a \
-                     written record",
-                ));
-            }
             // Refused before anything is touched. `clear_category` reaches its
             // own `ensure_fatal_access_allowed` only after the open chunk had
             // already been zeroed, so a refusal returned an error to a caller
             // entitled to believe nothing had happened.
             self.ensure_chunk_access_allowed(category)?;
-            // Resolved, not applied: everything that can fail about the chunk
-            // half happens here, so the destructive part below cannot be the
-            // thing that reports an error.
-            chunk_block = self.open_chunk_block_for(category)?;
+            // The same discipline for the reopen refusals. A format whose
+            // chunks cannot be rewritten at their stored length would fail on
+            // the first written chunk — after the region had been cleared and
+            // possibly after several chunks had been — so it is asked here,
+            // where the answer is a property of the spec and nothing has moved.
+            if let Some(oldest) = self.chunk_directory()?.chunks.first().map(|it| it.index) {
+                if self.spec.chunk_compression.is_some() {
+                    return Err(Error::MatrixChunkNotReopenable {
+                        chunk: oldest,
+                        reason: "chunk compression",
+                    });
+                }
+                if self.spec.index_policy.segment_on_flush {
+                    return Err(Error::MatrixChunkNotReopenable {
+                        chunk: oldest,
+                        reason: "segment_on_flush",
+                    });
+                }
+            }
         }
         let result = {
             let matrix = self.matrix.as_mut().ok_or(Error::MatrixLayoutMissing)?;
             crate::matrix::clear_category(self.spec, matrix, self.file.matrix_region(), category)
         };
+        // The region first, as before: it is one write that either happens or
+        // does not, so a failure there leaves the chunks untouched rather than
+        // half-cleared behind an error.
         let region_cleared = self.finish_matrix_mutation(result)?;
-        // Only now. The region clear writes to disk and can fail on I/O; the
-        // chunk clear is a memset over a buffer this handle owns and cannot.
-        // Doing the memset first meant a failed region clear left the chunk's
-        // committed cells destroyed behind an error that says nothing happened
-        // — the gate above covers a refusal, and this covers the write.
-        if let Some(position) = chunk_block {
-            cleared = self.clear_open_chunk_block(position);
+        if self.spec.growing_matrix.is_some() {
+            // The open chunk, whether or not it has a record yet. Doing it here
+            // rather than inside the walk keeps the common case — a growing
+            // matrix that has never written a chunk — exactly what it was: a
+            // memset over a buffer, no I/O at all.
+            if let Some(position) = self.open_chunk_block_for(category)? {
+                cleared = cleared.saturating_add(self.clear_open_chunk_block(position));
+            }
+            cleared = cleared.saturating_add(self.clear_written_chunks_of(category)?);
         }
         Ok(cleared + region_cleared)
+    }
+
+    /// Clears the category out of every written chunk, one at a time.
+    ///
+    /// Walks the directory by position rather than over a collected list of
+    /// indexes: the list would be one `u64` per chunk held for the length of
+    /// the walk, which is the shape this file removes everywhere else, and the
+    /// walk rewrites records in place so the directory neither grows nor
+    /// reorders under it. The chunk already open is skipped — the caller
+    /// cleared it in its buffer — and is written out by the first reload, which
+    /// is what carries that clear to disk.
+    fn clear_written_chunks_of(&mut self, category: &str) -> Result<u64> {
+        let mut cleared = 0u64;
+        let mut at = 0usize;
+        loop {
+            let Some(index) = self.chunk_directory()?.chunks.get(at).map(|it| it.index) else {
+                return Ok(cleared);
+            };
+            at += 1;
+            if self
+                .open_chunk
+                .as_ref()
+                .is_some_and(|open| open.index == index)
+            {
+                continue;
+            }
+            self.open_chunk_at(index)?;
+            if let Some(position) = self.open_chunk_block_for(category)? {
+                cleared = cleared.saturating_add(self.clear_open_chunk_block(position));
+            }
+        }
     }
 
     /// Which block of the open chunk a category names, if any.
@@ -9975,17 +10040,27 @@ impl VarveFile {
         block.written.fill(0);
         block.slots.fill(0);
         block.crc.fill(0);
-        // `dirty` means "some cell was committed", and it is what makes the
-        // next flush write this chunk. Leaving it set after clearing every bit
-        // written an all-uncommitted record — which then refused every later
-        // write to those rows with `MatrixChunkClosed`, permanently, and cost a
-        // full-size dead record for rows that hold nothing. Recompute it from
-        // what is actually left rather than clearing it outright: another
-        // block in the same chunk may still hold committed cells.
-        chunk.dirty = chunk
-            .blocks
-            .iter()
-            .any(|block| block.commit.iter().any(|byte| *byte != 0));
+        // `dirty` is what makes the next flush write this chunk out, and the
+        // answer differs by whether the chunk already has a record.
+        //
+        // **No record.** Leaving `dirty` set after clearing every bit wrote an
+        // all-uncommitted record — a full-size record for rows that hold
+        // nothing, which (before chunks could be reopened) then refused every
+        // later write to those rows, permanently. So it is recomputed from
+        // what is left, not cleared outright: another block of the same chunk
+        // may still hold committed cells.
+        //
+        // **Has a record.** The opposite, and getting this wrong loses the
+        // clear silently: the record on disk still holds the cells this just
+        // zeroed, so a chunk that goes non-dirty is never written and the file
+        // keeps serving them. It was unreachable while `clear_matrix_category`
+        // refused a written chunk, and became reachable the moment that
+        // refusal was lifted.
+        chunk.dirty = chunk.backing.is_some()
+            || chunk
+                .blocks
+                .iter()
+                .any(|block| block.commit.iter().any(|byte| *byte != 0));
         cleared
     }
 
