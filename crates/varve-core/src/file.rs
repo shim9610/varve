@@ -9793,12 +9793,16 @@ impl VarveFile {
     }
 
     /// [`Self::clear_chunk_cell`] addressed by block id rather than by type, for
-    /// the by-category entry point.
+    /// [`Self::clear_matrix_cell_by_category`].
     ///
-    /// **Still open-chunk only, unlike its typed twin.** The by-category clear
-    /// walks every row of a category, so reopening for it means loading and
-    /// rewriting *every* written chunk — a different operation with a different
-    /// cost, not a line of plumbing. It is refused rather than half-done.
+    /// **One cell, exactly as its typed twin clears one cell.** Only the way the
+    /// block is named differs — a category string instead of a Rust type — and
+    /// the two must therefore refuse and accept the same things. They briefly
+    /// did not: `clear_chunk_cell` learned to reopen a written chunk and this
+    /// did not, so the same cell cleared under one spelling and returned
+    /// `MatrixChunkClosed` under the other. The comment justifying that claimed
+    /// this entry point walks a whole category; it does not, and
+    /// [`Self::clear_matrix_category`] is the one that does.
     fn clear_chunk_cell_by_id(
         &mut self,
         block_id: u32,
@@ -9810,19 +9814,7 @@ impl VarveFile {
         // the block by id and so went through nothing, leaving a quarantined
         // category clearable through any chunked row.
         self.ensure_chunk_access_by_block_id(block_id)?;
-        match &self.open_chunk {
-            Some(open) if open.index == chunk_index => {}
-            _ => {
-                // `open` is what the caller may still write to. With no chunk
-                // open there is none, and the first version reported the
-                // refused chunk as its own opener — `{ chunk: 3, open: 3 }`,
-                // which reads as a contradiction.
-                return Err(Error::MatrixChunkClosed {
-                    chunk: chunk_index,
-                    open: self.open_chunk.as_ref().map(|open| open.index),
-                });
-            }
-        }
+        self.open_chunk_at(chunk_index)?;
         let chunk = self.open_chunk.as_mut().ok_or(Error::InvalidMatrixChunk)?;
         let position = chunk
             .block_position(block_id)
@@ -9855,6 +9847,11 @@ impl VarveFile {
         .map_err(|_| Error::InvalidMatrixLayout)?;
         let len = usize::try_from(block.stride).map_err(|_| Error::InvalidMatrixLayout)?;
         block.slots[start..start + len].fill(0);
+        // Same reason as in the typed twin: a chunk with a record on disk must
+        // go out again, or the file keeps serving the value this just cleared.
+        if chunk.backing.is_some() {
+            chunk.dirty = true;
+        }
         Ok(())
     }
 

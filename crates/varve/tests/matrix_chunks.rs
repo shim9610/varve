@@ -702,6 +702,49 @@ fn the_payload_write_entry_point_routes_like_the_typed_one() -> varve::Result<()
     Ok(())
 }
 
+/// The two spellings of "clear one cell" accept and refuse the same things.
+///
+/// `clear_matrix_cell::<T>` and `clear_matrix_cell_by_category` are one
+/// operation — one cell, one commit bit, one slot — differing only in whether
+/// the block is named by Rust type or by category string. They diverged once:
+/// the typed one learned to reopen a written chunk and the by-category one did
+/// not, so the same cell cleared under one name and returned
+/// `MatrixChunkClosed` under the other. Nothing about a caller can act on that
+/// distinction, which is why it is a test and not a documented difference.
+///
+/// Two chunks, cleared one way each, so the test fails whichever half regresses.
+#[test]
+fn both_spellings_of_a_cell_clear_reach_a_written_chunk() -> varve::Result<()> {
+    let path = temp_path("clear_by_category");
+    let typed = key(ROWS_PER_CHUNK, 0);
+    let by_category = key(ROWS_PER_CHUNK * 2, 0);
+    let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+    for cell in [typed, by_category] {
+        writer.write_matrix_cell(cell, &Sample { value: 4 })?;
+        writer.commit_matrix_cell::<Sample>(cell)?;
+    }
+    // Write both chunks out by moving past them.
+    let far = key(ROWS_PER_CHUNK * 5, 0);
+    writer.write_matrix_cell(far, &Sample { value: 5 })?;
+    writer.commit_matrix_cell::<Sample>(far)?;
+    writer.flush()?;
+
+    writer.clear_matrix_cell::<Sample>(typed)?;
+    writer.clear_matrix_cell_by_category(Sample::CATEGORY, by_category)?;
+    writer.flush()?;
+    drop(writer);
+
+    let reader = growing_spec().open_reader(path.path())?;
+    for cell in [typed, by_category] {
+        assert_eq!(
+            reader.matrix_cell_status::<Sample>(cell)?,
+            MatrixCellStatus::NotCommitted,
+        );
+    }
+    assert_eq!(reader.read_matrix_cell::<Sample>(far)?, Sample { value: 5 });
+    Ok(())
+}
+
 /// A cell clears in a written chunk exactly as it does in the open one, and the
 /// clear survives to the file.
 ///
@@ -736,10 +779,6 @@ fn clearing_a_cell_works_in_a_written_chunk_as_in_the_open_one() -> varve::Resul
         writer.matrix_cell_status::<Sample>(written_cell)?,
         MatrixCellStatus::NotCommitted,
     );
-    // The by-category refusal is asserted by
-    // `clearing_a_category_counts_the_open_chunk_and_refuses_a_written_one`, and
-    // cannot be asserted here any more: the typed clear above reopened chunk 1,
-    // so it is now *the open chunk* and the category clear serves it.
     writer.flush()?;
     drop(writer);
 
