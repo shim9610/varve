@@ -20390,6 +20390,66 @@ mod tests {
         Ok(())
     }
 
+    /// A-3. A whole-category clear does its fallible region half first, so a
+    /// failure there leaves every chunk exactly as it was.
+    ///
+    /// **The ordering was fixed on 2026-08-08 and went unpinned until now,
+    /// because nothing could make the region half fail.** The clear writes
+    /// through `zero_range`; the two injectors that existed sat on
+    /// `write_slot_payload` and `write_bitmap_byte`, neither of which a
+    /// category clear ever calls. So the fix was a reordering nobody could
+    /// observe, which is the same as no fix at all against the next edit — and
+    /// the defect it corrected is silent: the chunk half used to run first as
+    /// an infallible memset, so a region clear that then failed on I/O returned
+    /// an error to a caller entitled to believe nothing had happened, with the
+    /// chunk's committed cells already destroyed.
+    ///
+    /// Both kinds of chunk are present, because the halves are separate code
+    /// now: chunk 1 has a record and is reached by the directory walk, chunk 2
+    /// is the open buffer. Neither may be touched.
+    #[test]
+    fn a_failed_region_clear_leaves_every_chunk_alone() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("clear-order.varve");
+        let spec = matrix_test_spec().with_growing_matrix_dimension("scan", 4);
+        let mut file = VarveFile::create_with_dims(
+            spec,
+            &path,
+            MatrixDimensions::from_pairs([("scan", 4), ("ch", 1)]),
+        )?;
+        let region = MatrixKey::new(0, 0);
+        let written = MatrixKey::new(4, 0);
+        let open = MatrixKey::new(8, 0);
+        for (key, value) in [(region, 1), (written, 2), (open, 3)] {
+            file.write_matrix_cell(key, &MatrixTestCell { value })?;
+            file.commit_matrix_cell::<MatrixTestCell>(key)?;
+        }
+        // Opening chunk 2 wrote chunk 1 out, so `written` lives in a record and
+        // `open` lives in the buffer.
+        file.flush()?;
+        let length_before = file.file.metadata()?.len();
+
+        crate::matrix::inject_zero_range_failure();
+        assert!(matches!(
+            file.clear_matrix_category(MatrixTestCell::CATEGORY),
+            Err(Error::Io(_))
+        ));
+
+        for key in [region, written, open] {
+            assert_eq!(
+                file.matrix_cell_status::<MatrixTestCell>(key)?,
+                MatrixCellStatus::Committed,
+                "a clear that failed on the region reported an error and destroyed a cell",
+            );
+        }
+        assert_eq!(
+            file.file.metadata()?.len(),
+            length_before,
+            "a clear that failed before its first write must not have rewritten a chunk record",
+        );
+        Ok(())
+    }
+
     #[test]
     fn partial_matrix_overwrite_is_withdrawn_and_poisons_writer() -> Result<()> {
         let directory = tempfile::tempdir()?;

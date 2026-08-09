@@ -920,6 +920,13 @@ fn punch_zero_range_native(_file: &mut File, _offset: u64, _len: u64) -> bool {
 /// [`MatrixRecoveryReport::matrix_last_zero_range_streamed_bytes`] rather than
 /// having to infer it from the target triple.
 fn zero_range(file: &mut File, offset: u64, len: u64) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_ZERO_RANGE.replace(false) {
+        return Err(Error::Io(std::io::Error::other(
+            "injected matrix zero-range failure",
+        )));
+    }
+
     if punch_zero_range(file, offset, len) {
         sparse_zeroing::record(0);
         return Ok(());
@@ -936,6 +943,16 @@ std::thread_local! {
         std::cell::Cell::new(false)
     };
     static FAIL_NEXT_BITMAP_WRITE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    /// A-3: the first disk mutation a whole-category clear performs.
+    ///
+    /// `clear_category` writes through `zero_range` and never through
+    /// `write_bitmap_byte`, so neither existing injector can make it fail —
+    /// which is why the ordering it establishes went unpinned. The clear's
+    /// region half must run before the chunk half touches anything, and the
+    /// only way to observe that is to fail the region half.
+    static FAIL_NEXT_ZERO_RANGE: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
     };
     /// F-02: the page-index publication boundary, which is the first fallible
@@ -1355,6 +1372,13 @@ pub(crate) fn inject_partial_slot_write_failure() {
 #[cfg(test)]
 pub(crate) fn inject_bitmap_write_failure() {
     FAIL_NEXT_BITMAP_WRITE.set(true);
+}
+
+/// Fails the next range-zeroing write, which is how a whole-category clear
+/// mutates the file. See [`FAIL_NEXT_ZERO_RANGE`].
+#[cfg(test)]
+pub(crate) fn inject_zero_range_failure() {
+    FAIL_NEXT_ZERO_RANGE.set(true);
 }
 
 fn write_slot_payload(file: &mut File, payload: &[u8]) -> Result<()> {
