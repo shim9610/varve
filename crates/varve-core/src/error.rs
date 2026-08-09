@@ -545,14 +545,19 @@ pub enum Error {
 
     /// A write or commit addressed a chunk that is no longer the open one.
     ///
-    /// One chunk is buffered at a time, which is what bounds a growing matrix's
-    /// memory — but *which* chunk is not fixed. A write to a row belonging to
-    /// an already-written chunk writes the open one out and loads that chunk
-    /// back, so this refusal is now reached only where the reload is impossible
-    /// and [`Error::MatrixChunkNotReopenable`] says which case that is.
+    /// **Nothing in the crate constructs this any more, and that is deliberate
+    /// rather than an oversight.** One chunk is buffered at a time, which is
+    /// what bounds a growing matrix's memory, but *which* chunk is not fixed: a
+    /// write to a row belonging to an already-written chunk writes the open one
+    /// out and loads that chunk back. Every path that used to refuse now
+    /// reloads, and the cases where a reload is impossible say so by name
+    /// through [`Error::MatrixChunkNotReopenable`] instead of through this.
     ///
-    /// `open` is the chunk a caller may still write to, or `None` when there is
-    /// none.
+    /// It is kept because the enum is `#[non_exhaustive]` in the other
+    /// direction only — removing a variant breaks a caller matching on it, and
+    /// a caller who wrote that arm against 0.5.0 should get a dead arm rather
+    /// than a compile error. `open` was the chunk a caller could still write
+    /// to, or `None` when there was none.
     ///
     /// **Closed, not necessarily written.** This was `MatrixChunkSealed`, and
     /// both the name and the message claimed the chunk had been written out as

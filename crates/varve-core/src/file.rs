@@ -8466,13 +8466,21 @@ impl VarveFile {
             None,
         )?;
         let record_offset = info.record_offset;
-        // On disk. Only now does the handle stop holding it.
-        self.open_chunk = None;
         // Extend the directory rather than invalidate it: a writer writing the chunk its
         // millionth chunk must not pay a rebuild, and the newest entry is what
         // answers "which chunks are written" on the next write.
+        //
+        // `get_mut`, never `chunk_directory()`. Asking for the directory here
+        // *builds* it, and building it needs a growing-matrix spec — so a
+        // format that declares none, which can still reach this through a
+        // hand-built chunk, got `InvalidMatrixChunk` out of a write that had
+        // already succeeded. The ordinal is only needed to back the buffer
+        // below, and a handle that has no directory yet has not looked one up:
+        // it will build it on the next chunk access and find this record there.
+        let mut ordinal = None;
         if let Some(directory) = self.chunk_directory.get_mut() {
-            let ordinal = directory.next_ordinal();
+            let at = directory.next_ordinal();
+            ordinal = Some(at);
             directory.note_written(ChunkLocator {
                 index,
                 record_offset,
@@ -8480,10 +8488,54 @@ impl VarveFile {
                 block_count,
                 cell_crc,
                 compressed_slots,
-                ordinal,
+                ordinal: at,
             });
         }
+        // **On disk, and the buffer stays.** Releasing it here lost data, and
+        // the loss was invisible: the write bitmap is buffer state that no
+        // record carries, so a chunk released at a flush and reloaded at the
+        // next commit came back with `written` rebuilt from "is the slot
+        // non-zero" — and a cell holding a legitimate all-zero value therefore
+        // read as never written. `write` → `flush` → `commit` on such a cell
+        // returned `MatrixCellNotWritten` on a chunked row while succeeding on
+        // the identical region row (measured 2026-08-09), which is the exact
+        // defect a zero-valued cell was already fixed for once this round.
+        //
+        // Keeping it is also cheaper — no reload on the next edit — and costs
+        // nothing in memory, because one chunk buffer is the ceiling this design
+        // already sets. It is released on a transition to a different chunk
+        // index, which is the only point where a second buffer would be needed.
+        //
+        // **Retained only with an ordinal.** A retained chunk with no `backing`
+        // would be written *again* on its next edit — appending a second record
+        // for a chunk index that already has one, which is the shape that makes
+        // a file unopenable. So the no-ordinal case releases the buffer exactly
+        // as this did before, trading the write bitmap for the guarantee that
+        // no duplicate can be produced. It is reachable only where the chunk
+        // directory was never materialised, which no chunk path does:
+        // `open_chunk_at` consults it before a chunk exists at all.
+        match ordinal {
+            Some(at) => {
+                if let Some(chunk) = self.open_chunk.as_mut() {
+                    chunk.dirty = false;
+                    chunk.backing = Some(at);
+                }
+            }
+            None => self.open_chunk = None,
+        }
         Ok(())
+    }
+
+    /// Whether the open chunk holds anything the file does not.
+    ///
+    /// The question `open_chunk.is_some()` used to stand in for, and stopped
+    /// answering when a written chunk began staying open: a clean backed chunk
+    /// is byte-for-byte its record, so a handle that dropped now would lose
+    /// nothing.
+    fn open_chunk_is_unwritten(&self) -> bool {
+        self.open_chunk
+            .as_ref()
+            .is_some_and(|chunk| chunk.dirty || chunk.backing.is_none())
     }
 
     /// Rewrites the record a reloaded chunk came from, where it already sits.
@@ -8606,8 +8658,14 @@ impl VarveFile {
             self.poison.poison();
             return Err(error);
         }
-        // On disk. Only now does the handle stop holding it.
-        self.open_chunk = None;
+        // On disk, and the buffer stays for the same reason the append path
+        // keeps it: the write bitmap is not in the record, so releasing here
+        // would make an all-zero uncommitted cell read as never written on the
+        // next reload. It is already backed — by this very record — so only
+        // `dirty` changes.
+        if let Some(chunk) = self.open_chunk.as_mut() {
+            chunk.dirty = false;
+        }
         // No `note_written`: the directory already carries this chunk, at this
         // ordinal, at this offset and this length — none of which the rewrite
         // changed.
@@ -8941,9 +8999,13 @@ impl VarveFile {
 
     /// Every written chunk as `(record offset, payload length)`, oldest first.
     ///
-    /// Chunks are written in increasing index order — only the newest is open —
-    /// so this list is sorted by chunk index, which is what makes the binary
-    /// search below legal.
+    /// The list is **sorted here**, by chunk index, which is what makes the
+    /// binary search in `find` legal. It used to be left in file order and that
+    /// order demanded to be ascending, on the reasoning that only the newest
+    /// chunk is ever open — no longer true: a chunk that committed nothing is
+    /// never written, so a later write to one of its rows appends its record
+    /// after higher-indexed ones. File order is still what `ordinal` records,
+    /// because that is what addresses a record for a rewrite.
     ///
     /// **`payload_len` is the point, not a convenience.** Every offset the chunk
     /// decode computes comes from bytes in the file, and without the record's
@@ -8952,7 +9014,22 @@ impl VarveFile {
     /// `RecordPayloadLen`; the decode below treats it as the wall.
     fn build_chunk_directory(&self) -> Result<ChunkDirectory> {
         let mut chunks = Vec::new();
-        for entry in self.index.iter() {
+        // **Through the retention gate, not straight at the field.** A handle
+        // opened by `open_lazy` / `open_readonly_lazy` keeps no resident
+        // directory: `self.index` is *empty*, not merely unbuilt. Reading it
+        // directly made every written chunk invisible, which is not a read that
+        // returns less — it is a writer that believes chunk N has no record and
+        // appends a **second** one for it. That file no longer opens: the
+        // duplicate refusal below fires, every chunked read answers
+        // `InvalidMatrixChunk`, and the cells that were committed are gone.
+        //
+        // `NoResidentDirectory` is the same answer `blocks::<T>()` gives on such
+        // a handle, and for the same reason: an empty answer here is
+        // indistinguishable from "this file has no chunks", and that
+        // indistinguishability is what destroys data rather than inconveniencing
+        // a caller.
+        let index = self.resident_directory("matrix chunk directory")?;
+        for entry in index.iter() {
             let entry = entry?;
             if entry.block_id != MATRIX_CHUNK_BLOCK_ID {
                 continue;
@@ -10175,14 +10252,21 @@ impl VarveFile {
 
     /// What a resumed writer should do with this category.
     ///
-    /// A growing matrix with an still-open chunk is never `Clean`: the chunk is
-    /// live state this handle holds and the next handle will not, so reporting
+    /// A growing matrix holding a **dirty** chunk is never `Clean`: that chunk
+    /// is live state this handle has and the next handle will not, so reporting
     /// a clean category over it told a caller the acquisition had finished when
     /// it had not.
+    ///
+    /// **Dirty, not merely open.** The test is `is_unwritten`, and it used to be
+    /// `is_some`. A chunk stays open after its record is written now — that is
+    /// what preserves the write bitmap across a flush, which is not on disk —
+    /// so "a chunk is open" no longer implies "something is only in memory". A
+    /// clean chunk's every byte is in its record; the next handle reads exactly
+    /// what this one would.
     pub fn matrix_resume_signal(&self, category: &str) -> Result<MatrixResumeSignal> {
         let matrix = self.matrix.as_ref().ok_or(Error::MatrixLayoutMissing)?;
         let signal = crate::matrix::resume_signal(matrix, category)?;
-        if self.open_chunk.is_some() && matches!(signal, MatrixResumeSignal::Clean) {
+        if self.open_chunk_is_unwritten() && matches!(signal, MatrixResumeSignal::Clean) {
             return Ok(MatrixResumeSignal::Partial {
                 committed: 0,
                 total: 0,
@@ -19572,6 +19656,15 @@ mod tests {
         ));
 
         // Let it succeed, and confirm the chunk is released exactly once.
+        //
+        // Released, even though a written chunk is normally *retained* now —
+        // retention is what preserves the write bitmap across a flush. This
+        // fixture builds an `OpenChunk` by hand on a spec that declares no
+        // growing matrix, so no chunk directory exists and the record it just
+        // wrote has no ordinal to be addressed by later. A retained chunk with
+        // no `backing` would append a *second* record for its index on the next
+        // edit, so the no-ordinal case releases instead: the write bitmap is
+        // worth less than the guarantee that a duplicate cannot be produced.
         file.spec = file
             .spec
             .with_read_limits(file.spec.read_limits.with_max_record_payload_len(u64::MAX));

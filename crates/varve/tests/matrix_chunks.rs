@@ -26,7 +26,7 @@ use varve::{
     BlockDescriptor, BlockKind, Endian, Error, FormatSpec, IndexPolicy, IntegrityPolicy,
     LazyOpenSource, MatrixBlockDescriptor, MatrixCellStatus, MatrixCommitDescriptor,
     MatrixCommitKind, MatrixDimensionDescriptor, MatrixDimensions, MatrixKey, ReadLimits,
-    VarveBlock, VarveFile, VarveMatrixBlock,
+    VarveBlock, VarveFile, VarveMatrixBlock, VarveWriter,
 };
 
 const CHANNELS: u64 = 8;
@@ -1064,6 +1064,52 @@ fn write_then_flush_then_commit_keeps_the_write() -> varve::Result<()> {
         reader.read_matrix_cell::<Sample>(cell)?,
         Sample { value: 33 }
     );
+    Ok(())
+}
+
+/// A cell holding a legitimate all-zero value commits after a flush, on a
+/// chunked row exactly as on a region row.
+///
+/// **This regressed on 2026-08-09 and a review caught it, not the suite.**
+/// Widening `dirty` to include a bare write made a flush push the chunk's
+/// record out and release the buffer; the write bitmap is buffer state that no
+/// record carries, so the reload at commit time rebuilt it from "is the slot
+/// non-zero" and a legitimate zero read as never written. Measured then:
+/// region row `Ok(())`, chunked row `Err(MatrixCellNotWritten)`, chunked row
+/// holding `7` `Ok(())` — so the existing zero-value test passed and the
+/// existing flush test passed, because neither combined the two.
+///
+/// The region row is asserted in the same test on purpose. The claim the broken
+/// version rested on was "this matches the region", and that claim was false;
+/// asserting only the chunk would let it be made again.
+#[test]
+fn a_zero_valued_chunk_cell_commits_after_a_flush() -> varve::Result<()> {
+    let path = temp_path("zero_after_flush");
+    let region = key(0, 0);
+    let chunked = key(ROWS_PER_CHUNK, 0);
+    let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+
+    writer.write_matrix_cell(region, &Sample { value: 0 })?;
+    writer.flush()?;
+    writer.commit_matrix_cell::<Sample>(region)?;
+
+    writer.write_matrix_cell(chunked, &Sample { value: 0 })?;
+    writer.flush()?;
+    writer.commit_matrix_cell::<Sample>(chunked)?;
+    writer.flush()?;
+    drop(writer);
+
+    let reader = growing_spec().open_reader(path.path())?;
+    for cell in [region, chunked] {
+        assert_eq!(
+            reader.matrix_cell_status::<Sample>(cell)?,
+            MatrixCellStatus::Committed,
+        );
+        assert_eq!(
+            reader.read_matrix_cell::<Sample>(cell)?,
+            Sample { value: 0 }
+        );
+    }
     Ok(())
 }
 
@@ -2152,6 +2198,60 @@ fn patch_byte(path: &Path, offset: u64, value: u8) {
 fn digest_growing_spec() -> FormatSpec {
     let spec = growing_spec();
     spec.with_index_policy(spec.index_policy.with_open_digest_on_flush(true))
+}
+
+/// A lazy handle refuses a chunked row rather than writing a second record for
+/// a chunk that already has one.
+///
+/// **This destroyed the matrix until 2026-08-09.** `build_chunk_directory` read
+/// `self.index` directly, and a lazy open keeps no resident directory — the
+/// index is *empty*, not merely unbuilt. So every written chunk was invisible,
+/// a write to one of their rows appended a duplicate record for that chunk
+/// index, and the resulting file no longer opened: the duplicate refusal fired
+/// and every chunked read answered `InvalidMatrixChunk`, with the committed
+/// cells gone.
+///
+/// It goes through the retention gate now and answers `NoResidentDirectory`,
+/// the same refusal `blocks::<T>()` gives such a handle. The assertion that
+/// matters is the second half: the file the lazy writer touched still reads
+/// back what the scanning writer put there.
+#[test]
+fn a_lazy_writer_refuses_a_chunked_row_instead_of_duplicating_its_record() -> varve::Result<()> {
+    let spec = digest_growing_spec();
+    let path = temp_path("lazy_chunk");
+    let chunked = key(ROWS_PER_CHUNK, 0);
+    {
+        let mut writer = spec.create_writer_with_dims(path.path(), dims())?;
+        writer.write_matrix_cell(chunked, &Sample { value: 5 })?;
+        writer.commit_matrix_cell::<Sample>(chunked)?;
+        // Move past chunk 1 so it has a record, then flush for the digest.
+        writer.write_matrix_cell(key(ROWS_PER_CHUNK * 2, 0), &Sample { value: 6 })?;
+        writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK * 2, 0))?;
+        writer.flush()?;
+    }
+    {
+        let (mut lazy, source) = VarveWriter::open_lazy_with_report(spec, path.path())?;
+        assert_eq!(
+            source,
+            LazyOpenSource::Digest,
+            "the test needs the lazy route"
+        );
+        assert!(
+            matches!(
+                lazy.write_matrix_cell(chunked, &Sample { value: 99 }),
+                Err(Error::NoResidentDirectory { .. })
+            ),
+            "a lazy handle cannot see written chunks and must say so, not append a second record",
+        );
+        lazy.flush()?;
+    }
+    let reader = spec.open_reader(path.path())?;
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(chunked)?,
+        Sample { value: 5 },
+        "the committed cell must survive the lazy handle",
+    );
+    Ok(())
 }
 
 /// `sync()` must leave the digest where a lazy open can still find it.
