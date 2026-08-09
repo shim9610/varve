@@ -175,6 +175,50 @@ magic `b"VDIG"`. See [Spec](docs/spec.md) for the layout and the acceptance
 rules. A reader whose spec does not declare it indexes it as an internal record
 exactly as it indexes a segment record; measured, the entry lists are identical.
 
+### A **writer** open that reads no record
+
+`VarveFile::open_lazy` and `VarveWriter::open_lazy`, with
+`open_lazy_with_report` beside each. Additive; see
+[API Changes §B.-3](docs/api-changes.md).
+
+The digest open above landed on the read side only, and that left the standing
+requirement — TB-scale files work, memory bounded by the working set — true for
+readers and false for the workload this project names as primary. Every writer
+open called `load_index` with `ScanIntent::Writer` and framed every record in
+the file, at any size, and a continuous appender reopens its writer on every
+restart. Measured at 200 records: the scanning open frames **202**, the lazy one
+frames **1**. The difference is the file, not the constant.
+
+It inherits both of the read-side open's absences. No resident directory —
+`blocks::<T>()` answers `NoResidentDirectory`, and `record_map` is the walk;
+appending is unaffected, because the append path maintains the block tails and
+the sequence itself and the digest supplied both. And no checkpoint or segment:
+a spec declaring `checkpoint_on_flush` or `segment_on_flush` is refused at open
+with the new `Error::LazyWriterIndexPolicy`, because both records serialize the
+resident index this handle does not keep. Refusing beats opening a handle that
+writes nothing and leaves a file slower to open than its spec claims.
+
+Falls back to the full scan for any file whose digest is not usable, exactly as
+the read-side open does, and `open_lazy_with_report` returns which route it took.
+
+### One `lseek` per appended record, gone
+
+`AppendSnapshot` took its rollback cursor with `stream_position` — a syscall per
+record, on the path whose policy admits none. The same round removed two
+`fstat`s from this window and left this one, because the test guarding it counts
+`metadata` calls and could not see a seek. Measured at 1,000 records: **2,000
+seeks before, 1,000 after**, and the survivor is `append_record_at_end`'s own
+`seek(SeekFrom::End(0))` — the check that refuses an append at any offset but
+the end, whose removal is the positional-write redesign and not this.
+
+The cheap version does not work, and measuring is what showed it. The hypothesis
+was that the cursor always equals the snapshot's `eof`, which would make the
+syscall a request for a number already held; a `debug_assert` on that fired on
+the first append after a reopen, at 5493 against 9143 — the open scan leaves the
+handle where it stopped reading, while `eof` is the committed end. So the cursor
+is *tracked* by the one type that moves it, not derived. `take_record_file_seeks`
+(behind `scalable-fault-injection`) is what makes the count assertable.
+
 ### `max_file_len` no longer does anything
 
 All twenty-two file-length enforcement sites were removed, and `file_len` came
