@@ -464,19 +464,25 @@ fn the_primary_record_handle_is_only_written_through_its_two_gated_operations() 
         .join("\n");
     assert!(
         gate_code.contains(
-            "    pub struct RecordFile {\n        file: File,\n        cursor: \
-             Option<u64>,\n        matrix_read_pool: crate::matrix::MatrixReadPool,\n    }"
+            "    pub struct RecordFile {\n        file: File,\n        matrix_read_pool: \
+             crate::matrix::MatrixReadPool,\n    }"
         ),
-        "the wrapped handle must stay a private field of `RecordFile`, and the other fields are \
-         the two argued for here; any further one has to be argued for the same way. \
+        "the wrapped handle must stay a private field of `RecordFile`, and the one other field is \
+         the one argued for here; any further one has to be argued for the same way. \
          `MatrixReadPool` is read-only — its handles are opened `FILE_GENERIC_READ` and never \
          leave `mod region_reader`, see \
-         `the_private_matrix_read_handles_are_read_only_and_never_lent_out`. `cursor` is a cache \
-         of where this type last put the handle, carrying no capability: it is written only by \
-         the same operations this gate already permits to move the handle, and set to `None` by \
-         `matrix_region`, which lends the raw `&mut File` out and so ends the type's knowledge of \
-         where the cursor is. It exists because the per-record `stream_position` on the append \
-         path was an `lseek` asking the kernel for a number those operations already knew"
+         `the_private_matrix_read_handles_are_read_only_and_never_lent_out`. \
+         \
+         A cached file offset is the field this gate is now specifically here to keep out. There \
+         was one — `cursor: Option<u64>`, to spare the append path an `lseek` per record — and it \
+         could not be made sound: `VarveFile::snapshot` is a `try_clone` of this same handle, so \
+         it shares the open file description and therefore the offset, and it seeks that offset \
+         (`SnapshotFile::cursor_at`, every `replace_*` through `validate_generation_index`, and \
+         on Windows every single positional read, `read_exact_at` being `seek_read` there). The \
+         Windows case moves the offset from another thread under `&self` while this handle is \
+         exclusively borrowed, which no invalidate-on-handout scheme reaches. Making the append \
+         path free of the syscall did not need the cache anyway: the offset's only consumer was \
+         `AppendSnapshot`'s rollback cursor, and the rollback restores `eof` instead"
     );
     assert!(
         !gate.contains("impl Write for RecordFile")

@@ -220,13 +220,29 @@ seeks before, 1,000 after**, and the survivor is `append_record_at_end`'s own
 `seek(SeekFrom::End(0))` — the check that refuses an append at any offset but
 the end, whose removal is the positional-write redesign and not this.
 
-The cheap version does not work, and measuring is what showed it. The hypothesis
-was that the cursor always equals the snapshot's `eof`, which would make the
-syscall a request for a number already held; a `debug_assert` on that fired on
-the first append after a reopen, at 5493 against 9143 — the open scan leaves the
-handle where it stopped reading, while `eof` is the committed end. So the cursor
-is *tracked* by the one type that moves it, not derived. `take_record_file_seeks`
-(behind `scalable-fault-injection`) is what makes the count assertable.
+Nothing takes the number now, because nothing needed it: its only consumer was
+the value `rollback_append` seeks back to, and a rollback truncates to
+`AppendSnapshot::eof` — an offset the append already holds. Restoring that
+instead costs no syscall and no bookkeeping. `take_record_file_seeks` (behind
+`scalable-fault-injection`) is what makes the count assertable.
+
+The first attempt *tracked* the cursor in `RecordFile` instead, and that version
+was unsound. The writer's `snapshot` is a `try_clone` of the same handle, and
+`try_clone` shares the open file description — so it shares the offset, and it
+seeks it: `SnapshotFile::cursor_at` (the layout scan), every `replace_*` through
+`validate_generation_index`, and on Windows every positional read, since
+`read_exact_at` is `seek_read` there. That last one moves the offset from another
+thread, under `&self`, while the writer holds `&mut` — so no
+invalidate-on-handout scheme could have covered it. The cache is gone and
+`enforcement_gates.rs` pins its absence.
+
+One cold-path behaviour changed with it. A rollback used to put the handle back
+exactly where the append found it; it now leaves it at the restored end of file.
+The two differ only for the first append after a reopen — the open scan leaves
+the handle where it stopped reading (measured 5493) while `eof` is the committed
+end (9143) — and only when that append fails. Nothing reads this handle
+sequentially: appends seek `SEEK_END`, rewrites seek their own offset, reads are
+positional.
 
 ### `max_file_len` no longer does anything
 

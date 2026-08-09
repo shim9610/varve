@@ -772,18 +772,31 @@ mod record_file {
         RECORD_FILE_METADATA_CALLS.with(|count| count.replace(0))
     }
 
+    /// The record handle, and the one place that may move its file offset.
+    ///
+    /// # Why there is no cached cursor here
+    ///
+    /// There was one, to spare the append path an `lseek` per record, and it
+    /// was unsound: `VarveFile::snapshot` is a `try_clone` of this same handle,
+    /// and `try_clone` shares the *open file description* — so it shares the
+    /// offset. Everything derived from that snapshot moves the number this
+    /// type would have been claiming to know:
+    ///
+    /// - `SnapshotFile::cursor_at` seeks its `BufReader` (the layout scan), and
+    /// - `try_clone_file` hands a sharing duplicate to `validate_generation_index`
+    ///   (every `replace_*`) and to `verify_matrix_metadata`, both of which seek it,
+    /// - and on Windows `SnapshotFile::read_exact_at` is `seek_read`, which moves
+    ///   the offset on **every positional read** — including from another thread,
+    ///   under `&self`, while this handle is exclusively borrowed. No
+    ///   invalidate-on-handout scheme can cover that one.
+    ///
+    /// So the offset is not this type's to cache. The append path pays no
+    /// `lseek` for it anyway, because it no longer asks: the only consumer was
+    /// the rollback cursor, and `rollback_append` now restores the end of file
+    /// it truncates back to — a number it already holds.
     #[derive(Debug)]
     pub struct RecordFile {
         file: File,
-        /// Where this handle's cursor is, when this type put it there.
-        ///
-        /// `stream_position` was a real `lseek` on the per-record append path,
-        /// asking the kernel for a number every mutator here already knows.
-        /// `None` is "someone else may have moved it": `matrix_region` hands
-        /// out the raw `&mut File`, and `crate::matrix` seeks it (`SEEK_DATA`
-        /// / `SEEK_HOLE` for extent queries), so that accessor invalidates and
-        /// the next ask pays one syscall to re-learn it.
-        cursor: Option<u64>,
         /// Owner of this file's per-thread private read handles. Holds only an
         /// id and a cold-path `Mutex<Vec<Arc<File>>>`, so `RecordFile` stays
         /// `Sync` and the read path stays lock-free; see
@@ -795,7 +808,6 @@ mod record_file {
         pub(super) fn new(file: File) -> Self {
             Self {
                 file,
-                cursor: None,
                 matrix_read_pool: crate::matrix::MatrixReadPool::new(),
             }
         }
@@ -805,29 +817,22 @@ mod record_file {
             self.file.metadata()
         }
 
+        /// Asks the kernel where this handle's offset is.
+        ///
+        /// Test-only, and deliberately: no production path reads this. Its one
+        /// caller was the rollback cursor, which is where the cache above came
+        /// from — see that type's documentation for why it could not stay.
+        #[cfg(test)]
         pub(super) fn stream_position(&mut self) -> std::io::Result<u64> {
-            if let Some(cursor) = self.cursor {
-                #[cfg(test)]
-                debug_assert_eq!(
-                    cursor,
-                    self.file.stream_position()?,
-                    "the tracked cursor drifted from the handle's real one",
-                );
-                return Ok(cursor);
-            }
             count_record_file_seek();
-            let cursor = self.file.stream_position()?;
-            self.cursor = Some(cursor);
-            Ok(cursor)
+            self.file.stream_position()
         }
 
         /// Moves the handle's cursor. Reads and cursor restoration only: this
         /// type implements no write that follows the cursor.
         pub(super) fn seek_to(&mut self, offset: u64) -> std::io::Result<u64> {
             count_record_file_seek();
-            let landed = self.file.seek(SeekFrom::Start(offset))?;
-            self.cursor = Some(landed);
-            Ok(landed)
+            self.file.seek(SeekFrom::Start(offset))
         }
 
         pub(super) fn set_len(&mut self, len: u64) -> std::io::Result<()> {
@@ -862,10 +867,6 @@ mod record_file {
         /// site of this accessor must be an argument to a `crate::matrix::`
         /// call, which `enforcement_gates.rs` asserts.
         pub(super) fn matrix_region(&mut self) -> &mut File {
-            // `crate::matrix` seeks this handle — `AllocatedExtents::query`
-            // restores what it took, but nothing here can verify that, so the
-            // tracked cursor stops being a fact the moment it is handed out.
-            self.cursor = None;
             &mut self.file
         }
 
@@ -931,9 +932,6 @@ mod record_file {
             after_header: impl FnOnce() -> Result<()>,
         ) -> Result<WrittenThrough> {
             count_record_file_seek();
-            // Invalidated first: every `?` between here and the assignment
-            // below leaves the cursor somewhere this type did not choose.
-            self.cursor = None;
             let offset = self.file.seek(SeekFrom::End(0))?;
             if offset != expected_offset {
                 return Err(Error::Io(std::io::Error::new(
@@ -961,7 +959,6 @@ mod record_file {
             .ok_or(Error::ResourceArithmeticOverflow {
                 resource: "appended record extent",
             })?;
-            self.cursor = Some(written);
             Ok(WrittenThrough::after_write(written))
         }
 
@@ -978,16 +975,11 @@ mod record_file {
         ) -> Result<()> {
             count_record_file_seek();
             count_record_file_seek();
-            self.cursor = None;
             self.file.seek(SeekFrom::Start(write.record_offset()))?;
             self.file.write_all(header_bytes)?;
             self.file.seek(SeekFrom::Start(write.payload_offset()))?;
             self.file.write_all(payload)?;
             self.file.flush()?;
-            let end = u64::try_from(payload.len())
-                .ok()
-                .and_then(|len| write.payload_offset().checked_add(len));
-            self.cursor = end;
             Ok(())
         }
     }
@@ -3243,8 +3235,17 @@ fn take_injected_commit_durability_failure() -> Result<()> {
 
 #[derive(Clone, Copy, Debug)]
 struct AppendSnapshot {
+    /// The end of file this append starts from, and the offset a rollback both
+    /// truncates to and leaves the handle at.
+    ///
+    /// It used to carry a second number beside this one — the handle's actual
+    /// offset, read with a per-record `stream_position` — so that a rollback
+    /// could put the cursor back exactly where it found it. Reading it was an
+    /// `lseek` per record; caching it instead was unsound, because the offset
+    /// is shared with `VarveFile::snapshot` (see `RecordFile`). Restoring `eof`
+    /// costs neither: it is this field, and after any successful append the two
+    /// numbers are the same one.
     eof: u64,
-    cursor: u64,
     sequence_state: SequenceState,
     index_len: usize,
     checkpoint_cadence: CheckpointCadence,
@@ -11249,7 +11250,6 @@ impl VarveFile {
             // over live data. Removing that check along with the syscall is the
             // positional-write redesign, and is deliberately not what this is.
             eof: self.snapshot.len(),
-            cursor: self.file.stream_position()?,
             sequence_state: self.sequence_state,
             index_len: self.index.len(),
             checkpoint_cadence: self.checkpoint_cadence,
@@ -11471,7 +11471,10 @@ impl VarveFile {
             fail_rollback_if_requested().and_then(|()| self.file.set_len(snapshot.eof));
         #[cfg(not(test))]
         let truncate_result = self.file.set_len(snapshot.eof);
-        let cursor_result = self.file.seek_to(snapshot.cursor).map(|_| ());
+        // Back to the end of file this append started from — the offset the
+        // truncate above just restored, and the one the next append's
+        // `SEEK_END` would land on anyway. See `AppendSnapshot::eof`.
+        let cursor_result = self.file.seek_to(snapshot.eof).map(|_| ());
         if let Some(source) = truncate_result.err().or_else(|| cursor_result.err()) {
             self.poison.poison();
             Error::WriteRollbackFailed {
@@ -19736,7 +19739,8 @@ mod tests {
     /// `an_append_window_issues_no_metadata_syscall` pins the `fstat` half and
     /// counts `metadata` only, so the `stream_position` the `AppendSnapshot`
     /// took for its rollback cursor — an `lseek`, once per record — was
-    /// invisible to it. It is answered from the tracked cursor now.
+    /// invisible to it. Nothing takes it now: the rollback restores
+    /// `AppendSnapshot::eof`, which the append already holds.
     ///
     /// Measured at 1,000 records: **2,000 seeks before, 1,000 after.** The one
     /// that remains is `append_record_at_end`'s own `seek(SeekFrom::End(0))`,
@@ -19744,12 +19748,18 @@ mod tests {
     /// is deliberately kept — removing it is the positional-write redesign, as
     /// the comment there says. What went is the second one.
     ///
-    /// And it went by being tracked, not by being dropped. The cursor and the
-    /// snapshot's `eof` are **not** the same number: on the first append after
-    /// a reopen they were 5493 and 9143, because the open scan leaves the
-    /// handle where it stopped reading while `eof` is the committed end.
-    /// Restoring `eof` on rollback would have been a different behaviour, not a
-    /// cheaper spelling of the same one.
+    /// It first went by being *cached* rather than dropped, and this doc
+    /// carried the reason: the cursor and `eof` are not always the same number,
+    /// because a reopen's scan leaves the handle where it stopped reading
+    /// (measured 5493) while `eof` is the committed end (9143). That reason was
+    /// sound and the cache was not — the offset belongs to a file description
+    /// `VarveFile::snapshot` shares and seeks (see `RecordFile`). What the
+    /// difference actually costs is one cold-path behaviour: a rollback of the
+    /// *first* append after an open now leaves the handle at the end of file
+    /// instead of at 5493. Nothing reads this handle sequentially — every
+    /// append seeks `SEEK_END`, every rewrite seeks its own offset, every read
+    /// is positional — so the restored offset is a tidiness property, and the
+    /// end of file is the tidier of the two.
     #[cfg(feature = "scalable-fault-injection")]
     #[test]
     fn an_append_window_issues_no_seek_per_record() -> Result<()> {
@@ -19757,7 +19767,6 @@ mod tests {
         let path = directory.path().join("append-seeks.varve");
         let mut file = VarveFile::create(test_spec(), &path)?;
 
-        // Warm-up: the first append after any open re-learns the cursor once.
         file.push_info_for_test(12, b"warm")?;
         let _ = VarveFile::take_record_file_seeks();
 
@@ -20466,6 +20475,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("rollback.varve");
         let mut file = VarveFile::create(test_spec(), &path)?;
+        // Somewhere no append would have left it, so that "restored the end of
+        // file" and "left it where it found it" are different answers.
         file.file.seek_to(0)?;
         let original_len = file.file.metadata()?.len();
         inject_write_fault(WriteFault::AppendAfterHeader);
@@ -20475,7 +20486,10 @@ mod tests {
             Err(Error::Io(_))
         ));
         assert_eq!(file.file.metadata()?.len(), original_len);
-        assert_eq!(file.file.stream_position()?, 0);
+        // The truncate put the file back; this is the handle put back with it.
+        // Not the offset the append found — that was 0, and it is a number this
+        // writer no longer has any way to know. See `AppendSnapshot::eof`.
+        assert_eq!(file.file.stream_position()?, original_len);
         assert!(file.index.is_empty());
         assert_eq!(file.sequence_state, SequenceState::Available(0));
         assert!(!file.poison.is_refusing());
@@ -20483,6 +20497,46 @@ mod tests {
             file.write_record(METADATA_BLOCK_ID, 1, RECORD_FLAG_INTERNAL, b"ok")?,
             0
         );
+        Ok(())
+    }
+
+    /// A read through the snapshot moves the writer's own file offset.
+    ///
+    /// `VarveFile::snapshot` is a `try_clone` of `VarveFile::file`, and
+    /// `try_clone` shares the open file description — so the two share one
+    /// offset. `cursor_at` is the plainest way to show it (it is what the
+    /// layout scan uses), but it is not the only one: every `replace_*` seeks
+    /// this description through `validate_generation_index`, and on Windows so
+    /// does every positional read, `read_exact_at` being `seek_read` there.
+    ///
+    /// This is a property of the design, not a defect — reads are supposed to
+    /// be free of the writer. What was a defect is anything believing it knows
+    /// where the offset is: `RecordFile` cached it, and after the `cursor_at`
+    /// below the cache said `eof` while the kernel said `0`, with nothing able
+    /// to tell the writer otherwise. The cache is gone; every write here seeks
+    /// first, so a displaced offset costs nothing.
+    #[test]
+    fn a_snapshot_read_moves_the_writers_offset_and_the_writer_survives_it() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("shared-description.varve");
+        let mut file = VarveFile::create(test_spec(), &path)?;
+        file.push_info_for_test(12, b"first")?;
+        let after_first = file.snapshot.len();
+        assert_eq!(file.file.stream_position()?, after_first);
+
+        // What a layout scan does, on the description the writer appends to.
+        let _scan = file.snapshot.cursor_at(0)?;
+        assert_eq!(
+            file.file.stream_position()?,
+            0,
+            "the snapshot and the writer share one file offset",
+        );
+
+        // The append still lands at the end, because it seeks there itself.
+        let info = file.push_info_for_test(12, b"second")?;
+        assert_eq!(info.record_offset, after_first);
+        assert_eq!(file.file.stream_position()?, file.snapshot.len());
+        assert!(file.snapshot.len() > after_first);
         Ok(())
     }
 
