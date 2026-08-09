@@ -8508,14 +8508,40 @@ impl VarveFile {
     /// the spec on the way in, and the payload it is handed back is the same
     /// length, which is asserted below rather than assumed.
     ///
-    /// The rewrite is *not* crash-atomic, and that is a real difference from the
-    /// append. An append leaves the previous bytes intact until a later record
-    /// supersedes them; this overwrites the only copy, so a torn write loses the
-    /// chunk's older contents as well as its newer ones. The record's header
-    /// checksum covers the payload, so the damage is detected rather than
-    /// silently served. This is the same bargain the matrix *region* has always
-    /// made — an in-place slot write with a per-cell checksum — and reopening a
-    /// chunk is opting into the region's durability model for chunked rows.
+    /// # The rewrite is not crash-atomic
+    ///
+    /// This overwrites the only copy. Neither write below is `fsync`ed here —
+    /// `RecordFile::overwrite_indexed_record` ends in `File::flush`, which for a
+    /// `File` does nothing — so until the next `sync` the new bytes are page
+    /// cache, and writeback lands per page. Three ways the file ends up holding
+    /// a mix of the old chunk and the new one: power loss or a machine crash
+    /// before that `sync`, a `write_all` that fails part-way on `ENOSPC` or
+    /// `EIO`, and a process crash (the page cache survives, so the partial write
+    /// is what reaches disk).
+    ///
+    /// **The difference from an append is recoverability, not detection.** A
+    /// torn append lands past the committed end, and open truncates the
+    /// uncommitted tail; the data that was already readable is untouched. A torn
+    /// rewrite mixes data that *was* committed and readable.
+    ///
+    /// **What detects it depends on the format, and the first version of this
+    /// comment said otherwise.** `checksum_record_bytes` returns a constant `0`
+    /// under [`IntegrityPolicy::None`], and a chunk carries the per-cell
+    /// checksum table only when the policy asks for one — so under `None`
+    /// nothing catches a torn rewrite and the mixed cells are served as values.
+    /// Under `Crc32`/`Crc32WithHeader` the per-cell checksum is stored beside
+    /// the cell and a read of a torn cell fails with `ChecksumMismatch`.
+    ///
+    /// **The blast radius is bounded to cell values inside this one chunk**,
+    /// which is worth stating next to the rest. The payload length is unchanged
+    /// — asserted above, not assumed — and the write is in place, so record
+    /// framing, every offset chain, the resident index and every other record
+    /// are untouched. A torn rewrite leaves a file that still opens and still
+    /// parses, holding some cells at their previous values.
+    ///
+    /// This is the bargain the matrix *region* has always made — an in-place
+    /// slot write with a per-cell checksum — and reopening a chunk is opting
+    /// into the region's durability model for chunked rows.
     fn rewrite_chunk_record(
         &mut self,
         permit: &FileMutationPermit,
