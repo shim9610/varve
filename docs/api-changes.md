@@ -99,11 +99,21 @@ change:
 Both are off by default, so a format that declares neither never sees this
 error. Reads of such a chunk are unaffected; only modification is refused.
 
-One entry point did **not** change: `clear_matrix_cell_by_category` still
-refuses a written chunk with `MatrixChunkClosed`. It walks every row of a
-category, so serving it across written chunks means loading and rewriting every
-one of them — a different operation with a different cost, and it is refused
-rather than half-served.
+`clear_matrix_cell_by_category(category, key)` changed with the rest of them.
+It clears **one cell**, exactly as `clear_matrix_cell::<T>(key)` does — the only
+difference is that the block is named by category string instead of by Rust type
+— so the two accept and refuse the same things, and a test pins that. An earlier
+draft of this note claimed it walks a whole category and was therefore left
+refusing; that was a confusion with `clear_matrix_category` below, and it made
+the same cell clearable under one spelling and not the other.
+
+One entry point did **not** change: `clear_matrix_category(category)` — the
+bulk one, which takes no key and returns how many cells it cleared — still
+refuses a growing matrix with written chunks, with `MatrixChunkClosed`. That one
+really does walk every row of the category, so serving it means loading and
+rewriting every written chunk. It is refused rather than half-served: the
+version before 0.6.0 cleared the matrix region only and returned a count that
+did not include the chunked rows it had silently left committed.
 
 ### B.-1 `Error::MatrixChunkSealed` is now `Error::MatrixChunkClosed`
 

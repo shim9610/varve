@@ -31,9 +31,13 @@ Append-only streaming never takes the path.
 `Error::MatrixChunkNotReopenable { chunk, reason }` is new, and reports the two
 cases where the payload length would change and so the record cannot be
 rewritten at its stored size: `chunk_compression` and `segment_on_flush`. Both
-are off by default. `clear_matrix_cell_by_category` is unchanged and still
-refuses a written chunk — it walks a whole category, which is a different
-operation, and it is refused rather than half-served.
+are off by default. `clear_matrix_cell::<T>` and `clear_matrix_cell_by_category`
+both reach a written chunk; they are one operation differing only in whether the
+block is named by type or by category string, and a test pins that they accept
+and refuse the same things. `clear_matrix_category` — the bulk one, no key,
+returns a count — still refuses: it really does walk every row of the category,
+so serving it means rewriting every written chunk, and it is refused rather than
+half-served.
 
 An uncommitted write into a chunk is no longer discarded when the writer moves
 on. A chunk counts as needing a write-out once anything is written to it, not
