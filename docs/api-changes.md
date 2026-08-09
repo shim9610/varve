@@ -107,13 +107,30 @@ draft of this note claimed it walks a whole category and was therefore left
 refusing; that was a confusion with `clear_matrix_category` below, and it made
 the same cell clearable under one spelling and not the other.
 
-One entry point did **not** change: `clear_matrix_category(category)` — the
-bulk one, which takes no key and returns how many cells it cleared — still
-refuses a growing matrix with written chunks, with `MatrixChunkClosed`. That one
-really does walk every row of the category, so serving it means loading and
-rewriting every written chunk. It is refused rather than half-served: the
-version before 0.6.0 cleared the matrix region only and returned a count that
-did not include the chunked rows it had silently left committed.
+`clear_matrix_category(category)` — the bulk one, no key, returns how many cells
+it cleared — reaches written chunks too, and its count includes them. A draft of
+this note said it was left refusing because reaching them costs a reload and a
+rewrite per chunk; that is what clearing a category *is*, not a reason to refuse
+it. The version before 0.6.0 cleared the matrix region only and returned a count
+that omitted the chunked rows it had silently left committed, and a refusal
+replaced that; this replaces the refusal.
+
+Two properties worth knowing before you call it on a large file:
+
+* **Cost is proportional to the written chunks holding the category** — one
+  reload and one record rewrite each — while memory stays one chunk at a time.
+  A growing matrix that has not written a chunk yet is unchanged: a memset over
+  a buffer, no I/O.
+* **It is not atomic, and idempotence is what replaces that.** Each chunk is its
+  own record write, so the fifth can fail after four have landed. Clearing an
+  already-clear category clears nothing and counts nothing, so the answer to a
+  failure part-way is to call it again; the two counts sum to the total. A torn
+  write inside a single record poisons the handle, as on every other write path.
+
+It refuses with `MatrixChunkNotReopenable` for the same two formats as above
+(`chunk_compression`, `segment_on_flush`), and asks that question **before**
+clearing anything, so such a format gets a refusal rather than a region that has
+been cleared and chunks that have not.
 
 ### B.-1 `Error::MatrixChunkSealed` is now `Error::MatrixChunkClosed`
 

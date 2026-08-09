@@ -35,9 +35,10 @@ are off by default. `clear_matrix_cell::<T>` and `clear_matrix_cell_by_category`
 both reach a written chunk; they are one operation differing only in whether the
 block is named by type or by category string, and a test pins that they accept
 and refuse the same things. `clear_matrix_category` — the bulk one, no key,
-returns a count — still refuses: it really does walk every row of the category,
-so serving it means rewriting every written chunk, and it is refused rather than
-half-served.
+returns a count — reaches written chunks too, and counts them: one reload and
+one rewrite per chunk holding the category, memory still one chunk at a time.
+It is not atomic and does not claim to be; clearing an already-clear category
+counts nothing, so a failure part-way is answered by calling again.
 
 An uncommitted write into a chunk is no longer discarded when the writer moves
 on. A chunk counts as needing a write-out once anything is written to it, not
