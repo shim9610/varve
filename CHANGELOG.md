@@ -6,6 +6,41 @@ increment the minor version.
 
 ## 0.6.0 - 2026-08-07
 
+### A written matrix chunk is editable
+
+**Breaking, behavioural.** A write to a row of an already-written chunk used to
+fail with `Error::MatrixChunkClosed`; it now succeeds. See
+[API Changes §B.-2](docs/api-changes.md).
+
+The matrix *region* has always been rewritten in place, and a chunk is an
+ordinary record, which the writer has been able to rewrite in place since 0.5.0
+— so the refusal made a growing matrix the one thing in the file that was
+append-only, for no reason in the format. It also caught rows of a chunk that
+was merely *skipped*: nothing committed means no record was ever written, and
+those rows were unwritable for the life of the file.
+
+The open chunk is written out, the addressed chunk's record is read back into
+the buffer, and the next transition rewrites that record where it already sits.
+The file does not grow, and no second record for a chunk index is ever created.
+Memory is bounded by the same `rows_per_chunk` ceiling as before. Two costs are
+real and are written down in the API note: a rewrite is not crash-atomic (the
+record checksum detects a torn write rather than preventing it), and a workload
+alternating between two far-apart chunks pays a reload plus a rewrite each time.
+Append-only streaming never takes the path.
+
+`Error::MatrixChunkNotReopenable { chunk, reason }` is new, and reports the two
+cases where the payload length would change and so the record cannot be
+rewritten at its stored size: `chunk_compression` and `segment_on_flush`. Both
+are off by default. `clear_matrix_cell_by_category` is unchanged and still
+refuses a written chunk — it walks a whole category, which is a different
+operation, and it is refused rather than half-served.
+
+An uncommitted write into a chunk is no longer discarded when the writer moves
+on. A chunk counts as needing a write-out once anything is written to it, not
+only once something is committed — a widening that was previously unsafe,
+because a chunk that went out could never come back and a `write` → `flush`
+sequence therefore locked the rest of its rows permanently.
+
 ### The reader stops keeping a copy of the file
 
 **Breaking, source-level.** Two signatures changed; both are listed in

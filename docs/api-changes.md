@@ -3,7 +3,7 @@
 Migration document. Companion to [Known Limitations](known-limitations.md)
 and the [Changelog](../CHANGELOG.md).
 
-Section **B** is the 0.5.0 → 0.6.0 migration: two changed signatures, both from the
+Section **B** is the 0.5.0 → 0.6.0 migration: two changed signatures from the
 reader no longer keeping a copy of the file's index. Section **A** is the
 0.4.0 → 0.5.0 migration: four changes, all about matrix commit-metadata
 residency and verification. Everything numbered 1 through 5 is the
@@ -17,9 +17,9 @@ decoder, header field or version constant was touched. If you are coming from
 
 ---
 
-## B. From 0.5.0 to 0.6.0: a writer open that does not scan, two changed signatures, one struct field, and one renamed error
+## B. From 0.5.0 to 0.6.0: a writer open that does not scan, an editable written chunk, two changed signatures, one struct field, and one renamed error
 
-### B.-1 `VarveFile::open_lazy` / `VarveWriter::open_lazy` — a writer that does not scan
+### B.-3 `VarveFile::open_lazy` / `VarveWriter::open_lazy` — a writer that does not scan
 
 New, additive; nothing to migrate. Every other writer open frames every record
 in the file, at any size, because it builds the resident index. `open_lazy`
@@ -49,7 +49,63 @@ Two things it does not have, both inherited from the read-only digest open:
 `open_lazy_with_report` returns `LazyOpenSource` like its read-only twin, and
 the fallback is the same: any file whose digest is not usable opens by scanning.
 
-### B.0 `Error::MatrixChunkSealed` is now `Error::MatrixChunkClosed`
+### B.-2 A written matrix chunk can now be edited, and `Error::MatrixChunkNotReopenable` is new
+
+**A write to a row of an already-written chunk used to fail with
+`Error::MatrixChunkClosed`. It now succeeds.** If your code matched on that
+error to detect "too late, this row is gone", delete the arm: the write lands.
+Nothing else in the signature changed — `write_matrix_cell`,
+`write_matrix_cell_payload` and `clear_matrix_cell` take the same arguments and
+return the same type.
+
+The refusal had nothing behind it. A varve file's matrix *region* is rewritten
+in place on every write; a chunk is an ordinary record, and rewriting one of
+those in place is a route the writer has had since 0.5.0. So a reader-writer
+could edit a written row of a fixed matrix and not a written row of a growing
+one, for a reason that existed only in the chunk code. Worse, the refusal also
+caught rows of a chunk that was merely *skipped* — one where nothing was ever
+committed, so no record was written at all — and made them permanently
+unwritable.
+
+What happens now: the open chunk is written out, the addressed chunk's record is
+read back into the buffer, the edit applies, and the next chunk transition
+rewrites that record **where it already sits**. The file does not grow, and no
+second record for the same chunk index is ever created.
+
+Two costs, stated plainly:
+
+* **Memory is unchanged, latency is not.** The reload reads one chunk's commit
+  map, checksum table and slot region — the same ceiling `rows_per_chunk`
+  already sets on holding a chunk open. But it is a read plus, on the way out, a
+  rewrite, so a workload that alternates between two far-apart chunks pays for
+  both on every alternation. Append-only streaming, the primary workload, never
+  takes this path at all.
+* **A rewrite is not crash-atomic.** An append leaves the older bytes intact
+  until something supersedes them; a rewrite overwrites the only copy, so a torn
+  write loses the chunk's previous contents along with its new ones. The record
+  header's checksum covers the payload, so the damage is *detected* rather than
+  silently served. This is the bargain the matrix region has always made, and
+  editing a written chunk is opting into it for chunked rows.
+
+`Error::MatrixChunkNotReopenable { chunk, reason }` is the new refusal, and it
+fires only where the rewrite is impossible because the payload length would
+change:
+
+| `reason` | when |
+| --- | --- |
+| `"chunk compression"` | the format declares `chunk_compression`, so a chunk's payload length is a function of its contents |
+| `"segment_on_flush"` | the same formats `replace_fixed` already refuses in-place replacement for |
+
+Both are off by default, so a format that declares neither never sees this
+error. Reads of such a chunk are unaffected; only modification is refused.
+
+One entry point did **not** change: `clear_matrix_cell_by_category` still
+refuses a written chunk with `MatrixChunkClosed`. It walks every row of a
+category, so serving it across written chunks means loading and rewriting every
+one of them — a different operation with a different cost, and it is refused
+rather than half-served.
+
+### B.-1 `Error::MatrixChunkSealed` is now `Error::MatrixChunkClosed`
 
 Same fields (`chunk`, `open`), same meaning, honest name. Match arms and any
 `matches!` on the variant need the new spelling; nothing else changes.
@@ -71,7 +127,7 @@ the first is what the operation does; the second is a consequence of records
 being write-once today, not a property of the data model. The matrix region
 itself is rewritten in place all the time.
 
-## B. From 0.5.0 to 0.6.0: two signatures changed, and one struct gained a field
+### B.0 The two changed signatures, and the new field
 
 The two signatures come from the same change — the reader stopped keeping a copy
 of the file's index — and are source-level only. The field is
