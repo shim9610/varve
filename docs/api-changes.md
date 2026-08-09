@@ -80,12 +80,28 @@ Two costs, stated plainly:
   rewrite, so a workload that alternates between two far-apart chunks pays for
   both on every alternation. Append-only streaming, the primary workload, never
   takes this path at all.
-* **A rewrite is not crash-atomic.** An append leaves the older bytes intact
-  until something supersedes them; a rewrite overwrites the only copy, so a torn
-  write loses the chunk's previous contents along with its new ones. The record
-  header's checksum covers the payload, so the damage is *detected* rather than
-  silently served. This is the bargain the matrix region has always made, and
-  editing a written chunk is opting into it for chunked rows.
+* **A rewrite is not crash-atomic**, and what that costs depends on your
+  integrity policy. It overwrites the only copy, and the write is not `fsync`ed
+  until the next `sync`, so power loss before that, a `write_all` that fails
+  part-way on `ENOSPC`/`EIO`, or a process crash can each leave the file holding
+  a mix of the old chunk and the new one. The difference from an append is
+  **recoverability**: a torn append lands past the committed end and open
+  truncates it, leaving already-readable data untouched, while a torn rewrite
+  mixes data that was already committed.
+
+  Under `IntegrityPolicy::Crc32` or `Crc32WithHeader` a torn cell is *detected*
+  — the per-cell checksum is stored beside the cell, and reading one fails with
+  `ChecksumMismatch`. Under **`IntegrityPolicy::None` nothing detects it**: the
+  record checksum is a constant zero and the chunk carries no per-cell table, so
+  the mixed cells are served as ordinary values. If you enable chunk editing on
+  data you cannot re-derive, declare an integrity policy.
+
+  The blast radius is bounded to cell values inside that one chunk. The rewrite
+  is byte-length-identical and in place, so record framing, the offset chains,
+  the index and every other record are untouched: the file still opens and still
+  parses, with some cells at their previous values. This is the bargain the
+  matrix region has always made, and editing a written chunk is opting into it
+  for chunked rows.
 
 `Error::MatrixChunkNotReopenable { chunk, reason }` is the new refusal, and it
 fires only where the rewrite is impossible because the payload length would

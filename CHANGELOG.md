@@ -22,11 +22,20 @@ those rows were unwritable for the life of the file.
 The open chunk is written out, the addressed chunk's record is read back into
 the buffer, and the next transition rewrites that record where it already sits.
 The file does not grow, and no second record for a chunk index is ever created.
-Memory is bounded by the same `rows_per_chunk` ceiling as before. Two costs are
-real and are written down in the API note: a rewrite is not crash-atomic (the
-record checksum detects a torn write rather than preventing it), and a workload
-alternating between two far-apart chunks pays a reload plus a rewrite each time.
-Append-only streaming never takes the path.
+Memory is bounded by the same `rows_per_chunk` ceiling as before.
+
+Two costs are real and are written down in the API note. A workload alternating
+between two far-apart chunks pays a reload plus a rewrite each time;
+append-only streaming never takes the path at all. And **a rewrite is not
+crash-atomic**: it overwrites the only copy, so power loss before the next
+`sync`, a `write_all` that fails part-way, or a process crash can leave a chunk
+holding a mix of its old and new cells. Under `IntegrityPolicy::Crc32` or
+`Crc32WithHeader` that is detected — the per-cell checksum sits beside the cell
+and a read fails with `ChecksumMismatch`. Under `IntegrityPolicy::None` it is
+**not** detected: the record checksum is a constant zero and no per-cell table
+exists, so mixed cells are served as values. The damage cannot spread past that
+one chunk's cells — the rewrite is byte-length-identical and in place, so
+framing, offset chains, the index and every other record are untouched.
 
 `Error::MatrixChunkNotReopenable { chunk, reason }` is new, and reports the two
 cases where the payload length would change and so the record cannot be
