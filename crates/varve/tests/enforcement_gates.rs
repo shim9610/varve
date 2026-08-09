@@ -610,11 +610,31 @@ fn an_in_place_record_write_still_demands_a_version_checked_target() {
         "the target token's field must stay private, which is what \
          tests/ui/fail_fabricated_replacement_target.rs asserts"
     );
+    // Two constructors, and the count is on the *body* rather than on the
+    // count of `pub(super) fn`s, because what has to stay unique is the place
+    // the stored-version refusal happens. `resolve<T>` substitutes `T::ID` and
+    // `T::VERSION` into `resolve_internal` and does nothing else, so a third
+    // constructor that skipped the refusal would have to add a second `if
+    // actual != ` — which this catches.
     assert_eq!(
         source.matches("fn resolve<T: VarveBlock>").count(),
         1,
-        "`ReplacementTarget::resolve` must remain the only constructor, because it is where the \
-         `T::VERSION` refusal lives"
+        "`ReplacementTarget::resolve` must remain the only *generic* constructor"
+    );
+    assert_eq!(
+        source.matches("fn resolve_internal(").count(),
+        1,
+        "`ReplacementTarget::resolve_internal` must remain the only non-generic constructor. It \
+         exists because a matrix chunk record is a block varve writes itself and no `VarveBlock` \
+         type names, and a written chunk has to be rewritable in place — see \
+         `VarveFile::rewrite_chunk_record`. It performs the same refusal against an explicit \
+         `(block_id, version)` pair"
+    );
+    assert_eq!(
+        source.matches("if actual != block_version {").count(),
+        1,
+        "the stored-version refusal must live in exactly one place, whichever constructor was \
+         called: that is the whole reason a second constructor delegates rather than repeating"
     );
     assert_eq!(
         source.matches("fn prepare(").count(),

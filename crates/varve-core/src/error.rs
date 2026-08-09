@@ -545,11 +545,14 @@ pub enum Error {
 
     /// A write or commit addressed a chunk that is no longer the open one.
     ///
-    /// Only the newest chunk accepts writes: one chunk is buffered at a time,
-    /// which is what bounds a growing matrix's memory. Late data is refused
-    /// rather than dropped — a value that silently does not arrive is
-    /// indistinguishable from one that was never sent. `open` is the chunk a
-    /// caller may still write to, or `None` when there is none.
+    /// One chunk is buffered at a time, which is what bounds a growing matrix's
+    /// memory — but *which* chunk is not fixed. A write to a row belonging to
+    /// an already-written chunk writes the open one out and loads that chunk
+    /// back, so this refusal is now reached only where the reload is impossible
+    /// and [`Error::MatrixChunkNotReopenable`] says which case that is.
+    ///
+    /// `open` is the chunk a caller may still write to, or `None` when there is
+    /// none.
     ///
     /// **Closed, not necessarily written.** This was `MatrixChunkSealed`, and
     /// both the name and the message claimed the chunk had been written out as
@@ -563,6 +566,25 @@ pub enum Error {
         None => String::from("; no chunk is open"),
     })]
     MatrixChunkClosed { chunk: u64, open: Option<u64> },
+
+    /// A write addressed an already-written chunk that cannot be loaded back.
+    ///
+    /// Reopening a written chunk rewrites its record where it already sits,
+    /// which needs the rewritten payload to be exactly as long as the one on
+    /// disk. Two format options break that, and each names itself here rather
+    /// than arriving as a generic refusal:
+    ///
+    /// * `"chunk compression"` — a compressed chunk's payload length is a
+    ///   function of its *contents*, so a changed cell changes the length and
+    ///   the record no longer fits its slot. Nothing is lost by refusing: the
+    ///   option is off by default, and a format that does not set it reopens.
+    /// * `"segment_on_flush"` — the same reason
+    ///   [`crate::VarveFile::replace_fixed`] refuses in-place replacement for
+    ///   these formats.
+    ///
+    /// Both are refusals to *modify*; reads of the chunk are unaffected.
+    #[error("matrix chunk {chunk} cannot be reopened: {reason}")]
+    MatrixChunkNotReopenable { chunk: u64, reason: &'static str },
 
     #[error("invalid matrix chunk record")]
     InvalidMatrixChunk,

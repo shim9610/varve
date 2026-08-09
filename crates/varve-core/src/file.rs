@@ -577,10 +577,36 @@ pub(crate) mod replacement_target {
             index: &super::ResidentIndex,
             ordinal: usize,
         ) -> Result<Self> {
+            Self::resolve_internal(index, T::ID, T::VERSION, ordinal)
+        }
+
+        /// The same selection and the same version refusal, for a block varve
+        /// writes itself and no `VarveBlock` type names.
+        ///
+        /// [`Self::resolve`] is this function with `T::ID` and `T::VERSION`
+        /// substituted, so there is one implementation of "find the nth record
+        /// of a block and refuse a stored version that is not the expected
+        /// one", not two that could drift.
+        ///
+        /// **Why a second constructor is not a second write route.** The
+        /// property `ReplacementTarget` exists to enforce is that the bytes of
+        /// an already-indexed record are reachable only by consuming one of
+        /// these, and only through `RecordFile::overwrite_indexed_record`. That
+        /// is unchanged: this returns the same opaque token, having done the
+        /// same refusal. What it does not do is decide *which* internal blocks
+        /// may be rewritten — its one caller today is the matrix chunk, and a
+        /// caller for anything else has to argue for itself, exactly as this
+        /// one did.
+        pub(super) fn resolve_internal(
+            index: &super::ResidentIndex,
+            block_id: u32,
+            block_version: u16,
+            ordinal: usize,
+        ) -> Result<Self> {
             let mut found = None;
             let mut matches_seen = 0usize;
             for (candidate, entry) in index.iter().enumerate() {
-                if entry?.block_id != T::ID {
+                if entry?.block_id != block_id {
                     continue;
                 }
                 if matches_seen == ordinal {
@@ -591,10 +617,10 @@ pub(crate) mod replacement_target {
             }
             let position = found.ok_or(Error::UnexpectedEof)?;
             let actual = index.entry_at(position)?.block_version;
-            if actual != T::VERSION {
+            if actual != block_version {
                 return Err(Error::BlockVersionMismatch {
-                    block_id: T::ID,
-                    expected: T::VERSION,
+                    block_id,
+                    expected: block_version,
                     actual,
                 });
             }
@@ -2485,6 +2511,49 @@ fn try_zeroed_vec(len: u64, resource: &'static str) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
+/// Rebuilds a reloaded chunk block's write bitmap from what the record does
+/// carry.
+///
+/// A cell counts as written if it is committed — a commit cannot have happened
+/// without one — or if its slot bytes are not all zero. That second clause is
+/// the region's own test (`matrix::commit_cell` scans the slot when its
+/// session bitmap says nothing), so a reloaded chunk and a region row answer
+/// "was this written" identically.
+fn seed_written_map(commit: &[u8], slots: &[u8], cells: u64, stride: u64) -> Result<Vec<u8>> {
+    let len = u64::try_from(commit.len()).map_err(|_| Error::ResourceArithmeticOverflow {
+        resource: "matrix chunk write map",
+    })?;
+    let mut written = try_zeroed_vec(len, "matrix chunk write map")?;
+    let stride = usize::try_from(stride).map_err(|_| Error::InvalidMatrixLayout)?;
+    for ordinal in 0..cells {
+        let byte = usize::try_from(ordinal / 8).map_err(|_| Error::InvalidMatrixLayout)?;
+        let bit = 1u8 << (ordinal % 8);
+        if commit
+            .get(byte)
+            .is_some_and(|committed| committed & bit != 0)
+        {
+            written[byte] |= bit;
+            continue;
+        }
+        let start = usize::try_from(ordinal)
+            .ok()
+            .and_then(|ordinal| ordinal.checked_mul(stride))
+            .ok_or(Error::InvalidMatrixLayout)?;
+        let slot = slots
+            .get(
+                start
+                    ..start
+                        .checked_add(stride)
+                        .ok_or(Error::InvalidMatrixLayout)?,
+            )
+            .ok_or(Error::InvalidMatrixChunk)?;
+        if slot.iter().any(|byte| *byte != 0) {
+            written[byte] |= bit;
+        }
+    }
+    Ok(written)
+}
+
 /// One matrix block's slice of the chunk being filled.
 #[derive(Debug)]
 struct OpenChunkBlock {
@@ -2533,6 +2602,14 @@ struct ChunkLocator {
     block_count: u32,
     cell_crc: bool,
     compressed_slots: bool,
+    /// This record's position among the chunk records, counted in the order the
+    /// resident index holds them — which is file order, not chunk-index order.
+    ///
+    /// It is what addresses the record for a rewrite, and it is stored rather
+    /// than derived because the two orders are no longer the same: a chunk that
+    /// was skipped and is written later sits at the end of the file with a
+    /// lower index than its neighbours, and the directory is sorted by index.
+    ordinal: usize,
 }
 
 /// Every written chunk, by chunk index, ordered once.
@@ -2565,18 +2642,32 @@ impl ChunkDirectory {
             .map(|position| self.chunks[position])
     }
 
-    /// The newest written chunk index, which is the last element because chunks
-    /// are written in increasing order.
-    fn newest(&self) -> Option<u64> {
-        self.chunks.last().map(|locator| locator.index)
-    }
-
     fn is_empty(&self) -> bool {
         self.chunks.is_empty()
     }
 
+    /// Files a chunk record that was just appended.
+    ///
+    /// Inserted at its index position rather than pushed, because a chunk is no
+    /// longer always written in ascending order: a chunk that committed nothing
+    /// is never written, and a later write to one of its rows appends its
+    /// record after higher-indexed ones. Ascending is still the common case and
+    /// costs an insert at the end.
+    ///
+    /// Returns the number of chunk records now filed, which is the ordinal the
+    /// *next* appended one will carry.
     fn note_written(&mut self, locator: ChunkLocator) {
-        self.chunks.push(locator);
+        let position = self
+            .chunks
+            .partition_point(|filed| filed.index < locator.index);
+        self.chunks.insert(position, locator);
+    }
+
+    /// The ordinal an appended chunk record would carry: one past the last,
+    /// because a record is appended at the end of the file and the ordinals
+    /// count file order.
+    fn next_ordinal(&self) -> usize {
+        self.chunks.len()
     }
 }
 
@@ -2587,8 +2678,9 @@ impl ChunkDirectory {
 /// writes it as one ordinary record, so nothing else in the file format learns
 /// that chunks exist.
 ///
-/// Only the newest chunk is open. A write addressing an older one is refused
-/// rather than dropped — see `Error::MatrixChunkClosed`.
+/// One chunk is open at a time, and which one is not fixed: writing a row that
+/// belongs to an already-written chunk writes the open one out and loads that
+/// chunk back — see `VarveFile::reopen_written_chunk`.
 #[derive(Debug)]
 struct OpenChunk {
     index: u64,
@@ -2602,6 +2694,20 @@ struct OpenChunk {
     /// answer every read identically, and writing one would grow the file on
     /// every idle flush the way an empty segment once did.
     dirty: bool,
+    /// The chunk-record ordinal this chunk was loaded from, when it was loaded
+    /// rather than started empty.
+    ///
+    /// `Some` means a record for this chunk index already exists and holds
+    /// these same bytes, so writing the chunk out must rewrite *that* record
+    /// rather than append a second one. Two records claiming one chunk index is
+    /// not a thing the directory can order, and `build_chunk_directory` refuses
+    /// a file that carries them.
+    ///
+    /// An ordinal rather than an offset because that is what
+    /// `ReplacementTarget` selects on: the nth record of `MATRIX_CHUNK_BLOCK_ID`
+    /// is the nth entry of the chunk directory, which is built by walking the
+    /// resident index in the same order.
+    backing: Option<usize>,
 }
 
 impl OpenChunk {
@@ -8073,26 +8179,32 @@ impl VarveFile {
     ///
     /// Refuses a chunk older than the open one. That refusal is the whole
     /// contract of writing the chunk: a value that arrives late is reported, not dropped.
+    /// Makes chunk `index` the open one, loading it back from its record when
+    /// one exists.
+    ///
+    /// **Both halves of this used to be a refusal.** Writing a row that belonged
+    /// to an already-written chunk — or to any chunk older than the open one —
+    /// returned `MatrixChunkClosed`, which made a written chunk permanently
+    /// unmodifiable and, worse, made the rows of a chunk that was merely
+    /// *skipped* permanently unwritable. A reader-writer that can edit a written
+    /// region row could not edit a written chunk row, for no reason in the
+    /// format: a chunk record is an ordinary record and `RecordFile` has had a
+    /// route for rewriting one of those in place since round 12.
+    ///
+    /// The cost of the reload, stated: the chunk record's commit map, checksum
+    /// table and slot region are read into the buffer — one chunk's worth of
+    /// bytes, the same ceiling `rows_per_chunk` already sets on holding one
+    /// open, so the memory bound is unchanged. It is a cold path (a chunk
+    /// transition, not a record), and a format that never revisits an old row
+    /// never takes it.
     fn open_chunk_at(&mut self, index: u64) -> Result<()> {
         match &self.open_chunk {
             Some(open) if open.index == index => return Ok(()),
-            Some(open) if open.index > index => {
-                return Err(Error::MatrixChunkClosed {
-                    chunk: index,
-                    open: Some(open.index),
-                });
-            }
             Some(_) => self.write_open_chunk_record()?,
             None => {}
         }
-        let newest = self.newest_written_chunk()?;
-        if let Some(newest) = newest
-            && index <= newest
-        {
-            return Err(Error::MatrixChunkClosed {
-                chunk: index,
-                open: self.open_chunk.as_ref().map(|open| open.index),
-            });
+        if let Some(locator) = self.chunk_directory()?.find(index) {
+            return self.reopen_written_chunk(locator);
         }
         let rows = self
             .spec
@@ -8158,18 +8270,143 @@ impl VarveFile {
             compression: self.spec.chunk_compression,
             blocks,
             dirty: false,
+            backing: None,
         });
         Ok(())
     }
 
-    /// The newest written chunk index.
+    /// Loads a written chunk's record back into the buffer as the open chunk.
     ///
-    /// The directory's last element. The first version walked the resident
-    /// index in reverse on every chunk transition and cached only a *positive*
-    /// answer, so a writer whose chunks were never dirty-written repeated the
-    /// full walk at every chunk boundary — on the append path.
-    fn newest_written_chunk(&mut self) -> Result<Option<u64>> {
-        Ok(self.chunk_directory()?.newest())
+    /// Every geometry field was already checked against the spec by
+    /// `build_chunk_directory` (rows, first row, block count, checksum policy,
+    /// compression policy) and by `chunk_block_location` (per-block stride and
+    /// cell count), so this reads bytes rather than re-deriving trust.
+    ///
+    /// **`written` is not on disk, and this is what that costs.** The record
+    /// carries the commit map, the checksums and the slot bytes; the
+    /// write-this-session bitmap is buffer state, so it cannot be restored. The
+    /// buffer is seeded the way the region answers the same question — a cell
+    /// counts as written if it is committed, or if its slot bytes are not all
+    /// zero (`matrix::commit_cell`). The one case that differs from an
+    /// uninterrupted session: a cell written with an all-zero value and never
+    /// committed reads as unwritten after a reload, so committing it needs the
+    /// value written again. That is exactly the region's behaviour for the same
+    /// cell, and the alternative — persisting a second bitmap — would grow every
+    /// chunk record for a distinction that only a discarded write can observe.
+    fn reopen_written_chunk(&mut self, locator: ChunkLocator) -> Result<()> {
+        if locator.compressed_slots {
+            return Err(Error::MatrixChunkNotReopenable {
+                chunk: locator.index,
+                reason: "chunk compression",
+            });
+        }
+        if self.spec.index_policy.segment_on_flush {
+            return Err(Error::MatrixChunkNotReopenable {
+                chunk: locator.index,
+                reason: "segment_on_flush",
+            });
+        }
+        let rows = self
+            .spec
+            .growing_rows_per_chunk()
+            .ok_or(Error::MatrixLayoutMissing)?;
+        let first_row =
+            locator
+                .index
+                .checked_mul(rows)
+                .ok_or(Error::ResourceArithmeticOverflow {
+                    resource: "matrix chunk first row",
+                })?;
+        let mut blocks = Vec::new();
+        blocks
+            .try_reserve_exact(self.spec.matrix_blocks.len())
+            .map_err(|_| Error::AllocationFailed {
+                resource: "matrix chunk blocks",
+                requested: self.spec.matrix_blocks.len() as u64,
+            })?;
+        for descriptor in self.spec.matrix_blocks {
+            let location = self
+                .chunk_block_location(
+                    locator.record_offset,
+                    locator.payload_len,
+                    locator.block_count,
+                    locator.cell_crc,
+                    false,
+                    descriptor.block_id,
+                )?
+                // A block this spec declares and the record does not: the
+                // record was written by a different layout, and every cell
+                // address derived from it would name another block's bytes.
+                .ok_or(Error::InvalidMatrixChunk)?;
+            let cells = location.cells;
+            self.spec
+                .read_limits
+                .check(ReadLimitKey::MatrixCells, cells)?;
+            let slot_len =
+                cells
+                    .checked_mul(location.stride)
+                    .ok_or(Error::ResourceArithmeticOverflow {
+                        resource: "matrix chunk slot region",
+                    })?;
+            self.spec
+                .read_limits
+                .check(ReadLimitKey::MatrixSlotRegionLen, slot_len)?;
+            // The stored commit map, at its stored length. Re-encoding it at
+            // the canonical `cells.div_ceil(8)` would be a different number of
+            // bytes for a record whose map is longer than that — which
+            // `chunk_block_location` permits, checking only that it covers the
+            // cells — and the rewrite must reproduce the payload length exactly.
+            let commit_len = location
+                .crc_offset
+                .unwrap_or(location.slots_offset)
+                .checked_sub(location.commit_offset)
+                .ok_or(Error::InvalidMatrixChunk)?;
+            let mut commit = try_zeroed_vec(commit_len, "matrix chunk commit map")?;
+            self.snapshot
+                .read_exact_at(location.commit_offset, &mut commit)?;
+            note_chunk_bytes_read(commit_len);
+            let crc = match location.crc_offset {
+                Some(crc_offset) => {
+                    let crc_len = cells.checked_mul(MATRIX_CHUNK_CRC_LEN).ok_or(
+                        Error::ResourceArithmeticOverflow {
+                            resource: "matrix chunk checksum table",
+                        },
+                    )?;
+                    let mut crc = try_zeroed_vec(crc_len, "matrix chunk checksum table")?;
+                    self.snapshot.read_exact_at(crc_offset, &mut crc)?;
+                    note_chunk_bytes_read(crc_len);
+                    crc
+                }
+                None => Vec::new(),
+            };
+            let mut slots = try_zeroed_vec(slot_len, "matrix chunk slot region")?;
+            self.snapshot
+                .read_exact_at(location.slots_offset, &mut slots)?;
+            note_chunk_bytes_read(slot_len);
+            let written = seed_written_map(&commit, &slots, cells, location.stride)?;
+            blocks.push(OpenChunkBlock {
+                block_id: descriptor.block_id,
+                stride: location.stride,
+                cells,
+                written,
+                commit,
+                crc,
+                slots,
+            });
+        }
+        self.open_chunk = Some(OpenChunk {
+            index: locator.index,
+            first_row,
+            rows,
+            compression: None,
+            blocks,
+            // The buffer equals the record it came from. Writing it out now
+            // would rewrite a record with its own bytes, and an idle flush
+            // between a reopen and the first edit must stay a no-op.
+            dirty: false,
+            backing: Some(locator.ordinal),
+        });
+        Ok(())
     }
 
     /// Writes the open chunk as one ordinary internal record.
@@ -8189,7 +8426,7 @@ impl VarveFile {
     /// holding it costs a commit point nothing, and an idle flush still writes
     /// no record, which is the property this guard was for.
     fn write_open_chunk_record(&mut self) -> Result<()> {
-        let (payload, index, block_count, cell_crc, compressed_slots) = {
+        let (payload, index, block_count, cell_crc, compressed_slots, backing) = {
             let Some(chunk) = self.open_chunk.as_ref() else {
                 return Ok(());
             };
@@ -8206,6 +8443,7 @@ impl VarveFile {
                 })?,
                 chunk.blocks.iter().any(|block| !block.crc.is_empty()),
                 chunk.compression.is_some(),
+                chunk.backing,
             )
         };
         let payload_len = payload.len() as u64;
@@ -8215,6 +8453,13 @@ impl VarveFile {
         // Taken from the append itself, not from a second `metadata()` call:
         // the two would disagree if anything landed between them.
         let permit = self.ensure_write()?;
+        // A chunk that was loaded back already has a record. Appending a second
+        // one for the same chunk index would leave the file saying two
+        // different things about the same rows, which `build_chunk_directory`
+        // refuses to read at all — so the edit goes back over the original.
+        if let Some(ordinal) = backing {
+            return self.rewrite_chunk_record(&permit, ordinal, &payload, payload_len);
+        }
         let info = self.write_record_with_prev_key(
             &permit,
             MATRIX_CHUNK_BLOCK_ID,
@@ -8231,6 +8476,7 @@ impl VarveFile {
         // millionth chunk must not pay a rebuild, and the newest entry is what
         // answers "which chunks are written" on the next write.
         if let Some(directory) = self.chunk_directory.get_mut() {
+            let ordinal = directory.next_ordinal();
             directory.note_written(ChunkLocator {
                 index,
                 record_offset,
@@ -8238,8 +8484,118 @@ impl VarveFile {
                 block_count,
                 cell_crc,
                 compressed_slots,
+                ordinal,
             });
         }
+        Ok(())
+    }
+
+    /// Rewrites the record a reloaded chunk came from, where it already sits.
+    ///
+    /// The shape is `replace_fixed_in_place_exclusive`'s, and the addressing is
+    /// the same mechanism: the bytes of an already-indexed record are reachable
+    /// only by consuming a [`ReplacementTarget`], and this one comes from
+    /// `resolve_internal`, which performed the same stored-version refusal.
+    ///
+    /// **Two gates that path runs and this one does not, and why.**
+    /// `ensure_generation_rewrite_allowed` refuses formats with a non-resident
+    /// block, and `validate_source_generation` re-walks and re-validates the
+    /// whole generation before writing. Both belong to a *user* record
+    /// replacement, where the caller names a record by ordinal among blocks the
+    /// file's own readers resolve by ordinal, and neither is free: the second is
+    /// `O(file)`. This runs on a chunk transition, which is the write path of a
+    /// growing matrix — an `O(file)` scan there is the thing the standing
+    /// append-hot-path policy exists to refuse, and it would make a TB-scale
+    /// file's every chunk boundary cost a full pass. What replaces them is that
+    /// the target is not a user's ordinal at all: it is the record this handle
+    /// itself wrote or read this chunk from, its geometry was checked against
+    /// the spec on the way in, and the payload it is handed back is the same
+    /// length, which is asserted below rather than assumed.
+    ///
+    /// The rewrite is *not* crash-atomic, and that is a real difference from the
+    /// append. An append leaves the previous bytes intact until a later record
+    /// supersedes them; this overwrites the only copy, so a torn write loses the
+    /// chunk's older contents as well as its newer ones. The record's header
+    /// checksum covers the payload, so the damage is detected rather than
+    /// silently served. This is the same bargain the matrix *region* has always
+    /// made — an in-place slot write with a per-cell checksum — and reopening a
+    /// chunk is opting into the region's durability model for chunked rows.
+    fn rewrite_chunk_record(
+        &mut self,
+        permit: &FileMutationPermit,
+        ordinal: usize,
+        payload: &[u8],
+        payload_len: u64,
+    ) -> Result<()> {
+        let target = ReplacementTarget::resolve_internal(
+            &self.index,
+            MATRIX_CHUNK_BLOCK_ID,
+            MATRIX_CHUNK_VERSION,
+            ordinal,
+        )?;
+        let entry = self.index.entry_at(target.position())?;
+        // The encoder is deterministic for an uncompressed chunk — the payload
+        // length is a function of the block count, the strides, the cell counts
+        // and the stored commit-map lengths, all of which came from this record
+        // — so this cannot fire from an ordinary edit. It fires if any of that
+        // stops being true, and it fires *before* a byte moves.
+        if entry.payload_len != payload_len {
+            return Err(Error::ReplaceSizeMismatch {
+                old: entry.payload_len,
+                new: payload_len,
+            });
+        }
+        let sequence = self.sequence_state.available()?;
+        let mut footer_bytes = [0; RECORD_FOOTER_LEN as usize];
+        let footer = if let Some(footer_offset) = entry.footer_offset {
+            // Carried across unchanged: the footer holds the offset chains,
+            // which describe where this record sits among its block's records,
+            // and rewriting its payload does not move it.
+            self.snapshot
+                .read_exact_at(footer_offset, &mut footer_bytes)?;
+            &footer_bytes[..]
+        } else {
+            &[]
+        };
+        let header = RecordHeaderFields {
+            block_id: entry.block_id,
+            block_version: entry.block_version,
+            flags: entry.flags,
+            sequence,
+            payload_len,
+            checksum: 0,
+            uncompressed_len_hint: entry.uncompressed_len_hint,
+        };
+        let checksum =
+            checksum_record_fields(self.spec, entry.record_offset, header, payload, footer)?;
+        let header_bytes = encode_native_record_header(
+            RecordHeaderFields { checksum, ..header },
+            entry.record_offset,
+            record_footer_len(self.spec),
+        )?;
+        if let Err(error) =
+            self.overwrite_record_bytes_in_place(permit, target, &header_bytes, payload)
+        {
+            // The record's own bytes are now of unknown state — this is the one
+            // step that cannot be rolled back by truncation — so the handle
+            // stops writing rather than carrying on over it. The chunk is left
+            // open, as in the append path: a failure must not also destroy the
+            // buffer.
+            self.poison.poison();
+            return Err(error);
+        }
+        // On disk. Only now does the handle stop holding it.
+        self.open_chunk = None;
+        // No `note_written`: the directory already carries this chunk, at this
+        // ordinal, at this offset and this length — none of which the rewrite
+        // changed.
+        //
+        // The digest does move, though. It stores the sequence high-water, and
+        // the rewrite consumed a sequence without appending a record, so the
+        // append-driven flag would leave a stale digest describing a file whose
+        // newest sequence is higher than it claims.
+        self.appended_since_digest = true;
+        self.publish_sequence(sequence);
         Ok(())
     }
 
@@ -8322,6 +8678,18 @@ impl VarveFile {
         }
         let byte = usize::try_from(ordinal / 8).map_err(|_| Error::InvalidMatrixLayout)?;
         block.written[byte] |= 1u8 << (ordinal % 8);
+        // A-7. A write, not just a commit, now makes the buffer differ from the
+        // file, and a chunk that is not `dirty` is dropped on the next chunk
+        // transition — so without this a write into a reloaded chunk vanished
+        // silently, which is strictly worse than the refusal it replaced.
+        //
+        // Widening `dirty` to "has content" was tried before reopening existed
+        // and had to be reverted: it made an uncommitted write force the chunk
+        // out, and a chunk that had gone out could never be opened again, so a
+        // `write` → `flush` sequence *locked the rest of its rows forever*. That
+        // is no longer the case — a written chunk comes back — which is what
+        // makes this the honest meaning rather than a trap.
+        chunk.dirty = true;
         Ok(())
     }
 
@@ -8593,16 +8961,6 @@ impl VarveFile {
             {
                 return Err(Error::InvalidMatrixChunk);
             }
-            // The binary search below is only legal on an ordered list, and
-            // the writer's ordering is a property of *this* build's writing the chunk
-            // rule, not of the bytes. A file from anywhere else must be
-            // refused rather than searched.
-            if chunks
-                .last()
-                .is_some_and(|last: &ChunkLocator| last.index >= prefix.index)
-            {
-                return Err(Error::InvalidMatrixChunk);
-            }
             chunks.try_reserve(1).map_err(|_| Error::AllocationFailed {
                 resource: "matrix chunk directory",
                 requested: chunks.len() as u64 + 1,
@@ -8614,7 +8972,32 @@ impl VarveFile {
                 block_count: prefix.block_count,
                 cell_crc: prefix.cell_crc,
                 compressed_slots: prefix.compressed_slots,
+                // File order, which is the order this loop walks and the order
+                // `ReplacementTarget` counts in. Captured here because the sort
+                // below is about to destroy it.
+                ordinal: chunks.len(),
             });
+        }
+        // The binary search in `find` is only legal on a list ordered by chunk
+        // index, and file order no longer supplies that: a chunk that committed
+        // nothing is never written, so a later write to one of its rows appends
+        // its record *after* higher-indexed ones. This used to demand ascending
+        // file order and refuse anything else, which was correct while chunks
+        // could only be written in one direction and is a rejection of a
+        // perfectly readable file now.
+        //
+        // `sort_by_key` and not `sort_unstable_by_key`: with duplicate indexes
+        // the two disagree about which record survives to the `windows` check
+        // below, and refusing must not depend on that.
+        chunks.sort_by_key(|locator| locator.index);
+        // What *is* still refused, and the reason it has to be. Two records
+        // claiming one chunk index is not an ordering question — it is a file
+        // saying two different things about the same rows, with nothing in the
+        // format to say which is current. A rewrite goes back over the original
+        // record precisely so this cannot arise; a file where it has arisen was
+        // not written by this code.
+        if chunks.windows(2).any(|pair| pair[0].index == pair[1].index) {
+            return Err(Error::InvalidMatrixChunk);
         }
         Ok(ChunkDirectory { chunks })
     }
@@ -9365,28 +9748,25 @@ impl VarveFile {
 
     /// Clears one chunked cell: its commit bit and its slot bytes.
     ///
-    /// Only in the open chunk. A written chunk is a written record, and a record
-    /// is not rewritten — the same refusal a late write gets, for the same
-    /// reason.
+    /// Opens the cell's chunk first, loading it back from its record when it has
+    /// one. This used to refuse anything but the currently open chunk, which
+    /// left the two halves of the same capability disagreeing: after
+    /// [`Self::open_chunk_at`] learned to reload, a written cell could be
+    /// *overwritten* but not *cleared*. A caller cannot act on that distinction
+    /// — clearing is what `write` is for a cell that should go back to having no
+    /// value — so it was a refusal with nothing behind it.
+    ///
+    /// The refusals that remain are the ones `open_chunk_at` reports, and they
+    /// are about the record's shape rather than about the cell: a compressed
+    /// chunk cannot be rewritten at its stored length. See
+    /// [`Error::MatrixChunkNotReopenable`].
     fn clear_chunk_cell<T: VarveMatrixBlock>(
         &mut self,
         key: MatrixKey,
         chunk_index: u64,
         local_row: u64,
     ) -> Result<()> {
-        match &self.open_chunk {
-            Some(open) if open.index == chunk_index => {}
-            _ => {
-                // `open` is what the caller may still write to. With no chunk
-                // open there is none, and the first version reported the
-                // refused chunk as its own opener — `{ chunk: 3, open: 3 }`,
-                // which reads as a contradiction.
-                return Err(Error::MatrixChunkClosed {
-                    chunk: chunk_index,
-                    open: self.open_chunk.as_ref().map(|open| open.index),
-                });
-            }
-        }
+        self.open_chunk_at(chunk_index)?;
         let (position, ordinal) = self.chunk_block_slice::<T>(chunk_index, local_row, key)?;
         let chunk = self.open_chunk.as_mut().ok_or(Error::InvalidMatrixChunk)?;
         let block = &mut chunk.blocks[position];
@@ -9401,11 +9781,24 @@ impl VarveFile {
         .map_err(|_| Error::InvalidMatrixLayout)?;
         let len = usize::try_from(block.stride).map_err(|_| Error::InvalidMatrixLayout)?;
         block.slots[start..start + len].fill(0);
+        // A chunk with a record on disk must be written out again, or the clear
+        // lives in the buffer while the file keeps serving the old value —
+        // silent loss of a mutation, reported as success. A chunk with no record
+        // has nothing to contradict, so clearing it leaves an idle flush writing
+        // nothing, which is what `dirty` is for.
+        if chunk.backing.is_some() {
+            chunk.dirty = true;
+        }
         Ok(())
     }
 
     /// [`Self::clear_chunk_cell`] addressed by block id rather than by type, for
     /// the by-category entry point.
+    ///
+    /// **Still open-chunk only, unlike its typed twin.** The by-category clear
+    /// walks every row of a category, so reopening for it means loading and
+    /// rewriting *every* written chunk — a different operation with a different
+    /// cost, not a line of plumbing. It is refused rather than half-done.
     fn clear_chunk_cell_by_id(
         &mut self,
         block_id: u32,
@@ -19058,6 +19451,7 @@ mod tests {
                 slots: vec![7; 128],
             }],
             dirty: true,
+            backing: None,
         });
 
         // A ceiling the encoded chunk cannot fit under.

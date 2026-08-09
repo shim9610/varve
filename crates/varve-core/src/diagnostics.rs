@@ -810,6 +810,7 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::MatrixNotCommitted
         | Error::MatrixCellNotWritten
         | Error::MatrixChunkClosed { .. }
+        | Error::MatrixChunkNotReopenable { .. }
         | Error::InvalidMatrixChunk
         | Error::LayoutFieldMissing(_)
         | Error::LayoutFieldUnexpected(_)

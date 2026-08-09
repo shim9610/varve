@@ -338,36 +338,129 @@ fn an_uncommitted_cell_in_a_written_chunk_stays_uncommitted() -> varve::Result<(
 }
 
 // ---------------------------------------------------------------------------
-// §6.4 A late write into a written chunk is refused
+// §6.4 A late write into a written chunk edits it where it already sits
 // ---------------------------------------------------------------------------
 
+/// A write to a row of an already-written chunk lands, and does not grow the
+/// file.
+///
+/// **This test asserted the opposite refusal until 2026-08-09, and the refusal
+/// was the defect.** A writer that can edit a written row of the matrix
+/// *region* could not edit a written row of a *chunk*, for no reason in the
+/// format: a chunk record is an ordinary record, and rewriting one of those in
+/// place is a route `RecordFile` has had since round 12. What the refusal cost
+/// was not a corner case — it was every read-modify-write of a growing matrix.
+///
+/// The file length is the assertion that the edit went back over the original
+/// record instead of appending a second one for the same chunk index. A
+/// duplicate would not merely waste space: `build_chunk_directory` refuses a
+/// file carrying two records for one chunk, so the append would have made the
+/// file unopenable.
 #[test]
-fn a_write_into_a_written_chunk_is_refused_and_changes_nothing() -> varve::Result<()> {
+fn a_write_into_a_written_chunk_edits_it_in_place() -> varve::Result<()> {
     let path = temp_path("closed_refusal");
+    let first = key(ROWS_PER_CHUNK, 0);
+    let late = key(ROWS_PER_CHUNK, 1);
     let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
-    writer.write_matrix_cell(key(ROWS_PER_CHUNK, 0), &Sample { value: 1 })?;
-    writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0))?;
+    writer.write_matrix_cell(first, &Sample { value: 1 })?;
+    writer.commit_matrix_cell::<Sample>(first)?;
     // Opening chunk 2 writes out chunk 1.
     writer.write_matrix_cell(key(ROWS_PER_CHUNK * 2, 0), &Sample { value: 2 })?;
     writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK * 2, 0))?;
     writer.flush()?;
-    let before = std::fs::read(path.path())?;
+    let before = std::fs::metadata(path.path())?.len();
 
-    // Late data is reported, not dropped: a value that silently does not arrive
-    // is indistinguishable from one that was never sent.
-    //
-    // `open` is `None` because the flush above written chunk 2, so nothing is
-    // open — which the error now says, rather than naming the refused chunk as
-    // its own opener.
-    assert!(matches!(
-        writer.write_matrix_cell(key(ROWS_PER_CHUNK, 1), &Sample { value: 3 }),
-        Err(Error::MatrixChunkClosed {
-            chunk: 1,
-            open: None
-        }),
-    ));
+    writer.write_matrix_cell(late, &Sample { value: 3 })?;
+    writer.commit_matrix_cell::<Sample>(late)?;
     writer.flush()?;
-    assert_eq!(std::fs::read(path.path())?, before);
+    assert_eq!(
+        std::fs::metadata(path.path())?.len(),
+        before,
+        "the edit must rewrite chunk 1's record, not append a second one",
+    );
+    drop(writer);
+
+    let reader = growing_spec().open_reader(path.path())?;
+    // The new cell, and the one that was already there: a rewrite carries the
+    // whole chunk, so losing the untouched cell is the way this fails.
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(late)?,
+        Sample { value: 3 }
+    );
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(first)?,
+        Sample { value: 1 }
+    );
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(key(ROWS_PER_CHUNK * 2, 0))?,
+        Sample { value: 2 }
+    );
+    Ok(())
+}
+
+/// The same cell, written twice: the second value is what the file holds.
+///
+/// Separate from the test above because "a cell that had no value gets one" and
+/// "a cell that had a value gets a different one" fail differently — the second
+/// is the one that a rewrite which ORs commit bits without replacing slot bytes
+/// would still pass.
+#[test]
+fn a_written_chunk_cell_can_be_overwritten_with_a_new_value() -> varve::Result<()> {
+    let path = temp_path("chunk_cell_rewrite");
+    let cell = key(ROWS_PER_CHUNK, 0);
+    let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+    writer.write_matrix_cell(cell, &Sample { value: 11 })?;
+    writer.commit_matrix_cell::<Sample>(cell)?;
+    // Write chunk 1 out by moving past it.
+    writer.write_matrix_cell(key(ROWS_PER_CHUNK * 2, 0), &Sample { value: 2 })?;
+    writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK * 2, 0))?;
+    writer.flush()?;
+
+    writer.write_matrix_cell(cell, &Sample { value: 22 })?;
+    writer.commit_matrix_cell::<Sample>(cell)?;
+    writer.flush()?;
+    drop(writer);
+
+    let reader = growing_spec().open_reader(path.path())?;
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(cell)?,
+        Sample { value: 22 }
+    );
+    Ok(())
+}
+
+/// A chunk the writer skipped — nothing committed, so no record — accepts a
+/// write later, and the file it produces still opens.
+///
+/// This is the case that makes the chunk directory's ordering rule a *sorted*
+/// one rather than an ascending-file-order one. Chunk 3's record is written
+/// first; chunk 1's is appended after it and carries the lower index. Under the
+/// old rule the file that produced was refused at open with
+/// `InvalidMatrixChunk` — by the writer's own next open.
+#[test]
+fn a_skipped_chunk_can_be_filled_in_after_a_later_one_was_written() -> varve::Result<()> {
+    let path = temp_path("chunk_backfill");
+    let late = key(ROWS_PER_CHUNK * 3, 0);
+    let skipped = key(ROWS_PER_CHUNK, 0);
+    {
+        let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
+        writer.write_matrix_cell(late, &Sample { value: 33 })?;
+        writer.commit_matrix_cell::<Sample>(late)?;
+        writer.flush()?;
+        // Chunk 1 was never opened, so no record for it exists.
+        writer.write_matrix_cell(skipped, &Sample { value: 11 })?;
+        writer.commit_matrix_cell::<Sample>(skipped)?;
+        writer.flush()?;
+    }
+    let reader = growing_spec().open_reader(path.path())?;
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(skipped)?,
+        Sample { value: 11 }
+    );
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(late)?,
+        Sample { value: 33 }
+    );
     Ok(())
 }
 
@@ -609,8 +702,21 @@ fn the_payload_write_entry_point_routes_like_the_typed_one() -> varve::Result<()
     Ok(())
 }
 
+/// A cell clears in a written chunk exactly as it does in the open one, and the
+/// clear survives to the file.
+///
+/// **The typed clear used to refuse a written chunk and no longer does.** Once
+/// `write_matrix_cell` could edit a written chunk, that refusal had nothing
+/// behind it: clearing is what a write is for a cell that should go back to
+/// having no value, so accepting one and refusing the other left the two halves
+/// of one capability disagreeing.
+///
+/// The by-category clear still refuses, and that is not the same omission: it
+/// walks every row of a category, so serving it over written chunks means
+/// loading and rewriting every one of them — a different operation with a
+/// different cost. It is refused rather than half-done.
 #[test]
-fn clearing_a_cell_in_the_open_chunk_works_and_in_a_written_one_is_refused() -> varve::Result<()> {
+fn clearing_a_cell_works_in_a_written_chunk_as_in_the_open_one() -> varve::Result<()> {
     let path = temp_path("clear");
     let written_cell = key(ROWS_PER_CHUNK, 0);
     let open_cell = key(ROWS_PER_CHUNK * 2, 1);
@@ -625,16 +731,26 @@ fn clearing_a_cell_in_the_open_chunk_works_and_in_a_written_one_is_refused() -> 
         writer.matrix_cell_status::<Sample>(open_cell)?,
         MatrixCellStatus::NotCommitted,
     );
-    // A written chunk is a written record, and a record is not rewritten — the
-    // same refusal a late write gets, for the same reason.
-    assert!(matches!(
-        writer.clear_matrix_cell::<Sample>(written_cell),
-        Err(Error::MatrixChunkClosed { chunk: 1, .. }),
-    ));
-    assert!(matches!(
-        writer.clear_matrix_cell_by_category(Sample::CATEGORY, written_cell),
-        Err(Error::MatrixChunkClosed { chunk: 1, .. }),
-    ));
+    writer.clear_matrix_cell::<Sample>(written_cell)?;
+    assert_eq!(
+        writer.matrix_cell_status::<Sample>(written_cell)?,
+        MatrixCellStatus::NotCommitted,
+    );
+    // The by-category refusal is asserted by
+    // `clearing_a_category_counts_the_open_chunk_and_refuses_a_written_one`, and
+    // cannot be asserted here any more: the typed clear above reopened chunk 1,
+    // so it is now *the open chunk* and the category clear serves it.
+    writer.flush()?;
+    drop(writer);
+
+    // Written out, not just cleared in the buffer: the record on disk still
+    // carried the old value until `dirty` learned that a clear on a reloaded
+    // chunk is a change.
+    let reader = growing_spec().open_reader(path.path())?;
+    assert_eq!(
+        reader.matrix_cell_status::<Sample>(written_cell)?,
+        MatrixCellStatus::NotCommitted,
+    );
     Ok(())
 }
 
@@ -660,11 +776,19 @@ fn the_entry_points_that_do_not_apply_say_so_by_name() -> varve::Result<()> {
     Ok(())
 }
 
+/// A chunk written by an earlier handle is editable by a later one, from a cold
+/// open and again after another chunk has been opened in between.
+///
+/// Both orders on purpose. The first edit happens with **no chunk open**, so it
+/// can only work by finding the record in the directory built from the file;
+/// the second happens while chunk 3 is open, so it also exercises writing that
+/// chunk out and loading chunk 1 back in the same call. An implementation that
+/// handled only the in-memory branch would pass the second and fail the first.
 #[test]
-fn a_reopened_writer_appends_to_a_later_chunk_and_still_refuses_the_closed_one() -> varve::Result<()>
-{
+fn a_reopened_writer_edits_a_chunk_written_by_the_previous_handle() -> varve::Result<()> {
     let path = temp_path("reopen_append");
     let first = key(ROWS_PER_CHUNK, 0);
+    let second = key(ROWS_PER_CHUNK, 2);
     let later = key(ROWS_PER_CHUNK * 3, 0);
     {
         let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
@@ -673,34 +797,25 @@ fn a_reopened_writer_appends_to_a_later_chunk_and_still_refuses_the_closed_one()
         writer.flush()?;
     }
     let mut writer = growing_spec().open_writer(path.path())?;
-    // The written write comes **first**, while no chunk is open. Ordered the
-    // other way this test proved nothing: opening chunk 3 first makes the
-    // refusal come from the in-memory `open_chunk.index > index` branch, so a
-    // build that forgot the watermark across a reopen still passed. Only the
-    // crash sweep caught that, which is why the order here is deliberate.
-    assert!(matches!(
-        writer.write_matrix_cell(first, &Sample { value: 1 }),
-        Err(Error::MatrixChunkClosed {
-            chunk: 1,
-            open: None
-        }),
-    ));
+    // Cold: nothing is open, so chunk 1 must come back from its record.
+    writer.write_matrix_cell(first, &Sample { value: 1 })?;
+    writer.commit_matrix_cell::<Sample>(first)?;
     writer.write_matrix_cell(later, &Sample { value: 9 })?;
     writer.commit_matrix_cell::<Sample>(later)?;
-    assert!(matches!(
-        writer.write_matrix_cell(first, &Sample { value: 1 }),
-        Err(Error::MatrixChunkClosed {
-            chunk: 1,
-            open: Some(3)
-        }),
-    ));
+    // Warm: chunk 3 is open and must be written out to make room for chunk 1.
+    writer.write_matrix_cell(second, &Sample { value: 7 })?;
+    writer.commit_matrix_cell::<Sample>(second)?;
     writer.flush()?;
     drop(writer);
 
     let reader = growing_spec().open_reader(path.path())?;
     assert_eq!(
         reader.read_matrix_cell::<Sample>(first)?,
-        Sample { value: 5 }
+        Sample { value: 1 }
+    );
+    assert_eq!(
+        reader.read_matrix_cell::<Sample>(second)?,
+        Sample { value: 7 }
     );
     assert_eq!(
         reader.read_matrix_cell::<Sample>(later)?,
@@ -802,16 +917,15 @@ fn a_truncated_file_loses_no_committed_cell_and_shows_no_half_chunk() -> varve::
                 survived.push(chunk);
             }
         }
-        // A surviving chunk is written: reopening it must be refused, not
-        // silently duplicated.
+        // A surviving chunk is written, and a written chunk is editable: the
+        // record is loaded back and rewritten where it sits, never duplicated.
+        // The duplicate is what the sweep is watching for here — it would make
+        // the file unopenable at the *next* open, several statements below,
+        // rather than at the write.
         if let Some(newest) = survived.last() {
-            assert!(
-                matches!(
-                    writer.write_matrix_cell(key(newest * ROWS_PER_CHUNK, 1), &Sample { value: 0 }),
-                    Err(Error::MatrixChunkClosed { .. }),
-                ),
-                "cut {cut}: chunk {newest} survived but was reopenable",
-            );
+            let touched = key(newest * ROWS_PER_CHUNK, 1);
+            writer.write_matrix_cell(touched, &Sample { value: 0xABC })?;
+            writer.commit_matrix_cell::<Sample>(touched)?;
         }
         let fresh = key((chunks + 4) * ROWS_PER_CHUNK, 0);
         writer.write_matrix_cell(fresh, &Sample { value: 99 })?;
