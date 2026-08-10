@@ -1,12 +1,15 @@
-# API Changes — 0.3.0 to 0.4.0, 0.4.0 to 0.5.0, and 0.5.0 to 0.6.0
+# API Changes — 0.3.0 through 0.7.0
 
 Migration document. Companion to [Known Limitations](known-limitations.md)
 and the [Changelog](../CHANGELOG.md).
 
-Section **B** is the 0.5.0 → 0.6.0 migration: two changed signatures from the
-reader no longer keeping a copy of the file's index. Section **A** is the
-0.4.0 → 0.5.0 migration: four changes, all about matrix commit-metadata
-residency and verification. Everything numbered 1 through 5 is the
+Sections run newest first, and the letters ascend with the release they
+describe. Section **C** is the 0.6.0 → 0.7.0 migration: a writer open that does
+not scan, an editable written matrix chunk, and one renamed error. Section **B**
+is the 0.5.0 → 0.6.0 migration: two changed signatures from the reader no longer
+keeping a copy of the file's index. Section **A** is the 0.4.0 → 0.5.0
+migration: four changes, all about matrix commit-metadata residency and
+verification. Everything numbered 1 through 5 is the
 0.3.0 → 0.4.0 migration and is unchanged except where a section says 0.5.0
 corrected it — §5.12 in particular now describes a bug that **no longer exists**,
 and says so in place.
@@ -17,9 +20,9 @@ decoder, header field or version constant was touched. If you are coming from
 
 ---
 
-## B. From 0.5.0 to 0.6.0: a writer open that does not scan, an editable written chunk, two changed signatures, one struct field, and one renamed error
+## C. From 0.6.0 to 0.7.0: a writer open that does not scan, an editable written chunk, and one renamed error
 
-### B.-3 `VarveFile::open_lazy` / `VarveWriter::open_lazy` — a writer that does not scan
+### C.1 `VarveFile::open_lazy` / `VarveWriter::open_lazy` — a writer that does not scan
 
 New, additive; nothing to migrate. Every other writer open frames every record
 in the file, at any size, because it builds the resident index. `open_lazy`
@@ -49,7 +52,7 @@ Two things it does not have, both inherited from the read-only digest open:
 `open_lazy_with_report` returns `LazyOpenSource` like its read-only twin, and
 the fallback is the same: any file whose digest is not usable opens by scanning.
 
-### B.-2 A written matrix chunk can now be edited, and `Error::MatrixChunkNotReopenable` is new
+### C.2 A written matrix chunk can now be edited, and `Error::MatrixChunkNotReopenable` is new
 
 **A write to a row of an already-written chunk used to fail with
 `Error::MatrixChunkClosed`. It now succeeds.** If your code matched on that
@@ -148,7 +151,7 @@ It refuses with `MatrixChunkNotReopenable` for the same two formats as above
 clearing anything, so such a format gets a refusal rather than a region that has
 been cleared and chunks that have not.
 
-### B.-1 `Error::MatrixChunkSealed` is now `Error::MatrixChunkClosed`
+### C.3 `Error::MatrixChunkSealed` is now `Error::MatrixChunkClosed`
 
 Same fields (`chunk`, `open`), same meaning, honest name. Match arms and any
 `matches!` on the variant need the new spelling; nothing else changes.
@@ -169,6 +172,8 @@ not the same: making a chunk durable, and closing it to further writes. Only
 the first is what the operation does; the second is a consequence of records
 being write-once today, not a property of the data model. The matrix region
 itself is rewritten in place all the time.
+
+## B. From 0.5.0 to 0.6.0: two changed signatures, one struct field, and changed behaviour at unchanged signatures
 
 ### B.0 The two changed signatures, and the new field
 

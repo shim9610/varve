@@ -546,7 +546,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "varve"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proptest",
  "tempfile",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "varve-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crc32fast",
  "libc",
@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "varve-macros"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "varve-test-runner"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "wait-timeout"

@@ -1242,12 +1242,30 @@ on tests at far smaller scales, not on a demonstration at one petabyte.
   predate several rounds of change to `matrix.rs`, `file.rs`, `codec.rs` and
   `format.rs`. The cited ASan run covered 21 library tests; the library suite is
   now 139.
-- **No fuzz campaign, no Miri run and no ASan run has been performed against this
-  release's code.**
-- An unpromoted libFuzzer OOM reproducer exists in the working tree at
-  `fuzz/artifacts/codec_arbitrary/oom-53bc…` from 2026-07-20. It is gitignored
-  and will not be published, and `scripts/run-security-fuzz.ps1` refuses to start
-  (exit 2) while it is present.
+- **This changed in 0.7.0, and the change is smaller than it sounds.** All three
+  now run, weekly, in `.github/workflows/sanitizers.yml`: `fuzz-smoke` builds and
+  runs **every** target for 90 seconds each, `asan` runs the `varve` and
+  `varve-core` test suites under AddressSanitizer with `--all-features`, and
+  `miri` runs `varve-core`'s no-default-feature unit tests. Executed on Linux
+  before the workflow landed: Miri 28 tests green under strict provenance and
+  symbolic alignment checking, ASan 163 tests green with zero reports, and a
+  bounded campaign on two targets producing no artifact.
+
+  Ninety seconds per target is a smoke test, not a campaign. It proves the
+  harness runs and catches what is shallow; it explores almost nothing. The
+  disparity is measurable rather than theoretical: `codec_arbitrary` executes
+  about 300,000 inputs per second, while `sidecar_state_machine` -- which builds
+  a redb sidecar per input and `fsync`s it -- manages 64, so the same 90 seconds
+  buys 27 million executions on one target and under 6,000 on another. **No long
+  fuzz campaign has been run against this code**, and the modules that most need
+  one are the slowest to fuzz.
+- A libFuzzer OOM reproducer from 2026-07-20 sat unpromoted in
+  `fuzz/artifacts/codec_arbitrary/` until 0.7.0, blocking
+  `scripts/run-security-fuzz.ps1` (exit 2) the whole time. It is now a test --
+  `codec_hardening.rs::the_2026_07_20_oom_reproducer_stays_refused`, with the
+  eleven bytes inlined so deleting the artifact did not delete the regression --
+  and the artifact is gone. Replayed through the real fuzz target on Linux before
+  removal: executed in 0 ms, no OOM.
 
   **It has now been triaged, and it does not reproduce against this release's
   code.** The 11 bytes select `decode_from_slice::<HashMap<(), ()>>` (selector

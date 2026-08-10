@@ -27,8 +27,9 @@ choose the digest when open cost is.
 > merge and compact are resident-only and Varve exports no bounded-memory
 > external merge or compact. The scale gates behind the cost model
 > (`pib_probe`'s 1 PiB and 1 TiB positional-I/O probes) are `#[ignore]`d and have
-> never been executed, and this module set has not been walked against the
-> project's internal invariants. See
+> never been executed. This module set **has** been walked against the project's
+> internal invariants, with no defect found; that is review, not use, and does not
+> move the `dev` flag. See
 > [Known Limitations §3](known-limitations.md#3-the-scalable-family-is-behind-a-feature-flag-named-dev)
 > and [§6](known-limitations.md#6-not-verified).
 

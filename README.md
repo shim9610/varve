@@ -34,11 +34,12 @@ is covered in **[API Changes](docs/api-changes.md)**.
 - Bounded-memory ingest and point lookup over data far larger than RAM — with two
   caveats that a reader should weigh before choosing Varve for this workload.
   It is behind the `high-cardinality-dev` feature, has never shipped in a released
-  version, and its API may still change. **And its four modules (`disk_index.rs`,
-  `stream.rs`, `indexed.rs`, `scan_control.rs`) have not been walked against the
-  project's five internal invariants**, while the matrix and resident paths have.
-  The only path offered for the larger-than-RAM workload is the least-audited code
-  in the tree.
+  version, and its API may still change. Its four modules (`disk_index.rs`,
+  `stream.rs`, `indexed.rs`, `scan_control.rs`) **have now been walked against the
+  project's five internal invariants**, as the matrix and resident paths were, and
+  the walk found no defect. That is a statement about review, not about use: the
+  feature is still `dev`, still unreleased, and the flag is still the honest
+  signal.
 - Preallocated matrix storage with **fixed dimensions**, a live page count whose
   page-index mirror (~96 bytes per live page) fits the process memory budget — the
   commit-map payload itself is demand-cached and bounded, so it does not have to —
@@ -251,7 +252,7 @@ the git repository and pin a tag:
 
 ```toml
 [dependencies]
-varve = { git = "https://github.com/shim9610/varve", tag = "v0.6.0" }
+varve = { git = "https://github.com/shim9610/varve", tag = "v0.7.0" }
 ```
 
 Pin the tag rather than tracking `main`: `main` moves, and this project is at a
@@ -265,7 +266,7 @@ a build that enables none is the smallest one. Enable what a format declaration
 actually asks for:
 
 ```toml
-varve = { git = "https://github.com/shim9610/varve", tag = "v0.6.0",
+varve = { git = "https://github.com/shim9610/varve", tag = "v0.7.0",
           features = ["integrity", "compression-zstd"] }
 ```
 
@@ -393,7 +394,7 @@ gate, file data, environment, or library invariant issues. See
 
 ## Status
 
-Varve 0.6.0 is usable as an alpha library for experimentation and controlled
+Varve 0.7.0 is usable as an alpha library for experimentation and controlled
 deployments. Through the **stable, released** APIs that means moderate scale —
 files whose record and key counts fit in RAM. The larger-than-RAM path exists but
 is behind `high-cardinality-dev`, has never shipped, and is the least audited code
@@ -401,11 +402,11 @@ in the tree; "far larger than RAM" in the capability table above describes that
 feature-gated family, not the default one. It includes append-log blocks, keyed
 collections, transaction/footer commit policies, schema manifests, diagnostics,
 merge and compact helpers, variable-block compression, matrix storage, mmap, and
-opt-in zero-copy. Valid native 0.1 append-log wire bytes remain readable in 0.6.0,
+opt-in zero-copy. Valid native 0.1 append-log wire bytes remain readable in 0.7.0,
 but the Rust API is still pre-1.0 and may evolve through semver-signaled minor
 releases.
 
-**Four artifact classes are not covered by that statement in 0.6.0.** They are
+**Four artifact classes are not covered by that statement in 0.7.0.** They are
 rejected with a typed error rather than misread, but two of them hold data and two
 are regenerable, and the difference is what it costs you:
 
@@ -452,12 +453,15 @@ and the remediation was verified on 2026-07-10 and 2026-07-11 across fail-closed
 resource limits, open-object snapshots, strict recovery classification,
 copy-on-write fixed replacement, canonical decoding, native and matrix structural
 validation, sidecar and lock bounds, and generated API trust boundaries. **That
-review predates 0.4.0 and every hardening round recorded in the changelog, and it
-is not a substitute for the fuzz, Miri and ASan runs that have not happened.**
+review predates 0.4.0 and every hardening round recorded in the changelog.**
 
-For the full assurance picture — including that no fuzz, Miri or ASan run covers
-this code, and which platform each number came from — see
-[Known Limitations §6](docs/known-limitations.md#6-not-verified).
+Fuzz, Miri and ASan now run weekly (`.github/workflows/sanitizers.yml`), and
+0.7.0 is the first release that can say so. Read what that buys before relying
+on it: the fuzz job gives each target **90 seconds**, which is a smoke test and
+not a campaign, and the targets that exercise the sidecar path manage about 64
+executions per second against `codec_arbitrary`'s 300,000. For the full
+assurance picture — including that, and which platform each number came from —
+see [Known Limitations §6](docs/known-limitations.md#6-not-verified).
 
 ## Local Verification
 

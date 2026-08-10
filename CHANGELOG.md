@@ -4,7 +4,7 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
-## 0.6.0 - 2026-08-07
+## 0.7.0 - 2026-08-10
 
 ### A written matrix chunk is editable
 
@@ -54,6 +54,68 @@ on. A chunk counts as needing a write-out once anything is written to it, not
 only once something is committed — a widening that was previously unsafe,
 because a chunk that went out could never come back and a `write` → `flush`
 sequence therefore locked the rest of its rows permanently.
+
+### A **writer** open that reads no record
+
+`VarveFile::open_lazy` and `VarveWriter::open_lazy`, with
+`open_lazy_with_report` beside each. Additive; see
+[API Changes §B.-3](docs/api-changes.md).
+
+The digest open above landed on the read side only, and that left the standing
+requirement — TB-scale files work, memory bounded by the working set — true for
+readers and false for the workload this project names as primary. Every writer
+open called `load_index` with `ScanIntent::Writer` and framed every record in
+the file, at any size, and a continuous appender reopens its writer on every
+restart. Measured at 200 records: the scanning open frames **202**, the lazy one
+frames **1**. The difference is the file, not the constant.
+
+It inherits both of the read-side open's absences. No resident directory —
+`blocks::<T>()` answers `NoResidentDirectory`, and `record_map` is the walk;
+appending is unaffected, because the append path maintains the block tails and
+the sequence itself and the digest supplied both. And no checkpoint or segment:
+a spec declaring `checkpoint_on_flush` or `segment_on_flush` is refused at open
+with the new `Error::LazyWriterIndexPolicy`, because both records serialize the
+resident index this handle does not keep. Refusing beats opening a handle that
+writes nothing and leaves a file slower to open than its spec claims.
+
+Falls back to the full scan for any file whose digest is not usable, exactly as
+the read-side open does, and `open_lazy_with_report` returns which route it took.
+
+### One `lseek` per appended record, gone
+
+`AppendSnapshot` took its rollback cursor with `stream_position` — a syscall per
+record, on the path whose policy admits none. The same round removed two
+`fstat`s from this window and left this one, because the test guarding it counts
+`metadata` calls and could not see a seek. Measured at 1,000 records: **2,000
+seeks before, 1,000 after**, and the survivor is `append_record_at_end`'s own
+`seek(SeekFrom::End(0))` — the check that refuses an append at any offset but
+the end, whose removal is the positional-write redesign and not this.
+
+Nothing takes the number now, because nothing needed it: its only consumer was
+the value `rollback_append` seeks back to, and a rollback truncates to
+`AppendSnapshot::eof` — an offset the append already holds. Restoring that
+instead costs no syscall and no bookkeeping. `take_record_file_seeks` (behind
+`scalable-fault-injection`) is what makes the count assertable.
+
+The first attempt *tracked* the cursor in `RecordFile` instead, and that version
+was unsound. The writer's `snapshot` is a `try_clone` of the same handle, and
+`try_clone` shares the open file description — so it shares the offset, and it
+seeks it: `SnapshotFile::cursor_at` (the layout scan), every `replace_*` through
+`validate_generation_index`, and on Windows every positional read, since
+`read_exact_at` is `seek_read` there. That last one moves the offset from another
+thread, under `&self`, while the writer holds `&mut` — so no
+invalidate-on-handout scheme could have covered it. The cache is gone and
+`enforcement_gates.rs` pins its absence.
+
+One cold-path behaviour changed with it. A rollback used to put the handle back
+exactly where the append found it; it now leaves it at the restored end of file.
+The two differ only for the first append after a reopen — the open scan leaves
+the handle where it stopped reading (measured 5493) while `eof` is the committed
+end (9143) — and only when that append fails. Nothing reads this handle
+sequentially: appends seek `SEEK_END`, rewrites seek their own offset, reads are
+positional.
+
+## 0.6.0 - 2026-08-07
 
 ### The reader stops keeping a copy of the file
 
@@ -183,66 +245,6 @@ New on disk: internal block id `OPEN_DIGEST_BLOCK_ID` (`0xFFFF_FFF5`), payload
 magic `b"VDIG"`. See [Spec](docs/spec.md) for the layout and the acceptance
 rules. A reader whose spec does not declare it indexes it as an internal record
 exactly as it indexes a segment record; measured, the entry lists are identical.
-
-### A **writer** open that reads no record
-
-`VarveFile::open_lazy` and `VarveWriter::open_lazy`, with
-`open_lazy_with_report` beside each. Additive; see
-[API Changes §B.-3](docs/api-changes.md).
-
-The digest open above landed on the read side only, and that left the standing
-requirement — TB-scale files work, memory bounded by the working set — true for
-readers and false for the workload this project names as primary. Every writer
-open called `load_index` with `ScanIntent::Writer` and framed every record in
-the file, at any size, and a continuous appender reopens its writer on every
-restart. Measured at 200 records: the scanning open frames **202**, the lazy one
-frames **1**. The difference is the file, not the constant.
-
-It inherits both of the read-side open's absences. No resident directory —
-`blocks::<T>()` answers `NoResidentDirectory`, and `record_map` is the walk;
-appending is unaffected, because the append path maintains the block tails and
-the sequence itself and the digest supplied both. And no checkpoint or segment:
-a spec declaring `checkpoint_on_flush` or `segment_on_flush` is refused at open
-with the new `Error::LazyWriterIndexPolicy`, because both records serialize the
-resident index this handle does not keep. Refusing beats opening a handle that
-writes nothing and leaves a file slower to open than its spec claims.
-
-Falls back to the full scan for any file whose digest is not usable, exactly as
-the read-side open does, and `open_lazy_with_report` returns which route it took.
-
-### One `lseek` per appended record, gone
-
-`AppendSnapshot` took its rollback cursor with `stream_position` — a syscall per
-record, on the path whose policy admits none. The same round removed two
-`fstat`s from this window and left this one, because the test guarding it counts
-`metadata` calls and could not see a seek. Measured at 1,000 records: **2,000
-seeks before, 1,000 after**, and the survivor is `append_record_at_end`'s own
-`seek(SeekFrom::End(0))` — the check that refuses an append at any offset but
-the end, whose removal is the positional-write redesign and not this.
-
-Nothing takes the number now, because nothing needed it: its only consumer was
-the value `rollback_append` seeks back to, and a rollback truncates to
-`AppendSnapshot::eof` — an offset the append already holds. Restoring that
-instead costs no syscall and no bookkeeping. `take_record_file_seeks` (behind
-`scalable-fault-injection`) is what makes the count assertable.
-
-The first attempt *tracked* the cursor in `RecordFile` instead, and that version
-was unsound. The writer's `snapshot` is a `try_clone` of the same handle, and
-`try_clone` shares the open file description — so it shares the offset, and it
-seeks it: `SnapshotFile::cursor_at` (the layout scan), every `replace_*` through
-`validate_generation_index`, and on Windows every positional read, since
-`read_exact_at` is `seek_read` there. That last one moves the offset from another
-thread, under `&self`, while the writer holds `&mut` — so no
-invalidate-on-handout scheme could have covered it. The cache is gone and
-`enforcement_gates.rs` pins its absence.
-
-One cold-path behaviour changed with it. A rollback used to put the handle back
-exactly where the append found it; it now leaves it at the restored end of file.
-The two differ only for the first append after a reopen — the open scan leaves
-the handle where it stopped reading (measured 5493) while `eof` is the committed
-end (9143) — and only when that append fails. Nothing reads this handle
-sequentially: appends seek `SEEK_END`, rewrites seek their own offset, reads are
-positional.
 
 ### `max_file_len` no longer does anything
 
