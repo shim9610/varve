@@ -47,6 +47,17 @@ and with `open_digest_on_flush`.
 offset in the file. Existing files do not open with it and cannot be given the
 region in place. A format that does not declare it is byte-identical to before.
 
+**Two source-breaking changes for callers**, both additive on disk. `IndexPolicy`
+gained a public field, so struct-literal construction of one needs updating;
+`new` and the `with_*` builders do not. `LazyOpenSource` gained a
+`HeaderTails` variant, so an exhaustive `match` on it needs an arm — a handler
+that treats it like `Digest` is correct, since both mean "the open read a table
+instead of the file".
+
+New on disk: file-header extension block `b"VBTT"`, present only when the option
+is declared. See [Format Author Guide](docs/format-author-guide.md) for the
+layout and what a reader checks before adopting it.
+
 ### A memory-mapped payload window no longer covers the file header
 
 **Soundness, no API change for existing formats.** `mmap_payloads` mapped from
