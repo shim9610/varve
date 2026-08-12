@@ -354,12 +354,22 @@ const HEADER_TAILS_SLOTS: usize = 2;
 /// length is; a format that ever needs more writes `HEADER_TAILS_FLAG_OVERFLOW`
 /// and `count = 0` rather than a table that is silently partial.
 const HEADER_TAILS_RESERVED_ENTRIES: usize = 8;
-/// `version: u16 | flags: u16 | capacity: u32 | count: u32 | generation: u64`.
-const HEADER_TAILS_SLOT_HEADER_LEN: usize = 2 + 2 + 4 + 4 + 8;
+/// `version u16 | flags u16 | capacity u32 | count u32 | generation u64 |
+/// commit_offset u64`.
+///
+/// `commit_offset` is what makes the table checkable. Every other field
+/// describes the table; this one names the *commit marker record* the table was
+/// written for, and a reader confirms it by framing that record and then
+/// walking forward to the end of the file. See `adopt_header_tails`.
+const HEADER_TAILS_SLOT_HEADER_LEN: usize = 2 + 2 + 4 + 4 + 8 + 8;
 /// `block_id: u32 | tail_offset: u64`.
 const HEADER_TAILS_ENTRY_LEN: usize = 4 + 8;
 /// The slot's own crc32, over every byte of the slot before it.
 const HEADER_TAILS_SLOT_TRAILER_LEN: usize = 4;
+/// The table did not fit the slot's capacity: `count` is zero and the slot
+/// claims nothing, rather than claiming a table that is silently partial.
+const HEADER_TAILS_FLAG_OVERFLOW: u16 = 1;
+const HEADER_TAILS_KNOWN_FLAGS: u16 = HEADER_TAILS_FLAG_OVERFLOW;
 /// The block's own framing: `magic[4] | len: u32`.
 const HEADER_TAILS_BLOCK_FRAMING_LEN: usize = 4 + 4;
 const MATRIX_SIDECAR_MAGIC: &[u8; 4] = b"VSID";
@@ -804,6 +814,13 @@ mod record_file {
 
     /// The record handle, and the one place that may move its file offset.
     ///
+    /// Three writes leave this module and no others, pinned by
+    /// `enforcement_gates::the_primary_record_handle_is_only_written_through_its_three_gated_operations`:
+    /// [`RecordFile::append_record_at_end`], which seeks to the end itself;
+    /// [`RecordFile::overwrite_indexed_record`], which consumes a
+    /// `RecordOverwrite`; and [`RecordFile::overwrite_header_region`], which
+    /// writes a fixed-length region of the file header and no record byte.
+    ///
     /// # Why there is no cached cursor here
     ///
     /// There was one, to spare the append path an `lseek` per record, and it
@@ -997,6 +1014,27 @@ mod record_file {
         /// Takes the [`RecordOverwrite`] by value; producing one performs the
         /// version refusal (F-01) and drops the block's keyed-tail map (F-02),
         /// both strictly before the first byte reaches disk.
+        /// Overwrites a fixed-length region *inside the file header*.
+        ///
+        /// The third gated write, and the only one that does not touch a
+        /// record. It exists for `IndexPolicy::header_tails`, whose region is
+        /// written at create and rewritten at every commit point; the region's
+        /// length never changes, so this never moves a record.
+        ///
+        /// Safe against the append cursor for the reason nothing here caches
+        /// one: `append_record_at_end` re-seeks `SeekFrom::End(0)` on every
+        /// call, and every read is positional. A single `write_all` is
+        /// deliberate — on Linux a `write()` to a regular file is taken under
+        /// the inode lock, so a concurrent unlocked reader sees the slot whole
+        /// or not at all. Windows offers no equivalent, which is why every slot
+        /// carries its own checksum.
+        pub(super) fn overwrite_header_region(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+            count_record_file_seek();
+            self.file.seek(SeekFrom::Start(offset))?;
+            self.file.write_all(bytes)?;
+            Ok(())
+        }
+
         pub(super) fn overwrite_indexed_record(
             &mut self,
             write: RecordOverwrite,
@@ -1428,6 +1466,13 @@ use resident_index::{ReservedIndexSlot, ResidentIndex};
 /// stopwatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LazyOpenSource {
+    /// The tail table in the *file header* was read and the file corroborated
+    /// it. A handful of records were framed — the commit marker it names, what
+    /// follows that marker, and one per block tail — and no more.
+    ///
+    /// The route [`IndexPolicy::header_tails`] exists for: unlike the digest,
+    /// nothing appended to the file can move this table or bury it.
+    HeaderTails,
     /// The digest at the end of the file was read. No record was framed.
     Digest,
     /// No usable digest, so every record was framed. Correct, and expensive.
@@ -5466,7 +5511,17 @@ impl VarveFile {
         spec.validate()?;
         ensure_native_open_limits(spec)?;
         let path = path.as_ref().to_path_buf();
-        match Self::open_readonly_from_digest(spec, &path) {
+        // The header table first, because nothing appended can hide it; the
+        // digest second, because a file written before the option existed has
+        // only that. Each failure is a fall-through, not an error, exactly as
+        // the digest already falls through to the scan.
+        if spec.index_policy.header_tails
+            && let Ok(file) =
+                Self::open_readonly_from_digest(spec, &path, LazyOpenSource::HeaderTails)
+        {
+            return Ok((file, LazyOpenSource::HeaderTails));
+        }
+        match Self::open_readonly_from_digest(spec, &path, LazyOpenSource::Digest) {
             Ok(file) => Ok((file, LazyOpenSource::Digest)),
             // Only a *spec-level* refusal propagates, exactly as it does for
             // the segment chain: those describe the caller's configuration and
@@ -5550,7 +5605,13 @@ impl VarveFile {
         // open — a lazy attempt that falls back must not hold two claims, and a
         // refused one must not leave a stale claim behind.
         let ((mut file, source), lock) = with_writer_lock_value(lock, |lock| {
-            match Self::open_writer_from_digest(spec, &path, lock) {
+            if spec.index_policy.header_tails
+                && let Ok(file) =
+                    Self::open_writer_from_digest(spec, &path, lock, LazyOpenSource::HeaderTails)
+            {
+                return Ok((file, LazyOpenSource::HeaderTails));
+            }
+            match Self::open_writer_from_digest(spec, &path, lock, LazyOpenSource::Digest) {
                 Ok(file) => Ok((file, LazyOpenSource::Digest)),
                 // Only a spec-level refusal propagates, exactly as it does for
                 // the read-only route: those describe the caller's
@@ -5578,6 +5639,7 @@ impl VarveFile {
         spec: FormatSpec,
         path: &Path,
         lock: &mut WriterLock,
+        source: LazyOpenSource,
     ) -> Result<Self> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         lock.bind_native(&file, path)?;
@@ -5595,7 +5657,15 @@ impl VarveFile {
         // uncommitted tail past the digest to truncate: the digest is written
         // at a commit point and is the last record, or it is not found at all
         // and this route has already failed into the scan.
-        let digest = read_open_digest(spec, &mut file, append_start, captured_len)?;
+        let digest = read_lazy_block_tails(
+            spec,
+            &mut file,
+            append_start,
+            captured_len,
+            header_len,
+            &header_extensions,
+            source,
+        )?;
         let snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, digest.physical_end)?;
         Ok(Self {
             spec,
@@ -5633,7 +5703,11 @@ impl VarveFile {
         })
     }
 
-    fn open_readonly_from_digest(spec: FormatSpec, path: &Path) -> Result<Self> {
+    fn open_readonly_from_digest(
+        spec: FormatSpec,
+        path: &Path,
+        source: LazyOpenSource,
+    ) -> Result<Self> {
         let mut file = OpenOptions::new().read(true).open(path)?;
         let captured_len = check_open_file_len(spec, &file)?;
         let (header_len, header_extensions) = read_file_header_parts(spec, &mut file)?;
@@ -5644,7 +5718,15 @@ impl VarveFile {
             captured_len,
         )?);
         let append_start = append_log_start(header_len, matrix.as_ref());
-        let digest = read_open_digest(spec, &mut file, append_start, captured_len)?;
+        let digest = read_lazy_block_tails(
+            spec,
+            &mut file,
+            append_start,
+            captured_len,
+            header_len,
+            &header_extensions,
+            source,
+        )?;
         let snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, digest.physical_end)?;
         Ok(Self {
             spec,
@@ -10929,6 +11011,17 @@ impl VarveFile {
     /// copied snapshot, and tying every returned slice to the mapping owner.
     /// Use owned reads instead when external immutability cannot be guaranteed.
     pub unsafe fn mmap_payloads(&self) -> Result<MmapPayloads> {
+        // The mapping starts at byte 0, so the file header is inside it, and a
+        // `header_tails` format rewrites part of that header at every commit
+        // point. The safety contract above asks the caller to prevent mutation
+        // "through every handle, thread, and process" — and a caller cannot
+        // prevent the writer's own commits. Refusing is the honest answer until
+        // the mapping starts past the header; see the note on `MmapPayloads`.
+        if self.spec.index_policy.header_tails {
+            return Err(Error::InvalidFormatSpec(
+                "mmap is not supported for a format declaring header_tails: a commit rewrites header bytes that are inside the mapping",
+            ));
+        }
         let mapped_len = self.snapshot.len();
         // `MmapLen` alone. `FileLen` was checked here too, against the same
         // value — the mapping's length is the snapshot's length — so it bounded
@@ -11916,6 +12009,88 @@ impl VarveFile {
     fn close_commit_point(&mut self) {
         self.write_index_segment_if_needed();
         self.write_open_digest_if_needed();
+        // Last, and deliberately after both: the slot records the file as it is
+        // when the commit point is closed, and a reader corroborates it by
+        // walking forward from the commit marker to the end of the file. A
+        // segment or a digest appended after the slot would put the end of the
+        // file past where the slot expects it, and every later open would fall
+        // back.
+        self.write_header_tails_if_needed();
+    }
+
+    /// Rewrites the header tail slot for the commit point just closed.
+    ///
+    /// Failure is swallowed for the same reason the segment's and the digest's
+    /// are: the commit marker is already in the file, so the transaction has
+    /// happened and reporting an error here would entitle the caller to re-run
+    /// it. A slot that was not written is a slot a later open does not adopt —
+    /// it names an older commit marker, the forward walk does not reach the end
+    /// of the file, and the open falls back to the scan. Slow, never wrong.
+    fn write_header_tails_if_needed(&mut self) {
+        if self.mode != OpenMode::ReadWrite || !self.spec.index_policy.header_tails {
+            return;
+        }
+        let Some(commit_offset) = self.block_tails.tail(COMMIT_BLOCK_ID) else {
+            return;
+        };
+        let _ = self.write_header_tails(commit_offset);
+    }
+
+    fn write_header_tails(&mut self, commit_offset: u64) -> Result<()> {
+        // `header_tails` refuses a format declaring matrix blocks, so the
+        // append log starts exactly where the header ends and this *is* the
+        // header length. The refusal is what makes the equality safe to rely
+        // on; if it is ever lifted, this needs the real header length.
+        debug_assert!(!self.spec.has_matrix_blocks());
+        let header_len = append_log_start_for_file(self)?;
+        let Some(extent) = mutable_header_block_extent(header_len, &self.header_extensions)? else {
+            return Ok(());
+        };
+        let capacity = header_tails_capacity(self.spec);
+        let slot_len = header_tails_slot_len(capacity).ok_or(Error::InvalidFormatSpec(
+            "header_tails region length overflows",
+        ))?;
+        if extent.payload_len != slot_len.saturating_mul(HEADER_TAILS_SLOTS) {
+            // A region this build did not write. Leaving it alone is the only
+            // safe answer: its geometry is not the one encoded here.
+            return Ok(());
+        }
+        let generation = {
+            let payload = self
+                .header_extensions
+                .get(
+                    extent.payload_in_extensions..extent.payload_in_extensions + extent.payload_len,
+                )
+                .ok_or(Error::InvalidCompressionHeader)?;
+            decode_header_tails_slots(payload)
+                .iter()
+                .map(|slot| slot.generation)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+        };
+        let index = (generation % HEADER_TAILS_SLOTS as u64) as usize;
+        let bytes = encode_header_tails_slot(
+            capacity,
+            generation,
+            commit_offset,
+            self.block_tails.as_slice(),
+        )?;
+        let offset = extent
+            .payload_offset
+            .checked_add((index * slot_len) as u64)
+            .ok_or(Error::InvalidCompressionHeader)?;
+        self.file.overwrite_header_region(offset, &bytes)?;
+        // The cached region is what the *next* write reads its generation from,
+        // and what a `replace_*` carries forward, so it has to follow the file.
+        // Leaving it at the create-time bytes would make every commit write
+        // generation 1 over the top of generation 1.
+        let at = extent.payload_in_extensions + index * slot_len;
+        self.header_extensions
+            .get_mut(at..at + slot_len)
+            .ok_or(Error::InvalidCompressionHeader)?
+            .copy_from_slice(&bytes);
+        Ok(())
     }
 
     /// Whether this commit point should write an open digest.
@@ -13714,34 +13889,21 @@ pub(crate) fn header_tails_region_len(spec: FormatSpec) -> u64 {
 /// offset would be a lie.
 fn encode_cold_header_tails_region(spec: FormatSpec) -> Result<Vec<u8>> {
     let capacity = header_tails_capacity(spec);
-    let slot_len = header_tails_slot_len(capacity).ok_or(Error::InvalidFormatSpec(
-        "header_tails region length overflows",
-    ))?;
-    let payload_len = slot_len
-        .checked_mul(HEADER_TAILS_SLOTS)
-        .ok_or(Error::InvalidFormatSpec(
-            "header_tails region length overflows",
-        ))?;
+    let framed_len = usize::try_from(header_tails_region_len(spec))
+        .map_err(|_| Error::InvalidFormatSpec("header_tails region length overflows"))?;
     // The region shares the 64 KiB extension budget with every other block, so
     // the check is against the whole region's framed length, not the payload.
-    let framed_len = payload_len
-        .checked_add(HEADER_TAILS_BLOCK_FRAMING_LEN)
-        .ok_or(Error::InvalidFormatSpec(
-            "header_tails region length overflows",
-        ))?;
-    // The saturating derivation the layout plan publishes must agree with this
-    // checked one on every spec that gets this far.
-    debug_assert_eq!(header_tails_region_len(spec), framed_len as u64);
-    if u64::try_from(framed_len).unwrap_or(u64::MAX)
-        > crate::native_layout::MAX_FILE_HEADER_EXTENSION_LEN
-    {
+    if header_tails_region_len(spec) > crate::native_layout::MAX_FILE_HEADER_EXTENSION_LEN {
         return Err(Error::InvalidFormatSpec(
             "header_tails region exceeds the file-header extension limit; the format declares too many blocks",
         ));
     }
+    let slot_len = header_tails_slot_len(capacity).ok_or(Error::InvalidFormatSpec(
+        "header_tails region length overflows",
+    ))?;
+    let payload_len = framed_len - HEADER_TAILS_BLOCK_FRAMING_LEN;
+    debug_assert_eq!(payload_len, slot_len * HEADER_TAILS_SLOTS);
     let payload_len_u32 = u32::try_from(payload_len)
-        .map_err(|_| Error::InvalidFormatSpec("header_tails region length overflows"))?;
-    let capacity_u32 = u32::try_from(capacity)
         .map_err(|_| Error::InvalidFormatSpec("header_tails region length overflows"))?;
 
     let mut region = Vec::new();
@@ -13754,18 +13916,63 @@ fn encode_cold_header_tails_region(spec: FormatSpec) -> Result<Vec<u8>> {
     region.extend_from_slice(HEADER_TAILS_MAGIC);
     region.extend_from_slice(&payload_len_u32.to_le_bytes());
     for _ in 0..HEADER_TAILS_SLOTS {
-        let start = region.len();
-        region.extend_from_slice(&HEADER_TAILS_VERSION.to_le_bytes());
-        region.extend_from_slice(&0u16.to_le_bytes());
-        region.extend_from_slice(&capacity_u32.to_le_bytes());
-        region.extend_from_slice(&0u32.to_le_bytes());
-        region.extend_from_slice(&0u64.to_le_bytes());
-        region.resize(start + slot_len - HEADER_TAILS_SLOT_TRAILER_LEN, 0);
-        let checksum = crc32_bytes(&region[start..])?;
-        region.extend_from_slice(&checksum.to_le_bytes());
+        region.extend_from_slice(&encode_header_tails_slot(capacity, 0, 0, &[])?);
     }
     debug_assert_eq!(region.len(), framed_len);
     Ok(region)
+}
+
+/// One slot's bytes, exactly `header_tails_slot_len(capacity)` long.
+///
+/// `count = 0` is what a slot claims when it has nothing to say, and it covers
+/// two cases that must not be told apart by a reader: the cold slot create
+/// writes, and a table that does not fit the capacity fixed at create. The
+/// second sets [`HEADER_TAILS_FLAG_OVERFLOW`] so the file records *why*, but it
+/// still claims nothing — a partial table is one a reader would believe.
+fn encode_header_tails_slot(
+    capacity: usize,
+    generation: u64,
+    commit_offset: u64,
+    tails: &[(u32, u64)],
+) -> Result<Vec<u8>> {
+    let slot_len = header_tails_slot_len(capacity).ok_or(Error::InvalidFormatSpec(
+        "header_tails region length overflows",
+    ))?;
+    let capacity_u32 = u32::try_from(capacity)
+        .map_err(|_| Error::InvalidFormatSpec("header_tails region length overflows"))?;
+    let overflow = tails.len() > capacity;
+    let (flags, count) = if overflow {
+        (HEADER_TAILS_FLAG_OVERFLOW, 0u32)
+    } else {
+        (0u16, tails.len() as u32)
+    };
+    let mut slot = Vec::new();
+    slot.try_reserve_exact(slot_len)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "header tail slot",
+            requested: slot_len as u64,
+        })?;
+    slot.extend_from_slice(&HEADER_TAILS_VERSION.to_le_bytes());
+    slot.extend_from_slice(&flags.to_le_bytes());
+    slot.extend_from_slice(&capacity_u32.to_le_bytes());
+    slot.extend_from_slice(&count.to_le_bytes());
+    slot.extend_from_slice(&generation.to_le_bytes());
+    slot.extend_from_slice(&commit_offset.to_le_bytes());
+    if !overflow {
+        for (block_id, offset) in tails {
+            slot.extend_from_slice(&block_id.to_le_bytes());
+            slot.extend_from_slice(&offset.to_le_bytes());
+        }
+    }
+    // The unused entries are zeroed rather than left over from the slot this
+    // one replaces: the region is overwritten in place, so anything not written
+    // here is the *previous* generation's bytes, and a reader that mis-read
+    // `count` would find a plausible table behind it.
+    slot.resize(slot_len - HEADER_TAILS_SLOT_TRAILER_LEN, 0);
+    let checksum = crc32_bytes(&slot)?;
+    slot.extend_from_slice(&checksum.to_le_bytes());
+    debug_assert_eq!(slot.len(), slot_len);
+    Ok(slot)
 }
 
 /// One block of the file-header extension region.
@@ -13885,8 +14092,47 @@ pub(crate) fn blank_mutable_header_bytes(
     header_len: u64,
     extensions: &[u8],
 ) -> Result<u64> {
-    if extensions.is_empty() {
+    let Some(extent) = mutable_header_block_extent(header_len, extensions)? else {
         return Ok(0);
+    };
+    let Ok(start) = usize::try_from(extent.payload_offset) else {
+        return Ok(0);
+    };
+    // A caller's window may end inside the region, or before it starts.
+    let Some(window) = prefix.get_mut(start..) else {
+        return Ok(0);
+    };
+    let take = extent.payload_len.min(window.len());
+    window[..take].fill(0);
+    Ok(take as u64)
+}
+
+/// Where the mutable extension block's payload lives, as a file offset.
+///
+/// **One derivation, two callers**: the blanking above, which has to skip these
+/// bytes, and the commit-time writer, which has to hit exactly them. Computing
+/// it twice is the shape of defect that put a wrong extension length in the
+/// published layout plan, and it would be worse here — a writer and a hasher
+/// that disagree by a few bytes fail silently in opposite directions.
+///
+/// `None` when the file carries no mutable block, which is every file whose
+/// format does not declare `header_tails`.
+struct MutableHeaderExtent {
+    /// Where the payload starts as a *file* offset, framing excluded — what the
+    /// writer seeks to and what the hasher skips.
+    payload_offset: u64,
+    /// The same payload's start *within the extension region*, for a caller
+    /// holding the region rather than the file.
+    payload_in_extensions: usize,
+    payload_len: usize,
+}
+
+fn mutable_header_block_extent(
+    header_len: u64,
+    extensions: &[u8],
+) -> Result<Option<MutableHeaderExtent>> {
+    if extensions.is_empty() {
+        return Ok(None);
     }
     // The region sits at the end of the header, so its start is the header's
     // length less its own. Deriving it rather than recomputing the header
@@ -13898,7 +14144,6 @@ pub(crate) fn blank_mutable_header_bytes(
         .checked_sub(extension_len)
         .ok_or(Error::InvalidCompressionHeader)?;
 
-    let mut blanked = 0u64;
     for block in parse_file_header_extension_blocks(extensions)? {
         if !is_mutable_header_extension_magic(&block.magic) {
             continue;
@@ -13908,24 +14153,25 @@ pub(crate) fn blank_mutable_header_bytes(
         // rather than assuming it keeps the arithmetic below honest if that
         // ever changes.
         debug_assert_ne!(&block.magic, FILE_COMPRESSION_MAGIC);
-        let framing = 4 + 4;
+        let framing = HEADER_TAILS_BLOCK_FRAMING_LEN;
         let payload_len = block.encoded.len().saturating_sub(framing);
-        let start = region_start
-            .checked_add(u64::try_from(block.offset).map_err(|_| Error::InvalidCompressionHeader)?)
-            .and_then(|start| start.checked_add(framing as u64))
+        let payload_in_extensions = block
+            .offset
+            .checked_add(framing)
             .ok_or(Error::InvalidCompressionHeader)?;
-        let Ok(start) = usize::try_from(start) else {
-            continue;
-        };
-        // A caller's window may end inside the region, or before it starts.
-        let Some(window) = prefix.get_mut(start..) else {
-            continue;
-        };
-        let take = payload_len.min(window.len());
-        window[..take].fill(0);
-        blanked += take as u64;
+        let payload_offset = region_start
+            .checked_add(
+                u64::try_from(payload_in_extensions)
+                    .map_err(|_| Error::InvalidCompressionHeader)?,
+            )
+            .ok_or(Error::InvalidCompressionHeader)?;
+        return Ok(Some(MutableHeaderExtent {
+            payload_offset,
+            payload_in_extensions,
+            payload_len,
+        }));
     }
-    Ok(blanked)
+    Ok(None)
 }
 
 /// The extension region to write into the file a `replace_*` builds.
@@ -16433,6 +16679,259 @@ fn trailing_open_digest(
 }
 
 /// Reads the digest at the end of the file: the record, then what it says.
+/// A header tail slot as the file carries it, after its checksum verified.
+struct HeaderTailsSlot {
+    generation: u64,
+    /// The commit marker record this table was written for. Everything that
+    /// makes the table checkable hangs off this one field.
+    commit_offset: u64,
+    tails: Vec<(u32, u64)>,
+}
+
+/// Every slot whose checksum and framing verify and which claims a table,
+/// newest generation first.
+///
+/// A slot that fails anything here is skipped rather than refused: the region
+/// is overwritten in place, so a half-written slot is an expected state and the
+/// answer to it is the other slot, or the scan.
+fn decode_header_tails_slots(payload: &[u8]) -> Vec<HeaderTailsSlot> {
+    let mut slots: Vec<HeaderTailsSlot> = Vec::new();
+    if payload.is_empty() || !payload.len().is_multiple_of(HEADER_TAILS_SLOTS) {
+        return slots;
+    }
+    let slot_len = payload.len() / HEADER_TAILS_SLOTS;
+    if slot_len < HEADER_TAILS_SLOT_HEADER_LEN + HEADER_TAILS_SLOT_TRAILER_LEN {
+        return slots;
+    }
+    for index in 0..HEADER_TAILS_SLOTS {
+        let slot = &payload[index * slot_len..(index + 1) * slot_len];
+        let body = &slot[..slot_len - HEADER_TAILS_SLOT_TRAILER_LEN];
+        let mut recorded = [0u8; 4];
+        recorded.copy_from_slice(&slot[slot_len - HEADER_TAILS_SLOT_TRAILER_LEN..]);
+        // The one check that separates a torn write from a good one. The slot's
+        // length never changes, so without this a half-written slot frames
+        // perfectly and names records that are not where it says.
+        let Ok(computed) = crc32_bytes(body) else {
+            continue;
+        };
+        if computed != u32::from_le_bytes(recorded) {
+            continue;
+        }
+        let read_u16 = |at: usize| u16::from_le_bytes([body[at], body[at + 1]]);
+        let read_u32 =
+            |at: usize| u32::from_le_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+        let read_u64 = |at: usize| {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&body[at..at + 8]);
+            u64::from_le_bytes(bytes)
+        };
+        if read_u16(0) != HEADER_TAILS_VERSION || read_u16(2) & !HEADER_TAILS_KNOWN_FLAGS != 0 {
+            continue;
+        }
+        let capacity = read_u32(4) as usize;
+        let count = read_u32(8) as usize;
+        // The capacity the slot declares must be the geometry the region
+        // actually has, so a corrupt count cannot walk past the slot.
+        if header_tails_slot_len(capacity) != Some(slot_len) || count > capacity {
+            continue;
+        }
+        // A cold or overflow slot claims nothing and is never adopted (see
+        // `corroborate_header_tails`), but it is kept here because its
+        // `generation` is what the next write has to advance past.
+        let mut tails: Vec<(u32, u64)> = Vec::new();
+        if tails.try_reserve_exact(count).is_err() {
+            continue;
+        }
+        let mut previous: Option<u32> = None;
+        let mut ordered = true;
+        for entry in 0..count {
+            let at = HEADER_TAILS_SLOT_HEADER_LEN + entry * HEADER_TAILS_ENTRY_LEN;
+            let block_id = read_u32(at);
+            let offset = read_u64(at + 4);
+            // Strictly ascending, for the reason the digest requires it: every
+            // lookup in `BlockTails` is a binary search, and an unsorted table
+            // answers wrong rather than slowly.
+            if previous.is_some_and(|last| block_id <= last) {
+                ordered = false;
+                break;
+            }
+            previous = Some(block_id);
+            tails.push((block_id, offset));
+        }
+        if !ordered {
+            continue;
+        }
+        slots.push(HeaderTailsSlot {
+            generation: read_u64(12),
+            commit_offset: read_u64(20),
+            tails,
+        });
+    }
+    slots.sort_unstable_by_key(|slot| std::cmp::Reverse(slot.generation));
+    slots
+}
+
+/// Adopt the newest header tail table the *file* corroborates, or fail into the
+/// scan.
+///
+/// The table lives at a fixed offset, which is the whole point — nothing
+/// appended can move it or bury it — and is also the whole difficulty: a
+/// structure at a fixed offset is always present and always "last", so its
+/// position proves nothing about which state of the file it describes. The open
+/// digest gets that for free by being a record whose extent must end exactly at
+/// EOF (`frame_open_digest`); this has to earn it, in two bounded steps.
+///
+/// **(a) Is `commit_offset` a commit marker?** One positional framing with the
+/// record checksum verified. This proves the table names *a* commit point.
+///
+/// **(b) Is it the *newest* one?** Walk forward from the marker's end; it must
+/// reach the end of the file. Only a segment and an open digest may follow a
+/// marker, and only in that order — `committed_prefix_len` accepts exactly the
+/// shapes `[SEGMENT]`, `[DIGEST]` and `[SEGMENT, DIGEST]` — so the walk frames
+/// at most two records and is not a scan.
+///
+/// **(b) is the one that matters.** A stale table names an older marker, and
+/// that marker is still in the file and still checksums, so (a) passes. Without
+/// (b) the reader would resume at an older commit boundary, and the next append
+/// would write a `prev_same_block_offset` that skips every record in between —
+/// a chain that is silently short, with every link's checksum intact. "Reaches
+/// the end of the file" is exactly "no commit happened after this one".
+///
+/// Each tail is then re-framed and its block id checked, so a table that
+/// survives both steps and still lies is detected rather than trusted.
+fn read_header_tails(
+    spec: FormatSpec,
+    file: &mut File,
+    append_start: u64,
+    file_len: u64,
+    header_len: u64,
+    extensions: &[u8],
+) -> Result<OpenDigest> {
+    let Some(extent) = mutable_header_block_extent(header_len, extensions)? else {
+        return Err(Error::InvalidIndexSegment);
+    };
+    let payload = extensions
+        .get(extent.payload_in_extensions..extent.payload_in_extensions + extent.payload_len)
+        .ok_or(Error::InvalidIndexSegment)?;
+
+    for slot in decode_header_tails_slots(payload) {
+        if let Some(digest) = corroborate_header_tails(spec, file, append_start, file_len, &slot)
+            .ok()
+            .flatten()
+        {
+            return Ok(digest);
+        }
+    }
+    Err(Error::InvalidIndexSegment)
+}
+
+fn corroborate_header_tails(
+    spec: FormatSpec,
+    file: &mut File,
+    append_start: u64,
+    file_len: u64,
+    slot: &HeaderTailsSlot,
+) -> Result<Option<OpenDigest>> {
+    let checks = ScanChecks {
+        // A table is either wholly corroborated or it is not adopted. There is
+        // no recoverable tail to negotiate here, and the scan owns that
+        // decision, exactly as `frame_open_digest` defers to it.
+        partial_boundary: None,
+        checksum_boundary: None,
+        verify_checksums: true,
+    };
+    let mut accounting = ScanAccounting::default();
+    // A cold slot, or one whose table overflowed its capacity. Both say "I know
+    // nothing", and adopting one would assert that no block has a tail.
+    if slot.tails.is_empty() {
+        return Ok(None);
+    }
+    if slot.commit_offset < append_start || slot.commit_offset >= file_len {
+        return Ok(None);
+    }
+    // (a)
+    let RecordRead::Entry(marker) = read_record_entry_at(
+        spec,
+        file,
+        file_len,
+        slot.commit_offset,
+        checks,
+        &mut accounting,
+    )?
+    else {
+        return Ok(None);
+    };
+    if marker.block_id != COMMIT_BLOCK_ID || marker.flags & RECORD_FLAG_INTERNAL == 0 {
+        return Ok(None);
+    }
+    // (b) — at most a segment then a digest, and it must land exactly on EOF.
+    let mut cursor = marker.checked_physical_end()?;
+    let mut sequence_high_water = marker.sequence;
+    for expected in [SEGMENT_BLOCK_ID, OPEN_DIGEST_BLOCK_ID] {
+        if cursor == file_len {
+            break;
+        }
+        let RecordRead::Entry(entry) =
+            read_record_entry_at(spec, file, file_len, cursor, checks, &mut accounting)?
+        else {
+            return Ok(None);
+        };
+        if entry.block_id != expected {
+            return Ok(None);
+        }
+        sequence_high_water = sequence_high_water.max(entry.sequence);
+        cursor = entry.checked_physical_end()?;
+    }
+    if cursor != file_len {
+        return Ok(None);
+    }
+    // Every offset the table hands out is re-framed against the file. A table
+    // that survives (a) and (b) and still lies is detected here, not trusted.
+    for (block_id, offset) in &slot.tails {
+        if *offset < append_start || *offset >= file_len {
+            return Ok(None);
+        }
+        let RecordRead::Entry(entry) =
+            read_record_entry_at(spec, file, file_len, *offset, checks, &mut accounting)?
+        else {
+            return Ok(None);
+        };
+        if entry.block_id != *block_id {
+            return Ok(None);
+        }
+    }
+    Ok(Some(OpenDigest {
+        physical_end: file_len,
+        sequence_high_water: Some(sequence_high_water),
+        block_tails: BlockTails::from_sorted(slot.tails.clone()),
+    }))
+}
+
+/// Picks which of the two lazy routes reads the block tails.
+///
+/// Both answer the same three facts and both fail into the scan; they differ in
+/// where the answer is stored and therefore in what can hide it. Kept as one
+/// dispatch so the two open sites stay identical either way.
+fn read_lazy_block_tails(
+    spec: FormatSpec,
+    file: &mut File,
+    append_start: u64,
+    file_len: u64,
+    header_len: u64,
+    extensions: &[u8],
+    source: LazyOpenSource,
+) -> Result<OpenDigest> {
+    match source {
+        LazyOpenSource::HeaderTails => {
+            read_header_tails(spec, file, append_start, file_len, header_len, extensions)
+        }
+        LazyOpenSource::Digest => read_open_digest(spec, file, append_start, file_len),
+        // The scan is not a route this reaches: it is the fallback the callers
+        // take when both of the above fail.
+        LazyOpenSource::FullScan => Err(Error::InvalidIndexSegment),
+    }
+}
+
 fn read_open_digest(
     spec: FormatSpec,
     file: &mut File,

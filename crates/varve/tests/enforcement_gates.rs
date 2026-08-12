@@ -418,7 +418,7 @@ fn a_permit_can_only_be_minted_from_the_writers_own_poison_flag() {
 /// cannot express from outside the crate: that the handle stays wrapped and
 /// that no second write pair is introduced against the raw field.
 #[test]
-fn the_primary_record_handle_is_only_written_through_its_two_gated_operations() {
+fn the_primary_record_handle_is_only_written_through_its_three_gated_operations() {
     let source = crate_source("file.rs");
     assert!(
         source.contains("    file: RecordFile,"),
@@ -452,9 +452,31 @@ fn the_primary_record_handle_is_only_written_through_its_two_gated_operations() 
             !outside.contains(bypass),
             "`{bypass}` writes or positions the primary handle directly; record bytes may only \
              be placed by `RecordFile::append_record_at_end` (which seeks to the end itself) or \
-             by `RecordFile::overwrite_indexed_record` (which consumes a `RecordOverwrite`)"
+             by `RecordFile::overwrite_indexed_record` (which consumes a `RecordOverwrite`), \
+             and header bytes only by `RecordFile::overwrite_header_region`"
         );
     }
+    // The gate above forbids a bypass; it does not notice a *new gated method*,
+    // and adding one is exactly how the module's guarantee widens without
+    // anyone deciding to widen it. So count them: three today, and a fourth
+    // has to be argued for here before it can exist.
+    let gated: Vec<&str> = gate
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("pub(super) fn "))
+        .filter_map(|rest| rest.split(['(', '<']).next())
+        .filter(|name| {
+            matches!(
+                *name,
+                "append_record_at_end" | "overwrite_indexed_record" | "overwrite_header_region"
+            )
+        })
+        .collect();
+    assert_eq!(
+        gated.len(),
+        3,
+        "`mod record_file` must expose exactly the three writes this gate names, and no other: \
+         found {gated:?}"
+    );
     // Comment-stripped, because the fields carry doc comments and a gate that
     // breaks when someone rewords a comment teaches people to relax the gate.
     let gate_code: String = gate

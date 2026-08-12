@@ -9,14 +9,26 @@
 //! `index: header_tails` puts the same table at a fixed offset inside the file
 //! header, where nothing appended can move it or bury it.
 //!
+//! A table at a fixed offset is always present and always "last", so its
+//! position proves nothing about which state of the file it describes. It earns
+//! that in two bounded steps: the commit marker it names must frame as one, and
+//! walking forward from it must land exactly on the end of the file. Most of
+//! what is pinned here aims at the second step, because it is the one a
+//! signature check alone does not give you.
+//!
 //! What this file pins, in order: the option is inert when off; turning it on
 //! changes the schema hash, because it moves every record offset in the file;
-//! the region's length is fixed by the declaration alone; it starts cold and
-//! claims nothing; its *contents* may differ from what the spec would write
-//! while its framing may not; and the two refusals.
+//! the region's length is fixed by the declaration alone; a commit warms
+//! exactly one slot; a byte past the commit point, a table naming an older
+//! marker, a `commit_offset` naming a data record, and a tail naming another
+//! block's record are each refused; a torn slot is skipped and the other one
+//! answers; a writer resumed from the header appends a chain the scan agrees
+//! with; and the refusals.
 //!
-//! Not pinned here, because nothing writes a warm table yet: that the update
-//! lands before the commit marker, and the crash matrix over the two slots.
+//! Not pinned here: a *real* torn write. `fault_point` aborts the child process
+//! and the page cache survives that, so the harness can produce "the write did
+//! not happen" but never "the write half happened". The tears here are hand
+//! byte-patches, which is the only instrument in the tree that expresses it.
 
 // The fixture declares `integrity: crc32`, so without the `integrity` feature
 // it is refused at create with `IntegrityFeatureDisabled`.
@@ -108,7 +120,7 @@ varve_format! {
 /// the format is, and a change to the layout has to change them here too.
 const SLOTS: usize = 2;
 const RESERVED_ENTRIES: usize = 8;
-const SLOT_HEADER_LEN: usize = 2 + 2 + 4 + 4 + 8;
+const SLOT_HEADER_LEN: usize = 2 + 2 + 4 + 4 + 8 + 8;
 const ENTRY_LEN: usize = 4 + 8;
 const SLOT_CRC_LEN: usize = 4;
 const BLOCK_FRAMING_LEN: usize = 4 + 4;
@@ -276,45 +288,109 @@ fn the_region_length_is_fixed_by_the_declaration() -> varve::Result<()> {
 }
 
 #[test]
-fn the_region_starts_cold() -> varve::Result<()> {
+fn the_region_starts_cold_and_a_commit_warms_exactly_one_slot() -> varve::Result<()> {
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("cold.varve");
-    write_samples(on_spec(), &path, 200)?;
-
-    let bytes = std::fs::read(&path)?;
-    let offset = find_region(&bytes).expect("the region is in the header");
     let capacity = declared_blocks() + RESERVED_ENTRIES;
     let slot_len = SLOT_HEADER_LEN + capacity * ENTRY_LEN + SLOT_CRC_LEN;
 
+    // A file that has never reached a commit point. `flush` writes a marker
+    // only when there is uncommitted work, so a writer that pushed nothing
+    // leaves the region exactly as create wrote it.
+    let cold_path = directory.path().join("cold.varve");
+    drop(on_spec().create(&cold_path)?);
+    let cold = std::fs::read(&cold_path)?;
+    let cold_at = find_region(&cold).expect("the region is in the header");
     for slot in 0..SLOTS {
-        let start = offset + BLOCK_FRAMING_LEN + slot * slot_len;
-        let end = start + slot_len;
+        let start = cold_at + BLOCK_FRAMING_LEN + slot * slot_len;
+        let fields = slot_fields(&cold, start, slot_len);
+        assert_eq!(fields.version, 1);
+        assert_eq!(fields.flags, 0, "no flag is set on a cold slot");
+        assert_eq!(fields.capacity as usize, capacity);
         assert_eq!(
-            u16::from_le_bytes(bytes[start..start + 2].try_into().unwrap()),
-            1
-        );
-        assert_eq!(
-            u16::from_le_bytes(bytes[start + 2..start + 4].try_into().unwrap()),
-            0,
-            "no flag is set on a cold slot",
-        );
-        assert_eq!(
-            u32::from_le_bytes(bytes[start + 4..start + 8].try_into().unwrap()) as usize,
-            capacity,
-        );
-        assert_eq!(
-            u32::from_le_bytes(bytes[start + 8..start + 12].try_into().unwrap()),
-            0,
+            fields.count, 0,
             "slot {slot} claims a tail before anything has written one",
         );
-        let recorded = u32::from_le_bytes(bytes[end - SLOT_CRC_LEN..end].try_into().unwrap());
-        assert_eq!(
-            recorded,
-            crc32(&bytes[start..end - SLOT_CRC_LEN]),
-            "slot {slot}'s checksum covers the slot",
+        assert_eq!(fields.generation, 0);
+        assert_eq!(fields.commit_offset, 0);
+        assert!(fields.checksum_matches, "slot {slot}'s checksum covers it");
+    }
+
+    // And a file that has committed. Exactly one slot is warm, because a slot
+    // records the file as of one commit point and only the newest one can still
+    // describe the file that is there.
+    let warm_path = directory.path().join("warm.varve");
+    write_samples(on_spec(), &warm_path, 200)?;
+    let warm = std::fs::read(&warm_path)?;
+    let warm_at = find_region(&warm).expect("the region is in the header");
+    let slots: Vec<SlotFields> = (0..SLOTS)
+        .map(|slot| {
+            slot_fields(
+                &warm,
+                warm_at + BLOCK_FRAMING_LEN + slot * slot_len,
+                slot_len,
+            )
+        })
+        .collect();
+    for (index, fields) in slots.iter().enumerate() {
+        assert!(
+            fields.checksum_matches,
+            "slot {index} must checksum whether it is the newest or not",
         );
     }
+    let newest = slots
+        .iter()
+        .max_by_key(|fields| fields.generation)
+        .expect("two slots");
+    assert!(newest.generation > 0, "a commit advances the generation");
+    assert!(newest.count > 0, "a commit writes a table");
+    assert!(
+        (newest.count as usize) <= capacity,
+        "a table never claims more than the capacity fixed at create",
+    );
+    assert_eq!(newest.flags, 0, "the table fit, so no overflow flag");
+    // The one field that makes the table checkable: it must name a real offset
+    // inside the file, not zero.
+    assert!(
+        newest.commit_offset > 0 && (newest.commit_offset as usize) < warm.len(),
+        "commit_offset must name a record of this file",
+    );
     Ok(())
+}
+
+struct SlotFields {
+    version: u16,
+    flags: u16,
+    capacity: u32,
+    count: u32,
+    generation: u64,
+    commit_offset: u64,
+    checksum_matches: bool,
+}
+
+/// Decodes one slot straight out of the file's bytes.
+///
+/// Field offsets are written out rather than derived from the writer's
+/// constants, for the reason the geometry above is: a test that shares the
+/// writer's arithmetic agrees with a change to it, including a wrong one.
+fn slot_fields(bytes: &[u8], start: usize, slot_len: usize) -> SlotFields {
+    let u16_at =
+        |at: usize| u16::from_le_bytes(bytes[start + at..start + at + 2].try_into().unwrap());
+    let u32_at =
+        |at: usize| u32::from_le_bytes(bytes[start + at..start + at + 4].try_into().unwrap());
+    let u64_at =
+        |at: usize| u64::from_le_bytes(bytes[start + at..start + at + 8].try_into().unwrap());
+    let body_end = start + slot_len - SLOT_CRC_LEN;
+    SlotFields {
+        version: u16_at(0),
+        flags: u16_at(2),
+        capacity: u32_at(4),
+        count: u32_at(8),
+        generation: u64_at(12),
+        commit_offset: u64_at(20),
+        checksum_matches: u32::from_le_bytes(
+            bytes[body_end..body_end + SLOT_CRC_LEN].try_into().unwrap(),
+        ) == crc32(&bytes[start..body_end]),
+    }
 }
 
 /// The contents of this block are the file's to change; its framing is not.
@@ -562,5 +638,410 @@ fn the_published_layout_plan_describes_the_header_the_writer_writes() -> varve::
         planned, header_end as u64,
         "the plan's header length must be where the file's header actually ends",
     );
+    Ok(())
+}
+
+/// The route exists and it is the one taken, and it does not buy speed by
+/// being wrong.
+#[test]
+fn a_lazy_open_reads_its_tails_from_the_header() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("resume.varve");
+    write_samples(on_spec(), &path, 400)?;
+
+    let (lazy, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &path)?;
+    assert_eq!(source, varve::LazyOpenSource::HeaderTails);
+
+    let scanned = varve::VarveFile::open_readonly(on_spec(), &path)?;
+    for block in [Sample::ID, Note::ID] {
+        assert_eq!(
+            lazy.block_tail_offset(block),
+            scanned.block_tail_offset(block),
+            "block {block}'s tail must be the one the scan finds",
+        );
+        assert!(lazy.block_tail_offset(block).is_some());
+    }
+    Ok(())
+}
+
+/// One byte past the last commit point and the table is no longer adopted.
+///
+/// This is the check the whole design turns on. The table sits at a fixed
+/// offset, so its position proves nothing about which state of the file it
+/// describes; what proves it is walking forward from the commit marker the
+/// table names and landing exactly on the end of the file. A byte past that end
+/// means something happened after the commit the table describes, and the table
+/// has to stop being believed.
+#[test]
+fn a_byte_past_the_commit_point_takes_the_table_out_of_use() -> varve::Result<()> {
+    use std::io::Write;
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("appended.varve");
+    write_samples(on_spec(), &path, 200)?;
+
+    let (before, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &path)?;
+    assert_eq!(source, varve::LazyOpenSource::HeaderTails);
+    let expected = before.block_tail_offset(Sample::ID);
+    drop(before);
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)?
+        .write_all(&[0u8])?;
+
+    let (after, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &path)?;
+    assert_eq!(
+        source,
+        varve::LazyOpenSource::FullScan,
+        "the forward walk no longer reaches the end of the file",
+    );
+    // Falling back is not the same as being broken: the scan answers, and it
+    // answers what the table would have.
+    assert_eq!(after.block_tail_offset(Sample::ID), expected);
+    Ok(())
+}
+
+/// A table naming an *older* commit marker is refused, and that marker is a
+/// real one.
+///
+/// This is the case a signature check alone cannot catch. The offset the stale
+/// table carries still points at a genuine commit marker with a valid checksum,
+/// so "is there a commit marker here" passes. What fails is "and nothing was
+/// committed after it". Without that second half the reader would resume at the
+/// older boundary and the next append would write a `prev_same_block_offset`
+/// that skips every record in between — a chain that is silently short, with
+/// every link's checksum intact.
+#[test]
+fn a_table_naming_an_older_commit_marker_is_refused() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("stale.varve");
+
+    // Commit once, and keep the region exactly as that commit left it.
+    let mut file = on_spec().create(&path)?;
+    for value in 0..40 {
+        file.push(&Sample { value })?;
+    }
+    file.flush()?;
+    drop(file);
+    let stale_region = {
+        let bytes = std::fs::read(&path)?;
+        let at = find_region(&bytes).expect("the region is in the header");
+        bytes[at..at + expected_region_len()].to_vec()
+    };
+
+    // Commit again, several times, so the tails genuinely move.
+    let mut file = varve::VarveWriter::open(on_spec(), &path)?;
+    for value in 40..200 {
+        file.push(&Sample { value })?;
+        if value % 20 == 19 {
+            file.flush()?;
+        }
+    }
+    file.flush()?;
+    drop(file);
+
+    let current = varve::VarveFile::open_readonly(on_spec(), &path)?;
+    let current_tail = current.block_tail_offset(Sample::ID).expect("a tail");
+    drop(current);
+
+    // Put the first commit's table back over the current file's region.
+    let mut bytes = std::fs::read(&path)?;
+    let at = find_region(&bytes).expect("the region is in the header");
+    bytes[at..at + expected_region_len()].copy_from_slice(&stale_region);
+    std::fs::write(&path, &bytes)?;
+
+    // The premise: the offset it carries is a REAL commit marker, so a check
+    // that only looked for a signature there would accept it.
+    let slot_len =
+        SLOT_HEADER_LEN + (declared_blocks() + RESERVED_ENTRIES) * ENTRY_LEN + SLOT_CRC_LEN;
+    let stale = (0..SLOTS)
+        .map(|slot| slot_fields(&bytes, at + BLOCK_FRAMING_LEN + slot * slot_len, slot_len))
+        .filter(|fields| fields.checksum_matches && fields.count > 0)
+        .max_by_key(|fields| fields.generation)
+        .expect("the first commit left a warm slot");
+    assert!(stale.commit_offset > 0);
+    assert!(
+        stale.commit_offset < current_tail,
+        "the stale table names a marker from before the later commits",
+    );
+
+    let (file, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &path)?;
+    assert_eq!(
+        source,
+        varve::LazyOpenSource::FullScan,
+        "a table naming an older commit marker must not be adopted",
+    );
+    assert_eq!(
+        file.block_tail_offset(Sample::ID),
+        Some(current_tail),
+        "and the fallback answers with the file's real tail",
+    );
+    Ok(())
+}
+
+/// The two options answer the same question and are declared apart.
+#[test]
+fn the_region_and_the_open_digest_are_not_declared_together() {
+    let spec = on_spec().with_index_policy(on_spec().index_policy.with_open_digest_on_flush(true));
+    let error = spec.validate().expect_err("two answers, one question");
+    assert!(
+        matches!(
+            error,
+            varve::Error::InvalidFormatSpec(
+                "header_tails and open_digest_on_flush are two answers to the same question; declare one"
+            )
+        ),
+        "{error:?}",
+    );
+}
+
+/// Rewrites **every warm slot** in `bytes` through `mutate`, fixing checksums.
+///
+/// Every warm slot, not just the newest, and the reason is a real property of
+/// the format rather than test convenience: a commit point that appends nothing
+/// still closes, so two consecutive slots can name the *same* commit marker and
+/// both corroborate. Mutating one leaves the other adoptable, and a test that
+/// did so would pass while proving nothing. (That fallback is the one thing the
+/// second slot actually buys.)
+fn rewrite_warm_slots(bytes: &mut [u8], at: usize, mut mutate: impl FnMut(&mut [u8])) {
+    let slot_len =
+        SLOT_HEADER_LEN + (declared_blocks() + RESERVED_ENTRIES) * ENTRY_LEN + SLOT_CRC_LEN;
+    let mut rewritten = 0;
+    for slot in 0..SLOTS {
+        let start = at + BLOCK_FRAMING_LEN + slot * slot_len;
+        let fields = slot_fields(bytes, start, slot_len);
+        if !fields.checksum_matches || fields.count == 0 {
+            continue;
+        }
+        let body_end = start + slot_len - SLOT_CRC_LEN;
+        mutate(&mut bytes[start..body_end]);
+        // Recomputed so the mutation is not caught by the wrong check: these
+        // tests are about what the *corroboration* rejects, and a slot that
+        // fails its CRC never reaches it.
+        let checksum = crc32(&bytes[start..body_end]).to_le_bytes();
+        bytes[body_end..body_end + SLOT_CRC_LEN].copy_from_slice(&checksum);
+        rewritten += 1;
+    }
+    assert!(rewritten > 0, "the file must carry a warm slot to rewrite");
+}
+
+/// `commit_offset` must name a *commit marker*, not merely a record that
+/// happens to end where the file does.
+///
+/// The forward walk alone does not catch this. A file whose last record is an
+/// uncommitted append ends exactly at that record, so a table pointing there
+/// walks zero records and lands on the end of the file — the check that catches
+/// a stale table passes. What would follow is a reader treating an uncommitted
+/// record's end as the commit boundary.
+#[test]
+fn commit_offset_must_name_a_commit_marker() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("uncommitted.varve");
+    write_samples(on_spec(), &path, 100)?;
+
+    // One append with no flush. `Drop` writes no commit marker, so the file now
+    // ends with an uncommitted data record.
+    let mut writer = varve::VarveWriter::open(on_spec(), &path)?;
+    // `push_info`, not `push`: the offset has to come from the append itself.
+    // A read-only scan reports the newest *committed* record of the block, so
+    // it would name the record before the marker and the forward walk would
+    // reject on the marker instead — which is the other check.
+    let uncommitted = writer.push_info(&Sample { value: 4242 })?.record_offset;
+    drop(writer);
+    assert_eq!(
+        uncommitted
+            + varve::VarveFile::open_readonly(on_spec(), &path)?
+                .index_entries()
+                .last()
+                .map(|_| 0)
+                .unwrap_or(0),
+        uncommitted,
+    );
+
+    let mut bytes = std::fs::read(&path)?;
+    let at = find_region(&bytes).expect("the region is in the header");
+    rewrite_warm_slots(&mut bytes, at, |body| {
+        body[20..28].copy_from_slice(&uncommitted.to_le_bytes());
+    });
+    std::fs::write(&path, &bytes)?;
+
+    let (_, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &path)?;
+    assert_eq!(
+        source,
+        varve::LazyOpenSource::FullScan,
+        "a data record is not a commit point, however conveniently it is placed",
+    );
+    Ok(())
+}
+
+/// Every offset the table hands out is re-framed against the file.
+///
+/// A table can name a real, well-framed record of the right file and still be
+/// wrong about which block it belongs to. Both corroboration steps pass — the
+/// commit marker is genuine and nothing was committed after it — so this is the
+/// only check that separates a table that is merely *plausible* from one that
+/// is *true*.
+#[test]
+fn a_tail_naming_another_blocks_record_is_refused() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("crossed.varve");
+    write_samples(on_spec(), &path, 100)?;
+
+    let scanned = varve::VarveFile::open_readonly(on_spec(), &path)?;
+    let note_tail = scanned.block_tail_offset(Note::ID).expect("a Note tail");
+    let sample_tail = scanned
+        .block_tail_offset(Sample::ID)
+        .expect("a Sample tail");
+    assert_ne!(note_tail, sample_tail);
+    drop(scanned);
+
+    let mut bytes = std::fs::read(&path)?;
+    let at = find_region(&bytes).expect("the region is in the header");
+    rewrite_warm_slots(&mut bytes, at, |body| {
+        // Point `Sample`'s entry at `Note`'s newest record. Ids are ascending
+        // and `Sample::ID` is the lower of the two, so it is the first entry
+        // whose id matches.
+        let count = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+        for entry in 0..count {
+            let field = SLOT_HEADER_LEN + entry * ENTRY_LEN;
+            if u32::from_le_bytes(body[field..field + 4].try_into().unwrap()) == Sample::ID {
+                body[field + 4..field + 12].copy_from_slice(&note_tail.to_le_bytes());
+                return;
+            }
+        }
+        panic!("the table must carry a Sample tail");
+    });
+    std::fs::write(&path, &bytes)?;
+
+    let (file, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &path)?;
+    assert_eq!(
+        source,
+        varve::LazyOpenSource::FullScan,
+        "a tail naming another block's record must not be adopted",
+    );
+    assert_eq!(file.block_tail_offset(Sample::ID), Some(sample_tail));
+    Ok(())
+}
+
+/// Flips a byte inside one slot's table and does **not** fix its checksum.
+fn tear_slot(bytes: &mut [u8], at: usize, slot: usize) {
+    let slot_len =
+        SLOT_HEADER_LEN + (declared_blocks() + RESERVED_ENTRIES) * ENTRY_LEN + SLOT_CRC_LEN;
+    let start = at + BLOCK_FRAMING_LEN + slot * slot_len;
+    bytes[start + SLOT_HEADER_LEN + 4] ^= 0xFF;
+}
+
+/// The crash matrix, as far as this tree can express it.
+///
+/// The region is overwritten in place at a constant length, so its failure mode
+/// is a slot that is half the previous generation and half the next — framed
+/// perfectly, and naming records that are not there. Only the per-slot checksum
+/// separates that from a good write, which is why a crc32 integrity policy is
+/// mandatory for the option.
+///
+/// **The harness cannot produce a real torn write**: `fault_point` aborts the
+/// child process and the page cache survives a process kill, so a `write()`
+/// that returned is already visible to the next open. It can produce "the write
+/// did not happen", never "the write half happened". A hand byte-patch is the
+/// only instrument in the tree that expresses it, so that is what this is.
+#[test]
+fn a_torn_slot_is_skipped_and_the_other_one_answers() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("torn.varve");
+    write_samples(on_spec(), &path, 100)?;
+
+    let scanned = varve::VarveFile::open_readonly(on_spec(), &path)?;
+    let expected = scanned.block_tail_offset(Sample::ID);
+    drop(scanned);
+
+    let clean = std::fs::read(&path)?;
+    let at = find_region(&clean).expect("the region is in the header");
+
+    // One slot torn. The final `flush` closes a commit point that appends
+    // nothing, so both slots name the same commit marker and the survivor is
+    // still true of this file — the one thing the second slot buys.
+    for torn in 0..SLOTS {
+        let mut bytes = clean.clone();
+        tear_slot(&mut bytes, at, torn);
+        let one = directory.path().join(format!("torn-{torn}.varve"));
+        std::fs::write(&one, &bytes)?;
+        let (file, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &one)?;
+        assert_eq!(
+            source,
+            varve::LazyOpenSource::HeaderTails,
+            "slot {torn} torn, the other still describes this file",
+        );
+        assert_eq!(file.block_tail_offset(Sample::ID), expected);
+    }
+
+    // Both torn. There is nothing left to corroborate, and the answer is the
+    // scan — slower, never wrong.
+    let mut bytes = clean.clone();
+    for torn in 0..SLOTS {
+        tear_slot(&mut bytes, at, torn);
+    }
+    let both = directory.path().join("torn-both.varve");
+    std::fs::write(&both, &bytes)?;
+    let (file, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &both)?;
+    assert_eq!(source, varve::LazyOpenSource::FullScan);
+    assert_eq!(file.block_tail_offset(Sample::ID), expected);
+
+    // A tear that lands in the slot's *unused* entries. Nothing else in the
+    // corroboration would notice — the table is still true — so this is the
+    // case that says the checksum covers the whole slot rather than only the
+    // part a reader happens to look at. A torn write lands where it lands.
+    let mut bytes = clean.clone();
+    let slot_len =
+        SLOT_HEADER_LEN + (declared_blocks() + RESERVED_ENTRIES) * ENTRY_LEN + SLOT_CRC_LEN;
+    for slot in 0..SLOTS {
+        let start = at + BLOCK_FRAMING_LEN + slot * slot_len;
+        bytes[start + slot_len - SLOT_CRC_LEN - 1] ^= 0xFF;
+    }
+    let padded = directory.path().join("torn-padding.varve");
+    std::fs::write(&padded, &bytes)?;
+    let (file, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &padded)?;
+    assert_eq!(
+        source,
+        varve::LazyOpenSource::FullScan,
+        "the checksum covers every byte of the slot, not only the live entries",
+    );
+    assert_eq!(file.block_tail_offset(Sample::ID), expected);
+    Ok(())
+}
+
+/// A writer resumed from the header table appends a chain the scan agrees with.
+///
+/// The point of the tails is to seed `prev_same_block_offset` for the next
+/// append. A resume that adopted a wrong tail would produce a chain that is
+/// silently short — every link checksums, and only a full walk notices. So this
+/// resumes lazily, appends, and then compares the chain against the scan.
+#[test]
+fn a_writer_resumed_from_the_header_appends_a_chain_the_scan_agrees_with() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("resumed.varve");
+    write_samples(on_spec(), &path, 120)?;
+
+    let (mut writer, source) = varve::VarveWriter::open_lazy_with_report(on_spec(), &path)?;
+    assert_eq!(source, varve::LazyOpenSource::HeaderTails);
+    for value in 1000..1010 {
+        writer.push(&Sample { value })?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    // The chain, walked from the tail the scan finds, must reach every Sample.
+    let scanned = varve::VarveFile::open_readonly(on_spec(), &path)?;
+    let samples = scanned
+        .index_entries()
+        .iter()
+        .filter(|entry| entry.block_id == Sample::ID)
+        .count();
+    let walked = scanned.block_chain(Sample::ID)?.count();
+    assert_eq!(
+        walked, samples,
+        "the chain must reach every Sample record, not stop at the resume point",
+    );
+    assert_eq!(samples, 130);
     Ok(())
 }

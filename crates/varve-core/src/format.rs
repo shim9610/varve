@@ -1169,14 +1169,30 @@ pub struct IndexPolicy {
     /// the open falls back to reading every record. The moment a resume is
     /// needed is the moment that is most likely.
     ///
-    /// **Not finished, and it costs a little without paying yet.** The region
-    /// is reserved and written at create, and it is read back and checked at
-    /// open, but nothing writes a *warm* table into it: every slot says it
-    /// holds no tail, so an open learns nothing from it and falls back exactly
-    /// as it would without it. What a file with this on gets today is the space
-    /// and a schema hash of its own. The commit-time update — before the commit
-    /// marker, riding the `sync_data` that already precedes it, so no extra
-    /// `fsync` — is the next step and is not here.
+    /// The region is written at create and rewritten at the end of every commit
+    /// point, after the commit marker and inside the durability request that
+    /// already follows it — so it costs **no extra `fsync`**, and its length
+    /// never changes, so it moves no record.
+    ///
+    /// **A slot has to earn belief, and it does so in two bounded steps.** It
+    /// records the offset of the commit marker it was written for. An open
+    /// frames that record and requires it to be a commit marker, then walks
+    /// forward — at most a segment and an open digest may follow one — and
+    /// requires the walk to land exactly on the end of the file. The second
+    /// step is the one that matters: a stale table names an older marker that
+    /// is still in the file and still checksums, and adopting it would seed the
+    /// next append with a `prev_same_block_offset` that skips every record in
+    /// between. "Reaches the end of the file" is exactly "nothing was committed
+    /// after this". Every tail is then re-framed and its block id checked.
+    ///
+    /// **It serves a fresh open, not an open handle.** The header is read once,
+    /// at open, so a handle held across many commits keeps the table it opened
+    /// with. That is what the option is for — a resume — and it is not a live
+    /// view.
+    ///
+    /// Refused together with [`Self::open_digest_on_flush`]: they are two
+    /// answers to the same question with different safety properties, and no
+    /// precedence rule between them is safe in both directions.
     ///
     /// **Changes the bytes on disk.** The region lives in the header, so
     /// `append_log_start` and every record offset move, and the schema hash
@@ -2928,6 +2944,17 @@ impl FormatSpec {
         {
             return Err(Error::InvalidFormatSpec(
                 "header_tails requires a crc32 integrity policy",
+            ));
+        }
+        // Two persisted answers to the same question, with different safety
+        // properties and no precedence rule that is safe in both directions.
+        // The digest is bound to the file by ending exactly at EOF, which the
+        // header table has to *earn* by walking forward from the commit marker
+        // it names; "whichever is newer" would sometimes prefer the weaker one.
+        // Rather than invent an order, declare one.
+        if self.index_policy.header_tails && self.index_policy.open_digest_on_flush {
+            return Err(Error::InvalidFormatSpec(
+                "header_tails and open_digest_on_flush are two answers to the same question; declare one",
             ));
         }
         for (index, block) in self.blocks.iter().enumerate() {
