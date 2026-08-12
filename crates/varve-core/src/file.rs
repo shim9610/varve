@@ -10661,6 +10661,21 @@ impl VarveFile {
         record_file::take_record_file_seeks()
     }
 
+    /// Reads and clears this thread's count of resident-index entries rebuilt
+    /// from their record headers.
+    ///
+    /// The resident index stores an offset and a commit bit per record, not the
+    /// entry — every read of an entry is one positional read of that record's
+    /// header (`fault_record_entry`). So this counts what walking the directory
+    /// actually costs, which no byte counter does: `take_open_scan_bytes`
+    /// measures the open scan, and a directory walk after open is invisible to
+    /// it.
+    #[cfg(any(test, feature = "scalable-fault-injection"))]
+    #[doc(hidden)]
+    pub fn take_record_entry_faults() -> u64 {
+        take_record_entry_faults()
+    }
+
     /// Cumulative bytes this thread has read to answer chunked cell reads.
     ///
     /// Fault-testing hook only. This is the unit a growing matrix's read path
@@ -14742,6 +14757,25 @@ pub(crate) fn take_open_scan_bytes() -> u64 {
     OPEN_SCAN_BYTES.with(|total| total.replace(0))
 }
 
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+thread_local! {
+    static RECORD_ENTRY_FAULTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one entry rebuilt from its record header. Inert outside tests and
+/// without the `scalable-fault-injection` feature.
+#[inline]
+fn count_record_entry_fault() {
+    #[cfg(any(test, feature = "scalable-fault-injection"))]
+    RECORD_ENTRY_FAULTS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+/// Reads and clears this thread's count of entries faulted in from the file.
+#[cfg(any(test, feature = "scalable-fault-injection"))]
+pub(crate) fn take_record_entry_faults() -> u64 {
+    RECORD_ENTRY_FAULTS.with(|count| count.replace(0))
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct ScanAccounting {
     advanced: u64,
@@ -17179,6 +17213,7 @@ pub(crate) fn fault_record_entry(
     record_offset: u64,
     committed: bool,
 ) -> Result<RecordIndexEntry> {
+    count_record_entry_fault();
     let mut header_bytes = [0; RECORD_HEADER_LEN as usize];
     snapshot.read_exact_at(record_offset, &mut header_bytes)?;
     let decoded = read_native_record_header(&mut header_bytes.as_slice(), record_offset)?;
