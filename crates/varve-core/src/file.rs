@@ -1104,8 +1104,26 @@ pub(crate) mod resident_index {
     #[derive(Clone, Copy, Debug)]
     struct IndexSlot {
         record_offset: u64,
+        /// The record's block id, kept so that a directory walk looking for one
+        /// block can skip the rest **without faulting them**.
+        ///
+        /// Everything else about an entry is rebuilt from the record header,
+        /// which is one positional read each — so a walk that filters after
+        /// faulting pays for every record in the file to keep a handful. This
+        /// is the one field worth the exception, and it is free: `u64` forces
+        /// eight-byte alignment, so the `bool` already sat in seven bytes of
+        /// padding and the `u32` takes four of them. `SLOT_IS_STILL_SIXTEEN`
+        /// below is the assertion that keeps that true.
+        block_id: u32,
         committed: bool,
     }
+
+    /// Adding `block_id` to the slot must not grow the resident index.
+    ///
+    /// The index is one slot per record for the life of the handle, so a byte
+    /// here is a byte times every record in the file — the reason the slot
+    /// holds an offset and a bit rather than the entry in the first place.
+    const SLOT_IS_STILL_SIXTEEN: () = assert!(size_of::<IndexSlot>() == 16);
 
     /// What an entry is rebuilt from.
     ///
@@ -1166,6 +1184,7 @@ pub(crate) mod resident_index {
                 })?;
             slots.extend(entries.iter().map(|entry| IndexSlot {
                 record_offset: entry.record_offset,
+                block_id: entry.block_id,
                 committed: entry.committed,
             }));
             Ok(Self {
@@ -1250,10 +1269,22 @@ pub(crate) mod resident_index {
         /// it is already on disk, at that offset.
         pub(crate) fn install(&mut self, slot: ReservedIndexSlot, entry: &RecordIndexEntry) {
             let ReservedIndexSlot(()) = slot;
+            // Evaluated for its assertion, at the one place a slot is grown.
+            let () = SLOT_IS_STILL_SIXTEEN;
             self.slots.push(IndexSlot {
                 record_offset: entry.record_offset,
+                block_id: entry.block_id,
                 committed: entry.committed,
             });
+        }
+
+        /// The block id at `position` without rebuilding the entry.
+        ///
+        /// The point of the field: a caller looking for one block can decide
+        /// to skip a record for the cost of a `Vec` index, where faulting to
+        /// find out costs a positional read of that record's header.
+        pub(crate) fn block_id_at(&self, position: usize) -> Option<u32> {
+            self.slots.get(position).map(|slot| slot.block_id)
         }
 
         /// Drops the tail beyond `len`, for the append rollback. Shrinking can
@@ -1412,6 +1443,20 @@ pub trait RecordDirectory {
 
     /// The entry at `position`, or `UnexpectedEof` if there is none.
     fn record_at(&self, position: usize) -> Result<RecordIndexEntry>;
+
+    /// The block id at `position`, when it can be told without building the
+    /// entry. `None` means "ask `record_at`" and is always a correct answer.
+    ///
+    /// This exists for walks that want one block out of a directory. Producing
+    /// an entry can read the file — the resident index rebuilds each one from
+    /// its record header — so a walk that filters *after* `record_at` pays for
+    /// every record in the file to keep the few that match. Directories that
+    /// hold whole entries answer from those; the resident index answers from
+    /// the field its slot carries; the default answers `None`, which costs a
+    /// filtering caller nothing beyond what it already did.
+    fn block_id_at(&self, _position: usize) -> Option<u32> {
+        None
+    }
 }
 
 /// Every entry of `dir` in order, fallible per item for the same reason
@@ -1434,6 +1479,10 @@ impl RecordDirectory for ResidentIndex {
     fn record_at(&self, position: usize) -> Result<RecordIndexEntry> {
         self.entry_at(position)
     }
+
+    fn block_id_at(&self, position: usize) -> Option<u32> {
+        ResidentIndex::block_id_at(self, position)
+    }
 }
 
 impl RecordDirectory for [RecordIndexEntry] {
@@ -1443,6 +1492,10 @@ impl RecordDirectory for [RecordIndexEntry] {
 
     fn record_at(&self, position: usize) -> Result<RecordIndexEntry> {
         self.get(position).cloned().ok_or(Error::UnexpectedEof)
+    }
+
+    fn block_id_at(&self, position: usize) -> Option<u32> {
+        self.get(position).map(|entry| entry.block_id)
     }
 }
 
@@ -8006,8 +8059,26 @@ impl VarveFile {
         let mut budget = MaterializationBudget::new(self.spec);
         // One payload buffer for the whole walk, not one per record.
         let mut payload = Vec::new();
-        for (record_ordinal, entry) in directory_records(dir).enumerate() {
-            let entry = entry?;
+        for record_ordinal in 0..dir.record_count() {
+            // Only two block ids can move `T`'s tail: `T` itself, and a
+            // tombstone, which may name one of `T`'s keys. When the directory
+            // can say which a record is without building the entry, every
+            // other record is skipped here — before `record_at`, which for the
+            // resident index is a positional read of that record's header.
+            //
+            // This is what makes a generated writer's construction affordable.
+            // It primes one map per keyed block, so a format with four of them
+            // read every record header four times to keep four small maps. The
+            // walk is still O(records); what it no longer does is read them.
+            //
+            // `record_ordinal` stays the position in the directory rather than
+            // a count of what survived the filter, because `MergeOrder` uses it
+            // to break ties between records that share a sequence.
+            match dir.block_id_at(record_ordinal) {
+                Some(id) if id != T::ID && id != TOMBSTONE_BLOCK_ID => continue,
+                _ => {}
+            }
+            let entry = dir.record_at(record_ordinal)?;
             // One record's materialization at a time (see
             // `MaterializationBudget`). Every decoded block is dropped once its
             // key is taken, so the peak here is one payload however many

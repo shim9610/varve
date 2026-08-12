@@ -2,16 +2,16 @@
 //!
 //! The generated writer primes one keyed-tail map per keyed block, and each
 //! priming pass walks the whole record directory. The resident index stores an
-//! offset and a commit bit per record rather than the entry, so *walking* it is
-//! not free: every entry is rebuilt by one positional read of that record's
-//! header (`fault_record_entry`).
+//! offset, a block id and a commit bit per record rather than the entry, so
+//! producing an entry is one positional read of that record's header
+//! (`fault_record_entry`) — and a walk that filtered *after* producing them
+//! read every record in the file, once per keyed block.
 //!
-//! Measured at 520 records and four keyed blocks: the untyped open faults
-//! **0** entries and the generated writer faults **2080**, which is four walks
-//! of the whole file. The open scan does not appear in that number at all —
-//! it frames records as it reads forward and never rebuilds an entry — so the
-//! primes are not a fraction of the open cost, they are 4N *random* header
-//! reads added to a single sequential pass.
+//! Measured at 520 records and four keyed blocks: **2080 faults before, 20
+//! after** — four walks of the whole file, against the twenty records that
+//! actually carry a key. The open scan appears in neither number: it frames
+//! records as it reads forward and never rebuilds an entry, so this cost was
+//! never a fraction of the open cost. It was random header reads added to it.
 //!
 //! The instrument is `take_record_entry_faults`, which counts exactly those
 //! rebuilds. `take_open_scan_bytes` cannot see this: it charges the open scan,
@@ -50,13 +50,16 @@ varve_format! {
     }
 }
 
-/// The distinct-key counts are deliberately tiny and the record count is not:
-/// the cost being measured is the directory walk, which is charged per record
-/// in the file rather than per key in the map.
+/// Distinct keys per block, deliberately tiny. The whole point of the format
+/// this mirrors is that its keyed blocks are small and bounded while the
+/// non-keyed ones carry the volume.
 const KEYS_PER_BLOCK: u32 = 5;
-const BULK_RECORDS: u64 = 500;
+const KEYED_BLOCKS: u64 = 4;
 
-fn build(path: &std::path::Path) -> Result<u64> {
+/// Records that carry a key, and are therefore the ones a prime must read.
+const KEYED_RECORDS: u64 = KEYS_PER_BLOCK as u64 * KEYED_BLOCKS;
+
+fn build(path: &std::path::Path, bulk: u64) -> Result<()> {
     let mut writer = FourKeyedFormat::create_writer(path)?;
     for index in 0..KEYS_PER_BLOCK {
         writer.push_channel(&Channel { index, value: 0 })?;
@@ -73,49 +76,65 @@ fn build(path: &std::path::Path) -> Result<u64> {
             value: 0,
         })?;
     }
-    for value in 0..BULK_RECORDS {
+    for value in 0..bulk {
         writer.push_bulk(&Bulk { value })?;
     }
     writer.flush()?;
-    let records = u64::from(KEYS_PER_BLOCK) * 4 + BULK_RECORDS;
-    Ok(records)
+    Ok(())
 }
 
-/// Reopening a generated writer reads every record header once per keyed block.
-///
-/// The primes run whether or not the caller ever performs a keyed operation on
-/// the handle: construction builds all four maps, and a writer that only ever
-/// appends to the non-keyed blocks pays for every one of them.
-///
-/// The assertion is a ratio against the record count rather than an absolute
-/// number, because what is under test is that the primes scale with the
-/// *records* in the file while the maps they build hold `KEYS_PER_BLOCK`
-/// entries each — 5 here, against 520 records walked four times.
-#[test]
-fn reopening_a_generated_writer_walks_the_directory_once_per_keyed_block() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let path = directory.path().join("prime-cost.varve");
-    let records = build(&path)?;
+/// Opens a generated writer over a file with `bulk` non-keyed records and
+/// returns how many entries the priming rebuilt.
+fn prime_faults(directory: &std::path::Path, bulk: u64) -> Result<u64> {
+    let path = directory.join(format!("prime-{bulk}.varve"));
+    build(&path, bulk)?;
 
-    // The untyped handle does the open work and nothing else: no generated
-    // wrapper, so no priming. This is the baseline the primes sit on top of.
+    // The untyped handle does the open work and no priming: no generated
+    // wrapper. This is the baseline the primes sit on top of.
     let _ = varve::VarveFile::take_record_entry_faults();
     let untyped = varve::VarveWriter::open(FourKeyedFormat::spec(), &path)?;
     let open_only = varve::VarveFile::take_record_entry_faults();
     drop(untyped);
+    assert_eq!(
+        open_only, 0,
+        "the open scan frames records as it reads and rebuilds no entry; if this \
+         moved, the baseline below is measuring something else",
+    );
 
-    // The same open, through the generated writer, which primes four maps.
     let _ = varve::VarveFile::take_record_entry_faults();
     let typed = FourKeyedFormat::open_writer(&path)?;
-    let with_primes = varve::VarveFile::take_record_entry_faults();
+    let faults = varve::VarveFile::take_record_entry_faults();
     drop(typed);
+    Ok(faults)
+}
 
-    let primes = with_primes - open_only;
+/// Priming the keyed-tail maps must cost the keyed records, not the file.
+///
+/// The primes run whether or not the caller ever performs a keyed operation on
+/// the handle — construction builds all four maps, and a writer that only ever
+/// appends to `Bulk` pays for every one of them. So what they cost has to be
+/// bounded by the keys, which are bounded by the format, rather than by the
+/// records, which are bounded by how long the session ran.
+///
+/// **The instrument is a count of rebuilt entries, and the assertion is that it
+/// does not move when the file grows twentyfold.** A ratio against the record
+/// count would have passed just as well before this was fixed; only
+/// independence from the record count distinguishes the two.
+#[test]
+fn priming_the_keyed_tails_reads_the_keyed_records_and_not_the_file() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+
+    let small = prime_faults(directory.path(), 50)?;
+    let large = prime_faults(directory.path(), 1_000)?;
+
     assert_eq!(
-        primes,
-        records * 4,
-        "four keyed blocks must cost four directory walks of {records} records; \
-         open alone faulted {open_only}, the generated writer {with_primes}",
+        small, KEYED_RECORDS,
+        "priming four maps of {KEYS_PER_BLOCK} keys must rebuild {KEYED_RECORDS} entries",
+    );
+    assert_eq!(
+        large, small,
+        "the file grew from 50 to 1,000 non-keyed records and the priming cost \
+         moved from {small} to {large}; it is walking the file again",
     );
     Ok(())
 }
