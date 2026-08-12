@@ -13823,6 +13823,77 @@ fn parse_file_header_extension_blocks(region: &[u8]) -> Result<Vec<HeaderExtensi
     Ok(blocks)
 }
 
+/// Blank out the header bytes a file is allowed to change after create.
+///
+/// `prefix` is the file's leading bytes from offset 0 — any length, so a caller
+/// holding a fixed window shorter than the header can pass what it has.
+/// `header_len` and `extensions` are what `read_file_header_parts` returned for
+/// the same file.
+///
+/// This exists for the two places that bind a *derived* artefact to the primary
+/// file by hashing its leading bytes. Both were written when the header was
+/// written exactly once, and both say so out loud; an updatable region falsifies
+/// that, and without this every in-place update would permanently invalidate
+/// every published sidecar for the file.
+///
+/// **Only the mutable block's payload is blanked.** Its magic and its declared
+/// length stay in the hash, so a region that changed size, changed identity or
+/// disappeared is still caught — which is the property that matters, because
+/// those are the changes that move `append_log_start` and with it every record
+/// offset. What stops being detected is a change to the table's *contents*,
+/// which is exactly what the option exists to make legal.
+///
+/// Returns the number of bytes it blanked, so a caller can assert it did
+/// something.
+#[cfg(any(test, feature = "high-cardinality-dev"))]
+pub(crate) fn blank_mutable_header_bytes(
+    prefix: &mut [u8],
+    header_len: u64,
+    extensions: &[u8],
+) -> Result<u64> {
+    if extensions.is_empty() {
+        return Ok(0);
+    }
+    // The region sits at the end of the header, so its start is the header's
+    // length less its own. Deriving it rather than recomputing the header
+    // layout keeps this correct for a file whose region is longer than this
+    // build would write - which is the whole point of skippable unknown blocks.
+    let extension_len =
+        u64::try_from(extensions.len()).map_err(|_| Error::InvalidCompressionHeader)?;
+    let region_start = header_len
+        .checked_sub(extension_len)
+        .ok_or(Error::InvalidCompressionHeader)?;
+
+    let mut blanked = 0u64;
+    for block in parse_file_header_extension_blocks(extensions)? {
+        if !is_mutable_header_extension_magic(&block.magic) {
+            continue;
+        }
+        // Every mutable block carries the `magic | len: u32` framing; `VCHD` is
+        // the one block that does not, and it is not mutable. Asserting it here
+        // rather than assuming it keeps the arithmetic below honest if that
+        // ever changes.
+        debug_assert_ne!(&block.magic, FILE_COMPRESSION_MAGIC);
+        let framing = 4 + 4;
+        let payload_len = block.encoded.len().saturating_sub(framing);
+        let start = region_start
+            .checked_add(u64::try_from(block.offset).map_err(|_| Error::InvalidCompressionHeader)?)
+            .and_then(|start| start.checked_add(framing as u64))
+            .ok_or(Error::InvalidCompressionHeader)?;
+        let Ok(start) = usize::try_from(start) else {
+            continue;
+        };
+        // A caller's window may end inside the region, or before it starts.
+        let Some(window) = prefix.get_mut(start..) else {
+            continue;
+        };
+        let take = payload_len.min(window.len());
+        window[..take].fill(0);
+        blanked += take as u64;
+    }
+    Ok(blanked)
+}
+
 /// The extension region to write into the file a `replace_*` builds.
 ///
 /// Everything the old file carried, including blocks this build does not know,
@@ -19665,6 +19736,88 @@ mod tests {
                 "{name}: block tails diverged from the forward walk"
             );
         }
+    }
+
+    /// What the two sidecar identity windows must stop covering, and what they
+    /// must keep covering.
+    ///
+    /// Both windows hash the file's leading bytes to bind a derived artefact to
+    /// the primary. That was sound while the header was written once; the
+    /// header tail region makes it false, and without this blanking one commit
+    /// would permanently invalidate every published sidecar for the file.
+    ///
+    /// The relaxation has to be exactly as narrow as that. This asserts three
+    /// things a looser version would get wrong: the magic and the declared
+    /// length stay in the window (they are what move `append_log_start`, so a
+    /// change to either has to keep failing); a block that is *not* mutable is
+    /// untouched even when it sits beside one that is; and a caller whose
+    /// window ends inside the region blanks what it holds rather than
+    /// overrunning or refusing.
+    #[test]
+    fn blanking_covers_the_mutable_payload_and_nothing_else() {
+        const PAYLOAD_LEN: usize = 40;
+        const HEADER_PREAMBLE: usize = 20;
+        let mut extensions = Vec::new();
+        // `VCHD` first: it predates the framing and carries no length prefix,
+        // so it also checks that the walk's offsets survive a block of a
+        // different shape sitting in front of the mutable one.
+        extensions.extend_from_slice(FILE_COMPRESSION_MAGIC);
+        extensions.extend_from_slice(&[0x11; FILE_COMPRESSION_PAYLOAD_LEN]);
+        let vchd_len = extensions.len();
+        extensions.extend_from_slice(HEADER_TAILS_MAGIC);
+        extensions.extend_from_slice(&(PAYLOAD_LEN as u32).to_le_bytes());
+        extensions.extend_from_slice(&[0x22; PAYLOAD_LEN]);
+
+        let header_len = (HEADER_PREAMBLE + extensions.len()) as u64;
+        let payload_start = HEADER_PREAMBLE + vchd_len + 8;
+
+        let mut prefix = vec![0xAAu8; header_len as usize];
+        let blanked = blank_mutable_header_bytes(&mut prefix, header_len, &extensions)
+            .expect("a well-framed region blanks");
+        assert_eq!(blanked, PAYLOAD_LEN as u64);
+        assert!(
+            prefix[payload_start..payload_start + PAYLOAD_LEN]
+                .iter()
+                .all(|byte| *byte == 0),
+            "the mutable payload is blanked",
+        );
+        assert!(
+            prefix[..payload_start].iter().all(|byte| *byte == 0xAA),
+            "everything before it — including `VBTT`'s own magic and declared \
+             length — stays in the window",
+        );
+        assert!(
+            prefix[payload_start + PAYLOAD_LEN..]
+                .iter()
+                .all(|byte| *byte == 0xAA),
+            "and everything after it",
+        );
+
+        // A window that stops inside the region blanks its own tail and no more.
+        let short = payload_start + 5;
+        let mut clipped = vec![0xAAu8; short];
+        let blanked = blank_mutable_header_bytes(&mut clipped, header_len, &extensions)
+            .expect("a clipped window is not an error");
+        assert_eq!(blanked, 5);
+        assert!(clipped[payload_start..].iter().all(|byte| *byte == 0));
+
+        // A window that ends before the region touches nothing.
+        let mut early = vec![0xAAu8; HEADER_PREAMBLE];
+        assert_eq!(
+            blank_mutable_header_bytes(&mut early, header_len, &extensions).expect("no overrun"),
+            0,
+        );
+        assert!(early.iter().all(|byte| *byte == 0xAA));
+
+        // A region with no mutable block is left exactly as it is.
+        let immutable = &extensions[..vchd_len];
+        let header_len = (HEADER_PREAMBLE + immutable.len()) as u64;
+        let mut untouched = vec![0xAAu8; header_len as usize];
+        assert_eq!(
+            blank_mutable_header_bytes(&mut untouched, header_len, immutable).expect("no block"),
+            0,
+        );
+        assert!(untouched.iter().all(|byte| *byte == 0xAA));
     }
 
     use super::*;

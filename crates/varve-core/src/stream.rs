@@ -13,10 +13,10 @@ use crate::disk_index::{
 };
 use crate::file::{
     NativeStreamScanner, PreparedStreamRecord, ReplaceDurability, WriterLock,
-    fresh_stream_creation_nonce, prepare_stream_creation_nonce_record,
+    blank_mutable_header_bytes, fresh_stream_creation_nonce, prepare_stream_creation_nonce_record,
     prepare_stream_manifest_record, prepare_stream_tombstone_record,
     prepare_stream_user_record_into, publish_temp_path_atomically, read_file_header,
-    read_stream_creation_nonce, write_file_header,
+    read_file_header_parts, read_stream_creation_nonce, write_file_header,
 };
 use crate::scan_control::{ScanCancelled, ScanProgressDriver};
 use crate::snapshot::WrittenThrough;
@@ -1983,16 +1983,29 @@ fn create_state_store(
 ///
 /// * The **per-create nonce** stamped inside the primary at create. This is
 ///   what makes the witness a true generation identity: an equal-length
-///   in-place rewrite preserves the OS object, the header bytes and the schema
-///   hash, but a primary created by a different `create` call carries a
-///   different nonce no matter how much content the two generations share.
+///   in-place rewrite preserves the OS object, the schema hash and — for a
+///   format without [`IndexPolicy::header_tails`] — the header bytes, but a
+///   primary created by a different `create` call carries a different nonce no
+///   matter how much content the two generations share.
 ///   It is folded in explicitly rather than relied upon to fall inside the
 ///   content window below, so the guarantee does not depend on record sizes.
 /// * A **content digest** over the first `min(eof, window)` bytes, bounded by
-///   [`PRIMARY_GENERATION_WINDOW`]. This is defence in depth against accidental
-///   truncation/overwrite of a primary that carries no nonce (legacy primaries,
-///   and primaries bootstrapped from a resident `VarveFile`). It is a CRC-based
-///   accident detector, not an adversary-resistant hash.
+///   [`PRIMARY_GENERATION_WINDOW`], with one exclusion. This is defence in
+///   depth against accidental truncation/overwrite of a primary that carries no
+///   nonce (legacy primaries, and primaries bootstrapped from a resident
+///   `VarveFile`). It is a CRC-based accident detector, not an
+///   adversary-resistant hash.
+///
+///   The exclusion: a header tail region's *payload* is blanked before hashing,
+///   because a format that declares one rewrites it in place at every commit
+///   point and this witness would otherwise change on every commit — turning a
+///   generation check into a commit counter and invalidating every published
+///   sidecar. Its magic and declared length stay in the digest, which is what
+///   still catches a region that changed size, since that is the change that
+///   moves `append_log_start` and every record offset with it. For every format
+///   that does not declare the region — which is all of them until one opts in
+///   — the blanking touches nothing and this digest is byte-for-byte what it
+///   was.
 ///
 /// Both parts are bounded work: one small read of the leading window plus one
 /// bounded point read of the leading record, regardless of file size. This runs
@@ -2005,11 +2018,18 @@ pub(crate) fn primary_generation(
 ) -> Result<DiskIndexPrimaryGeneration> {
     crate::disk_index::primary_generation_scan();
     let len = len.min(PRIMARY_GENERATION_WINDOW);
-    let prefix = snapshot.read_vec_at(0, len, PRIMARY_GENERATION_WINDOW, "primary generation")?;
-    let header_len = {
+    let mut prefix =
+        snapshot.read_vec_at(0, len, PRIMARY_GENERATION_WINDOW, "primary generation")?;
+    let (header_len, extensions) = {
         let mut file = snapshot.try_clone_file()?;
-        read_file_header(spec, &mut file)?
+        read_file_header_parts(spec, &mut file)?
     };
+    // STO-01a: the window is a prefix of the file, so it contains the header,
+    // and a header carrying an updatable region is no longer constant for the
+    // file's life. Blanking that region's payload — and only its payload — is
+    // what keeps this a *generation* witness rather than a commit counter.
+    // Everything the window still covers is listed on the helper.
+    blank_mutable_header_bytes(&mut prefix, header_len, &extensions)?;
     // A primary that carries no nonce folds in a zero value *and* a zero
     // presence flag, so "carries no nonce" can never collide with "carries an
     // all-zero nonce".
@@ -2036,8 +2056,10 @@ pub(crate) fn primary_generation(
 }
 
 /// Rejects a sidecar that was published against a different generation of the
-/// same file object: an equal-length in-place rewrite preserves OS identity,
-/// schema hash and header bytes, but not the recorded leading bytes.
+/// same file object: an equal-length in-place rewrite preserves OS identity and
+/// schema hash, but not the recorded leading bytes — excepting a header tail
+/// region's payload, which [`primary_generation`] blanks and which is therefore
+/// the one part of a primary that may change without a new generation.
 pub(crate) fn verify_primary_generation(
     spec: FormatSpec,
     recorded: DiskIndexPrimaryGeneration,
@@ -2057,8 +2079,13 @@ pub(crate) fn primary_identity(
     snapshot: &SnapshotFile,
 ) -> Result<crate::disk_index::DiskIndexIdentity> {
     let mut file = snapshot.try_clone_file()?;
-    let header_len = read_file_header(spec, &mut file)?;
-    let header = snapshot.read_vec_at(0, header_len, header_len, "file header")?;
+    let (header_len, extensions) = read_file_header_parts(spec, &mut file)?;
+    let mut header = snapshot.read_vec_at(0, header_len, header_len, "file header")?;
+    // Same reason as `primary_generation`, and here it matters more: this
+    // fingerprint is stored in the sidecar and compared on every open, so
+    // without the blanking one commit would make every published sidecar for
+    // the file permanently unopenable.
+    blank_mutable_header_bytes(&mut header, header_len, &extensions)?;
     let object_identity = opened_file_identity(&file)?;
     let schema_hash = if spec.schema_hash == 0 {
         spec.computed_schema_hash()
