@@ -264,7 +264,8 @@ pub enum DiskIndexError {
     InvalidTail(&'static str),
     IdentityMismatch,
     /// The primary no longer matches the generation the sidecar was published
-    /// against: the leading bytes of the file changed underneath it (STO-01).
+    /// against: the leading bytes of the file changed underneath it, outside a
+    /// declared header tail region, which is excluded from the witness (STO-01).
     PrimaryGenerationMismatch,
     ModeMismatch {
         expected: DiskIndexMode,
@@ -615,6 +616,13 @@ pub(crate) const PRIMARY_GENERATION_WINDOW: u64 = 4096;
 /// one file object. `digest` covers the first `len` bytes of the primary as of
 /// the recorded commit, which no such rewrite preserves unless it reproduces
 /// those bytes exactly.
+///
+/// One exclusion, and it is the only part of a primary that may change without
+/// a new generation: a declared `IndexPolicy::header_tails` region's payload is
+/// blanked before the digest is taken, because a commit rewrites it in place
+/// and the witness would otherwise become a commit counter. The region's magic
+/// and declared length stay covered, which is what still catches a region that
+/// changed size — the change that moves every record offset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DiskIndexPrimaryGeneration {
     pub len: u64,

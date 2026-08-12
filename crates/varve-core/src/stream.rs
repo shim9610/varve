@@ -817,8 +817,12 @@ impl VarveStreamWriter {
         // STO-01: stamp the per-create nonce as the very first record of the
         // log, before anything else can be appended. It has to live inside the
         // primary because an equal-length in-place rewrite preserves the OS
-        // object, the header bytes and the schema hash — everything except the
-        // primary's own content. One record at create; zero cost per append.
+        // object, the schema hash and every header byte a witness looks at —
+        // everything except the primary's own content. (The one header byte
+        // range a witness no longer looks at is a declared `header_tails`
+        // region's payload, which `primary_generation` blanks; the nonce sits
+        // in a record after the header and is unaffected either way.) One
+        // record at create; zero cost per append.
         {
             let sequence = writer.next_sequence()?;
             let offset = writer.snapshot.len();
@@ -888,7 +892,10 @@ impl VarveStreamWriter {
         let identity = primary_identity(spec, &physical_snapshot)?;
         let (checkpoint, generation, loaded) = load_checkpoint(identity, physical_len)?;
         // STO-01: the sidecar must belong to this generation of the primary,
-        // not merely to the same file object with the same header bytes.
+        // not merely to the same file object with the same header bytes — of
+        // which a declared `header_tails` region's payload is no longer one,
+        // since a commit rewrites it in place and `primary_generation` blanks
+        // it for exactly that reason.
         verify_primary_generation(spec, generation, &physical_snapshot)?;
         checkpoint.validate(spec, header_len, physical_len)?;
         file.seek(SeekFrom::Start(checkpoint.logical_eof))?;

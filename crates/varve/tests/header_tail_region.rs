@@ -493,3 +493,74 @@ fn the_region_requires_a_crc32_integrity_policy() {
         "{error:?}",
     );
 }
+
+/// The published layout plan must describe the header the writer actually
+/// emits, region included.
+///
+/// `FormatSpec::effective_layout` is where a tool outside this crate learns
+/// where the file header ends and the first record begins, and
+/// `schema_debug_dump` prints the same plan. The plan derived its extension
+/// length from a function that knew only about the compression block, so for a
+/// `header_tails` format it omitted the `extensions` field entirely and put the
+/// end of the header inside the region — a wrong answer from a public accessor,
+/// contradicted by the `file_header_len` sitting beside it in the same returned
+/// struct, which is read from the real file.
+///
+/// The assertion is against the FILE, not against a restatement of the plan's
+/// own arithmetic: the previous guard compared the plan with itself and passed.
+#[test]
+fn the_published_layout_plan_describes_the_header_the_writer_writes() -> varve::Result<()> {
+    use varve::{LayoutPlanFieldSource, LayoutPlanFieldType, LayoutPlanLen, LayoutPlanPartKind};
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("plan.varve");
+    write_samples(on_spec(), &path, 40)?;
+    let bytes = std::fs::read(&path)?;
+
+    let plan = on_spec().effective_layout();
+    let LayoutPlanPartKind::FileHeader(header) = &plan.parts[0].kind else {
+        panic!("the native preset publishes a file header part");
+    };
+
+    let extensions = header
+        .fields
+        .iter()
+        .find(|field| field.name == "extensions")
+        .expect("a format declaring the region has an extension field in its plan");
+    assert_eq!(
+        extensions.ty,
+        LayoutPlanFieldType::Bytes {
+            len: LayoutPlanLen::Fixed(expected_region_len() as u64)
+        },
+    );
+    assert!(matches!(
+        extensions.source,
+        LayoutPlanFieldSource::Native("file_header_extension_region"),
+    ));
+
+    // And the sum of the plan's fields is where the first record starts. The
+    // region's declared length comes off the file, so this compares the plan
+    // against the bytes rather than against the constants above.
+    let offset = find_region(&bytes).expect("the region is in the header");
+    let declared = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+    let header_end = offset + BLOCK_FRAMING_LEN + declared;
+    let planned: u64 = header
+        .fields
+        .iter()
+        .map(|field| match field.ty {
+            LayoutPlanFieldType::U8 => 1,
+            LayoutPlanFieldType::U16 => 2,
+            LayoutPlanFieldType::U32 => 4,
+            LayoutPlanFieldType::U64 => 8,
+            LayoutPlanFieldType::Bytes {
+                len: LayoutPlanLen::Fixed(len),
+            } => len,
+            ref other => panic!("unexpected field type in the native file header: {other:?}"),
+        })
+        .sum();
+    assert_eq!(
+        planned, header_end as u64,
+        "the plan's header length must be where the file's header actually ends",
+    );
+    Ok(())
+}

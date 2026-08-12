@@ -360,6 +360,8 @@ const HEADER_TAILS_SLOT_HEADER_LEN: usize = 2 + 2 + 4 + 4 + 8;
 const HEADER_TAILS_ENTRY_LEN: usize = 4 + 8;
 /// The slot's own crc32, over every byte of the slot before it.
 const HEADER_TAILS_SLOT_TRAILER_LEN: usize = 4;
+/// The block's own framing: `magic[4] | len: u32`.
+const HEADER_TAILS_BLOCK_FRAMING_LEN: usize = 4 + 4;
 const MATRIX_SIDECAR_MAGIC: &[u8; 4] = b"VSID";
 // v2 bound the sidecar to the native file's OS-object identity and matrix
 // layout generation (DUR-04/05). v3 additionally binds it to the per-create
@@ -13675,6 +13677,33 @@ fn header_tails_slot_len(capacity: usize) -> Option<usize> {
         .checked_add(HEADER_TAILS_SLOT_TRAILER_LEN)
 }
 
+/// The framed length of the `VBTT` block a spec would write, or zero for a spec
+/// that declares no region.
+///
+/// **One derivation, and the layout plan is the third consumer.** The encoder
+/// below produces the region and the bound above refuses an over-large one;
+/// `native_layout`'s published plan has to report the same number, because
+/// `FormatSpec::effective_layout` is where a tool outside this crate learns
+/// where the file header ends and the first record begins. Deriving it twice is
+/// what let the plan describe a header short by the whole region.
+///
+/// Saturating rather than fallible, because the plan is infallible and a
+/// saturated length is honest where a zero would read as "there is no region".
+/// A spec that would saturate is refused at create by the encoder, which does
+/// the same arithmetic checked.
+pub(crate) fn header_tails_region_len(spec: FormatSpec) -> u64 {
+    if !spec.index_policy.header_tails {
+        return 0;
+    }
+    let capacity = header_tails_capacity(spec) as u64;
+    let slot = capacity
+        .saturating_mul(HEADER_TAILS_ENTRY_LEN as u64)
+        .saturating_add(HEADER_TAILS_SLOT_HEADER_LEN as u64)
+        .saturating_add(HEADER_TAILS_SLOT_TRAILER_LEN as u64);
+    slot.saturating_mul(HEADER_TAILS_SLOTS as u64)
+        .saturating_add(HEADER_TAILS_BLOCK_FRAMING_LEN as u64)
+}
+
 /// The whole `VBTT` block a spec would write, framing included, with both slots
 /// cold.
 ///
@@ -13695,9 +13724,14 @@ fn encode_cold_header_tails_region(spec: FormatSpec) -> Result<Vec<u8>> {
         ))?;
     // The region shares the 64 KiB extension budget with every other block, so
     // the check is against the whole region's framed length, not the payload.
-    let framed_len = payload_len.checked_add(8).ok_or(Error::InvalidFormatSpec(
-        "header_tails region length overflows",
-    ))?;
+    let framed_len = payload_len
+        .checked_add(HEADER_TAILS_BLOCK_FRAMING_LEN)
+        .ok_or(Error::InvalidFormatSpec(
+            "header_tails region length overflows",
+        ))?;
+    // The saturating derivation the layout plan publishes must agree with this
+    // checked one on every spec that gets this far.
+    debug_assert_eq!(header_tails_region_len(spec), framed_len as u64);
     if u64::try_from(framed_len).unwrap_or(u64::MAX)
         > crate::native_layout::MAX_FILE_HEADER_EXTENSION_LEN
     {

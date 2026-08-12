@@ -281,6 +281,15 @@ path, same OS object, same header bytes, same schema hash — a refusal rather
 than an accepted stale generation. The recovery is `rebuild_disk_index`, never
 "trust the sidecar".
 
+One byte range of the primary is excluded from that window, and it is the only
+part of a file that may change without being a new generation: a format that
+declares `index: header_tails` reserves a region inside the file header which a
+commit rewrites in place, and the witness blanks that region's *payload* before
+checksumming. Its magic and its declared length stay covered, so a region that
+changed size — the change that moves the end of the header and every record
+offset after it — is still a refusal. For a format that does not declare the
+region, the window is exactly what it was.
+
 The nonce costs one record at create and nothing per append. Reading it is one
 bounded point read of the leading record, performed only at create and open. A
 primary that carries no nonce — a legacy file, or one bootstrapped from a

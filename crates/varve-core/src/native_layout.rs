@@ -1058,7 +1058,15 @@ fn native_file_header_field(
         NativeFileHeaderField::Extensions => NativeField {
             name: "extensions",
             ty: NativeFieldType::Bytes { len: extension_len },
-            source: NativeFieldSource::Native("file_explicit_compression_header"),
+            // The region held exactly one block until `header_tails`, and the
+            // source name said so. It can now hold two, so the name has to
+            // widen — but only for the specs that can carry the second one, so
+            // every plan published before this is byte-identical.
+            source: NativeFieldSource::Native(if spec.index_policy.header_tails {
+                "file_header_extension_region"
+            } else {
+                "file_explicit_compression_header"
+            }),
         },
     }
 }
@@ -1145,12 +1153,21 @@ fn native_container_marker_for_plan(spec: FormatSpec) -> &'static [u8; 6] {
     native_container_marker_for_extensions(spec, native_file_header_plan_extension_len(spec))
 }
 
+/// The extension region length the plan publishes, which must be the length the
+/// writer actually emits.
+///
+/// It is derived here rather than taken from `file_header_extensions` because
+/// the plan is infallible and that function is not; every term must therefore
+/// be a length the writer agrees with. `header_tails_region_len` is the writer's
+/// own derivation, imported rather than restated — restating it is what made
+/// the plan describe a header short by the whole `VBTT` region.
 fn native_file_header_plan_extension_len(spec: FormatSpec) -> u64 {
-    if native_uses_file_explicit_compression(spec) {
+    let compression = if native_uses_file_explicit_compression(spec) {
         FILE_EXPLICIT_COMPRESSION_HEADER_LEN
     } else {
         0
-    }
+    };
+    compression.saturating_add(crate::file::header_tails_region_len(spec))
 }
 
 fn native_file_header_has_extension_len(spec: FormatSpec, extension_len: u64) -> bool {
