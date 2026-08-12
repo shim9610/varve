@@ -3552,6 +3552,18 @@ pub enum ReplaceStrategy {
 #[derive(Debug)]
 pub struct MmapPayloads {
     spec: FormatSpec,
+    /// The file offset the mapping starts at, which is the start of the append
+    /// log rather than byte 0.
+    ///
+    /// **The file header is deliberately outside the mapping.** Every accessor
+    /// slices through `Deref`, which materialises a `&[u8]` over the *whole*
+    /// mapping before taking a window, so a mapping that began at byte 0 would
+    /// mean a live shared reference covering the header for as long as any
+    /// window is held — and `IndexPolicy::header_tails` rewrites part of that
+    /// header at every commit point. Moving the base is what removes those
+    /// bytes from every reference Rust constructs here; the OS still maps the
+    /// page they sit in, and that is not the part that matters.
+    base: u64,
     // Sorted by `record_offset` (append-log order), so snapshot membership is
     // a binary search on this one copy instead of a second full HashSet copy
     // of every entry (PERF2-07).
@@ -3659,8 +3671,12 @@ impl MmapPayloads {
     }
 
     fn payload_window_unchecked(&self, entry: &RecordIndexEntry) -> Result<&[u8]> {
-        let start =
-            usize::try_from(entry.payload_offset).map_err(|_| Error::MmapPayloadOutOfBounds {
+        // File offsets are absolute; the mapping starts at `base`.
+        let start = entry
+            .payload_offset
+            .checked_sub(self.base)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or(Error::MmapPayloadOutOfBounds {
                 offset: entry.payload_offset,
                 len: entry.payload_len,
             })?;
@@ -4307,6 +4323,12 @@ impl VarveReader {
     /// every indexed extent with checked arithmetic, rejecting entries outside
     /// the copied snapshot, and tying every returned slice to the mapping owner.
     /// Use owned reads instead when external immutability cannot be guaranteed.
+    ///
+    /// **The file header is not mapped.** The mapping begins at the start of
+    /// the append log, so the bytes a commit can rewrite — the
+    /// `IndexPolicy::header_tails` region among them — are outside every
+    /// reference this type constructs. The condition above is therefore about
+    /// the *records*, which nothing but a `replace_*` ever rewrites.
     pub unsafe fn mmap_payloads(&self) -> Result<MmapPayloads> {
         // SAFETY: The caller accepts the complete file-backed mapping contract.
         unsafe { self.file.mmap_payloads() }
@@ -4326,6 +4348,13 @@ impl VarveReader {
     /// the complete matrix extent, checking every requested slot, and tying
     /// every returned slice to the mapping owner. Use owned reads instead when
     /// external immutability cannot be guaranteed.
+    ///
+    /// Unlike [`Self::mmap_payloads`] this mapping *does* start at byte 0 and so
+    /// covers the file header: the matrix region it exists to serve sits between
+    /// the header and the append log, so there is no base to move it to. That is
+    /// sound because the one option that rewrites header bytes,
+    /// `IndexPolicy::header_tails`, is refused for a format declaring matrix
+    /// blocks — the two cannot meet.
     pub unsafe fn mmap_matrix(&self) -> Result<MmapMatrix> {
         // SAFETY: The caller accepts the complete file-backed mapping contract.
         unsafe { self.file.mmap_matrix() }
@@ -11010,18 +11039,13 @@ impl VarveFile {
     /// indexed extent with checked arithmetic, rejecting entries outside the
     /// copied snapshot, and tying every returned slice to the mapping owner.
     /// Use owned reads instead when external immutability cannot be guaranteed.
+    ///
+    /// **The file header is not mapped.** The mapping begins at the start of
+    /// the append log, so the bytes a commit can rewrite — the
+    /// `IndexPolicy::header_tails` region among them — are outside every
+    /// reference this type constructs. The condition above is therefore about
+    /// the *records*, which nothing but a `replace_*` ever rewrites.
     pub unsafe fn mmap_payloads(&self) -> Result<MmapPayloads> {
-        // The mapping starts at byte 0, so the file header is inside it, and a
-        // `header_tails` format rewrites part of that header at every commit
-        // point. The safety contract above asks the caller to prevent mutation
-        // "through every handle, thread, and process" — and a caller cannot
-        // prevent the writer's own commits. Refusing is the honest answer until
-        // the mapping starts past the header; see the note on `MmapPayloads`.
-        if self.spec.index_policy.header_tails {
-            return Err(Error::InvalidFormatSpec(
-                "mmap is not supported for a format declaring header_tails: a commit rewrites header bytes that are inside the mapping",
-            ));
-        }
         let mapped_len = self.snapshot.len();
         // `MmapLen` alone. `FileLen` was checked here too, against the same
         // value — the mapping's length is the snapshot's length — so it bounded
@@ -11050,11 +11074,30 @@ impl VarveFile {
                 len: mapped_len,
             });
         }
-        let map_len =
-            usize::try_from(mapped_len).map_err(|_| Error::LengthOverflow { value: mapped_len })?;
+        // Start the mapping at the append log, not at byte 0: see
+        // `MmapPayloads::base`. Every payload this type hands out lives at or
+        // after this offset by construction, so nothing is lost.
+        let (base, mapped_span) = match mapped_len.checked_sub(append_log_start_for_file(self)?) {
+            Some(span) if span > 0 => (append_log_start_for_file(self)?, span),
+            // The file holds no records. No accessor can produce a window, so
+            // the mapping is never dereferenced and nothing constructs a
+            // reference over the header — mapping it is sound, and it avoids
+            // asking the OS for a zero-length mapping.
+            _ => {
+                debug_assert_eq!(self.index.len(), 0);
+                (0, mapped_len)
+            }
+        };
+        let map_len = usize::try_from(mapped_span)
+            .map_err(|_| Error::LengthOverflow { value: mapped_span })?;
         // SAFETY: The caller guarantees that the cloned backing object remains
         // immutable and valid for the mapping's entire lifetime.
-        let mmap = unsafe { memmap2::MmapOptions::new().len(map_len).map(&file)? };
+        let mmap = unsafe {
+            memmap2::MmapOptions::new()
+                .offset(base)
+                .len(map_len)
+                .map(&file)?
+        };
         let mut index = Vec::new();
         index
             .try_reserve_exact(self.index.len())
@@ -11113,6 +11156,7 @@ impl VarveFile {
         }
         Ok(MmapPayloads {
             spec: self.spec,
+            base,
             index,
             by_block,
             mmap,

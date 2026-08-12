@@ -1045,3 +1045,36 @@ fn a_writer_resumed_from_the_header_appends_a_chain_the_scan_agrees_with() -> va
     assert_eq!(samples, 130);
     Ok(())
 }
+
+/// A format that rewrites part of its header at every commit can still be
+/// memory-mapped.
+///
+/// The mapping starts at the append log rather than at byte 0, so the bytes a
+/// commit rewrites are outside every reference `MmapPayloads` constructs. What
+/// this test can check is that the windows are still right; that no `&[u8]`
+/// covers the header is an aliasing property, and ASan is the tool for it.
+#[cfg(feature = "mmap")]
+#[test]
+fn a_header_tails_file_can_still_be_mapped() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("mapped.varve");
+    write_samples(on_spec(), &path, 60)?;
+
+    let file = varve::VarveFile::open_readonly(on_spec(), &path)?;
+    // SAFETY: nothing else holds this file open for writing for the duration.
+    let mapped = unsafe { file.mmap_payloads()? };
+    let mut compared = 0;
+    for entry in file.index_entries() {
+        if entry.block_id != Sample::ID {
+            continue;
+        }
+        assert_eq!(
+            mapped.payload_window(&entry)?,
+            entry.read_payload(&path)?,
+            "the mapped window must be the payload the indexed read returns",
+        );
+        compared += 1;
+    }
+    assert_eq!(compared, 60);
+    Ok(())
+}
