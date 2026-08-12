@@ -138,3 +138,33 @@ fn priming_the_keyed_tails_reads_the_keyed_records_and_not_the_file() -> Result<
     );
     Ok(())
 }
+
+/// The same defect, on the read path — and this one is paid per call.
+///
+/// `blocks::<T>()` and its siblings want one block out of the directory. They
+/// filtered on `block_id` after producing the entry, which the resident index
+/// produces by reading that record's header, so returning five `Channel`s out
+/// of a long session read every record in the file.
+///
+/// Priming is once, at open. This is every call.
+#[test]
+fn reading_one_block_reads_that_blocks_records_and_not_the_file() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("read-cost.varve");
+    build(&path, 1_000)?;
+
+    let reader = FourKeyedFormat::open_reader(&path)?;
+
+    let _ = varve::VarveFile::take_record_entry_faults();
+    let channels = reader.channels()?;
+    let faults = varve::VarveFile::take_record_entry_faults();
+
+    assert_eq!(channels.len(), KEYS_PER_BLOCK as usize);
+    assert_eq!(
+        faults,
+        KEYS_PER_BLOCK as u64,
+        "reading {} channels out of a file of 1,020 records rebuilt {faults} entries",
+        channels.len(),
+    );
+    Ok(())
+}

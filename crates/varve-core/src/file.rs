@@ -1471,6 +1471,26 @@ pub fn directory_records<D: RecordDirectory + ?Sized>(
     (0..dir.record_count()).map(|position| dir.record_at(position))
 }
 
+/// Whether the record at `position` can be passed over without building its
+/// entry, given the block ids the caller is looking for.
+///
+/// Every walk that wants one block used to filter *after* `record_at`, which
+/// was free when the resident index held whole entries and stopped being free
+/// when it became one offset and one block id per record: producing an entry
+/// is now a positional read of that record's header. A walk over a 600,000
+/// record file that keeps five of them was reading 600,000 headers.
+///
+/// `false` when the directory cannot say (`block_id_at` returned `None`) —
+/// the caller then does exactly what it did before, and its own check after
+/// `record_at` is still the one that decides. This is an optimisation with no
+/// authority: it never admits a record the caller's own filter would reject.
+fn directory_skips<D: RecordDirectory + ?Sized>(dir: &D, position: usize, wanted: &[u32]) -> bool {
+    match dir.block_id_at(position) {
+        Some(id) => !wanted.contains(&id),
+        None => false,
+    }
+}
+
 impl RecordDirectory for ResidentIndex {
     fn record_count(&self) -> usize {
         self.len()
@@ -6215,8 +6235,11 @@ impl VarveFile {
         // One payload buffer for the whole walk. It used to be one per record,
         // and the walk is over every record in the file.
         let mut payload = Vec::new();
-        for (record_ordinal, entry) in directory_records(dir).enumerate() {
-            let entry = entry?;
+        for record_ordinal in 0..dir.record_count() {
+            if directory_skips(dir, record_ordinal, &[METADATA_BLOCK_ID]) {
+                continue;
+            }
+            let entry = dir.record_at(record_ordinal)?;
             if entry.block_id != METADATA_BLOCK_ID {
                 continue;
             }
@@ -6266,8 +6289,11 @@ impl VarveFile {
         out.clear();
         let mut budget = MaterializationBudget::new(self.spec);
         let mut payload = Vec::new();
-        for entry in directory_records(dir) {
-            let entry = entry?;
+        for position in 0..dir.record_count() {
+            if directory_skips(dir, position, &[METADATA_BLOCK_ID]) {
+                continue;
+            }
+            let entry = dir.record_at(position)?;
             if entry.block_id != METADATA_BLOCK_ID {
                 continue;
             }
@@ -6292,8 +6318,11 @@ impl VarveFile {
         dir: &D,
     ) -> Result<Option<SchemaManifest>> {
         let mut newest: Option<(MergeOrder, RecordIndexEntry)> = None;
-        for (record_ordinal, entry) in directory_records(dir).enumerate() {
-            let entry = entry?;
+        for record_ordinal in 0..dir.record_count() {
+            if directory_skips(dir, record_ordinal, &[MANIFEST_BLOCK_ID]) {
+                continue;
+            }
+            let entry = dir.record_at(record_ordinal)?;
             if entry.block_id != MANIFEST_BLOCK_ID {
                 continue;
             }
@@ -7401,8 +7430,11 @@ impl VarveFile {
         // exceeds the ceiling is still refused during the build rather than
         // after the whole array is resident.
         let mut entries: Vec<RecordIndexEntry> = Vec::new();
-        for entry in directory_records(dir) {
-            let entry = entry?;
+        for position in 0..dir.record_count() {
+            if directory_skips(dir, position, &[T::ID]) {
+                continue;
+            }
+            let entry = dir.record_at(position)?;
             if entry.block_id != T::ID {
                 continue;
             }
@@ -7439,8 +7471,11 @@ impl VarveFile {
         crate::collections::ensure_registered_block::<T>(self.spec)?;
         crate::collections::ensure_resident_block::<T>(self.spec)?;
         out.clear();
-        for entry in directory_records(dir) {
-            let entry = entry?;
+        for position in 0..dir.record_count() {
+            if directory_skips(dir, position, &[T::ID]) {
+                continue;
+            }
+            let entry = dir.record_at(position)?;
             if entry.block_id != T::ID {
                 continue;
             }
@@ -7490,8 +7525,11 @@ impl VarveFile {
         out.clear();
         let mut budget = MaterializationBudget::new(self.spec);
         let mut payload = Vec::new();
-        for entry in directory_records(dir) {
-            let entry = entry?;
+        for position in 0..dir.record_count() {
+            if directory_skips(dir, position, &[T::ID]) {
+                continue;
+            }
+            let entry = dir.record_at(position)?;
             if entry.block_id != T::ID {
                 continue;
             }
@@ -7567,8 +7605,11 @@ impl VarveFile {
         out.clear();
         let mut budget = MaterializationBudget::new(self.spec);
         let mut payload = Vec::new();
-        for entry in directory_records(dir) {
-            let entry = entry?;
+        for position in 0..dir.record_count() {
+            if directory_skips(dir, position, &[From::ID]) {
+                continue;
+            }
+            let entry = dir.record_at(position)?;
             if entry.block_id != From::ID || entry.block_version != From::VERSION {
                 continue;
             }
@@ -7655,8 +7696,11 @@ impl VarveFile {
         let mut budget = MaterializationBudget::new(self.spec);
         // One payload buffer for the whole walk, not one per record.
         let mut payload = Vec::new();
-        for (record_ordinal, entry) in directory_records(dir).enumerate() {
-            let entry = entry?;
+        for record_ordinal in 0..dir.record_count() {
+            if directory_skips(dir, record_ordinal, &[T::ID, TOMBSTONE_BLOCK_ID]) {
+                continue;
+            }
+            let entry = dir.record_at(record_ordinal)?;
             // One record's materialization at a time. Every decoded block is
             // dropped once its key is taken; what survives the loop is index
             // entries and keys, each charged as it is taken through
@@ -8074,9 +8118,8 @@ impl VarveFile {
             // `record_ordinal` stays the position in the directory rather than
             // a count of what survived the filter, because `MergeOrder` uses it
             // to break ties between records that share a sequence.
-            match dir.block_id_at(record_ordinal) {
-                Some(id) if id != T::ID && id != TOMBSTONE_BLOCK_ID => continue,
-                _ => {}
+            if directory_skips(dir, record_ordinal, &[T::ID, TOMBSTONE_BLOCK_ID]) {
+                continue;
             }
             let entry = dir.record_at(record_ordinal)?;
             // One record's materialization at a time (see
