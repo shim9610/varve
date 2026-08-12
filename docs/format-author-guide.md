@@ -500,6 +500,68 @@ is reportable: `open_readonly_lazy_with_report` returns
 `LazyOpenSource::{Digest, FullScan}`. **Finish writing with `flush()`** here
 too, and for the same reason.
 
+### When A Later Append Must Not Be Able To Hide The Answer
+
+The digest has one property that is a real limit rather than a cost: it is a
+*record*, and it is usable only while it is the file's last one. Anything
+appended after it — a partial write, records from a run that then crashed —
+hides it, and the open falls back to reading everything. The moment you most
+need a cheap resume is the moment that is most likely.
+
+`index: header_tails` writes the same table into a fixed region of the **file
+header**, where nothing appended can move it or bury it:
+
+```rust
+varve_format! {
+    pub struct MyFormat {
+        // ...
+        integrity: crc32;
+        index: header_tails;
+        commit: transaction_marker(on_flush);
+        blocks: [Note, Reading];
+    }
+}
+```
+
+```rust
+let (file, source) = VarveFile::open_readonly_lazy_with_report(SPEC, path)?;
+assert_eq!(source, LazyOpenSource::HeaderTails);
+```
+
+**What it costs.** A fixed region sized by your declaration and nothing else:
+`8 + 2 x (28 + 12 x (blocks + 8) + 4)` bytes, so **312 bytes for a two-block
+format**, the same at two hundred records and at two billion. The update rides
+the durability request that already ends a commit, so there is **no extra
+`fsync`**. Measured on the two-block fixture: a scanning open frames every
+record; this one frames **4** — the commit marker plus one per distinct block id
+— and frames the same 4 on a file ten times larger.
+
+**What it requires.** `block_offset_chain`, which it turns on for you, and
+`integrity: crc32`. The checksum is not optional here for a reason the other
+options do not have: the region is overwritten *in place* at a constant length,
+so a torn write leaves a region that frames perfectly and names records that are
+not there. Each of the two slots carries its own checksum, and that is the only
+thing that separates the two.
+
+**What it refuses.** A format declaring matrix blocks (the matrix layout sits at
+a fixed offset after the header, which the region moves), and
+`open_digest_on_flush` — the two are answers to the same question with different
+safety properties, so declare one.
+
+**Turning it on changes the schema hash**, because the region lives in the
+header and so moves every record offset in the file. An existing file does not
+open with it and cannot be given the region in place; write a new one.
+
+**How a reader knows the table is still true.** A table at a fixed offset is
+always present and always "last", so unlike the digest its position proves
+nothing. It records the offset of the commit marker it was written for, and an
+open frames that record, requires it to be a commit marker, then walks forward —
+at most a segment and a digest may follow one — and requires the walk to land
+exactly on the end of the file. Anything else falls back to the scan and answers
+identically, only slower: a file appended to since that commit, a table left
+over from an earlier one, a torn slot. You do not have to do anything about any
+of those.
+
 ## Custom Physical Layout
 
 Most formats should use the Varve-native append log. Use custom physical layout

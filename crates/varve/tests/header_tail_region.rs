@@ -1078,3 +1078,51 @@ fn a_header_tails_file_can_still_be_mapped() -> varve::Result<()> {
     assert_eq!(compared, 60);
     Ok(())
 }
+
+/// What the route costs at open, in records framed.
+///
+/// The number that matters is that it does not move with the file. A scan
+/// frames every record; this frames the commit marker, whatever follows it, and
+/// one record per distinct block id — all three bounded by the *declaration*.
+#[cfg(feature = "scalable-fault-injection")]
+#[test]
+fn the_open_cost_does_not_move_with_the_file() -> varve::Result<()> {
+    fn framed<T>(body: impl FnOnce() -> T) -> (T, u64) {
+        let before = varve::VarveFile::records_framed();
+        let value = body();
+        (value, varve::VarveFile::records_framed() - before)
+    }
+
+    let directory = tempfile::tempdir()?;
+    let mut costs = Vec::new();
+    for records in [200u32, 2_000] {
+        let path = directory.path().join(format!("cost-{records}.varve"));
+        write_samples(on_spec(), &path, records)?;
+
+        let (_, scan) = framed(|| {
+            varve::VarveFile::open_readonly(on_spec(), &path).expect("the scanning open")
+        });
+        let ((_, source), lazy) = framed(|| {
+            varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &path)
+                .expect("the header route")
+        });
+        assert_eq!(source, varve::LazyOpenSource::HeaderTails);
+        assert!(
+            scan >= u64::from(records),
+            "the scan frames every record: {scan} for {records}",
+        );
+        costs.push(lazy);
+    }
+
+    assert_eq!(
+        costs[0], costs[1],
+        "a ten-fold larger file must frame the same number of records: {costs:?}",
+    );
+    // Pinned, so a change that starts framing more has to say so here: the
+    // commit marker, plus one per distinct block id in the table.
+    assert_eq!(
+        costs[0], 4,
+        "marker + Sample + Note + the marker's own tail"
+    );
+    Ok(())
+}

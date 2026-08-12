@@ -6,6 +6,62 @@ increment the minor version.
 
 ## Unreleased
 
+### `index: header_tails` — a commit boundary a later append cannot hide
+
+**New capability, opt-in, and off by default.** The open digest already writes
+down the three facts an open needs, but it writes them as a *record*, and a
+record is usable only while it is the file's last one. Anything appended after
+it — a partial write, records from a run that then crashed — hides it and the
+open falls back to reading everything. The moment a cheap resume is most needed
+is the moment that is most likely.
+
+`index: header_tails` puts the same table in a fixed region of the **file
+header**, written at create and rewritten at the end of every commit point.
+`open_readonly_lazy_with_report` and `VarveWriter::open_lazy_with_report` report
+`LazyOpenSource::HeaderTails` when they take it.
+
+The region is sized by the declaration and by nothing else — `8 + 2 x (28 + 12 x
+(blocks + 8) + 4)` bytes, **312 for a two-block format**, the same at any record
+count. The update rides the durability request that already ends a commit, so
+there is **no extra `fsync`**. Measured on a two-block fixture: an open takes
+**4 record framings** — the commit marker plus one per distinct block id — and
+the same 4 on a file ten times larger, against a scanning open that frames every
+record.
+
+**A table at a fixed offset has to earn belief**, because unlike the digest its
+position proves nothing: it is always present and always "last". Each slot
+records the offset of the commit marker it was written for, and an open frames
+that record, requires it to be a commit marker, then walks forward — at most a
+segment and a digest may follow one — and requires the walk to land exactly on
+the end of the file. A file appended to since that commit, a table left over
+from an earlier one, a tail naming another block's record, or a torn slot all
+fall back to the scan and answer identically.
+
+Requires `block_offset_chain` (turned on for you) and `integrity: crc32` — the
+region is overwritten in place at a constant length, so a torn write leaves
+something that frames perfectly, and the per-slot checksum is the only thing
+that separates it from a good write. Refused together with a matrix declaration
+and with `open_digest_on_flush`.
+
+**Turning it on changes the schema hash**, because the region moves every record
+offset in the file. Existing files do not open with it and cannot be given the
+region in place. A format that does not declare it is byte-identical to before.
+
+### A memory-mapped payload window no longer covers the file header
+
+**Soundness, no API change for existing formats.** `mmap_payloads` mapped from
+byte 0, so the file header was inside every mapping — harmless while the header
+was written exactly once, and not harmless once `header_tails` rewrites part of
+it at every commit. Every accessor slices through a `&[u8]` over the *whole*
+mapping, so a window held across a commit meant a live shared reference over
+bytes the writer was storing into.
+
+The mapping now starts at the append log. Every payload is at or after that
+offset by construction, so nothing is lost, and the header is outside every
+reference the type constructs. `mmap_matrix` still maps from byte 0 — the matrix
+region it serves sits between the header and the append log — which is sound
+because `header_tails` and matrix blocks are refused together.
+
 ### A lazily opened handle can build its keyed tails
 
 **New capability.** `key_tail_offsets` went through the resident record
