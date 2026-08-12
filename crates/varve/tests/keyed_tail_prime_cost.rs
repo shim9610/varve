@@ -168,3 +168,109 @@ fn reading_one_block_reads_that_blocks_records_and_not_the_file() -> Result<()> 
     );
     Ok(())
 }
+
+/// The same format with the open digest turned on.
+///
+/// The digest is what a lazy open reads its per-block tails from, and it is not
+/// reachable from the `index:` clause — `with_open_digest_on_flush` is a spec
+/// builder. Both create and open use this, so the schema hash agrees.
+fn digest_spec() -> varve::FormatSpec {
+    let mut spec = FourKeyedFormat::spec();
+    spec.index_policy = spec.index_policy.with_open_digest_on_flush(true);
+    spec
+}
+
+fn build_untyped(path: &std::path::Path, bulk: u64, deletes: bool) -> Result<()> {
+    let mut writer = varve::VarveWriter::create(digest_spec(), path)?;
+    for index in 0..KEYS_PER_BLOCK {
+        writer.push_keyed(&Channel { index, value: 1 })?;
+    }
+    if deletes {
+        // One key deleted and written again, so its newest record sits after
+        // its own tombstone; one key deleted and left deleted.
+        writer.delete::<Channel>(&2)?;
+        writer.push_keyed(&Channel {
+            index: 2,
+            value: 99,
+        })?;
+        writer.delete::<Channel>(&4)?;
+    }
+    for value in 0..bulk {
+        writer.push(&Bulk { value })?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// A lazy handle can build its keyed tails, and builds the same ones.
+///
+/// `key_tail_offsets` used to require a resident directory, which a lazy handle
+/// deliberately has none of — so a generated writer, which primes one keyed-tail
+/// map per keyed block at construction, failed before the caller did anything.
+///
+/// The two paths must not merely both work. The resident builder breaks
+/// sequence ties with the record's position in the directory, so a chain walk —
+/// which yields records newest-first with no position — has to reconstruct that
+/// order or the maps can differ on a tie. This asserts the maps are equal, on a
+/// file carrying a tombstone whose key is written again afterwards and a
+/// tombstone whose key is not.
+#[test]
+fn a_lazy_handle_builds_the_same_keyed_tails_as_a_resident_one() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("lazy-tails.varve");
+    build_untyped(&path, 200, true)?;
+
+    let eager = varve::VarveWriter::open(digest_spec(), &path)?;
+    let resident = eager.key_tail_offsets::<Channel>()?;
+    drop(eager);
+
+    let (lazy, source) = varve::VarveWriter::open_lazy_with_report(digest_spec(), &path)?;
+    assert_eq!(
+        source,
+        varve::LazyOpenSource::Digest,
+        "the test needs the lazy route, not a full scan"
+    );
+    let chained = lazy.key_tail_offsets::<Channel>()?;
+
+    assert_eq!(
+        chained, resident,
+        "the chain-walk build and the resident build must agree exactly",
+    );
+    assert!(!resident.is_empty(), "the fixture must produce some tails");
+    Ok(())
+}
+
+/// And it costs the keyed records, not the file.
+///
+/// The instrument is the same entry-fault counter: a chain walk reads the
+/// records of one block plus the tombstones, so growing the non-keyed bulk must
+/// not move it.
+#[test]
+fn a_lazy_keyed_tail_build_reads_the_chain_and_not_the_file() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+
+    let measure = |bulk: u64| -> Result<u64> {
+        let path = directory.path().join(format!("lazy-cost-{bulk}.varve"));
+        build_untyped(&path, bulk, false)?;
+        let (lazy, source) = varve::VarveWriter::open_lazy_with_report(digest_spec(), &path)?;
+        assert_eq!(source, varve::LazyOpenSource::Digest);
+        let _ = varve::VarveFile::take_record_entry_faults();
+        let tails = lazy.key_tail_offsets::<Channel>()?;
+        let faults = varve::VarveFile::take_record_entry_faults();
+        assert_eq!(tails.len(), KEYS_PER_BLOCK as usize);
+        Ok(faults)
+    };
+
+    let small = measure(50)?;
+    let large = measure(1_000)?;
+    assert_eq!(
+        large, small,
+        "the file grew from 50 to 1,000 non-keyed records and the chain build \
+         moved from {small} to {large} reads; it is not following the chain",
+    );
+    assert!(
+        small <= u64::from(KEYS_PER_BLOCK) * 2,
+        "building {KEYS_PER_BLOCK} tails read {small} entries",
+    );
+    Ok(())
+}

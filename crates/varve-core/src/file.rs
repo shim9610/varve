@@ -8077,12 +8077,84 @@ impl VarveFile {
     /// `MergeOrder` the caller has no use for — so this removes the second map
     /// of `distinct keys`, not the first. The `KeyedTailBytes` charge below
     /// still accounts for both being alive at once, unchanged.
+    /// # Without a resident directory
+    ///
+    /// A lazy handle keeps none, so this used to be one of the entry points it
+    /// simply could not serve — and because a generated writer primes one keyed
+    /// tail map per keyed block at construction, that refusal arrived before
+    /// the caller had done anything at all.
+    ///
+    /// The chains hold the answer. `prev_same_block_offset` links each record
+    /// to the previous record of its block, so walking one block's chain
+    /// newest-first reaches every record of that block, reading nothing else in
+    /// the file. `keyed_chain_directory` collects those records and the
+    /// tombstones into file order and hands them to the same builder the
+    /// resident path uses, so the two produce the same map by construction
+    /// rather than by two implementations agreeing.
     pub fn key_tail_offsets_into<T>(&self, out: &mut HashMap<T::Key, u64>) -> Result<()>
     where
         T: VarveKeyedBlock,
         T::Key: Eq + Hash,
     {
-        self.key_tail_offsets_into_in::<T, _>(self.resident_directory("key_tail_offsets")?, out)
+        if let Some(dir) = self.index.is_retained().then_some(&self.index) {
+            return self.key_tail_offsets_into_in::<T, _>(dir, out);
+        }
+        let chained = self.keyed_chain_directory(T::ID, "key_tail_offsets")?;
+        self.key_tail_offsets_into_in::<T, _>(&chained, out)
+    }
+
+    /// The records that can move `block_id`'s keyed tails, in file order.
+    ///
+    /// Two chains, because two block ids move a keyed tail: the block itself,
+    /// and [`TOMBSTONE_BLOCK_ID`], whose records may name any keyed block's
+    /// key. The tombstone chain is shared by every keyed block, so it is not
+    /// filtered here — the builder decodes each one against `T` exactly as it
+    /// does on the resident path.
+    ///
+    /// # Why file order matters
+    ///
+    /// The builder breaks sequence ties with the record's *position in the
+    /// directory* (`MergeOrder::for_record`). A chain yields records
+    /// newest-first with no position at all, so the sort is what makes the two
+    /// paths agree: records are appended at strictly increasing offsets and
+    /// directory position is append order, so sorting by offset reconstructs
+    /// exactly the ordinals the resident path would have used.
+    ///
+    /// # What this is bounded by
+    ///
+    /// The records of one keyed block plus the tombstones — not the file. That
+    /// is the whole point, and it is why this may be materialised at all: the
+    /// keyed blocks a format declares are the small ones by design, and
+    /// [`BlockChain`] already charges its walk against `ReadLimitKey::Records`.
+    fn keyed_chain_directory(
+        &self,
+        block_id: u32,
+        operation: &'static str,
+    ) -> Result<Vec<RecordIndexEntry>> {
+        if !self.spec.index_policy.block_offset_chain {
+            // Without the block chain there is no second route to these
+            // records, so the refusal the caller would have had stands.
+            return Err(Error::NoResidentDirectory { operation });
+        }
+        let mut records = Vec::new();
+        for id in [block_id, TOMBSTONE_BLOCK_ID] {
+            for entry in self.block_chain(id)? {
+                let entry = entry?;
+                let requested = index_bytes_for_count(records.len().saturating_add(1))?;
+                self.spec
+                    .read_limits
+                    .check(ReadLimitKey::IndexBytes, requested)?;
+                records
+                    .try_reserve(1)
+                    .map_err(|_| Error::AllocationFailed {
+                        resource: "keyed chain directory",
+                        requested,
+                    })?;
+                records.push(entry);
+            }
+        }
+        records.sort_unstable_by_key(|entry| entry.record_offset);
+        Ok(records)
     }
 
     fn key_tail_offsets_into_in<T, D: RecordDirectory + ?Sized>(
