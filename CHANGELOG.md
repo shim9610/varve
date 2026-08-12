@@ -4,6 +4,61 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
+## Unreleased
+
+### A lazily opened handle can build its keyed tails
+
+**New capability.** `key_tail_offsets` went through the resident record
+directory, which a lazy handle deliberately has none of — so it answered
+`NoResidentDirectory`. A *generated* writer primes one keyed-tail map per keyed
+block at construction, so a format with keyed blocks could not be opened lazily
+at all: the refusal arrived before the caller had done anything.
+
+It now falls back to the offset chains, which already hold the answer.
+`prev_same_block_offset` links each record to the previous record of its block,
+and `index: keyed_offset_chain` turns that chain on as well as the keyed one, so
+files written by earlier versions already carry it. The build collects the
+block's chain and the tombstone chain, orders them by record offset, and hands
+the result to the same builder the resident path uses — the two agree by
+construction rather than by two implementations matching.
+
+Bounded by one keyed block's records plus the tombstones, not by the file.
+Measured on a file grown from 50 to 1,000 non-keyed records: **the same number
+of entries read at both sizes.** Nothing changes for a handle that has a
+resident directory; that path is untouched.
+
+Requires `block_offset_chain`. A format without it still gets
+`NoResidentDirectory`, because without the chain there is no second route to
+those records.
+
+### Reading one block no longer reads every record in the file
+
+**Performance, no API change.** When the resident index became one slot per
+record instead of one entry per record, producing an entry became a positional
+read of that record's header — and every walk that wanted a single block was
+still written the way it had been when entries were free:
+
+```rust
+let entry = entry?;                       // now: read this record's header
+if entry.block_id != T::ID { continue; }  // now: and throw it away
+```
+
+Ten walks do this; eight of them want one block. The slot now carries the block
+id, so the filter runs *before* the read. It costs no memory: `u64` forces
+eight-byte alignment, so the `bool` already sat in padding and the `u32` takes
+four bytes of it — a const assertion at the one site that grows the index keeps
+the slot at sixteen bytes.
+
+Measured on a 1,020-record file holding five records of the block being read:
+**1020 entry rebuilds before, 5 after.** Priming four keyed-tail maps over a
+70-record file: **280 before, 20 after.** `verify_all` and `index_entries_into`
+genuinely want every record and are unchanged.
+
+`VarveFile::take_record_entry_faults()` (behind `scalable-fault-injection`)
+counts the rebuilds, which is the unit this cost is charged in. Nothing could
+see it before: the open-scan byte counter charges the scan, and these walks run
+after it.
+
 ## 0.7.0 - 2026-08-10
 
 ### A written matrix chunk is editable
