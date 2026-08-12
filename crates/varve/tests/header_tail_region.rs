@@ -1126,3 +1126,39 @@ fn the_open_cost_does_not_move_with_the_file() -> varve::Result<()> {
     );
     Ok(())
 }
+
+/// The region needs a commit marker to name, so it needs the policy that
+/// produces one.
+///
+/// Measured before this refusal existed: under `CommitPolicy::None`, five
+/// flushes over a hundred records left **both slots at `count = 0`,
+/// `generation = 0`** — `commit_durable` refuses a markerless policy outright
+/// and `flush` writes a marker only under `marker_on_flush`, so there is never
+/// anything for a slot to name. The option would cost its bytes and its schema
+/// hash and do nothing, which is the one thing an option here may not do.
+#[test]
+fn the_region_requires_a_commit_marker_to_name() {
+    for policy in [varve::CommitPolicy::None, varve::CommitPolicy::RecordFooter] {
+        let error = on_spec()
+            .with_commit_policy(policy)
+            .validate()
+            .expect_err("a markerless policy never warms the region");
+        assert!(
+            matches!(
+                error,
+                varve::Error::InvalidFormatSpec(
+                    "header_tails requires a transaction_marker commit policy"
+                )
+            ),
+            "{policy:?}: {error:?}",
+        );
+    }
+    // Explicit markers are fine: `commit()` writes one, so a commit point
+    // exists even though `flush` does not make it.
+    on_spec()
+        .with_commit_policy(varve::CommitPolicy::TransactionMarker(
+            varve::TransactionMarkerMode::Explicit,
+        ))
+        .validate()
+        .expect("an explicit marker is still a marker");
+}

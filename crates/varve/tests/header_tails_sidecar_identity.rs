@@ -1,28 +1,38 @@
-//! What a disk-index sidecar may and may not notice about the header.
+//! Why a disk-index format cannot carry a header tail region, from both sides.
 //!
-//! A sidecar binds itself to its primary by hashing the primary's leading
-//! bytes, twice over: `primary_identity` hashes the whole header into the
-//! identity it stores and compares on every open, and `primary_generation`
-//! CRCs the first 4 KiB. Both were written when the header was written exactly
-//! once at create, and both said so out loud.
+//! This file used to assert that a rewritten region does not invalidate a
+//! published sidecar — the narrowing of `primary_identity` and
+//! `primary_generation` that landed in 93c64c3. Those two cases could not
+//! survive the refusal that followed, and the reason is the finding this file
+//! now records.
 //!
-//! `IndexPolicy::header_tails` reserves a region *inside* that header which a
-//! commit rewrites in place. Without narrowing the two windows, one commit
-//! would make every published sidecar for that file permanently unopenable —
-//! the sidecar is not stale, the primary is not damaged, and the check would
-//! refuse anyway.
+//! **The region is only ever written for a commit marker.** Nothing else names
+//! a commit point, so a format without one leaves the region cold for the life
+//! of the file — measured before the refusal existed: five flushes over a
+//! hundred records, both slots still at `count = 0`. `FormatSpec::validate`
+//! therefore refuses `header_tails` without a `transaction_marker` policy.
 //!
-//! The narrowing has to be exactly one region wide, so this file asserts both
-//! sides of it: a changed region payload is accepted, and a changed byte just
-//! *past* the header — still inside the 4 KiB generation window — is still
-//! refused. The second assertion is the one that would catch a fix that simply
-//! stopped checking.
+//! **The streaming path refuses a commit marker.** `NativeStreamScanner`
+//! errors with `StreamingUnsupported` the moment it frames a `COMMIT_BLOCK_ID`
+//! record, and the disk index reads its primary through that scanner. So a
+//! disk-index format cannot have markers.
+//!
+//! The two together are exclusive, and that is the whole content of this file.
+//! It matters beyond bookkeeping: it means the hazard 93c64c3 was written for —
+//! a commit rewriting header bytes underneath a published sidecar — **cannot
+//! arise from a writer**, because no declarable format both warms the region
+//! and carries a sidecar. The blanking stays, as the thing that keeps the two
+//! windows honest against any future mutable header block and against a
+//! hand-edited file; its narrowness is asserted by
+//! `varve_core::file::tests::blanking_covers_the_mutable_payload_and_nothing_else`,
+//! which does not need either half of this combination.
+//!
+//! Delete this file the day the disk index tolerates a commit marker, and
+//! restore the two end-to-end cases from 93c64c3's history.
 
 #![cfg(all(feature = "integrity", feature = "high-cardinality-dev"))]
 
-use std::path::Path;
-
-use varve::{DiskIndexOptions, varve_format};
+use varve::{DiskIndexOptions, Error, IndexPolicy, varve_format};
 
 varve_format! {
     pub format TailedIndexFormat {
@@ -31,6 +41,7 @@ varve_format! {
         schema_hash: computed;
         integrity: crc32;
         index: [keyed_offset_chain, header_tails];
+        commit: transaction_marker(on_flush);
         blocks {
             variable Frame(id = 1, key = [scan], key_index = disk) {
                 scan: u32,
@@ -40,111 +51,73 @@ varve_format! {
     }
 }
 
-/// Where the `VBTT` block starts within the file.
+/// Side one: the region needs a commit marker, so it cannot be declared away.
 ///
-/// A byte search rather than a re-derivation of the header layout: the point is
-/// to find the bytes the writer put on disk.
-fn region_offset(bytes: &[u8]) -> usize {
-    bytes
-        .windows(4)
-        .position(|window| window == b"VBTT")
-        .filter(|offset| *offset < 512)
-        .expect("the format declares the region, so the file carries it")
-}
-
-fn build(path: &Path) -> varve::Result<()> {
-    let mut writer = TailedIndexFormat::create_indexed_writer(path, DiskIndexOptions::default())?;
-    for scan in 0..64u32 {
-        writer.push_frame(&Frame {
-            scan,
-            payload: scan.to_le_bytes().to_vec(),
-        })?;
-    }
-    writer.sync()?;
-    Ok(())
-}
-
-/// Opens the indexed reader and reads one key back, so a "success" here means
-/// the sidecar was accepted and used rather than merely that a handle opened.
-fn reopen(path: &Path) -> varve::Result<Option<Vec<u8>>> {
-    let reader = TailedIndexFormat::open_indexed_reader(path, DiskIndexOptions::default())?;
-    Ok(reader.get_frame(&7)?.map(|frame| frame.payload))
-}
-
+/// A format author reaching for the disk index would want the markerless policy
+/// the streaming path requires, and this is what stops them from getting a
+/// region that silently never fills.
 #[test]
-fn a_rewritten_tail_region_does_not_invalidate_a_published_sidecar() -> varve::Result<()> {
-    let directory = tempfile::tempdir()?;
-    let path = directory.path().join("tailed.varve");
-    build(&path)?;
-
-    // Baseline: the sidecar is there and is accepted.
+fn the_region_cannot_be_declared_without_a_commit_marker() {
+    let error = TailedIndexFormat::spec()
+        .with_commit_policy(varve::CommitPolicy::None)
+        .validate()
+        .expect_err("a markerless policy leaves the region cold forever");
     assert!(
-        varve::disk_index_sidecar_path(&path).exists(),
-        "the fixture must actually publish a sidecar, or this test proves nothing",
+        matches!(
+            error,
+            Error::InvalidFormatSpec("header_tails requires a transaction_marker commit policy")
+        ),
+        "{error:?}",
     );
-    assert_eq!(reopen(&path)?, Some(7u32.to_le_bytes().to_vec()));
+}
 
-    // Change the region's payload the way a commit will. Every other byte of
-    // the file is untouched, so this is exactly the difference the two windows
-    // must stop seeing.
-    let original = std::fs::read(&path)?;
-    let offset = region_offset(&original);
-    let mut rewritten = original.clone();
-    for byte in rewritten
-        .get_mut(offset + 8..offset + 8 + 32)
-        .expect("the region has a payload")
-    {
-        *byte ^= 0xFF;
-    }
-    assert_ne!(rewritten, original);
-    std::fs::write(&path, &rewritten)?;
+/// Side two: the disk index cannot handle a primary that carries commit
+/// markers.
+///
+/// Asserted against the real path rather than by reading the scanner, and the
+/// whole sequence is one `Result` because the refusal does not wait for the
+/// read: it arrives as soon as the indexed path frames a marker, which is
+/// before this can get a reader open.
+#[test]
+fn a_disk_index_cannot_handle_a_primary_that_carries_commit_markers() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("tailed.varve");
 
+    let outcome = (|| -> varve::Result<()> {
+        let mut writer =
+            TailedIndexFormat::create_indexed_writer(&path, DiskIndexOptions::default())?;
+        for scan in 0..8u32 {
+            writer.push_frame(&Frame {
+                scan,
+                payload: scan.to_le_bytes().to_vec(),
+            })?;
+        }
+        writer.sync()?;
+        TailedIndexFormat::open_indexed_reader(&path, DiskIndexOptions::default())?;
+        Ok(())
+    })();
+
+    assert!(
+        matches!(outcome, Err(Error::StreamingUnsupported)),
+        "the disk index reads its primary through the stream scanner, which refuses a \
+         commit marker: {outcome:?}",
+    );
+}
+
+/// And the combination stays refusable rather than merely unusable.
+///
+/// `header_tails` composes with the two things it does need — the block offset
+/// chain and a crc32 policy — so this checks the spec is otherwise sound and
+/// the only thing standing between it and a working file is the disk index.
+#[test]
+fn the_declaration_itself_is_valid() {
+    TailedIndexFormat::spec()
+        .validate()
+        .expect("markers plus the region is a valid declaration; the disk index is what refuses");
+    assert!(TailedIndexFormat::spec().index_policy.header_tails);
+    assert!(TailedIndexFormat::spec().index_policy.block_offset_chain);
     assert_eq!(
-        reopen(&path)?,
-        Some(7u32.to_le_bytes().to_vec()),
-        "a rewritten tail region must not invalidate the sidecar",
+        TailedIndexFormat::spec().index_policy,
+        IndexPolicy::KeyedOffsetChain.with_header_tails(true),
     );
-    Ok(())
-}
-
-#[test]
-fn a_change_outside_the_region_is_still_refused() -> varve::Result<()> {
-    let directory = tempfile::tempdir()?;
-    let path = directory.path().join("tailed.varve");
-    build(&path)?;
-    assert_eq!(reopen(&path)?, Some(7u32.to_le_bytes().to_vec()));
-
-    let original = std::fs::read(&path)?;
-    let offset = region_offset(&original);
-    // The first byte after the header — inside the 4 KiB generation window, and
-    // one byte past the region. If the fix were "stop hashing the header" this
-    // would still pass; if it were "stop hashing the window" it would not.
-    let after_header = {
-        let declared =
-            u32::from_le_bytes(original[offset + 4..offset + 8].try_into().unwrap()) as usize;
-        offset + 8 + declared
-    };
-    assert!(
-        after_header < 4096 && after_header < original.len(),
-        "the fixture must put the first record inside the generation window",
-    );
-
-    let mut damaged = original.clone();
-    damaged[after_header] ^= 0xFF;
-    std::fs::write(&path, &damaged)?;
-    assert!(
-        reopen(&path).is_err(),
-        "a byte past the header still moves the generation witness",
-    );
-
-    // And the region's own framing is not excused either: its declared length
-    // is what `append_log_start` and every record offset ride on.
-    let mut relengthed = original.clone();
-    relengthed[offset + 4] = relengthed[offset + 4].wrapping_add(1);
-    std::fs::write(&path, &relengthed)?;
-    assert!(
-        reopen(&path).is_err(),
-        "a region that changed length must not open",
-    );
-    Ok(())
 }

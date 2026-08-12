@@ -2957,6 +2957,19 @@ impl FormatSpec {
                 "header_tails and open_digest_on_flush are two answers to the same question; declare one",
             ));
         }
+        // The slot is written for a *commit marker*, and a marker is the one
+        // thing these policies never produce: `commit_durable` refuses them
+        // outright and `flush` writes a marker only under `marker_on_flush`.
+        // With no marker there is nothing for the slot to name, so the region
+        // stays cold for the life of the file — measured, both slots at
+        // `count = 0` after five flushes — and the option costs its bytes and
+        // its schema hash while doing nothing. Refusing it is what keeps a
+        // capability a capability.
+        if self.index_policy.header_tails && !self.commit_policy.is_transaction_marker() {
+            return Err(Error::InvalidFormatSpec(
+                "header_tails requires a transaction_marker commit policy",
+            ));
+        }
         for (index, block) in self.blocks.iter().enumerate() {
             if block.id >= RESERVED_BLOCK_ID_START {
                 return Err(Error::InvalidFormatSpec("user block id is reserved"));

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use varve::varve_format;
 
 pub mod digest;
+pub mod header_tails;
 pub mod sidecar;
 
 varve_format! {

@@ -36,6 +36,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "header_tails_arbitrary"
+path = "fuzz_targets/header_tails_arbitrary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "codec_arbitrary"
 path = "fuzz_targets/codec_arbitrary.rs"
 test = false
