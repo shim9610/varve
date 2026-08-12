@@ -937,6 +937,7 @@ struct IndexChoice {
     checkpoint_on_flush: bool,
     block_offset_chain: bool,
     keyed_offset_chain: bool,
+    header_tails: bool,
 }
 
 impl IndexChoice {
@@ -946,6 +947,7 @@ impl IndexChoice {
             checkpoint_on_flush: false,
             block_offset_chain: false,
             keyed_offset_chain: false,
+            header_tails: false,
         }
     }
 
@@ -966,6 +968,16 @@ impl IndexChoice {
         self.scan_on_open = true;
         self.block_offset_chain = true;
         self.keyed_offset_chain = true;
+        self
+    }
+
+    /// The region hands out a block's tail offset, and the only way to use one
+    /// is to walk back through `prev_same_block_offset`, so the chain comes
+    /// with it.
+    fn with_header_tails(mut self) -> Self {
+        self.scan_on_open = true;
+        self.block_offset_chain = true;
+        self.header_tails = true;
         self
     }
 }
@@ -1527,9 +1539,10 @@ fn apply_index_ident(mut choice: IndexChoice, value: Ident) -> Result<IndexChoic
         }
         "block_offset_chain" => Ok(choice.with_block_offset_chain()),
         "keyed_offset_chain" => Ok(choice.with_keyed_offset_chain()),
+        "header_tails" => Ok(choice.with_header_tails()),
         _ => Err(syn::Error::new_spanned(
             value,
-            "expected scan_on_open, checkpoint_on_flush, block_offset_chain, or keyed_offset_chain",
+            "expected scan_on_open, checkpoint_on_flush, block_offset_chain, keyed_offset_chain, or header_tails",
         )),
     }
 }
@@ -3547,6 +3560,7 @@ fn index_tokens(choice: IndexChoice) -> TokenStream2 {
     let checkpoint_on_flush = choice.checkpoint_on_flush;
     let block_offset_chain = choice.block_offset_chain;
     let keyed_offset_chain = choice.keyed_offset_chain;
+    let header_tails = choice.header_tails;
     quote! {
         ::varve::__core::IndexPolicy::new(
             #scan_on_open,
@@ -3554,6 +3568,7 @@ fn index_tokens(choice: IndexChoice) -> TokenStream2 {
             #block_offset_chain,
             #keyed_offset_chain,
         )
+        .with_header_tails(#header_tails)
     }
 }
 

@@ -379,6 +379,7 @@ fn a_digest_requires_the_chain_it_hands_out_entry_points_to() {
             keyed_offset_chain: false,
             segment_on_flush: false,
             open_digest_on_flush: true,
+            header_tails: false,
         })
         .validate();
     assert!(matches!(

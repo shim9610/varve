@@ -1157,6 +1157,36 @@ pub struct IndexPolicy {
     /// builds whatever index it needs with `record_map`. An open that wants the
     /// index still scans or walks the segment chain.
     pub open_digest_on_flush: bool,
+    /// Whether the file header carries a fixed region holding each block's
+    /// newest record offset.
+    ///
+    /// The same three facts as [`Self::open_digest_on_flush`], written to a
+    /// place that cannot move instead of appended as a record. That is the
+    /// whole difference, and it is the difference between a resume that works
+    /// and one that works most of the time: a digest record is only usable
+    /// while it is the file's *last* record, so anything appended after it —
+    /// a partial write, a record from a run that then crashed — hides it and
+    /// the open falls back to reading every record. The moment a resume is
+    /// needed is the moment that is most likely.
+    ///
+    /// **Not finished, and it costs a little without paying yet.** The region
+    /// is reserved and written at create, and it is read back and checked at
+    /// open, but nothing writes a *warm* table into it: every slot says it
+    /// holds no tail, so an open learns nothing from it and falls back exactly
+    /// as it would without it. What a file with this on gets today is the space
+    /// and a schema hash of its own. The commit-time update — before the commit
+    /// marker, riding the `sync_data` that already precedes it, so no extra
+    /// `fsync` — is the next step and is not here.
+    ///
+    /// **Changes the bytes on disk.** The region lives in the header, so
+    /// `append_log_start` and every record offset move, and the schema hash
+    /// changes with it — a file written without this option does not open with
+    /// it, and there is no way to add the region to an existing file in place.
+    ///
+    /// Requires [`Self::block_offset_chain`], for the reason
+    /// [`Self::open_digest_on_flush`] does: a tail offset is an entry point to
+    /// a chain, and without the chain it names a record with nothing behind it.
+    pub header_tails: bool,
 }
 
 #[allow(non_upper_case_globals)]
@@ -1168,6 +1198,7 @@ impl IndexPolicy {
         keyed_offset_chain: false,
         segment_on_flush: false,
         open_digest_on_flush: false,
+        header_tails: false,
     };
 
     pub const CheckpointOnFlush: Self = Self {
@@ -1177,6 +1208,7 @@ impl IndexPolicy {
         keyed_offset_chain: false,
         segment_on_flush: false,
         open_digest_on_flush: false,
+        header_tails: false,
     };
 
     pub const BlockOffsetChain: Self = Self {
@@ -1186,6 +1218,7 @@ impl IndexPolicy {
         keyed_offset_chain: false,
         segment_on_flush: false,
         open_digest_on_flush: false,
+        header_tails: false,
     };
 
     pub const KeyedOffsetChain: Self = Self {
@@ -1195,6 +1228,7 @@ impl IndexPolicy {
         keyed_offset_chain: true,
         segment_on_flush: false,
         open_digest_on_flush: false,
+        header_tails: false,
     };
 
     /// Segment-chained open, built on the block offset chain it needs.
@@ -1205,6 +1239,7 @@ impl IndexPolicy {
         keyed_offset_chain: false,
         segment_on_flush: true,
         open_digest_on_flush: false,
+        header_tails: false,
     };
 
     pub const fn new(
@@ -1220,6 +1255,7 @@ impl IndexPolicy {
             keyed_offset_chain,
             segment_on_flush: false,
             open_digest_on_flush: false,
+            header_tails: false,
         }
     }
 
@@ -1276,6 +1312,21 @@ impl IndexPolicy {
     /// chain that is not there would be handing out a dead end.
     pub const fn with_open_digest_on_flush(mut self, enabled: bool) -> Self {
         self.open_digest_on_flush = enabled;
+        if enabled {
+            self.scan_on_open = true;
+            self.block_offset_chain = true;
+        }
+        self
+    }
+
+    /// Enables the header tail region.
+    ///
+    /// Turns the block offset chain on with it, for the reason
+    /// [`Self::with_open_digest_on_flush`] does: the region hands out each
+    /// block's tail offset, and the only thing to do with one is walk back
+    /// through `prev_same_block_offset`.
+    pub const fn with_header_tails(mut self, enabled: bool) -> Self {
+        self.header_tails = enabled;
         if enabled {
             self.scan_on_open = true;
             self.block_offset_chain = true;
@@ -2829,6 +2880,23 @@ impl FormatSpec {
                 "open_digest_on_flush requires block_offset_chain",
             ));
         }
+        // Same reason, and the region is the same three facts as the digest.
+        if self.index_policy.header_tails && !self.index_policy.block_offset_chain {
+            return Err(Error::InvalidFormatSpec(
+                "header_tails requires block_offset_chain",
+            ));
+        }
+        // The matrix creation nonce and the matrix layout header sit at fixed
+        // offsets *after* the file header, so a header that grew by a tail
+        // region moves both. Every consumer of those two offsets has not been
+        // walked, so this refuses rather than guesses; lifting it is a matter
+        // of establishing that they are all derived from `header_len` and none
+        // is a stored constant.
+        if self.index_policy.header_tails && self.has_matrix_blocks() {
+            return Err(Error::InvalidFormatSpec(
+                "header_tails is not supported for a format declaring matrix blocks",
+            ));
+        }
         // A record scan reads each record's own header, so damage to one record
         // misindexes that record. A segment chain reads one payload that
         // describes many records, so damage to it misindexes records whose own
@@ -2844,6 +2912,22 @@ impl FormatSpec {
         {
             return Err(Error::InvalidFormatSpec(
                 "segment_on_flush requires a crc32 integrity policy",
+            ));
+        }
+        // The region is written *in place* over a live file, so unlike every
+        // other structure here its failure mode is a half-written slot rather
+        // than a short file. A per-slot checksum is what distinguishes the two,
+        // and it is the only thing that does: the slot's length never changes,
+        // so a torn write leaves a region that frames perfectly and describes
+        // records that are not there.
+        if self.index_policy.header_tails
+            && !matches!(
+                self.integrity_policy,
+                IntegrityPolicy::Crc32 | IntegrityPolicy::Crc32WithHeader
+            )
+        {
+            return Err(Error::InvalidFormatSpec(
+                "header_tails requires a crc32 integrity policy",
             ));
         }
         for (index, block) in self.blocks.iter().enumerate() {
@@ -3381,6 +3465,14 @@ const fn index_policy_hash_byte(policy: IndexPolicy) -> u8 {
     // a writer produces - a segment record is a record - so a file written
     // with it is not the file a spec without it describes. A spec that leaves
     // it off hashes to exactly the byte it hashed to before the bit existed.
+    //
+    // Bit 5 is `header_tails`, and it is hashed for a stronger reason than
+    // that: the region lives in the file *header*, so it moves
+    // `append_log_start` and with it every record offset. A build that ignored
+    // the flag would compute a different append log start and fail somewhere
+    // downstream with an unrelated error. `open_digest_on_flush` is
+    // deliberately still absent - it adds a record a reader without it indexes
+    // as any other internal record, and moves nothing.
     (if policy.scan_on_open { 1 } else { 0 })
         | (if policy.checkpoint_on_flush {
             1 << 1
@@ -3390,6 +3482,7 @@ const fn index_policy_hash_byte(policy: IndexPolicy) -> u8 {
         | (if policy.block_offset_chain { 1 << 2 } else { 0 })
         | (if policy.keyed_offset_chain { 1 << 3 } else { 0 })
         | (if policy.segment_on_flush { 1 << 4 } else { 0 })
+        | (if policy.header_tails { 1 << 5 } else { 0 })
 }
 
 const fn commit_policy_hash_byte(policy: CommitPolicy) -> u8 {

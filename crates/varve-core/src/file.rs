@@ -332,6 +332,34 @@ const FILE_COMPRESSION_VERSION: u8 = 1;
 /// length is fixed by its own layout: version, algorithm, level kind, and the
 /// `only_if_smaller` flag, then the exact level and the two length bounds.
 const FILE_COMPRESSION_PAYLOAD_LEN: usize = 1 + 1 + 1 + 1 + 4 + 8 + 8;
+/// The header block holding each block's newest record offset
+/// ([`IndexPolicy::header_tails`]).
+const HEADER_TAILS_MAGIC: &[u8; 4] = b"VBTT";
+const HEADER_TAILS_VERSION: u16 = 1;
+/// Two slots, written alternately.
+///
+/// The update is an in-place overwrite of a live file, so there is a window in
+/// which the bytes being written are neither the old table nor the new one. A
+/// single slot would make that window a hole: a crash inside it leaves nothing
+/// readable and the open falls all the way back to a full scan. Two slots make
+/// it a step back — the slot *not* being written still carries the previous
+/// commit point's table, so the fallback is an earlier commit boundary rather
+/// than no boundary.
+const HEADER_TAILS_SLOTS: usize = 2;
+/// Entries reserved beyond the declared blocks.
+///
+/// Blocks with a tail that `spec.blocks` does not name: the commit marker, the
+/// segment chain, the open digest, the tombstone chain and the index
+/// checkpoint, plus spare. The capacity is fixed at create because the region's
+/// length is; a format that ever needs more writes `HEADER_TAILS_FLAG_OVERFLOW`
+/// and `count = 0` rather than a table that is silently partial.
+const HEADER_TAILS_RESERVED_ENTRIES: usize = 8;
+/// `version: u16 | flags: u16 | capacity: u32 | count: u32 | generation: u64`.
+const HEADER_TAILS_SLOT_HEADER_LEN: usize = 2 + 2 + 4 + 4 + 8;
+/// `block_id: u32 | tail_offset: u64`.
+const HEADER_TAILS_ENTRY_LEN: usize = 4 + 8;
+/// The slot's own crc32, over every byte of the slot before it.
+const HEADER_TAILS_SLOT_TRAILER_LEN: usize = 4;
 const MATRIX_SIDECAR_MAGIC: &[u8; 4] = b"VSID";
 // v2 bound the sidecar to the native file's OS-object identity and matrix
 // layout generation (DUR-04/05). v3 additionally binds it to the per-create
@@ -6434,8 +6462,12 @@ impl VarveFile {
             }
             // Write back the region this file carries, not the one `spec`
             // would generate: regenerating drops any block this build does not
-            // know and moves the append log out from under the index.
-            write_native_file_header(&mut temp_file, self.spec, &self.header_extensions)?;
+            // know and moves the append log out from under the index. The one
+            // exception is a mutable block, which is reset to cold rather than
+            // carried forward describing offsets this file will not have.
+            let replacement_extensions =
+                header_extensions_for_replacement(self.spec, &self.header_extensions)?;
+            write_native_file_header(&mut temp_file, self.spec, &replacement_extensions)?;
             for (position, source_entry) in self.index.iter().enumerate() {
                 let source_entry = source_entry?;
                 let mut updated = source_entry.clone();
@@ -6909,8 +6941,12 @@ impl VarveFile {
             }
             // Write back the region this file carries, not the one `spec`
             // would generate: regenerating drops any block this build does not
-            // know and moves the append log out from under the index.
-            write_native_file_header(&mut temp_file, self.spec, &self.header_extensions)?;
+            // know and moves the append log out from under the index. The one
+            // exception is a mutable block, which is reset to cold rather than
+            // carried forward describing offsets this file will not have.
+            let replacement_extensions =
+                header_extensions_for_replacement(self.spec, &self.header_extensions)?;
+            write_native_file_header(&mut temp_file, self.spec, &replacement_extensions)?;
             for (position, source_entry) in self.index.iter().enumerate() {
                 let source_entry = source_entry?;
                 let mut updated = source_entry.clone();
@@ -11195,6 +11231,12 @@ impl VarveFile {
                 // its block id is stale too.
                 self.last_resident_block_id = new_index.last().map(|entry| entry.block_id);
                 self.keyed_tails.invalidate_all();
+                // The published file carries a *cold* mutable header block —
+                // the rewrite could not carry the old offsets forward — so the
+                // cached region has to say so too. Same length either way, which
+                // is why nothing derived from `header_extensions.len()` moves.
+                self.header_extensions =
+                    header_extensions_for_replacement(self.spec, &self.header_extensions)?;
                 Ok(info)
             }
             Err(source) => {
@@ -13213,20 +13255,22 @@ fn index_policy_byte(policy: IndexPolicy) -> u8 {
         } else {
             0
         })
+        | (if policy.header_tails { 1 << 6 } else { 0 })
 }
 
 fn index_policy_from_byte(value: u8) -> Result<IndexPolicy> {
     match value {
         1 => Ok(IndexPolicy::ScanOnOpen),
         2 => Ok(IndexPolicy::CheckpointOnFlush),
-        3..=63 => Ok(IndexPolicy::new(
+        3..=127 => Ok(IndexPolicy::new(
             value & 0x01 != 0,
             value & 0x02 != 0,
             value & 0x04 != 0,
             value & 0x08 != 0,
         )
         .with_segment_on_flush(value & 0x10 != 0)
-        .with_open_digest_on_flush(value & 0x20 != 0)),
+        .with_open_digest_on_flush(value & 0x20 != 0)
+        .with_header_tails(value & 0x40 != 0)),
         _ => Err(Error::InvalidSchemaManifest),
     }
 }
@@ -13596,27 +13640,106 @@ fn validate_record_entry(spec: FormatSpec, entry: &RecordIndexEntry) -> Result<(
 }
 
 fn file_header_extensions(spec: FormatSpec) -> Result<Vec<u8>> {
-    let Some(compression) = variable_compression(spec) else {
-        return Ok(Vec::new());
-    };
-    if compression.header_mode != CompressionHeaderMode::FileExplicit {
-        return Ok(Vec::new());
-    }
     let mut payload = Vec::new();
-    payload.extend_from_slice(FILE_COMPRESSION_MAGIC);
-    payload.push(FILE_COMPRESSION_VERSION);
-    payload.push(compression_algorithm_byte(compression.algorithm));
-    payload.push(compression_level_kind_byte(compression.level));
-    payload.push(u8::from(compression.only_if_smaller));
-    payload.extend_from_slice(&compression_level_exact(compression.level).to_le_bytes());
-    payload.extend_from_slice(&compression.min_uncompressed_len.to_le_bytes());
-    payload.extend_from_slice(&compression.max_uncompressed_len.to_le_bytes());
+    if let Some(compression) = variable_compression(spec)
+        && compression.header_mode == CompressionHeaderMode::FileExplicit
+    {
+        payload.extend_from_slice(FILE_COMPRESSION_MAGIC);
+        payload.push(FILE_COMPRESSION_VERSION);
+        payload.push(compression_algorithm_byte(compression.algorithm));
+        payload.push(compression_level_kind_byte(compression.level));
+        payload.push(u8::from(compression.only_if_smaller));
+        payload.extend_from_slice(&compression_level_exact(compression.level).to_le_bytes());
+        payload.extend_from_slice(&compression.min_uncompressed_len.to_le_bytes());
+        payload.extend_from_slice(&compression.max_uncompressed_len.to_le_bytes());
+    }
+    if spec.index_policy.header_tails {
+        payload.extend_from_slice(&encode_cold_header_tails_region(spec)?);
+    }
     Ok(payload)
+}
+
+/// How many `(block_id, tail_offset)` entries one slot holds.
+///
+/// Fixed by the declaration, because the region's length is fixed at create and
+/// the block set is fixed at compile time. This is the only reason the region
+/// can be a constant-length in-place write at all.
+fn header_tails_capacity(spec: FormatSpec) -> usize {
+    spec.blocks.len() + HEADER_TAILS_RESERVED_ENTRIES
+}
+
+fn header_tails_slot_len(capacity: usize) -> Option<usize> {
+    capacity
+        .checked_mul(HEADER_TAILS_ENTRY_LEN)?
+        .checked_add(HEADER_TAILS_SLOT_HEADER_LEN)?
+        .checked_add(HEADER_TAILS_SLOT_TRAILER_LEN)
+}
+
+/// The whole `VBTT` block a spec would write, framing included, with both slots
+/// cold.
+///
+/// A cold slot is framed and checksummed but claims nothing: `count` is zero, so
+/// a reader that adopts it learns no tail and falls back exactly as it would for
+/// a file with no region at all. That is what create writes, and what a
+/// `replace_*` writes into the new file, because in both cases every recorded
+/// offset would be a lie.
+fn encode_cold_header_tails_region(spec: FormatSpec) -> Result<Vec<u8>> {
+    let capacity = header_tails_capacity(spec);
+    let slot_len = header_tails_slot_len(capacity).ok_or(Error::InvalidFormatSpec(
+        "header_tails region length overflows",
+    ))?;
+    let payload_len = slot_len
+        .checked_mul(HEADER_TAILS_SLOTS)
+        .ok_or(Error::InvalidFormatSpec(
+            "header_tails region length overflows",
+        ))?;
+    // The region shares the 64 KiB extension budget with every other block, so
+    // the check is against the whole region's framed length, not the payload.
+    let framed_len = payload_len.checked_add(8).ok_or(Error::InvalidFormatSpec(
+        "header_tails region length overflows",
+    ))?;
+    if u64::try_from(framed_len).unwrap_or(u64::MAX)
+        > crate::native_layout::MAX_FILE_HEADER_EXTENSION_LEN
+    {
+        return Err(Error::InvalidFormatSpec(
+            "header_tails region exceeds the file-header extension limit; the format declares too many blocks",
+        ));
+    }
+    let payload_len_u32 = u32::try_from(payload_len)
+        .map_err(|_| Error::InvalidFormatSpec("header_tails region length overflows"))?;
+    let capacity_u32 = u32::try_from(capacity)
+        .map_err(|_| Error::InvalidFormatSpec("header_tails region length overflows"))?;
+
+    let mut region = Vec::new();
+    region
+        .try_reserve_exact(framed_len)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "header tail region",
+            requested: framed_len as u64,
+        })?;
+    region.extend_from_slice(HEADER_TAILS_MAGIC);
+    region.extend_from_slice(&payload_len_u32.to_le_bytes());
+    for _ in 0..HEADER_TAILS_SLOTS {
+        let start = region.len();
+        region.extend_from_slice(&HEADER_TAILS_VERSION.to_le_bytes());
+        region.extend_from_slice(&0u16.to_le_bytes());
+        region.extend_from_slice(&capacity_u32.to_le_bytes());
+        region.extend_from_slice(&0u32.to_le_bytes());
+        region.extend_from_slice(&0u64.to_le_bytes());
+        region.resize(start + slot_len - HEADER_TAILS_SLOT_TRAILER_LEN, 0);
+        let checksum = crc32_bytes(&region[start..])?;
+        region.extend_from_slice(&checksum.to_le_bytes());
+    }
+    debug_assert_eq!(region.len(), framed_len);
+    Ok(region)
 }
 
 /// One block of the file-header extension region.
 struct HeaderExtensionBlock<'a> {
     magic: [u8; 4],
+    /// Where the block starts within the region, so a caller that has to
+    /// *replace* one can address it without re-deriving the framing.
+    offset: usize,
     /// The block's bytes *including* its magic and any length prefix, so a
     /// known block is compared against what this spec would write without
     /// re-encoding the framing.
@@ -13628,7 +13751,25 @@ struct HeaderExtensionBlock<'a> {
 /// The whole point of the walk: a magic that is not on this list is skipped,
 /// so a file carrying a block from a later release still opens here.
 fn is_known_header_extension_magic(magic: &[u8; 4]) -> bool {
-    magic == FILE_COMPRESSION_MAGIC
+    magic == FILE_COMPRESSION_MAGIC || magic == HEADER_TAILS_MAGIC
+}
+
+/// Whether the file is allowed to disagree with this spec about the block's
+/// *contents*.
+///
+/// Every other known block is compared byte for byte, which is what makes a
+/// header a fixed description of the file. `VBTT` cannot be: its whole purpose
+/// is to be rewritten as the file grows, so a file open five commits later
+/// legitimately carries bytes no spec would produce. Its framing — magic,
+/// declared length, position — is still compared, so a region that changed size
+/// or vanished is still refused.
+///
+/// The cost is real and worth writing down: these files never take the
+/// `expected == extensions` fast path in [`validate_file_header_extensions`],
+/// so every open walks the block list. It is a walk over a handful of blocks in
+/// a region under 64 KiB, once per open.
+fn is_mutable_header_extension_magic(magic: &[u8; 4]) -> bool {
+    magic == HEADER_TAILS_MAGIC
 }
 
 /// Walk the extension region as a block sequence.
@@ -13675,10 +13816,47 @@ fn parse_file_header_extension_blocks(region: &[u8]) -> Result<Vec<HeaderExtensi
         }
         blocks.push(HeaderExtensionBlock {
             magic,
+            offset: start,
             encoded: &region[start..offset],
         });
     }
     Ok(blocks)
+}
+
+/// The extension region to write into the file a `replace_*` builds.
+///
+/// Everything the old file carried, including blocks this build does not know,
+/// except that a mutable block is reset to cold. Copying `VBTT` forward would
+/// publish a table of offsets measured against the *old* file, and
+/// `replace_block` moves every record after the replaced one by a uniform
+/// delta — so every entry in it would be wrong by that delta, and wrong in a
+/// way that frames a real record at the wrong place rather than failing to
+/// frame one. A cold table claims nothing and the next commit fills it.
+///
+/// The reset is length-preserving by construction: the cold region and the one
+/// the file carries are both `encode_cold_header_tails_region`'s output for the
+/// same spec, and a file whose region is a different length was refused at open.
+fn header_extensions_for_replacement(spec: FormatSpec, extensions: &[u8]) -> Result<Vec<u8>> {
+    if !spec.index_policy.header_tails {
+        return Ok(extensions.to_vec());
+    }
+    let cold = encode_cold_header_tails_region(spec)?;
+    let (offset, len) = {
+        let blocks = parse_file_header_extension_blocks(extensions)?;
+        let block = blocks
+            .iter()
+            .find(|block| &block.magic == HEADER_TAILS_MAGIC)
+            .ok_or(Error::InvalidCompressionHeader)?;
+        (block.offset, block.encoded.len())
+    };
+    if len != cold.len() {
+        return Err(Error::InvalidCompressionHeader);
+    }
+    let mut out = extensions.to_vec();
+    out.get_mut(offset..offset + len)
+        .ok_or(Error::InvalidCompressionHeader)?
+        .copy_from_slice(&cold);
+    Ok(out)
 }
 
 /// Judge the region a file carries against the one this spec would write.
@@ -13703,6 +13881,14 @@ fn validate_file_header_extensions(spec: FormatSpec, extensions: &[u8]) -> Resul
             .iter()
             .find(|block| block.magic == expected_block.magic)
             .ok_or(Error::InvalidCompressionHeader)?;
+        if is_mutable_header_extension_magic(&expected_block.magic) {
+            // Contents are the file's to change; the length is not. Comparing
+            // it is what keeps every offset derived from `header_len` valid.
+            if found.encoded.len() != expected_block.encoded.len() {
+                return Err(Error::InvalidCompressionHeader);
+            }
+            continue;
+        }
         if found.encoded != expected_block.encoded {
             return Err(Error::InvalidCompressionHeader);
         }
