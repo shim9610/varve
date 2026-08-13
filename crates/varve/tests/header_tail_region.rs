@@ -21,9 +21,17 @@
 //! the region's length is fixed by the declaration alone; a commit warms
 //! exactly one slot; a byte past the commit point, a table naming an older
 //! marker, a `commit_offset` naming a data record, and a tail naming another
-//! block's record are each refused; a torn slot is skipped and the other one
-//! answers; a writer resumed from the header appends a chain the scan agrees
-//! with; and the refusals.
+//! block's record are each refused; every field the slot decoder checks beyond
+//! the checksum takes the table out of use, and so does a slot that says it
+//! overflowed; a torn slot is skipped and the other one answers; a writer
+//! resumed from the header appends a chain the scan agrees with, continues the
+//! sequence, and keeps rewriting the region; an in-place fixed replacement
+//! keeps the table warm where a republishing one resets it; a file with records
+//! past its last marker is truncated by the fallback rather than resumed from;
+//! `crc32_with_header` works as well as `crc32`; and the refusals.
+//!
+//! The one combination not here is `segment_on_flush`, which needs its own
+//! declaration and has `header_tails_segment_combo.rs`.
 //!
 //! Not pinned here: a *real* torn write. `fault_point` aborts the child process
 //! and the page cache survives that, so the harness can produce "the write did
