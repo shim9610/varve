@@ -1305,3 +1305,324 @@ fn an_explicit_marker_format_resumes_from_the_header() -> varve::Result<()> {
     assert_eq!(source, varve::LazyOpenSource::HeaderTails);
     Ok(())
 }
+
+/// A lazily opened handle refuses to map, by name.
+///
+/// `mmap_payloads` maps the *resident* index, and the header route deliberately
+/// keeps none. Before this refusal it answered `Ok` with zero entries on a file
+/// holding sixty-five records — `is_empty()` true, every window `None`, nothing
+/// to distinguish "this handle cannot answer that" from "the file is empty".
+/// The caller most likely to hit it is the one this option exists for: someone
+/// resuming a very large file cheaply and then mapping it.
+#[cfg(feature = "mmap")]
+#[test]
+fn a_lazily_opened_handle_refuses_to_map_rather_than_answering_empty() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("lazy-map.varve");
+    write_samples(on_spec(), &path, 60)?;
+
+    // The premise: the file is not empty, and the scanning handle maps it.
+    let scanned = varve::VarveFile::open_readonly(on_spec(), &path)?;
+    let records = scanned.index_entries().len();
+    assert!(records > 0);
+    let mapped = unsafe { scanned.mmap_payloads()? };
+    assert_eq!(mapped.len(), records);
+    drop(mapped);
+    drop(scanned);
+
+    let (lazy, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &path)?;
+    assert_eq!(source, varve::LazyOpenSource::HeaderTails);
+    // SAFETY: nothing else holds this file open for writing.
+    let outcome = unsafe { lazy.mmap_payloads() };
+    assert!(
+        matches!(
+            outcome,
+            Err(varve::Error::NoResidentDirectory {
+                operation: "mmap_payloads"
+            })
+        ),
+        "a handle with no directory must say so: {:?}",
+        outcome.map(|mapped| mapped.len()),
+    );
+    Ok(())
+}
+
+/// A non-resident block's tail reaches the region, and the chain survives a
+/// resume.
+///
+/// This is the combination with the worst failure mode the option permits. A
+/// non-resident block's records are reachable **only** through
+/// `prev_same_block_offset` — `validate` calls a non-resident block without the
+/// chain "a block written into a hole" — so the region is the only thing that
+/// tells a lazy open where that chain starts. If the table were built from the
+/// resident index instead of from `block_tails`, that entry would simply be
+/// absent, a resumed writer would append with `prev_same_block_offset: None`,
+/// and every earlier record of the block would become unreachable with every
+/// link's checksum intact.
+#[test]
+fn a_non_resident_blocks_tail_is_in_the_region() -> varve::Result<()> {
+    const NOTES_NON_RESIDENT: &[varve::BlockResidencyDescriptor] =
+        &[varve::BlockResidencyDescriptor {
+            block_id: 91,
+            resident: false,
+        }];
+    let spec = on_spec().with_block_residency(NOTES_NON_RESIDENT);
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("non-resident.varve");
+    let mut writer = spec.create(&path)?;
+    for value in 0..120u32 {
+        writer.push(&Sample { value })?;
+        writer.push(&Note {
+            body: format!("note {value}"),
+        })?;
+        if value % 30 == 29 {
+            writer.flush()?;
+        }
+    }
+    writer.flush()?;
+    drop(writer);
+
+    // The premise: `Note` really is absent from the resident index.
+    let scanned = varve::VarveFile::open_readonly(spec, &path)?;
+    assert!(
+        !scanned
+            .index_entries()
+            .iter()
+            .any(|entry| entry.block_id == Note::ID),
+        "the fixture must declare Note non-resident or this test proves nothing",
+    );
+    let scanned_tail = scanned
+        .block_tail_offset(Note::ID)
+        .expect("the chain still knows where the block ends");
+    drop(scanned);
+
+    let (lazy, source) = varve::VarveFile::open_readonly_lazy_with_report(spec, &path)?;
+    assert_eq!(source, varve::LazyOpenSource::HeaderTails);
+    assert_eq!(
+        lazy.block_tail_offset(Note::ID),
+        Some(scanned_tail),
+        "the region must carry a non-resident block's tail; it is the only route \
+         back to that block's records",
+    );
+    assert_eq!(lazy.block_chain(Note::ID)?.count(), 120);
+    drop(lazy);
+
+    // And a writer resumed through the header keeps the chain whole.
+    let mut writer = varve::VarveWriter::open_lazy(spec, &path)?;
+    for value in 1000..1010u32 {
+        writer.push(&Note {
+            body: format!("resumed {value}"),
+        })?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    let scanned = varve::VarveFile::open_readonly(spec, &path)?;
+    assert_eq!(
+        scanned.block_chain(Note::ID)?.count(),
+        130,
+        "the resumed appends must extend the chain, not restart it",
+    );
+    Ok(())
+}
+
+/// A format declaring *both* extension blocks, so the published plan's SUM is
+/// pinned and not only each term alone.
+///
+/// `native_file_header_plan_extension_len` adds the file-explicit compression
+/// block's length to the region's. `compression.rs` pins the first term with no
+/// region present and the test above pins the second with no compression, so an
+/// either/or rewrite of that function would leave both green while reporting a
+/// header 28 bytes short for a format that declares both — a wrong answer from
+/// `effective_layout`, contradicted by the `file_header_len` beside it.
+///
+/// The 28 is restated rather than imported, like the rest of the geometry here:
+/// `FILE_EXPLICIT_COMPRESSION_HEADER_LEN` is private, and a test sharing the
+/// writer's constant would agree with a change to it.
+#[cfg(feature = "compression-zstd")]
+mod both_extension_blocks {
+    use super::{
+        BLOCK_FRAMING_LEN, ENTRY_LEN, Note, RESERVED_ENTRIES, SLOT_CRC_LEN, SLOT_HEADER_LEN, SLOTS,
+        Sample, find_region,
+    };
+    use varve::{
+        LayoutPlanFieldSource, LayoutPlanFieldType, LayoutPlanLen, LayoutPlanPartKind, varve_format,
+    };
+
+    /// `VCHD`'s framed length: it predates the block framing and carries no
+    /// length prefix, so this is its magic plus its fixed payload.
+    const COMPRESSION_BLOCK_LEN: usize = 4 + (1 + 1 + 1 + 1 + 4 + 8 + 8);
+
+    varve_format! {
+        pub struct BothFormat {
+            magic: b"VBOTHEXT";
+            version: 1;
+            limits {
+                file_len: 8_589_934_592;
+                records: 4_000_000;
+                index_bytes: 536_870_912;
+                scan_bytes: 8_589_934_592;
+                record_payload: 67_108_864;
+                logical_payload: 268_435_456;
+                materialized_bytes: 1_073_741_824;
+                segments: 4_000_000;
+                matrix_dimension: 16_000_000;
+                matrix_cells: 16_000_000;
+                matrix_bitmap: 64_000_000;
+                matrix_crc: 128_000_000;
+                matrix_metadata: 268_435_456;
+                matrix_slot_region: 8_589_934_592;
+                sidecar: 268_435_456;
+                mmap: 8_589_934_592;
+            }
+            endian: little;
+            schema_hash: computed;
+            integrity: crc32;
+            index: header_tails;
+            commit: transaction_marker(on_flush);
+            compression: variable_blocks(
+                zstd,
+                level = fast,
+                header = file_explicit,
+                min_len = 32,
+                only_if_smaller = true,
+                max_len = 1048576,
+            );
+            blocks: [Sample, Note];
+        }
+    }
+
+    fn region_len() -> usize {
+        let capacity = BothFormat::spec().blocks.len() + RESERVED_ENTRIES;
+        BLOCK_FRAMING_LEN + SLOTS * (SLOT_HEADER_LEN + capacity * ENTRY_LEN + SLOT_CRC_LEN)
+    }
+
+    #[test]
+    fn the_plan_sums_both_extension_blocks() -> varve::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("both.varve");
+        let mut writer = BothFormat::spec().create(&path)?;
+        for value in 0..40u32 {
+            writer.push(&Sample { value })?;
+            writer.push(&Note {
+                body: format!("a body long enough to be worth compressing {value}"),
+            })?;
+        }
+        writer.flush()?;
+        drop(writer);
+
+        let bytes = std::fs::read(&path)?;
+        // Both blocks are really there, in this order.
+        let compression_at = bytes
+            .windows(4)
+            .position(|window| window == b"VCHD")
+            .expect("the format declares file-explicit compression");
+        let region_at = find_region(&bytes).expect("and the region");
+        assert_eq!(region_at, compression_at + COMPRESSION_BLOCK_LEN);
+
+        let plan = BothFormat::spec().effective_layout();
+        let LayoutPlanPartKind::FileHeader(header) = &plan.parts[0].kind else {
+            panic!("the native preset publishes a file header part");
+        };
+        let extensions = header
+            .fields
+            .iter()
+            .find(|field| field.name == "extensions")
+            .expect("a plan for a format with extensions has the field");
+        assert_eq!(
+            extensions.ty,
+            LayoutPlanFieldType::Bytes {
+                len: LayoutPlanLen::Fixed((COMPRESSION_BLOCK_LEN + region_len()) as u64)
+            },
+            "the plan must sum both blocks, not report either alone",
+        );
+        assert!(matches!(
+            extensions.source,
+            LayoutPlanFieldSource::Native("file_header_extension_region"),
+        ));
+
+        // And the plan's total still lands where the file's header ends.
+        let declared =
+            u32::from_le_bytes(bytes[region_at + 4..region_at + 8].try_into().unwrap()) as usize;
+        let header_end = region_at + BLOCK_FRAMING_LEN + declared;
+        let planned: u64 = header
+            .fields
+            .iter()
+            .map(|field| match field.ty {
+                LayoutPlanFieldType::U8 => 1,
+                LayoutPlanFieldType::U16 => 2,
+                LayoutPlanFieldType::U32 => 4,
+                LayoutPlanFieldType::U64 => 8,
+                LayoutPlanFieldType::Bytes {
+                    len: LayoutPlanLen::Fixed(len),
+                } => len,
+                ref other => panic!("unexpected field type: {other:?}"),
+            })
+            .sum();
+        assert_eq!(planned, header_end as u64);
+
+        // A two-block extension region had never been written; check it opens.
+        let (_, source) =
+            varve::VarveFile::open_readonly_lazy_with_report(BothFormat::spec(), &path)?;
+        assert_eq!(source, varve::LazyOpenSource::HeaderTails);
+        Ok(())
+    }
+}
+
+/// The region costs one seek per commit point and nothing per record.
+///
+/// The append hot path is the thing this option must not touch. The write is an
+/// overwrite of a fixed extent inside the header, so it moves the shared file
+/// offset — which is safe only because `append_record_at_end` re-seeks
+/// `SEEK_END` every call and nothing caches a cursor. That safety is what makes
+/// the cost question the interesting one: the write must happen per *commit
+/// point*, never per record.
+///
+/// `take_record_file_seeks` counts exactly the seeks `RecordFile` performs, so
+/// the assertion is a difference between two runs that differ only in record
+/// count — a per-record cost would show up as the difference, and a constant
+/// one cancels.
+#[cfg(feature = "scalable-fault-injection")]
+#[test]
+fn the_region_write_is_one_seek_per_commit_point() -> varve::Result<()> {
+    fn seeks(
+        path: &std::path::Path,
+        spec: FormatSpec,
+        records: u32,
+        flushes: u32,
+    ) -> varve::Result<u64> {
+        let mut writer = spec.create(path)?;
+        let _ = varve::VarveFile::take_record_file_seeks();
+        for value in 0..records {
+            writer.push(&Sample { value })?;
+            if flushes > 0 && (value + 1) % (records / flushes) == 0 {
+                writer.flush()?;
+            }
+        }
+        writer.flush()?;
+        drop(writer);
+        Ok(varve::VarveFile::take_record_file_seeks())
+    }
+
+    let directory = tempfile::tempdir()?;
+    // Same number of commit points, ten times the records.
+    let small_on = seeks(&directory.path().join("s-on.varve"), on_spec(), 100, 5)?;
+    let large_on = seeks(&directory.path().join("l-on.varve"), on_spec(), 1_000, 5)?;
+    let small_off = seeks(&directory.path().join("s-off.varve"), off_spec(), 100, 5)?;
+    let large_off = seeks(&directory.path().join("l-off.varve"), off_spec(), 1_000, 5)?;
+
+    // What the option adds, at each size. If the region write had migrated onto
+    // the append path these two would differ by the record count.
+    let added_small = small_on - small_off;
+    let added_large = large_on - large_off;
+    assert_eq!(
+        added_small, added_large,
+        "the region added {added_small} seeks at 100 records and {added_large} at \
+         1,000; it is being written per record",
+    );
+    // Six commit points — five flushes plus the trailing one — and one seek
+    // each. Pinned, so a second write per commit point has to say so here.
+    assert_eq!(added_small, 6, "one seek per commit point");
+    Ok(())
+}

@@ -7363,9 +7363,17 @@ impl VarveFile {
             // is not the last record is one no lazy open can use. `flush` writes out
             // before it closes the commit point for exactly this reason; `sync`
             // written and stopped, silently demoting every later
-            // `open_readonly_lazy` on the file to a full scan. Re-closing costs
-            // nothing when nothing was written: both writers are predicated on
-            // there being something new to describe.
+            // `open_readonly_lazy` on the file to a full scan.
+            //
+            // Re-closing is cheap but no longer free, and the count matters:
+            // the segment and the digest are each predicated on there being
+            // something new to describe, so an idle close appends nothing. The
+            // header tail region is not — it has no such predicate, because its
+            // write is an overwrite of a fixed extent rather than an append, so
+            // an idle close costs one seek and one 360-byte write and advances
+            // the slot generation. It never grows the file and it is never on
+            // the append path; `the_region_write_is_one_seek_per_commit_point`
+            // is what holds that to a count.
             self.close_commit_point();
         }
         self.file.sync_all()?;
@@ -11097,6 +11105,14 @@ impl VarveFile {
     /// reference this type constructs. The condition above is therefore about
     /// the *records*, which nothing but a `replace_*` ever rewrites.
     pub unsafe fn mmap_payloads(&self) -> Result<MmapPayloads> {
+        // The index this maps is the *resident* one, and a lazily opened handle
+        // deliberately has none. Without this the answer was `Ok` with zero
+        // entries on a file holding hundreds of thousands of records —
+        // `is_empty()` true, every window `None`, no error anywhere. Refusing by
+        // name is what every other directory-needing read does, and it is the
+        // difference between "this handle cannot answer that" and "there is
+        // nothing here".
+        let _ = self.resident_directory("mmap_payloads")?;
         let mapped_len = self.snapshot.len();
         // `MmapLen` alone. `FileLen` was checked here too, against the same
         // value — the mapping's length is the snapshot's length — so it bounded
