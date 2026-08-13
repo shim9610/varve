@@ -1656,7 +1656,9 @@ fn each_field_the_slot_decoder_checks_takes_the_table_out_of_use() -> varve::Res
 
     // Each case names the field and what a reader would do with the slot if the
     // check were not there.
-    let cases: Vec<(&str, Box<dyn Fn(&mut [u8])>)> = vec![
+    /// One case: the field's name, and what makes the slot lie about it.
+    type Case = (&'static str, Box<dyn Fn(&mut [u8])>);
+    let cases: Vec<Case> = vec![
         (
             // A future version may lay the slot out differently; reading it
             // with this version's offsets would frame the wrong numbers.
