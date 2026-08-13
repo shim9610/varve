@@ -72,10 +72,10 @@ varve_format! {
 
 /// How many bytes from the start of the region a head-anchored mutation writes.
 ///
-/// The region is `8 + 2 x (28 + 12 x (blocks + 8) + 4)` bytes — 312 for this
+/// The region is `8 + 2 x (28 + 12 x (blocks + 10) + 4)` bytes — 360 for this
 /// two-block format — so a window a little larger than that covers both slots
 /// and a few bytes past, and stops well before the records.
-const HEAD_WINDOW: usize = 384;
+const HEAD_WINDOW: usize = 448;
 
 /// How much the two routes owe each other on this file.
 #[derive(Clone, Copy, PartialEq)]

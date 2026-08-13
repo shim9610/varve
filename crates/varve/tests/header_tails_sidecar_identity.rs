@@ -1,10 +1,9 @@
-//! Why a disk-index format cannot carry a header tail region, from both sides.
+//! Why a disk-index format cannot carry a header tail region *today*.
 //!
 //! This file used to assert that a rewritten region does not invalidate a
 //! published sidecar — the narrowing of `primary_identity` and
 //! `primary_generation` that landed in 93c64c3. Those two cases could not
-//! survive the refusal that followed, and the reason is the finding this file
-//! now records.
+//! survive the refusal that followed, and the reason is what this file records.
 //!
 //! **The region is only ever written for a commit marker.** Nothing else names
 //! a commit point, so a format without one leaves the region cold for the life
@@ -12,20 +11,29 @@
 //! hundred records, both slots still at `count = 0`. `FormatSpec::validate`
 //! therefore refuses `header_tails` without a `transaction_marker` policy.
 //!
-//! **The streaming path refuses a commit marker.** `NativeStreamScanner`
-//! errors with `StreamingUnsupported` the moment it frames a `COMMIT_BLOCK_ID`
-//! record, and the disk index reads its primary through that scanner. So a
-//! disk-index format cannot have markers.
+//! **The streaming path refuses four internal record kinds, by policy.**
+//! `NativeStreamScanner::next_entry` errors with `StreamingUnsupported` on
+//! `OP`, `INDEX`, `COMMIT` and `SEGMENT` — and passes `TOMBSTONE`, `METADATA`
+//! and the creation nonce straight through. So it is not that the scanner
+//! cannot cope with an internal record; those four are the ones a writer it
+//! does not use produces, and seeing one means "this is not a file I wrote".
+//! It fails loudly rather than reporting a shape it was not designed for.
 //!
-//! The two together are exclusive, and that is the whole content of this file.
-//! It matters beyond bookkeeping: it means the hazard 93c64c3 was written for —
-//! a commit rewriting header bytes underneath a published sidecar — **cannot
-//! arise from a writer**, because no declarable format both warms the region
-//! and carries a sidecar. The blanking stays, as the thing that keeps the two
-//! windows honest against any future mutable header block and against a
-//! hand-edited file; its narrowness is asserted by
+//! **So the exclusivity is a decision, not a law**, and this file is careful to
+//! say so. Mechanically, skipping a commit marker there is `continue` instead
+//! of `Err`; whether that is *right* is a separate question — the same loop
+//! enforces strictly increasing sequence two lines below, and the sidecar's
+//! model assumes it wrote the primary. `header_tails` with a disk index is a
+//! feature nobody has built, not an impossibility.
+//!
+//! What follows from it for 93c64c3: no *currently declarable* format both
+//! warms the region and carries a sidecar, so a commit rewriting header bytes
+//! underneath a published sidecar cannot happen today. The blanking stays — it
+//! is what keeps the two windows honest against a hand-edited file and against
+//! any future mutable header block, and it is what would already be right if
+//! the scanner ever learns to skip a marker. Its narrowness is asserted by
 //! `varve_core::file::tests::blanking_covers_the_mutable_payload_and_nothing_else`,
-//! which does not need either half of this combination.
+//! which needs neither half of this combination.
 //!
 //! Delete this file the day the disk index tolerates a commit marker, and
 //! restore the two end-to-end cases from 93c64c3's history.
@@ -71,13 +79,17 @@ fn the_region_cannot_be_declared_without_a_commit_marker() {
     );
 }
 
-/// Side two: the disk index cannot handle a primary that carries commit
-/// markers.
+/// Side two: the disk index refuses a primary that carries commit markers.
 ///
 /// Asserted against the real path rather than by reading the scanner, and the
 /// whole sequence is one `Result` because the refusal does not wait for the
 /// read: it arrives as soon as the indexed path frames a marker, which is
 /// before this can get a reader open.
+///
+/// "Refuses", not "cannot" — the scanner passes other internal records through
+/// and it is these four it treats as a foreign file shape. This test pins the
+/// behaviour so that relaxing it is a deliberate change with a test to update,
+/// which is the opposite of the state that produced this file.
 #[test]
 fn a_disk_index_cannot_handle_a_primary_that_carries_commit_markers() {
     let directory = tempfile::tempdir().expect("tempdir");

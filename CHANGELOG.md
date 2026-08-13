@@ -21,8 +21,8 @@ header**, written at create and rewritten at the end of every commit point.
 `LazyOpenSource::HeaderTails` when they take it.
 
 The region is sized by the declaration and by nothing else — `8 + 2 x (28 + 12 x
-(blocks + 8) + 4)` bytes, **312 for a two-block format**, the same at any record
-count. The update rides the durability request that already ends a commit, so
+(blocks + 10) + 4)` bytes, **360 for a two-block format**, the same at any
+record count, where the `+ 10` is one slot per internal block id. The update rides the durability request that already ends a commit, so
 there is **no extra `fsync`**. Measured on a two-block fixture: an open takes
 **4 record framings** — the commit marker plus one per distinct block id — and
 the same 4 on a file ten times larger, against a scanning open that frames every

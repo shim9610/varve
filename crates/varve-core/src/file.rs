@@ -42,6 +42,51 @@ pub const CREATION_NONCE_BLOCK_ID: u32 = 0xFFFF_FFF8;
 /// [`IndexPolicy::segment_on_flush`].
 pub const SEGMENT_BLOCK_ID: u32 = 0xFFFF_FFF7;
 const RESERVED_BLOCK_ID_START: u32 = 0xFFFF_FF00;
+
+/// Every block id varve reserves for its own records, as one list.
+///
+/// It exists because a *count* of these was needed and was written down by
+/// hand. `HEADER_TAILS_RESERVED_ENTRIES` was `8` against ten ids — it happened
+/// to be enough, because three of the ten cannot co-occur with that option, but
+/// nothing tied the number to the list and an eleventh id would have overflowed
+/// the region silently: `flags = OVERFLOW`, `count = 0`, and the option doing
+/// nothing for the life of every file written afterwards.
+///
+/// So the count is derived, the range membership is a compile-time assertion,
+/// and `enforcement_gates` reads this file's source to require that every
+/// `*_BLOCK_ID` constant appears here. The last of those is the one that
+/// catches a new id, because the compiler cannot notice an omission.
+pub(crate) const INTERNAL_BLOCK_IDS: &[u32] = &[
+    TOMBSTONE_BLOCK_ID,
+    OP_BLOCK_ID,
+    METADATA_BLOCK_ID,
+    INDEX_BLOCK_ID,
+    MANIFEST_BLOCK_ID,
+    COMMIT_BLOCK_ID,
+    CREATION_NONCE_BLOCK_ID,
+    SEGMENT_BLOCK_ID,
+    MATRIX_CHUNK_BLOCK_ID,
+    OPEN_DIGEST_BLOCK_ID,
+];
+
+const _: () = {
+    let mut index = 0;
+    while index < INTERNAL_BLOCK_IDS.len() {
+        assert!(
+            INTERNAL_BLOCK_IDS[index] >= RESERVED_BLOCK_ID_START,
+            "an internal block id must be inside the reserved range"
+        );
+        let mut other = index + 1;
+        while other < INTERNAL_BLOCK_IDS.len() {
+            assert!(
+                INTERNAL_BLOCK_IDS[index] != INTERNAL_BLOCK_IDS[other],
+                "internal block ids must be distinct"
+            );
+            other += 1;
+        }
+        index += 1;
+    }
+};
 pub(crate) const RECORD_HEADER_LEN: u64 = 32;
 pub(crate) const RECORD_FOOTER_LEN: u64 = 32;
 const RECORD_FLAG_COMPRESSED: u16 = 0x0001;
@@ -346,14 +391,20 @@ const HEADER_TAILS_VERSION: u16 = 1;
 /// commit point's table, so the fallback is an earlier commit boundary rather
 /// than no boundary.
 const HEADER_TAILS_SLOTS: usize = 2;
-/// Entries reserved beyond the declared blocks.
+/// Entries reserved beyond the declared blocks: one per internal block id.
 ///
-/// Blocks with a tail that `spec.blocks` does not name: the commit marker, the
-/// segment chain, the open digest, the tombstone chain and the index
-/// checkpoint, plus spare. The capacity is fixed at create because the region's
-/// length is; a format that ever needs more writes `HEADER_TAILS_FLAG_OVERFLOW`
-/// and `count = 0` rather than a table that is silently partial.
-const HEADER_TAILS_RESERVED_ENTRIES: usize = 8;
+/// Derived from [`INTERNAL_BLOCK_IDS`] rather than chosen, because the capacity
+/// is fixed at create and a table that outgrows it is not truncated — it is
+/// dropped, with `HEADER_TAILS_FLAG_OVERFLOW` and `count = 0`, and the option
+/// then does nothing for the life of that file. A hand-picked number is a
+/// silent expiry date; a derived one widens the region when the list grows.
+///
+/// Reserving all ten is deliberate over-reserving. Three of them cannot
+/// co-occur with this option — the open digest and matrix chunks are refused
+/// alongside it, and the creation nonce belongs to a path that is — so the true
+/// need today is seven. Twelve bytes each is not worth the reasoning it would
+/// take to keep "which ids can co-occur" correct as the refusals change.
+const HEADER_TAILS_RESERVED_ENTRIES: usize = INTERNAL_BLOCK_IDS.len();
 /// `version u16 | flags u16 | capacity u32 | count u32 | generation u64 |
 /// commit_offset u64`.
 ///

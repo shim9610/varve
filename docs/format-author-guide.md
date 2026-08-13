@@ -529,8 +529,9 @@ assert_eq!(source, LazyOpenSource::HeaderTails);
 ```
 
 **What it costs.** A fixed region sized by your declaration and nothing else:
-`8 + 2 x (28 + 12 x (blocks + 8) + 4)` bytes, so **312 bytes for a two-block
-format**, the same at two hundred records and at two billion. The update rides
+`8 + 2 x (28 + 12 x (blocks + 10) + 4)` bytes, so **360 bytes for a two-block
+format**, the same at two hundred records and at two billion. The `+ 10` is one
+slot per block id varve reserves for its own records. The update rides
 the durability request that already ends a commit, so there is **no extra
 `fsync`**. Measured on the two-block fixture: a scanning open frames every
 record; this one frames **4** — the commit marker plus one per distinct block id

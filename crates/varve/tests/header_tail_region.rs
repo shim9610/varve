@@ -119,7 +119,10 @@ varve_format! {
 /// agree with any change to them, including a wrong one. These are the numbers
 /// the format is, and a change to the layout has to change them here too.
 const SLOTS: usize = 2;
-const RESERVED_ENTRIES: usize = 8;
+/// One per internal block id. Restated rather than imported, like the rest of
+/// the geometry here: the writer derives it from `INTERNAL_BLOCK_IDS`, and a
+/// test that shared that derivation would agree with a change to it.
+const RESERVED_ENTRIES: usize = 10;
 const SLOT_HEADER_LEN: usize = 2 + 2 + 4 + 4 + 8 + 8;
 const ENTRY_LEN: usize = 4 + 8;
 const SLOT_CRC_LEN: usize = 4;

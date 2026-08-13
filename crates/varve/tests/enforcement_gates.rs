@@ -417,6 +417,57 @@ fn a_permit_can_only_be_minted_from_the_writers_own_poison_flag() {
 /// general-purpose write. This gate stands for the part a compile-fail fixture
 /// cannot express from outside the crate: that the handle stays wrapped and
 /// that no second write pair is introduced against the raw field.
+/// Every reserved block id has to be in `INTERNAL_BLOCK_IDS`.
+///
+/// The list is what `HEADER_TAILS_RESERVED_ENTRIES` counts, and the region's
+/// capacity is fixed at create: a table that outgrows it is dropped whole, so
+/// an id missing from the list would make `index: header_tails` silently do
+/// nothing for the life of every file written after it was added.
+///
+/// The compiler cannot catch an omission — a new `const FOO_BLOCK_ID` compiles
+/// perfectly well without being listed — so this reads the source, which is the
+/// same reason every other gate in this file does.
+#[test]
+fn every_reserved_block_id_is_in_the_internal_list() {
+    let source = crate_source("file.rs");
+    let list_start = source
+        .find("pub(crate) const INTERNAL_BLOCK_IDS: &[u32] = &[")
+        .expect("the list exists");
+    let list_end = source[list_start..]
+        .find("];")
+        .map(|at| list_start + at)
+        .expect("the list is terminated");
+    let list = &source[list_start..list_end];
+
+    let mut missing: Vec<&str> = Vec::new();
+    for line in source.lines() {
+        let line = line.trim();
+        let Some(rest) = line
+            .strip_prefix("pub const ")
+            .or_else(|| line.strip_prefix("pub(crate) const "))
+            .or_else(|| line.strip_prefix("const "))
+        else {
+            continue;
+        };
+        let Some(name) = rest.split(':').next() else {
+            continue;
+        };
+        // `RESERVED_BLOCK_ID_START` is the range bound, not a member of it.
+        if !name.ends_with("_BLOCK_ID") {
+            continue;
+        }
+        if !list.contains(name) {
+            missing.push(line);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "these reserved block ids are not in `INTERNAL_BLOCK_IDS`, so the header tail \
+         region does not reserve a slot for them and a table naming one would be dropped \
+         whole: {missing:?}"
+    );
+}
+
 #[test]
 fn the_primary_record_handle_is_only_written_through_its_three_gated_operations() {
     let source = crate_source("file.rs");
