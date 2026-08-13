@@ -20419,9 +20419,22 @@ mod tests {
         extensions.extend_from_slice(HEADER_TAILS_MAGIC);
         extensions.extend_from_slice(&(PAYLOAD_LEN as u32).to_le_bytes());
         extensions.extend_from_slice(&[0x22; PAYLOAD_LEN]);
+        // And a block *after* the mutable one, which the walk skips because it
+        // does not know the magic. Without it the mutable payload runs to the
+        // end of the region and "everything after it is untouched" asserts over
+        // an empty slice — true of any implementation, including one that
+        // blanked to the end.
+        const TRAILING_LEN: usize = 12;
+        extensions.extend_from_slice(b"VZZZ");
+        extensions.extend_from_slice(&(TRAILING_LEN as u32).to_le_bytes());
+        extensions.extend_from_slice(&[0x33; TRAILING_LEN]);
 
         let header_len = (HEADER_PREAMBLE + extensions.len()) as u64;
         let payload_start = HEADER_PREAMBLE + vchd_len + 8;
+        assert!(
+            payload_start + PAYLOAD_LEN < header_len as usize,
+            "the assertion below has to have bytes to be about",
+        );
 
         let mut prefix = vec![0xAAu8; header_len as usize];
         let blanked = blank_mutable_header_bytes(&mut prefix, header_len, &extensions)
@@ -20463,6 +20476,7 @@ mod tests {
 
         // A region with no mutable block is left exactly as it is.
         let immutable = &extensions[..vchd_len];
+        assert!(!immutable.is_empty());
         let header_len = (HEADER_PREAMBLE + immutable.len()) as u64;
         let mut untouched = vec![0xAAu8; header_len as usize];
         assert_eq!(

@@ -1892,3 +1892,148 @@ fn a_lazily_resumed_writer_keeps_warming_the_region() -> varve::Result<()> {
     );
     Ok(())
 }
+
+/// An in-place fixed replacement keeps the region warm, and should.
+///
+/// `replace_block` resets the region to cold because it republishes the file
+/// with every record offset shifted by a uniform delta, so every offset the old
+/// table held is wrong. `replace_fixed` is the opposite case and deliberately
+/// skips that reset: it copies the file and patches one record of unchanged
+/// length, so nothing moves. Skipping a reset is the kind of decision that is
+/// only obviously right until someone changes the other path, so this asserts
+/// the table survives *and* still describes the file.
+#[test]
+fn an_in_place_replacement_keeps_the_warm_region() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("in-place.varve");
+    write_samples(on_spec(), &path, 100)?;
+
+    let slot_len =
+        SLOT_HEADER_LEN + (declared_blocks() + RESERVED_ENTRIES) * ENTRY_LEN + SLOT_CRC_LEN;
+    let warm = |bytes: &[u8]| -> Vec<u64> {
+        let at = find_region(bytes).expect("the region is in the header");
+        (0..SLOTS)
+            .map(|slot| slot_fields(bytes, at + BLOCK_FRAMING_LEN + slot * slot_len, slot_len))
+            .filter(|fields| fields.checksum_matches && fields.count > 0)
+            .map(|fields| fields.commit_offset)
+            .collect()
+    };
+
+    let before = warm(&std::fs::read(&path)?);
+    assert!(!before.is_empty(), "the fixture must be warm to start with");
+    let expected = {
+        let scanned = varve::VarveFile::open_readonly(on_spec(), &path)?;
+        scanned.block_tail_offset(Sample::ID)
+    };
+
+    let mut writer = varve::VarveWriter::open(on_spec(), &path)?;
+    writer.replace_fixed(0, &Sample { value: 4_242 })?;
+    drop(writer);
+
+    assert_eq!(
+        warm(&std::fs::read(&path)?),
+        before,
+        "an equal-length in-place patch moves no record, so the table it \
+         published is still true",
+    );
+
+    // And the fast route still opens the file and answers what the scan does.
+    let (file, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &path)?;
+    assert_eq!(source, varve::LazyOpenSource::HeaderTails);
+    assert_eq!(file.block_tail_offset(Sample::ID), expected);
+
+    // The replacement really landed, so the test is about a file that changed.
+    let scanned = varve::VarveFile::open_readonly(on_spec(), &path)?;
+    let samples = scanned.blocks::<Sample>()?;
+    assert_eq!(samples.get(0)?.expect("a Sample").value, 4_242);
+    Ok(())
+}
+
+/// `Crc32WithHeader` is the other integrity policy the region accepts.
+///
+/// `validate` names two — `Crc32` and `Crc32WithHeader` — and every fixture
+/// above declares the first, so the second was accepted by a `matches!` arm no
+/// file exercised. It is not a cosmetic difference: the policy adds a checksum
+/// over each record's *header*, which changes record framing, and the whole
+/// corroboration is framing — the marker at `commit_offset`, the walk forward
+/// to the end of the file, and every tail re-framed against its block id.
+mod crc32_with_header {
+    use super::{Note, Sample};
+    use varve::{VarveBlock, varve_format};
+
+    varve_format! {
+        pub struct HeaderCrcTailFormat {
+            magic: b"VHDRTAIL";
+            version: 1;
+            limits {
+                file_len: 8_589_934_592;
+                records: 4_000_000;
+                index_bytes: 536_870_912;
+                scan_bytes: 8_589_934_592;
+                record_payload: 67_108_864;
+                logical_payload: 268_435_456;
+                materialized_bytes: 1_073_741_824;
+                segments: 4_000_000;
+                matrix_dimension: 16_000_000;
+                matrix_cells: 16_000_000;
+                matrix_bitmap: 64_000_000;
+                matrix_crc: 128_000_000;
+                matrix_metadata: 268_435_456;
+                matrix_slot_region: 8_589_934_592;
+                sidecar: 268_435_456;
+                mmap: 8_589_934_592;
+            }
+            endian: little;
+            schema_hash: computed;
+            integrity: crc32_with_header;
+            index: header_tails;
+            commit: transaction_marker(on_flush);
+            blocks: [Sample, Note];
+        }
+    }
+
+    #[test]
+    fn a_header_checksummed_format_resumes_from_the_header() -> varve::Result<()> {
+        let spec = HeaderCrcTailFormat::spec();
+        assert_eq!(
+            spec.integrity_policy,
+            varve::IntegrityPolicy::Crc32WithHeader
+        );
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("header-crc.varve");
+        super::write_samples(spec, &path, 200)?;
+
+        let (lazy, source) = varve::VarveFile::open_readonly_lazy_with_report(spec, &path)?;
+        assert_eq!(source, varve::LazyOpenSource::HeaderTails);
+
+        let scanned = varve::VarveFile::open_readonly(spec, &path)?;
+        for block in [Sample::ID, Note::ID] {
+            assert_eq!(
+                lazy.block_tail_offset(block),
+                scanned.block_tail_offset(block),
+            );
+            assert!(lazy.block_tail_offset(block).is_some());
+        }
+
+        // A byte flipped in a record's header is what this policy exists to
+        // catch, and the corroboration frames records — so the table must stop
+        // being adopted rather than hand out an offset it could not verify.
+        let mut bytes = std::fs::read(&path)?;
+        let marker = scanned
+            .block_tail_offset(varve::COMMIT_BLOCK_ID)
+            .expect("a flushed marker") as usize;
+        drop(scanned);
+        bytes[marker + 4] ^= 0xFF;
+        let damaged = directory.path().join("damaged.varve");
+        std::fs::write(&damaged, &bytes)?;
+        assert!(
+            !matches!(
+                varve::VarveFile::open_readonly_lazy_with_report(spec, &damaged),
+                Ok((_, varve::LazyOpenSource::HeaderTails)),
+            ),
+            "a damaged commit marker must take the table out of use",
+        );
+        Ok(())
+    }
+}

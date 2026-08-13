@@ -194,3 +194,79 @@ fn the_scanning_open_really_does_read_the_whole_file() -> Result<()> {
     );
     Ok(())
 }
+
+/// A tombstone is a block with a tail like any other, and the region carries it.
+///
+/// Deleting a key appends a tombstone record on the shared tombstone chain, and
+/// the keyed rebuild walks *two* chains — the block's own and the tombstone's —
+/// because a tombstone is what makes a key's newest record a deletion. So the
+/// region has to hand out both entry points; a table missing the tombstone tail
+/// would leave a lazily opened handle answering the pre-delete offset for every
+/// deleted key, and the next append would chain to a record the delete had
+/// already superseded.
+///
+/// Note what `key_tail_offsets` does *not* do: it does not drop the key. The
+/// map is the newest record offset per key and the tombstone is that record —
+/// which is exactly what `prev_same_key_offset` has to point at on the next
+/// append. So the assertion is that the deleted key's tail *moved onto the
+/// tombstone*, not that it disappeared.
+///
+/// `TOMBSTONE_BLOCK_ID` is one of the ten internal ids the region reserves
+/// capacity for; this is the test that a reserved entry is used rather than
+/// merely counted.
+#[test]
+fn a_deleted_key_points_at_its_tombstone_through_the_header_route() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("deleted.varve");
+    build(&path, 200)?;
+
+    let before = {
+        let (file, source) =
+            VarveFile::open_readonly_lazy_with_report(KeyedResumeFormat::spec(), &path)?;
+        assert_eq!(source, LazyOpenSource::HeaderTails);
+        keyed_maps(&file)?.0
+    };
+
+    {
+        let mut writer = VarveFile::open(KeyedResumeFormat::spec(), &path)?;
+        writer.delete::<Channel>(&1)?;
+        writer.delete::<Partition>(&2)?;
+        writer.flush()?;
+    }
+
+    let (lazy, source) =
+        VarveFile::open_readonly_lazy_with_report(KeyedResumeFormat::spec(), &path)?;
+    assert_eq!(source, LazyOpenSource::HeaderTails);
+    let tombstone_tail = lazy.block_tail_offset(varve::TOMBSTONE_BLOCK_ID).expect(
+        "the region must hand out the tombstone chain's entry point, or the \
+             keyed rebuild has no way to learn a key was deleted",
+    );
+
+    let scanned = VarveFile::open_readonly(KeyedResumeFormat::spec(), &path)?;
+    let (lazy_channels, lazy_partitions) = keyed_maps(&lazy)?;
+    let (scanned_channels, scanned_partitions) = keyed_maps(&scanned)?;
+    assert_eq!(lazy_channels, scanned_channels);
+    assert_eq!(lazy_partitions, scanned_partitions);
+
+    // The deleted key moved onto its tombstone; every other key stayed put.
+    for key in 0..KEYS_PER_BLOCK {
+        let now = lazy_channels[&key];
+        if key == 1 {
+            assert_ne!(now, before[&key], "channel 1's tail did not move");
+            assert!(
+                now <= tombstone_tail,
+                "channel 1's tail {now} is past the newest tombstone \
+                 {tombstone_tail}",
+            );
+            // And it really is a tombstone, not a Channel record: the two
+            // deletes are the only records appended after the build, so the
+            // pre-delete tails bound where a Channel record can be.
+            let highest_channel = before.values().copied().max().expect("a tail");
+            assert!(now > highest_channel);
+        } else {
+            assert_eq!(now, before[&key], "channel {key}'s tail moved");
+        }
+    }
+    assert_eq!(lazy_channels.len(), KEYS_PER_BLOCK as usize);
+    Ok(())
+}
