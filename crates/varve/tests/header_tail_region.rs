@@ -1626,3 +1626,269 @@ fn the_region_write_is_one_seek_per_commit_point() -> varve::Result<()> {
     assert_eq!(added_small, 6, "one seek per commit point");
     Ok(())
 }
+
+/// Every field the slot decoder checks, checked.
+///
+/// `decode_header_tails_slots` refuses a slot on five grounds beyond its
+/// checksum, and each one exists because a slot that got past it would be used
+/// as a table. They had no test: the checksum is what a *torn* write breaks,
+/// and the tests above break it, so every one of these branches was reachable
+/// only by a byte-patch nothing was making. Each mutation here recomputes the
+/// checksum, so the slot is well-formed in the one way the earlier tests
+/// exercise and malformed only in the field named.
+///
+/// The mutation is applied to **every** warm slot, for the reason
+/// `rewrite_warm_slots` documents: an idle commit leaves two slots naming the
+/// same marker and either one alone would answer.
+#[test]
+fn each_field_the_slot_decoder_checks_takes_the_table_out_of_use() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("fields.varve");
+    write_samples(on_spec(), &path, 100)?;
+
+    let scanned = varve::VarveFile::open_readonly(on_spec(), &path)?;
+    let expected = scanned.block_tail_offset(Sample::ID);
+    drop(scanned);
+
+    let clean = std::fs::read(&path)?;
+    let at = find_region(&clean).expect("the region is in the header");
+    let capacity = (declared_blocks() + RESERVED_ENTRIES) as u32;
+
+    // Each case names the field and what a reader would do with the slot if the
+    // check were not there.
+    let cases: Vec<(&str, Box<dyn Fn(&mut [u8])>)> = vec![
+        (
+            // A future version may lay the slot out differently; reading it
+            // with this version's offsets would frame the wrong numbers.
+            "version",
+            Box::new(|body: &mut [u8]| body[0..2].copy_from_slice(&2u16.to_le_bytes())),
+        ),
+        (
+            // An unknown flag is a claim this build cannot honour. `OVERFLOW`
+            // is the one flag defined, and bit 1 is not it.
+            "an unknown flag",
+            Box::new(|body: &mut [u8]| body[2..4].copy_from_slice(&2u16.to_le_bytes())),
+        ),
+        (
+            // The declared capacity has to be the geometry the region actually
+            // has, or the entry stride is wrong and every offset is garbage.
+            "capacity",
+            Box::new(move |body: &mut [u8]| {
+                body[4..8].copy_from_slice(&(capacity + 1).to_le_bytes())
+            }),
+        ),
+        (
+            // A count past the capacity walks the reader off the end of the
+            // slot and into the next one.
+            "count past capacity",
+            Box::new(move |body: &mut [u8]| {
+                body[8..12].copy_from_slice(&(capacity + 1).to_le_bytes())
+            }),
+        ),
+        (
+            // `BlockTails` binary-searches, so an unsorted table answers wrong
+            // rather than slowly — the failure that does not announce itself.
+            "block ids out of order",
+            Box::new(|body: &mut [u8]| {
+                let first = SLOT_HEADER_LEN;
+                let second = SLOT_HEADER_LEN + ENTRY_LEN;
+                let (head, tail) = body.split_at_mut(second);
+                head[first..first + ENTRY_LEN].swap_with_slice(&mut tail[..ENTRY_LEN]);
+            }),
+        ),
+    ];
+
+    for (name, mutate) in cases {
+        let mut bytes = clean.clone();
+        rewrite_warm_slots(&mut bytes, at, |body| mutate(body));
+        let one = directory
+            .path()
+            .join(format!("{}.varve", name.replace(' ', "-")));
+        std::fs::write(&one, &bytes)?;
+        let (file, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &one)?;
+        assert_eq!(
+            source,
+            varve::LazyOpenSource::FullScan,
+            "a slot with a bad {name} must not be adopted",
+        );
+        assert_eq!(
+            file.block_tail_offset(Sample::ID),
+            expected,
+            "and the fallback answers what the file holds ({name})",
+        );
+    }
+    Ok(())
+}
+
+/// A slot that says "I overflowed" is not read as "no block has a tail".
+///
+/// The overflow flag is the writer's escape hatch for a format with more block
+/// ids than the region has entries: rather than publish a partial table, it
+/// publishes `flags = OVERFLOW, count = 0`. The decoder keeps such a slot —
+/// its generation is what the next write has to advance past — so the refusal
+/// has to happen in the corroboration, and it is the same refusal a cold slot
+/// gets. Adopting one would assert that every block's chain is empty, which is
+/// the worst possible answer: a writer would then start a fresh chain and
+/// orphan every record already in the file.
+#[test]
+fn an_overflow_slot_is_not_adopted() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("overflow.varve");
+    write_samples(on_spec(), &path, 100)?;
+
+    let scanned = varve::VarveFile::open_readonly(on_spec(), &path)?;
+    let expected = scanned.block_tail_offset(Sample::ID);
+    drop(scanned);
+
+    let mut bytes = std::fs::read(&path)?;
+    let at = find_region(&bytes).expect("the region is in the header");
+    rewrite_warm_slots(&mut bytes, at, |body| {
+        body[2..4].copy_from_slice(&1u16.to_le_bytes());
+        body[8..12].copy_from_slice(&0u32.to_le_bytes());
+    });
+    let overflowed = directory.path().join("overflowed.varve");
+    std::fs::write(&overflowed, &bytes)?;
+
+    let (file, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &overflowed)?;
+    assert_eq!(source, varve::LazyOpenSource::FullScan);
+    assert_eq!(file.block_tail_offset(Sample::ID), expected);
+    Ok(())
+}
+
+/// A writer resumed through the header continues the sequence.
+///
+/// The region answers three facts and this is the one the tail offsets do not
+/// cover. `corroborate_header_tails` builds its `sequence_high_water` from the
+/// commit marker it framed and the records the forward walk stepped through —
+/// not from the table, which carries no sequence at all. If that were wrong,
+/// the resumed writer would issue a sequence a record in the file already has,
+/// and nothing on the append path would notice.
+#[test]
+fn a_writer_resumed_from_the_header_continues_the_sequence() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("sequence.varve");
+    write_samples(on_spec(), &path, 100)?;
+
+    let highest_before = {
+        let scanned = varve::VarveFile::open_readonly(on_spec(), &path)?;
+        // The commit marker is the last record a closed commit point wrote, so
+        // it carries the highest sequence in the file.
+        let mut buffer = Vec::new();
+        let mut walk = scanned.record_map(&mut buffer)?;
+        let mut highest = 0u64;
+        while let Some(entry) = walk.advance()? {
+            highest = highest.max(entry.sequence);
+        }
+        highest
+    };
+
+    let (mut writer, source) = varve::VarveFile::open_lazy_with_report(on_spec(), &path)?;
+    assert_eq!(source, varve::LazyOpenSource::HeaderTails);
+    let appended = writer.push_info(&Sample { value: 1_000 })?;
+    assert!(
+        appended.sequence > highest_before,
+        "the resumed writer issued sequence {} over a file whose highest was \
+         {highest_before}",
+        appended.sequence,
+    );
+    writer.flush()?;
+    drop(writer);
+
+    // And the file still reads as one strictly ascending sequence, which is the
+    // property a repeat would break.
+    let scanned = varve::VarveFile::open_readonly(on_spec(), &path)?;
+    // Sequences start at zero, so the comparison has to be against "the one
+    // before", not against a sentinel.
+    let mut previous: Option<u64> = None;
+    let mut records = 0usize;
+    let mut buffer = Vec::new();
+    let mut walk = scanned.record_map(&mut buffer)?;
+    while let Some(entry) = walk.advance()? {
+        if let Some(previous) = previous {
+            assert!(
+                entry.sequence > previous,
+                "sequence {} follows {previous}",
+                entry.sequence,
+            );
+        }
+        previous = Some(entry.sequence);
+        records += 1;
+    }
+    assert!(records > 100, "the walk saw {records} records");
+    Ok(())
+}
+
+/// The region keeps being rewritten by a writer that never scanned the file.
+///
+/// A resume that adopted the table but then stopped maintaining it would work
+/// once and degrade silently: the first reopen is fast, every reopen after it
+/// falls back, and nothing says so. So this resumes lazily three times in a
+/// row, each time appending and committing *twice*, and requires that the route
+/// stays `HeaderTails` and the slot generation strictly advances.
+///
+/// Two commits per handle rather than one, and that is the load-bearing part.
+/// A fresh open re-reads the header from disk, so the generation would keep
+/// advancing across handles even if a handle never updated its own cached copy
+/// of the region — the second commit on one handle is what catches that, and
+/// measured by removing the write-back in `write_header_tails`, it is what
+/// makes this test fail rather than pass.
+#[test]
+fn a_lazily_resumed_writer_keeps_warming_the_region() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("generations.varve");
+    write_samples(on_spec(), &path, 100)?;
+
+    let slot_len =
+        SLOT_HEADER_LEN + (declared_blocks() + RESERVED_ENTRIES) * ENTRY_LEN + SLOT_CRC_LEN;
+    let newest_generation = |bytes: &[u8]| -> u64 {
+        let at = find_region(bytes).expect("the region is in the header");
+        (0..SLOTS)
+            .map(|slot| slot_fields(bytes, at + BLOCK_FRAMING_LEN + slot * slot_len, slot_len))
+            .filter(|fields| fields.checksum_matches && fields.count > 0)
+            .map(|fields| fields.generation)
+            .max()
+            .unwrap_or(0)
+    };
+
+    let mut generation = newest_generation(&std::fs::read(&path)?);
+    assert!(generation > 0, "the fixture must be warm to start with");
+
+    for round in 0..3u32 {
+        let (mut writer, source) = varve::VarveFile::open_lazy_with_report(on_spec(), &path)?;
+        assert_eq!(
+            source,
+            varve::LazyOpenSource::HeaderTails,
+            "round {round} fell back, so the previous round stopped maintaining \
+             the region",
+        );
+        // Twice on the *same* handle, which is the half a fresh open cannot
+        // stand in for: the generation a write picks is one past the highest in
+        // the region the handle has cached, so a handle that did not keep that
+        // cache in step with the file would write the same generation twice and
+        // the second commit would leave the region no newer than the first.
+        for commit in 0..2u32 {
+            writer.push(&Sample {
+                value: 2_000 + round * 10 + commit,
+            })?;
+            writer.flush()?;
+            let mid = newest_generation(&std::fs::read(&path)?);
+            assert!(
+                mid > generation,
+                "round {round} commit {commit} left generation {mid} behind \
+                 {generation}",
+            );
+            generation = mid;
+        }
+        drop(writer);
+    }
+
+    // And every record is still there, by the slow route that cannot be fooled.
+    let scanned = varve::VarveFile::open_readonly(on_spec(), &path)?;
+    let (lazy, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &path)?;
+    assert_eq!(source, varve::LazyOpenSource::HeaderTails);
+    assert_eq!(
+        lazy.block_tail_offset(Sample::ID),
+        scanned.block_tail_offset(Sample::ID),
+    );
+    Ok(())
+}
