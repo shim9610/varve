@@ -1165,3 +1165,143 @@ fn the_region_requires_a_commit_marker_to_name() {
         .validate()
         .expect("an explicit marker is still a marker");
 }
+
+/// A whole-generation replacement publishes a **cold** region.
+///
+/// `replace_block` moves every record after the replaced one by a uniform
+/// delta, so carrying the table forward would publish offsets that are each
+/// wrong by that delta — and wrong in the worst way, since they still frame a
+/// real record, just the wrong one. `header_extensions_for_replacement` resets
+/// the region for exactly that reason, and until a commit could warm the region
+/// there was nothing for the reset to do, so this could not be written.
+#[test]
+fn a_replacement_publishes_a_cold_region() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("replaced.varve");
+    write_samples(on_spec(), &path, 100)?;
+
+    let slot_len =
+        SLOT_HEADER_LEN + (declared_blocks() + RESERVED_ENTRIES) * ENTRY_LEN + SLOT_CRC_LEN;
+    let warm_slots = |bytes: &[u8]| -> usize {
+        let at = find_region(bytes).expect("the region is in the header");
+        (0..SLOTS)
+            .map(|slot| slot_fields(bytes, at + BLOCK_FRAMING_LEN + slot * slot_len, slot_len))
+            .filter(|fields| fields.checksum_matches && fields.count > 0)
+            .count()
+    };
+
+    // The premise: the file really carries a warm table before the replacement.
+    let before = std::fs::read(&path)?;
+    assert!(
+        warm_slots(&before) > 0,
+        "the fixture must be warm or this test proves nothing",
+    );
+
+    // Replace a Note with a longer one, so every later record moves.
+    //
+    // The index is the ordinal among `Note`'s records — `ReplacementTarget::resolve`
+    // resolves it per block type — not a position in the resident index.
+    let mut writer = varve::VarveWriter::open(on_spec(), &path)?;
+    writer.replace_block(
+        0,
+        &Note {
+            body: "a replacement long enough to move every record after it".into(),
+        },
+    )?;
+    drop(writer);
+
+    let after = std::fs::read(&path)?;
+    assert_eq!(
+        warm_slots(&after),
+        0,
+        "a published generation must carry a cold region: every offset the old \
+         table held moved by the replacement's delta",
+    );
+
+    // And the file is still readable, by the route the cold region forces.
+    let (file, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &path)?;
+    assert_eq!(source, varve::LazyOpenSource::FullScan);
+    let scanned = varve::VarveFile::open_readonly(on_spec(), &path)?;
+    for block in [Sample::ID, Note::ID] {
+        assert_eq!(
+            file.block_tail_offset(block),
+            scanned.block_tail_offset(block),
+        );
+    }
+    Ok(())
+}
+
+/// An explicit-marker format is allowed, and it works — which is not obvious.
+///
+/// `validate` permits `TransactionMarker(Explicit)` and one test asserts the
+/// declaration is valid, but nothing wrote a file with it. Under Explicit,
+/// `flush` does **not** write a commit marker and `commit()` does, while
+/// `close_commit_point` — and so the region write — runs on both. So a flush
+/// rewrites the slot for a commit point whose marker is older than the records
+/// just written, and the question is whether the reader then does something
+/// sensible.
+///
+/// It does, and for a reason worth stating: `commit_offset` comes from
+/// `block_tails.tail(COMMIT_BLOCK_ID)`, which is the newest marker in the file
+/// whatever the caller last called. So the slot is never internally
+/// inconsistent; a flush merely makes it describe a commit point the file has
+/// since grown past, and the forward walk catches exactly that.
+#[test]
+fn an_explicit_marker_format_resumes_from_the_header() -> varve::Result<()> {
+    let spec = on_spec().with_commit_policy(varve::CommitPolicy::TransactionMarker(
+        varve::TransactionMarkerMode::Explicit,
+    ));
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("explicit.varve");
+
+    let mut writer = spec.create(&path)?;
+    for value in 0..40 {
+        writer.push(&Sample { value })?;
+    }
+    writer.commit()?;
+    drop(writer);
+
+    // Committed and nothing after it: the table describes the file exactly.
+    let (file, source) = varve::VarveFile::open_readonly_lazy_with_report(spec, &path)?;
+    assert_eq!(source, varve::LazyOpenSource::HeaderTails);
+    let scanned = varve::VarveFile::open_readonly(spec, &path)?;
+    assert_eq!(
+        file.block_tail_offset(Sample::ID),
+        scanned.block_tail_offset(Sample::ID),
+    );
+    drop(file);
+    drop(scanned);
+
+    // Now append and *flush* without committing. `flush` writes no marker here,
+    // so the newest marker is the one before these records — and the forward
+    // walk no longer reaches the end of the file.
+    let mut writer = varve::VarveWriter::open(spec, &path)?;
+    for value in 40..60 {
+        writer.push(&Sample { value })?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    let (file, source) = varve::VarveFile::open_readonly_lazy_with_report(spec, &path)?;
+    assert_eq!(
+        source,
+        varve::LazyOpenSource::FullScan,
+        "records past the last marker must take the table out of use",
+    );
+    let scanned = varve::VarveFile::open_readonly(spec, &path)?;
+    assert_eq!(
+        file.block_tail_offset(Sample::ID),
+        scanned.block_tail_offset(Sample::ID),
+        "and the fallback answers what the file actually holds",
+    );
+
+    // Commit, and the table is current again.
+    drop(file);
+    drop(scanned);
+    let mut writer = varve::VarveWriter::open(spec, &path)?;
+    writer.commit()?;
+    drop(writer);
+    let (_, source) = varve::VarveFile::open_readonly_lazy_with_report(spec, &path)?;
+    assert_eq!(source, varve::LazyOpenSource::HeaderTails);
+    Ok(())
+}
