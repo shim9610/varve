@@ -5732,11 +5732,25 @@ impl VarveFile {
             captured_len,
         )?);
         let append_start = append_log_start(header_len, matrix.as_ref());
-        // The frame check inside this requires the digest's extent to end
-        // exactly at the file's length, so a file that reaches here has no
-        // uncommitted tail past the digest to truncate: the digest is written
-        // at a commit point and is the last record, or it is not found at all
-        // and this route has already failed into the scan.
+        // No `truncate_uncommitted_tail_if_needed`, and both routes earn that
+        // the same way — by requiring the thing they read to account for the
+        // file all the way to its last byte.
+        //
+        // The digest does it by position: `frame_open_digest` refuses a digest
+        // whose extent does not end exactly at the file's length, so a digest
+        // that was found is the last record and was written at a commit point.
+        //
+        // The header table cannot do it by position — it is at a fixed offset
+        // and is always "last" — so it does it by walking:
+        // `corroborate_header_tails` frames the commit marker the slot names
+        // and steps forward through at most a segment and a digest, and refuses
+        // unless that lands exactly on the file's length. A file with records
+        // past its last marker overshoots and this route fails into the scan,
+        // which is the open that does truncate.
+        //
+        // Either way a file that reaches the line below has no uncommitted tail
+        // to cut. `a_file_with_an_uncommitted_tail_is_truncated_by_the_scan`
+        // is what holds that for the header route.
         let digest = read_lazy_block_tails(
             spec,
             &mut file,

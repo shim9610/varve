@@ -537,12 +537,22 @@ the durability request that already ends a commit, so there is **no extra
 record; this one frames **4** — the commit marker plus one per distinct block id
 — and frames the same 4 on a file ten times larger.
 
-**What it requires.** `block_offset_chain`, which it turns on for you, and
-`integrity: crc32`. The checksum is not optional here for a reason the other
-options do not have: the region is overwritten *in place* at a constant length,
-so a torn write leaves a region that frames perfectly and names records that are
-not there. Each of the two slots carries its own checksum, and that is the only
-thing that separates the two.
+**What it requires.** `block_offset_chain`, which it turns on for you;
+`integrity: crc32` (or `crc32_with_header`); and a `transaction_marker` commit
+policy. The checksum is not optional here for a reason the other options do not
+have: the region is overwritten *in place* at a constant length, so a torn write
+leaves a region that frames perfectly and names records that are not there. Each
+of the two slots carries its own checksum, and that is the only thing that
+separates the two. The commit policy is required because a slot names a commit
+marker — with no marker there is nothing to name, and the region would stay cold
+for the life of the file while still costing its bytes.
+
+**What the handle can do.** It keeps no resident directory, which is the point —
+a resume must not cost memory proportional to the file. So `blocks::<T>()` and
+`mmap_payloads` refuse with `NoResidentDirectory`, and `record_map` is how you
+walk records. Keyed lookups work: `key_tail_offsets` rebuilds from the chains at
+a cost bounded by the keyed records rather than by the file, which is what makes
+a keyed resume on a 600,000-record file affordable.
 
 **What it refuses.** A format declaring matrix blocks (the matrix layout sits at
 a fixed offset after the header, which the region moves), and

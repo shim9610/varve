@@ -2037,3 +2037,76 @@ mod crc32_with_header {
         Ok(())
     }
 }
+
+/// A file that needs truncating gets it, because the header route declines it.
+///
+/// Both lazy writer routes skip `truncate_uncommitted_tail_if_needed`, and the
+/// skip is only safe because neither can adopt a file that has records past its
+/// last commit point. The digest earns that by position — it must end exactly
+/// at the file's length. The table cannot: it is at a fixed offset and is
+/// always "last", so it earns it by walking forward from the marker it names
+/// and requiring that walk to land exactly on the end of the file.
+///
+/// If it did not, this is what would go wrong: the writer would resume from the
+/// table, keep the uncommitted records, and append behind them — publishing a
+/// prefix the commit marker never covered. So the assertion is not merely that
+/// the route falls back; it is that the fallback open *cut the tail*.
+#[test]
+fn a_file_with_an_uncommitted_tail_is_truncated_by_the_scan() -> varve::Result<()> {
+    // Explicit markers: `flush` writes none, so records can reach the file
+    // without a commit point closing over them. This is the only way the tree
+    // can produce that state without a crash harness.
+    let spec = on_spec().with_commit_policy(varve::CommitPolicy::TransactionMarker(
+        varve::TransactionMarkerMode::Explicit,
+    ));
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("uncommitted-tail.varve");
+
+    let mut writer = spec.create(&path)?;
+    for value in 0..40 {
+        writer.push(&Sample { value })?;
+    }
+    writer.commit()?;
+    drop(writer);
+    let committed_len = std::fs::metadata(&path)?.len();
+
+    // Now records with no marker behind them.
+    let mut writer = varve::VarveWriter::open(spec, &path)?;
+    for value in 40..60 {
+        writer.push(&Sample { value })?;
+    }
+    writer.flush()?;
+    drop(writer);
+    let grown_len = std::fs::metadata(&path)?.len();
+    assert!(
+        grown_len > committed_len,
+        "the fixture must actually have an uncommitted tail",
+    );
+
+    // A lazy writer open must not take the table — and the open that answers
+    // instead is the one that truncates.
+    let (writer, source) = varve::VarveFile::open_lazy_with_report(spec, &path)?;
+    assert_eq!(
+        source,
+        varve::LazyOpenSource::FullScan,
+        "a file with records past its last marker must not resume from the table",
+    );
+    drop(writer);
+
+    assert_eq!(
+        std::fs::metadata(&path)?.len(),
+        committed_len,
+        "the fallback open left the uncommitted tail in place",
+    );
+
+    // And with the tail gone the table describes the file again, so the next
+    // open is fast: the fallback is a one-time cost, not a permanent demotion.
+    let (file, source) = varve::VarveFile::open_readonly_lazy_with_report(spec, &path)?;
+    assert_eq!(source, varve::LazyOpenSource::HeaderTails);
+    let scanned = varve::VarveFile::open_readonly(spec, &path)?;
+    assert_eq!(
+        file.block_tail_offset(Sample::ID),
+        scanned.block_tail_offset(Sample::ID),
+    );
+    Ok(())
+}

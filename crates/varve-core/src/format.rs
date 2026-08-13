@@ -1190,9 +1190,34 @@ pub struct IndexPolicy {
     /// with. That is what the option is for — a resume — and it is not a live
     /// view.
     ///
+    /// **The handle it opens keeps no resident directory.** That is the point —
+    /// the memory a resume costs must not grow with the file — but it is a
+    /// smaller handle than a scanning open's: `blocks::<T>()` and
+    /// `mmap_payloads` refuse with `NoResidentDirectory`, and `record_map` is
+    /// the way to walk records. Keyed lookups work: `key_tail_offsets` rebuilds
+    /// from the chains, at a cost bounded by the keyed records rather than by
+    /// the file.
+    ///
+    /// **What the two slots buy, precisely.** They alternate, and only one can
+    /// pass the walk — the other names an older marker by construction. The
+    /// exception is a commit point that appended nothing: both slots then name
+    /// the same marker and both are true of the file, so a torn write to one is
+    /// answered by the other, with `generation` breaking the tie. Outside that
+    /// case a torn slot means the scan.
+    ///
+    /// **With [`Self::segment_on_flush`]** the commit point appends a segment
+    /// after its marker, and the walk steps through it. That is the only
+    /// combination where the walk covers more than the marker itself.
+    ///
     /// Refused together with [`Self::open_digest_on_flush`]: they are two
     /// answers to the same question with different safety properties, and no
-    /// precedence rule between them is safe in both directions.
+    /// precedence rule between them is safe in both directions. Also refused
+    /// for a format declaring matrix blocks (the matrix region sits at a fixed
+    /// offset behind the header, which these bytes would move), without a
+    /// crc32 integrity policy (only a per-slot checksum separates a torn
+    /// in-place rewrite from a good one), and without a `transaction_marker`
+    /// commit policy (with no marker there is nothing for a slot to name, and
+    /// the region would stay cold for the life of the file).
     ///
     /// **Changes the bytes on disk.** The region lives in the header, so
     /// `append_log_start` and every record offset move, and the schema hash
