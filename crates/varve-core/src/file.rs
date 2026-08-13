@@ -12120,12 +12120,20 @@ impl VarveFile {
     fn close_commit_point(&mut self) {
         self.write_index_segment_if_needed();
         self.write_open_digest_if_needed();
-        // Last, and deliberately after both: the slot records the file as it is
-        // when the commit point is closed, and a reader corroborates it by
-        // walking forward from the commit marker to the end of the file. A
-        // segment or a digest appended after the slot would put the end of the
-        // file past where the slot expects it, and every later open would fall
-        // back.
+        // Last, and deliberately after both, so the slot's tails include the
+        // records this commit point itself appended.
+        //
+        // Not for the reader's sake: the slot names a commit *offset*, not a
+        // file length, so a reader corroborating it walks forward from the same
+        // marker either way and still lands on the end of the file — that is
+        // what the segment arm of the walk is for. What the order buys is the
+        // slot's own `SEGMENT` entry. Written first, it would name the previous
+        // commit point's segment, and corroboration cannot catch that: a stale
+        // segment offset still frames as a segment record. It is only wrong as
+        // a chain link, which is the same silent breakage a stale table causes
+        // anywhere else.
+        // `the_slot_names_the_segment_from_its_own_commit_point` in
+        // `header_tails_segment_combo.rs` is the assertion that holds this.
         self.write_header_tails_if_needed();
     }
 
