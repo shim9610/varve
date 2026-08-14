@@ -588,3 +588,289 @@ fn a_followed_run_that_repeats_a_sequence_is_refused() -> varve::Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Crossing a generation, which `follow` deliberately will not do.
+// ---------------------------------------------------------------------------
+
+/// `is_current` says what `follow`'s zero could not.
+///
+/// A handle bound to a replaced object answers `0` to every follow, forever,
+/// and that is indistinguishable from "the writer appended nothing". This is
+/// the question that separates them, and it must stay `&self` — a shared reader
+/// has to be able to ask it without anybody stopping.
+#[test]
+fn a_handle_can_tell_that_its_generation_was_replaced() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("current.varve");
+
+    let mut writer = spec().create(&path)?;
+    writer.push(&Label {
+        text: "original".into(),
+    })?;
+    for value in 0..10 {
+        writer.push(&Reading { value })?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    let reader = varve::VarveFile::open_readonly(spec(), &path)?;
+    assert!(reader.is_current()?, "nothing has replaced it yet");
+
+    // Appending does not replace anything, so the answer must not change: this
+    // asks about the object, not about the content.
+    let mut writer = varve::VarveWriter::open(spec(), &path)?;
+    for value in 10..20 {
+        writer.push(&Reading { value })?;
+    }
+    writer.flush()?;
+    assert!(
+        reader.is_current()?,
+        "an append is not a new generation, and this must not confuse the two",
+    );
+
+    // A republish is.
+    writer.replace_block(
+        0,
+        &Label {
+            text: "a replacement long enough to move every record after it".into(),
+        },
+    )?;
+    drop(writer);
+    assert!(
+        !reader.is_current()?,
+        "the pathname resolves to a different object now",
+    );
+    // And the writer that published it is on the new generation itself.
+    let published = varve::VarveFile::open_readonly(spec(), &path)?;
+    assert!(published.is_current()?);
+    Ok(())
+}
+
+/// A pathname that no longer exists is not this handle's.
+///
+/// The handle stays perfectly readable — the object is pinned by the descriptor
+/// — so this is exactly the case where "still works" and "still current" come
+/// apart.
+#[test]
+fn a_removed_pathname_is_not_current_and_the_handle_still_reads() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("removed.varve");
+
+    let mut writer = spec().create(&path)?;
+    for value in 0..10 {
+        writer.push(&Reading { value })?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    let reader = varve::VarveFile::open_readonly(spec(), &path)?;
+    let held = records(&reader)?;
+    std::fs::remove_file(&path)?;
+
+    assert!(!reader.is_current()?);
+    assert_eq!(
+        records(&reader)?,
+        held,
+        "the descriptor pins the object, so the handle is unharmed",
+    );
+    Ok(())
+}
+
+/// `reopen_readonly` moves to the current generation, and takes `&self`.
+///
+/// The `&self` is the point rather than a detail: a handle shared as
+/// `Arc<VarveFile>` cannot be advanced in place, so the owner produces a
+/// replacement and stores it while every reader keeps reading. This asserts
+/// both handles are usable at once and that they disagree, which is what makes
+/// the swap meaningful.
+#[test]
+fn reopen_moves_to_the_current_generation_without_disturbing_the_old() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("reopen.varve");
+
+    let mut writer = spec().create(&path)?;
+    writer.push(&Label {
+        text: "original".into(),
+    })?;
+    for value in 0..10 {
+        writer.push(&Reading { value })?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    let old = varve::VarveFile::open_readonly(spec(), &path)?;
+    let old_tail = old.block_tail_offset(Reading::ID).expect("a Reading");
+
+    let mut writer = varve::VarveWriter::open(spec(), &path)?;
+    writer.replace_block(
+        0,
+        &Label {
+            text: "a replacement long enough to move every record after it".into(),
+        },
+    )?;
+    drop(writer);
+
+    // `&self`, so this is what a shared reader can do — pinned by signature in
+    // `detecting_and_reopening_a_generation_take_a_shared_borrow`.
+    let new = old.reopen_readonly()?;
+    assert!(new.is_current()?);
+    assert!(!old.is_current()?);
+    assert_ne!(
+        new.block_tail_offset(Reading::ID),
+        Some(old_tail),
+        "the generations must actually differ",
+    );
+
+    // Both alive and both correct, each about its own generation.
+    assert_eq!(old.block_tail_offset(Reading::ID), Some(old_tail));
+    let old_label: Label = old.read_block_at(old.block_tail_offset(Label::ID).unwrap())?;
+    assert_eq!(old_label.text, "original");
+    let new_label: Label = new.read_block_at(new.block_tail_offset(Label::ID).unwrap())?;
+    assert!(new_label.text.starts_with("a replacement"));
+
+    let fresh = varve::VarveFile::open_readonly(spec(), &path)?;
+    assert_eq!(
+        new.block_tail_offset(Reading::ID),
+        fresh.block_tail_offset(Reading::ID),
+    );
+    Ok(())
+}
+
+/// A reopen keeps the route the handle was using.
+///
+/// A directoryless handle must not come back with a resident directory: the
+/// whole reason it has none is that the file is too large to hold one, and a
+/// reopen that quietly retained one would allocate `N` slots on a caller that
+/// had asked for exactly the opposite.
+#[test]
+fn a_reopen_keeps_the_route_the_handle_was_using() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("route.varve");
+
+    let mut writer = spec().create(&path)?;
+    for value in 0..20 {
+        writer.push(&Reading { value })?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    let retained = varve::VarveFile::open_readonly(spec(), &path)?;
+    assert!(retained.blocks::<Reading>().is_ok());
+    assert!(retained.reopen_readonly()?.blocks::<Reading>().is_ok());
+
+    let mut scratch = Vec::new();
+    let bare = varve::VarveFile::open_readonly_without_directory(spec(), &path, &mut scratch)?;
+    assert!(matches!(
+        bare.reopen_readonly()?.blocks::<Reading>(),
+        Err(varve::Error::NoResidentDirectory { .. })
+    ));
+    Ok(())
+}
+
+/// The reader wrapper carries both, and `reopen` there is `&self` too.
+#[test]
+fn the_reader_wrapper_exposes_the_pair() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("wrapper.varve");
+
+    let mut writer = spec().create(&path)?;
+    for value in 0..10 {
+        writer.push(&Reading { value })?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    let reader = varve::VarveReader::open(spec(), &path)?;
+    assert!(reader.is_current()?);
+    let again = reader.reopen()?;
+    assert!(again.is_current()?);
+    assert_eq!(
+        again.blocks::<Reading>()?.len(),
+        reader.blocks::<Reading>()?.len()
+    );
+    Ok(())
+}
+
+/// The read policy, held by the compiler rather than by a comment.
+///
+/// The standing requirement is that no read entry point needs `&mut self` —
+/// one handle serves concurrent readers through `&self`. `follow` is the one
+/// operation that is not a read and takes `&mut self` accordingly, so the pair
+/// added beside it had to stay `&self` or the whole point of `reopen` (produce
+/// a replacement *without* anybody stopping) would be gone.
+///
+/// This is written as a shared borrow held across both calls: if either method
+/// took `&mut self`, this would not compile.
+#[test]
+fn detecting_and_reopening_a_generation_take_a_shared_borrow() -> varve::Result<()> {
+    fn through_a_shared_reference(file: &varve::VarveFile) -> varve::Result<varve::VarveFile> {
+        assert!(file.is_current()?);
+        // Reads stay available on the same shared borrow, which is the property
+        // the policy is about.
+        let _ = file.block_tail_offset(Reading::ID);
+        file.reopen_readonly()
+    }
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("shared.varve");
+    let mut writer = spec().create(&path)?;
+    for value in 0..10 {
+        writer.push(&Reading { value })?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    let reader = varve::VarveFile::open_readonly(spec(), &path)?;
+    let borrowed = &reader;
+    let replacement = through_a_shared_reference(borrowed)?;
+    // The original is still borrowable and still readable afterwards.
+    assert_eq!(
+        borrowed.block_tail_offset(Reading::ID),
+        replacement.block_tail_offset(Reading::ID),
+    );
+    Ok(())
+}
+
+/// A handle across threads, which is what the `&self` policy exists for.
+///
+/// Not a stress test — a demonstration that the pair is usable in the shape the
+/// design assumes: readers hold an `Arc` and read concurrently, and the owner
+/// produces the next generation through the same shared handle.
+#[test]
+fn readers_share_a_handle_while_the_next_generation_is_produced() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("threads.varve");
+    let mut writer = spec().create(&path)?;
+    for value in 0..50 {
+        writer.push(&Reading { value })?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    let shared = std::sync::Arc::new(varve::VarveFile::open_readonly(spec(), &path)?);
+    let expected = shared.block_tail_offset(Reading::ID);
+
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let handle = std::sync::Arc::clone(&shared);
+            std::thread::spawn(move || -> varve::Result<()> {
+                for _ in 0..25 {
+                    assert_eq!(handle.block_tail_offset(Reading::ID), expected);
+                    assert!(handle.is_current()?);
+                }
+                Ok(())
+            })
+        })
+        .collect();
+
+    // The owner produces the replacement through the same shared handle, with
+    // every reader still running against it.
+    let next = shared.reopen_readonly()?;
+    assert_eq!(next.block_tail_offset(Reading::ID), expected);
+
+    for reader in readers {
+        reader.join().expect("no reader panicked")?;
+    }
+    Ok(())
+}

@@ -1079,8 +1079,11 @@ Within that:
 another handle is writing. It is not.
 
 **Workaround.** `follow()` advances a resident reader at a cost proportional to
-what was appended rather than to the file; reopen when the pathname has been
-republished, which `follow` deliberately does not cross. For a matrix there is no
+what was appended rather than to the file. It does not cross a generation, so
+when the pathname has been republished the pair to use is `is_current()` — which
+compares the OS object identity and costs one `open` — followed by
+`reopen_readonly()`. Both take `&self`, so a handle shared behind an `Arc` can
+be asked and replaced without any reader stopping. For a matrix there is no
 "advance": a reopen gives a fresh handle whose pages will again be as of whenever
 each one is first touched, so a reader that needs one instant across a whole map
 must coordinate that with the writer itself.

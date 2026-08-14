@@ -38,6 +38,36 @@ already extend its snapshot.
 `VarveReader::follow` is the only `&mut self` method on that type. Every read
 still takes `&self`.
 
+### `is_current()` and `reopen_readonly()` — moving to a republished generation
+
+`follow()` deliberately does not cross a generation, which leaves a handle bound
+to a replaced object answering `0` forever with no way to say why. These are the
+two halves that close that, and **both take `&self`**.
+
+`is_current` compares the operating system's object identity — device and inode
+on Unix, volume and file index on Windows — against what the pathname resolves
+to now. One `open` and two metadata calls; nothing is read and nothing is
+framed. It is `false` for a removed pathname too, which is exactly the case
+where "still works" and "still current" come apart: the descriptor pins the
+object, so the handle keeps reading perfectly. Identity reuse cannot fool it,
+because a live descriptor is what stops the object from being freed and its
+identity handed to something else.
+
+`reopen_readonly` returns a fresh handle on the current generation, by the route
+this handle was using — a directoryless handle reopens directoryless, through
+the lazy route, so a format carrying `index: header_tails` reopens at a cost
+that does not grow with the file. `VarveReader::reopen` is the same on that
+type.
+
+`&self` on both is the design rather than a detail. A handle shared as
+`Arc<VarveFile>` cannot be mutated, so moving those readers forward means
+*replacing* the handle: the owner reopens and stores the new `Arc` while every
+reader keeps reading, and the superseded object is released when the last reader
+drops it. The alternative — interior mutability so a `refresh(&self)` could swap
+a shared handle in place — is deliberately not offered, because it would put an
+atomic load on every read, forever, in every format including the ones that
+never republish anything.
+
 ### `index: header_tails` — a commit boundary a later append cannot hide
 
 **New capability, opt-in, and off by default.** The open digest already writes

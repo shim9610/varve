@@ -4073,6 +4073,22 @@ impl VarveReader {
         self.file.follow()
     }
 
+    /// See [`VarveFile::is_current`].
+    pub fn is_current(&self) -> Result<bool> {
+        self.file.is_current()
+    }
+
+    /// A fresh reader on whatever the pathname resolves to now. See
+    /// [`VarveFile::reopen_readonly`].
+    ///
+    /// `&self`, so a reader shared behind an `Arc` can produce the replacement
+    /// its owner stores without any reader having to stop.
+    pub fn reopen(&self) -> Result<Self> {
+        Ok(Self {
+            file: self.file.reopen_readonly()?,
+        })
+    }
+
     /// See [`VarveFile::open_readonly_with_scratch`].
     pub fn open_with_scratch<P: AsRef<Path>>(
         spec: FormatSpec,
@@ -7599,6 +7615,79 @@ impl VarveFile {
         DirectoryRead {
             file: self,
             directory,
+        }
+    }
+
+    /// Whether the pathname still resolves to the object this handle opened.
+    ///
+    /// A handle is bound to an *object*, not to a name. The replacement paths
+    /// publish by renaming a new file over the pathname, and on a system where
+    /// that leaves an open descriptor reading the old object — which is what
+    /// makes a republish safe for readers in flight — a handle goes on serving
+    /// a complete, self-consistent generation with nothing to announce that a
+    /// newer one exists. [`follow`](Self::follow) answers `0` forever there by
+    /// design. This is how a caller learns why.
+    ///
+    /// `false` also for a pathname that no longer exists: the handle is still
+    /// readable, but nothing at that name is it.
+    ///
+    /// # Why the comparison is sound
+    ///
+    /// It compares the operating system's object identity — device and inode on
+    /// Unix, volume and file index on Windows — and those are reused once the
+    /// object they named is gone. That cannot fool this check, because *this
+    /// handle holds the object open*: a live descriptor pins it, so its
+    /// identity cannot be handed to a different file while there is anything
+    /// here to compare against.
+    ///
+    /// # Cost
+    ///
+    /// One `open` and two metadata calls. Nothing is read and nothing is
+    /// framed, so this is cheap enough to ask before each round of a polling
+    /// loop — but it *is* a syscall, so it is a question the caller asks rather
+    /// than one every read answers.
+    pub fn is_current(&self) -> Result<bool> {
+        let mine = self.file.object_identity()?;
+        match File::open(&self.path) {
+            Ok(file) => Ok(opened_file_identity(&file)? == mine),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// A fresh read-only handle on whatever the pathname resolves to now.
+    ///
+    /// The other half of [`is_current`](Self::is_current), and the reason both
+    /// take `&self`: a handle shared as `Arc<VarveFile>` across readers cannot
+    /// be mutated, so moving those readers to a newer generation means
+    /// *replacing* the handle rather than advancing it. The owner reopens and
+    /// stores the new `Arc`; readers in flight finish on the old one, and the
+    /// old object is released when the last of them drops it. That is refcount
+    /// semantics doing exactly what the disk needs — the superseded generation
+    /// stays alive precisely as long as somebody is reading it.
+    ///
+    /// The alternative would be interior mutability so that `refresh(&self)`
+    /// could swap a shared handle's state in place. That is deliberately not
+    /// offered: it would put an atomic load on every read, forever, in every
+    /// format — including the ones that never republish anything.
+    ///
+    /// # Which route it takes
+    ///
+    /// The one this handle is using. A handle that retains a record directory
+    /// reopens with one; a handle that keeps none reopens without one, through
+    /// the lazy route, so a format carrying `index: header_tails` or an open
+    /// digest reopens at a cost that does not grow with the file.
+    ///
+    /// # Always read-only
+    ///
+    /// Including from a read-write handle, which is why the name says so. A
+    /// second writer is refused by the object lock this one holds, and a read
+    /// view of the published generation is the useful thing to hand back.
+    pub fn reopen_readonly(&self) -> Result<Self> {
+        if self.index.is_retained() {
+            Self::open_readonly(self.spec, &self.path)
+        } else {
+            Ok(Self::open_readonly_lazy_with_report(self.spec, &self.path)?.0)
         }
     }
 
