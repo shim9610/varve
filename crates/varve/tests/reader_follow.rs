@@ -874,3 +874,120 @@ fn readers_share_a_handle_while_the_next_generation_is_produced() -> varve::Resu
     }
     Ok(())
 }
+
+/// A handle that never follows is never told, and that is deliberate.
+///
+/// The `follow() == 0` idiom serves a reader that is looping. A reader that
+/// opened and reads on demand — a viewer, a lookup service, anything with no
+/// stream to follow — has no such moment, and no mechanism varve has reaches
+/// it: a marker appended to the old object is outside its snapshot, and the
+/// file header is read at open and never again. It goes on serving the
+/// generation it opened, silently and correctly.
+///
+/// This pins that silence as a property rather than an accident. If a read ever
+/// starts refusing on a superseded handle, it will be because someone put a
+/// syscall on the read path, and this is where that shows up.
+#[test]
+fn a_handle_that_never_follows_reads_on_without_being_told() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("viewer.varve");
+
+    let mut writer = spec().create(&path)?;
+    writer.push(&Label {
+        text: "original".into(),
+    })?;
+    for value in 0..20 {
+        writer.push(&Reading { value })?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    // A viewer: opens once, holds the handle, never follows anything.
+    let viewer = varve::VarveFile::open_readonly(spec(), &path)?;
+    let held = records(&viewer)?;
+    let held_tail = viewer.block_tail_offset(Reading::ID).expect("a Reading");
+    let held_value: Reading = viewer.read_block_at(held_tail)?;
+
+    let mut writer = varve::VarveWriter::open(spec(), &path)?;
+    writer.replace_block(
+        0,
+        &Label {
+            text: "a replacement long enough to move every record after it".into(),
+        },
+    )?;
+    drop(writer);
+
+    // Every read still succeeds, and every one of them is about the old
+    // generation. No error, no warning, nothing in the values themselves.
+    assert_eq!(records(&viewer)?, held);
+    assert_eq!(viewer.block_tail_offset(Reading::ID), Some(held_tail));
+    assert_eq!(viewer.read_block_at::<Reading>(held_tail)?, held_value);
+    let label: Label = viewer.read_block_at(viewer.block_tail_offset(Label::ID).unwrap())?;
+    assert_eq!(label.text, "original");
+    assert!(!viewer.blocks::<Reading>()?.is_empty());
+
+    // The one thing that says so, and only because it was asked.
+    assert!(!viewer.is_current()?);
+
+    // And a fresh open of the same path disagrees with all of it, which is what
+    // "stale" means here: whole and self-consistent, just not the current file.
+    let fresh = varve::VarveFile::open_readonly(spec(), &path)?;
+    assert_ne!(
+        fresh.block_tail_offset(Reading::ID),
+        viewer.block_tail_offset(Reading::ID),
+    );
+    let fresh_label: Label = fresh.read_block_at(fresh.block_tail_offset(Label::ID).unwrap())?;
+    assert!(fresh_label.text.starts_with("a replacement"));
+    Ok(())
+}
+
+/// The superseded object stays on disk while a handle holds it.
+///
+/// An unlinked file is freed when its last descriptor closes, so a compaction
+/// that halves a file frees nothing until the readers of the old one let go.
+/// That is the second cost of a forgotten handle, next to staleness, and it is
+/// the one that does not announce itself at all.
+#[test]
+fn a_held_generation_keeps_its_bytes_until_the_handle_drops() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("bytes.varve");
+
+    let mut writer = spec().create(&path)?;
+    writer.push(&Label {
+        text: "x".repeat(4_000),
+    })?;
+    for value in 0..200 {
+        writer.push(&Reading { value })?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    let occupied = |dir: &std::path::Path| -> std::io::Result<u64> {
+        let mut total = 0;
+        for entry in std::fs::read_dir(dir)? {
+            total += entry?.metadata()?.len();
+        }
+        Ok(total)
+    };
+
+    let viewer = varve::VarveFile::open_readonly(spec(), &path)?;
+    let before = occupied(directory.path())?;
+
+    // Republish with a much smaller record, so the new generation is smaller.
+    let mut writer = varve::VarveWriter::open(spec(), &path)?;
+    writer.replace_block(0, &Label { text: "x".into() })?;
+    drop(writer);
+
+    let named = occupied(directory.path())?;
+    assert!(
+        named < before,
+        "the visible file did shrink: {before} -> {named}",
+    );
+    // The old object is unlinked but alive, so the handle still reads all of
+    // it — the bytes are gone from the directory listing, not from the disk.
+    assert!(viewer.blocks::<Reading>()?.len() >= 200);
+    let held: Label = viewer.read_block_at(viewer.block_tail_offset(Label::ID).unwrap())?;
+    assert_eq!(held.text.len(), 4_000);
+    drop(viewer);
+    Ok(())
+}

@@ -1091,6 +1091,63 @@ must coordinate that with the writer itself.
 **Planned.** No live-view mode is planned. `follow()` is an explicit advance,
 not a live view: between two calls the handle is still a fixed snapshot.
 
+### 4.2b Nothing tells a reader that its generation was replaced
+
+`follow()` advances a handle along the object it opened. The replacement paths
+(`replace_block`, `replace_rewrite`, and any future compaction) publish by
+writing a new file and renaming it over the pathname, and a handle that was open
+across that keeps reading the old object — which is what makes a republish safe
+for readers in flight, and is measured: a handle holding 21 records read them all
+back, unchanged and without error, after the pathname had been replaced.
+
+**There is no notification, and there is no design that would give one for
+free.** A handle learns its generation was replaced only by asking, and the
+question costs a syscall. Two mechanisms that look like they would avoid it do
+not:
+
+- **A marker record appended to the old object before the rename.** Only a
+  handle that is following the tail can see it, because a handle's snapshot
+  length is fixed and a record past that length is outside it. A handle that
+  never calls `follow()` never sees the marker.
+- **A flag or magic word in the file header.** The header is read at open and at
+  no other time — five call sites, all of them opens — so a live handle never
+  reads it again. It would inform only a *new* open, which already resolves the
+  pathname to the current generation anyway.
+
+Both cover exactly the handles that are already in a polling loop, and neither
+covers the rest. What each shape of reader actually needs:
+
+| Reader | Calls `follow()` | How it learns |
+| --- | --- | --- |
+| Streaming loop | yes | `follow()` returning `0` means *either* "nothing appended" or "this generation is finished"; `is_current()` separates them, on a path that is idle by definition |
+| Opens, reads, closes | no | **Not affected.** Every open resolves the pathname to the current generation |
+| Long-lived, read-only, no loop | no | **Nothing informs it.** The application decides when freshness matters and calls `is_current()` — a timer, a user action, a filesystem watch |
+| Shared `Arc<VarveFile>` | owner only | The owner polls and swaps in `reopen_readonly()`; readers hold `&self` throughout |
+
+**Why varve does not check on every read.** It could, and the check is one
+`open` plus two metadata calls — per read, on a path whose cost is the reason
+positional reads exist. That collides with the standing requirement that reads
+stay cheap and take `&self`, and it would charge every format for a capability
+most of them never use. The check is offered, not imposed.
+
+**What staleness costs.** Two things, and neither is corruption. The data is old
+but whole: the superseded generation is complete and self-consistent, and every
+offset the handle holds still means what it meant. And the object stays on disk
+— an unlinked file is freed when the last descriptor closes, so a forgotten
+read-only handle holds a whole generation's bytes for as long as it lives. A
+compaction that halves a file frees nothing until the readers of the old one let
+go.
+
+**Who it affects.** Any long-lived reader that must not serve stale results, and
+any deployment where a compaction's disk saving is expected promptly.
+
+**Workaround.** `is_current()` before the reads that matter, and
+`reopen_readonly()` when it answers `false`. Drop handles that are no longer
+being read, rather than keeping them for a possible later question.
+
+**Planned.** No push notification is planned, for the reason above: every
+candidate mechanism reaches only readers that are already asking.
+
 ### 4.3 Writer-lock edge cases
 
 - `WriterLock::drop` discards the error from `clear_writer_lock_info` because

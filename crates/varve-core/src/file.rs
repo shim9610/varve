@@ -7631,6 +7631,13 @@ impl VarveFile {
     /// `false` also for a pathname that no longer exists: the handle is still
     /// readable, but nothing at that name is it.
     ///
+    /// **This is a question, not a subscription.** Varve does not check on
+    /// every read — the check is a syscall and reads are the path that must
+    /// stay cheap and take `&self` — so a handle that never asks is never told.
+    /// A reader that loops has a natural place to ask (see
+    /// [`follow`](Self::follow)); one that does not loop has to decide for
+    /// itself when freshness matters.
+    ///
     /// # Why the comparison is sound
     ///
     /// It compares the operating system's object identity — device and inode on
@@ -7706,7 +7713,28 @@ impl VarveFile {
     /// `O(appended)` per call rather than `O(records)`, and charges only those
     /// bytes against [`ReadLimits::max_scan_bytes`](crate::ReadLimits).
     ///
-    /// Returns the bytes gained, `0` when there is nothing new to adopt.
+    /// Returns the bytes gained.
+    ///
+    /// # `0` means two different things
+    ///
+    /// Either nothing was appended, or this handle's generation is finished —
+    /// the pathname was republished and the object this handle holds will never
+    /// grow again, so every later call answers `0` too.
+    /// [`is_current`](Self::is_current) is what separates them, and a streaming
+    /// reader asks it exactly here, on a path that is idle by definition:
+    ///
+    /// ```text
+    /// if reader.follow()? == 0 {
+    ///     if !reader.is_current()? { reader = reader.reopen_readonly()?; }
+    ///     wait();
+    /// }
+    /// ```
+    ///
+    /// **That idiom serves a reader that is looping, and only that reader.** A
+    /// handle that never calls this — one that opened, and reads on demand
+    /// without following anything — is never informed of a republish by any
+    /// mechanism varve has, because a handle learns it only by asking. See
+    /// `known-limitations.md` §4.2b for what each shape of reader needs.
     ///
     /// # Uncommitted records are still not visible
     ///
