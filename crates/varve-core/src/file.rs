@@ -4794,6 +4794,21 @@ impl VarveWriter {
 
     /// Publishes a replacement by rewriting the complete file generation.
     ///
+    /// # Not for a format that writes a record footer
+    ///
+    /// Refused with `InvalidFormatSpec("replace is not supported for
+    /// record-footer formats")`, which is every format declaring an offset
+    /// chain, `segment_on_flush`, or any commit policy other than
+    /// [`CommitPolicy::None`]. Use [`replace_block`](Self::replace_block)
+    /// there: it does the same whole-file republish and does maintain the
+    /// footer, translating both chain offsets and checking each predecessor
+    /// against the prefix it has already written.
+    ///
+    /// The refusal is a statement about *this* routine rather than about the
+    /// operation. Its record writer emits header and payload and stops — no
+    /// footer, and both chain fields cleared — so a file it produced for such a
+    /// format would frame perfectly and carry no chain at all.
+    ///
     /// [`Error::PublishedButRebindFailed`] means publication already succeeded.
     /// Do not retry blindly; discard this poisoned writer and reopen the path.
     ///
@@ -7087,6 +7102,21 @@ impl VarveFile {
     }
 
     /// Publishes a replacement by rewriting the complete file generation.
+    ///
+    /// # Not for a format that writes a record footer
+    ///
+    /// Refused with `InvalidFormatSpec("replace is not supported for
+    /// record-footer formats")`, which is every format declaring an offset
+    /// chain, `segment_on_flush`, or any commit policy other than
+    /// [`CommitPolicy::None`]. Use [`replace_block`](Self::replace_block)
+    /// there: it does the same whole-file republish and does maintain the
+    /// footer, translating both chain offsets and checking each predecessor
+    /// against the prefix it has already written.
+    ///
+    /// The refusal is a statement about *this* routine rather than about the
+    /// operation. Its record writer emits header and payload and stops — no
+    /// footer, and both chain fields cleared — so a file it produced for such a
+    /// format would frame perfectly and carry no chain at all.
     ///
     /// [`Error::PublishedButRebindFailed`] means publication already succeeded.
     /// Do not retry blindly; discard this poisoned writer and reopen the path.
