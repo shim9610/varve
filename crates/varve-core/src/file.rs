@@ -4064,6 +4064,15 @@ impl VarveReader {
         })
     }
 
+    /// See [`VarveFile::follow`].
+    ///
+    /// The one `&mut self` method on this type, and deliberately so: every read
+    /// takes `&self` and stays available to concurrent callers, and advancing
+    /// the handle to a later state is the one operation that is not a read.
+    pub fn follow(&mut self) -> Result<u64> {
+        self.file.follow()
+    }
+
     /// See [`VarveFile::open_readonly_with_scratch`].
     pub fn open_with_scratch<P: AsRef<Path>>(
         spec: FormatSpec,
@@ -7591,6 +7600,128 @@ impl VarveFile {
             file: self,
             directory,
         }
+    }
+
+    /// Extends this handle to records appended since it opened.
+    ///
+    /// A handle fixes its snapshot length when it opens, and every read is
+    /// positional against that length. That is what lets one handle serve
+    /// concurrent readers through `&self` while a writer appends: a reader can
+    /// never observe a record the writer has not finished. The cost is that it
+    /// never observes one the writer *has* finished either — measured on a
+    /// five-record file grown to fifteen, the open handle went on reporting 6
+    /// records while a fresh open of the same path reported 17.
+    ///
+    /// This is how a handle catches up without reopening. It frames only the
+    /// bytes past the end it already holds, so following a growing file costs
+    /// `O(appended)` per call rather than `O(records)`, and charges only those
+    /// bytes against [`ReadLimits::max_scan_bytes`](crate::ReadLimits).
+    ///
+    /// Returns the bytes gained, `0` when there is nothing new to adopt.
+    ///
+    /// # Uncommitted records are still not visible
+    ///
+    /// Under a `transaction_marker` policy a record becomes visible when a
+    /// marker covers it, exactly as at open — the same `committed_prefix_len`
+    /// boundary decides both. A file whose tail is appended but not yet
+    /// committed answers `0`, and the same call answers the whole run once the
+    /// marker lands.
+    ///
+    /// # What it deliberately does not do
+    ///
+    /// **It does not cross a generation.** The replacement paths publish by
+    /// renaming a new file over the pathname, and this follows the *object*
+    /// this handle opened, not the name. That object's length never changes
+    /// again, so following a replaced handle answers `0` forever. That is the
+    /// honest answer rather than a failure: the handle is still a complete,
+    /// self-consistent view of the generation it opened, and reopening the path
+    /// is how you move to the newer one.
+    ///
+    /// **It follows the append log only.** A matrix file's cell region sits
+    /// ahead of the log at a fixed offset and is written in place, so it was
+    /// never bounded by the snapshot and is not what this extends.
+    ///
+    /// **A read-write handle gains nothing and answers `0`.** varve admits one
+    /// writer per object, and that writer's own appends already extend its
+    /// snapshot, so its end is the object's end by construction.
+    pub fn follow(&mut self) -> Result<u64> {
+        let _permit = self.ensure_not_poisoned()?;
+        if self.mode == OpenMode::ReadWrite {
+            return Ok(0);
+        }
+        let from = self.snapshot.len();
+        // The object, not the pathname. A rename may have put a different file
+        // at the path, and framing *that* file's bytes at this handle's offsets
+        // is the one thing this must never do.
+        let mut file = self.snapshot.try_clone_file()?;
+        if file.metadata()?.len() <= from {
+            return Ok(0);
+        }
+        let mut framed = Vec::new();
+        let scanned = scan_records_range(
+            self.spec,
+            &mut file,
+            from,
+            // Nothing for the prefix: the bytes before `from` were charged to
+            // the open that framed them.
+            0,
+            ScanIntent::ReadOnly,
+            &mut framed,
+        )?;
+        let logical_len = scanned.physical_end(from);
+        if logical_len <= from {
+            // Bytes arrived, but no commit boundary covers them yet.
+            return Ok(0);
+        }
+        // Sequences are file-global and strictly increasing, and the scan's own
+        // uniqueness check only sees the run it framed. The run begins after
+        // everything this handle already holds, so its lowest sequence must
+        // too. This is the check that the run really is this object's
+        // continuation rather than bytes that came from somewhere else.
+        if let (SequenceState::Available(next), Some(lowest)) = (
+            self.sequence_state,
+            framed.iter().map(|entry| entry.sequence).min(),
+        ) && lowest < next
+        {
+            return Err(Error::InvalidCanonicalEncoding(
+                "followed records repeat a sequence this handle already holds",
+            ));
+        }
+        let snapshot = self.snapshot.with_len(logical_len)?;
+        if self.index.is_retained() {
+            for entry in &framed {
+                let length = self.index.len();
+                let slot = self
+                    .index
+                    .reserve(|| index_bytes_for_count(length.saturating_add(1)))?;
+                self.index.install(slot, entry);
+                let position = self.index.len() - 1;
+                self.checkpoint_cadence
+                    .note_appended(position, entry.block_id);
+                self.segment_cursor.note_appended(
+                    position,
+                    entry.block_id,
+                    entry.checked_physical_end()?,
+                );
+            }
+        }
+        self.snapshot = snapshot;
+        // The entries just installed describe records past the end the old
+        // snapshot allowed, and a read beyond a snapshot's logical length is
+        // refused rather than served.
+        self.index.rebind(self.snapshot.clone());
+        // Merged, not replaced: a block with no record in this range keeps the
+        // tail it already had.
+        for (block_id, record_offset) in scanned.newest_pairs() {
+            self.block_tails.note_appended(block_id, record_offset);
+        }
+        self.sequence_state = scanned.sequence_state();
+        if let Some(entry) = framed.last() {
+            self.last_resident_block_id = Some(entry.block_id);
+        }
+        // A record just adopted may be the newest of its key.
+        self.keyed_tails.invalidate_all();
+        Ok(logical_len - from)
     }
 
     /// A [`RecordMap`] over the caller's buffer: an index built one record at a
@@ -16563,6 +16694,17 @@ impl ScannedIndex {
         BlockTails::from_newest(&self.newest)
     }
 
+    /// The same tails, for a caller holding a `BlockTails` to merge them into
+    /// rather than one to replace.
+    ///
+    /// [`VarveFile::follow`] is that caller: it frames a *range*, so a block
+    /// with no record in the range has no entry here and must keep the tail it
+    /// already had. Replacing wholesale would report every such block as having
+    /// no records at all.
+    fn newest_pairs(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+        self.newest.iter().map(|(id, offset)| (*id, *offset))
+    }
+
     fn sequence_state(&self) -> SequenceState {
         match self.sequence_high_water {
             None => SequenceState::Available(0),
@@ -16626,7 +16768,7 @@ fn load_index(
     // commit-boundary truncation; a truncated prefix of a duplicate-free list
     // is still duplicate-free, so revalidating here would only repeat the
     // N-element copy+sort on every open (PERF2-07).
-    scan_records_from(spec, file, header_len, intent, out)
+    scan_records_range(spec, file, header_len, header_len, intent, out)
 }
 
 /// Rebuilds the resident index from the internal segment chain, or reports
@@ -17688,13 +17830,29 @@ fn record_headers_match(left: &RecordIndexEntry, right: &RecordIndexEntry) -> bo
         && left.committed == right.committed
 }
 
-fn scan_records_from(
+/// Frames records from `from` to the end of the file.
+///
+/// `from` is normally the start of the append log, which is also the byte count
+/// this charges against `ScanBytes` before framing anything — an open walks the
+/// header to reach the log and the ceiling counts those bytes.
+///
+/// [`VarveFile::follow`] passes the end of the range it has already framed
+/// instead, and charges nothing for the prefix: the bytes before `from` were
+/// charged by the open that framed them, and charging them again would make a
+/// handle that follows a growing file refuse against a ceiling it never
+/// approached. `from` doubles as the initial commit boundary, which is the
+/// other half of resuming: a read-only handle's snapshot ends at a commit
+/// point, so the tail past it stands or falls on a marker of its own exactly
+/// as it would in a scan of the whole file.
+fn scan_records_range(
     spec: FormatSpec,
     file: &mut File,
-    header_len: u64,
+    from: u64,
+    prefix_charge: u64,
     intent: ScanIntent,
     entries: &mut Vec<RecordIndexEntry>,
 ) -> Result<ScannedIndex> {
+    let header_len = from;
     let file_len = file.metadata()?.len();
     let mut offset = header_len;
     entries.clear();
@@ -17708,7 +17866,7 @@ fn scan_records_from(
     };
     let mut latest_commit_end = None;
     let mut accounting = ScanAccounting::default();
-    accounting.advance(spec, header_len)?;
+    accounting.advance(spec, prefix_charge)?;
     while offset < file_len {
         let partial_boundary = match spec.commit_policy {
             CommitPolicy::None

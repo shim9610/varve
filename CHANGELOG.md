@@ -6,6 +6,38 @@ increment the minor version.
 
 ## Unreleased
 
+### `follow()` — a reader that advances without reopening
+
+A handle fixes its snapshot length when it opens and reads positionally against
+it. That is what lets one handle serve concurrent readers through `&self` while
+a writer appends — a reader can never observe a record the writer has not
+finished — but it also meant the handle never observed a finished one either.
+Measured on a five-record file grown to fifteen, the open handle went on
+reporting 6 records while a fresh open of the same path reported 17. Reopening
+was the only way forward, and on a scanning open that is `O(records)`.
+
+`VarveFile::follow` and `VarveReader::follow` frame only the bytes past the end
+the handle already holds and adopt them, returning the bytes gained. Following a
+growing file costs `O(appended)` per call, and the `ScanBytes` charge is the
+tail rather than the file, so a long-lived stream reader does not walk into that
+ceiling for reading nothing new.
+
+It stops where an open stops. Under a `transaction_marker` policy the same
+`committed_prefix_len` boundary decides both, so an appended-but-uncommitted
+tail answers `0` and the same call adopts the whole run once the marker lands.
+
+Three things it deliberately does not do. It does not cross a generation: the
+replacement paths publish by renaming a new file over the pathname, and this
+follows the *object* the handle opened, so a followed handle stays a complete,
+self-consistent view of its own generation and answers `0` forever after a
+republish. It follows the append log only — a matrix cell region sits ahead of
+the log and was never bounded by the snapshot. And a read-write handle answers
+`0`, because varve admits one writer per object and that writer's own appends
+already extend its snapshot.
+
+`VarveReader::follow` is the only `&mut self` method on that type. Every read
+still takes `&self`.
+
 ### `index: header_tails` — a commit boundary a later append cannot hide
 
 **New capability, opt-in, and off by default.** The open digest already writes

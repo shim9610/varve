@@ -1057,9 +1057,13 @@ ever take it for a hash lookup.
 Varve is **single-writer**, enforced by a native object lock on the target file.
 Within that:
 
-- **Resident record reads are a snapshot as of open.** The record index is built
-  at open. Records a writer appends afterwards are not visible to that reader
-  handle without reopening.
+- **Resident record reads are a snapshot as of open, until the handle is asked
+  to advance.** The record index is built at open, and records a writer appends
+  afterwards are not visible to that handle until it calls
+  [`VarveFile::follow`]/[`VarveReader::follow`], which frames the bytes past the
+  end it holds and adopts them to the same commit boundary an open would stop
+  at. A handle never advances on its own — that is what keeps a `&self` read
+  from observing a record mid-write.
 - **Matrix commit status is not a snapshot at all.** Each commit-map page is as
   of the first touch that faulted it in, so different pages can reflect different
   instants and a page faulted in late can reflect a writer's later work. This is
@@ -1074,12 +1078,15 @@ Within that:
 **Who it affects.** Anyone assuming a Varve handle is a live view of a file
 another handle is writing. It is not.
 
-**Workaround.** Reopen to advance a resident reader. For a matrix there is no
+**Workaround.** `follow()` advances a resident reader at a cost proportional to
+what was appended rather than to the file; reopen when the pathname has been
+republished, which `follow` deliberately does not cross. For a matrix there is no
 "advance": a reopen gives a fresh handle whose pages will again be as of whenever
 each one is first touched, so a reader that needs one instant across a whole map
 must coordinate that with the writer itself.
 
-**Planned.** No live-view mode is planned.
+**Planned.** No live-view mode is planned. `follow()` is an explicit advance,
+not a live view: between two calls the handle is still a fixed snapshot.
 
 ### 4.3 Writer-lock edge cases
 
