@@ -4,7 +4,7 @@
 //! it, which is what lets one handle serve concurrent readers while a writer
 //! appends. The cost was that the handle never saw the appends either: measured
 //! before this existed, a handle open on a five-record file that then grew to
-//! fifteen went on reporting 6 records while a fresh open reported 17.
+//! fifteen went on reporting 6 records while a fresh open reported 18.
 //!
 //! `follow()` closes that, and the things worth pinning are the ones that are
 //! easy to get wrong rather than the happy path: it must adopt exactly what a

@@ -13,7 +13,7 @@ it. That is what lets one handle serve concurrent readers through `&self` while
 a writer appends — a reader can never observe a record the writer has not
 finished — but it also meant the handle never observed a finished one either.
 Measured on a five-record file grown to fifteen, the open handle went on
-reporting 6 records while a fresh open of the same path reported 17. Reopening
+reporting 6 records while a fresh open of the same path reported 18. Reopening
 was the only way forward, and on a scanning open that is `O(records)`.
 
 `VarveFile::follow` and `VarveReader::follow` frame only the bytes past the end

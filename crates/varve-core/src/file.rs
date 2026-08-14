@@ -7439,7 +7439,9 @@ impl VarveFile {
             // something new to describe, so an idle close appends nothing. The
             // header tail region is not — it has no such predicate, because its
             // write is an overwrite of a fixed extent rather than an append, so
-            // an idle close costs one seek and one 360-byte write and advances
+            // an idle close costs one seek and one slot-sized write — 176
+            // bytes on a two-block format, 12 more per declared block; the 360
+            // the author guide quotes is the whole two-slot region — and advances
             // the slot generation. It never grows the file and it is never on
             // the append path; `the_region_write_is_one_seek_per_commit_point`
             // is what holds that to a count.
@@ -7685,11 +7687,18 @@ impl VarveFile {
     /// than one every read answers.
     pub fn is_current(&self) -> Result<bool> {
         let mine = self.file.object_identity()?;
-        match File::open(&self.path) {
-            Ok(file) => Ok(opened_file_identity(&file)? == mine),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error.into()),
-        }
+        // Any failure to reach the pathname is `false`, not an error, and it
+        // has to be *any* rather than `NotFound` alone. On Windows a file
+        // deleted while this handle still holds it open goes delete-pending
+        // with its directory entry intact, and `CreateFile` on that name then
+        // fails `ERROR_ACCESS_DENIED` — so mapping only `NotFound` turned the
+        // documented "removed pathname answers false" into a hard error on the
+        // one platform where the case is easiest to hit, and would have failed
+        // the ungated test for it on the Windows CI job.
+        //
+        // Same shape as `path_resolves_to_object`, which this is the public
+        // half of: a name we cannot open is not this object.
+        Ok(path_resolves_to_object(&self.path, &mine))
     }
 
     /// A fresh read-only handle on whatever the pathname resolves to now.
@@ -7736,7 +7745,7 @@ impl VarveFile {
     /// never observe a record the writer has not finished. The cost is that it
     /// never observes one the writer *has* finished either — measured on a
     /// five-record file grown to fifteen, the open handle went on reporting 6
-    /// records while a fresh open of the same path reported 17.
+    /// records while a fresh open of the same path reported 18.
     ///
     /// This is how a handle catches up without reopening. It frames only the
     /// bytes past the end it already holds, so following a growing file costs
@@ -7841,6 +7850,38 @@ impl VarveFile {
         }
         let snapshot = self.snapshot.with_len(logical_len)?;
         if self.index.is_retained() {
+            // Charged against the *handle's* total, and charged before a single
+            // entry is installed.
+            //
+            // The scan charges `Records` and `IndexBytes` per entry into the
+            // buffer it is filling, and that buffer is a fresh one here — so
+            // charging only there bounds one run rather than the handle, and a
+            // handle following a growing file walks past a ceiling that a fresh
+            // open of the same file refuses. Measured with `records: 30`: a
+            // handle at 21 entries followed four times to 65 while every fresh
+            // open answered `LimitExceeded { resource: "record count" }`.
+            //
+            // Up front rather than inside the loop because the loop mutates
+            // `self`: refusing on the tenth entry left nine installed and the
+            // snapshot un-advanced, which is an index describing records the
+            // snapshot does not reach. Charging the whole run first makes the
+            // refusal leave the handle exactly as it was.
+            //
+            // `ScanBytes` is deliberately *not* charged — that exemption is the
+            // point of the zero prefix charge above and is documented on
+            // `scan_records_range`. These two bound the handle's resident
+            // footprint, which is a different claim.
+            let held =
+                u64::try_from(self.index.len().saturating_add(framed.len())).map_err(|_| {
+                    Error::ResourceArithmeticOverflow {
+                        resource: "record count",
+                    }
+                })?;
+            self.spec.read_limits.check(ReadLimitKey::Records, held)?;
+            self.spec.read_limits.check(
+                ReadLimitKey::IndexBytes,
+                index_bytes_for_count(self.index.len().saturating_add(framed.len()))?,
+            )?;
             for entry in &framed {
                 let length = self.index.len();
                 let slot = self
@@ -19620,7 +19661,9 @@ pub(crate) fn replace_path_atomically(
 
 /// Returns whether `path` currently resolves to the OS file object with the
 /// given identity bytes. Any open or identity failure counts as "no".
-#[cfg(windows)]
+///
+/// Not Windows-only any more: [`VarveFile::is_current`] is the public half of
+/// exactly this question and needs the same answer on both platforms.
 fn path_resolves_to_object(path: &Path, identity: &[u8]) -> bool {
     File::open(path)
         .ok()
