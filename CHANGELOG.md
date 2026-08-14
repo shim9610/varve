@@ -22,6 +22,13 @@ growing file costs `O(appended)` per call, and the `ScanBytes` charge is the
 tail rather than the file, so a long-lived stream reader does not walk into that
 ceiling for reading nothing new.
 
+Derived state the handle caches is dropped with it — keyed tails, and the
+matrix chunk directory. That directory is built on the first chunked read and
+kept in a `OnceLock` that nothing invalidates, which was sound only while a
+handle's snapshot could not grow. Measured while verifying this: without the
+drop, a followed handle answered `MatrixNotCommitted` for a cell that a fresh
+open of the same file read back.
+
 It stops where an open stops. Under a `transaction_marker` policy the same
 `committed_prefix_len` boundary decides both, so an appended-but-uncommitted
 tail answers `0` and the same call adopts the whole run once the marker lands.

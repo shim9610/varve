@@ -7786,7 +7786,12 @@ impl VarveFile {
     ///
     /// **It follows the append log only.** A matrix file's cell region sits
     /// ahead of the log at a fixed offset and is written in place, so it was
-    /// never bounded by the snapshot and is not what this extends.
+    /// never bounded by the snapshot and is not what this extends. Note what
+    /// that does *not* mean: a matrix chunk record is an ordinary append-log
+    /// record, so a run can bring new chunks and this does adopt them — and
+    /// therefore has to drop the chunk directory, which is built once and
+    /// cached. Caching it for the life of a handle was sound only while a
+    /// handle's snapshot could not grow.
     ///
     /// **A read-write handle gains nothing and answers `0`.** varve admits one
     /// writer per object, and that writer's own appends already extend its
@@ -7868,6 +7873,13 @@ impl VarveFile {
         }
         // A record just adopted may be the newest of its key.
         self.keyed_tails.invalidate_all();
+        // And a matrix chunk record is an ordinary append-log record, so a run
+        // may have brought new chunks. The chunk directory is built once and
+        // cached in a `OnceLock`, which was sound to keep forever only while a
+        // handle's snapshot could not grow — it can now. Measured before this
+        // line existed: a followed handle answered `MatrixNotCommitted` for a
+        // cell a fresh open of the same file read back.
+        self.chunk_directory = std::sync::OnceLock::new();
         Ok(logical_len - from)
     }
 
