@@ -5569,7 +5569,19 @@ impl VarveFile {
         let sequence_state = index.sequence_state();
         let block_tails = index.block_tails();
         let index = &*scratch;
-        truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, index)?;
+        // The crash verdict has to be read *before* the handle exists, because
+        // truncation happens here and would destroy the evidence it decides
+        // about. `mark_writer_open` re-reads it for the handle's own field; the
+        // two agree because nothing has written the block in between.
+        let previous_writer_crashed = decode_liveness_flags(header_len, &header_extensions)?
+            .is_some_and(|flags| flags & LIVENESS_FLAG_DIRTY != 0);
+        let pending_mark = truncate_uncommitted_tail_if_needed(
+            spec,
+            &mut file,
+            append_start,
+            index,
+            previous_writer_crashed,
+        )?;
         let derived = derive_index_state(infallible_entries(index), false)?;
         let checkpoint_cadence = derived.checkpoint_cadence;
         let segment_cursor = derived.segment_cursor;
@@ -5601,6 +5613,9 @@ impl VarveFile {
             _lock: None,
         };
         opened.mark_writer_open()?;
+        if let Some(from) = pending_mark {
+            opened.recover_marked_tail(from)?;
+        }
         Ok(opened)
     }
 
@@ -6112,7 +6127,9 @@ impl VarveFile {
         let sequence_state = index.sequence_state();
         let block_tails = index.block_tails();
         let index = &*scratch;
-        truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, index)?;
+        // No mark here: this route reaches a file that already ended at a
+        // commit point, so there is no tail. See the digest's frame check.
+        truncate_uncommitted_tail_if_needed(spec, &mut file, append_start, index, false)?;
         let recovered_len = file.metadata()?.len();
         let derived = derive_index_state(infallible_entries(index), false)?;
         let checkpoint_cadence = derived.checkpoint_cadence;
@@ -12939,6 +12956,103 @@ impl VarveFile {
         self.write_liveness_flags(LIVENESS_FLAG_DIRTY)
     }
 
+    /// Marks a crashed writer's uncommitted tail dead, then commits it.
+    ///
+    /// Called once, at the open that discovers the crash, and only under
+    /// `RecoveryPolicy::MarkTail`. `from` is the end of the committed prefix —
+    /// the point `TruncateTail` would have cut at.
+    ///
+    /// **The commit marker at the end is the load-bearing part.** Marking alone
+    /// would leave the file ending past its last marker, and the next marker
+    /// written would make `committed_prefix_len` treat this whole tail as
+    /// committed — records the original writer never committed, becoming
+    /// visible retroactively. Committing them *here*, flagged dead, is the
+    /// honest statement: they arrived, they were never committed by their
+    /// writer, they are kept, and a defragmenting rewrite may drop them.
+    ///
+    /// Costs one scan of the tail — not of the file — plus four bytes per
+    /// record and one appended record.
+    fn recover_marked_tail(&mut self, from: u64) -> Result<usize> {
+        // Walked directly rather than through `scan_records_range`, and that is
+        // not a shortcut. Under a marker policy the scan applies
+        // `committed_prefix_len` to whatever it framed and **clears the list**
+        // when no marker is in range — which is exactly this range, by
+        // definition. That behaviour is right for `follow`, whose question is
+        // "what is committed"; here the question is the opposite one.
+        let end = self.snapshot.len();
+        let mut offset = from;
+        let mut marked = 0usize;
+        let mut framed_end = from;
+        let mut targets = Vec::new();
+        let mut highest: Option<u64> = None;
+        while offset < end {
+            let Ok(entry) = fault_record_entry(&self.snapshot, self.spec, offset, false) else {
+                // A half-written record is the expected find in a crashed
+                // writer's tail, not a surprise. Everything before it framed and
+                // is kept; this and anything after it never became a record and
+                // is cut below.
+                break;
+            };
+            let Ok(next) = entry.checked_physical_end() else {
+                break;
+            };
+            if next > end || next <= offset {
+                break;
+            }
+            if entry.block_id < RESERVED_BLOCK_ID_START {
+                targets.push(entry.record_offset);
+            }
+            // The kept tail's sequences are *higher* than anything the handle
+            // knows about: its high-water mark came from the committed prefix,
+            // which the scan truncated at the marker. Without this the marker
+            // appended below reuses a sequence a kept record already holds, and
+            // the next open refuses the file with "duplicate native record
+            // sequence" — measured, before this line existed.
+            highest = highest.max(Some(entry.sequence));
+            framed_end = next;
+            offset = next;
+        }
+        if let Some(highest) = highest {
+            let next = highest
+                .checked_add(1)
+                .map_or(SequenceState::Exhausted, SequenceState::Available);
+            if let (SequenceState::Available(now), SequenceState::Available(want)) =
+                (self.sequence_state, next)
+                && want > now
+            {
+                self.sequence_state = next;
+            } else if matches!(next, SequenceState::Exhausted) {
+                self.sequence_state = next;
+            }
+        }
+        // Cut whatever did not frame. Leaving it would put unframeable bytes
+        // *before* the marker appended below, which every later scan would walk
+        // into — worse than the truncation this policy exists to avoid, because
+        // it would take the framed records with it.
+        if framed_end < end {
+            self.file.set_len(framed_end)?;
+            self.snapshot = self.snapshot.with_len(framed_end)?;
+            self.index.rebind(self.snapshot.clone());
+        }
+        for record_offset in targets {
+            self.set_record_mutable_flags(record_offset, RECORD_MUTABLE_FLAG_DEAD)?;
+            marked += 1;
+        }
+        // `write_commit_marker` directly, not `commit()`. `commit()` reuses the
+        // existing marker when nothing has been appended since the last one —
+        // and nothing has been, because marking rewrites footers rather than
+        // appending. That short-circuit is right for an ordinary commit and
+        // exactly wrong here: the file ends past its last marker precisely
+        // because this handle appended nothing, and leaving it that way is the
+        // retroactive-commit hazard the marker exists to close.
+        //
+        // Unconditional, including when zero records were marked: an empty tail
+        // that framed nothing still moved the end past the marker.
+        self.write_commit_marker()?;
+        self.close_commit_point();
+        Ok(marked)
+    }
+
     /// Whether the writer that held this file before this handle died without
     /// releasing it.
     ///
@@ -14446,6 +14560,7 @@ fn recovery_policy_byte(policy: RecoveryPolicy) -> u8 {
     match policy {
         RecoveryPolicy::Strict => 1,
         RecoveryPolicy::TruncateTail => 2,
+        RecoveryPolicy::MarkTail => 3,
     }
 }
 
@@ -14453,6 +14568,7 @@ fn recovery_policy_from_byte(value: u8) -> Result<RecoveryPolicy> {
     match value {
         1 => Ok(RecoveryPolicy::Strict),
         2 => Ok(RecoveryPolicy::TruncateTail),
+        3 => Ok(RecoveryPolicy::MarkTail),
         _ => Err(Error::InvalidSchemaManifest),
     }
 }
@@ -18295,23 +18411,44 @@ fn committed_prefix_len(entries: &[RecordIndexEntry]) -> Option<usize> {
     Some(kept)
 }
 
+/// Deals with whatever sits past the last commit marker.
+///
+/// Two answers, and which one applies is the difference between losing a
+/// crashed writer's records and keeping them.
+///
+/// `TruncateTail` (and `Strict`) delete it, which is what varve has always
+/// done. `RecoveryPolicy::MarkTail` keeps it — but only when the file's
+/// liveness block says the previous writer never released, because an
+/// uncommitted tail left by an *orderly* writer (one that appended and then
+/// chose not to commit) is that writer's business and truncating it is the
+/// contract it was written under.
+///
+/// Returns `Some(committed_end)` when it left a tail in place for the caller to
+/// mark. The caller must then mark and re-commit it: a file that ends past its
+/// last marker is one the *next* marker would retroactively commit, and that is
+/// the whole reason this cannot simply skip the truncate and stop.
 fn truncate_uncommitted_tail_if_needed(
     spec: FormatSpec,
     file: &mut File,
     header_len: u64,
     entries: &[RecordIndexEntry],
-) -> Result<()> {
+    previous_writer_crashed: bool,
+) -> Result<Option<u64>> {
     if !spec.commit_policy.is_transaction_marker() {
-        return Ok(());
+        return Ok(None);
     }
     let committed_end = match committed_prefix_len(entries) {
         Some(len) => entries[len - 1].checked_physical_end()?,
         None => header_len,
     };
-    if file.metadata()?.len() > committed_end {
-        file.set_len(committed_end)?;
+    if file.metadata()?.len() <= committed_end {
+        return Ok(None);
     }
-    Ok(())
+    if spec.recovery_policy == RecoveryPolicy::MarkTail && previous_writer_crashed {
+        return Ok(Some(committed_end));
+    }
+    file.set_len(committed_end)?;
+    Ok(None)
 }
 
 #[derive(Debug)]

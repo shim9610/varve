@@ -1009,6 +1009,7 @@ enum LivenessChoice {
 enum RecoveryChoice {
     Strict,
     TruncateTail,
+    MarkTail,
 }
 
 enum ManifestChoice {
@@ -1349,10 +1350,11 @@ impl Parse for FormatInput {
                 recovery = match value.to_string().as_str() {
                     "strict" => RecoveryChoice::Strict,
                     "truncate_tail" => RecoveryChoice::TruncateTail,
+                    "mark_tail" => RecoveryChoice::MarkTail,
                     _ => {
                         return Err(syn::Error::new_spanned(
                             value,
-                            "expected strict or truncate_tail",
+                            "expected strict, truncate_tail, or mark_tail",
                         ));
                     }
                 };
@@ -2514,6 +2516,7 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     let recovery = match input.recovery {
         RecoveryChoice::Strict => quote!(::varve::__core::RecoveryPolicy::Strict),
         RecoveryChoice::TruncateTail => quote!(::varve::__core::RecoveryPolicy::TruncateTail),
+        RecoveryChoice::MarkTail => quote!(::varve::__core::RecoveryPolicy::MarkTail),
     };
     let manifest = match input.manifest {
         ManifestChoice::None => quote!(::varve::__core::ManifestPolicy::None),

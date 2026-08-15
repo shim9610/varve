@@ -65,6 +65,22 @@ varve_format! {
 
 // The same declaration with the header in the checksum, which is the policy the
 // footer placement is supposed to leave alone.
+// The crash-recovery pairing: keep a crashed writer's tail instead of cutting it.
+varve_format! {
+    pub struct Marked {
+        magic: b"VRDEADD1";
+        version: 1;
+        endian: little;
+        schema_hash: computed;
+        integrity: crc32;
+        index: block_offset_chain;
+        commit: transaction_marker(explicit);
+        liveness: footer_flags;
+        recovery: mark_tail;
+        blocks: [Reading];
+    }
+}
+
 varve_format! {
     pub struct OnWithHeaderCrc {
         magic: b"VRDEADC1";
@@ -398,4 +414,140 @@ fn a_reader_does_not_claim_a_crash_verdict() -> varve::Result<()> {
     let reader = varve::VarveFile::open_readonly(On::spec(), &path)?;
     assert!(!reader.opened_after_crash());
     Ok(())
+}
+
+/// A crashed writer's uncommitted tail is kept and flagged, not deleted.
+#[test]
+fn a_crashed_tail_is_marked_dead_instead_of_truncated() -> varve::Result<()> {
+    fn checksum(bytes: &[u8]) -> u32 {
+        let mut hash = 2_166_136_261u32;
+        for byte in bytes {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(16_777_619);
+        }
+        hash
+    }
+    fn abandon(path: &std::path::Path) -> varve::Result<()> {
+        let mut bytes = std::fs::read(path)?;
+        let at = bytes
+            .windows(4)
+            .position(|window| window == b"VLIV")
+            .expect("a liveness format writes a VLIV block");
+        let payload = at + 8;
+        bytes[payload..payload + 2].copy_from_slice(&1u16.to_le_bytes());
+        bytes[payload + 2..payload + 4].copy_from_slice(&1u16.to_le_bytes());
+        let crc = checksum(&bytes[payload..payload + 4]);
+        bytes[payload + 4..payload + 8].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(path, &bytes)?;
+        Ok(())
+    }
+    fn records(file: &varve::VarveFile) -> varve::Result<usize> {
+        let mut buffer = Vec::new();
+        let mut walk = file.record_map(&mut buffer)?;
+        let mut count = 0;
+        while walk.advance()?.is_some() {
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("crashed.varve");
+
+    // Committed work, then an uncommitted tail — under `explicit`, `flush`
+    // writes no marker, so these records reach the file uncommitted.
+    let mut writer = varve::VarveWriter::create(Marked::spec(), &path)?;
+    for value in 0..4 {
+        writer.push(&Reading { value })?;
+    }
+    writer.commit()?;
+    let committed_len = std::fs::metadata(&path)?.len();
+
+    let mut tail = Vec::new();
+    for value in 4..7 {
+        tail.push(writer.push_info(&Reading { value })?.record_offset);
+    }
+    writer.flush()?;
+    drop(writer);
+    let with_tail = std::fs::metadata(&path)?.len();
+    assert!(
+        with_tail > committed_len,
+        "the uncommitted tail must have reached the file",
+    );
+
+    // The state a killed writer leaves.
+    abandon(&path)?;
+
+    // The recovery open keeps it.
+    let recovered = varve::VarveWriter::open(Marked::spec(), &path)?;
+    assert!(recovered.opened_after_crash());
+    for offset in &tail {
+        assert!(
+            recovered.record_is_dead(*offset)?,
+            "record at {offset} must be marked dead, not deleted",
+        );
+    }
+    drop(recovered);
+
+    // Kept, not cut — and the file ends at a commit point again, so a later
+    // marker cannot retroactively commit anything.
+    assert!(std::fs::metadata(&path)?.len() > with_tail);
+    let file = varve::VarveFile::open_readonly(Marked::spec(), &path)?;
+    let readings: Vec<Reading> = file
+        .blocks::<Reading>()?
+        .iter()
+        .collect::<varve::Result<_>>()?;
+    assert_eq!(readings.len(), 7, "all seven records survived");
+    assert!(records(&file)? >= 7);
+    for (index, offset) in tail.iter().enumerate() {
+        assert!(file.record_is_dead(*offset)?, "tail record {index}");
+    }
+    Ok(())
+}
+
+/// The same file under the default policy loses the tail, which is the
+/// behaviour `mark_tail` exists to change.
+#[test]
+fn the_default_policy_still_truncates() -> varve::Result<()> {
+    let spec = Marked::spec().with_recovery_policy(varve::RecoveryPolicy::TruncateTail);
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("cut.varve");
+
+    let mut writer = varve::VarveWriter::create(spec, &path)?;
+    for value in 0..4 {
+        writer.push(&Reading { value })?;
+    }
+    writer.commit()?;
+    let committed_len = std::fs::metadata(&path)?.len();
+    for value in 4..7 {
+        writer.push(&Reading { value })?;
+    }
+    writer.flush()?;
+    drop(writer);
+    assert!(std::fs::metadata(&path)?.len() > committed_len);
+
+    let reopened = varve::VarveWriter::open(spec, &path)?;
+    drop(reopened);
+    assert_eq!(
+        std::fs::metadata(&path)?.len(),
+        committed_len,
+        "TruncateTail must still cut the tail",
+    );
+    Ok(())
+}
+
+/// `mark_tail` has nowhere to write its verdict without the liveness word, and
+/// nothing to name a boundary with without a marker.
+#[test]
+fn mark_tail_refuses_without_its_prerequisites() {
+    let no_word = Marked::spec().with_liveness_policy(varve::LivenessPolicy::None);
+    assert!(matches!(
+        no_word.validate(),
+        Err(varve::Error::InvalidFormatSpec(m)) if m.contains("liveness")
+    ));
+    let no_marker = Marked::spec().with_commit_policy(varve::CommitPolicy::None);
+    assert!(matches!(
+        no_marker.validate(),
+        Err(varve::Error::InvalidFormatSpec(m)) if m.contains("marker") || m.contains("footer")
+    ));
 }

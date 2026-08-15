@@ -1463,6 +1463,33 @@ impl CommitPolicy {
 pub enum RecoveryPolicy {
     Strict,
     TruncateTail,
+    /// Keep a crashed writer's uncommitted tail, marked dead.
+    ///
+    /// `TruncateTail` answers a crash by deleting every record past the last
+    /// commit marker. That is correct and it is cheap, and it is also the only
+    /// operation in varve that destroys data the caller might have wanted: the
+    /// records framed, they are structurally complete, and the writer simply
+    /// never got to say so.
+    ///
+    /// This keeps them. On a read-write open of a file whose liveness block
+    /// says the previous writer never released, the tail is walked, every
+    /// record in it is marked [`crate::RECORD_MUTABLE_FLAG_DEAD`], and a commit marker
+    /// is appended so the file ends at a commit point again.
+    ///
+    /// **The appended marker is not optional.** Without it the file ends past
+    /// its last marker, and the *next* marker to be written would make
+    /// `committed_prefix_len` treat the whole tail as committed — records the
+    /// original writer never committed would become visible, retroactively.
+    /// Committing them here, flagged dead, is the honest statement: they
+    /// arrived, they were never committed, they are kept, and a defragmenting
+    /// rewrite is free to drop them.
+    ///
+    /// Requires `liveness: footer_flags`, because the mark has nowhere to live
+    /// without it.
+    ///
+    /// The cost is that the file keeps bytes `TruncateTail` would have
+    /// reclaimed, until something defragments it.
+    MarkTail,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2985,6 +3012,23 @@ impl FormatSpec {
                 "open_digest_on_flush requires block_offset_chain",
             ));
         }
+        // `MarkTail` writes its verdict into the footer word and needs a
+        // commit marker to name the boundary it stops at. Both are refusals
+        // rather than silent degradations to `TruncateTail`, because the
+        // difference between the two is whether a crashed writer's records
+        // survive — not a detail to discover later.
+        if matches!(self.recovery_policy, RecoveryPolicy::MarkTail) {
+            if !matches!(self.liveness_policy, LivenessPolicy::FooterFlags) {
+                return Err(Error::InvalidFormatSpec(
+                    "recovery: mark_tail requires liveness: footer_flags",
+                ));
+            }
+            if !self.commit_policy.is_transaction_marker() {
+                return Err(Error::InvalidFormatSpec(
+                    "recovery: mark_tail requires a transaction_marker commit policy",
+                ));
+            }
+        }
         // The mutable word IS the footer's trailing field, so a format that
         // writes no footer has nowhere to put it. Refused rather than silently
         // inert: an option that does nothing is the shape this project treats
@@ -3666,6 +3710,7 @@ const fn recovery_policy_hash_byte(policy: RecoveryPolicy) -> u8 {
     match policy {
         RecoveryPolicy::Strict => 1,
         RecoveryPolicy::TruncateTail => 2,
+        RecoveryPolicy::MarkTail => 3,
     }
 }
 
