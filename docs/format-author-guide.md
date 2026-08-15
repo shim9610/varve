@@ -577,6 +577,121 @@ identically, only slower: a file appended to since that commit, a table left
 over from an earlier one, a torn slot. You do not have to do anything about any
 of those.
 
+## Dead Records And Crash Recovery
+
+Two options, and they are a pair. Declare the first to be able to say a record
+is dead; declare both to stop a crash from deleting a writer's last work.
+
+### `liveness: footer_flags`
+
+Without it, a varve record can stop being the answer in exactly two ways, and
+neither reaches a block with no key. A tombstone names a block id and a **key**,
+never an offset — every delete entry point requires `T: VarveKeyedBlock`. And a
+`replace_*` publishes a whole new file in which the superseded record simply is
+not there, which is a rewrite, not a mark.
+
+`liveness: footer_flags` turns the record footer's trailing `reserved` word into
+a mutable flag word and **takes it out of the record checksum**:
+
+```rust
+varve_format! {
+    pub struct Log {
+        magic: b"MYLOG001";
+        version: 1;
+        endian: little;
+        integrity: crc32;
+        index: block_offset_chain;
+        commit: transaction_marker(on_flush);
+        liveness: footer_flags;
+        blocks: [Reading];
+    }
+}
+```
+
+```rust
+writer.mark_record_dead(offset)?;        // four bytes, in place
+file.record_is_dead(offset)?;            // or entry.is_dead()
+```
+
+**It costs no bytes.** The word is already in every footer such a format writes;
+only its meaning and its checksum coverage change. What it does cost is a
+different schema hash — excluding four bytes changes the checksum of every
+record, so an existing file does not open under it.
+
+**Why the footer and not the header.** The word has to be writable *after* the
+record was written, and putting it in the footer outside the checksum means the
+record's checksum stays valid (nothing re-reads the payload to recompute a CRC),
+`crc32_with_header` is unaffected (it covers the header), and a reader that
+already framed the record does not disagree with the disk — the seven fields
+that establish a record's identity are all header fields.
+
+**A dead record is advisory and is still there.** It still frames, `blocks`,
+`scan` and `record_map` still return it, and every chain that pointed at it
+still does. Hiding it would silently change what a chain walk means. What
+consumes the mark is a defragmenting rewrite — the operation that can actually
+drop a record and rebuild the chains that named it.
+
+**Be clear about the trade:** those four bytes are the only part of a record no
+checksum covers. A flipped bit there is detected by nothing. A set flag says
+"the writer marked this", never "these bytes are sound". That is the price of a
+field that can change without rewriting the record.
+
+Requires a record footer, so declare a commit policy or an offset chain.
+Internal records — commit markers, segments, digests — cannot be marked:
+dropping those would drop the records that say where the commit boundary is.
+
+### `recovery: mark_tail`
+
+varve's default answer to a crash is `recovery: truncate_tail`: at the next
+read-write open, every record past the last commit marker is deleted. It is
+correct and cheap, and it is also the only operation in varve that destroys data
+you might have wanted — those records framed, they are structurally complete,
+and the writer simply never got to say so.
+
+```rust
+        liveness: footer_flags;
+        recovery: mark_tail;
+```
+
+Now that tail is kept, every record in it is marked dead, and a commit marker is
+appended. Read the verdict with `writer.opened_after_crash()`.
+
+**How a crash is told from a clean shutdown.** A writer sets a bit in the file
+header when it takes the object and clears it when it releases. The writer lock
+answers the other half — "is anybody holding it now" — and it is an *object*
+lock, so hard links and other path aliases cannot dodge it:
+
+| lock | header bit | verdict |
+| --- | --- | --- |
+| held by someone else | set | a writer is working normally |
+| free | clear | the last writer released cleanly |
+| free | **set** | the last writer died without releasing |
+
+This is the only durable record varve keeps of a writer's lifecycle. The signal
+it replaces — "does the file end exactly at a commit point" — can only describe
+a suffix, never an interior record, and the next open truncates that suffix away
+before anything can ask.
+
+**Only a crashed writer's tail is kept.** An uncommitted tail left by an orderly
+writer is that writer's business, and truncating it is the contract it was
+written under.
+
+**Why a commit marker is appended.** Without it the file ends past its last
+marker, and the *next* marker written would make the whole tail count as
+committed — records the original writer never committed, becoming visible
+retroactively. Committing them here, flagged dead, is the honest statement: they
+arrived, they were never committed by their writer, they are kept, and a
+defragmenting rewrite may drop them.
+
+**What is still cut.** A half-written record is the expected find in a crashed
+tail. Everything that framed before it is kept; it and anything after it never
+became a record and is truncated.
+
+**What it costs.** The file keeps bytes `truncate_tail` would have reclaimed,
+until something defragments it. Refused without `liveness: footer_flags` (no
+word to write the verdict in) and without a transaction marker (nothing to name
+a boundary with).
+
 ## Custom Physical Layout
 
 Most formats should use the Varve-native append log. Use custom physical layout

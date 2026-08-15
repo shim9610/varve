@@ -63,8 +63,6 @@ varve_format! {
     }
 }
 
-// The same declaration with the header in the checksum, which is the policy the
-// footer placement is supposed to leave alone.
 // The crash-recovery pairing: keep a crashed writer's tail instead of cutting it.
 varve_format! {
     pub struct Marked {
@@ -81,6 +79,8 @@ varve_format! {
     }
 }
 
+// The same declaration with the header in the checksum, which is the policy the
+// footer placement is supposed to leave alone.
 varve_format! {
     pub struct OnWithHeaderCrc {
         magic: b"VRDEADC1";

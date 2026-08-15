@@ -491,6 +491,23 @@ prefix it has read. A duplicate sequence past the stopping point is not detected
 until a walk reaches it. A map walked to completion (`fill()`) is the open
 scan's index, entry for entry.
 
+### Marking a record dead
+
+Available on `VarveFile` and `VarveWriter` when the format declares
+`liveness: footer_flags`. See the format-author guide for what the option costs.
+
+| Call | Takes | What it does |
+| --- | --- | --- |
+| `mark_record_dead(record_offset)` | `&mut self` | Sets the dead flag in the record's footer — four bytes, in place. Not synced here; it rides the next `flush`/`commit`/`sync` |
+| `record_is_dead(record_offset)` | `&self` | Frames that record and reads the flag |
+| `RecordIndexEntry::is_dead()` | `&self` | The same answer from an entry you already hold, at no extra read |
+| `opened_after_crash()` | `&self` | Whether the writer that held this file before this handle died without releasing it. `false` on a read-only handle by construction — answering needs the object lock a reader does not hold |
+
+The mark is **advisory**: the record is still framed, still returned by every
+collection, and still on every chain that pointed at it. A defragmenting rewrite
+is what acts on it. Refused for an internal record (`ReservedBlockId`) and for a
+format without the option (`InvalidFormatSpec`).
+
 ### An open that reads no record
 
 `open_readonly_lazy(spec, path)` opens from the **open digest** at the end of

@@ -6,6 +6,63 @@ increment the minor version.
 
 ## Unreleased
 
+### `liveness: footer_flags` — a record can be marked dead
+
+Until now a varve record could stop being the answer in two ways, and neither
+reached a block with no key: a tombstone names a block id and a **key**, never
+an offset, and a `replace_*` publishes a new file in which the record is simply
+not there. There was no way to say "this record is dead" — which is what a
+defragmenting rewrite has to be told.
+
+This turns the record footer's trailing `reserved` word into a mutable flag word
+and **takes it out of the record checksum**. No new bytes: the word is already
+in every footer such a format writes.
+
+```rust
+writer.mark_record_dead(offset)?;    // four bytes rewritten in place
+file.record_is_dead(offset)?;        // or entry.is_dead()
+```
+
+The exclusion is the mechanism, and the footer is the right place for it: the
+record's checksum stays valid so nothing re-reads the payload to recompute a
+CRC; `crc32_with_header` is unaffected because it covers the *header*; and a
+reader that already framed the record does not disagree with the disk, because
+the seven fields establishing a record's identity are all header fields.
+
+A dead record is **advisory** and still present — still framed, still returned
+by every collection, still pointed at by every chain. A defragmenting rewrite is
+what acts on it. The trade, stated plainly: those four bytes are the only part
+of a record no checksum covers, so a flipped bit there is detected by nothing.
+
+Inert when off, including the strictness the reserved word has always had; the
+flag is a previously-zero bit inside the integrity byte of the schema hash, so a
+format that does not declare it hashes exactly as before. Turning it on does
+change the hash, because it changes what the checksum covers. Requires a record
+footer; internal records cannot be marked.
+
+### `recovery: mark_tail` — a crash no longer deletes the writer's last work
+
+`recovery: truncate_tail` deletes every record past the last commit marker at
+the next read-write open. `mark_tail` keeps them, marks each dead, and appends a
+commit marker. `VarveFile::opened_after_crash()` reports the verdict.
+
+A crash is told from a clean shutdown by a new `VLIV` header block: a writer
+sets a bit when it takes the object and clears it when it releases, and the
+writer lock answers "is anybody holding it now". Lock free plus bit set means
+the last writer died without releasing. This is the only durable record varve
+keeps of a writer's lifecycle — the signal it replaces, "does the file end
+exactly at a commit point", can only describe a suffix and is truncated away by
+the very open that would ask.
+
+The appended marker is not optional: without it the file ends past its last
+marker, and the next marker written would make the whole tail count as
+committed. A half-written record is still cut — everything that framed before it
+is kept. Only a *crashed* writer's tail is kept; an orderly writer's uncommitted
+tail is truncated as before.
+
+Requires `liveness: footer_flags` and a transaction-marker commit policy; both
+are refusals, not silent degradations.
+
 ### Breaking: `with_directory` returns `Result`, and refuses a directory from another generation
 
 `VarveFile::with_directory`, `VarveReader::with_directory` and
