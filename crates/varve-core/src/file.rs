@@ -91,6 +91,14 @@ const _: () = {
 pub(crate) const RECORD_HEADER_LEN: u64 = 32;
 pub(crate) const RECORD_FOOTER_LEN: u64 = 32;
 
+/// The record is dead: the writer marked it as no longer wanted, and a
+/// defragmenting rewrite may drop it.
+///
+/// Advisory by construction — the word it lives in is outside the record
+/// checksum, which is what makes it writable after the fact. It says "the
+/// writer marked this", never "these bytes are sound".
+pub const RECORD_MUTABLE_FLAG_DEAD: u32 = 0x0000_0001;
+
 /// The width of the footer's trailing mutable word — the `reserved` field that
 /// [`LivenessPolicy::FooterFlags`] turns into record flags and takes out of the
 /// checksum. Named here because two places need to agree on it and a footer
@@ -387,6 +395,27 @@ const FILE_COMPRESSION_PAYLOAD_LEN: usize = 1 + 1 + 1 + 1 + 4 + 8 + 8;
 /// The header block holding each block's newest record offset
 /// ([`IndexPolicy::header_tails`]).
 const HEADER_TAILS_MAGIC: &[u8; 4] = b"VBTT";
+
+/// The liveness block: a writer's open/close mark, in the file header.
+///
+/// One bit of real content. A writer sets `DIRTY` when it takes the object and
+/// clears it when it releases cleanly, so a later open that *can* take the
+/// object and still finds the bit set is looking at a file whose last writer
+/// died without releasing. The writer lock supplies the other half of that
+/// question — "is anybody holding it now" — and it is an object lock, so hard
+/// links and path aliases cannot dodge it.
+///
+/// This is the only durable record varve keeps of a writer's lifecycle. The
+/// alternative signal, "does the file end exactly at a commit point", is
+/// positional: it can only ever describe a suffix, never an interior record,
+/// and the next read-write open truncates that suffix away before anyone can
+/// ask. A bit in the header is neither pushed along nor truncated.
+const LIVENESS_MAGIC: &[u8; 4] = b"VLIV";
+const LIVENESS_BLOCK_VERSION: u16 = 1;
+/// `version u16 | flags u16 | crc32 u32`.
+const LIVENESS_PAYLOAD_LEN: usize = 8;
+/// The writer holds this object and has not released it cleanly.
+const LIVENESS_FLAG_DIRTY: u16 = 0x0001;
 const HEADER_TAILS_VERSION: u16 = 1;
 /// Two slots, written alternately.
 ///
@@ -1090,6 +1119,32 @@ mod record_file {
             count_record_file_seek();
             self.file.seek(SeekFrom::Start(offset))?;
             self.file.write_all(bytes)?;
+            Ok(())
+        }
+
+        /// Overwrites a record footer's trailing mutable word, and nothing
+        /// else.
+        ///
+        /// The fourth gated write, and the narrowest: it takes a fixed
+        /// four-byte array rather than a slice, so it cannot be handed a run
+        /// of record bytes by mistake, and the offset it is given is checked
+        /// by the caller against a footer it has just framed.
+        ///
+        /// Safe against the append cursor for the reason the others are:
+        /// `append_record_at_end` re-seeks `SeekFrom::End(0)` every call and
+        /// every read is positional. A single `write_all` of four bytes, which
+        /// Linux takes under the inode lock; Windows offers no equivalent, and
+        /// unlike the header-tail slot there is no checksum here to catch a
+        /// torn one — a four-byte write is not torn by any storage stack this
+        /// targets, and the flags are advisory even if it were.
+        pub(super) fn overwrite_record_mutable_flags(
+            &mut self,
+            offset: u64,
+            bytes: [u8; 4],
+        ) -> Result<()> {
+            count_record_file_seek();
+            self.file.seek(SeekFrom::Start(offset))?;
+            self.file.write_all(&bytes)?;
             Ok(())
         }
 
@@ -2269,6 +2324,21 @@ impl RecordIndexEntry {
             });
         }
         Ok(())
+    }
+
+    /// Whether the writer marked this record dead.
+    ///
+    /// Always `false` for a format without `liveness: footer_flags`, where the
+    /// word is a reserved field every reader requires to be zero.
+    ///
+    /// **Advisory.** The record is still here, still framed, and still read
+    /// back by every collection; a defragmenting rewrite is what acts on this.
+    /// Unknown bits in the word are ignored rather than refused — the word is
+    /// outside the checksum, so there is nothing to tell a newer build's flag
+    /// from a flipped bit, and refusing would turn a forward-compatible mark
+    /// into an unreadable file.
+    pub const fn is_dead(&self) -> bool {
+        self.mutable_flags & RECORD_MUTABLE_FLAG_DEAD != 0
     }
 
     pub fn checked_physical_end(&self) -> Result<u64> {
@@ -4002,6 +4072,14 @@ impl Drop for VarveFile {
         if self.mode == OpenMode::ReadWrite && self.open_chunk.is_some() {
             let _ = self.write_open_chunk_record();
         }
+        // The clean-release half of the crash verdict. Best-effort by
+        // necessity — `drop` cannot report — and that is the right shape here:
+        // a clear that fails leaves the bit set, so the next open runs a
+        // recovery pass it did not strictly need, which is the direction to
+        // fail in. The opposite arrangement would let a crash read as clean.
+        if self.mode == OpenMode::ReadWrite {
+            let _ = self.mark_writer_closed();
+        }
     }
 }
 
@@ -4093,6 +4171,14 @@ pub struct VarveFile {
     // request, so the parent sync happens once per created file and never on
     // the append path (DUR3-01).
     pending_pathname_parent_sync: bool,
+    /// Whether the file's liveness block said `DIRTY` when this handle opened
+    /// it — i.e. whether the previous writer died without releasing.
+    ///
+    /// Read *before* this open sets the bit for itself, so it describes the
+    /// predecessor rather than this handle. Always `false` for a format without
+    /// `liveness: footer_flags` and for every read-only handle, which never
+    /// takes the object and so cannot tell "held" from "abandoned".
+    opened_after_crash: bool,
     poison: PoisonFlag,
     _lock: Option<WriterLock>,
 }
@@ -4813,6 +4899,21 @@ impl VarveWriter {
     /// usable, but the rename is not yet guaranteed durable against power loss
     /// until the parent directory is synced (for example by a later successful
     /// publication or an explicit directory sync).
+    /// See [`VarveFile::mark_record_dead`].
+    pub fn mark_record_dead(&mut self, record_offset: u64) -> Result<()> {
+        self.file.mark_record_dead(record_offset)
+    }
+
+    /// See [`VarveFile::record_is_dead`].
+    pub fn record_is_dead(&self, record_offset: u64) -> Result<bool> {
+        self.file.record_is_dead(record_offset)
+    }
+
+    /// See [`VarveFile::opened_after_crash`].
+    pub const fn opened_after_crash(&self) -> bool {
+        self.file.opened_after_crash()
+    }
+
     pub fn replace_fixed<T: VarveBlock>(&mut self, index: usize, block: &T) -> Result<u64> {
         self.file.replace_fixed(index, block)
     }
@@ -5225,10 +5326,12 @@ impl VarveFile {
             open_chunk: None,
             chunk_directory: std::sync::OnceLock::new(),
             pending_pathname_parent_sync: true,
+            opened_after_crash: false,
             poison: PoisonFlag::healthy(),
             _lock: None,
         };
         file.write_embedded_manifest_if_needed()?;
+        file.mark_writer_open()?;
         Ok(file)
     }
 
@@ -5358,10 +5461,12 @@ impl VarveFile {
             open_chunk: None,
             chunk_directory: std::sync::OnceLock::new(),
             pending_pathname_parent_sync: true,
+            opened_after_crash: false,
             poison: PoisonFlag::healthy(),
             _lock: None,
         };
         file.write_embedded_manifest_if_needed()?;
+        file.mark_writer_open()?;
         Ok(file)
     }
 
@@ -5469,7 +5574,7 @@ impl VarveFile {
         let checkpoint_cadence = derived.checkpoint_cadence;
         let segment_cursor = derived.segment_cursor;
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
-        Ok(Self {
+        let mut opened = Self {
             spec,
             path,
             file: RecordFile::new(file),
@@ -5491,9 +5596,12 @@ impl VarveFile {
             last_resident_block_id: index.last().map(|entry| entry.block_id),
             keyed_tails: KeyedTails::new_empty(),
             pending_pathname_parent_sync: false,
+            opened_after_crash: false,
             poison: PoisonFlag::healthy(),
             _lock: None,
-        })
+        };
+        opened.mark_writer_open()?;
+        Ok(opened)
     }
 
     pub fn open_with_lock_policy<P: AsRef<Path>>(
@@ -5618,6 +5726,7 @@ impl VarveFile {
             last_resident_block_id: index.last().map(|entry| entry.block_id),
             keyed_tails: KeyedTails::new_empty(),
             pending_pathname_parent_sync: false,
+            opened_after_crash: false,
             poison: PoisonFlag::healthy(),
             _lock: None,
         })
@@ -5883,6 +5992,7 @@ impl VarveFile {
             last_resident_block_id: None,
             keyed_tails: KeyedTails::new_empty(),
             pending_pathname_parent_sync: false,
+            opened_after_crash: false,
             poison: PoisonFlag::healthy(),
             _lock: None,
         })
@@ -5945,6 +6055,7 @@ impl VarveFile {
             last_resident_block_id: None,
             keyed_tails: KeyedTails::new_empty(),
             pending_pathname_parent_sync: false,
+            opened_after_crash: false,
             poison: PoisonFlag::healthy(),
             _lock: None,
         })
@@ -6031,6 +6142,7 @@ impl VarveFile {
                 last_resident_block_id: index.last().map(|entry| entry.block_id),
                 keyed_tails: KeyedTails::new_empty(),
                 pending_pathname_parent_sync: false,
+                opened_after_crash: false,
                 poison: PoisonFlag::healthy(),
                 _lock: None,
             },
@@ -6910,6 +7022,90 @@ impl VarveFile {
             ));
         }
         Ok(())
+    }
+
+    /// Marks the record at `record_offset` dead.
+    ///
+    /// The one mutation varve makes to a record that is not a rewrite of it.
+    /// It sets a bit in the footer's trailing word — four bytes, outside the
+    /// record checksum — and touches nothing else: the payload is not read, no
+    /// checksum is recomputed, no record moves, and the file does not grow.
+    ///
+    /// # What a dead record is, and is not
+    ///
+    /// It is **advisory**. The record is still framed, still read back by
+    /// `blocks`, `scan` and `record_map`, and still part of every chain that
+    /// points at it. Nothing is hidden, because hiding it would silently change
+    /// what a chain walk means and would make the mark a data-loss operation
+    /// rather than a note. What consumes it is a defragmenting rewrite, which
+    /// is the operation that can actually drop a record and rebuild the chains
+    /// that named it.
+    ///
+    /// Read it back with [`RecordIndexEntry::is_dead`].
+    ///
+    /// # Refusals
+    ///
+    /// - `InvalidFormatSpec` unless the format declares
+    ///   `liveness: footer_flags`; without it the word is a reserved field that
+    ///   every reader requires to be zero.
+    /// - `ReservedBlockId` for an internal record. Marking a commit marker or a
+    ///   segment dead would make a defragmenter drop the very records that say
+    ///   where the commit boundary is.
+    /// - Whatever framing the record at `record_offset` fails with, if it is
+    ///   not a record.
+    ///
+    /// # Durability
+    ///
+    /// Not synced here. The mark rides the next `flush`/`commit`/`sync` like
+    /// any other write; a crash before one leaves the record alive, which is
+    /// the safe direction — a defragmenter that has not been told keeps data it
+    /// could have dropped.
+    pub fn mark_record_dead(&mut self, record_offset: u64) -> Result<()> {
+        self.set_record_mutable_flags(record_offset, RECORD_MUTABLE_FLAG_DEAD)
+    }
+
+    fn set_record_mutable_flags(&mut self, record_offset: u64, set: u32) -> Result<()> {
+        let _permit = self.ensure_write()?;
+        if self.spec.liveness_policy != LivenessPolicy::FooterFlags {
+            return Err(Error::InvalidFormatSpec(
+                "marking a record requires liveness: footer_flags",
+            ));
+        }
+        let entry = fault_record_entry(&self.snapshot, self.spec, record_offset, false)?;
+        if entry.block_id >= RESERVED_BLOCK_ID_START {
+            return Err(Error::ReservedBlockId(entry.block_id));
+        }
+        let Some(footer_offset) = entry.footer_offset else {
+            return Err(Error::InvalidFormatSpec(
+                "marking a record requires a record footer",
+            ));
+        };
+        let word_offset = footer_offset
+            .checked_add(RECORD_FOOTER_LEN - RECORD_FOOTER_MUTABLE_LEN)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "record footer offset",
+            })?;
+        let updated = entry.mutable_flags | set;
+        if updated == entry.mutable_flags {
+            // Already marked. Skipping the write is not an optimisation — it
+            // keeps a repeated mark from being a repeated dirtying of a page
+            // that readers may be faulting.
+            return Ok(());
+        }
+        self.file
+            .overwrite_record_mutable_flags(word_offset, updated.to_le_bytes())?;
+        Ok(())
+    }
+
+    /// Whether the record at `record_offset` is marked dead.
+    ///
+    /// Frames the record and reads its footer, so this costs one record's
+    /// worth of positional reads. Reading a run of entries through
+    /// [`record_map`](Self::record_map) and asking each
+    /// [`RecordIndexEntry::is_dead`] costs the same framing once.
+    pub fn record_is_dead(&self, record_offset: u64) -> Result<bool> {
+        let entry = fault_record_entry(&self.snapshot, self.spec, record_offset, false)?;
+        Ok(entry.is_dead())
     }
 
     pub fn replace_fixed<T: VarveBlock>(&mut self, index: usize, block: &T) -> Result<u64> {
@@ -12692,6 +12888,88 @@ impl VarveFile {
     /// it. A slot that was not written is a slot a later open does not adopt —
     /// it names an older commit marker, the forward walk does not reach the end
     /// of the file, and the open falls back to the scan. Slow, never wrong.
+    /// Writes the liveness block's flags in place.
+    ///
+    /// Two callers and two values: a writer open sets `DIRTY`, and a clean
+    /// release clears it. Everything between is unchanged, which is the point —
+    /// this is not a heartbeat, it is a bracket.
+    fn write_liveness_flags(&mut self, flags: u16) -> Result<()> {
+        if self.spec.liveness_policy != LivenessPolicy::FooterFlags {
+            return Ok(());
+        }
+        let header_len = append_log_start_for_file(self)?;
+        let Some(extent) =
+            mutable_header_block_extent(header_len, &self.header_extensions, LIVENESS_MAGIC)?
+        else {
+            return Ok(());
+        };
+        let block = encode_liveness_block(flags);
+        // The payload only: the framing this seeks past is the magic and the
+        // declared length, which must not move.
+        self.file
+            .overwrite_header_region(extent.payload_offset, &block[8..])?;
+        // Kept in step so a later read of this handle's own cached region does
+        // not disagree with the file it just wrote.
+        let start = extent.payload_in_extensions;
+        if let Some(window) = self
+            .header_extensions
+            .get_mut(start..start + LIVENESS_PAYLOAD_LEN)
+        {
+            window.copy_from_slice(&block[8..]);
+        }
+        Ok(())
+    }
+
+    /// Takes the object: records whether the *previous* writer released it
+    /// cleanly, then marks it held by this one.
+    ///
+    /// Order matters and is the whole content of the mechanism — the read has
+    /// to happen before the write, or every open reports itself as the crash it
+    /// is looking for. Called only from a read-write open, because the question
+    /// "was this abandoned" is only answerable by somebody who could take the
+    /// object: a reader that finds the bit set cannot tell an abandoned file
+    /// from one a healthy writer is appending to right now.
+    fn mark_writer_open(&mut self) -> Result<()> {
+        if self.spec.liveness_policy != LivenessPolicy::FooterFlags {
+            return Ok(());
+        }
+        let header_len = append_log_start_for_file(self)?;
+        self.opened_after_crash = decode_liveness_flags(header_len, &self.header_extensions)?
+            .is_some_and(|flags| flags & LIVENESS_FLAG_DIRTY != 0);
+        self.write_liveness_flags(LIVENESS_FLAG_DIRTY)
+    }
+
+    /// Whether the writer that held this file before this handle died without
+    /// releasing it.
+    ///
+    /// The durable half of a crash verdict, and the half varve could not answer
+    /// before:
+    /// the other signal — "does the file end exactly at a commit point" — is
+    /// positional, describes only a suffix, and is truncated away by this very
+    /// open before anyone can ask.
+    ///
+    /// `false` for a read-only handle by construction: answering needs the
+    /// object lock this handle does not hold, and a set bit on a file a healthy
+    /// writer is appending to is not a crash.
+    pub const fn opened_after_crash(&self) -> bool {
+        self.opened_after_crash
+    }
+
+    /// Marks a clean release, and makes it durable before returning.
+    ///
+    /// The sync matters here and nowhere else in this pair: a cleared bit that
+    /// never reaches the platter reads as a crash, which costs a recovery pass
+    /// that had nothing to do. The *set* bit needs no such care, because the
+    /// direction it errs in is the safe one.
+    fn mark_writer_closed(&mut self) -> Result<()> {
+        if self.spec.liveness_policy != LivenessPolicy::FooterFlags {
+            return Ok(());
+        }
+        self.write_liveness_flags(0)?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+
     fn write_header_tails_if_needed(&mut self) {
         if self.mode != OpenMode::ReadWrite || !self.spec.index_policy.header_tails {
             return;
@@ -12709,7 +12987,9 @@ impl VarveFile {
         // on; if it is ever lifted, this needs the real header length.
         debug_assert!(!self.spec.has_matrix_blocks());
         let header_len = append_log_start_for_file(self)?;
-        let Some(extent) = mutable_header_block_extent(header_len, &self.header_extensions)? else {
+        let Some(extent) =
+            mutable_header_block_extent(header_len, &self.header_extensions, HEADER_TAILS_MAGIC)?
+        else {
             return Ok(());
         };
         let capacity = header_tails_capacity(self.spec);
@@ -14503,6 +14783,9 @@ fn file_header_extensions(spec: FormatSpec) -> Result<Vec<u8>> {
     if spec.index_policy.header_tails {
         payload.extend_from_slice(&encode_cold_header_tails_region(spec)?);
     }
+    if spec.liveness_policy == LivenessPolicy::FooterFlags {
+        payload.extend_from_slice(&encode_liveness_block(0));
+    }
     Ok(payload)
 }
 
@@ -14662,7 +14945,7 @@ struct HeaderExtensionBlock<'a> {
 /// The whole point of the walk: a magic that is not on this list is skipped,
 /// so a file carrying a block from a later release still opens here.
 fn is_known_header_extension_magic(magic: &[u8; 4]) -> bool {
-    magic == FILE_COMPRESSION_MAGIC || magic == HEADER_TAILS_MAGIC
+    magic == FILE_COMPRESSION_MAGIC || magic == HEADER_TAILS_MAGIC || magic == LIVENESS_MAGIC
 }
 
 /// Whether the file is allowed to disagree with this spec about the block's
@@ -14679,8 +14962,63 @@ fn is_known_header_extension_magic(magic: &[u8; 4]) -> bool {
 /// `expected == extensions` fast path in [`validate_file_header_extensions`],
 /// so every open walks the block list. It is a walk over a handful of blocks in
 /// a region under 64 KiB, once per open.
+/// The liveness block, framed, with its checksum.
+///
+/// Self-checking for the same reason the header-tail slot is: this is written
+/// in place while unlocked readers may be reading it, Windows offers no atomic
+/// regular-file write, and a torn one must read as "I cannot tell" rather than
+/// as a value. A torn block is treated as dirty — the conservative direction,
+/// because it makes recovery run when it might not have been needed rather than
+/// skip when it was.
+fn encode_liveness_block(flags: u16) -> [u8; 8 + LIVENESS_PAYLOAD_LEN] {
+    let mut block = [0u8; 8 + LIVENESS_PAYLOAD_LEN];
+    block[..4].copy_from_slice(LIVENESS_MAGIC);
+    block[4..8].copy_from_slice(&(LIVENESS_PAYLOAD_LEN as u32).to_le_bytes());
+    block[8..10].copy_from_slice(&LIVENESS_BLOCK_VERSION.to_le_bytes());
+    block[10..12].copy_from_slice(&flags.to_le_bytes());
+    let checksum = liveness_checksum(&block[8..12]);
+    block[12..16].copy_from_slice(&checksum.to_le_bytes());
+    block
+}
+
+/// Not gated on the `integrity` feature, unlike the record checksums.
+///
+/// Four bytes of header, written once per writer open and once per release, is
+/// not a place where a checksum is a cost worth declaring away — and the thing
+/// it protects is a *recovery decision*, which a format that declared no
+/// integrity policy needs just as much as one that did.
+fn liveness_checksum(bytes: &[u8]) -> u32 {
+    let mut hash = 2_166_136_261u32;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    hash
+}
+
+/// The liveness flags a file carries, or `None` if it carries no such block.
+///
+/// `Some(DIRTY)` for a torn or otherwise unreadable payload, deliberately: an
+/// unreadable mark is not evidence of a clean release.
+fn decode_liveness_flags(header_len: u64, extensions: &[u8]) -> Result<Option<u16>> {
+    let Some(extent) = mutable_header_block_extent(header_len, extensions, LIVENESS_MAGIC)? else {
+        return Ok(None);
+    };
+    let start = extent.payload_in_extensions;
+    let Some(payload) = extensions.get(start..start + LIVENESS_PAYLOAD_LEN) else {
+        return Ok(Some(LIVENESS_FLAG_DIRTY));
+    };
+    let version = u16::from_le_bytes([payload[0], payload[1]]);
+    let flags = u16::from_le_bytes([payload[2], payload[3]]);
+    let stored = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    if version != LIVENESS_BLOCK_VERSION || stored != liveness_checksum(&payload[..4]) {
+        return Ok(Some(LIVENESS_FLAG_DIRTY));
+    }
+    Ok(Some(flags))
+}
+
 fn is_mutable_header_extension_magic(magic: &[u8; 4]) -> bool {
-    magic == HEADER_TAILS_MAGIC
+    magic == HEADER_TAILS_MAGIC || magic == LIVENESS_MAGIC
 }
 
 /// Walk the extension region as a block sequence.
@@ -14762,19 +15100,24 @@ pub(crate) fn blank_mutable_header_bytes(
     header_len: u64,
     extensions: &[u8],
 ) -> Result<u64> {
-    let Some(extent) = mutable_header_block_extent(header_len, extensions)? else {
-        return Ok(0);
-    };
-    let Ok(start) = usize::try_from(extent.payload_offset) else {
-        return Ok(0);
-    };
-    // A caller's window may end inside the region, or before it starts.
-    let Some(window) = prefix.get_mut(start..) else {
-        return Ok(0);
-    };
-    let take = extent.payload_len.min(window.len());
-    window[..take].fill(0);
-    Ok(take as u64)
+    // Every mutable block, not the first. With two of them, blanking one left
+    // the other's bytes in the identity hash, and a single flip there would
+    // permanently invalidate every published sidecar for the file — the exact
+    // defect this function exists to prevent, reintroduced by a second block.
+    let mut blanked = 0u64;
+    for (_, extent) in mutable_header_block_extents(header_len, extensions)? {
+        let Ok(start) = usize::try_from(extent.payload_offset) else {
+            continue;
+        };
+        // A caller's window may end inside the region, or before it starts.
+        let Some(window) = prefix.get_mut(start..) else {
+            continue;
+        };
+        let take = extent.payload_len.min(window.len());
+        window[..take].fill(0);
+        blanked = blanked.saturating_add(take as u64);
+    }
+    Ok(blanked)
 }
 
 /// Where the mutable extension block's payload lives, as a file offset.
@@ -14797,12 +15140,20 @@ struct MutableHeaderExtent {
     payload_len: usize,
 }
 
-fn mutable_header_block_extent(
+/// Every mutable block's extent, in the order they sit in the region.
+///
+/// There is more than one now — the header-tail table and the liveness dirty
+/// bit — and the difference matters most to the *hasher*: the sidecar identity
+/// windows have to skip **all** of them, because a single unskipped mutable
+/// byte means one flip permanently invalidates every published sidecar for the
+/// file, which is the defect task #39 fixed when there was only one block.
+fn mutable_header_block_extents(
     header_len: u64,
     extensions: &[u8],
-) -> Result<Option<MutableHeaderExtent>> {
+) -> Result<Vec<([u8; 4], MutableHeaderExtent)>> {
+    let mut found = Vec::new();
     if extensions.is_empty() {
-        return Ok(None);
+        return Ok(found);
     }
     // The region sits at the end of the header, so its start is the header's
     // length less its own. Deriving it rather than recomputing the header
@@ -14835,13 +15186,28 @@ fn mutable_header_block_extent(
                     .map_err(|_| Error::InvalidCompressionHeader)?,
             )
             .ok_or(Error::InvalidCompressionHeader)?;
-        return Ok(Some(MutableHeaderExtent {
-            payload_offset,
-            payload_in_extensions,
-            payload_len,
-        }));
+        found.push((
+            block.magic,
+            MutableHeaderExtent {
+                payload_offset,
+                payload_in_extensions,
+                payload_len,
+            },
+        ));
     }
-    Ok(None)
+    Ok(found)
+}
+
+/// One named mutable block's extent, for a writer that needs to hit exactly it.
+fn mutable_header_block_extent(
+    header_len: u64,
+    extensions: &[u8],
+    magic: &[u8; 4],
+) -> Result<Option<MutableHeaderExtent>> {
+    Ok(mutable_header_block_extents(header_len, extensions)?
+        .into_iter()
+        .find(|(found, _)| found == magic)
+        .map(|(_, extent)| extent))
 }
 
 /// The extension region to write into the file a `replace_*` builds.
@@ -17490,7 +17856,8 @@ fn read_header_tails(
     header_len: u64,
     extensions: &[u8],
 ) -> Result<OpenDigest> {
-    let Some(extent) = mutable_header_block_extent(header_len, extensions)? else {
+    let Some(extent) = mutable_header_block_extent(header_len, extensions, HEADER_TAILS_MAGIC)?
+    else {
         return Err(Error::InvalidIndexSegment);
     };
     let payload = extensions

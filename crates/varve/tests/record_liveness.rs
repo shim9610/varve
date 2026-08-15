@@ -38,7 +38,7 @@ struct Reading {
 // A footer-bearing format, because the word lives in the footer.
 varve_format! {
     pub struct Off {
-        magic: b"VLIVEOFF";
+        magic: b"VRDEADA1";
         version: 1;
         endian: little;
         schema_hash: computed;
@@ -51,7 +51,7 @@ varve_format! {
 
 varve_format! {
     pub struct On {
-        magic: b"VLIVEOFF";
+        magic: b"VRDEADB1";
         version: 1;
         endian: little;
         schema_hash: computed;
@@ -67,7 +67,7 @@ varve_format! {
 // footer placement is supposed to leave alone.
 varve_format! {
     pub struct OnWithHeaderCrc {
-        magic: b"VLIVEOFF";
+        magic: b"VRDEADC1";
         version: 1;
         endian: little;
         schema_hash: computed;
@@ -203,4 +203,199 @@ fn it_is_refused_where_there_is_no_footer() {
         matches!(error, varve::Error::InvalidFormatSpec(message) if message.contains("footer")),
         "the refusal must name the footer",
     );
+}
+
+/// The mark is durable, advisory, and does not disturb the record.
+#[test]
+fn a_marked_record_stays_readable_and_says_it_is_dead() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("mark.varve");
+
+    let mut writer = varve::VarveWriter::create(On::spec(), &path)?;
+    let mut offsets = Vec::new();
+    for value in 0..6 {
+        offsets.push(writer.push_info(&Reading { value })?.record_offset);
+    }
+    writer.flush()?;
+    let before = std::fs::metadata(&path)?.len();
+
+    writer.mark_record_dead(offsets[2])?;
+    writer.flush()?;
+    drop(writer);
+
+    // The file did not grow: the mark is four bytes rewritten in place.
+    assert_eq!(std::fs::metadata(&path)?.len(), before);
+
+    // It survives a reopen, and it is the only record marked.
+    let spec = On::spec();
+    let spec = spec.with_read_limits(
+        spec.read_limits
+            .with_integrity_verification(varve::IntegrityVerification::AtOpen),
+    );
+    let file = varve::VarveFile::open_readonly(spec, &path)?;
+    for (index, offset) in offsets.iter().enumerate() {
+        assert_eq!(
+            file.record_is_dead(*offset)?,
+            index == 2,
+            "record {index} liveness",
+        );
+    }
+
+    // Advisory: the record is still there, still read back, still correct.
+    let readings: Vec<Reading> = file
+        .blocks::<Reading>()?
+        .iter()
+        .collect::<varve::Result<_>>()?;
+    assert_eq!(readings.len(), 6);
+    assert_eq!(readings[2], Reading { value: 2 });
+    Ok(())
+}
+
+/// A format that did not opt in has no word to write, and says so.
+#[test]
+fn marking_is_refused_without_the_policy() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("nopolicy.varve");
+    let mut writer = varve::VarveWriter::create(Off::spec(), &path)?;
+    let offset = writer.push_info(&Reading { value: 0 })?.record_offset;
+    writer.flush()?;
+    assert!(matches!(
+        writer.mark_record_dead(offset),
+        Err(varve::Error::InvalidFormatSpec(_))
+    ));
+    Ok(())
+}
+
+/// Marking an internal record would make a defragmenter drop the records that
+/// say where the commit boundary is.
+#[test]
+fn an_internal_record_cannot_be_marked() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("internal.varve");
+    let mut writer = varve::VarveWriter::create(On::spec(), &path)?;
+    writer.push(&Reading { value: 0 })?;
+    writer.flush()?;
+    drop(writer);
+
+    // The commit marker `on_flush` wrote is the last record in the file.
+    let file = varve::VarveFile::open_readonly(On::spec(), &path)?;
+    let mut buffer = Vec::new();
+    let mut walk = file.record_map(&mut buffer)?;
+    let mut marker = None;
+    while let Some(entry) = walk.advance()? {
+        if entry.block_id == varve::COMMIT_BLOCK_ID {
+            marker = Some(entry.record_offset);
+        }
+    }
+    drop(file);
+    let marker = marker.expect("on_flush wrote a commit marker");
+
+    let mut writer = varve::VarveWriter::open(On::spec(), &path)?;
+    assert!(matches!(
+        writer.mark_record_dead(marker),
+        Err(varve::Error::ReservedBlockId(_))
+    ));
+    Ok(())
+}
+
+/// A clean release clears the dirty bit; an abandoned object leaves it set.
+///
+/// **What is simulated, and what is not.** A killed process releases the OS
+/// object lock — the descriptor closes at exit — while leaving the header bit
+/// set, and that combination is the whole verdict. The harness cannot kill a
+/// process and keep its page cache, and leaking the handle is not a substitute:
+/// `mem::forget` leaks the *lock* too, so the next open is refused by the lock
+/// before the bit is ever consulted. (That refusal is itself correct, and it is
+/// the two halves working together.) So the on-disk *state* is written by hand
+/// here, the way `header_tail_region.rs` writes a torn slot by hand.
+///
+/// The patch deliberately does not import the writer's encoder: a test that
+/// recomputes the layout is the only one that can catch the writer changing it.
+#[test]
+fn a_clean_close_is_told_apart_from_an_abandoned_one() -> varve::Result<()> {
+    /// FNV-1a 32, restated rather than imported.
+    fn checksum(bytes: &[u8]) -> u32 {
+        let mut hash = 2_166_136_261u32;
+        for byte in bytes {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(16_777_619);
+        }
+        hash
+    }
+
+    /// Sets the liveness block's DIRTY flag, in place, by finding its magic.
+    ///
+    /// The fixtures above deliberately do not begin with `VLIV`: they did, and
+    /// this search matched the *file magic* at offset 0 and patched the
+    /// container marker, which failed as `UnsupportedContainer` several layers
+    /// away from the cause.
+    fn abandon(path: &std::path::Path) -> varve::Result<()> {
+        let mut bytes = std::fs::read(path)?;
+        let at = bytes
+            .windows(4)
+            .position(|window| window == b"VLIV")
+            .expect("a liveness format writes a VLIV block");
+        // `magic(4) | len(4) | version(2) | flags(2) | crc(4)`
+        let payload = at + 8;
+        bytes[payload..payload + 2].copy_from_slice(&1u16.to_le_bytes());
+        bytes[payload + 2..payload + 4].copy_from_slice(&1u16.to_le_bytes());
+        let crc = checksum(&bytes[payload..payload + 4]);
+        bytes[payload + 4..payload + 8].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(path, &bytes)?;
+        Ok(())
+    }
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("dirty.varve");
+
+    let mut writer = varve::VarveWriter::create(On::spec(), &path)?;
+    writer.push(&Reading { value: 0 })?;
+    writer.flush()?;
+    assert!(
+        !writer.opened_after_crash(),
+        "a freshly created file has no predecessor to have crashed",
+    );
+    drop(writer);
+
+    // A clean predecessor reads as clean.
+    let second = varve::VarveWriter::open(On::spec(), &path)?;
+    assert!(
+        !second.opened_after_crash(),
+        "the previous writer released cleanly",
+    );
+    drop(second);
+
+    // The state a killed writer leaves: lock gone, bit set.
+    abandon(&path)?;
+    let third = varve::VarveWriter::open(On::spec(), &path)?;
+    assert!(
+        third.opened_after_crash(),
+        "an object whose writer never released must read as abandoned",
+    );
+    drop(third);
+
+    // And the verdict is not sticky: the third writer released cleanly, so the
+    // fourth sees a clean predecessor. This is the assertion that catches a
+    // `mark_writer_closed` that never runs.
+    let fourth = varve::VarveWriter::open(On::spec(), &path)?;
+    assert!(!fourth.opened_after_crash(), "the verdict is not sticky");
+    Ok(())
+}
+
+/// A read-only handle never answers the crash question.
+///
+/// It cannot: answering needs the object lock it does not hold, and a set bit
+/// on a file a healthy writer is appending to right now is not a crash.
+#[test]
+fn a_reader_does_not_claim_a_crash_verdict() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("reader.varve");
+    let mut writer = varve::VarveWriter::create(On::spec(), &path)?;
+    writer.push(&Reading { value: 0 })?;
+    writer.flush()?;
+    drop(writer);
+
+    let reader = varve::VarveFile::open_readonly(On::spec(), &path)?;
+    assert!(!reader.opened_after_crash());
+    Ok(())
 }

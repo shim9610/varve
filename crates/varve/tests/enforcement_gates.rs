@@ -469,7 +469,7 @@ fn every_reserved_block_id_is_in_the_internal_list() {
 }
 
 #[test]
-fn the_primary_record_handle_is_only_written_through_its_three_gated_operations() {
+fn the_primary_record_handle_is_only_written_through_its_four_gated_operations() {
     let source = crate_source("file.rs");
     assert!(
         source.contains("    file: RecordFile,"),
@@ -504,13 +504,24 @@ fn the_primary_record_handle_is_only_written_through_its_three_gated_operations(
             "`{bypass}` writes or positions the primary handle directly; record bytes may only \
              be placed by `RecordFile::append_record_at_end` (which seeks to the end itself) or \
              by `RecordFile::overwrite_indexed_record` (which consumes a `RecordOverwrite`), \
-             and header bytes only by `RecordFile::overwrite_header_region`"
+             header bytes only by `RecordFile::overwrite_header_region`, and a footer's mutable \
+             word only by `RecordFile::overwrite_record_mutable_flags`"
         );
     }
     // The gate above forbids a bypass; it does not notice a *new gated method*,
     // and adding one is exactly how the module's guarantee widens without
-    // anyone deciding to widen it. So count them: three today, and a fourth
-    // has to be argued for here before it can exist.
+    // anyone deciding to widen it. So count them: four today, and a fifth has
+    // to be argued for here before it can exist.
+    //
+    // The fourth is `overwrite_record_mutable_flags`, and the argument for it
+    // is that it is the narrowest write in the module. It takes `[u8; 4]`
+    // rather than a slice, so no run of record bytes fits through it; the four
+    // bytes it writes are the footer's trailing word, which
+    // `LivenessPolicy::FooterFlags` excludes from the record checksum; and it
+    // is the only way varve mutates a record without rewriting it. Routing it
+    // through `overwrite_header_region` instead would have been a lie about
+    // what that method touches, and reusing `overwrite_indexed_record` would
+    // have meant re-encoding a header and payload to change four bytes.
     let gated: Vec<&str> = gate
         .lines()
         .filter_map(|line| line.trim().strip_prefix("pub(super) fn "))
@@ -518,14 +529,17 @@ fn the_primary_record_handle_is_only_written_through_its_three_gated_operations(
         .filter(|name| {
             matches!(
                 *name,
-                "append_record_at_end" | "overwrite_indexed_record" | "overwrite_header_region"
+                "append_record_at_end"
+                    | "overwrite_indexed_record"
+                    | "overwrite_header_region"
+                    | "overwrite_record_mutable_flags"
             )
         })
         .collect();
     assert_eq!(
         gated.len(),
-        3,
-        "`mod record_file` must expose exactly the three writes this gate names, and no other: \
+        4,
+        "`mod record_file` must expose exactly the four writes this gate names, and no other: \
          found {gated:?}"
     );
     // Comment-stripped, because the fields carry doc comments and a gate that
