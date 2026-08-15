@@ -1094,8 +1094,10 @@ not a live view: between two calls the handle is still a fixed snapshot.
 ### 4.2b Nothing tells a reader that its generation was replaced
 
 `follow()` advances a handle along the object it opened. The replacement paths
-(`replace_block`, `replace_rewrite`, and any future compaction) publish by
-writing a new file and renaming it over the pathname, and a handle that was open
+(`replace_fixed`, `replace_block`, `replace_rewrite`, and any future compaction)
+publish by writing a new file and renaming it over the pathname — `replace_fixed`
+included, which copies the generation and patches one same-length record in the
+copy, so it moves no offset but still leaves the old object behind. A handle open
 across that keeps reading the old object — which is what makes a republish safe
 for readers in flight, and is measured: a handle holding 21 records read them all
 back, unchanged and without error, after the pathname had been replaced.
@@ -1109,17 +1111,20 @@ not:
   handle that is following the tail can see it, because a handle's snapshot
   length is fixed and a record past that length is outside it. A handle that
   never calls `follow()` never sees the marker.
-- **A flag or magic word in the file header.** The header is read at open and at
-  no other time — five call sites, all of them opens — so a live handle never
-  reads it again. It would inform only a *new* open, which already resolves the
-  pathname to the current generation anyway.
+- **A flag or magic word in the file header.** No read a live handle performs
+  goes near it. Of the eight sites that read the header, five are the opens
+  themselves; the other three are a generation check on the `replace_*` paths
+  and the two disk-index sidecar windows behind `high-cardinality-dev`, and all
+  three re-read the file rather than consulting a handle. So a flag there would
+  inform only a *new* open, which already resolves the pathname to the current
+  generation anyway.
 
 Both cover exactly the handles that are already in a polling loop, and neither
 covers the rest. What each shape of reader actually needs:
 
 | Reader | Calls `follow()` | How it learns |
 | --- | --- | --- |
-| Streaming loop | yes | `follow()` returning `0` means *either* "nothing appended" or "this generation is finished"; `is_current()` separates them, on a path that is idle by definition |
+| Streaming loop | yes | `follow()` returning `0` does not say which of its reasons applies — "nothing appended", "appended but not yet committed", or "this generation is finished"; `is_current()` separates the last from the other two, on a path that is idle by definition |
 | Opens, reads, closes | no | **Not affected.** Every open resolves the pathname to the current generation |
 | Long-lived, read-only, no loop | no | **Nothing informs it.** The application decides when freshness matters and calls `is_current()` — a timer, a user action, a filesystem watch |
 | Shared `Arc<VarveFile>` | owner only | The owner polls and swaps in `reopen_readonly()`; readers hold `&self` throughout |

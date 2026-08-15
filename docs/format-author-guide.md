@@ -552,7 +552,11 @@ a resume must not cost memory proportional to the file. So `blocks::<T>()` and
 `mmap_payloads` refuse with `NoResidentDirectory`, and `record_map` is how you
 walk records. Keyed lookups work: `key_tail_offsets` rebuilds from the chains at
 a cost bounded by the keyed records rather than by the file, which is what makes
-a keyed resume on a 600,000-record file affordable.
+a keyed resume on a 600,000-record file affordable. Bounded by the keyed records
+*and by every tombstone in the file*: deletions are their own block with their
+own chain, one chain shared by all keyed blocks, and the rebuild walks it whole
+because it cannot know which entries belong to the block being asked about
+without decoding them.
 
 **What it refuses.** A format declaring matrix blocks (the matrix layout sits at
 a fixed offset after the header, which the region moves), and

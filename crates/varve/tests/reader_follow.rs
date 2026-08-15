@@ -217,6 +217,7 @@ fn a_follow_stops_at_the_commit_boundary_an_open_stops_at() -> varve::Result<()>
         writer.push(&Reading { value })?;
     }
     writer.commit()?;
+    let committed_len = std::fs::metadata(&path)?.len();
 
     let mut reader = varve::VarveFile::open_readonly(spec, &path)?;
     let committed = records(&reader)?;
@@ -226,7 +227,14 @@ fn a_follow_stops_at_the_commit_boundary_an_open_stops_at() -> varve::Result<()>
         writer.push(&Reading { value })?;
     }
     writer.flush()?;
-    assert!(std::fs::metadata(&path)?.len() > 0);
+    // The premise this test rests on: the uncommitted run really did reach the
+    // file, so the `0` below is "not committed" rather than "not written". The
+    // assertion here was `len() > 0`, which is true of every file this test can
+    // produce and therefore established nothing.
+    assert!(
+        std::fs::metadata(&path)?.len() > committed_len,
+        "the uncommitted tail must have reached the file to be worth refusing",
+    );
 
     assert_eq!(
         reader.follow()?,
@@ -769,26 +777,63 @@ fn a_reopen_keeps_the_route_the_handle_was_using() -> varve::Result<()> {
 }
 
 /// The reader wrapper carries both, and `reopen` there is `&self` too.
+///
+/// Through a republish, because without one every assertion here holds on an
+/// unmodified file: `is_current` is `true` either way, and a `reopen` that did
+/// nothing at all would still hand back a handle with the same record count.
+/// The republish is what makes the pair mean anything.
 #[test]
 fn the_reader_wrapper_exposes_the_pair() -> varve::Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("wrapper.varve");
 
     let mut writer = spec().create(&path)?;
+    writer.push(&Label {
+        text: "original".into(),
+    })?;
     for value in 0..10 {
         writer.push(&Reading { value })?;
     }
     writer.flush()?;
     drop(writer);
 
+    let label = |reader: &varve::VarveReader| -> varve::Result<String> {
+        let mut labels = Vec::new();
+        reader.decode_blocks_into::<Label>(&mut labels)?;
+        Ok(labels.last().expect("a Label").text.clone())
+    };
+
     let reader = varve::VarveReader::open(spec(), &path)?;
     assert!(reader.is_current()?);
+    let held = reader.blocks::<Reading>()?.len();
+    assert_eq!(label(&reader)?, "original");
+
+    // Same object, so the reopen agrees with the original about everything.
     let again = reader.reopen()?;
     assert!(again.is_current()?);
-    assert_eq!(
-        again.blocks::<Reading>()?.len(),
-        reader.blocks::<Reading>()?.len()
-    );
+    assert_eq!(again.blocks::<Reading>()?.len(), held);
+
+    let mut writer = varve::VarveWriter::open(spec(), &path)?;
+    writer.replace_block(
+        0,
+        &Label {
+            text: "a replacement long enough to move every record after it".into(),
+        },
+    )?;
+    drop(writer);
+
+    // Now the two answers separate: the wrapper reports the generation it holds
+    // is superseded, keeps serving it, and the reopen lands on the new one.
+    assert!(!reader.is_current()?);
+    assert_eq!(reader.blocks::<Reading>()?.len(), held);
+    assert_eq!(label(&reader)?, "original");
+
+    let moved = reader.reopen()?;
+    assert!(moved.is_current()?);
+    assert!(label(&moved)?.starts_with("a replacement"));
+    // Same records — the replacement moved every one of them, and the reopened
+    // handle found them all at their new offsets.
+    assert_eq!(moved.blocks::<Reading>()?.len(), held);
     Ok(())
 }
 
@@ -941,14 +986,25 @@ fn a_handle_that_never_follows_reads_on_without_being_told() -> varve::Result<()
     Ok(())
 }
 
-/// The superseded object stays on disk while a handle holds it.
+/// The superseded object stays readable through its handle after the pathname
+/// has shrunk.
 ///
 /// An unlinked file is freed when its last descriptor closes, so a compaction
 /// that halves a file frees nothing until the readers of the old one let go.
 /// That is the second cost of a forgotten handle, next to staleness, and it is
 /// the one that does not announce itself at all.
+///
+/// **What this measures, and what it does not.** It measures that the directory
+/// listing shrank and that the handle still reads its whole generation back
+/// afterwards — which is the observable half, and the half a regression would
+/// break. It does *not* measure the blocks still allocated on the device, nor
+/// anything after the drop: the old object is unlinked, so it is absent from
+/// the very listing this sums, and reaching its allocation would mean a
+/// filesystem-level free-space reading that is shared with everything else on
+/// the volume. The name said "keeps its bytes until the handle drops" and
+/// neither of those two clauses was ever asserted.
 #[test]
-fn a_held_generation_keeps_its_bytes_until_the_handle_drops() -> varve::Result<()> {
+fn a_shrunk_pathname_leaves_a_held_generation_whole() -> varve::Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("bytes.varve");
 

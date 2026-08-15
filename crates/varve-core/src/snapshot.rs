@@ -66,19 +66,18 @@ impl SnapshotFile {
     /// Rebinds to an arbitrary length, paying the `fstat` that proves the file
     /// reaches it.
     ///
-    /// Only the scalable family shrinks or re-pins a snapshot this way
-    /// (`stream.rs`, behind `high-cardinality-dev`); the append path uses
-    /// [`Self::with_written_len`], which proves the same fact from the write
-    /// that just returned and issues no syscall. Gated rather than left to warn
-    /// under default features: a bare warning is indistinguishable from a
-    /// genuinely orphaned method, and this one has callers.
-    #[cfg_attr(
-        not(any(test, feature = "high-cardinality-dev")),
-        allow(
-            dead_code,
-            reason = "the only callers are in `stream.rs`, behind `high-cardinality-dev`"
-        )
-    )]
+    /// Two callers, and they are the two places a snapshot moves to a length
+    /// nobody just wrote: the scalable family, which shrinks or re-pins one
+    /// (`stream.rs`, behind `high-cardinality-dev`), and `VarveFile::follow`,
+    /// which extends a read-only handle to a length a *different* process
+    /// wrote. The append path uses [`Self::with_written_len`] instead, which
+    /// proves the same fact from the write that just returned and issues no
+    /// syscall.
+    ///
+    /// It carried a `dead_code` exemption naming `stream.rs` as the only
+    /// caller, which stopped being true when `follow` landed — and `follow` is
+    /// ungated, so the exemption was suppressing a lint that no longer fires
+    /// under any configuration.
     pub(crate) fn with_len(&self, len: u64) -> Result<Self> {
         let bounds = checked_snapshot_bounds(&self.file, len)?;
         Ok(Self {

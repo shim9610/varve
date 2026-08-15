@@ -1380,6 +1380,27 @@ pub(crate) mod resident_index {
             Ok(ReservedIndexSlot(()))
         }
 
+        /// Reserves room for a whole run before any of it is installed.
+        ///
+        /// The append path grows by one and uses [`Self::reserve`], where a
+        /// refusal has nothing to undo. `follow` installs a run, and failing
+        /// partway through one would leave the directory describing records
+        /// the handle's snapshot does not reach — and a second `follow` would
+        /// then re-frame the same bytes and install them again, because the
+        /// snapshot it resumes from never moved. So every fallible step there
+        /// has to happen before the first `install`. `Vec::try_reserve` does
+        /// nothing when the capacity is already sufficient, which is exactly
+        /// what makes the per-entry `reserve` calls after this one unable to
+        /// fail.
+        pub(crate) fn reserve_run(&mut self, additional: usize, index_bytes: u64) -> Result<()> {
+            self.slots
+                .try_reserve(additional)
+                .map_err(|_| super::Error::AllocationFailed {
+                    resource: "record index",
+                    requested: index_bytes,
+                })
+        }
+
         /// Installs the record into capacity that is already reserved.
         ///
         /// Infallible and allocation-free by construction: this is the only
@@ -7669,6 +7690,19 @@ impl VarveFile {
     /// `false` also for a pathname that no longer exists: the handle is still
     /// readable, but nothing at that name is it.
     ///
+    /// # `false` does not always mean "republished"
+    ///
+    /// It means "this name did not resolve to my object", and *any* failure to
+    /// reach the name produces it — a descriptor limit, a permission change, a
+    /// filesystem that went away. This never errs toward calling a stale handle
+    /// fresh, which is the direction that matters, but it does mean a caller
+    /// must not treat `false` as proof that a newer generation is there to be
+    /// had. Concretely: if [`reopen_readonly`](Self::reopen_readonly) then
+    /// fails, keep the handle you have and ask again later. It is still a
+    /// complete, self-consistent view; discarding it because a transient
+    /// `open` failed loses a working reader to a condition that has already
+    /// passed.
+    ///
     /// **This is a question, not a subscription.** Varve does not check on
     /// every read — the check is a syscall and reads are the path that must
     /// stay cheap and take `&self` — so a handle that never asks is never told.
@@ -7704,6 +7738,14 @@ impl VarveFile {
         //
         // Same shape as `path_resolves_to_object`, which this is the public
         // half of: a name we cannot open is not this object.
+        //
+        // The cost of "any" is that a *transient* failure — a descriptor limit,
+        // a permission change, a network filesystem blip — is reported as
+        // "not current" too, and the caller cannot tell it from a republish.
+        // That is the safe direction to be wrong in (it never claims a stale
+        // handle is fresh), and the rustdoc tells callers what to do about it:
+        // a `reopen_readonly` that then fails is a reason to keep the handle
+        // and retry, not to discard it.
         Ok(path_resolves_to_object(&self.path, &mine))
     }
 
@@ -7760,13 +7802,24 @@ impl VarveFile {
     ///
     /// Returns the bytes gained.
     ///
-    /// # `0` means two different things
+    /// # `0` is not one answer
     ///
-    /// Either nothing was appended, or this handle's generation is finished —
-    /// the pathname was republished and the object this handle holds will never
-    /// grow again, so every later call answers `0` too.
-    /// [`is_current`](Self::is_current) is what separates them, and a streaming
-    /// reader asks it exactly here, on a path that is idle by definition:
+    /// Four things produce it, and the return value does not say which:
+    ///
+    /// 1. Nothing was appended.
+    /// 2. Bytes were appended but no commit boundary covers them yet — see
+    ///    *Uncommitted records* below.
+    /// 3. This handle's generation is finished: the pathname was republished
+    ///    and the object this handle holds will never grow again, so every
+    ///    later call answers `0` too.
+    /// 4. This is a read-write handle, which gains nothing — see the last
+    ///    section.
+    ///
+    /// Only (3) is a reason to do something, and only (3) is durable; (1) and
+    /// (2) both resolve on their own when the writer gets there.
+    /// [`is_current`](Self::is_current) is what separates it from the rest, and
+    /// a streaming reader asks it exactly here, on a path that is idle by
+    /// definition:
     ///
     /// ```text
     /// if reader.follow()? == 0 {
@@ -7874,31 +7927,48 @@ impl VarveFile {
             // Up front rather than inside the loop because the loop mutates
             // `self`: refusing on the tenth entry left nine installed and the
             // snapshot un-advanced, which is an index describing records the
-            // snapshot does not reach. Charging the whole run first makes *this*
-            // refusal leave the handle as it was.
+            // snapshot does not reach — and, worse, a second `follow` would
+            // then re-frame the same bytes from the same unmoved `from` and
+            // install them a second time.
             //
-            // Not every refusal. `reserve` can still fail on allocation partway
-            // through the loop and leave the same shape behind — that path is
-            // an OOM and is not made reachable by any input, but the claim here
-            // is about the ceiling, not about the loop being infallible.
+            // Which is why *every* fallible step of the run is here rather than
+            // only the ceilings. The loop below has no failure to leave a
+            // half-installed run behind, and that is a property of its shape
+            // rather than of how unlikely each call is to fail:
+            //
+            //   - the two ceilings, charged once for the whole run;
+            //   - the run's index capacity, in one `try_reserve`, which makes
+            //     each per-entry `reserve` a no-op that cannot allocate;
+            //   - each entry's physical end, so the loop can use the saturating
+            //     `physical_end` and carry no `?` at all.
             //
             // `ScanBytes` is deliberately *not* charged — that exemption is the
             // point of the zero prefix charge above and is documented on
             // `scan_records_range`. These two bound the handle's resident
             // footprint, which is a different claim.
-            let held =
-                u64::try_from(self.index.len().saturating_add(framed.len())).map_err(|_| {
-                    Error::ResourceArithmeticOverflow {
-                        resource: "record count",
-                    }
-                })?;
+            let holding = self.index.len().saturating_add(framed.len());
+            let held = u64::try_from(holding).map_err(|_| Error::ResourceArithmeticOverflow {
+                resource: "record count",
+            })?;
             self.spec.read_limits.check(ReadLimitKey::Records, held)?;
-            self.spec.read_limits.check(
-                ReadLimitKey::IndexBytes,
-                index_bytes_for_count(self.index.len().saturating_add(framed.len()))?,
-            )?;
+            let index_bytes = index_bytes_for_count(holding)?;
+            self.spec
+                .read_limits
+                .check(ReadLimitKey::IndexBytes, index_bytes)?;
+            self.index.reserve_run(framed.len(), index_bytes)?;
+            for entry in &framed {
+                // Never fails: the scan advances its own walk by exactly this
+                // value on every entry it frames, so each one already succeeded
+                // once. Proving it *here* is what lets the loop below use the
+                // saturating form.
+                entry.checked_physical_end()?;
+            }
             for entry in &framed {
                 let length = self.index.len();
+                // Also never fails, for the two reasons above: the capacity is
+                // already reserved, and `index_bytes_for_count` is monotonic
+                // and already succeeded at `holding`, which is at least
+                // `length + 1`.
                 let slot = self
                     .index
                     .reserve(|| index_bytes_for_count(length.saturating_add(1)))?;
@@ -7906,11 +7976,8 @@ impl VarveFile {
                 let position = self.index.len() - 1;
                 self.checkpoint_cadence
                     .note_appended(position, entry.block_id);
-                self.segment_cursor.note_appended(
-                    position,
-                    entry.block_id,
-                    entry.checked_physical_end()?,
-                );
+                self.segment_cursor
+                    .note_appended(position, entry.block_id, entry.physical_end());
             }
         }
         self.snapshot = snapshot;
@@ -11473,11 +11540,12 @@ impl VarveFile {
     pub unsafe fn mmap_payloads(&self) -> Result<MmapPayloads> {
         // The index this maps is the *resident* one, and a lazily opened handle
         // deliberately has none. Without this the answer was `Ok` with zero
-        // entries on a file holding hundreds of thousands of records —
-        // `is_empty()` true, every window `None`, no error anywhere. Refusing by
-        // name is what every other directory-needing read does, and it is the
-        // difference between "this handle cannot answer that" and "there is
-        // nothing here".
+        // entries — `is_empty()` true, every window `None`, no error anywhere.
+        // Measured on the fixture that pins it, which holds sixty-five records;
+        // the count is not what makes it wrong, but it is what was measured.
+        // Refusing by name is what every other directory-needing read does, and
+        // it is the difference between "this handle cannot answer that" and
+        // "there is nothing here".
         let _ = self.resident_directory("mmap_payloads")?;
         let mapped_len = self.snapshot.len();
         // `MmapLen` alone. `FileLen` was checked here too, against the same

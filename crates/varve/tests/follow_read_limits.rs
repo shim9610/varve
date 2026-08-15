@@ -81,8 +81,12 @@ fn a_follow_is_refused_by_the_ceiling_that_refuses_an_open() -> varve::Result<()
         "a follow past the ceiling must be refused, not granted",
     );
 
-    // And *this* refusal leaves the handle exactly as it was: charging after
+    // And the refusal leaves the handle exactly as it was: charging after
     // installing left entries in the index that the snapshot did not reach.
+    // That now holds for every refusal in `follow`, not only this one — the
+    // ceilings, the run's index capacity and each entry's physical end are all
+    // settled before the first entry is installed, so nothing in the install
+    // loop can fail partway through it.
     assert_eq!(n(&reader)?, held);
     assert!(reader.blocks::<Reading>().is_ok());
     Ok(())

@@ -18,17 +18,28 @@
 //!
 //! What this file pins, in order: the option is inert when off; turning it on
 //! changes the schema hash, because it moves every record offset in the file;
-//! the region's length is fixed by the declaration alone; a commit warms
-//! exactly one slot; a byte past the commit point, a table naming an older
-//! marker, a `commit_offset` naming a data record, and a tail naming another
-//! block's record are each refused; every field the slot decoder checks beyond
-//! the checksum takes the table out of use, and so does a slot that says it
-//! overflowed; a torn slot is skipped and the other one answers; a writer
-//! resumed from the header appends a chain the scan agrees with, continues the
-//! sequence, and keeps rewriting the region; an in-place fixed replacement
-//! keeps the table warm where a republishing one resets it; a file with records
-//! past its last marker is truncated by the fallback rather than resumed from;
-//! `crc32_with_header` works as well as `crc32`; and the refusals.
+//! the DSL keyword produces the builder policy; the region's length is fixed by
+//! the declaration alone; a commit warms exactly one slot; the contents may
+//! drift but the framing may not; the published layout plan describes the
+//! header the writer actually writes; a lazy open reads its tails from the
+//! header, at a cost that does not move with the file, and a non-resident
+//! block's tail is in the region too; a byte past the commit point, a table
+//! naming an older marker, a `commit_offset` naming a data record, and a tail
+//! naming another block's record are each refused; every field the slot decoder
+//! checks beyond the checksum takes the table out of use, and so does a slot
+//! that says it overflowed; a torn slot is skipped and the other one answers; a
+//! writer resumed from the header appends a chain the scan agrees with,
+//! continues the sequence, and keeps rewriting the region; the region write is
+//! one seek per commit point; such a file can still be mapped, while a lazily
+//! opened handle refuses to map rather than answering empty; an in-place fixed
+//! replacement keeps the table warm where a republishing one resets it; a file
+//! with records past its last marker is truncated by the fallback rather than
+//! resumed from; `crc32_with_header` works as well as `crc32`; and the
+//! refusals.
+//!
+//! That list is maintained by hand and had drifted by nine tests before this
+//! sweep, so treat a name missing from it as a stale sentence rather than as a
+//! test that is not here.
 //!
 //! The one combination not here is `segment_on_flush`, which needs its own
 //! declaration and has `header_tails_segment_combo.rs`.
