@@ -1120,6 +1120,55 @@ pub enum IntegrityPolicy {
     Crc32WithHeader,
 }
 
+/// Whether a record can be marked dead after it was written.
+///
+/// Every other way a varve record stops being the answer is either keyed — a
+/// tombstone names a block id and a *key*, never an offset — or destructive,
+/// where a `replace_*` publishes a whole new generation in which the record
+/// simply is not there. A block with no key had no way to say "this record is
+/// dead" at all, and that is what a defragmenting rewrite needs to be told.
+///
+/// # `FooterFlags`: the last word of the record footer, outside the checksum
+///
+/// The footer already ends with two fields that are written as zero and
+/// validated as zero — a `crc32` placeholder that never held a checksum, and a
+/// `reserved` word. This policy turns the trailing `reserved` word into a
+/// mutable flag word, and takes it **out of the record checksum**, which is
+/// what makes it writable after the fact:
+///
+/// - the record's own checksum stays valid when a flag is set, so nothing has
+///   to re-read the payload to recompute a CRC;
+/// - `IntegrityPolicy::Crc32WithHeader` is unaffected, because the mutable word
+///   is in the footer and that policy covers the *header*;
+/// - a reader holding a resident index does not disagree with the disk, because
+///   the seven fields that establish a record's identity are all header fields.
+///
+/// The cost is that the word is unauthenticated: a flipped bit there is not
+/// detected by anything. That is the honest trade for a field that must be
+/// writable without rewriting the record, and it is why the flags are advisory
+/// — a set flag says "the writer marked this dead", never "these bytes are
+/// corrupt".
+///
+/// # What it costs to turn on
+///
+/// **No bytes.** The word is already in every footer this format writes; only
+/// its meaning and its checksum coverage change. But turning it on changes the
+/// schema hash, because excluding four bytes from the checksum changes the
+/// checksum of every record — an existing file does not open under it.
+///
+/// Requires a record footer, for the obvious reason that there is nowhere to
+/// put the word without one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LivenessPolicy {
+    /// The trailing footer word stays reserved, is written as zero, and is
+    /// refused if it is not zero. Byte-identical to every file written before
+    /// this policy existed.
+    None,
+    /// The trailing footer word carries mutable record flags and is excluded
+    /// from the record checksum.
+    FooterFlags,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexPolicy {
     pub scan_on_open: bool,
@@ -1851,6 +1900,8 @@ pub struct FormatSpec {
     pub index_policy: IndexPolicy,
     pub commit_policy: CommitPolicy,
     pub integrity_policy: IntegrityPolicy,
+    /// Whether a record can be marked dead after it was written.
+    pub liveness_policy: LivenessPolicy,
     pub recovery_policy: RecoveryPolicy,
     pub manifest_policy: ManifestPolicy,
     pub compression_policy: CompressionPolicy,
@@ -1911,6 +1962,7 @@ pub struct FormatSpecBuilder {
     index_policy: IndexPolicy,
     commit_policy: CommitPolicy,
     integrity_policy: IntegrityPolicy,
+    liveness_policy: LivenessPolicy,
     recovery_policy: RecoveryPolicy,
     manifest_policy: ManifestPolicy,
     compression_policy: CompressionPolicy,
@@ -1966,6 +2018,7 @@ impl FormatSpec {
             index_policy,
             commit_policy: CommitPolicy::None,
             integrity_policy,
+            liveness_policy: LivenessPolicy::None,
             recovery_policy,
             manifest_policy,
             compression_policy: CompressionPolicy::None,
@@ -2019,6 +2072,13 @@ impl FormatSpec {
 
     pub const fn with_commit_policy(mut self, commit_policy: CommitPolicy) -> Self {
         self.commit_policy = commit_policy;
+        self
+    }
+
+    /// See [`LivenessPolicy`]. Defaults to `None`, which is byte-identical
+    /// to every file written before the policy existed.
+    pub const fn with_liveness_policy(mut self, liveness_policy: LivenessPolicy) -> Self {
+        self.liveness_policy = liveness_policy;
         self
     }
 
@@ -2659,6 +2719,7 @@ impl FormatSpec {
         output.push_str(&format!("index_policy: {:?}\n", self.index_policy));
         output.push_str(&format!("commit_policy: {:?}\n", self.commit_policy));
         output.push_str(&format!("integrity_policy: {:?}\n", self.integrity_policy));
+        output.push_str(&format!("liveness_policy: {:?}\n", self.liveness_policy));
         output.push_str(&format!("recovery_policy: {:?}\n", self.recovery_policy));
         output.push_str(&format!("manifest_policy: {:?}\n", self.manifest_policy));
         output.push_str(&format!(
@@ -2764,7 +2825,10 @@ impl FormatSpec {
         }
         hash.write_u8(index_policy_hash_byte(self.index_policy));
         hash.write_u8(commit_policy_hash_byte(self.commit_policy));
-        hash.write_u8(integrity_policy_hash_byte(self.integrity_policy));
+        hash.write_u8(
+            integrity_policy_hash_byte(self.integrity_policy)
+                | liveness_policy_hash_bit(self.liveness_policy),
+        );
         hash.write_u8(recovery_policy_hash_byte(self.recovery_policy));
         hash.write_u8(manifest_policy_hash_byte(self.manifest_policy));
         hash_compression_policy(&mut hash, self.compression_policy);
@@ -2919,6 +2983,17 @@ impl FormatSpec {
         if self.index_policy.open_digest_on_flush && !self.index_policy.block_offset_chain {
             return Err(Error::InvalidFormatSpec(
                 "open_digest_on_flush requires block_offset_chain",
+            ));
+        }
+        // The mutable word IS the footer's trailing field, so a format that
+        // writes no footer has nowhere to put it. Refused rather than silently
+        // inert: an option that does nothing is the shape this project treats
+        // as a defect, not a convenience.
+        if matches!(self.liveness_policy, LivenessPolicy::FooterFlags)
+            && !self.spec_needs_record_footer()
+        {
+            return Err(Error::InvalidFormatSpec(
+                "liveness: footer_flags requires a record footer (declare a commit policy or an offset chain)",
             ));
         }
         // Same reason, and the region is the same three facts as the digest.
@@ -3559,6 +3634,26 @@ const fn commit_policy_hash_byte(policy: CommitPolicy) -> u8 {
     }
 }
 
+/// A **bit inside the integrity byte**, not a byte of its own.
+///
+/// It has to be in the schema hash: the policy changes what the record checksum
+/// covers, so a build that ignored the flag would read every record as corrupt
+/// rather than as incompatible, which is the wrong error and the wrong
+/// remedy. But a new `write_u8` would change the hash of every format that
+/// leaves the option *off*, and "a user who does not opt in pays nothing" is a
+/// standing requirement, not a nicety — a changed hash means existing files
+/// stop opening. Setting a previously-zero bit in a byte that is already hashed
+/// keeps off byte-identical, which is exactly how `header_tails` was landed.
+///
+/// The integrity byte rather than any other, because that is what this policy
+/// modifies: it decides how much of the record the checksum covers.
+const fn liveness_policy_hash_bit(policy: LivenessPolicy) -> u8 {
+    match policy {
+        LivenessPolicy::None => 0,
+        LivenessPolicy::FooterFlags => 0x80,
+    }
+}
+
 const fn integrity_policy_hash_byte(policy: IntegrityPolicy) -> u8 {
     match policy {
         IntegrityPolicy::None => 1,
@@ -3925,6 +4020,7 @@ impl FormatSpecBuilder {
             index_policy: IndexPolicy::ScanOnOpen,
             commit_policy: CommitPolicy::None,
             integrity_policy: IntegrityPolicy::None,
+            liveness_policy: LivenessPolicy::None,
             recovery_policy: RecoveryPolicy::Strict,
             manifest_policy: ManifestPolicy::None,
             compression_policy: CompressionPolicy::None,
@@ -3975,6 +4071,11 @@ impl FormatSpecBuilder {
 
     pub const fn commit_policy(mut self, commit_policy: CommitPolicy) -> Self {
         self.commit_policy = commit_policy;
+        self
+    }
+
+    pub const fn liveness_policy(mut self, liveness_policy: LivenessPolicy) -> Self {
+        self.liveness_policy = liveness_policy;
         self
     }
 

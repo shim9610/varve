@@ -906,6 +906,7 @@ struct FormatInput {
     index: IndexChoice,
     commit: CommitChoice,
     integrity: IntegrityChoice,
+    liveness: LivenessChoice,
     recovery: RecoveryChoice,
     manifest: ManifestChoice,
     compression: CompressionChoice,
@@ -998,6 +999,11 @@ enum IntegrityChoice {
     None,
     Crc32,
     Crc32WithHeader,
+}
+
+enum LivenessChoice {
+    None,
+    FooterFlags,
 }
 
 enum RecoveryChoice {
@@ -1206,6 +1212,7 @@ impl Parse for FormatInput {
         let mut index = IndexChoice::scan_on_open();
         let mut commit = CommitChoice::None;
         let mut integrity = IntegrityChoice::None;
+        let mut liveness = LivenessChoice::None;
         let mut recovery = RecoveryChoice::Strict;
         let mut manifest = ManifestChoice::None;
         let mut compression = CompressionChoice::None;
@@ -1325,6 +1332,18 @@ impl Parse for FormatInput {
                         ));
                     }
                 };
+            } else if key == "liveness" {
+                let value: Ident = content.parse()?;
+                liveness = match value.to_string().as_str() {
+                    "none" => LivenessChoice::None,
+                    "footer_flags" => LivenessChoice::FooterFlags,
+                    _ => {
+                        return Err(syn::Error::new_spanned(
+                            value,
+                            "expected none or footer_flags",
+                        ));
+                    }
+                };
             } else if key == "recovery" {
                 let value: Ident = content.parse()?;
                 recovery = match value.to_string().as_str() {
@@ -1419,6 +1438,7 @@ impl Parse for FormatInput {
             index,
             commit,
             integrity,
+            liveness,
             recovery,
             manifest,
             compression,
@@ -2487,6 +2507,10 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
             quote!(::varve::__core::IntegrityPolicy::Crc32WithHeader)
         }
     };
+    let liveness = match input.liveness {
+        LivenessChoice::None => quote!(::varve::__core::LivenessPolicy::None),
+        LivenessChoice::FooterFlags => quote!(::varve::__core::LivenessPolicy::FooterFlags),
+    };
     let recovery = match input.recovery {
         RecoveryChoice::Strict => quote!(::varve::__core::RecoveryPolicy::Strict),
         RecoveryChoice::TruncateTail => quote!(::varve::__core::RecoveryPolicy::TruncateTail),
@@ -2885,6 +2909,7 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                     BLOCKS,
                 )
                 .with_extension(#extension)
+                .with_liveness_policy(#liveness)
                 .with_commit_policy(#commit)
                 .with_compression_policy(#compression)
                 .with_read_limits(#read_limits)

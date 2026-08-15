@@ -11,10 +11,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::{
     BlockKind, BlockVec, CommitPolicy, CompressionAlgorithm, CompressionHeaderMode,
     CompressionLevel, CompressionPolicy, Endian, Error, FormatSpec, IndexPolicy, IntegrityPolicy,
-    IntegrityVerification, KeyedBlockVec, ManifestPolicy, MatrixCellStatus, MatrixCommitEvent,
-    MatrixDimensions, MatrixKey, MatrixRecoveryAction, MatrixRecoveryReport, MatrixResumeSignal,
-    RecoveryPolicy, Result, SnapshotFile, VariableCompression, VarveBlock, VarveEncode,
-    VarveKeyedBlock, VarveMatrixBlock, VarveMerge, VarveMigration, VarveReplaceBlock, WireType,
+    IntegrityVerification, KeyedBlockVec, LivenessPolicy, ManifestPolicy, MatrixCellStatus,
+    MatrixCommitEvent, MatrixDimensions, MatrixKey, MatrixRecoveryAction, MatrixRecoveryReport,
+    MatrixResumeSignal, RecoveryPolicy, Result, SnapshotFile, VariableCompression, VarveBlock,
+    VarveEncode, VarveKeyedBlock, VarveMatrixBlock, VarveMerge, VarveMigration, VarveReplaceBlock,
+    WireType,
     codec::encode_to_vec_limited,
     collections::MaterializationBudget,
     format::ReadLimitKey,
@@ -89,6 +90,12 @@ const _: () = {
 };
 pub(crate) const RECORD_HEADER_LEN: u64 = 32;
 pub(crate) const RECORD_FOOTER_LEN: u64 = 32;
+
+/// The width of the footer's trailing mutable word — the `reserved` field that
+/// [`LivenessPolicy::FooterFlags`] turns into record flags and takes out of the
+/// checksum. Named here because two places need to agree on it and a footer
+/// layout change has to break both.
+pub(crate) const RECORD_FOOTER_MUTABLE_LEN: u64 = 4;
 const RECORD_FLAG_COMPRESSED: u16 = 0x0001;
 pub(crate) const RECORD_FLAG_INTERNAL: u16 = 0x8000;
 const RECORD_KNOWN_FLAGS: u16 = RECORD_FLAG_COMPRESSED | RECORD_FLAG_INTERNAL;
@@ -2071,6 +2078,14 @@ pub struct RecordIndexEntry {
     pub footer_offset: Option<u64>,
     pub prev_same_block_offset: Option<u64>,
     pub prev_same_key_offset: Option<u64>,
+    /// The trailing footer word this record carries.
+    ///
+    /// Always `0` under [`LivenessPolicy::None`], which is every format that
+    /// did not opt in. Under [`LivenessPolicy::FooterFlags`] it is the record's
+    /// mutable flags — the only part of a written record that can change
+    /// without rewriting it, and the only field here that is not covered by the
+    /// record's checksum.
+    pub mutable_flags: u32,
     pub committed: bool,
 }
 
@@ -3600,6 +3615,15 @@ pub(crate) struct RecordHeaderFields {
 pub(crate) struct RecordFooterFields {
     pub(crate) prev_same_block_offset: Option<u64>,
     pub(crate) prev_same_key_offset: Option<u64>,
+    /// The trailing footer word, which is the only part of a written record
+    /// that can change afterwards.
+    ///
+    /// Zero under [`LivenessPolicy::None`], where it is the reserved word it has
+    /// always been and a non-zero value is refused at decode. Under
+    /// [`LivenessPolicy::FooterFlags`] it carries record flags and is excluded
+    /// from the record checksum, which is what makes it writable in place
+    /// without touching the payload.
+    pub(crate) mutable_flags: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12268,6 +12292,8 @@ impl VarveFile {
             Some(encode_record_footer(RecordFooterFields {
                 prev_same_block_offset,
                 prev_same_key_offset,
+                // A record being appended is alive by construction.
+                mutable_flags: 0,
             })?)
         } else {
             None
@@ -12347,6 +12373,8 @@ impl VarveFile {
             footer_offset,
             prev_same_block_offset,
             prev_same_key_offset,
+            // Appended, therefore alive.
+            mutable_flags: 0,
             committed,
         };
         let info = AppendInfo::from(&entry);
@@ -13005,13 +13033,14 @@ fn read_record_entry_positional(
         footer_offset: None,
         prev_same_block_offset: None,
         prev_same_key_offset: None,
+        mutable_flags: 0,
         committed: true,
     };
     validate_record_entry(spec, &entry)?;
     if spec.spec_needs_record_footer() {
         let mut footer = [0u8; RECORD_FOOTER_LEN as usize];
         snapshot.read_exact_at(payload_end, &mut footer)?;
-        let decoded = decode_record_footer(&footer, payload_end, record_offset)?;
+        let decoded = decode_record_footer(spec, &footer, payload_end, record_offset)?;
         entry.footer_offset = Some(payload_end);
         entry.prev_same_block_offset = decoded.prev_same_block_offset;
         entry.prev_same_key_offset = decoded.prev_same_key_offset;
@@ -13411,6 +13440,9 @@ fn rewrite_replacement_record_streaming(
         let footer = encode_record_footer(RecordFooterFields {
             prev_same_block_offset: entry.prev_same_block_offset,
             prev_same_key_offset: entry.prev_same_key_offset,
+            // Carried, not reset: a republish moves a record, it does not bring
+            // it back to life.
+            mutable_flags: entry.mutable_flags,
         })?;
         output.write_all(&footer)?;
         Some(footer)
@@ -16288,10 +16320,11 @@ fn read_record_entry_at(
     let footer = if spec.spec_needs_record_footer() {
         let footer_offset = payload_end;
         let footer_bytes = read_record_footer_bytes(file, footer_offset)?;
-        let footer = decode_record_footer(&footer_bytes, footer_offset, entry.record_offset)?;
+        let footer = decode_record_footer(spec, &footer_bytes, footer_offset, entry.record_offset)?;
         entry.footer_offset = Some(footer_offset);
         entry.prev_same_block_offset = footer.prev_same_block_offset;
         entry.prev_same_key_offset = footer.prev_same_key_offset;
+        entry.mutable_flags = footer.mutable_flags;
         Some(footer_bytes)
     } else {
         None
@@ -16868,6 +16901,7 @@ fn prepare_stream_record_into(
         Some(encode_record_footer(RecordFooterFields {
             prev_same_block_offset,
             prev_same_key_offset,
+            mutable_flags: 0,
         })?)
     } else {
         None
@@ -18125,6 +18159,12 @@ fn read_index_entry_payload(payload: &[u8], checkpoint_version: u16) -> RecordIn
         footer_offset,
         prev_same_block_offset,
         prev_same_key_offset,
+        // Index-checkpoint entries do not carry the word. That is deliberate
+        // rather than an omission: the checkpoint is written once, and the
+        // whole point of this field is that it changes afterwards, so a copy
+        // stored there could only ever go stale. The record's own footer is the
+        // authority, and `fault_record_entry` reads it from there.
+        mutable_flags: 0,
         committed,
     }
 }
@@ -18517,7 +18557,8 @@ impl RecordIndexEntry {
         let mut footer_bytes = [0; RECORD_FOOTER_LEN as usize];
         let footer = if let Some(footer_offset) = self.footer_offset {
             snapshot.read_exact_at(footer_offset, &mut footer_bytes)?;
-            let decoded = decode_record_footer(&footer_bytes, footer_offset, self.record_offset)?;
+            let decoded =
+                decode_record_footer(spec, &footer_bytes, footer_offset, self.record_offset)?;
             if decoded.prev_same_block_offset != self.prev_same_block_offset
                 || decoded.prev_same_key_offset != self.prev_same_key_offset
             {
@@ -18819,6 +18860,7 @@ fn read_record_header(file: &mut File, _spec: FormatSpec, offset: u64) -> Result
         footer_offset: None,
         prev_same_block_offset: None,
         prev_same_key_offset: None,
+        mutable_flags: 0,
         committed: true,
     })
 }
@@ -18908,6 +18950,7 @@ pub(crate) fn fault_record_entry(
         footer_offset: None,
         prev_same_block_offset: None,
         prev_same_key_offset: None,
+        mutable_flags: 0,
         committed,
     };
     if spec.spec_needs_record_footer() {
@@ -18918,10 +18961,11 @@ pub(crate) fn fault_record_entry(
         )?;
         let mut footer_bytes = [0; RECORD_FOOTER_LEN as usize];
         snapshot.read_exact_at(footer_offset, &mut footer_bytes)?;
-        let footer = decode_record_footer(&footer_bytes, footer_offset, record_offset)?;
+        let footer = decode_record_footer(spec, &footer_bytes, footer_offset, record_offset)?;
         entry.footer_offset = Some(footer_offset);
         entry.prev_same_block_offset = footer.prev_same_block_offset;
         entry.prev_same_key_offset = footer.prev_same_key_offset;
+        entry.mutable_flags = footer.mutable_flags;
     }
     Ok(entry)
 }
@@ -18936,12 +18980,28 @@ fn read_record_footer_bytes(
     Ok(footer)
 }
 
+/// Decodes a footer and holds its trailing word to the spec's policy.
+///
+/// The native decoder hands the word back rather than judging it, because
+/// whether a non-zero value is legitimate is a property of the *spec* and not
+/// of the bytes. Under [`LivenessPolicy::None`] it is the reserved field it has
+/// always been and a non-zero value is a corrupt footer — refusing it here is
+/// what keeps a format that did not opt in exactly as strict as it was before
+/// the policy existed, which matters because these four bytes are the ones the
+/// checksum does not cover under the other policy.
 fn decode_record_footer(
+    spec: FormatSpec,
     bytes: &[u8],
     footer_offset: u64,
     record_offset: u64,
 ) -> Result<RecordFooterFields> {
-    decode_native_record_footer(bytes, footer_offset, record_offset)
+    let footer = decode_native_record_footer(bytes, footer_offset, record_offset)?;
+    if spec.liveness_policy == LivenessPolicy::None && footer.mutable_flags != 0 {
+        return Err(Error::InvalidRecordFooter {
+            offset: footer_offset,
+        });
+    }
+    Ok(footer)
 }
 
 fn checksum_record_fields(
@@ -18998,7 +19058,7 @@ fn checksum_record_file(
         entry.payload_offset,
         entry.payload_len,
         header_bytes.as_ref().map(|bytes| &bytes[..]).unwrap_or(&[]),
-        footer,
+        checksummed_footer(spec, footer),
     )
 }
 
@@ -19040,6 +19100,28 @@ fn crc32_record_file(
     Err(Error::IntegrityFeatureDisabled)
 }
 
+/// How much of a record footer the checksum covers.
+///
+/// The whole thing under [`LivenessPolicy::None`], which is what every file
+/// written before that policy existed carries. Under
+/// [`LivenessPolicy::FooterFlags`] the trailing word is excluded, and that
+/// exclusion is the entire mechanism: it is what lets a writer set a flag there
+/// afterwards without re-reading the payload to recompute a CRC, and without
+/// making every reader that already framed the record disagree with the disk.
+///
+/// The price, stated once: those four bytes are unauthenticated. A flipped bit
+/// in them is not detected by anything, so the flags are advisory — a set flag
+/// says "the writer marked this", never "these bytes are sound".
+fn checksummed_footer(spec: FormatSpec, footer: &[u8]) -> &[u8] {
+    match spec.liveness_policy {
+        LivenessPolicy::None => footer,
+        LivenessPolicy::FooterFlags => footer
+            .len()
+            .checked_sub(RECORD_FOOTER_MUTABLE_LEN as usize)
+            .map_or(footer, |end| &footer[..end]),
+    }
+}
+
 fn checksum_record_bytes(
     spec: FormatSpec,
     header: &[u8],
@@ -19048,8 +19130,12 @@ fn checksum_record_bytes(
 ) -> Result<u32> {
     match spec.integrity_policy {
         IntegrityPolicy::None => Ok(0),
-        IntegrityPolicy::Crc32 => crc32_record_bytes(&[], payload, footer),
-        IntegrityPolicy::Crc32WithHeader => crc32_record_bytes(header, payload, footer),
+        IntegrityPolicy::Crc32 => {
+            crc32_record_bytes(&[], payload, checksummed_footer(spec, footer))
+        }
+        IntegrityPolicy::Crc32WithHeader => {
+            crc32_record_bytes(header, payload, checksummed_footer(spec, footer))
+        }
     }
 }
 
@@ -20887,6 +20973,7 @@ mod tests {
                 footer_offset: None,
                 prev_same_block_offset: None,
                 prev_same_key_offset: None,
+                mutable_flags: 0,
                 committed: false,
             }
         }
@@ -21086,6 +21173,7 @@ mod tests {
             footer_offset: None,
             prev_same_block_offset: None,
             prev_same_key_offset: None,
+            mutable_flags: 0,
             committed: true,
         }
     }
@@ -22918,6 +23006,7 @@ mod tests {
             footer_offset: None,
             prev_same_block_offset: None,
             prev_same_key_offset: None,
+            mutable_flags: 0,
             committed: true,
         };
         let payload = encode_index_checkpoint_payload(test_spec(), &[entry], 128)?;
@@ -23007,6 +23096,7 @@ mod tests {
                 footer_offset: None,
                 prev_same_block_offset: None,
                 prev_same_key_offset: None,
+                mutable_flags: 0,
                 committed: false,
             }
         }
@@ -23424,6 +23514,7 @@ mod bypass_catalogue {
             footer_offset: None,
             prev_same_block_offset: None,
             prev_same_key_offset: None,
+            mutable_flags: 0,
             committed: true,
         }
     }

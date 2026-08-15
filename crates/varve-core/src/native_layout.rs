@@ -624,6 +624,7 @@ pub(crate) fn decode_native_record_footer(
     let mut flags = None;
     let mut prev_same_block_offset = None;
     let mut prev_same_key_offset = None;
+    let mut mutable_flags = 0u32;
 
     for def in RECORD_FOOTER_FIELDS {
         let invalid = || Error::InvalidRecordFooter {
@@ -650,15 +651,22 @@ pub(crate) fn decode_native_record_footer(
             })?;
         match def.role {
             NativeRecordField::FooterMagic => return Err(invalid()),
-            NativeRecordField::FooterVersion
-            | NativeRecordField::FooterCrc32
-            | NativeRecordField::FooterReserved => {
+            NativeRecordField::FooterVersion | NativeRecordField::FooterCrc32 => {
                 let NativeFieldSource::LiteralU64(expected) = def.field.source else {
                     return Err(invalid());
                 };
                 if value_as_u64(name, &value).ok() != Some(expected) {
                     return Err(invalid());
                 }
+            }
+            // Handed back rather than checked here. Whether a non-zero value is
+            // legitimate depends on the spec's `LivenessPolicy`, which this
+            // decoder does not carry; `decode_record_footer` refuses it under
+            // `LivenessPolicy::None`, so the strictness this field has always
+            // had is unchanged for a format that did not opt in.
+            NativeRecordField::FooterReserved => {
+                mutable_flags = u32::try_from(value_as_u64(name, &value).map_err(|_| invalid())?)
+                    .map_err(|_| invalid())?;
             }
             NativeRecordField::FooterFlags => {
                 flags = Some(value_as_u16(name, &value).map_err(|_| invalid())?);
@@ -711,6 +719,7 @@ pub(crate) fn decode_native_record_footer(
     Ok(RecordFooterFields {
         prev_same_block_offset,
         prev_same_key_offset,
+        mutable_flags,
     })
 }
 
@@ -829,9 +838,7 @@ fn native_footer_value(
             };
             Ok(LayoutValue::Bytes(bytes.to_vec()))
         }
-        NativeRecordField::FooterVersion
-        | NativeRecordField::FooterCrc32
-        | NativeRecordField::FooterReserved => {
+        NativeRecordField::FooterVersion | NativeRecordField::FooterCrc32 => {
             let NativeFieldSource::LiteralU64(value) = def.field.source else {
                 return Err(Error::InvalidFormatSpec(
                     "native record footer constant must be a literal",
@@ -839,6 +846,10 @@ fn native_footer_value(
             };
             Ok(LayoutValue::U64(value))
         }
+        // The one field of a written record that is not fixed at append time.
+        // `LivenessPolicy::None` never sets a bit here, so it stays the literal
+        // zero it has always been and the encoded footer is byte-identical.
+        NativeRecordField::FooterReserved => Ok(LayoutValue::U64(u64::from(footer.mutable_flags))),
         NativeRecordField::FooterFlags => {
             let mut flags = 0u16;
             if footer.prev_same_block_offset.is_some() {
@@ -1368,6 +1379,10 @@ mod tests {
     const PROBE_FOOTER: RecordFooterFields = RecordFooterFields {
         prev_same_block_offset: Some(0x1122_3344_5566_7788),
         prev_same_key_offset: Some(0x0102_0304_0506_0708),
+        // Zero, so the captured bytes below stay the bytes this format has
+        // always written: `LivenessPolicy::None` never sets a bit here, and
+        // that is what "the option is inert when off" means at this layer.
+        mutable_flags: 0,
     };
 
     /// Captured from the build before the role dispatch replaced the

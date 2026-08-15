@@ -1673,6 +1673,7 @@ fn read_stream_entry_frame(
         footer_offset: None,
         prev_same_block_offset: None,
         prev_same_key_offset: None,
+        mutable_flags: 0,
         committed: true,
     };
     if spec.spec_needs_record_footer() {
@@ -1683,6 +1684,7 @@ fn read_stream_entry_frame(
         entry.footer_offset = Some(footer_offset);
         entry.prev_same_block_offset = footer.prev_same_block_offset;
         entry.prev_same_key_offset = footer.prev_same_key_offset;
+        entry.mutable_flags = footer.mutable_flags;
     }
     // The header's own length claim must agree with the extent-validated span.
     if entry.payload_len != span.payload_len().get()

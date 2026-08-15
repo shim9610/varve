@@ -106,7 +106,7 @@ pub use format::{
     LayoutFinalize, LayoutPartDescriptor, LayoutPartKind, LayoutPlan, LayoutPlanField,
     LayoutPlanFieldGroup, LayoutPlanFieldSource, LayoutPlanFieldType, LayoutPlanLen,
     LayoutPlanPartDescriptor, LayoutPlanPartKind, LayoutPlanRegion, LayoutPlanRegionSource,
-    LayoutPlanSegment, LayoutPreset, LayoutSpec, LeadInDescriptor, ManifestPolicy,
+    LayoutPlanSegment, LayoutPreset, LayoutSpec, LeadInDescriptor, LivenessPolicy, ManifestPolicy,
     MatrixAuxDescriptor, MatrixBlockDescriptor, MatrixCommitDescriptor, MatrixCommitKind,
     MatrixDimensionDescriptor, MatrixMetadataResidency, MatrixMetadataVerification,
     MetadataDescriptor, RawRegionDescriptor, ReadLimit, ReadLimits, RecoveryPolicy, ResourceLimits,

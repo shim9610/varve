@@ -186,6 +186,7 @@ fn sparse_payload_rejects_standard_limit_before_reading() -> varve::Result<()> {
         footer_offset: None,
         prev_same_block_offset: None,
         prev_same_key_offset: None,
+        mutable_flags: 0,
         committed: true,
     };
 
