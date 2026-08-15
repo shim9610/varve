@@ -4404,7 +4404,13 @@ impl VarveReader {
     /// the append log, so the bytes a commit can rewrite — the
     /// `IndexPolicy::header_tails` region among them — are outside every
     /// reference this type constructs. The condition above is therefore about
-    /// the *records*, which nothing but a `replace_*` ever rewrites.
+    /// the *records* — and a `replace_*` is **not** the only thing that rewrites
+    /// one. On a format declaring `with_growing_matrix_dimension`, any
+    /// `flush`, `commit`, `sync` or drop that writes an already-backed chunk
+    /// goes through `rewrite_chunk_record`, which overwrites that record's
+    /// header and payload where they sit — inside this mapping. A writer of
+    /// such a format has to be excluded for the mapping's lifetime like any
+    /// other; "I call no `replace_*`" is not enough.
     pub unsafe fn mmap_payloads(&self) -> Result<MmapPayloads> {
         // SAFETY: The caller accepts the complete file-backed mapping contract.
         unsafe { self.file.mmap_payloads() }
@@ -7826,6 +7832,10 @@ impl VarveFile {
             // Nothing for the prefix: the bytes before `from` were charged to
             // the open that framed them.
             0,
+            // `from` is this handle's committed end — under a marker policy the
+            // snapshot is bound to exactly that — so the range resumes with the
+            // commit boundary the whole-file scan would already be holding.
+            Some(from),
             ScanIntent::ReadOnly,
             &mut framed,
         )?;
@@ -7864,8 +7874,13 @@ impl VarveFile {
             // Up front rather than inside the loop because the loop mutates
             // `self`: refusing on the tenth entry left nine installed and the
             // snapshot un-advanced, which is an index describing records the
-            // snapshot does not reach. Charging the whole run first makes the
-            // refusal leave the handle exactly as it was.
+            // snapshot does not reach. Charging the whole run first makes *this*
+            // refusal leave the handle as it was.
+            //
+            // Not every refusal. `reserve` can still fail on allocation partway
+            // through the loop and leave the same shape behind — that path is
+            // an OOM and is not made reachable by any input, but the claim here
+            // is about the ceiling, not about the loop being infallible.
             //
             // `ScanBytes` is deliberately *not* charged — that exemption is the
             // point of the zero prefix charge above and is documented on
@@ -11448,7 +11463,13 @@ impl VarveFile {
     /// the append log, so the bytes a commit can rewrite — the
     /// `IndexPolicy::header_tails` region among them — are outside every
     /// reference this type constructs. The condition above is therefore about
-    /// the *records*, which nothing but a `replace_*` ever rewrites.
+    /// the *records* — and a `replace_*` is **not** the only thing that rewrites
+    /// one. On a format declaring `with_growing_matrix_dimension`, any
+    /// `flush`, `commit`, `sync` or drop that writes an already-backed chunk
+    /// goes through `rewrite_chunk_record`, which overwrites that record's
+    /// header and payload where they sit — inside this mapping. A writer of
+    /// such a format has to be excluded for the mapping's lifetime like any
+    /// other; "I call no `replace_*`" is not enough.
     pub unsafe fn mmap_payloads(&self) -> Result<MmapPayloads> {
         // The index this maps is the *resident* one, and a lazily opened handle
         // deliberately has none. Without this the answer was `Ok` with zero
@@ -16968,7 +16989,7 @@ fn load_index(
     // commit-boundary truncation; a truncated prefix of a duplicate-free list
     // is still duplicate-free, so revalidating here would only repeat the
     // N-element copy+sort on every open (PERF2-07).
-    scan_records_range(spec, file, header_len, header_len, intent, out)
+    scan_records_range(spec, file, header_len, header_len, None, intent, out)
 }
 
 /// Rebuilds the resident index from the internal segment chain, or reports
@@ -18049,6 +18070,7 @@ fn scan_records_range(
     file: &mut File,
     from: u64,
     prefix_charge: u64,
+    resume_commit_end: Option<u64>,
     intent: ScanIntent,
     entries: &mut Vec<RecordIndexEntry>,
 ) -> Result<ScannedIndex> {
@@ -18064,7 +18086,21 @@ fn scan_records_range(
         physical_end: None,
         physical_end_at_commit: None,
     };
-    let mut latest_commit_end = None;
+    // A commit boundary the *caller* already knows about, because it is where
+    // this range begins.
+    //
+    // It decides `checksum_boundary`, and that decides whether a record whose
+    // checksum fails is a recoverable tail the walk stops at or a hard
+    // `ChecksumMismatch`. A scan of the whole file has seen the last marker by
+    // the time it reaches anything after it, so it stops cleanly; a range that
+    // *starts* after that marker had not, so it errored where the open it is
+    // supposed to agree with returned `Ok`. Measured under
+    // `IntegrityVerification::AtOpen`, on a file whose first uncommitted record
+    // was byte-flipped: open `Ok`, follow `Err(ChecksumMismatch { offset: 818 })`.
+    //
+    // `None` for a scan from the start of the append log, where no commit has
+    // happened yet and a failing checksum really is unrecoverable.
+    let mut latest_commit_end = resume_commit_end;
     let mut accounting = ScanAccounting::default();
     accounting.advance(spec, prefix_charge)?;
     while offset < file_len {

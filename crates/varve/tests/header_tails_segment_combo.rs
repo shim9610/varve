@@ -286,10 +286,12 @@ fn the_header_route_does_not_read_the_segment() -> varve::Result<()> {
 /// frame as a segment record; it is only wrong as a chain link.
 ///
 /// So the assertion has to read the slot directly, and it has to read it while
-/// the writer is still open: `sync` re-closes the commit point on drop and the
-/// region write has no "something new" predicate, so a clean close rewrites the
-/// slot with the current tails and repairs the staleness before any later open
-/// could see it. Only a file that stopped at the commit point keeps it.
+/// the writer is still open — but not for the reason first written here, which
+/// said a drop re-closes the commit point. It does not: `Drop for VarveFile`
+/// writes an open matrix chunk and nothing else. What repairs the staleness is
+/// any *later* `flush`/`commit`/`sync`, because the region write has no
+/// "something new" predicate and so rewrites the slot with the current tails on
+/// an idle close. Reading mid-write is what catches the slot between the two.
 #[test]
 fn the_slot_names_the_segment_from_its_own_commit_point() -> varve::Result<()> {
     let directory = tempfile::tempdir()?;

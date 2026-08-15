@@ -81,7 +81,7 @@ fn a_follow_is_refused_by_the_ceiling_that_refuses_an_open() -> varve::Result<()
         "a follow past the ceiling must be refused, not granted",
     );
 
-    // And the refusal leaves the handle exactly as it was: charging after
+    // And *this* refusal leaves the handle exactly as it was: charging after
     // installing left entries in the index that the snapshot did not reach.
     assert_eq!(n(&reader)?, held);
     assert!(reader.blocks::<Reading>().is_ok());
