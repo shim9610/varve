@@ -424,7 +424,7 @@ it.
 ```rust
 let mut index = Vec::new();
 let file = VarveFile::open_readonly_with_scratch(spec, path, &mut index)?;
-let points = file.with_directory(&index).blocks::<Point>()?;
+let points = file.with_directory(&index)?.blocks::<Point>()?;
 ```
 
 `open_readonly_without_directory(spec, path, &mut index)` opens a handle that
@@ -460,7 +460,7 @@ let hit = map.find(|entry| entry.block_id == Note::ID)?;
 if let Some(entry) = hit {
     let note: Note = file.decode_block_into(&entry, &mut payload)?;
 }
-let points = file.with_directory(&map).blocks::<Point>()?;   // the prefix walked
+let points = file.with_directory(&map)?.blocks::<Point>()?;  // the prefix walked
 map.clear();
 ```
 

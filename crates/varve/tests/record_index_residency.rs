@@ -468,7 +468,7 @@ fn a_host_supplied_directory_answers_every_read_the_same() -> varve::Result<()> 
     let file = varve::VarveFile::open_readonly_with_scratch(spec, &path, &mut index)?;
     assert_eq!(index.len() as u32, RECORDS);
 
-    let supplied = file.with_directory(&index);
+    let supplied = file.with_directory(&index)?;
     assert_eq!(supplied.record_count(), index.len());
 
     // scan
@@ -526,7 +526,9 @@ fn a_host_supplied_directory_answers_every_read_the_same() -> varve::Result<()> 
     // padded from the handle's own. This is what proves the reads really go
     // through the parameter.
     let truncated: &[varve::RecordIndexEntry] = &index[..10];
-    let short = file.with_directory(truncated);
+    // A prefix is still a directory that describes this file — every entry in
+    // it is where it says it is — so the generation check accepts it.
+    let short = file.with_directory(truncated)?;
     assert_eq!(short.record_count(), 10);
     assert_eq!(short.scan().collect::<varve::Result<Vec<_>>>()?.len(), 10);
     Ok(())
@@ -629,7 +631,7 @@ fn a_handle_can_keep_no_directory_and_still_answer_every_read() -> varve::Result
     let file = varve::VarveFile::open_readonly_without_directory(spec, &large_path, &mut index)?;
     assert_eq!(index.len() as u32, LARGE);
 
-    let view = file.with_directory(&index);
+    let view = file.with_directory(&index)?;
     assert_eq!(view.record_count(), LARGE as usize);
     assert_eq!(
         view.scan().collect::<varve::Result<Vec<_>>>()?.len(),

@@ -796,7 +796,7 @@ where the figures in older copies of this document come from. Measured across
 
 The middle row is not a reduction in capability. `blocks`, `scan`,
 `keyed_blocks`, `metadata`, `verify_all` and the rest all still work — through
-`file.with_directory(&index)`, where `index` is the `Vec<RecordIndexEntry>` that
+`file.with_directory(&index)?`, where `index` is the `Vec<RecordIndexEntry>` that
 same call handed you. Calling one of them on the handle itself returns
 `Error::NoResidentDirectory { operation }`, naming both the read and the way to
 answer it; it does **not** answer as an empty file would, which would be
@@ -805,6 +805,29 @@ indistinguishable from the truth for a caller who forgot.
 Measured: opening a 20,000-record file allocates **320,218 bytes with a
 directory and 218 without** — the 320,000-byte slot array is not built, not
 built-and-freed.
+
+**A directory belongs to the generation it was built from.** `with_directory`
+reads at the offsets it is handed, and until it was made fallible nothing bound
+those offsets to a *file*. The replacement paths publish by renaming a new file
+over the pathname, so this sequence — build a directory, let a `replace_*` run,
+`reopen_readonly`, read through the directory you already had — pointed the
+reads at byte ranges where the records had moved. Measured on an
+`integrity: none` format: eight `Reading` values came back with no error at all,
+one of them a slice of the replacement's text reinterpreted as a `u64` and seven
+of them zero.
+
+`with_directory` now returns `Result` and re-frames the directory's first and
+last entries against the file, refusing with
+`Error::DirectoryDoesNotDescribeThisFile` when the record header at an offset is
+not the record the entry claims. Two record headers, once per `with_directory`
+rather than per read.
+
+Be exact about what that is: a **disagreement detector, not an authenticator**.
+A directory wrong only in the middle passes, and a caller who fabricates
+entries that frame correctly is not stopped. A supplied directory is still a
+trusted input — the check converts the common accident into a typed refusal.
+A subset or a prefix of a directory is legitimate and is accepted; so is an
+empty one, which makes no claim to disagree with.
 
 **The peak of a single open is a separate figure and is larger.** The scan still
 materialises one `RecordIndexEntry` per record before the directory is taken

@@ -1711,7 +1711,7 @@ impl RecordDirectory for Vec<RecordIndexEntry> {
 /// if let Some(entry) = hit {
 ///     let note: Note = file.decode_block_into(&entry, &mut payload)?;
 /// }
-/// let points = file.with_directory(&map).block_entries_into::<Note>(&mut out)?;
+/// let points = file.with_directory(&map)?.block_entries_into::<Note>(&mut out)?;
 /// map.clear();                                         // the caller's call
 /// ```
 ///
@@ -4259,7 +4259,7 @@ impl VarveReader {
     pub fn with_directory<'a, D: RecordDirectory + ?Sized>(
         &'a self,
         directory: &'a D,
-    ) -> DirectoryRead<'a, D> {
+    ) -> Result<DirectoryRead<'a, D>> {
         self.file.with_directory(directory)
     }
 
@@ -4600,7 +4600,7 @@ impl VarveWriter {
     pub fn with_directory<'a, D: RecordDirectory + ?Sized>(
         &'a self,
         directory: &'a D,
-    ) -> DirectoryRead<'a, D> {
+    ) -> Result<DirectoryRead<'a, D>> {
         self.file.with_directory(directory)
     }
 
@@ -5354,7 +5354,7 @@ impl VarveFile {
     /// ```ignore
     /// let mut index = Vec::new();
     /// let file = VarveFile::open_readonly_without_directory(spec, path, &mut index)?;
-    /// let points = file.with_directory(&index).blocks::<Point>()?;
+    /// let points = file.with_directory(&index)?.blocks::<Point>()?;
     /// // and `file.blocks::<Point>()` refuses with `NoResidentDirectory`,
     /// // naming `with_directory`, rather than answering as if empty.
     /// ```
@@ -7670,11 +7670,96 @@ impl VarveFile {
     pub fn with_directory<'a, D: RecordDirectory + ?Sized>(
         &'a self,
         directory: &'a D,
-    ) -> DirectoryRead<'a, D> {
-        DirectoryRead {
+    ) -> Result<DirectoryRead<'a, D>> {
+        self.check_directory_describes_this_file(directory)?;
+        Ok(DirectoryRead {
             file: self,
             directory,
+        })
+    }
+
+    /// Refuses a directory whose entries are not where it says they are.
+    ///
+    /// A supplied directory is trusted offsets, and trusting an offset is
+    /// correct — it is what makes handing over the scan buffer cheaper than
+    /// keeping a resident index. What was never bounded is *which file* the
+    /// offsets are trusted against. `reopen_readonly` made the unbounded
+    /// version reachable in an ordinary sequence rather than by a mistake:
+    /// build a directory, let a `replace_*` republish the pathname, reopen, and
+    /// read through the directory you already had. Measured on an
+    /// `integrity: none` format, eight records read back as zeros.
+    ///
+    /// # Why it is derived rather than declared
+    ///
+    /// The obvious fix — a provenance tag on the directory — cannot be applied
+    /// to the directory that matters most. `Vec<RecordIndexEntry>` *is* the
+    /// scan buffer, it is a foreign type, and no field can be added to it. So
+    /// the check asks the file instead: re-frame what the directory claims and
+    /// require the record to still be there. Same shape as the header-tail
+    /// slot, which re-frames every offset it adopts rather than believing the
+    /// table.
+    ///
+    /// # What it costs, and what it therefore does not check
+    ///
+    /// Two record headers, at `with_directory` rather than per read, so a walk
+    /// of 600,000 records pays it once. Checking every entry would be a second
+    /// full pass and would cost exactly what the supplied directory exists to
+    /// avoid. The two checked are the first and the last, which is what catches
+    /// the case this exists for: a republish moves every record by a uniform
+    /// delta, so an entry at either end lands on a different record — a
+    /// different sequence above all, since sequences are file-global and a
+    /// rewrite preserves them per record rather than per offset.
+    ///
+    /// Be exact about the residual: this is a **disagreement detector, not an
+    /// authenticator**. A directory that is wrong only in the middle passes, and
+    /// a caller who fabricates entries that happen to frame correctly is not
+    /// stopped. It converts the common accident into a typed refusal; it does
+    /// not make a supplied directory a trusted input.
+    ///
+    /// An empty directory describes nothing and is accepted: there is no claim
+    /// to disagree with, and refusing it would break the legitimate "I want no
+    /// records" call.
+    fn check_directory_describes_this_file<D: RecordDirectory + ?Sized>(
+        &self,
+        directory: &D,
+    ) -> Result<()> {
+        let count = directory.record_count();
+        let Some(last) = count.checked_sub(1) else {
+            return Ok(());
+        };
+        let limit = self.snapshot.len();
+        for position in if last == 0 { vec![0] } else { vec![0, last] } {
+            let stated = directory.record_at(position)?;
+            let mismatch = || Error::DirectoryDoesNotDescribeThisFile {
+                position,
+                offset: stated.record_offset,
+            };
+            // Outside the snapshot is the same disagreement seen from the other
+            // end, and it has to be answered before the read rather than by it:
+            // a positional read past the logical length is already refused, but
+            // as `UnexpectedEof`, which says nothing about the directory.
+            if stated.checked_physical_end().map_err(|_| mismatch())? > limit {
+                return Err(mismatch());
+            }
+            // The header only. Building a whole entry through
+            // `fault_record_entry` would also read the footer and would charge
+            // the record-entry fault counter, which several tests measure as a
+            // cost model — this probe is not a fault, it is a check.
+            let mut header_bytes = [0; RECORD_HEADER_LEN as usize];
+            self.snapshot
+                .read_exact_at(stated.record_offset, &mut header_bytes)?;
+            let actual =
+                read_native_record_header(&mut header_bytes.as_slice(), stated.record_offset)?
+                    .fields;
+            // `sequence` is the discriminator that carries this: it is
+            // file-global and strictly increasing, and a republish preserves it
+            // per *record*, so a record that moved leaves a different one at
+            // the offset it vacated.
+            if !record_header_describes(&actual, &stated) {
+                return Err(mismatch());
+            }
         }
+        Ok(())
     }
 
     /// Whether the pathname still resolves to the object this handle opened.
@@ -18423,14 +18508,7 @@ impl RecordIndexEntry {
         snapshot.read_exact_at(self.record_offset, &mut header_bytes)?;
         let mut header_reader = header_bytes.as_slice();
         let actual = read_native_record_header(&mut header_reader, self.record_offset)?.fields;
-        if actual.block_id != self.block_id
-            || actual.block_version != self.block_version
-            || actual.flags != self.flags
-            || actual.sequence != self.sequence
-            || actual.payload_len != self.payload_len
-            || actual.checksum != self.checksum
-            || actual.uncompressed_len_hint != self.uncompressed_len_hint
-        {
+        if !record_header_describes(&actual, self) {
             return Err(Error::ChecksumMismatch {
                 offset: self.record_offset,
             });
@@ -18778,6 +18856,27 @@ fn encode_record_footer(footer: RecordFooterFields) -> Result<[u8; RECORD_FOOTER
 /// This is what `ResidentIndex` calls for every entry it produces.
 /// `every_index_entry_can_be_rebuilt_from_its_own_record` is the proof that
 /// what comes back matches what the scanning reader would have built.
+/// Whether the record header actually at an offset is the record an entry
+/// claims is there.
+///
+/// Two callers ask exactly this, under opposite conditions, which is why the
+/// seven fields are listed once rather than twice.
+/// [`RecordIndexEntry::verify_snapshot_record`] asks it as part of integrity
+/// verification and returns early when no checksum is declared;
+/// [`VarveFile::check_directory_describes_this_file`] asks it of a
+/// caller-supplied directory and exists *above all* for the no-checksum case,
+/// where nothing else would notice. A field added to the record header has to
+/// arrive here or both of them silently stop covering it.
+fn record_header_describes(actual: &RecordHeaderFields, stated: &RecordIndexEntry) -> bool {
+    actual.block_id == stated.block_id
+        && actual.block_version == stated.block_version
+        && actual.flags == stated.flags
+        && actual.sequence == stated.sequence
+        && actual.payload_len == stated.payload_len
+        && actual.checksum == stated.checksum
+        && actual.uncompressed_len_hint == stated.uncompressed_len_hint
+}
+
 pub(crate) fn fault_record_entry(
     snapshot: &SnapshotFile,
     spec: FormatSpec,

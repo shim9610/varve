@@ -828,7 +828,10 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::ZeroCopyPayloadSizeMismatch { .. }
         | Error::ZeroCopyAlignmentMismatch { .. }
         | Error::KeyedChainRequiresKeyedApi { .. }
-        | Error::NoResidentDirectory { .. } => DiagnosticDomain::CallerUsage,
+        | Error::NoResidentDirectory { .. }
+        // Caller usage rather than file data: the file is fine, and so is the
+        // directory — they just belong to different generations of it.
+        | Error::DirectoryDoesNotDescribeThisFile { .. } => DiagnosticDomain::CallerUsage,
 
         #[cfg(feature = "high-cardinality-dev")]
         Error::StreamingUnsupported => DiagnosticDomain::FeatureGate,

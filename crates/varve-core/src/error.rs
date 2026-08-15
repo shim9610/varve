@@ -34,7 +34,7 @@ pub enum Error {
     /// The handle was opened through `open_readonly_without_directory`, which
     /// hands the directory to the caller instead of keeping one. The reads are
     /// not gone — they need to be told where the directory is:
-    /// `file.with_directory(&index).blocks::<T>()`.
+    /// `file.with_directory(&index)?.blocks::<T>()`.
     ///
     /// Deliberately an error and not an empty answer. An empty `BlockVec` here
     /// would be indistinguishable from an empty file, which is the one way a
@@ -44,6 +44,27 @@ pub enum Error {
         "this handle keeps no record directory; pass the one you were given to          `with_directory(..)` and repeat the {operation} there"
     )]
     NoResidentDirectory { operation: &'static str },
+
+    /// The directory handed to `with_directory` does not describe this file.
+    ///
+    /// A supplied directory is a list of offsets, and `with_directory` reads at
+    /// them — that is the whole point, and it is how a host that already holds
+    /// the scan buffer avoids paying for a second one. What it must not do is
+    /// read at offsets belonging to a *different* file. The replacement paths
+    /// publish a new generation by renaming over the pathname, so a directory
+    /// built before one and used after it names byte ranges where the records
+    /// have moved; with no checksum declared, nothing else would catch it.
+    ///
+    /// `position` and `offset` name the entry that did not check out: the
+    /// record header actually at `offset` is not the record the directory says
+    /// is there. Rebuild the directory from the handle you are reading through.
+    ///
+    /// Also returned when the entry lies outside the handle's snapshot, which
+    /// is the same disagreement seen from the other end.
+    #[error(
+        "the supplied directory does not describe this file: entry {position} says offset {offset} holds a record that is not there"
+    )]
+    DirectoryDoesNotDescribeThisFile { position: usize, offset: u64 },
 
     #[error("length value {value} does not fit on this platform")]
     LengthOverflow { value: u64 },

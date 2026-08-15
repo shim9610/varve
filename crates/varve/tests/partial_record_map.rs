@@ -193,7 +193,7 @@ fn the_map_is_a_directory_every_read_already_understands() -> varve::Result<()> 
         Err(varve::Error::NoResidentDirectory { .. })
     ));
     let mut ticks = Vec::new();
-    file.with_directory(&map)
+    file.with_directory(&map)?
         .block_entries_into::<Tick>(&mut ticks)?;
     assert_eq!(
         ticks.len(),

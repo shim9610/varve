@@ -6,6 +6,44 @@ increment the minor version.
 
 ## Unreleased
 
+### Breaking: `with_directory` returns `Result`, and refuses a directory from another generation
+
+`VarveFile::with_directory`, `VarveReader::with_directory` and
+`VarveWriter::with_directory` now return `Result<DirectoryRead<'_, D>>`. Existing
+calls need one `?`:
+
+```rust
+let points = file.with_directory(&index)?.blocks::<Point>()?;
+```
+
+A supplied directory is trusted offsets, and trusting them is the point — it is
+what makes handing over the scan buffer cheaper than keeping a resident index.
+What was never bounded is *which file* they are trusted against, and
+`reopen_readonly` made the unbounded version reachable in an ordinary sequence
+rather than by a mistake: build a directory, let a `replace_*` publish a new
+generation over the pathname, reopen, and read through the directory you already
+had. Measured on an `integrity: none` format, that returned **eight `Reading`
+values with no error** — one of them a slice of the replacement's label text
+reinterpreted as a `u64`, seven of them zero. With a checksum declared it was a
+`ChecksumMismatch`; without one, nothing looked.
+
+`with_directory` now re-frames the directory's first and last entries against
+the file and refuses with `Error::DirectoryDoesNotDescribeThisFile { position,
+offset }` when the record header at an offset is not the record the entry
+describes. It compares the same seven header fields integrity verification
+compares — that comparison now lives in one place, because the two ask the same
+question under opposite conditions: verification returns early when no checksum
+is declared, and this check exists above all for that case.
+
+Cost is two record headers, at `with_directory` rather than per read, so a walk
+of 600,000 records pays it once. Checking every entry would be a second full
+pass and would cost exactly what a supplied directory exists to avoid.
+
+**It is a disagreement detector, not an authenticator.** A directory wrong only
+in the middle passes, and fabricated entries that frame correctly are not
+stopped. A subset, a prefix, and an empty directory are all legitimate and are
+accepted.
+
 ### `follow()` — a reader that advances without reopening
 
 A handle fixes its snapshot length when it opens and reads positionally against

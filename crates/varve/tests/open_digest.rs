@@ -206,7 +206,7 @@ fn the_digest_open_keeps_no_directory_and_the_map_supplies_one() -> varve::Resul
 
     // And the reads that were refused above are answered against the map.
     let mut entries = Vec::new();
-    file.with_directory(&map)
+    file.with_directory(&map)?
         .block_entries_into::<Note>(&mut entries)?;
     assert_eq!(entries.len(), 12);
     let mut payload = Vec::new();
