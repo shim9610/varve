@@ -2396,6 +2396,15 @@ pub struct AppendInfo {
     pub committed: bool,
 }
 
+/// What a [`VarveFile::defragment`] actually did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DefragmentReport {
+    /// Records marked dead that the new generation does not contain.
+    pub records_dropped: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplacementInfo {
     pub sequence: u64,
@@ -4899,6 +4908,11 @@ impl VarveWriter {
     /// usable, but the rename is not yet guaranteed durable against power loss
     /// until the parent directory is synced (for example by a later successful
     /// publication or an explicit directory sync).
+    /// See [`VarveFile::defragment`].
+    pub fn defragment(&mut self) -> Result<DefragmentReport> {
+        self.file.defragment()
+    }
+
     /// See [`VarveFile::mark_record_dead`].
     pub fn mark_record_dead(&mut self, record_offset: u64) -> Result<()> {
         self.file.mark_record_dead(record_offset)
@@ -6773,6 +6787,234 @@ impl VarveFile {
     ///
     /// The new generation is validated and synced before atomic publication.
     /// Existing readers remain attached to the old generation.
+    /// Rewrites the file without the records marked dead.
+    ///
+    /// Publishes by the same route `replace_*` uses — a temp file in the same
+    /// directory, synced, then renamed over the pathname — so a reader open
+    /// across it keeps its own generation whole and `is_current` /
+    /// `reopen_readonly` are how it moves. The cost of that route is peak disk:
+    /// both generations exist at once.
+    ///
+    /// Every internal record is kept. Commit markers stay where they are, and
+    /// the derived ones — index checkpoints, segments, open digests — are
+    /// rebuilt from the records already written rather than copied, because
+    /// their payloads *are* record offsets and this moves them.
+    ///
+    /// # The part that is not a delta
+    ///
+    /// `replace_block` resizes one record and removes none, so a single
+    /// subtraction translates every chain link. Here each survivor moves by a
+    /// different amount and some predecessors are gone, so the links are
+    /// remapped through a table per chain. Substituting a uniform delta does
+    /// not publish a corrupt file: it is refused at write time with
+    /// `InvalidRecordFooter`, because every link is resolved against the prefix
+    /// already written and must name an earlier record of the same block.
+    /// Measured, rather than assumed.
+    ///
+    /// A link whose whole chain was dropped is **cleared**, not pointed
+    /// somewhere plausible.
+    ///
+    /// # Cost
+    ///
+    /// One pass over the file, one rewritten copy, and two offset tables sized
+    /// by the record count — charged to
+    /// [`ReadLimits::max_index_bytes`](crate::ReadLimits) like any other
+    /// per-record memory. It needs the resident directory, so a lazily opened
+    /// handle refuses by name.
+    pub fn defragment(&mut self) -> Result<DefragmentReport> {
+        let _permit = self.ensure_write()?;
+        if self.spec.liveness_policy != LivenessPolicy::FooterFlags {
+            return Err(Error::InvalidFormatSpec(
+                "defragment requires liveness: footer_flags — without it no record is ever dead",
+            ));
+        }
+        if !self.spec.layout.is_varve_native_default() {
+            return Err(Error::InvalidFormatSpec(
+                "defragment is not supported for custom physical layouts",
+            ));
+        }
+        if self.matrix.is_some() {
+            return Err(Error::InvalidFormatSpec(
+                "defragment is not supported for matrix storage",
+            ));
+        }
+        let _ = self.resident_directory("defragment")?;
+        self.ensure_generation_rewrite_allowed()?;
+
+        let bytes_before = self.file.metadata()?.len();
+        let index_bytes = index_bytes_for_count(self.index.len())?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::IndexBytes, index_bytes)?;
+        let mut new_index: Vec<RecordIndexEntry> = Vec::new();
+        new_index
+            .try_reserve_exact(self.index.len())
+            .map_err(|_| Error::AllocationFailed {
+                resource: "defragment index",
+                requested: index_bytes,
+            })?;
+        // One entry per record, per chain: a survivor maps its old offset to
+        // its new one, and a dropped record inherits whatever its own
+        // predecessor in that chain resolved to. Absent means "nothing in this
+        // chain survived".
+        let mut block_remap: HashMap<u64, u64> = HashMap::new();
+        let mut key_remap: HashMap<u64, u64> = HashMap::new();
+
+        let rewrite_append_start = append_log_start_for_file(self)?;
+        let mut segment_start = 0usize;
+        let mut segment_covered_start: Option<u64> = None;
+        let mut dropped = 0usize;
+        let (temp_path, mut temp_file) = create_rewrite_temp_file(&self.path)?;
+        let prepare_result = (|| -> Result<()> {
+            if let Ok(metadata) = self.file.metadata() {
+                temp_file.set_permissions(metadata.permissions())?;
+            }
+            let replacement_extensions =
+                header_extensions_for_replacement(self.spec, &self.header_extensions)?;
+            write_native_file_header(&mut temp_file, self.spec, &replacement_extensions)?;
+            for source_entry in self.index.iter() {
+                let source_entry = source_entry?;
+                let old_offset = source_entry.record_offset;
+                if source_entry.is_dead() {
+                    // Dropped. A link that pointed here has to reach past it to
+                    // whatever this record itself pointed at, in the same
+                    // chain — which is already resolved, because predecessors
+                    // are written before their successors.
+                    if let Some(previous) = source_entry
+                        .prev_same_block_offset
+                        .and_then(|offset| block_remap.get(&offset).copied())
+                    {
+                        block_remap.insert(old_offset, previous);
+                    }
+                    if let Some(previous) = source_entry
+                        .prev_same_key_offset
+                        .and_then(|offset| key_remap.get(&offset).copied())
+                    {
+                        key_remap.insert(old_offset, previous);
+                    }
+                    dropped += 1;
+                    continue;
+                }
+                let mut updated = source_entry.clone();
+                let checkpoint_payload;
+                let payload = if source_entry.block_id == INDEX_BLOCK_ID {
+                    checkpoint_payload = encode_index_checkpoint_payload(
+                        self.spec,
+                        &new_index,
+                        temp_file.stream_position()?,
+                    )?;
+                    RewritePayload::Bytes(&checkpoint_payload)
+                } else if source_entry.block_id == SEGMENT_BLOCK_ID {
+                    let record_offset = temp_file.stream_position()?;
+                    checkpoint_payload = encode_segment_payload(
+                        self.spec,
+                        infallible_entries(&new_index[segment_start..]),
+                        segment_covered_start.unwrap_or(rewrite_append_start),
+                        u64::try_from(segment_start).map_err(|_| {
+                            Error::ResourceArithmeticOverflow {
+                                resource: "segment entry count",
+                            }
+                        })?,
+                        record_offset,
+                    )?;
+                    RewritePayload::Bytes(&checkpoint_payload)
+                } else if source_entry.block_id == OPEN_DIGEST_BLOCK_ID {
+                    let record_offset = temp_file.stream_position()?;
+                    checkpoint_payload = encode_digest_payload(
+                        self.spec,
+                        new_index.iter().map(|entry| entry.sequence).max(),
+                        rewritten_block_tails(&new_index).as_slice(),
+                        record_offset,
+                    )?;
+                    RewritePayload::Bytes(&checkpoint_payload)
+                } else {
+                    RewritePayload::Snapshot {
+                        offset: source_entry.payload_offset,
+                        len: source_entry.payload_len,
+                    }
+                };
+                updated = rewrite_replacement_record_streaming(
+                    self.spec,
+                    &self.snapshot,
+                    &mut temp_file,
+                    updated,
+                    payload,
+                    ChainRemap::Tables {
+                        block: &block_remap,
+                        key: &key_remap,
+                    },
+                    &new_index,
+                )?;
+                block_remap.insert(old_offset, updated.record_offset);
+                key_remap.insert(old_offset, updated.record_offset);
+                if updated.block_id == SEGMENT_BLOCK_ID {
+                    segment_covered_start = Some(updated.checked_physical_end()?);
+                    segment_start = new_index.len() + 1;
+                }
+                debug_assert!(
+                    new_index
+                        .last()
+                        .is_none_or(|last| last.record_offset < updated.record_offset)
+                );
+                new_index.push(updated);
+            }
+            temp_file.flush()?;
+            temp_file.sync_all()?;
+            validate_replacement_generation_file(
+                self.spec,
+                &mut temp_file,
+                rewrite_append_start,
+                &new_index,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = prepare_result {
+            drop(temp_file);
+            let _ = remove_file(&temp_path);
+            return Err(error);
+        }
+        drop(temp_file);
+
+        // Only the two fields the rebind actually reads: it returns this value
+        // (which this operation discards in favour of its own report) and names
+        // `sequence` in the poisoned-publication error. `record_offset` and the
+        // payload lengths would describe a single replaced record, which this
+        // operation does not have — so they are zero rather than plausible, and
+        // the value never leaves this function.
+        let info = ReplacementInfo {
+            sequence: new_index
+                .iter()
+                .map(|entry| entry.sequence)
+                .max()
+                .unwrap_or(0),
+            record_offset: 0,
+            old_payload_len: 0,
+            new_payload_len: 0,
+            old_physical_len: bytes_before,
+            new_physical_len: 0,
+        };
+        match replace_path_atomically(&temp_path, &self.path) {
+            Ok(ReplaceDurability::Durable) => {
+                self.rebind_replacement_generation(info, new_index)?;
+            }
+            Ok(ReplaceDurability::ParentSyncPending(sync_error)) => {
+                return match self.rebind_replacement_generation(info, new_index) {
+                    Ok(_) => Err(Error::PublishedButParentSyncPending {
+                        path: self.path.display().to_string(),
+                        source: Box::new(sync_error),
+                    }),
+                    Err(rebind_error) => Err(rebind_error.with_pending_parent_sync(sync_error)),
+                };
+            }
+            Err(error) => return Err(self.fail_publication(&temp_path, error)),
+        }
+        Ok(DefragmentReport {
+            records_dropped: dropped,
+            bytes_before,
+            bytes_after: self.file.metadata()?.len(),
+        })
+    }
+
     pub fn replace_block<T: VarveReplaceBlock>(
         &mut self,
         index: usize,
@@ -6930,7 +7172,7 @@ impl VarveFile {
                     &mut temp_file,
                     updated,
                     payload,
-                    info,
+                    ChainRemap::Uniform(info),
                     &new_index,
                 )?;
                 if updated.block_id == SEGMENT_BLOCK_ID {
@@ -12199,6 +12441,18 @@ impl VarveFile {
                 // is why nothing derived from `header_extensions.len()` moves.
                 self.header_extensions =
                     header_extensions_for_replacement(self.spec, &self.header_extensions)?;
+                // The published header's mutable blocks were reset to cold, and
+                // one of them is the liveness bit. This handle still holds the
+                // object, so leaving it clear would tell the *next* open that
+                // the last writer released cleanly — and if this one then dies,
+                // `mark_tail` would not run and `truncate_tail` would cut a tail
+                // nobody was told about. Re-asserted rather than left to the
+                // next open to notice, because by then it is the wrong answer.
+                //
+                // Not `mark_writer_open`: that re-reads the block for the
+                // handle's own crash verdict, which would clobber the verdict
+                // this handle already established at its open.
+                self.write_liveness_flags(LIVENESS_FLAG_DIRTY)?;
                 Ok(info)
             }
             Err(source) => {
@@ -13754,13 +14008,72 @@ fn rewrite_record_streaming(
     Ok(entry)
 }
 
+/// Which backward chain a link belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Chain {
+    Block,
+    Key,
+}
+
+/// How a whole-file rewrite maps an old record offset to a new one.
+///
+/// The two rewrites in this crate move records for different reasons, and the
+/// arithmetic that is correct for one is silently wrong for the other.
+///
+/// `replace_block` resizes **exactly one** record and removes none, so every
+/// record after the target moves by the same amount and every record before it
+/// does not move at all. That is `Uniform`, and it is why
+/// [`ReplacementInfo::translate_record_offset`] can be one subtraction.
+///
+/// A defragmenting rewrite drops records, so each survivor moves by a different
+/// amount and some chain predecessors are not in the new file at all. A uniform
+/// delta there points a link at a byte offset that is not where that record
+/// went.
+///
+/// **How badly that fails was measured rather than assumed.** Substituting
+/// `Uniform` into the defragmenting rewrite does not publish a corrupt file: it
+/// is refused at write time with `InvalidRecordFooter { offset: 616 }`, because
+/// `validate_replacement_predecessors` resolves every link against the prefix
+/// already written and requires it to name an *earlier record of the same
+/// block*. Two of the four defragment tests fail that way, and nothing reaches
+/// the pathname. So the honest claim is that this type is required for the
+/// operation to work at all, not that it is the last thing between a caller and
+/// silent corruption — that guard is the predecessor check, and it is older
+/// than this.
+///
+/// `Tables` keeps one map per chain because the two diverge: when a record is
+/// dropped, a link that pointed at it must inherit *that record's* resolution
+/// in the same chain, and its block predecessor and key predecessor are
+/// different records. `None` is a real answer — "nothing in that chain
+/// survived" — and clears the field rather than pointing it somewhere
+/// plausible.
+enum ChainRemap<'a> {
+    Uniform(ReplacementInfo),
+    Tables {
+        block: &'a HashMap<u64, u64>,
+        key: &'a HashMap<u64, u64>,
+    },
+}
+
+impl ChainRemap<'_> {
+    fn translate(&self, chain: Chain, old: u64) -> Result<Option<u64>> {
+        match self {
+            Self::Uniform(info) => info.translate_record_offset(old).map(Some),
+            Self::Tables { block, key } => Ok(match chain {
+                Chain::Block => block.get(&old).copied(),
+                Chain::Key => key.get(&old).copied(),
+            }),
+        }
+    }
+}
+
 fn rewrite_replacement_record_streaming(
     spec: FormatSpec,
     snapshot: &SnapshotFile,
     output: &mut File,
     mut entry: RecordIndexEntry,
     payload: RewritePayload<'_>,
-    replacement: ReplacementInfo,
+    replacement: ChainRemap<'_>,
     rewritten_prefix: &[RecordIndexEntry],
 ) -> Result<RecordIndexEntry> {
     let payload_len = match payload {
@@ -13809,12 +14122,14 @@ fn rewrite_replacement_record_streaming(
     entry.footer_offset = spec.spec_needs_record_footer().then_some(payload_end);
     entry.prev_same_block_offset = entry
         .prev_same_block_offset
-        .map(|offset| replacement.translate_record_offset(offset))
-        .transpose()?;
+        .map(|offset| replacement.translate(Chain::Block, offset))
+        .transpose()?
+        .flatten();
     entry.prev_same_key_offset = entry
         .prev_same_key_offset
-        .map(|offset| replacement.translate_record_offset(offset))
-        .transpose()?;
+        .map(|offset| replacement.translate(Chain::Key, offset))
+        .transpose()?
+        .flatten();
 
     let header = RecordHeaderFields {
         block_id: entry.block_id,
