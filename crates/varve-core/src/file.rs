@@ -6910,10 +6910,10 @@ impl VarveFile {
                     RewritePayload::Bytes(&checkpoint_payload)
                 } else if source_entry.block_id == OPEN_DIGEST_BLOCK_ID {
                     let record_offset = temp_file.stream_position()?;
-                    checkpoint_payload = encode_digest_payload(
+                    checkpoint_payload = rebuilt_open_digest_payload(
                         self.spec,
-                        new_index.iter().map(|entry| entry.sequence).max(),
-                        rewritten_block_tails(&new_index).as_slice(),
+                        &new_index,
+                        source_entry.sequence,
                         record_offset,
                     )?;
                     RewritePayload::Bytes(&checkpoint_payload)
@@ -7131,22 +7131,23 @@ impl VarveFile {
                     )?;
                     RewritePayload::Bytes(&checkpoint_payload)
                 } else if source_entry.block_id == OPEN_DIGEST_BLOCK_ID {
-                    // A digest payload is block-tail offsets and its own start
-                    // offset, and a rewrite moves both. Copying the bytes would
-                    // publish a generation whose digest describes the file it
-                    // replaced. The trailer check at the next open catches that
-                    // — by falling back to the scan, which is the capability
-                    // silently going away rather than a failure anyone sees.
+                    // A digest payload is block-tail offsets and its own
+                    // start offset, and a rewrite moves both, so copying the
+                    // bytes would publish a generation whose digest describes
+                    // the file it replaced.
                     //
-                    // Rebuilt from the records already written, which is
-                    // exactly what the writer held when it wrote the original:
-                    // a digest closes a commit point and never describes
-                    // itself.
+                    // It is rebuilt including this record's own sequence. The
+                    // claim that stood here — that a digest "closes a commit
+                    // point and never describes itself" — is what made the
+                    // high-water mark one too low; see
+                    // `rebuilt_open_digest_payload`. The trailer check does
+                    // not catch it: the lazy open accepts the digest and
+                    // resumes on a sequence that is already taken.
                     let record_offset = temp_file.stream_position()?;
-                    checkpoint_payload = encode_digest_payload(
+                    checkpoint_payload = rebuilt_open_digest_payload(
                         self.spec,
-                        new_index.iter().map(|entry| entry.sequence).max(),
-                        rewritten_block_tails(&new_index).as_slice(),
+                        &new_index,
+                        source_entry.sequence,
                         record_offset,
                     )?;
                     RewritePayload::Bytes(&checkpoint_payload)
@@ -7268,6 +7269,33 @@ impl VarveFile {
         if self.spec.index_policy.segment_on_flush {
             return Err(Error::InvalidFormatSpec(
                 "in-place replacement is not supported for segment_on_flush formats",
+            ));
+        }
+        // The digest is the same shape of hazard as the segment above, and it
+        // is worse in what it costs. `replace_fixed` publishes by copying the
+        // generation byte for byte and patching one record, so it rewrites no
+        // derived record at all - while assigning the replacement a *fresh*
+        // sequence, which raises the file's true maximum above the mark the
+        // copied digest still reports.
+        //
+        // A scan recounts and is unaffected, which is why `checkpoint_on_flush`
+        // needs no refusal here and was measured not to. The digest is the one
+        // derived record a lazy open *trusts instead of recounting*: it seeds
+        // its writer with `sequence_high_water + 1`, so the next append lands
+        // on the sequence the replacement took and the file stops opening with
+        // `InvalidCanonicalEncoding("duplicate native record sequence")`.
+        //
+        // Measured before this refusal, on `crc32 + open_digest_on_flush`, 64
+        // records: `replace_fixed` gave the replacement sequence 65, the digest
+        // went on reporting 64, and the next lazy append also took 65.
+        //
+        // A capability trade, not a loss: `open_digest_on_flush` forces
+        // `block_offset_chain` on, so `replace` routes such a format to
+        // `replace_block`, which republishes and rebuilds the digest. Only a
+        // caller naming this method directly sees the refusal.
+        if self.spec.index_policy.open_digest_on_flush {
+            return Err(Error::InvalidFormatSpec(
+                "in-place replacement is not supported for open_digest_on_flush formats",
             ));
         }
         Ok(())
@@ -7693,22 +7721,23 @@ impl VarveFile {
                     )?;
                     RewritePayload::Bytes(&checkpoint_payload)
                 } else if source_entry.block_id == OPEN_DIGEST_BLOCK_ID {
-                    // A digest payload is block-tail offsets and its own start
-                    // offset, and a rewrite moves both. Copying the bytes would
-                    // publish a generation whose digest describes the file it
-                    // replaced. The trailer check at the next open catches that
-                    // — by falling back to the scan, which is the capability
-                    // silently going away rather than a failure anyone sees.
+                    // A digest payload is block-tail offsets and its own
+                    // start offset, and a rewrite moves both, so copying the
+                    // bytes would publish a generation whose digest describes
+                    // the file it replaced.
                     //
-                    // Rebuilt from the records already written, which is
-                    // exactly what the writer held when it wrote the original:
-                    // a digest closes a commit point and never describes
-                    // itself.
+                    // It is rebuilt including this record's own sequence. The
+                    // claim that stood here — that a digest "closes a commit
+                    // point and never describes itself" — is what made the
+                    // high-water mark one too low; see
+                    // `rebuilt_open_digest_payload`. The trailer check does
+                    // not catch it: the lazy open accepts the digest and
+                    // resumes on a sequence that is already taken.
                     let record_offset = temp_file.stream_position()?;
-                    checkpoint_payload = encode_digest_payload(
+                    checkpoint_payload = rebuilt_open_digest_payload(
                         self.spec,
-                        new_index.iter().map(|entry| entry.sequence).max(),
-                        rewritten_block_tails(&new_index).as_slice(),
+                        &new_index,
+                        source_entry.sequence,
                         record_offset,
                     )?;
                     RewritePayload::Bytes(&checkpoint_payload)
@@ -18657,6 +18686,48 @@ fn push_scanned_entry(
 /// The block tails of a generation being rewritten, as of the records already
 /// written into it.
 ///
+/// Rebuilds an open digest for a republished generation.
+///
+/// # The high-water mark counts this record
+///
+/// `written` holds only the records emitted *before* this one — a republish
+/// pushes each entry after writing it — so a maximum over that alone reports
+/// the state *before* the digest, which is `next - 1`. A lazy open seeds its
+/// writer with `sequence_high_water + 1`, so that number sends the next writer
+/// back over the sequence this very record used, and the append after it
+/// duplicates a sequence. The file then fails to open at all.
+///
+/// `own_sequence` closes that. A republish carries every entry's sequence
+/// forward unchanged (`updated = source_entry.clone()`), so the digest's own
+/// sequence is the source entry's.
+///
+/// This is the same correction [`VarveFile::write_open_digest_record`] makes
+/// on the append path, and it is a function rather than a line at each site
+/// because it was a line at each site: the append path was corrected and the
+/// three republish copies were not, all three still carrying the comment that
+/// a digest "never describes itself". Measured on a `crc32 +
+/// open_digest_on_flush` file of 64 records: the digest sat at sequence 64 and
+/// recorded 63, a lazy writer resumed at 64, and the next scan refused the
+/// file with `InvalidCanonicalEncoding("duplicate native record sequence")`.
+fn rebuilt_open_digest_payload(
+    spec: FormatSpec,
+    written: &[RecordIndexEntry],
+    own_sequence: u64,
+    record_offset: u64,
+) -> Result<Vec<u8>> {
+    let high_water = written
+        .iter()
+        .map(|entry| entry.sequence)
+        .chain(core::iter::once(own_sequence))
+        .max();
+    encode_digest_payload(
+        spec,
+        high_water,
+        rewritten_block_tails(written).as_slice(),
+        record_offset,
+    )
+}
+
 /// One forward pass into a map and one ordering — the shape
 /// [`BlockTails::from_newest`] exists for, and the same shape the open scan
 /// uses. It runs once per digest record in the source, so a rewrite of a file
