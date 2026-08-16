@@ -960,8 +960,6 @@ varve_format! {
 // generation runs must still accept a checkpoint that tiles its coverage.
 #[test]
 fn a_re_encoded_checkpoint_still_validates_strictly() -> varve::Result<()> {
-    use varve::ReplaceStrategy;
-
     let path = temp_path("checkpoint_gap");
     let mut file = GapFormat::create(&path)?;
     for value in 0..64u32 {
@@ -970,7 +968,7 @@ fn a_re_encoded_checkpoint_still_validates_strictly() -> varve::Result<()> {
     }
     // The generation this publishes is validated with strict checkpoint
     // checking, which is the caller of the tightened predicate.
-    file.replace(0, &Line { value: 4242 }, ReplaceStrategy::FixedCopyOnWrite)?;
+    file.replace(0, &Line { value: 4242 })?;
     drop(file);
 
     let file = GapFormat::open_readonly(&path)?;
@@ -985,24 +983,42 @@ fn a_re_encoded_checkpoint_still_validates_strictly() -> varve::Result<()> {
 
 #[test]
 fn an_in_place_replacement_is_refused() -> varve::Result<()> {
-    use varve::ReplaceStrategy;
-
     // An in-place replacement restamps the sequence and checksum of a record a
     // segment already describes, and nothing rewrites the segment behind it.
-    // The chain reads no data record, so open could not notice. The capability
-    // and the chain are alternatives, and this is where that is said.
+    // The chain reads no data record, so open could not notice.
+    //
+    // What that refuses is the *route*, not the capability: `replace_block`
+    // publishes a whole new generation and re-encodes every segment payload
+    // against the new offsets, so it stays available on a segment format. The
+    // third assertion below is the half that says so, and it is why `replace`
+    // — which picks the route from the declaration — does not refuse here.
     let path = temp_path("in_place_refused");
     write_lines(segment_spec(), &path, 16, 8)?;
     let mut file = segment_spec().open(&path)?;
     assert!(matches!(
-        file.replace(0, &Line { value: 4242 }, ReplaceStrategy::FixedCopyOnWrite),
+        file.replace_fixed(0, &Line { value: 4242 }),
         Err(varve::Error::InvalidFormatSpec(_)),
     ));
-    // The same format without the chain keeps the capability.
+    // The same format without segments keeps the in-place route.
     let plain = temp_path("in_place_allowed");
     write_lines(plain_spec(), &plain, 16, 8)?;
-    let mut file = plain_spec().open(&plain)?;
-    file.replace(0, &Line { value: 4242 }, ReplaceStrategy::FixedCopyOnWrite)?;
+    let mut plain_file = plain_spec().open(&plain)?;
+    plain_file.replace_fixed(0, &Line { value: 4242 })?;
+
+    // And the republishing route works on the segment format, which is the
+    // whole reason the refusal above is a trade between routes rather than a
+    // capability the declaration takes away. Reading it back matters: a
+    // republish that left the segments describing the old offsets would
+    // return `Ok` here and fail at the next open.
+    file.replace(0, &Line { value: 4242 })?;
+    drop(file);
+    let reopened = segment_spec().open_readonly(&path)?;
+    let blocks = reopened.blocks::<Line>()?;
+    assert_eq!(blocks.len(), 16);
+    assert_eq!(blocks.get(0)?, Some(Line { value: 4242 }));
+    for value in 1..16u32 {
+        assert_eq!(blocks.get(value as usize)?, Some(Line { value }));
+    }
     Ok(())
 }
 

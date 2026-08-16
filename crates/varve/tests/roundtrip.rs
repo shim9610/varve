@@ -2,8 +2,8 @@ use std::fs::{read_dir, remove_file};
 use std::path::PathBuf;
 
 use varve::{
-    OP_BLOCK_ID, ReadLimits, ReplaceStrategy, TOMBSTONE_BLOCK_ID, VarveBlock, VarveFile,
-    VarveMerge, compact_keyed_file, compact_keyed_files, merge_keyed_files, varve_format,
+    OP_BLOCK_ID, ReadLimits, TOMBSTONE_BLOCK_ID, VarveBlock, VarveFile, VarveMerge,
+    compact_keyed_file, compact_keyed_files, merge_keyed_files, varve_format,
 };
 
 #[derive(Clone, Debug, PartialEq, VarveBlock)]
@@ -189,7 +189,7 @@ fn fixed_replace_publishes_copy_on_write_generation() -> varve::Result<()> {
     {
         let mut file = TestFormat::create(&path)?;
         file.push(&Point { x: 1, y: 2 })?;
-        file.replace(0, &Point { x: 3, y: 4 }, ReplaceStrategy::FixedCopyOnWrite)?;
+        file.replace(0, &Point { x: 3, y: 4 })?;
         file.flush()?;
     }
 
@@ -225,7 +225,6 @@ fn variable_replace_rewrite_preserves_records_and_cleans_temp() -> varve::Result
                 region: 82,
                 name: "replacement with a different payload size".to_string(),
             },
-            ReplaceStrategy::RewriteFile,
         )?;
         file.flush()?;
     }

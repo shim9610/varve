@@ -67,8 +67,8 @@ mod enabled {
     use varve::scalable_fault::{FAULT_ENV, TRACE_ENV, arm_from_env};
     use varve::{
         BlockDescriptor, BlockKind, Decoder, Encoder, Endian, Error, FormatSpec, IndexPolicy,
-        IntegrityPolicy, ManifestPolicy, ReadLimits, RecoveryPolicy, ReplaceStrategy, Result,
-        VarveBlock, VarveDecode, VarveEncode, VarveFile, WireType,
+        IntegrityPolicy, ManifestPolicy, ReadLimits, RecoveryPolicy, Result, VarveBlock,
+        VarveDecode, VarveEncode, VarveFile, VarveReplaceBlock, WireType,
     };
 
     // The injected-failure counter and the fault registry are process-global;
@@ -101,6 +101,15 @@ mod enabled {
         const ENDIAN: Option<Endian> = None;
         const IS_KEYED: bool = false;
         const SCHEMA_FINGERPRINT: u64 = 0x5055_424C_0000_003E;
+    }
+
+    impl VarveReplaceBlock for PubRecord {
+        // Hand-written, because `PubRecord` is hand-written: the derive emits
+        // this for every block it generates, trivially `Ok` where there is no
+        // key. This test defines its block by hand, so it supplies the same.
+        fn validate_replacement(_old: &Self, _new: &Self) -> Result<()> {
+            Ok(())
+        }
     }
 
     static BLOCKS: &[BlockDescriptor] = &[BlockDescriptor {
@@ -136,7 +145,7 @@ mod enabled {
         writer.sync()?;
 
         VarveFile::inject_parent_sync_failures(1);
-        match writer.replace(0, &PubRecord(2), ReplaceStrategy::RewriteFile) {
+        match writer.replace(0, &PubRecord(2)) {
             Err(Error::PublishedButParentSyncPending { .. }) => {}
             other => panic!("expected PublishedButParentSyncPending, got {other:?}"),
         }
@@ -176,7 +185,7 @@ mod enabled {
         // Models an unreconciled ReplaceFileW 1176/1177 outcome (DUR2-01):
         // the pathname state is unknown to the caller.
         VarveFile::inject_replace_indeterminate_failures(1);
-        match writer.replace(0, &PubRecord(2), ReplaceStrategy::RewriteFile) {
+        match writer.replace(0, &PubRecord(2)) {
             Err(Error::ReplacePublicationIndeterminate { .. }) => {}
             other => panic!("expected ReplacePublicationIndeterminate, got {other:?}"),
         }
@@ -196,7 +205,7 @@ mod enabled {
         // The writer is poisoned: a blind retry could publish over an unknown
         // generation, so retries and further writes are refused.
         assert!(matches!(
-            writer.replace(0, &PubRecord(2), ReplaceStrategy::RewriteFile),
+            writer.replace(0, &PubRecord(2)),
             Err(Error::WriterPoisoned(_))
         ));
         assert!(matches!(
@@ -221,7 +230,7 @@ mod enabled {
         writer.push(&PubRecord(4))?;
         writer.sync()?;
 
-        let sequence = writer.replace(0, &PubRecord(5), ReplaceStrategy::RewriteFile)?;
+        let sequence = writer.replace(0, &PubRecord(5))?;
         assert!(sequence > 0);
         writer.push(&PubRecord(6))?;
         writer.sync()?;
@@ -253,7 +262,7 @@ mod enabled {
             let mut writer = VarveFile::create(spec(), &path)?;
             writer.push(&PubRecord(8))?;
             writer.sync()?;
-            writer.replace(0, &PubRecord(9), ReplaceStrategy::RewriteFile)?;
+            writer.replace(0, &PubRecord(9))?;
             Ok(())
         })();
         drop(guard);
@@ -290,9 +299,8 @@ mod enabled {
 mod cross_version_and_keyed_refusals {
     use varve::{
         BlockDescriptor, BlockKind, Decoder, Encoder, Endian, Error, FormatSpec, IndexPolicy,
-        IntegrityPolicy, ManifestPolicy, ReadLimits, RecoveryPolicy, ReplaceStrategy, Result,
-        VarveBlock, VarveDecode, VarveEncode, VarveFile, VarveKeyedBlock, VarveReplaceBlock,
-        WireType,
+        IntegrityPolicy, ManifestPolicy, ReadLimits, RecoveryPolicy, Result, VarveBlock,
+        VarveDecode, VarveEncode, VarveFile, VarveKeyedBlock, VarveReplaceBlock, WireType,
     };
 
     const RECORD_ID: u32 = 63;
@@ -504,10 +512,10 @@ mod cross_version_and_keyed_refusals {
                     .replace_block(ordinal, &RecordV2(9))
                     .expect_err("block must refuse a cross-version target"),
                 writer
-                    .replace(ordinal, &RecordV2(9), ReplaceStrategy::FixedCopyOnWrite)
+                    .replace(ordinal, &RecordV2(9))
                     .expect_err("the FixedCopyOnWrite wrapper must refuse it too"),
                 writer
-                    .replace(ordinal, &RecordV2(9), ReplaceStrategy::RewriteFile)
+                    .replace(ordinal, &RecordV2(9))
                     .expect_err("the RewriteFile wrapper must refuse it too"),
             ];
             // SAFETY: this process holds the only handle to the path, and the

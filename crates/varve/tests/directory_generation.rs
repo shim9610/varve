@@ -99,7 +99,6 @@ fn a_directory_from_a_superseded_generation_is_refused() -> varve::Result<()> {
         &Label {
             text: "a replacement long enough to move every record after it".into(),
         },
-        varve::ReplaceStrategy::RewriteFile,
     )?;
     drop(writer);
 

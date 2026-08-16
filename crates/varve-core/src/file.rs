@@ -3705,12 +3705,6 @@ pub(crate) struct RecordFooterFields {
     pub(crate) mutable_flags: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplaceStrategy {
-    FixedCopyOnWrite,
-    RewriteFile,
-}
-
 #[cfg(feature = "mmap")]
 /// A read-only mapping paired with an immutable snapshot of the validated
 /// append-log index.
@@ -4987,13 +4981,9 @@ impl VarveWriter {
         self.file.replace_rewrite(index, block)
     }
 
-    pub fn replace<T: VarveBlock>(
-        &mut self,
-        index: usize,
-        block: &T,
-        strategy: ReplaceStrategy,
-    ) -> Result<u64> {
-        self.file.replace(index, block, strategy)
+    /// See [`VarveFile::replace`].
+    pub fn replace<T: VarveReplaceBlock>(&mut self, index: usize, block: &T) -> Result<u64> {
+        self.file.replace(index, block)
     }
 
     pub fn flush(&mut self) -> Result<()> {
@@ -7779,16 +7769,43 @@ impl VarveFile {
         }
     }
 
-    pub fn replace<T: VarveBlock>(
-        &mut self,
-        index: usize,
-        block: &T,
-        strategy: ReplaceStrategy,
-    ) -> Result<u64> {
-        match strategy {
-            ReplaceStrategy::FixedCopyOnWrite => self.replace_fixed(index, block),
-            ReplaceStrategy::RewriteFile => self.replace_rewrite(index, block),
+    /// Replaces the record at `index`, by whichever route the format supports.
+    ///
+    /// **The route is not a choice the caller can make.** It used to be — this
+    /// took a `ReplaceStrategy` — and that was wrong in a way measurable rather
+    /// than stylistic: on a format declaring an offset chain or a commit
+    /// policy, *both* of the two strategies refused, and the implementation
+    /// that works was reachable only by naming
+    /// [`replace_block`](Self::replace_block) directly. What decides is the
+    /// declaration, so the declaration decides here:
+    ///
+    /// | format | route | why |
+    /// | --- | --- | --- |
+    /// | writes a record footer | [`replace_block`](Self::replace_block) | it is the only route that maintains the offset chains a footer carries |
+    /// | no footer, fixed block | [`replace_fixed`](Self::replace_fixed) | cheapest — copies the generation and patches one same-length record |
+    /// | no footer, otherwise | [`replace_rewrite`](Self::replace_rewrite) | a whole-file republish, with no footer to maintain |
+    ///
+    /// All three stay public for a caller who wants to name one and be refused
+    /// loudly if the format cannot serve it. This is the door for a caller who
+    /// wants the replacement rather than a particular mechanism.
+    ///
+    /// # Bound
+    ///
+    /// `VarveReplaceBlock` rather than `VarveBlock`, which the footer route
+    /// needs for its key-preservation check. That costs derived blocks nothing:
+    /// the macro emits the impl for every one — trivially `Ok` where there is
+    /// no key, and a `ReplacementKeyMismatch` check where there is. Only a
+    /// hand-written block needs the one-line impl.
+    ///
+    /// Returns the replacement record's sequence.
+    pub fn replace<T: VarveReplaceBlock>(&mut self, index: usize, block: &T) -> Result<u64> {
+        if self.spec.spec_needs_record_footer() {
+            return self.replace_block(index, block).map(|info| info.sequence);
         }
+        if T::KIND == BlockKind::Fixed {
+            return self.replace_fixed(index, block);
+        }
+        self.replace_rewrite(index, block)
     }
 
     pub fn flush(&mut self) -> Result<()> {
