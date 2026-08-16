@@ -686,10 +686,12 @@ to one written before the option existed. Enabling it costs:
   `Error::InvalidFormatSpec`. The chain answers the same question incrementally,
   is the thing open actually reads, and has no entry ceiling;
 - in-place fixed replacement (`replace_fixed`,
-  `replace_fixed_in_place_exclusive`, `ReplaceStrategy::FixedCopyOnWrite`), which
-  is refused with `Error::InvalidFormatSpec`. It restamps a record a segment
-  already describes. `replace_block` publishes a whole new generation and
-  re-encodes every segment payload against the new offsets, so it still works.
+  `replace_fixed_in_place_exclusive`), which is refused with
+  `Error::InvalidFormatSpec`. It restamps a record a segment already describes.
+  What that refuses is the route, not the capability: `replace_block` publishes
+  a whole new generation and re-encodes every segment payload against the new
+  offsets, so it still works — and since a segment format also declares
+  `block_offset_chain`, that is the route `replace` picks anyway.
 
 The chain is derived, so anything it cannot account for falls back to the full
 scan and produces the identical index — never an error. That covers a file

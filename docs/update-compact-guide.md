@@ -170,9 +170,9 @@ delegate with `u64::MAX`, so their behaviour is unchanged.
 
 ## Direct Replacement
 
-`replace_fixed` and
-`replace(index, block, ReplaceStrategy::FixedCopyOnWrite)` are the safe fixed
-replacement paths. The canonical payload size must be unchanged. Varve copies
+`replace_fixed` is the safe fixed replacement path, and the one
+`replace(index, block)` picks for a fixed block on a format that writes no
+record footer. The canonical payload size must be unchanged. Varve copies
 the current opened generation to a same-directory temporary file, patches the
 record header/payload and checksum, validates the complete new generation,
 syncs it, and atomically publishes it. Readers opened before publication keep
@@ -181,7 +181,7 @@ their original file object and value; new readers observe the replacement.
 `unsafe replace_fixed_in_place_exclusive` retains the lower-copy expert path.
 The caller must exclude every reader, writer, mmap, raw reference, handle,
 thread, and process for the operation and for every affected view's lifetime.
-It is deliberately not represented as a safe `ReplaceStrategy` variant.
+It is deliberately not a route `replace` will ever pick.
 
 On a `keyed_offset_chain` format the caller must also keep the record's key
 unchanged (F-02). Records appended after the target already carry
@@ -197,9 +197,24 @@ previously did not check — refuses a stored `block_version` that differs from
 `T::VERSION` with `Error::BlockVersionMismatch` (F-01), before any byte is
 written.
 
-`replace_rewrite` and `ReplaceStrategy::RewriteFile` rewrite the file through a
-temporary file and atomically publish it. Prefer append plus compact for routine
-updates because replacement gives up the append-friendly history model.
+`replace_rewrite` rewrites the file through a temporary file and atomically
+publishes it. Prefer append plus compact for routine updates because
+replacement gives up the append-friendly history model.
+
+### Which route `replace` picks
+
+`replace(index, block)` takes no strategy argument. The three routes are not
+interchangeable — which one is legal follows from the declaration, so the
+declaration is what chooses:
+
+| the format declares | `replace` calls | why |
+| --- | --- | --- |
+| a record footer (`block_offset_chain`, `keyed_offset_chain`, or a commit marker) | `replace_block` | the only route that rebuilds the offset chains; the others would publish a file that frames perfectly and carries no chain |
+| no footer, and `T` is a fixed block | `replace_fixed` | a fixed payload cannot change size, so the same-size copy-on-write is exactly right and is the cheapest |
+| no footer, and `T` is variable | `replace_rewrite` | the record's length changes, so every record after it moves |
+
+The named methods stay public for a caller who wants a particular mechanism and
+would rather be refused than silently rerouted.
 
 An error before atomic publication leaves the old pathname generation in
 place. `PublishedButRebindFailed`, however, explicitly means publication

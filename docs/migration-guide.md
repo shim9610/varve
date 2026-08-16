@@ -148,6 +148,33 @@ Use visibly named `*_trusted_unbounded` methods only when the complete input
 provenance is under your control. Omission now selects the standard runtime
 policy rather than causing a compile error.
 
+## Drop The Replace Strategy Argument
+
+`ReplaceStrategy` was removed and `replace` lost its third parameter:
+
+```rust
+- writer.replace(index, &block, ReplaceStrategy::FixedCopyOnWrite)?;
+- writer.replace(index, &block, ReplaceStrategy::RewriteFile)?;
++ writer.replace(index, &block)?;
+```
+
+Delete the argument and the import. There is nothing to choose: `replace` now
+reads the format spec and calls `replace_block` for a record-footer format,
+`replace_fixed` for a fixed block on a footerless one, and `replace_rewrite`
+otherwise. That closes a gap the enum had — on a footer-bearing format both
+variants refused, and the route that worked was reachable only by naming
+`replace_block` directly.
+
+Two smaller consequences. `replace` now returns the published sequence
+(`Result<u64>`) instead of `Result<()>`; ignore it with `let _ =` if you do not
+want it. And its bound tightened to `T: VarveReplaceBlock`, which
+`#[derive(VarveBlock)]` already emits for every block — only a hand-written
+`VarveBlock` impl needs one added, and it is trivially `Ok(())` for an unkeyed
+block.
+
+If you want a specific mechanism rather than the replacement, keep calling the
+named method; each still refuses where its format cannot serve it.
+
 ## Migrate To Resized Replacement
 
 Generated writers now expose `replace_<block>(index, &value)`. The encoded
@@ -157,10 +184,11 @@ publishes a new file generation. Keyed replacement must preserve the key.
 
 ## Migrate Fixed Replacement
 
-`ReplaceStrategy::FixedInPlace` was removed. Use
-`ReplaceStrategy::FixedCopyOnWrite` or `replace_fixed` for the safe same-size
-path. These publish a validated replacement generation atomically, so readers
-opened before replacement continue to observe their original snapshot.
+`ReplaceStrategy::FixedInPlace` was removed in 0.2.0; the whole
+`ReplaceStrategy` enum went with it later (see above). Use `replace_fixed`, or
+`replace`, for the safe same-size path. These publish a validated replacement
+generation atomically, so readers opened before replacement continue to observe
+their original snapshot.
 
 The lower-copy path is available only as
 `unsafe replace_fixed_in_place_exclusive`. Its caller must prove that no reader

@@ -572,12 +572,27 @@ Common `VarveWriter` APIs:
 | `delete::<T>(&key)` | append keyed tombstone; maintains the keyed offset chain |
 | `push_op::<T>(&key, &op)` | append user-defined merge op |
 | `write_metadata(key, bytes)` | append internal metadata record |
+| `replace(index, &block)` | **the door**: picks one of the three safe routes below from the format spec, and returns the published sequence |
 | `replace_block(index, &block)` | sequence-preserving copy-on-write replacement; encoded size may grow or shrink |
 | `replace_fixed(index, &block)` | same-size copy-on-write replacement; already-open readers keep their snapshot |
 | `unsafe replace_fixed_in_place_exclusive(index, &block)` | expert-only in-place replacement; caller must exclude readers and writers **and must not change a keyed record's key** |
 | `replace_rewrite(index, &block)` | rewrite whole file through temp file |
 
-All four replacement entry points select their target by block id and refuse a
+`replace` takes no strategy argument, because which route is legal follows from
+the declaration rather than from the caller:
+
+| the format declares | `replace` calls |
+| --- | --- |
+| a record footer (an offset chain, or a commit marker) | `replace_block` |
+| no footer, and `T` is a fixed block | `replace_fixed` |
+| no footer, and `T` is variable | `replace_rewrite` |
+
+It never picks the `unsafe` path. Call a named method instead when you want a
+particular mechanism and would rather be refused than rerouted — each still
+refuses where its format cannot serve it, and those refusals are the reason the
+choice is not the caller's to make.
+
+All four safe replacement entry points select their target by block id and refuse a
 stored `block_version` that differs from `T::VERSION` with
 `Error::BlockVersionMismatch` (F-01). `replace_rewrite` and
 `unsafe replace_fixed_in_place_exclusive` previously did not: they copied the

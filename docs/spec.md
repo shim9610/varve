@@ -171,8 +171,10 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
   It permits a native fixed or variable payload to grow or shrink, rebuilds
   headers, CRCs, checkpoints, and offset-chain footers, and publishes a new
   snapshot generation. Keyed replacement must preserve the key.
-- `replace(index, block, ReplaceStrategy)` is the policy-facing wrapper over
-  fixed copy-on-write replacement and full-file rewrite replacement.
+- `replace(index, block)` is the policy-facing entry point. It takes no
+  strategy: the route follows from the declaration — a record-footer format
+  goes to `replace_block`, a fixed block on a footerless format to
+  `replace_fixed`, anything else to `replace_rewrite`.
 - `unsafe replace_fixed_in_place_exclusive` is the explicitly unsafe expert
   path for coordinated callers that exclude all overlapping readers/writers.
 - Keyed deletes use a common internal tombstone record.
@@ -660,8 +662,9 @@ CRC integrity is a corruption-detection aid, not an authenticity or tamper-proof
 - `replace_fixed` performs a same-size, snapshot-preserving copy-on-write
   publication.
 - `replace_rewrite` is explicit full-file rewrite for direct replacement.
-- `replace(index, block, ReplaceStrategy::{FixedCopyOnWrite, RewriteFile})`
-  exposes the safe policy choice directly.
+- `replace(index, block)` picks among the three by reading the format spec, so
+  a caller who wants the replacement rather than a particular mechanism does
+  not have to know which one the declaration permits.
 - `unsafe replace_fixed_in_place_exclusive` retains the lower-copy path under
   an explicit exclusivity contract.
 - Delta/op append remains the recommended append-friendly update path.

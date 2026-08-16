@@ -6,6 +6,40 @@ increment the minor version.
 
 ## Unreleased
 
+### Breaking: `ReplaceStrategy` is removed; `replace` reads the declaration
+
+```rust
+- writer.replace(index, &block, ReplaceStrategy::FixedCopyOnWrite)?;
++ writer.replace(index, &block)?;              // -> Result<u64>
+```
+
+The strategy was never the caller's to pick — which route is legal follows from
+the format — and offering it as a choice hid a gap. Measured on a format
+declaring `integrity: crc32`, `index: block_offset_chain` and
+`commit: transaction_marker(on_flush)`, replacing a variable record with a
+longer one:
+
+| call | result |
+| --- | --- |
+| `replace(.., FixedCopyOnWrite)` | `BlockKindMismatch { expected: Fixed, actual: Variable }` |
+| `replace(.., RewriteFile)` | `InvalidFormatSpec("replace is not supported for record-footer formats")` |
+| `replace_block(..)` | `Ok` |
+
+Both variants refused, and the implementation that works was not reachable
+through the enum at all. `replace` now dispatches on the spec: a record-footer
+format to `replace_block`, a fixed block on a footerless format to
+`replace_fixed`, anything else to `replace_rewrite`. It returns the published
+sequence (`u64`) rather than `()`.
+
+The bound tightens from `T: VarveBlock` to `T: VarveReplaceBlock`, which is what
+lets it reach `replace_block`'s key-preservation hook. This costs derived blocks
+nothing — `#[derive(VarveBlock)]` already emits `VarveReplaceBlock` for every
+block, trivially `Ok` when the block is unkeyed. Only a hand-written block impl
+needs one added.
+
+The three named methods stay public and still refuse where they do not apply,
+for a caller who wants a particular mechanism rather than the replacement.
+
 ### `defragment()` — rewrite the file without the records marked dead
 
 ```rust

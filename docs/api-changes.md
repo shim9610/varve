@@ -5,7 +5,8 @@ and the [Changelog](../CHANGELOG.md).
 
 Sections run newest first, and the letters ascend with the release they
 describe. Section **C** is the 0.6.0 → 0.7.0 migration: a writer open that does
-not scan, an editable written matrix chunk, and one renamed error. Section **B**
+not scan, an editable written matrix chunk, one renamed error, and a removed
+replacement-strategy enum. Section **B**
 is the 0.5.0 → 0.6.0 migration: two changed signatures from the reader no longer
 keeping a copy of the file's index. Section **A** is the 0.4.0 → 0.5.0
 migration: four changes, all about matrix commit-metadata residency and
@@ -20,7 +21,7 @@ decoder, header field or version constant was touched. If you are coming from
 
 ---
 
-## C. From 0.6.0 to 0.7.0: a writer open that does not scan, an editable written chunk, and one renamed error
+## C. From 0.6.0 to 0.7.0: a writer open that does not scan, an editable written chunk, one renamed error, and a removed strategy enum
 
 ### C.1 `VarveFile::open_lazy` / `VarveWriter::open_lazy` — a writer that does not scan
 
@@ -172,6 +173,49 @@ not the same: making a chunk durable, and closing it to further writes. Only
 the first is what the operation does; the second is a consequence of records
 being write-once today, not a property of the data model. The matrix region
 itself is rewritten in place all the time.
+
+### C.4 `ReplaceStrategy` is removed and `replace` chooses the route itself
+
+```rust
+- writer.replace(index, &block, ReplaceStrategy::FixedCopyOnWrite)?;
+- writer.replace(index, &block, ReplaceStrategy::RewriteFile)?;
++ writer.replace(index, &block)?;
+```
+
+Drop the argument and the import. The signature is now
+`replace<T: VarveReplaceBlock>(&mut self, index: usize, block: &T) -> Result<u64>`
+— two changes beyond the missing parameter, both of which usually need nothing
+from a caller:
+
+- **It returns the published sequence** rather than `()`. Discard it with
+  `let _ = ...` if you were relying on `?` in a `()` position.
+- **The bound is `VarveReplaceBlock`,** not `VarveBlock`.
+  `#[derive(VarveBlock)]` and `varve_format!` already emit that impl for every
+  block, so derived blocks need nothing. A hand-written `VarveBlock` impl needs
+  one added; for an unkeyed block it is
+  `fn validate_replacement(_: &Self, _: &Self) -> Result<()> { Ok(()) }`.
+
+**Why the enum went.** It offered a choice that was never the caller's to make,
+and offering it hid a gap. Measured on a format declaring `integrity: crc32`,
+`index: block_offset_chain` and `commit: transaction_marker(on_flush)` —
+the shape this crate is built around — replacing a variable record with a
+longer one:
+
+| call | result |
+| --- | --- |
+| `replace(.., FixedCopyOnWrite)` | `BlockKindMismatch { expected: Fixed, actual: Variable }` |
+| `replace(.., RewriteFile)` | `InvalidFormatSpec("replace is not supported for record-footer formats")` |
+| `replace_block(..)` | `Ok` |
+
+Both variants refused, and the route that worked was not reachable through the
+enum at all — a caller had to know to call `replace_block` by name. `replace`
+now reads the spec: a record-footer format goes to `replace_block`, a fixed
+block on a footerless format to `replace_fixed`, anything else to
+`replace_rewrite`.
+
+The named methods are unchanged and still public, and still refuse where their
+format cannot serve them. Use one when you want a particular mechanism rather
+than the replacement.
 
 ## B. From 0.5.0 to 0.6.0: two changed signatures, one struct field, and changed behaviour at unchanged signatures
 
