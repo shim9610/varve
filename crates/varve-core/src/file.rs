@@ -7456,6 +7456,12 @@ impl VarveFile {
         new_index[target_position].sequence = sequence;
         new_index[target_position].checksum = checksum;
 
+        // The copy below reproduces the header verbatim, warm region included,
+        // and that table would describe a file whose true sequence maximum is
+        // no longer the one it can be derived from. See
+        // `header_tails_invalidation`.
+        let cold_tails = self.header_tails_invalidation()?;
+
         let (temp_path, mut temp_file) = create_rewrite_temp_file(&self.path)?;
         let prepare_result = (|| -> Result<()> {
             if let Ok(metadata) = self.file.metadata() {
@@ -7467,6 +7473,10 @@ impl VarveFile {
             temp_file.write_all(&header_bytes)?;
             temp_file.seek(SeekFrom::Start(payload_offset))?;
             temp_file.write_all(&payload)?;
+            if let Some((offset, cold)) = cold_tails.as_ref() {
+                temp_file.seek(SeekFrom::Start(*offset))?;
+                temp_file.write_all(cold)?;
+            }
             temp_file.flush()?;
             temp_file.sync_all()?;
             validate_generation_file(
@@ -7611,6 +7621,11 @@ impl VarveFile {
             entry.record_offset,
             record_footer_len(self.spec),
         )?;
+        // Before the record changes, not after: this mutates the live file, so
+        // the ordering is the only thing standing between a crash here and a
+        // file whose header table outlives the invariant it was derived under.
+        // See `header_tails_invalidation`.
+        self.retire_header_tails_in_place()?;
         let write_result =
             self.overwrite_record_bytes_in_place(&permit, target, &header_bytes, &payload);
         if let Err(error) = write_result {
@@ -12428,6 +12443,16 @@ impl VarveFile {
                 // its block id is stale too.
                 self.last_resident_block_id = new_index.last().map(|entry| entry.block_id);
                 self.keyed_tails.invalidate_all();
+                // Both callers publish a generation whose mutable header blocks
+                // are cold — `replace_rewrite` because it writes a fresh header
+                // through `header_extensions_for_replacement`, `replace_fixed`
+                // because it writes the cold region over its byte copy — so the
+                // cached region has to say so too, exactly as
+                // `rebind_replacement_generation` does. A cache left warm over
+                // a cold file makes the next commit write generation `N + 1`
+                // while a reader still prefers a warm slot claiming `N`.
+                self.header_extensions =
+                    header_extensions_for_replacement(self.spec, &self.header_extensions)?;
                 self.publish_sequence(sequence);
                 Ok(sequence)
             }
@@ -13381,6 +13406,95 @@ impl VarveFile {
         }
         self.write_liveness_flags(0)?;
         self.file.sync_data()?;
+        Ok(())
+    }
+
+    /// Where the `VBTT` region sits and the cold bytes that retire it, or
+    /// `None` for a format that declares no region.
+    ///
+    /// # Why an in-place replacement has to retire it
+    ///
+    /// The region stores no high-water mark. `corroborate_header_tails`
+    /// *derives* one — the commit marker the slot names, then the segment and
+    /// digest that may follow it — and that derivation is sound only because a
+    /// record's sequence rises with its offset, which holds for an append log.
+    ///
+    /// An in-place replacement is the one operation that breaks it: it takes a
+    /// *fresh* sequence and writes it at an offset **before** the marker, so
+    /// the file's true maximum is above every record the derivation looks at.
+    /// A lazy open then seeds its writer with a mark that is already used, and
+    /// the next append duplicates a sequence — measured on a `header_tails`
+    /// file of 64 records, `replace_fixed` took sequence 65 while the marker
+    /// still said 64, and the following scan refused the file with
+    /// `InvalidCanonicalEncoding("duplicate native record sequence")`. The file
+    /// stops opening, so this is data loss rather than a slow open.
+    ///
+    /// The offsets in the table stay perfectly valid — an in-place replacement
+    /// moves no record, which is exactly why this path was allowed to carry the
+    /// table forward where [`header_extensions_for_replacement`] resets it. But
+    /// the region answers three facts as a package, and one of them has gone
+    /// wrong, so it goes out of use whole.
+    ///
+    /// # Why this is retirement and not a refusal
+    ///
+    /// The digest hazard is the same shape and is refused instead
+    /// (`ensure_in_place_replacement_allowed`). The difference is that a
+    /// digest has no "claims nothing" state — it is a record, present and
+    /// trusted or not there at all — while a cold region is a state the format
+    /// already defines and every open already handles. Where an escape hatch
+    /// exists, the capability survives: the replacement still happens, and the
+    /// cost is that the next open scans once and the next commit rewarms the
+    /// region.
+    fn header_tails_invalidation(&self) -> Result<Option<(u64, Vec<u8>)>> {
+        if !self.spec.index_policy.header_tails {
+            return Ok(None);
+        }
+        let header_len = append_log_start_for_file(self)?;
+        let Some(extent) =
+            mutable_header_block_extent(header_len, &self.header_extensions, HEADER_TAILS_MAGIC)?
+        else {
+            return Ok(None);
+        };
+        let framed = encode_cold_header_tails_region(self.spec)?;
+        let cold = framed
+            .get(HEADER_TAILS_BLOCK_FRAMING_LEN..)
+            .ok_or(Error::InvalidCompressionHeader)?
+            .to_vec();
+        if extent.payload_len != cold.len() {
+            // `write_header_tails` leaves a region of unknown geometry alone,
+            // and for a *write* that is right: it cannot encode a slot it does
+            // not understand. Retirement is the opposite case — leaving it
+            // alone is precisely the outcome that must not happen, because the
+            // stale table would go on answering. Unreachable in practice: open
+            // refuses a file whose mutable block is a different length than
+            // this build would write (`validate_file_header_extensions`), so
+            // reaching here means the header changed under an open handle.
+            return Err(Error::InvalidCompressionHeader);
+        }
+        Ok(Some((extent.payload_offset, cold)))
+    }
+
+    /// Retires the region in the live file, for the path that mutates bytes
+    /// rather than publishing a new generation.
+    ///
+    /// Ordered before the record write by its caller, so a crash between the
+    /// two leaves a file whose lazy route is already out of use. The reverse
+    /// order would leave the window where the table outlives the invariant it
+    /// was derived under, which is the whole defect.
+    ///
+    /// The cached region follows the file for the reason
+    /// [`Self::write_header_tails`] states: it is what the next commit reads
+    /// its generation from, so a cache left warm over a cold file would write
+    /// generation `N + 1` while a reader still prefers the warm slot claiming
+    /// `N`.
+    fn retire_header_tails_in_place(&mut self) -> Result<()> {
+        let Some((offset, cold)) = self.header_tails_invalidation()? else {
+            return Ok(());
+        };
+        self.file.overwrite_header_region(offset, &cold)?;
+        self.file.sync_data()?;
+        self.header_extensions =
+            header_extensions_for_replacement(self.spec, &self.header_extensions)?;
         Ok(())
     }
 

@@ -32,7 +32,8 @@
 //! continues the sequence, and keeps rewriting the region; the region write is
 //! one seek per commit point; such a file can still be mapped, while a lazily
 //! opened handle refuses to map rather than answering empty; an in-place fixed
-//! replacement keeps the table warm where a republishing one resets it; a file
+//! replacement retires the table, as a republishing one does, and the next
+//! commit warms it again; a file
 //! with records past its last marker is truncated by the fallback rather than
 //! resumed from; `crc32_with_header` works as well as `crc32`; and the
 //! refusals.
@@ -1914,17 +1915,35 @@ fn a_lazily_resumed_writer_keeps_warming_the_region() -> varve::Result<()> {
     Ok(())
 }
 
-/// An in-place fixed replacement keeps the region warm, and should.
+/// An in-place fixed replacement retires the region, and must.
 ///
-/// `replace_block` resets the region to cold because it republishes the file
-/// with every record offset shifted by a uniform delta, so every offset the old
-/// table held is wrong. `replace_fixed` is the opposite case and deliberately
-/// skips that reset: it copies the file and patches one record of unchanged
-/// length, so nothing moves. Skipping a reset is the kind of decision that is
-/// only obviously right until someone changes the other path, so this asserts
-/// the table survives *and* still describes the file.
+/// **This test asserted the opposite until 2026-08-16, and the reasoning it
+/// carried was sound about the wrong fact.** It ran: `replace_block` resets the
+/// region because it shifts every record offset by a uniform delta, while
+/// `replace_fixed` patches one record of unchanged length, so nothing moves and
+/// the table stays true. Every clause of that is still correct — and the table
+/// still has to go, because the offsets were never the only thing it answers.
+///
+/// The region stores no high-water mark; `corroborate_header_tails` derives one
+/// from the commit marker the slot names. That derivation holds only while a
+/// record's sequence rises with its offset, and an in-place replacement is the
+/// one operation that breaks it: it takes a *fresh* sequence and writes it
+/// *before* the marker. Measured on this fixture's shape before the fix, the
+/// replacement took sequence 65 while the marker still reported 64, a lazy
+/// writer resumed at 65, and the next scan refused the file with
+/// `InvalidCanonicalEncoding("duplicate native record sequence")` — the file
+/// stopped opening.
+///
+/// So the capability is kept and the region is retired: the replacement still
+/// happens, the next open scans once, and the next commit rewarms the region.
+/// That is the whole cost, and the three assertions below are it.
+///
+/// Retired rather than refused — unlike the digest, which
+/// `ensure_in_place_replacement_allowed` refuses outright — because a cold
+/// region is a state this format already defines and every open already
+/// handles, and a digest has no equivalent: it is a record, trusted or absent.
 #[test]
-fn an_in_place_replacement_keeps_the_warm_region() -> varve::Result<()> {
+fn an_in_place_replacement_retires_the_warm_region() -> varve::Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("in-place.varve");
     write_samples(on_spec(), &path, 100)?;
@@ -1951,22 +1970,35 @@ fn an_in_place_replacement_keeps_the_warm_region() -> varve::Result<()> {
     writer.replace_fixed(0, &Sample { value: 4_242 })?;
     drop(writer);
 
-    assert_eq!(
-        warm(&std::fs::read(&path)?),
-        before,
-        "an equal-length in-place patch moves no record, so the table it \
-         published is still true",
+    assert!(
+        warm(&std::fs::read(&path)?).is_empty(),
+        "the replacement raised the file's true sequence maximum above the \
+         marker the table names, so no slot may still claim to describe it",
     );
 
-    // And the fast route still opens the file and answers what the scan does.
+    // Retiring the table is not allowed to cost a fact: the open falls back to
+    // the scan and answers exactly what it answered before.
     let (file, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &path)?;
-    assert_eq!(source, varve::LazyOpenSource::HeaderTails);
+    assert_eq!(source, varve::LazyOpenSource::FullScan);
     assert_eq!(file.block_tail_offset(Sample::ID), expected);
 
     // The replacement really landed, so the test is about a file that changed.
     let scanned = varve::VarveFile::open_readonly(on_spec(), &path)?;
     let samples = scanned.blocks::<Sample>()?;
     assert_eq!(samples.get(0)?.expect("a Sample").value, 4_242);
+
+    // And the cost is one open: the next commit warms the region again, so the
+    // retirement is a pause in the fast route rather than the end of it.
+    let mut writer = varve::VarveWriter::open(on_spec(), &path)?;
+    writer.push(&Sample { value: 7 })?;
+    writer.flush()?;
+    drop(writer);
+    assert!(
+        !warm(&std::fs::read(&path)?).is_empty(),
+        "the next commit rewarms the region",
+    );
+    let (_, source) = varve::VarveFile::open_readonly_lazy_with_report(on_spec(), &path)?;
+    assert_eq!(source, varve::LazyOpenSource::HeaderTails);
     Ok(())
 }
 
