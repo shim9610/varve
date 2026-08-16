@@ -6,6 +6,31 @@ increment the minor version.
 
 ## Unreleased
 
+### `defragment()` — rewrite the file without the records marked dead
+
+```rust
+let report = writer.defragment()?;   // DefragmentReport
+```
+
+Publishes by the route `replace_*` uses — temp file, sync, atomic rename — so a
+reader open across it keeps its own generation whole: the old object is unlinked
+but alive while a handle holds it, and that handle moves with `is_current()` and
+`reopen_readonly()`. Measured: a handle holding ten records read all ten back
+unchanged after a defrag dropped three, then reported `is_current() == false`
+and reopened onto the seven. The cost of that route is peak disk — both
+generations exist at once. An in-place compaction would avoid it and break every
+reader open at the time, which is the trade this chose against.
+
+Both offset chains are **rebuilt, not shifted**: a dropped record's successors
+relink to the nearest surviving predecessor in the same chain, and a link whose
+whole chain was dropped is cleared. Internal records are kept; the derived ones
+(index checkpoints, segments, open digests) are rebuilt from the records
+actually written, because their payloads are record offsets.
+
+Refused without `liveness: footer_flags`, for custom layouts, for matrix
+storage, and for a handle with no resident directory. Memory is two offset
+tables sized by the record count, charged to `max_index_bytes`.
+
 ### `liveness: footer_flags` — a record can be marked dead
 
 Until now a varve record could stop being the answer in two ways, and neither

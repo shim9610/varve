@@ -508,6 +508,21 @@ collection, and still on every chain that pointed at it. A defragmenting rewrite
 is what acts on it. Refused for an internal record (`ReservedBlockId`) and for a
 format without the option (`InvalidFormatSpec`).
 
+### Reclaiming the space a dead record holds
+
+| Call | Takes | What it does |
+| --- | --- | --- |
+| `defragment()` | `&mut self` | Rewrites the file without the records marked dead and publishes it by atomic rename. Returns `DefragmentReport { records_dropped, bytes_before, bytes_after }` |
+
+A reader open across it keeps its own generation whole — the old object is
+unlinked but alive while a handle holds it — and moves with `is_current()` plus
+`reopen_readonly()`. The cost of publishing that way is peak disk: both
+generations exist at once.
+
+Refused (`InvalidFormatSpec`) without `liveness: footer_flags`, for custom
+physical layouts and for matrix storage; refused (`NoResidentDirectory`) on a
+handle that keeps no directory.
+
 ### An open that reads no record
 
 `open_readonly_lazy(spec, path)` opens from the **open digest** at the end of

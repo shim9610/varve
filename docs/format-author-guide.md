@@ -692,6 +692,42 @@ until something defragments it. Refused without `liveness: footer_flags` (no
 word to write the verdict in) and without a transaction marker (nothing to name
 a boundary with).
 
+### Reclaiming the space: `defragment()`
+
+Marking a record dead costs four bytes and frees nothing. The operation that
+frees something is a defragmenting rewrite:
+
+```rust
+let report = writer.defragment()?;
+// report.records_dropped, report.bytes_before, report.bytes_after
+```
+
+It rewrites the file without the records marked dead and publishes the result
+the way `replace_*` does — a temp file in the same directory, synced, renamed
+over the pathname. **A reader open across it keeps its own generation whole**:
+the old object is unlinked but alive for as long as a handle holds it, so reads
+in flight neither fail nor change their answers. That handle learns about the
+new generation the same way it learns about any republish — `is_current()`, then
+`reopen_readonly()`.
+
+The cost of that route is **peak disk**: both generations exist at once. An
+in-place compaction would avoid it and would break every reader open at the
+time, which is the trade this chose against.
+
+Every internal record is kept. The derived ones — index checkpoints, segments,
+open digests — are rebuilt from the records actually written rather than copied,
+because their payloads *are* record offsets and a rewrite moves them.
+
+**Both offset chains are rebuilt, not shifted.** A dropped record's successors
+are relinked to the nearest surviving predecessor in the same chain, and a link
+whose whole chain was dropped is cleared rather than pointed at whatever now
+occupies that offset.
+
+Refused without `liveness: footer_flags` — nothing would ever be dead, so it
+would be a whole-file copy that achieves nothing — and for custom layouts,
+matrix storage, and a handle that keeps no resident directory. Memory is two
+offset tables sized by the record count, charged to `max_index_bytes`.
+
 ## Custom Physical Layout
 
 Most formats should use the Varve-native append log. Use custom physical layout
