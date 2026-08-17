@@ -108,8 +108,13 @@ is covered in **[API Changes](docs/api-changes.md)**.
   snapshots as of open. Matrix readers are not snapshots at all: each commit-map
   page is as of the first read that faulted it in, and since 0.5.0 no policy pins
   a whole-map instant. A reader that needs one must coordinate it.
-- **Anything depending on a fuzz, Miri or ASan pass on this release**, or on the
-  Unix code paths having been executed. Neither has happened; see
+- **Anything depending on a long fuzz campaign.** Fuzz, Miri and ASan do run
+  now — weekly, in CI — and the Unix code paths are executed rather than merely
+  compiled, which is a change from every release before 0.7.0. What has *not*
+  happened is a campaign: the fuzz job gives each target 90 seconds, and the
+  targets that build a sidecar per input manage about 64 executions per second
+  where the codec target manages 300,000. Treat the fuzz line as a smoke test
+  that has never failed, not as a search that has finished; see
   [Known Limitations §6](docs/known-limitations.md#6-not-verified).
 
 ## What Varve Provides
@@ -252,7 +257,7 @@ the git repository and pin a tag:
 
 ```toml
 [dependencies]
-varve = { git = "https://github.com/shim9610/varve", tag = "v0.7.0" }
+varve = { git = "https://github.com/shim9610/varve", tag = "v0.8.0" }
 ```
 
 Pin the tag rather than tracking `main`: `main` moves, and this project is at a
@@ -266,7 +271,7 @@ a build that enables none is the smallest one. Enable what a format declaration
 actually asks for:
 
 ```toml
-varve = { git = "https://github.com/shim9610/varve", tag = "v0.7.0",
+varve = { git = "https://github.com/shim9610/varve", tag = "v0.8.0",
           features = ["integrity", "compression-zstd"] }
 ```
 
@@ -394,7 +399,7 @@ gate, file data, environment, or library invariant issues. See
 
 ## Status
 
-Varve 0.7.0 is usable as an alpha library for experimentation and controlled
+Varve 0.8.0 is usable as an alpha library for experimentation and controlled
 deployments. Through the **stable, released** APIs that means moderate scale —
 files whose record and key counts fit in RAM. The larger-than-RAM path exists but
 is behind `high-cardinality-dev`, has never shipped, and is the least audited code
@@ -402,11 +407,11 @@ in the tree; "far larger than RAM" in the capability table above describes that
 feature-gated family, not the default one. It includes append-log blocks, keyed
 collections, transaction/footer commit policies, schema manifests, diagnostics,
 merge and compact helpers, variable-block compression, matrix storage, mmap, and
-opt-in zero-copy. Valid native 0.1 append-log wire bytes remain readable in 0.7.0,
+opt-in zero-copy. Valid native 0.1 append-log wire bytes remain readable in 0.8.0,
 but the Rust API is still pre-1.0 and may evolve through semver-signaled minor
 releases.
 
-**Four artifact classes are not covered by that statement in 0.7.0.** They are
+**Four artifact classes are not covered by that statement in 0.8.0.** They are
 rejected with a typed error rather than misread, but two of them hold data and two
 are regenerable, and the difference is what it costs you:
 

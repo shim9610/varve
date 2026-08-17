@@ -20,7 +20,12 @@ __pycache__/
 # manual, the local gate, the standing design policies, and notes about this
 # machine. They are not explanation or usage, so they do not belong in the
 # published tree. The file stays in the working tree -- it has to, that is how
-# it is read -- and is tracked on the internal-docs branch only, the same way
+# it is read -- and is tracked on the `internal` branch only, the same way
 # /.internal-docs/ is. Untracked here with `git rm --cached`, because adding a
 # line to this file does not untrack something git already tracks.
+#
+# This file differs by branch by design: these two lines are ACTIVE here and
+# commented out on `internal`, because git cannot track an ignored path. Do not
+# cherry-pick a commit touching this file between the two -- it carries neither
+# guarded path, so the pre-push hook has nothing to refuse.
 /CLAUDE.md
