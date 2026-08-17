@@ -6,6 +6,62 @@ increment the minor version.
 
 ## Unreleased
 
+### A replacement no longer leaves a lazy resume on a used sequence
+
+A lazy open does **not** recount: it seeds its writer with the recorded sequence
+high-water mark plus one. So a mark below the file's true maximum sends the next
+append onto a number a record already carries, and the following scanning open
+refuses the file with
+`InvalidCanonicalEncoding("duplicate native record sequence")` — the file stops
+opening. Two defects put a mark there, one on each lazy route.
+
+**`open_digest_on_flush`.** The three republishing paths (`replace_block`,
+`replace_rewrite`, `defragment`) computed the mark over the records written
+*before* the digest, so it reported one less than the digest's own sequence.
+Measured on `crc32 + open_digest_on_flush`, 64 records: the digest sat at
+sequence 64 and recorded 63, and a lazy writer resumed at 64. The append path
+had been corrected for exactly this; the three copies had not.
+
+`replace_fixed` and `unsafe replace_fixed_in_place_exclusive` could not be fixed
+the same way — they publish by copying the generation and patching one record,
+rewriting no derived record at all, while assigning the replacement a fresh
+sequence. They are now **refused** on such a format with
+`Error::InvalidFormatSpec`, alongside the `segment_on_flush` refusal they sit
+next to. Not a capability loss: `open_digest_on_flush` forces
+`block_offset_chain` on, so `replace` routes these formats to `replace_block`.
+Only a direct call to an in-place method meets the refusal.
+
+**`index: header_tails`.** The same symptom by a different mechanism, and one
+the digest fix could not cover, since the two options are refused together. This
+region stores no mark — an open *derives* one from the commit marker its slot
+names — and that derivation holds only while a record's sequence rises with its
+offset. An in-place replacement breaks it by taking a fresh sequence and writing
+it before the marker; measured, the replacement took 65 while the marker still
+reported 64.
+
+Here the region is **retired** rather than the operation refused: it is reset to
+cold, which is a state the format already defines and every open already
+handles. A digest has no equivalent — it is a record, trusted or absent. So the
+replacement still happens and the cost is one scanning open:
+
+```rust
+// header_tails format, before this change: the file stopped opening.
+writer.replace_fixed(0, &Sample { value: 4_242 })?;
+// LazyOpenSource::HeaderTails -> FullScan -> HeaderTails after the next commit
+```
+
+An in-place replacement on such a format previously kept the region warm, and a
+test asserted it should. The reasoning behind that assertion was correct about
+record offsets — nothing moves — and silent about the mark.
+
+Checkpoint formats needed no change and keep the in-place route, measured clean
+on all four: a scanning open re-derives a checkpoint, so a stale one is not
+observable the way a stale digest is.
+
+Files already written by an earlier release are **not** detected or repaired. A
+file whose in-place replacement was published with a stale mark still opens and
+reads correctly today; it is the next *lazy* append that makes it unopenable.
+
 ### Breaking: `ReplaceStrategy` is removed; `replace` reads the declaration
 
 ```rust

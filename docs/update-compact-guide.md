@@ -183,6 +183,20 @@ The caller must exclude every reader, writer, mmap, raw reference, handle,
 thread, and process for the operation and for every affected view's lifetime.
 It is deliberately not a route `replace` will ever pick.
 
+Both in-place routes are refused with `Error::InvalidFormatSpec` on a format
+declaring `segment_on_flush` or `open_digest_on_flush`. They restamp a record
+that an already written derived record describes, and rewrite no derived record
+themselves — while taking a fresh sequence, which leaves a digest's high-water
+mark below the file's true maximum. A lazy open resumes from that mark rather
+than recounting, so the next append would reuse a sequence and the file would
+stop opening. Both such formats declare `block_offset_chain`, so `replace`
+routes them to `replace_block` and the capability is not lost; only a direct
+call meets the refusal.
+
+A format declaring `index: header_tails` is not refused — that region has a cold
+state a digest record has not — but an in-place replacement resets it, so the
+next open scans once before the following commit warms it again.
+
 On a `keyed_offset_chain` format the caller must also keep the record's key
 unchanged (F-02). Records appended after the target already carry
 `prev_same_key_offset` pointers into it, and this path publishes no new

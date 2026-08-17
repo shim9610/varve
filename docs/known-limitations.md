@@ -754,6 +754,28 @@ something a caller should have to infer from a stopwatch.
 It requires `block_offset_chain` and composes with `segment_on_flush` and
 `checkpoint_on_flush` alike; the three answer different questions.
 
+It also refuses in-place fixed replacement (`replace_fixed`,
+`replace_fixed_in_place_exclusive`) with `Error::InvalidFormatSpec`, for a
+reason worth stating because it is not the segment's. A segment is refused
+because the replacement restamps a record it already describes by offset. The
+digest is refused because of the *sequence* it records: an in-place replacement
+takes a fresh sequence and rewrites no derived record, so the digest's mark is
+left one below the file's true maximum — and a lazy open trusts that mark
+instead of recounting, seeding its writer onto a number some record already
+used. The next scanning open then refuses the file with
+`InvalidCanonicalEncoding("duplicate native record sequence")`, so the failure
+is a file that stops opening rather than a stale index. As with the segment,
+what is refused is the route and not the capability: a digest format also
+declares `block_offset_chain`, so `replace` picks `replace_block`, which
+republishes and rebuilds the digest.
+
+`index: header_tails`, which answers the same three facts from the file header,
+is not refused. Its region has a defined cold state — framed, checksummed,
+claiming nothing — so an in-place replacement resets it rather than being turned
+away. A digest has no such state: it is a record, trusted or absent. The cost of
+the reset is one scanning open, after which the next commit warms the region
+again.
+
 **Otherwise every open scans the whole record region.** This correction matters
 because the previous version of this document offered a mitigation that does not
 exist:

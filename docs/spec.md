@@ -163,9 +163,18 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 
 - `replace_fixed` performs snapshot-preserving copy-on-write replacement and
   requires an unchanged encoded payload size. It is refused for a format with
-  `segment_on_flush`, which is also true of
+  `segment_on_flush` or with `open_digest_on_flush`, which is also true of
   `replace_fixed_in_place_exclusive`: both restamp a record that an already
-  written segment describes.
+  written derived record describes. A segment names the record's offset; a
+  digest records the file's sequence high-water mark, and an in-place
+  replacement takes a *fresh* sequence while rewriting no derived record, so the
+  mark is left below the file's true maximum. A lazy open does not recount — it
+  seeds its writer from that mark — so the next append would reuse a sequence
+  and the file would stop opening.
+- A format declaring `index: header_tails` is **not** refused. That region has a
+  defined "claims nothing" state, which a digest record has not, so an in-place
+  replacement resets it to cold instead: the next open falls back to the scan
+  once and the next commit warms it again.
 - `replace_rewrite` rewrites through a completed temporary file and atomically replaces the original file path.
 - `replace_block` is the generated/core sequence-preserving replacement path.
   It permits a native fixed or variable payload to grow or shrink, rebuilds

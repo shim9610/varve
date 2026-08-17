@@ -574,8 +574,8 @@ Common `VarveWriter` APIs:
 | `write_metadata(key, bytes)` | append internal metadata record |
 | `replace(index, &block)` | **the door**: picks one of the three safe routes below from the format spec, and returns the published sequence |
 | `replace_block(index, &block)` | sequence-preserving copy-on-write replacement; encoded size may grow or shrink |
-| `replace_fixed(index, &block)` | same-size copy-on-write replacement; already-open readers keep their snapshot |
-| `unsafe replace_fixed_in_place_exclusive(index, &block)` | expert-only in-place replacement; caller must exclude readers and writers **and must not change a keyed record's key** |
+| `replace_fixed(index, &block)` | same-size copy-on-write replacement; already-open readers keep their snapshot; refused on `segment_on_flush` and on `open_digest_on_flush` |
+| `unsafe replace_fixed_in_place_exclusive(index, &block)` | expert-only in-place replacement; same two refusals; caller must exclude readers and writers **and must not change a keyed record's key** |
 | `replace_rewrite(index, &block)` | rewrite whole file through temp file |
 
 `replace` takes no strategy argument, because which route is legal follows from
@@ -591,6 +591,25 @@ It never picks the `unsafe` path. Call a named method instead when you want a
 particular mechanism and would rather be refused than rerouted — each still
 refuses where its format cannot serve it, and those refusals are the reason the
 choice is not the caller's to make.
+
+Both in-place routes are refused with `Error::InvalidFormatSpec` on a format
+declaring `segment_on_flush` or `open_digest_on_flush`. They restamp a record
+that an already written derived record describes, and they rewrite no derived
+record — while taking a *fresh* sequence, which leaves a digest's stored
+high-water mark below the file's true maximum. A lazy open seeds its writer from
+that mark rather than recounting, so the next append would reuse a sequence and
+the file would stop opening with
+`InvalidCanonicalEncoding("duplicate native record sequence")`.
+
+Neither refusal costs the capability. `open_digest_on_flush` forces
+`block_offset_chain` on, so such a format is a record-footer format and `replace`
+routes it to `replace_block`, which republishes and rebuilds every derived
+record. Only a caller naming an in-place method directly meets the refusal.
+
+`index: header_tails` is the one lazy route that is *not* refused, because its
+region has a cold state that claims nothing and a digest record has no
+equivalent. An in-place replacement resets the region instead: the next open
+reports `LazyOpenSource::FullScan` and the next commit warms it again.
 
 All four safe replacement entry points select their target by block id and refuse a
 stored `block_version` that differs from `T::VERSION` with

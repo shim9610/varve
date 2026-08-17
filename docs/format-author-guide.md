@@ -563,6 +563,19 @@ a fixed offset after the header, which the region moves), and
 `open_digest_on_flush` — the two are answers to the same question with different
 safety properties, so declare one.
 
+**What it gives up on an in-place replacement.** `replace_fixed` and
+`unsafe replace_fixed_in_place_exclusive` reset the region to cold, so the next
+open reports `LazyOpenSource::FullScan` and the commit after it warms the region
+again. Nothing moves in such a replacement, so the offsets in the table would
+still be true — but the table does not only answer offsets. The high-water mark
+an open resumes from is *derived* from the commit marker the slot names, and
+that derivation assumes a record's sequence rises with its offset. An in-place
+replacement is the one operation that breaks it: it takes a fresh sequence and
+writes it before the marker. So the region goes out of use whole rather than
+answering two facts correctly and one wrongly. A digest cannot take this route —
+it is a record, with no cold state — which is why it refuses the operation
+outright instead.
+
 **Turning it on changes the schema hash**, because the region lives in the
 header and so moves every record offset in the file. An existing file does not
 open with it and cannot be given the region in place; write a new one.
