@@ -90,6 +90,41 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: asan
+      # LeakSanitizer matches its suppressions against *symbolized* frames, and
+      # the one suppression this repository has names a test function. With no
+      # symbolizer the frames are bare addresses, nothing matches, and the run
+      # fails on the single leak that is a test's premise.
+      #
+      # That is exactly what happened on 2026-08-24:
+      # `SUMMARY: AddressSanitizer: 3502 byte(s) leaked in 6 allocation(s)` --
+      # the same 6 allocations, and the same 3502 bytes, that the suppression
+      # accounts for when it can read them. Reproduced afterwards by re-running
+      # one unchanged binary two ways: with `symbolize=0` it exits 1 with that
+      # summary, and with a symbolizer it exits 0 reporting
+      # `6  3502  a_record_appended_past_the_digest_falls_back`.
+      #
+      # rustup's `llvm-tools` component does **not** ship `llvm-symbolizer` --
+      # checked, the component installs a set of llvm binaries and that is not
+      # one of them -- so adding it to `components:` above would not have fixed
+      # this. The runner image carries one; find it explicitly rather than hope
+      # it is on PATH, and fail here when it is not. A missing symbolizer must
+      # stop the job at this step, because downstream it does not look like a
+      # missing symbolizer: it looks like a leak in whichever test happens to
+      # own the suppressed allocation.
+      - name: locate llvm-symbolizer
+        run: |
+          for candidate in \
+            "$(command -v llvm-symbolizer || true)" \
+            $(ls -1 /usr/lib/llvm-*/bin/llvm-symbolizer 2>/dev/null | sort -V | tail -1) \
+            $(ls -1 /usr/bin/llvm-symbolizer-* 2>/dev/null | sort -V | tail -1); do
+            if [ -x "$candidate" ]; then
+              echo "symbolizing with $candidate"
+              echo "ASAN_SYMBOLIZER_PATH=$candidate" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done
+          echo "::error::no llvm-symbolizer found; LeakSanitizer suppressions match on symbolized frames, so this run would report a suppressed test premise as a leak"
+          exit 1
       # Three env choices, each with a measured reason:
       #
       #   * `VARVE_SKIP_UI_SNAPSHOTS=1` — trybuild runs its fixtures by
@@ -102,7 +137,8 @@ jobs:
       #     extra. Without the suppression file the suite exits 101 while all
       #     tests pass, because LeakSanitizer reports at process exit.
       #   * the suppression file names ONE test function whose leak is its
-      #     premise (`std::mem::forget` of a writer, to model a writer that
+      #     premise -- which is why the step above must have found a
+      #     symbolizer; a name cannot match an unsymbolized frame (`std::mem::forget` of a writer, to model a writer that
       #     died before flushing). It deliberately does not name the leaking
       #     frame — that is the append hot path, where a real leak would
       #     matter most. See the file's own comments.
