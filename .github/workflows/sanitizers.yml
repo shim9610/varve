@@ -137,9 +137,10 @@ jobs:
       #     extra. Without the suppression file the suite exits 101 while all
       #     tests pass, because LeakSanitizer reports at process exit.
       #   * the suppression file names ONE test function whose leak is its
-      #     premise -- which is why the step above must have found a
-      #     symbolizer; a name cannot match an unsymbolized frame (`std::mem::forget` of a writer, to model a writer that
-      #     died before flushing). It deliberately does not name the leaking
+      #     premise (`std::mem::forget` of a writer, to model a writer that
+      #     died before flushing) -- which is why the step above must have
+      #     found a symbolizer, because a name cannot match an unsymbolized
+      #     frame. It deliberately does not name the leaking
       #     frame — that is the append hot path, where a real leak would
       #     matter most. See the file's own comments.
       #

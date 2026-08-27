@@ -8231,8 +8231,11 @@ pub(crate) mod page_index_enumeration {
                 .ok_or(Error::InvalidMatrixLayout)?;
             let bytes = read_range(file, offset, len, resource)?;
             count_open_bitmap_bytes_read(len);
-            for entry in bytes.chunks_exact(PAGE_INDEX_ENTRY_LEN as usize) {
-                let raw = u64::from_le_bytes(entry.try_into().expect("chunk"));
+            // `as_chunks` yields `&[u8; 8]` directly, which retires the
+            // `try_into().expect("chunk")` below it -- a fallible conversion
+            // that could not fail, now absent rather than merely unreachable.
+            for entry in bytes.as_chunks::<{ PAGE_INDEX_ENTRY_LEN as usize }>().0 {
+                let raw = u64::from_le_bytes(*entry);
                 // `raw` is `page + 1`. Inside the counted prefix a zero or
                 // out-of-range value is damage, not an end marker, so it is
                 // reported and skipped rather than ending the scan.

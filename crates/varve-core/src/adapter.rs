@@ -169,12 +169,15 @@ impl<'a> BinaryCursor<'a> {
                 requested: usize_to_u64(byte_len),
             })?;
         self.position += byte_len;
-        for bytes in bytes.chunks_exact(8) {
-            let mut value = [0; 8];
-            value.copy_from_slice(bytes);
+        // `as_chunks` rather than `chunks_exact`: the chunk size is a
+        // constant, so the element type is `&[u8; 8]` and the intermediate
+        // copy into a local array goes away. The discarded `.1` remainder is
+        // the same tail `chunks_exact` dropped; `byte_len` is a multiple of 8
+        // by construction above, so it is empty.
+        for value in bytes.as_chunks::<8>().0 {
             values.push(f64::from_bits(match self.endian {
-                Endian::Little => u64::from_le_bytes(value),
-                Endian::Big => u64::from_be_bytes(value),
+                Endian::Little => u64::from_le_bytes(*value),
+                Endian::Big => u64::from_be_bytes(*value),
             }));
         }
         self.materialized_bytes += byte_len;
