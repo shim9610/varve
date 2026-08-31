@@ -1186,6 +1186,29 @@ pub struct IndexPolicy {
     /// Deliberately absent from the layout DSL. Blocks are what a user
     /// declares; segment granularity is varve's decision, so there is nothing
     /// here for a declaration to choose.
+    ///
+    /// **A recovery open does not take the chain**, and the cost difference is
+    /// the whole file: `open_recover_writer` frames every record where
+    /// `open_readonly` and `open_writer` frame one per commit point. Measured
+    /// on a 20-per-flush file, 200 records then 800: 10 and 40 framed for the
+    /// chained opens, 220 and 880 for the recovering one. That is deliberate --
+    /// a recovery open exists to look at every record, and the chain names only
+    /// the records a commit point closed, so walking it would skip exactly what
+    /// recovery is there to find. See `segment_chain_open_is_allowed`, which
+    /// also excludes `IntegrityVerification::AtOpen` for the same reason.
+    ///
+    /// **Combines with [`Self::open_digest_on_flush`]**, and the two are not
+    /// alternatives: the chain builds an index and the digest avoids building
+    /// one, so they serve different open entry points rather than competing to
+    /// answer the same question. What they do interact over is the end of the
+    /// file -- a digest is appended after the segment closing the same commit
+    /// point, so the newest segment no longer ends at `file_len`, which the
+    /// walk checks. `trailing_open_digest` finds the digest and ends the chain
+    /// at it; without that the digest would silently switch the chain off, and
+    /// silently is the word, because the result is a slower open rather than a
+    /// failed one. Contrast [`Self::header_tails`], which *is* refused
+    /// alongside the digest: two summary tables answering one question need a
+    /// precedence rule, and no safe one exists.
     pub segment_on_flush: bool,
     /// Whether a commit point appends an internal *open digest* record.
     ///
@@ -1205,6 +1228,27 @@ pub struct IndexPolicy {
     /// [`VarveFile::open_readonly_lazy`] is the open it serves, and the caller
     /// builds whatever index it needs with `record_map`. An open that wants the
     /// index still scans or walks the segment chain.
+    ///
+    /// **Combines with [`Self::segment_on_flush`]** for exactly that reason:
+    /// the two serve different open entry points, so there is no choice to make
+    /// between them and no precedence rule to define. `open_readonly_lazy`
+    /// reads this digest, `open_readonly` walks the chain, and
+    /// [`crate::LazyOpenSource`] reports which route a lazy open actually took.
+    ///
+    /// The one interaction is positional, and it is handled rather than
+    /// forbidden. A digest is appended *after* the segment closing the same
+    /// commit point, so with both on the newest segment no longer ends at
+    /// `file_len` -- which is precisely what the chain walk verifies.
+    /// `trailing_open_digest` frames the digest and ends the chain there, so
+    /// the walk still succeeds and the digest still appears in the index it
+    /// produces. Without it, declaring the digest would turn the chain off
+    /// without any error, which surfaces as an open that got slower rather than
+    /// one that failed.
+    ///
+    /// Refused alongside [`Self::header_tails`], which is the case that really
+    /// is a conflict: both are summary tables answering one question, and their
+    /// safety properties differ, so "whichever is newer" would sometimes prefer
+    /// the weaker one.
     pub open_digest_on_flush: bool,
     /// Whether the file header carries a fixed region holding each block's
     /// newest record offset.
