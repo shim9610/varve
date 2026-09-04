@@ -1,10 +1,12 @@
-# API Changes — 0.3.0 through 0.8.0
+# API Changes — 0.3.0 through 0.9.0
 
 Migration document. Companion to [Known Limitations](known-limitations.md)
 and the [Changelog](../CHANGELOG.md).
 
 Sections run newest first, and the letters ascend with the release they
-describe. Section **D** is the 0.7.0 → 0.8.0 migration: a removed
+describe. Section **E** is the 0.8.0 → 0.9.0 migration: one added `FormatSpec`
+field, which breaks a struct literal and nothing else, and a corrected
+`effective_layout()` header length. Section **D** is the 0.7.0 → 0.8.0 migration: a removed
 replacement-strategy enum, and a `with_directory` that returns `Result` so it can
 refuse a directory built against a different generation. Section **C** is the
 0.6.0 → 0.7.0 migration: a writer open that does not scan, an editable written
@@ -20,6 +22,72 @@ and says so in place.
 No on-disk byte changes in 0.5.0. A 0.4.0 file reads unchanged; no encoder,
 decoder, header field or version constant was touched. If you are coming from
 0.3.0 or earlier, read "Read this first" below — that guidance is unchanged.
+
+---
+
+## E. From 0.8.0 to 0.9.0: one added spec field, and a layout length that was wrong
+
+Two changes, and most callers need nothing for either. The additions —
+`header_slots` and the `write_header_block` family — are documented in the
+[format author guide](format-author-guide.md) and the
+[API reference](api-reference.md); a format that does not declare a region is
+byte-identical to 0.8.0 and its `computed_schema_hash()` is unchanged.
+
+### E.1 `FormatSpec` has a new field, `header_slots`
+
+```rust
+- let spec = FormatSpec { magic: b"MYFMT", version: 1, /* ..., */ };
++ let spec = FormatSpec { magic: b"MYFMT", version: 1, /* ..., */
++                         header_slots: HeaderSlots::NONE };
+```
+
+This affects **only** a caller who builds a `FormatSpec` with struct-literal
+syntax. `varve_format!`, `FormatSpecBuilder`, `FormatSpec::new` and every
+`with_*` method are unchanged and need nothing — which is every documented way
+to build a spec, so most trees will not notice this release.
+
+`HeaderSlots::NONE` is the inert value and what all four of those routes fill in.
+It folds nothing into the schema hash and writes no bytes.
+
+### E.2 `FormatSpecBuilder::build()` now carries `liveness_policy`
+
+```rust
+let spec = FormatSpecBuilder::new()
+    .liveness_policy(LivenessPolicy::FooterFlags)   // was silently dropped
+    .build()?;
+```
+
+The builder accepted the call and did not carry the value into the built spec,
+so a builder-declared format got `LivenessPolicy::None` no matter what it asked
+for. **Check any spec you build this way**: if it declares `footer_flags`, it was
+not getting it, and from 0.9.0 it is — which means the format now writes a record
+footer's mutable word and a `VLIV` header block it did not write before, and
+`computed_schema_hash()` changes with it. A file created under 0.8.0 by such a
+builder-declared spec will not open against the 0.9.0 spec.
+
+There is no migration that keeps both: the 0.8.0 behaviour was the option not
+working. To keep reading those files, drop the `.liveness_policy(..)` call, which
+is what the spec effectively had.
+
+Formats declared with `varve_format!` are unaffected — the macro never went
+through the builder.
+
+### E.3 `effective_layout()` reported a short header for `footer_flags` formats
+
+`FormatSpec::effective_layout()` and `inspect_layout_file()` published a
+file-header length **16 bytes short** for every format declaring
+`liveness: footer_flags`: the `VLIV` extension block was missing from the plan's
+extension-length term, so the plan described the first record as starting inside
+that block.
+
+No file was ever written wrong, and no varve read path was affected — the reader
+derives the boundary from the file's own extension region rather than from the
+plan. What was affected is an **external tool** that reads `effective_layout()`
+to find where the append log begins. If you have one and it works today against
+such a format, it is compensating for this bug, and 0.9.0 breaks that
+compensation. Remove the adjustment.
+
+Formats without `footer_flags` reported the correct length before and after.
 
 ---
 

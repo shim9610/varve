@@ -4,7 +4,7 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
-## Unreleased
+## 0.9.0 - 2026-09-04
 
 ### An editable fixed-size region in the file header
 
@@ -68,6 +68,15 @@ told wrong.
 The builder accepted `.liveness_policy(..)` and did not carry it into the built
 spec, so a format declared through the builder rather than the macro silently
 got `LivenessPolicy::None`.
+
+**This one needs a look before you upgrade.** `liveness_policy` is folded into
+the schema hash (measured, `liveness_policy_moves_the_schema_hash`), so a
+builder-declared spec asking for `footer_flags` now gets a different hash than it
+had — and files it created under 0.8.0 will not open against it. There is no
+migration that keeps both, because the 0.8.0 behaviour was the option not
+working; to keep reading those files, drop the `.liveness_policy(..)` call, which
+is what the spec effectively had. `varve_format!` never went through the builder
+and is unaffected. See [api-changes.md §E.2](docs/api-changes.md).
 
 ## 0.8.0 - 2026-08-10
 

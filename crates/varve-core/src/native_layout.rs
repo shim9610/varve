@@ -1546,4 +1546,34 @@ mod tests {
             );
         }
     }
+
+    /// The builder's dropped `liveness_policy` changed the schema hash, so the
+    /// migration note has to say so. Measured rather than asserted.
+    #[test]
+    fn liveness_policy_moves_the_schema_hash() {
+        use crate::{CommitPolicy, FormatSpecBuilder, IndexPolicy, LivenessPolicy, ReadLimits};
+
+        const BLOCKS: &[crate::BlockDescriptor] = &[crate::BlockDescriptor {
+            id: 7,
+            name: "b",
+            version: 1,
+            kind: crate::BlockKind::Variable,
+            fields: &[],
+        }];
+        let base = FormatSpecBuilder::new()
+            .magic(b"LIVEHASH")
+            .blocks(BLOCKS)
+            .read_limits(ReadLimits::TRUSTED_UNBOUNDED)
+            .index_policy(IndexPolicy::BlockOffsetChain)
+            .commit_policy(CommitPolicy::TransactionMarker(
+                crate::TransactionMarkerMode::OnFlush,
+            ))
+            .build()
+            .expect("spec");
+        assert_ne!(
+            base.computed_schema_hash(),
+            base.with_liveness_policy(LivenessPolicy::FooterFlags)
+                .computed_schema_hash(),
+        );
+    }
 }
