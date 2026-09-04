@@ -1169,6 +1169,127 @@ pub enum LivenessPolicy {
     FooterFlags,
 }
 
+/// What, if anything, checksums the editable header region.
+///
+/// The region is the one part of a varve file that is *meant* to change without
+/// the file becoming a new generation, which puts it outside every guarantee the
+/// append log gets for free: a record is checksummed once and never rewritten,
+/// so a torn write lands past the committed end and open truncates it. A header
+/// write has no such luxury --- it overwrites the only copy, in place, at a
+/// fixed offset. This is the knob that decides what that costs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderSlotIntegrity {
+    /// No checksum, no verification, editable for the life of the file.
+    ///
+    /// The region is excluded from every checksum the format computes, which is
+    /// the point: a write is one `write_all` and nothing else in the file has to
+    /// be recomputed. What you give up is detection --- a torn or rotted region
+    /// reads back as whatever the bytes say, and the entry framing is the only
+    /// thing that would notice.
+    None,
+    /// A checksum rewritten on every write and verified on every read.
+    ///
+    /// Costs one checksum over the region per write and per read; catches a
+    /// torn write, which on a fixed-offset in-place rewrite is the failure that
+    /// actually happens. The region stays editable for the life of the file.
+    Rolling,
+    /// A checksum written once, by an explicit seal, after which the region is
+    /// frozen.
+    ///
+    /// Until the seal the region is editable and unverified; the seal computes
+    /// the checksum and sets a flag, and from then on every write is refused and
+    /// every read verifies. For the shape where a header is assembled during
+    /// commissioning and must not move afterwards --- the seal is the moment the
+    /// file stops being configurable, and it is recorded in the file rather than
+    /// remembered by a caller.
+    Sealed,
+}
+
+/// A fixed-size region of the file header that user blocks can be written into
+/// after the file exists.
+///
+/// # Why the size is fixed and cannot be otherwise
+///
+/// Everything in a varve file after the header is addressed by an absolute
+/// offset --- `append_log_start`, every record offset, every chain link, the
+/// matrix region. The header's *length* is therefore part of the file's
+/// geometry, and a region that could grow would move every one of those. So the
+/// capacity is declared once, reserved at create, and never changes; a write
+/// that would not fit is refused rather than served by growing.
+///
+/// That is also why enabling this changes the schema hash: it moves
+/// `append_log_start`, so a build that did not know about the region would
+/// compute a different one and misread the file. Declaring it means existing
+/// files of the old spec do not open, and there is no way to add the region to a
+/// file in place --- write a new one.
+///
+/// # What it holds
+///
+/// Ordinary declared blocks, named by id in [`Self::blocks`], each stored at
+/// most once. Writing the same block again replaces it. They are *header* blocks
+/// rather than append-log records: they have no sequence, they are not part of
+/// any chain, no commit marker covers them, and `blocks::<T>()` does not return
+/// them.
+///
+/// # Cost
+///
+/// `capacity` bytes in every file of the format, whether written or not, plus 16
+/// bytes of region header and 8 of block framing. One `write_all` per write, of
+/// the whole region, at a fixed offset --- no record is appended and the file
+/// does not grow. Reads are served from the header bytes open already holds, so
+/// they cost no I/O at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeaderSlots {
+    /// Bytes reserved for entries. Zero means the format declares no region and
+    /// is byte-identical to one written before this existed.
+    pub capacity: u32,
+    /// What checksums the region. See [`HeaderSlotIntegrity`].
+    pub integrity: HeaderSlotIntegrity,
+    /// The block ids allowed in the region. A write of any other block is
+    /// refused, so the declaration is what the file's header can ever contain.
+    pub blocks: &'static [u32],
+}
+
+impl HeaderSlots {
+    /// No region. The default, and byte-identical to a format written before
+    /// this option existed.
+    pub const NONE: Self = Self {
+        capacity: 0,
+        integrity: HeaderSlotIntegrity::None,
+        blocks: &[],
+    };
+
+    /// Whether the format reserves a region at all.
+    pub const fn is_declared(&self) -> bool {
+        self.capacity > 0
+    }
+
+    /// Reserves `capacity` bytes for the given block ids.
+    pub const fn new(
+        capacity: u32,
+        integrity: HeaderSlotIntegrity,
+        blocks: &'static [u32],
+    ) -> Self {
+        Self {
+            capacity,
+            integrity,
+            blocks,
+        }
+    }
+
+    /// Whether `block_id` may be written into the region.
+    pub fn permits(&self, block_id: u32) -> bool {
+        let mut index = 0;
+        while index < self.blocks.len() {
+            if self.blocks[index] == block_id {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexPolicy {
     pub scan_on_open: bool,
@@ -1973,6 +2094,9 @@ pub struct FormatSpec {
     pub integrity_policy: IntegrityPolicy,
     /// Whether a record can be marked dead after it was written.
     pub liveness_policy: LivenessPolicy,
+    /// A fixed-size region of the file header that user blocks can be written
+    /// into after the file exists. See [`HeaderSlots`].
+    pub header_slots: HeaderSlots,
     pub recovery_policy: RecoveryPolicy,
     pub manifest_policy: ManifestPolicy,
     pub compression_policy: CompressionPolicy,
@@ -2034,6 +2158,7 @@ pub struct FormatSpecBuilder {
     commit_policy: CommitPolicy,
     integrity_policy: IntegrityPolicy,
     liveness_policy: LivenessPolicy,
+    header_slots: HeaderSlots,
     recovery_policy: RecoveryPolicy,
     manifest_policy: ManifestPolicy,
     compression_policy: CompressionPolicy,
@@ -2090,6 +2215,7 @@ impl FormatSpec {
             commit_policy: CommitPolicy::None,
             integrity_policy,
             liveness_policy: LivenessPolicy::None,
+            header_slots: HeaderSlots::NONE,
             recovery_policy,
             manifest_policy,
             compression_policy: CompressionPolicy::None,
@@ -2111,6 +2237,15 @@ impl FormatSpec {
 
     pub const fn with_extension(mut self, extension: Option<&'static str>) -> Self {
         self.extension = extension;
+        self
+    }
+
+    /// Reserves an editable fixed-size region in the file header.
+    ///
+    /// Changes the computed schema hash, because the region moves
+    /// `append_log_start`; see [`HeaderSlots`] for why that is not avoidable.
+    pub const fn with_header_slots(mut self, header_slots: HeaderSlots) -> Self {
+        self.header_slots = header_slots;
         self
     }
 
@@ -2941,6 +3076,22 @@ impl FormatSpec {
             hash.write_bytes(b"chunk-compression-v1");
             hash.write_u8(compression_algorithm_hash_byte(compression.algorithm));
         }
+        // Folded only when declared, like the growing dimension above: the
+        // region is bytes in the header, so it moves `append_log_start` and
+        // every record offset with it. A build that ignored the declaration
+        // would compute a different start and misread the file, which is
+        // exactly what a schema hash exists to stop. A spec that declares no
+        // region hashes to what it hashed to before this existed.
+        if self.header_slots.is_declared() {
+            hash.write_bytes(b"header-slots-v1");
+            hash.write_u32(self.header_slots.capacity);
+            hash.write_u8(header_slot_integrity_hash_byte(self.header_slots.integrity));
+            let mut ids = self.header_slots.blocks.to_vec();
+            ids.sort_unstable();
+            for id in ids {
+                hash.write_u32(id);
+            }
+        }
         if !self.layout.is_varve_native_default() {
             hash.write_bytes(b"layout-v1");
             hash_layout_spec(&mut hash, self.layout);
@@ -3100,6 +3251,69 @@ impl FormatSpec {
             return Err(Error::InvalidFormatSpec(
                 "header_tails is not supported for a format declaring matrix blocks",
             ));
+        }
+
+        // The editable header region, validated. Everything here is refused
+        // rather than approximated, because each one is a way for the region to
+        // exist while meaning nothing.
+        if self.header_slots.is_declared() {
+            // Same reason as the tail region directly above: the matrix
+            // creation nonce and the matrix layout sit at fixed offsets after
+            // the file header, and a reserved region moves both.
+            if self.has_matrix_blocks() {
+                return Err(Error::InvalidFormatSpec(
+                    "header_slots is not supported for a format declaring matrix blocks",
+                ));
+            }
+            // A custom physical layout does not have varve's file header at
+            // all, so there is nothing to reserve the region inside.
+            if !self.layout.is_varve_native_default() {
+                return Err(Error::InvalidFormatSpec(
+                    "header_slots requires the varve_native layout",
+                ));
+            }
+            // The region shares the 64 KiB file-header extension budget with
+            // every other block. Checked against the framed length, not the
+            // capacity, because the framing is what occupies the budget.
+            if header_slots_region_len(self) > crate::native_layout::MAX_FILE_HEADER_EXTENSION_LEN {
+                return Err(Error::InvalidFormatSpec(
+                    "header_slots capacity exceeds the file-header extension limit",
+                ));
+            }
+            // A region nothing may be written into is a region that costs its
+            // bytes and its schema hash to do nothing, which is the shape
+            // "capabilities are options" exists to refuse.
+            if self.header_slots.blocks.is_empty() {
+                return Err(Error::InvalidFormatSpec(
+                    "header_slots declares no blocks; declare at least one or drop the region",
+                ));
+            }
+            let mut seen = 0usize;
+            while seen < self.header_slots.blocks.len() {
+                let id = self.header_slots.blocks[seen];
+                // The id has to name a block this format declares, or a write
+                // of it could never be encoded and a read could never be typed.
+                if !self.blocks.iter().any(|block| block.id == id) {
+                    return Err(Error::InvalidFormatSpec(
+                        "header_slots names a block the format does not declare",
+                    ));
+                }
+                // A matrix block is not a value with an encoded payload, and a
+                // header entry is exactly that.
+                if let Some(block) = self.blocks.iter().find(|block| block.id == id)
+                    && matches!(block.kind, BlockKind::Matrix)
+                {
+                    return Err(Error::InvalidFormatSpec(
+                        "header_slots cannot hold a matrix block",
+                    ));
+                }
+                if self.header_slots.blocks[..seen].contains(&id) {
+                    return Err(Error::InvalidFormatSpec(
+                        "header_slots names the same block twice",
+                    ));
+                }
+                seen += 1;
+            }
         }
         // A record scan reads each record's own header, so damage to one record
         // misindexes that record. A segment chain reads one payload that
@@ -3688,6 +3902,41 @@ const fn matrix_commit_kind_hash_byte(kind: MatrixCommitKind) -> u8 {
     }
 }
 
+/// Bytes the `VHSL` block occupies in the file header, framing included, or
+/// zero for a format that declares no region.
+///
+/// **One derivation, three consumers**, and that is deliberate: the encoder in
+/// `file.rs` produces the region, the validator above refuses an over-large one,
+/// and `native_layout`'s published plan has to report the same number because
+/// that plan is where a tool outside this crate learns where the header ends and
+/// the first record begins. Deriving it twice is what once let the plan describe
+/// a header short by a whole region.
+///
+/// Saturating rather than fallible, because the plan is infallible and a
+/// saturated length is honest where a zero would read as "there is no region";
+/// a spec that would saturate is refused by `validate` above.
+pub(crate) fn header_slots_region_len(spec: FormatSpec) -> u64 {
+    if !spec.header_slots.is_declared() {
+        return 0;
+    }
+    u64::from(spec.header_slots.capacity)
+        .saturating_add(HEADER_SLOTS_PREFIX_LEN)
+        .saturating_add(HEADER_SLOTS_BLOCK_FRAMING_LEN)
+}
+
+/// `version u16 | flags u16 | capacity u32 | used u32 | crc32 u32`.
+pub(crate) const HEADER_SLOTS_PREFIX_LEN: u64 = 2 + 2 + 4 + 4 + 4;
+/// The `magic[4] | len u32` every extension block after `VCHD` carries.
+pub(crate) const HEADER_SLOTS_BLOCK_FRAMING_LEN: u64 = 4 + 4;
+
+const fn header_slot_integrity_hash_byte(integrity: HeaderSlotIntegrity) -> u8 {
+    match integrity {
+        HeaderSlotIntegrity::None => 0,
+        HeaderSlotIntegrity::Rolling => 1,
+        HeaderSlotIntegrity::Sealed => 2,
+    }
+}
+
 const fn index_policy_hash_byte(policy: IndexPolicy) -> u8 {
     // Bit 4 is `segment_on_flush`. It is hashed because it changes the bytes
     // a writer produces - a segment record is a record - so a file written
@@ -4110,6 +4359,7 @@ impl FormatSpecBuilder {
             commit_policy: CommitPolicy::None,
             integrity_policy: IntegrityPolicy::None,
             liveness_policy: LivenessPolicy::None,
+            header_slots: HeaderSlots::NONE,
             recovery_policy: RecoveryPolicy::Strict,
             manifest_policy: ManifestPolicy::None,
             compression_policy: CompressionPolicy::None,
@@ -4160,6 +4410,12 @@ impl FormatSpecBuilder {
 
     pub const fn commit_policy(mut self, commit_policy: CommitPolicy) -> Self {
         self.commit_policy = commit_policy;
+        self
+    }
+
+    /// Reserves an editable fixed-size region in the file header.
+    pub const fn header_slots(mut self, header_slots: HeaderSlots) -> Self {
+        self.header_slots = header_slots;
         self
     }
 
@@ -4279,6 +4535,12 @@ impl FormatSpecBuilder {
         )
         .with_extension(self.extension)
         .with_commit_policy(self.commit_policy)
+        // Both of these were settable on the builder and dropped here, so a
+        // caller who reached for `FormatSpec::builder().liveness_policy(..)`
+        // silently got `None`. Found while wiring `header_slots`, which the
+        // same omission would have made inert the same way.
+        .with_liveness_policy(self.liveness_policy)
+        .with_header_slots(self.header_slots)
         .with_compression_policy(self.compression_policy)
         .with_block_compression(self.block_compression)
         .with_block_residency(self.block_residency)

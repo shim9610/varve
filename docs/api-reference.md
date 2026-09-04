@@ -671,6 +671,81 @@ Common `VarveReader` APIs:
 | `schema_manifest()` | latest embedded manifest if present |
 | `scan()` | physical record event iterator |
 
+### An editable region in the header
+
+Every other way varve records a fact is append-only, which is exactly wrong for
+a fact that changes: a watermark, a processing state, a pointer into an external
+system. `HeaderSlots` reserves a **fixed** run of bytes in the file header that
+a caller rewrites in place for the life of the file.
+
+```rust
+varve_format! {
+    pub struct AppFormat {
+        magic: b"MYFORMAT";
+        version: 1;
+        endian: little;
+        schema_hash: computed;
+        header_slots {
+            capacity: 256;
+            integrity: rolling;
+            blocks: [Watermark];
+        }
+        blocks: [Sample, Watermark];
+    }
+}
+
+let mut file = AppFormat::create("f.varve")?;
+file.write_header_block(&Watermark { label: "ingested".into(), at: 42 })?;
+assert_eq!(file.read_header_block::<Watermark>()?, Some(watermark));
+```
+
+| method | takes | does |
+| --- | --- | --- |
+| `read_header_block::<T>()` | `&self` | decodes `T` from the cached header; no I/O, `None` if never written |
+| `write_header_block(&block)` | `&mut self` | writes it in place, replacing any earlier value for the same id |
+| `remove_header_block::<T>()` | `&mut self` | removes it, freeing its bytes |
+| `seal_header_slots()` | `&mut self` | fixes the checksum and refuses every later write |
+| `header_slots_capacity()` | `&self` | the declared size; `0` when undeclared |
+| `header_slots_used()` / `header_slots_free_bytes()` | `&self` | how much of it the current blocks occupy |
+| `header_slots_sealed()` | `&self` | whether the seal is down |
+
+**The size is fixed, and that is the point.** The append log starts after the
+region, so a region that could grow would move every record in the file. Writing
+into it changes no file length and invalidates no record offset — which is why
+this is a reservation rather than an append.
+
+**A rewrite replaces rather than appends.** Writing the same block a thousand
+times costs what writing it once costs, so a fixed region absorbs an unbounded
+number of edits. Two *different* blocks must both fit; a write that would not is
+refused with `Error::LimitExceeded` before any byte is written, and the region
+is left exactly as it was.
+
+**Choosing the integrity policy** — this is the "exempt from the CRC, or compute
+it and freeze it" decision, and all three are declarations, not runtime calls:
+
+| want | declare | costs |
+| --- | --- | --- |
+| the region editable forever, never verified | `integrity: none` | nothing; a changed byte is a changed value |
+| every read verified against a checksum kept current | `integrity: rolling` | one pass over the region per write and per read |
+| the value fixed at a point you choose, then immutable | `integrity: sealed` | the same, plus one `seal_header_slots()` call |
+
+Under `sealed`, the checksum is advisory until the seal — the region is still
+being edited, so a mismatch says nothing a caller could act on. After the seal,
+reads verify with `Error::ChecksumMismatch` and writes fail. Nothing unseals a
+region; a caller who could unseal would have gained nothing over `rolling`.
+`seal_header_slots()` on any other policy is refused rather than ignored,
+because `none` has no checksum to freeze and `rolling` recomputes on every
+write.
+
+The checksum is FNV-1a 32 and works without the `integrity` feature. Gating it
+would have made `rolling` and `sealed` silently do nothing in a default build.
+
+Undeclared, the region costs nothing: the header bytes and
+`computed_schema_hash()` are the ones the format produced before it existed. It
+is refused on a format declaring matrix blocks — the matrix creation nonce and
+layout header sit at fixed offsets after the file header, which a reserved
+region would move.
+
 ## Scalable Stream And Indexed Handles
 
 The experimental `high-cardinality-dev` feature generates a second handle

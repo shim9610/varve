@@ -376,6 +376,82 @@ tails but does not hide complete CRC mismatches in visible records.
 Transaction-marker readers may ignore corrupt tail after the latest valid
 marker because that tail is not part of the reader snapshot.
 
+## An Editable Region In The Header
+
+Append is the wrong shape for a fact that changes — a watermark, a processing
+state, a pointer into an external system. `header_slots` reserves a **fixed**
+run of bytes in the file header that a caller rewrites in place, for the life of
+the file, without republishing it.
+
+```rust
+varve_format! {
+    pub struct AppFormat {
+        magic: b"MYFORMAT";
+        version: 1;
+        endian: little;
+        schema_hash: computed;
+        header_slots {
+            capacity: 256;        // bytes; fixed for the life of the file
+            integrity: rolling;   // none | rolling | sealed
+            blocks: [Watermark];  // only these may be written there
+        }
+        blocks: [Sample, Watermark];
+    }
+}
+```
+
+All three keys have to be there except `integrity`, which defaults to `none`.
+Neither of the other two has a defensible default: a region with no declared
+blocks can hold nothing, and a capacity picked by the macro would be a size you
+discover from a failure rather than choose.
+
+`capacity` is the whole region's entry area in bytes. Each block costs its
+canonical encoded length plus eight bytes of entry framing, and a rewrite of a
+block already there reclaims its bytes first — so the budget is against the set
+of blocks held at once, not against how many times you write them.
+
+Then:
+
+```rust
+let mut file = AppFormat::create("f.varve")?;
+file.write_header_block(&Watermark { label: "ingested".into(), at: 42 })?;
+
+let mark = file.read_header_block::<Watermark>()?;   // takes &self, no I/O
+let left = file.header_slots_free_bytes()?;
+```
+
+Sizing it: `header_slots_used()` after one write of each block you intend to
+hold tells you the real cost, and `header_slots_free_bytes()` is what remains.
+A write that would not fit is refused with `Error::LimitExceeded` before any
+byte is written, so a region that is too small fails loudly at the write rather
+than quietly at the read.
+
+### Choosing `integrity`
+
+| you want | declare | it costs |
+| --- | --- | --- |
+| editable forever, never verified | `integrity: none` | nothing |
+| every read verified | `integrity: rolling` | one pass over the region per write and per read |
+| the value frozen at a point you pick | `integrity: sealed` | the same, plus one `seal_header_slots()` call |
+
+`sealed` is the freeze point: before the call the region is editable and the
+checksum is advisory, after it reads verify and writes fail with
+`Error::InvalidFormatSpec`. It is one-way. `seal_header_slots()` on `none` or
+`rolling` is refused rather than ignored, because there is nothing there for it
+to mean.
+
+The checksum is FNV-1a 32 rather than a crc32, so it works without the
+`integrity` feature — a `rolling` region verifies in a default build.
+
+### What it costs when you do not declare it
+
+Nothing, measurably: the header bytes and `computed_schema_hash()` are the ones
+your format produced before the option existed. Two refusals to know about — the
+capacity is part of the schema hash, so it cannot be changed for an existing
+file, and a format declaring matrix blocks is refused outright because the
+matrix creation nonce and layout header sit at fixed offsets after the file
+header that a reserved region would move.
+
 ## Commit And Offset Chains
 
 `commit: none;` keeps the legacy append behavior. `commit: record_footer;`

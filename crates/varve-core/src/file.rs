@@ -10,12 +10,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::{
     BlockKind, BlockVec, CommitPolicy, CompressionAlgorithm, CompressionHeaderMode,
-    CompressionLevel, CompressionPolicy, Endian, Error, FormatSpec, IndexPolicy, IntegrityPolicy,
-    IntegrityVerification, KeyedBlockVec, LivenessPolicy, ManifestPolicy, MatrixCellStatus,
-    MatrixCommitEvent, MatrixDimensions, MatrixKey, MatrixRecoveryAction, MatrixRecoveryReport,
-    MatrixResumeSignal, RecoveryPolicy, Result, SnapshotFile, VariableCompression, VarveBlock,
-    VarveEncode, VarveKeyedBlock, VarveMatrixBlock, VarveMerge, VarveMigration, VarveReplaceBlock,
-    WireType,
+    CompressionLevel, CompressionPolicy, Endian, Error, FormatSpec, HeaderSlotIntegrity,
+    IndexPolicy, IntegrityPolicy, IntegrityVerification, KeyedBlockVec, LivenessPolicy,
+    ManifestPolicy, MatrixCellStatus, MatrixCommitEvent, MatrixDimensions, MatrixKey,
+    MatrixRecoveryAction, MatrixRecoveryReport, MatrixResumeSignal, RecoveryPolicy, Result,
+    SnapshotFile, VariableCompression, VarveBlock, VarveEncode, VarveKeyedBlock, VarveMatrixBlock,
+    VarveMerge, VarveMigration, VarveReplaceBlock, WireType,
     codec::encode_to_vec_limited,
     collections::MaterializationBudget,
     format::ReadLimitKey,
@@ -414,6 +414,22 @@ const LIVENESS_MAGIC: &[u8; 4] = b"VLIV";
 const LIVENESS_BLOCK_VERSION: u16 = 1;
 /// `version u16 | flags u16 | crc32 u32`.
 const LIVENESS_PAYLOAD_LEN: usize = 8;
+/// The whole `VLIV` block a spec would write, framing included, or zero when
+/// the format declares no liveness word.
+///
+/// Exists so the layout plan can add the same term the writer emits. It was
+/// missing from `native_file_header_plan_extension_len`, which published a
+/// header length 16 bytes short of the real one for every `footer_flags`
+/// format — the plan described the first record as starting inside this block.
+/// Nothing inside this crate read that number (`append_log_start_for_file`
+/// derives the boundary from the file's own region), so no file was written
+/// wrong; a tool reading `FormatSpec::effective_layout` was told wrong.
+pub(crate) fn liveness_region_len(spec: FormatSpec) -> u64 {
+    if !matches!(spec.liveness_policy, LivenessPolicy::FooterFlags) {
+        return 0;
+    }
+    (8 + LIVENESS_PAYLOAD_LEN) as u64
+}
 /// The writer holds this object and has not released it cleanly.
 const LIVENESS_FLAG_DIRTY: u16 = 0x0001;
 const HEADER_TAILS_VERSION: u16 = 1;
@@ -13498,6 +13514,275 @@ impl VarveFile {
         Ok(())
     }
 
+    /// How many bytes the editable header region holds in total.
+    ///
+    /// The declared capacity, which never changes for the life of the file:
+    /// it is folded into the schema hash, so a file written under one capacity
+    /// is not opened under another. Zero when the format declares no region.
+    pub fn header_slots_capacity(&self) -> usize {
+        self.spec.header_slots.capacity as usize
+    }
+
+    /// How many of those bytes the blocks currently written there occupy,
+    /// framing included.
+    pub fn header_slots_used(&self) -> Result<usize> {
+        match self.header_slots_view()? {
+            Some((view, _)) => Ok(view.used),
+            None => Ok(0),
+        }
+    }
+
+    /// How many bytes remain. A write needs its payload plus eight bytes of
+    /// entry framing to fit in this, unless it replaces a block already there.
+    pub fn header_slots_free_bytes(&self) -> Result<usize> {
+        Ok(self
+            .header_slots_capacity()
+            .saturating_sub(self.header_slots_used()?))
+    }
+
+    /// Whether the region has been sealed and accepts no further writes.
+    ///
+    /// Always `false` under [`HeaderSlotIntegrity::None`] and
+    /// [`HeaderSlotIntegrity::Rolling`], which have no seal.
+    pub fn header_slots_sealed(&self) -> Result<bool> {
+        match self.header_slots_view()? {
+            Some((view, _)) => Ok(view.is_sealed()),
+            None => Ok(false),
+        }
+    }
+
+    /// Reads a header-declared block out of the editable region.
+    ///
+    /// `Ok(None)` means no block with this id has been written — which is what
+    /// a freshly created file answers for every declared id. Takes `&self` and
+    /// performs no I/O: the region is part of the header this handle already
+    /// holds, so this is a decode of bytes in memory.
+    pub fn read_header_block<T: VarveBlock>(&self) -> Result<Option<T>> {
+        let Some((view, _)) = self.header_slots_view()? else {
+            return Ok(None);
+        };
+        if !self.spec.header_slots.permits(T::ID) {
+            return Err(Error::InvalidFormatSpec(
+                "block is not declared in header_slots",
+            ));
+        }
+        let mut found: Option<(u16, Vec<u8>)> = None;
+        walk_header_slot_entries(view.entries, view.used, |id, version, payload| {
+            if id == T::ID {
+                found = Some((version, payload.to_vec()));
+            }
+            Ok(())
+        })?;
+        let Some((version, payload)) = found else {
+            return Ok(None);
+        };
+        if version != T::VERSION {
+            return Err(Error::BlockVersionMismatch {
+                block_id: T::ID,
+                expected: T::VERSION,
+                actual: version,
+            });
+        }
+        // Bounded by construction: `payload` is a slice of a region whose
+        // length the schema hash pins at at most `MAX_HEADER_SLOTS_LEN`.
+        crate::codec::decode_from_slice::<T>(&payload, T::ENDIAN.unwrap_or(self.spec.endian))
+            .map(Some)
+    }
+
+    /// Writes a header-declared block into the editable region, replacing any
+    /// earlier value for the same block id.
+    ///
+    /// Replacement rather than append is what lets a fixed region take an
+    /// unbounded number of edits: writing the same block a thousand times
+    /// costs what writing it once costs. Two different blocks must both fit,
+    /// and a write that would not is refused with
+    /// [`Error::LimitExceeded`] *before* any byte is written — the region is
+    /// never left half-updated by a rejected write.
+    ///
+    /// The region is rewritten in place at a fixed offset and length, so this
+    /// moves nothing: the append log starts where it started, and every record
+    /// offset already handed out stays valid.
+    pub fn write_header_block<T: VarveBlock>(&mut self, block: &T) -> Result<()> {
+        let payload = encode_logical_payload_limited(
+            self.spec,
+            block,
+            T::ENDIAN.unwrap_or(self.spec.endian),
+        )?;
+        self.write_header_slot_bytes(T::ID, T::VERSION, Some(&payload))
+    }
+
+    /// Removes a header-declared block from the editable region, freeing its
+    /// bytes for another.
+    ///
+    /// `Ok(())` whether or not the block was there; the post-condition is that
+    /// it is not.
+    pub fn remove_header_block<T: VarveBlock>(&mut self) -> Result<()> {
+        self.write_header_slot_bytes(T::ID, T::VERSION, None)
+    }
+
+    /// Fixes the region's checksum and refuses every later write.
+    ///
+    /// This is the "compute and freeze" point of
+    /// [`HeaderSlotIntegrity::Sealed`]: until it is called the region is
+    /// editable and its checksum is advisory; after it, reads verify the
+    /// checksum and writes fail with [`Error::InvalidFormatSpec`]. Sealing is
+    /// one-way — nothing unseals a region, because a caller who could would
+    /// have gained nothing over declaring [`HeaderSlotIntegrity::Rolling`].
+    ///
+    /// Refused on a format declaring any other integrity: `None` has no
+    /// checksum to freeze and `Rolling` recomputes on every write, so a seal
+    /// would mean something different in each and silently do nothing in one.
+    pub fn seal_header_slots(&mut self) -> Result<()> {
+        if self.spec.header_slots.integrity != HeaderSlotIntegrity::Sealed {
+            return Err(Error::InvalidFormatSpec(
+                "header_slots integrity is not `sealed`",
+            ));
+        }
+        let permit = self.ensure_write()?;
+        let Some((view, extent)) = self.header_slots_view()? else {
+            return Err(Error::InvalidFormatSpec("format declares no header_slots"));
+        };
+        if view.is_sealed() {
+            return Ok(());
+        }
+        let used = view.used;
+        let entries = view.entries.to_vec();
+        self.commit_header_slots(permit, extent, used, &entries, true)
+    }
+
+    /// The region's decoded view plus where it lives, or `None` when the
+    /// format declares none.
+    ///
+    /// Verification happens here rather than at each entry, so every read path
+    /// gets it: `Rolling` always checks, `Sealed` checks once sealed, `None`
+    /// never does.
+    fn header_slots_view(&self) -> Result<Option<(HeaderSlotsView<'_>, MutableHeaderExtent)>> {
+        if !self.spec.header_slots.is_declared() {
+            return Ok(None);
+        }
+        let header_len = append_log_start_for_file(self)?;
+        let Some(extent) =
+            mutable_header_block_extent(header_len, &self.header_extensions, HEADER_SLOTS_MAGIC)?
+        else {
+            return Ok(None);
+        };
+        let payload = self
+            .header_extensions
+            .get(extent.payload_in_extensions..extent.payload_in_extensions + extent.payload_len)
+            .ok_or(Error::InvalidCompressionHeader)?;
+        let view = decode_header_slots(self.spec, payload)?;
+        let verify = match self.spec.header_slots.integrity {
+            HeaderSlotIntegrity::None => false,
+            HeaderSlotIntegrity::Rolling => true,
+            HeaderSlotIntegrity::Sealed => view.is_sealed(),
+        };
+        if verify && view.checksum != view.expected_checksum(self.header_slots_capacity()) {
+            return Err(Error::ChecksumMismatch {
+                offset: extent.payload_offset,
+            });
+        }
+        Ok(Some((view, extent)))
+    }
+
+    /// Rebuilds the entry region with `block_id` set to `payload` — or removed
+    /// when it is `None` — and writes it back.
+    fn write_header_slot_bytes(
+        &mut self,
+        block_id: u32,
+        block_version: u16,
+        payload: Option<&[u8]>,
+    ) -> Result<()> {
+        if !self.spec.header_slots.is_declared() {
+            return Err(Error::InvalidFormatSpec("format declares no header_slots"));
+        }
+        if !self.spec.header_slots.permits(block_id) {
+            return Err(Error::InvalidFormatSpec(
+                "block is not declared in header_slots",
+            ));
+        }
+        let permit = self.ensure_write()?;
+        let capacity = self.header_slots_capacity();
+        let Some((view, extent)) = self.header_slots_view()? else {
+            return Err(Error::InvalidFormatSpec("format declares no header_slots"));
+        };
+        if view.is_sealed() {
+            return Err(Error::InvalidFormatSpec("header_slots region is sealed"));
+        }
+        let sealed = view.is_sealed();
+
+        // Built whole, then measured, then written. The old entries are copied
+        // in order with the target id dropped, so a rewrite of an existing
+        // block reclaims its bytes before the new value asks for them and the
+        // region does not creep.
+        let mut rebuilt: Vec<u8> = Vec::new();
+        walk_header_slot_entries(view.entries, view.used, |id, version, existing| {
+            if id == block_id {
+                return Ok(());
+            }
+            rebuilt.extend_from_slice(&id.to_le_bytes());
+            rebuilt.extend_from_slice(&version.to_le_bytes());
+            rebuilt.extend_from_slice(&0u16.to_le_bytes());
+            rebuilt.extend_from_slice(&(existing.len() as u32).to_le_bytes());
+            rebuilt.extend_from_slice(existing);
+            Ok(())
+        })?;
+        if let Some(payload) = payload {
+            let len = u32::try_from(payload.len()).map_err(|_| Error::LimitExceeded {
+                resource: "header slots block",
+                actual: payload.len() as u64,
+                limit: capacity as u64,
+            })?;
+            rebuilt.extend_from_slice(&block_id.to_le_bytes());
+            rebuilt.extend_from_slice(&block_version.to_le_bytes());
+            rebuilt.extend_from_slice(&0u16.to_le_bytes());
+            rebuilt.extend_from_slice(&len.to_le_bytes());
+            rebuilt.extend_from_slice(payload);
+        }
+        if rebuilt.len() > capacity {
+            return Err(Error::LimitExceeded {
+                resource: "header slots region",
+                actual: rebuilt.len() as u64,
+                limit: capacity as u64,
+            });
+        }
+        let used = rebuilt.len();
+        // Zero rather than leave: the padding is covered by the checksum, and
+        // stale entry bytes past `used` would also be readable in a file dump
+        // long after the block that wrote them was removed.
+        rebuilt.resize(capacity, 0);
+        self.commit_header_slots(permit, extent, used, &rebuilt, sealed)
+    }
+
+    /// The one place the region reaches the disk.
+    ///
+    /// Writes the payload at its fixed offset and syncs before updating the
+    /// cached copy, so a crash mid-write leaves the file and this handle
+    /// agreeing about which generation of the region is on disk.
+    fn commit_header_slots(
+        &mut self,
+        _permit: FileMutationPermit,
+        extent: MutableHeaderExtent,
+        used: usize,
+        entries: &[u8],
+        sealed: bool,
+    ) -> Result<()> {
+        let payload = encode_header_slots_payload(self.spec, used, entries, sealed)?;
+        if payload.len() != extent.payload_len {
+            // A region this build did not write: its geometry is not the one
+            // encoded here, and overwriting it would corrupt whatever it is.
+            return Err(Error::InvalidFormatSpec(
+                "header_slots region length disagrees with the declaration",
+            ));
+        }
+        self.file
+            .overwrite_header_region(extent.payload_offset, &payload)?;
+        self.file.sync_data()?;
+        self.header_extensions
+            [extent.payload_in_extensions..extent.payload_in_extensions + extent.payload_len]
+            .copy_from_slice(&payload);
+        Ok(())
+    }
+
     fn write_header_tails_if_needed(&mut self) {
         if self.mode != OpenMode::ReadWrite || !self.spec.index_policy.header_tails {
             return;
@@ -15357,7 +15642,7 @@ fn validate_record_entry(spec: FormatSpec, entry: &RecordIndexEntry) -> Result<(
     ensure_compression_algorithm_available(compression.algorithm)
 }
 
-fn file_header_extensions(spec: FormatSpec) -> Result<Vec<u8>> {
+pub(crate) fn file_header_extensions(spec: FormatSpec) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
     if let Some(compression) = variable_compression(spec)
         && compression.header_mode == CompressionHeaderMode::FileExplicit
@@ -15376,6 +15661,11 @@ fn file_header_extensions(spec: FormatSpec) -> Result<Vec<u8>> {
     }
     if spec.liveness_policy == LivenessPolicy::FooterFlags {
         payload.extend_from_slice(&encode_liveness_block(0));
+    }
+    // Appended last, so every format that declares no region produces exactly
+    // the bytes it produced before this existed.
+    if spec.header_slots.is_declared() {
+        payload.extend_from_slice(&encode_empty_header_slots_region(spec)?);
     }
     Ok(payload)
 }
@@ -15536,7 +15826,10 @@ struct HeaderExtensionBlock<'a> {
 /// The whole point of the walk: a magic that is not on this list is skipped,
 /// so a file carrying a block from a later release still opens here.
 fn is_known_header_extension_magic(magic: &[u8; 4]) -> bool {
-    magic == FILE_COMPRESSION_MAGIC || magic == HEADER_TAILS_MAGIC || magic == LIVENESS_MAGIC
+    magic == FILE_COMPRESSION_MAGIC
+        || magic == HEADER_TAILS_MAGIC
+        || magic == LIVENESS_MAGIC
+        || magic == HEADER_SLOTS_MAGIC
 }
 
 /// Whether the file is allowed to disagree with this spec about the block's
@@ -15608,8 +15901,221 @@ fn decode_liveness_flags(header_len: u64, extensions: &[u8]) -> Result<Option<u1
     Ok(Some(flags))
 }
 
+/// The editable header region: magic, framing, and the entry directory.
+///
+/// `magic "VHSL" | len u32` then
+/// `version u16 | flags u16 | capacity u32 | used u32 | checksum u32`
+/// followed by `capacity` bytes of entries and zero padding. `used` says how
+/// many of those bytes the entries occupy; everything past it is zero.
+///
+/// One entry is `block_id u32 | block_version u16 | reserved u16 | len u32`
+/// then `len` payload bytes. Ids appear at most once — a second write of the
+/// same block replaces the first rather than appending, which is what keeps a
+/// fixed region from filling up under repeated edits.
+const HEADER_SLOTS_MAGIC: &[u8; 4] = b"VHSL";
+const HEADER_SLOTS_VERSION: u16 = 1;
+/// The region is sealed: its checksum is written and it accepts no more writes.
+const HEADER_SLOTS_FLAG_SEALED: u16 = 0x0001;
+/// Every flag this version defines. A region setting one outside this set was
+/// written by something that means more by it than this build knows, and is
+/// refused rather than half-understood — the same posture the digest takes.
+const HEADER_SLOTS_FLAGS_KNOWN: u16 = HEADER_SLOTS_FLAG_SEALED;
+const HEADER_SLOT_ENTRY_HEADER_LEN: usize = 4 + 2 + 2 + 4;
+
+/// The region's checksum, and why it is not a crc32.
+///
+/// `crc32fast` is behind the `integrity` feature, and putting the region's
+/// checksum behind it too would make [`HeaderSlotIntegrity::Rolling`] and
+/// [`HeaderSlotIntegrity::Sealed`] silently do nothing in a default build —
+/// a declared policy that is inert is exactly what "capabilities are options"
+/// forbids. So this is an FNV-1a 32 written by hand, for the same reason and
+/// by the same precedent as the liveness block's.
+fn header_slots_checksum(bytes: &[u8]) -> u32 {
+    let mut hash = 2_166_136_261u32;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    hash
+}
+
+/// A decoded view of the region's payload, borrowed from the header bytes.
+struct HeaderSlotsView<'a> {
+    flags: u16,
+    used: usize,
+    checksum: u32,
+    /// The `capacity` bytes that hold the entries, padding included.
+    entries: &'a [u8],
+}
+
+impl HeaderSlotsView<'_> {
+    fn is_sealed(&self) -> bool {
+        self.flags & HEADER_SLOTS_FLAG_SEALED != 0
+    }
+
+    /// What the checksum should be: everything in the payload except the four
+    /// bytes holding the checksum itself.
+    fn expected_checksum(&self, capacity: usize) -> u32 {
+        let mut covered = Vec::with_capacity(12 + self.entries.len());
+        covered.extend_from_slice(&HEADER_SLOTS_VERSION.to_le_bytes());
+        covered.extend_from_slice(&self.flags.to_le_bytes());
+        covered.extend_from_slice(&(capacity as u32).to_le_bytes());
+        covered.extend_from_slice(&(self.used as u32).to_le_bytes());
+        covered.extend_from_slice(self.entries);
+        header_slots_checksum(&covered)
+    }
+}
+
+/// Frames the region's payload, or says why these bytes are not one.
+///
+/// Every field is checked against the declaration rather than trusted: a
+/// capacity that disagrees with the spec means the file was written by a
+/// different declaration, and a `used` past the capacity is a corrupt region
+/// rather than a large one.
+fn decode_header_slots(spec: FormatSpec, payload: &[u8]) -> Result<HeaderSlotsView<'_>> {
+    let capacity = spec.header_slots.capacity as usize;
+    let prefix = crate::format::HEADER_SLOTS_PREFIX_LEN as usize;
+    if payload.len() != prefix + capacity {
+        return Err(Error::InvalidCompressionHeader);
+    }
+    let version = u16::from_le_bytes([payload[0], payload[1]]);
+    if version != HEADER_SLOTS_VERSION {
+        return Err(Error::InvalidCompressionHeader);
+    }
+    let flags = u16::from_le_bytes([payload[2], payload[3]]);
+    if flags & !HEADER_SLOTS_FLAGS_KNOWN != 0 {
+        return Err(Error::InvalidCompressionHeader);
+    }
+    let stored_capacity = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    if stored_capacity as usize != capacity {
+        return Err(Error::InvalidCompressionHeader);
+    }
+    let used = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
+    if used > capacity {
+        return Err(Error::InvalidCompressionHeader);
+    }
+    let checksum = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
+    Ok(HeaderSlotsView {
+        flags,
+        used,
+        checksum,
+        entries: &payload[prefix..prefix + capacity],
+    })
+}
+
+/// Walks the entries, handing each one to `visit` as
+/// `(block_id, block_version, payload)`.
+///
+/// Stops at `used`; the padding past it is never framed. A truncated or
+/// overrunning entry is refused rather than skipped, because a region that
+/// cannot be walked is corrupt and answering from half of it would be worse
+/// than saying so.
+fn walk_header_slot_entries(
+    entries: &[u8],
+    used: usize,
+    mut visit: impl FnMut(u32, u16, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut offset = 0usize;
+    while offset < used {
+        let rest = used - offset;
+        if rest < HEADER_SLOT_ENTRY_HEADER_LEN {
+            return Err(Error::InvalidCompressionHeader);
+        }
+        let head = &entries[offset..offset + HEADER_SLOT_ENTRY_HEADER_LEN];
+        let block_id = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
+        let block_version = u16::from_le_bytes([head[4], head[5]]);
+        let reserved = u16::from_le_bytes([head[6], head[7]]);
+        if reserved != 0 {
+            return Err(Error::InvalidCompressionHeader);
+        }
+        let len = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize;
+        let start = offset + HEADER_SLOT_ENTRY_HEADER_LEN;
+        let end = start
+            .checked_add(len)
+            .ok_or(Error::InvalidCompressionHeader)?;
+        if end > used {
+            return Err(Error::InvalidCompressionHeader);
+        }
+        visit(block_id, block_version, &entries[start..end])?;
+        offset = end;
+    }
+    Ok(())
+}
+
+/// The empty region a create writes: framed, zero entries, and unsealed.
+fn encode_empty_header_slots_region(spec: FormatSpec) -> Result<Vec<u8>> {
+    let framed = crate::format::header_slots_region_len(spec);
+    let framed_len = usize::try_from(framed)
+        .map_err(|_| Error::InvalidFormatSpec("header_slots region length overflows"))?;
+    let capacity = spec.header_slots.capacity as usize;
+    let payload_len = framed_len - crate::format::HEADER_SLOTS_BLOCK_FRAMING_LEN as usize;
+    let payload_len_u32 = u32::try_from(payload_len)
+        .map_err(|_| Error::InvalidFormatSpec("header_slots region length overflows"))?;
+    let mut region = Vec::new();
+    region
+        .try_reserve_exact(framed_len)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "header slots region",
+            requested: framed,
+        })?;
+    region.extend_from_slice(HEADER_SLOTS_MAGIC);
+    region.extend_from_slice(&payload_len_u32.to_le_bytes());
+    region.extend_from_slice(&encode_header_slots_payload(
+        spec,
+        0,
+        &vec![0u8; capacity],
+        false,
+    )?);
+    debug_assert_eq!(region.len(), framed_len);
+    Ok(region)
+}
+
+/// Serializes the payload for a region holding `entries` (already padded to the
+/// declared capacity), sealing it if asked.
+///
+/// The checksum is written for every policy and only *checked* for some: a
+/// region that later turns its policy up should not have to be rewritten to
+/// become verifiable, and writing it costs one pass over bytes already in hand.
+fn encode_header_slots_payload(
+    spec: FormatSpec,
+    used: usize,
+    entries: &[u8],
+    sealed: bool,
+) -> Result<Vec<u8>> {
+    let capacity = spec.header_slots.capacity as usize;
+    if entries.len() != capacity {
+        return Err(Error::InvalidFormatSpec("header_slots entry region length"));
+    }
+    let flags = if sealed { HEADER_SLOTS_FLAG_SEALED } else { 0 };
+    let used_u32 =
+        u32::try_from(used).map_err(|_| Error::InvalidFormatSpec("header_slots used overflows"))?;
+    let capacity_u32 = u32::try_from(capacity)
+        .map_err(|_| Error::InvalidFormatSpec("header_slots capacity overflows"))?;
+    let mut covered = Vec::with_capacity(12 + capacity);
+    covered.extend_from_slice(&HEADER_SLOTS_VERSION.to_le_bytes());
+    covered.extend_from_slice(&flags.to_le_bytes());
+    covered.extend_from_slice(&capacity_u32.to_le_bytes());
+    covered.extend_from_slice(&used_u32.to_le_bytes());
+    covered.extend_from_slice(entries);
+    let checksum = header_slots_checksum(&covered);
+
+    let mut payload = Vec::new();
+    let payload_len = crate::format::HEADER_SLOTS_PREFIX_LEN as usize + capacity;
+    payload
+        .try_reserve_exact(payload_len)
+        .map_err(|_| Error::AllocationFailed {
+            resource: "header slots payload",
+            requested: payload_len as u64,
+        })?;
+    payload.extend_from_slice(&covered[..12]);
+    payload.extend_from_slice(&checksum.to_le_bytes());
+    payload.extend_from_slice(entries);
+    debug_assert_eq!(payload.len(), payload_len);
+    Ok(payload)
+}
+
 fn is_mutable_header_extension_magic(magic: &[u8; 4]) -> bool {
-    magic == HEADER_TAILS_MAGIC || magic == LIVENESS_MAGIC
+    magic == HEADER_TAILS_MAGIC || magic == LIVENESS_MAGIC || magic == HEADER_SLOTS_MAGIC
 }
 
 /// Walk the extension region as a block sequence.

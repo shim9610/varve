@@ -1548,6 +1548,56 @@ optional feature alone, all-features — so a defect requiring a specific *pair*
 
 ---
 
+## 6.9 The editable header region: what its fixed size actually forbids
+
+`header_slots` reserves a run of bytes in the file header that a caller can
+rewrite for the life of the file. Its size is fixed and folded into the schema
+hash, and three consequences follow that are limitations rather than details:
+
+- **The capacity cannot be changed for an existing file.** Reopening under a
+  different capacity is a `SchemaHashMismatch`. There is no grow path and no
+  migration for it; growing the region would move the append log, which means
+  moving every record in the file — which is republishing it. Size the region
+  when you declare the format, using `header_slots_used()` after one write of
+  each block you intend to hold.
+- **A format declaring matrix blocks cannot declare a region.** Refused at
+  validation with `Error::InvalidFormatSpec`. The matrix creation nonce and the
+  matrix layout header sit at fixed offsets *after* the file header, and a
+  reserved region moves both. Lifting this is a matter of establishing that
+  every consumer of those two offsets derives them from `header_len` rather than
+  storing a constant; that walk has not been done, so this refuses rather than
+  guesses — the same refusal, for the same reason, that `index: header_tails`
+  carries.
+- **An already-open handle sees the region as it was at its open, not live.**
+  `read_header_block` decodes from the header bytes the handle read when it
+  opened, which is exactly what lets it take `&self` and touch no I/O. A reader
+  opened before a write keeps answering with the old value until it is reopened;
+  a reader opened after it sees the new one. Measured, not inferred
+  (`a_reader_opened_before_a_write_does_not_see_it`). This is the same snapshot
+  model the rest of the read surface has, and it means the region is not a
+  channel for pushing a changed value to live readers.
+- **The region has no crash-atomicity guarantee across a write.** A write is a
+  positional overwrite of the region followed by `sync_data`. A crash between
+  the two leaves a region whose checksum does not match its bytes: under
+  `integrity: rolling` and a sealed `sealed` region, reads report
+  `Error::ChecksumMismatch` — which is the correct answer, but it is *detection*,
+  not recovery. There is no second slot to fall back to, unlike the `VBTT`
+  header-tail region, which carries two. A caller who needs the region to
+  survive a crash mid-write with its previous value intact does not have that
+  here.
+
+What has been measured: the seventeen cases in
+`crates/varve/tests/header_slots.rs`, over all three integrity policies —
+reserve at create, survive a reopen, rewrite without growth, removal, refusal on
+overflow, refusal on an undeclared block, refusal of a write after a seal,
+verification on read under `rolling` and under a sealed `sealed`, non-verification
+under `none` and under an unsealed `sealed`, the file length and record offsets
+unchanged across an edit, and the region carried verbatim across a republishing
+`replace`, and the reader-snapshot semantics above. What has **not** been
+measured: the crash behaviour above — no fault injection covers this region, so
+the statement that a torn write is *detected* rests on the checksum's
+construction and on the corruption tests, not on an interrupted write.
+
 ## 7. Resource limits: what they do and do not bound
 
 ### 7.1 Limit accounting is nominal, not peak RSS

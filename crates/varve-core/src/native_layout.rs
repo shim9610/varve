@@ -1178,7 +1178,10 @@ fn native_file_header_plan_extension_len(spec: FormatSpec) -> u64 {
     } else {
         0
     };
-    compression.saturating_add(crate::file::header_tails_region_len(spec))
+    compression
+        .saturating_add(crate::file::header_tails_region_len(spec))
+        .saturating_add(crate::file::liveness_region_len(spec))
+        .saturating_add(crate::format::header_slots_region_len(spec))
 }
 
 fn native_file_header_has_extension_len(spec: FormatSpec, extension_len: u64) -> bool {
@@ -1453,5 +1456,94 @@ mod tests {
     fn record_field_tables_sum_to_the_published_lengths() {
         assert_eq!(native_record_header_len(), crate::file::RECORD_HEADER_LEN);
         assert_eq!(native_record_footer_len(), crate::file::RECORD_FOOTER_LEN);
+    }
+
+    /// The plan's extension length must be the length the writer emits.
+    ///
+    /// `native_file_header_plan_extension_len` restates the writer's terms, and
+    /// a term left out of it does not fail to compile — it publishes a header
+    /// length short by exactly that block, which puts the first record inside
+    /// it. So the two are compared directly, over every combination of the
+    /// blocks that make up the region.
+    #[test]
+    fn the_plan_extension_length_is_the_length_the_writer_emits() {
+        use crate::{
+            CommitPolicy, FormatSpecBuilder, HeaderSlotIntegrity, HeaderSlots, IndexPolicy,
+            LivenessPolicy, ReadLimits,
+        };
+
+        const HEADER_BLOCK: u32 = 7;
+        const BLOCKS: &[crate::BlockDescriptor] = &[crate::BlockDescriptor {
+            id: HEADER_BLOCK,
+            name: "header_block",
+            version: 1,
+            kind: crate::BlockKind::Variable,
+            fields: &[],
+        }];
+        let base = FormatSpecBuilder::new()
+            .magic(b"PLNEXTLN")
+            .blocks(BLOCKS)
+            .read_limits(ReadLimits::TRUSTED_UNBOUNDED)
+            .build()
+            .expect("base spec");
+
+        let chained = base
+            .with_index_policy(IndexPolicy::BlockOffsetChain)
+            .with_commit_policy(CommitPolicy::TransactionMarker(
+                crate::TransactionMarkerMode::OnFlush,
+            ));
+        let slots = HeaderSlots::new(512, HeaderSlotIntegrity::Rolling, &[HEADER_BLOCK]);
+
+        // Mutated only by the `integrity`-gated block below, so without that
+        // feature the `mut` is genuinely unused. Annotated rather than
+        // restructured, so both halves of the case list stay in one place.
+        #[cfg_attr(not(feature = "integrity"), allow(unused_mut))]
+        let mut cases: Vec<(&str, FormatSpec)> = vec![
+            ("bare", base),
+            ("header_slots", base.with_header_slots(slots)),
+            (
+                "liveness",
+                chained.with_liveness_policy(LivenessPolicy::FooterFlags),
+            ),
+            (
+                "liveness + header_slots",
+                chained
+                    .with_liveness_policy(LivenessPolicy::FooterFlags)
+                    .with_header_slots(slots),
+            ),
+        ];
+
+        // `header_tails` checksums its slots and so demands `IntegrityPolicy::Crc32`,
+        // which is refused at create when the `integrity` feature is off. The
+        // region under test demands nothing of the sort — that is what its own
+        // feature-independent checksum buys — so only these two cases are gated.
+        #[cfg(feature = "integrity")]
+        {
+            let tails = chained
+                .with_integrity_policy(crate::IntegrityPolicy::Crc32)
+                .with_index_policy(IndexPolicy {
+                    header_tails: true,
+                    ..IndexPolicy::BlockOffsetChain
+                });
+            cases.push(("header_tails", tails));
+            cases.push((
+                "all three",
+                tails
+                    .with_liveness_policy(LivenessPolicy::FooterFlags)
+                    .with_header_slots(slots),
+            ));
+        }
+
+        for (name, spec) in cases {
+            spec.validate().unwrap_or_else(|e| panic!("{name}: {e}"));
+            let written = crate::file::file_header_extensions(spec)
+                .unwrap_or_else(|e| panic!("{name}: {e}"))
+                .len() as u64;
+            assert_eq!(
+                native_file_header_plan_extension_len(spec),
+                written,
+                "{name}: the plan and the writer disagree about the extension region",
+            );
+        }
     }
 }

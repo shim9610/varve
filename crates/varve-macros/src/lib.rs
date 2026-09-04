@@ -907,6 +907,7 @@ struct FormatInput {
     commit: CommitChoice,
     integrity: IntegrityChoice,
     liveness: LivenessChoice,
+    header_slots: Option<HeaderSlotsChoice>,
     recovery: RecoveryChoice,
     manifest: ManifestChoice,
     compression: CompressionChoice,
@@ -1004,6 +1005,23 @@ enum IntegrityChoice {
 enum LivenessChoice {
     None,
     FooterFlags,
+}
+
+/// `header_slots { capacity: N; integrity: ...; blocks: [..]; }`, parsed.
+///
+/// Held as the block *types* rather than ids: the DSL names blocks the way the
+/// rest of the format does, and the id is read off the type in the generated
+/// spec, so a renamed or renumbered block cannot drift out of this list.
+struct HeaderSlotsChoice {
+    capacity: u32,
+    integrity: HeaderSlotIntegrityChoice,
+    blocks: Vec<Type>,
+}
+
+enum HeaderSlotIntegrityChoice {
+    None,
+    Rolling,
+    Sealed,
 }
 
 enum RecoveryChoice {
@@ -1214,6 +1232,7 @@ impl Parse for FormatInput {
         let mut commit = CommitChoice::None;
         let mut integrity = IntegrityChoice::None;
         let mut liveness = LivenessChoice::None;
+        let mut header_slots: Option<HeaderSlotsChoice> = None;
         let mut recovery = RecoveryChoice::Strict;
         let mut manifest = ManifestChoice::None;
         let mut compression = CompressionChoice::None;
@@ -1265,6 +1284,16 @@ impl Parse for FormatInput {
                 let inner;
                 braced!(inner in content);
                 inline_blocks = Some(parse_inline_blocks(&inner)?);
+                if content.peek(Token![;]) {
+                    content.parse::<Token![;]>()?;
+                }
+                continue;
+            }
+            if key == "header_slots" && content.peek(syn::token::Brace) {
+                note_format_key(&mut seen_keys, &key)?;
+                let inner;
+                braced!(inner in content);
+                header_slots = Some(parse_header_slots(&inner)?);
                 if content.peek(Token![;]) {
                     content.parse::<Token![;]>()?;
                 }
@@ -1441,6 +1470,7 @@ impl Parse for FormatInput {
             commit,
             integrity,
             liveness,
+            header_slots,
             recovery,
             manifest,
             compression,
@@ -1609,6 +1639,64 @@ fn parse_commit_choice(input: ParseStream<'_>) -> Result<ParsedCommitChoice> {
 struct LayoutDecl {
     file_header: Option<LayoutFileHeader>,
     segments: Vec<LayoutSegment>,
+}
+
+/// `header_slots { capacity: N; integrity: none|rolling|sealed; blocks: [..]; }`
+///
+/// `capacity` and `blocks` are both required, and neither has a defensible
+/// default: a region with no declared blocks can hold nothing, and a capacity
+/// picked by the macro would be a size the caller has to discover from a
+/// failure rather than choose. `integrity` defaults to `none`, which is the
+/// setting that costs nothing.
+fn parse_header_slots(input: ParseStream<'_>) -> Result<HeaderSlotsChoice> {
+    let mut capacity: Option<u32> = None;
+    let mut integrity = HeaderSlotIntegrityChoice::None;
+    let mut blocks: Option<Vec<Type>> = None;
+
+    while !input.is_empty() {
+        let key: Ident = input.parse()?;
+        input.parse::<Token![:]>()?;
+        if key == "capacity" {
+            let value: LitInt = input.parse()?;
+            capacity = Some(value.base10_parse()?);
+        } else if key == "integrity" {
+            let value: Ident = input.parse()?;
+            integrity = match value.to_string().as_str() {
+                "none" => HeaderSlotIntegrityChoice::None,
+                "rolling" => HeaderSlotIntegrityChoice::Rolling,
+                "sealed" => HeaderSlotIntegrityChoice::Sealed,
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        value,
+                        "expected none, rolling, or sealed",
+                    ));
+                }
+            };
+        } else if key == "blocks" {
+            let inner;
+            bracketed!(inner in input);
+            let parsed = Punctuated::<Type, Token![,]>::parse_terminated(&inner)?;
+            blocks = Some(parsed.into_iter().collect());
+        } else {
+            return Err(syn::Error::new_spanned(
+                key,
+                "expected capacity, integrity, or blocks",
+            ));
+        }
+        if input.peek(Token![;]) {
+            input.parse::<Token![;]>()?;
+        }
+    }
+
+    let capacity = capacity
+        .ok_or_else(|| syn::Error::new(input.span(), "header_slots requires a capacity"))?;
+    let blocks = blocks
+        .ok_or_else(|| syn::Error::new(input.span(), "header_slots requires a blocks list"))?;
+    Ok(HeaderSlotsChoice {
+        capacity,
+        integrity,
+        blocks,
+    })
 }
 
 fn parse_layout(input: ParseStream<'_>) -> Result<LayoutDecl> {
@@ -2513,6 +2601,38 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
         LivenessChoice::None => quote!(::varve::__core::LivenessPolicy::None),
         LivenessChoice::FooterFlags => quote!(::varve::__core::LivenessPolicy::FooterFlags),
     };
+    let header_slots = match &input.header_slots {
+        None => quote!(::varve::__core::HeaderSlots::NONE),
+        Some(slots) => {
+            let capacity = slots.capacity;
+            let integrity = match slots.integrity {
+                HeaderSlotIntegrityChoice::None => {
+                    quote!(::varve::__core::HeaderSlotIntegrity::None)
+                }
+                HeaderSlotIntegrityChoice::Rolling => {
+                    quote!(::varve::__core::HeaderSlotIntegrity::Rolling)
+                }
+                HeaderSlotIntegrityChoice::Sealed => {
+                    quote!(::varve::__core::HeaderSlotIntegrity::Sealed)
+                }
+            };
+            let ids = slots
+                .blocks
+                .iter()
+                .map(|ty| quote!(<#ty as ::varve::__core::VarveBlock>::ID));
+            // A named const rather than a bare `&[..]`: the slice must be
+            // `&'static`, and relying on const promotion of an associated-const
+            // read is a rule this does not need to depend on.
+            quote!({
+                const HEADER_SLOT_BLOCK_IDS: &[u32] = &[#(#ids,)*];
+                ::varve::__core::HeaderSlots::new(
+                    #capacity,
+                    #integrity,
+                    HEADER_SLOT_BLOCK_IDS,
+                )
+            })
+        }
+    };
     let recovery = match input.recovery {
         RecoveryChoice::Strict => quote!(::varve::__core::RecoveryPolicy::Strict),
         RecoveryChoice::TruncateTail => quote!(::varve::__core::RecoveryPolicy::TruncateTail),
@@ -2913,6 +3033,7 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
                 )
                 .with_extension(#extension)
                 .with_liveness_policy(#liveness)
+                .with_header_slots(#header_slots)
                 .with_commit_policy(#commit)
                 .with_compression_policy(#compression)
                 .with_read_limits(#read_limits)

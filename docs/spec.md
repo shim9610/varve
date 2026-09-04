@@ -611,6 +611,82 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
   `replace_rewrite` refuses record-footer formats outright, and a digest
   requires the footer, so that path is unreachable for a digest format.
 
+### Editable Header Region
+
+- An **editable header region** is a fixed-size run of bytes reserved in the
+  file header that a caller can rewrite for the life of the file. It exists for
+  metadata a caller wants to revise without republishing: a watermark, a
+  processing state, a pointer into an external system. Every other way varve
+  records a fact is append-only, which is exactly wrong for a fact that changes.
+- Enabled by `HeaderSlots`, off by default. A format declaring none writes the
+  bytes it wrote before this existed and `computed_schema_hash()` is unchanged;
+  the schema-hash fold is skipped entirely when the region is undeclared rather
+  than folding a zero.
+- **The size is fixed and is part of the declaration.** `capacity` is folded
+  into the schema hash, so a file written under one capacity does not open under
+  another. This is what makes the region editable at all: the append log starts
+  after it, so a region that could grow would move every record in the file.
+  Writing into it moves nothing and changes no file length.
+- Only block ids named in the declaration may be written there, and each id
+  appears at most once. A second write of the same id **replaces** the first, so
+  a fixed region absorbs an unbounded number of edits — writing one block a
+  thousand times costs what writing it once costs. Two different blocks must
+  both fit.
+- A write that would not fit is refused with `Error::LimitExceeded` before any
+  byte is written; the region is never left half-updated by a rejected write.
+- The region is a mutable `VARVE2` file-header extension block with magic
+  `VHSL`, framed `magic[4] | len u32` like every extension after `VCHD`. Its
+  payload is:
+  - payload version `u16 = 1`,
+  - flags `u16` — bit `0` is *sealed*; any other bit set is refused rather than
+    ignored,
+  - capacity `u32`, which must equal the declared capacity,
+  - used `u32` — how many of the capacity bytes the entries occupy,
+  - checksum `u32`,
+  - `capacity` bytes of entries followed by zero padding to the full capacity.
+- One entry is `block_id u32 | block_version u16 | reserved u16 | len u32` then
+  `len` payload bytes, canonically encoded exactly as the same block would be
+  encoded in a record. `reserved` must be zero. The walk stops at `used`; the
+  padding past it is never framed and is zeroed on every write, so a removed
+  block's bytes do not survive in the file.
+- The checksum is FNV-1a 32 over the payload with the checksum field itself
+  excluded. It is **not** a crc32 and is deliberately not gated on the
+  `integrity` feature: gating it would make the two verifying policies below
+  silently inert in a default build, which is the shape this project treats as a
+  defect rather than a convenience. It follows the liveness block's precedent.
+- The checksum is *written* under every policy and *verified* under some, so a
+  format that later turns its policy up does not have to rewrite files to make
+  them verifiable.
+
+**The three integrity policies** are the answer to "exempt from the CRC, or
+compute it and freeze it at a chosen point":
+
+| `HeaderSlotIntegrity` | verified on read | writes | the seal |
+| --- | --- | --- | --- |
+| `None` | never | always allowed | none; `seal_header_slots` is refused |
+| `Rolling` | always | always allowed, checksum recomputed each time | none; `seal_header_slots` is refused |
+| `Sealed` | only once sealed | allowed until the seal, refused after | `seal_header_slots()` fixes the checksum, one-way |
+
+- `None` is the exemption: the region is editable forever and a changed byte is
+  a changed value, not an error.
+- `Rolling` verifies continuously, which is what a caller wants when the region
+  is read as authoritative throughout the file's life.
+- `Sealed` is the freeze point. Before the seal the checksum is advisory — the
+  region is still being edited, so a mismatch says nothing a caller could act
+  on. After it, reads verify and writes fail. Nothing unseals a region; a caller
+  who could unseal would have gained nothing over declaring `Rolling`.
+- Sealing is refused on any other policy, rather than doing nothing: `None` has
+  no checksum to freeze and `Rolling` recomputes on every write, so one call
+  would mean three different things.
+- A format declaring matrix blocks is refused. The matrix creation nonce and
+  matrix layout header sit at fixed offsets *after* the file header, and a
+  reserved region moves both — the same refusal `index: header_tails` carries,
+  for the same reason.
+- A republishing `replace` carries the region across verbatim. `VBTT` is reset
+  to cold there because every offset it records becomes a lie; this region
+  records no offsets, so preserving it is what "the file kept its metadata"
+  means.
+
 ### Checkpoint Index
 
 - Checkpoint records use internal block id `INDEX_BLOCK_ID`.

@@ -4,6 +4,71 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
+## Unreleased
+
+### An editable fixed-size region in the file header
+
+Every other way varve records a fact is append-only, which is exactly wrong for
+a fact that changes: a watermark, a processing state, a pointer into an external
+system. `HeaderSlots` reserves a **fixed** run of bytes in the file header that
+a caller rewrites in place for the life of the file.
+
+```rust
+header_slots {
+    capacity: 256;        // bytes; folded into the schema hash
+    integrity: rolling;   // none | rolling | sealed
+    blocks: [Watermark];  // only these may be written there
+}
+```
+
+`write_header_block`, `read_header_block`, `remove_header_block`,
+`seal_header_slots`, `header_slots_capacity`, `header_slots_used`,
+`header_slots_free_bytes` and `header_slots_sealed` on `VarveFile`. The three
+read accessors take `&self` and touch no I/O: the region is part of the header
+the handle already holds.
+
+The size being fixed is what makes it work. The append log starts after the
+region, so a region that could grow would move every record in the file; writing
+into it changes no file length and invalidates no record offset. A rewrite of a
+block already there replaces it rather than appending, so the region absorbs an
+unbounded number of edits — measured, 200 rewrites of one block leave
+`header_slots_used()` exactly where the first write left it. A write that would
+not fit is refused with `Error::LimitExceeded` before any byte is written.
+
+**The CRC question has three answers, all declarations.** `integrity: none` is
+the exemption: editable forever, never verified. `integrity: rolling` verifies
+every read against a checksum kept current. `integrity: sealed` is the freeze
+point — advisory until `seal_header_slots()`, then verified on read and closed
+to writes, one-way. Sealing on either other policy is refused rather than
+ignored. The checksum is FNV-1a 32, not a crc32, so it is not gated on the
+`integrity` feature: gating it would have made both verifying policies silently
+inert in a default build.
+
+Undeclared, it costs nothing — the header bytes and `computed_schema_hash()` are
+the ones the format produced before it existed, which the pinned schema-hash
+fixtures in `header_tail_region` and `matrix_chunks` (both captured from builds
+predating this change) still hold. Refused on a format declaring matrix blocks,
+for the same reason `index: header_tails` is: the matrix creation nonce and
+layout header sit at fixed offsets after the file header that a region moves.
+
+### The layout plan no longer understates a `footer_flags` header
+
+`FormatSpec::effective_layout()` published a file-header length 16 bytes short
+for every format declaring `liveness: footer_flags` — the `VLIV` extension block
+was missing from the plan's extension-length term, so the plan described the
+first record as starting inside it. Found by a new test comparing the plan's
+term against the writer's own output over every combination of extension blocks.
+
+No file was ever written wrong: the reader derives the boundary from the file's
+own region rather than from the plan. A tool reading `effective_layout()` was
+told wrong.
+
+### Fixed: `FormatSpecBuilder::build()` dropped `liveness_policy`
+
+The builder accepted `.liveness_policy(..)` and did not carry it into the built
+spec, so a format declared through the builder rather than the macro silently
+got `LivenessPolicy::None`.
+
 ## 0.8.0 - 2026-08-10
 
 ### A replacement no longer leaves a lazy resume on a used sequence
