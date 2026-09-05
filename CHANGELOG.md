@@ -6,6 +6,65 @@ increment the minor version.
 
 ## Unreleased
 
+### Walking one key's history
+
+The keyed predecessor chain has always been written — every keyed record's
+footer carries the offset of the previous record with the same key — and
+`prev_same_key_offset` has always been a public field on `RecordIndexEntry` and
+`AppendInfo`. What was missing was any way to *use* it. `read_block_at` turns an
+offset into a value and discards the entry it framed to get there, so a walk
+read the value at hop one and had nowhere to go for hop two; `keyed_blocks`
+answers a different question, the latest record per key. The chain was written
+and not readable.
+
+Two additions on `VarveFile`, both `&self`:
+
+```rust
+pub fn record_entry_at(&self, record_offset: u64) -> Result<RecordIndexEntry>
+pub fn keyed_chain(&self, from: u64) -> Result<KeyedChain<'_>>
+```
+
+`record_entry_at` is the primitive — it returns the entry `read_block_at`
+discards, which is where the next offset lives. `keyed_chain` is the walk built
+on it: seed it from `key_tail_offsets::<T>()` and it yields every generation of
+that key, newest first.
+
+```rust
+let newest = file.key_tail_offsets::<Reading>()?[&sensor];
+for step in file.keyed_chain(newest)? {
+    let entry = step?;
+    if entry.block_id == Reading::ID {
+        history.push(file.read_block_at::<Reading>(entry.record_offset)?);
+    }
+}
+```
+
+`KeyedChain` is the keyed counterpart of `BlockChain` and holds what that holds:
+one offset. Nothing is retained, so a key with more generations than memory is
+still walkable, and a walk over a large file costs the hops and not the file.
+Each step is charged against `max_records`, and the chain must strictly
+decrease, so a crafted or damaged file cannot make the walk loop.
+
+**It crosses block ids, and that is the one way it differs from `block_chain`**,
+which refuses a step that leaves its block. A delete writes its tombstone under
+`TOMBSTONE_BLOCK_ID` and a replacement under `OP_BLOCK_ID`, and both carry a
+live predecessor — so a walk that refused them would stop at the first deleted
+generation and look like an answer. Filter on `entry.block_id` yourself. This is
+also why `block_entries_into::<T>` is the wrong way to build such a walk by
+hand: it filters to `T::ID` and drops exactly those hops.
+
+`keyed_chain` is refused with `Error::InvalidFormatSpec` on a format that does
+not declare `index: [keyed_offset_chain]`, because without it the writer records
+no predecessor at all and a walk would return one record and look like an
+answer. Same refusal, for the same reason, that `block_chain` carries.
+
+Measured in `crates/varve/tests/keyed_chain_walk.rs`: `record_entry_at` returns
+the entry the resident index holds for the same record; a hand-written walk on
+the primitive alone reaches all 54 generations; the iterator agrees hop for hop
+and does not cross into another key; the walk passes through a tombstone and
+still reaches every generation behind it; the same 54 hops run over a file with
+20,000 unrelated records; and the walk is refused without the declaration.
+
 ### The file-header extension ceiling is a declaration, not a constant
 
 `header_slots` capacity was capped at 64 KiB by a private constant, so a caller

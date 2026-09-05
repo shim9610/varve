@@ -124,6 +124,47 @@ and materialization. Compatibility `*_with_limits` methods perform a meet, so
 `Finite(64 MiB)` tightened by `Finite(16 MiB)` is `Finite(16 MiB)`.
 `*_with_resource_limits` overlays fields and may raise or lower defaults.
 
+### Walking a chain
+
+Two chains are walkable, both `&self`, both lazy — each holds one offset, so a
+chain longer than memory is still walkable and the cost is the hops rather than
+the file.
+
+| method | follows | refuses without |
+| --- | --- | --- |
+| `block_chain(block_id)` -> `BlockChain<'_>` | `prev_same_block_offset` | `index: [block_offset_chain]` |
+| `keyed_chain(from)` -> `KeyedChain<'_>` | `prev_same_key_offset` | `index: [keyed_offset_chain]` |
+
+Both yield `Result<RecordIndexEntry>`. `record_entry_at(record_offset)` frames
+one record into its entry without a walk — it is what `read_block_at` builds and
+discards, and it is what a caller steering their own walk needs, since the entry
+is where the next offset lives.
+
+```rust
+let newest = file.key_tail_offsets::<Reading>()?[&sensor];
+for step in file.keyed_chain(newest)? {
+    let entry = step?;
+    if entry.block_id == Reading::ID {
+        history.push(file.read_block_at::<Reading>(entry.record_offset)?);
+    }
+}
+```
+
+**`keyed_chain` crosses block ids; `block_chain` does not.** That is the one
+behavioural difference and the reason they are separate types. A delete writes
+its tombstone under `TOMBSTONE_BLOCK_ID` and a replacement under `OP_BLOCK_ID`,
+and both carry a live keyed predecessor, so a keyed walk that refused them would
+stop at the first deleted generation and look like an answer. Filter on
+`entry.block_id` yourself.
+
+If you build the walk by hand from a materialised index instead, take it with
+`index_entries_into` — **not** `block_entries_into::<T>`, and not the `entries`
+half of `keyed_blocks_into`. Both filter to `T::ID`, which drops exactly the
+tombstone and op hops the chain runs through.
+
+Each step is charged against `max_records`, and both chains must strictly
+decrease, so a crafted or damaged file cannot make a walk loop.
+
 `ReadLimits::UNTRUSTED` (`ReadLimits::untrusted()`) is the finite companion to
 `STANDARD` for input from untrusted sources. Every aggregate dimension that
 `STANDARD` leaves effectively unbounded is finite: `max_records` 16,000,000,

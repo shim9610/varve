@@ -8087,6 +8087,49 @@ impl VarveFile {
         })
     }
 
+    /// Walks one key's records, newest first, from `from`.
+    ///
+    /// Seed it with that key's newest offset --
+    /// [`key_tail_offsets`](Self::key_tail_offsets) is where those come from --
+    /// and the iterator follows
+    /// [`prev_same_key_offset`](RecordIndexEntry::prev_same_key_offset) back
+    /// through every earlier generation of the key. Turn an entry into a value
+    /// with [`read_block_at`](Self::read_block_at) or
+    /// [`decode_block_into`](Self::decode_block_into).
+    ///
+    /// **It crosses block ids, and that is deliberate** -- the one way it
+    /// differs from [`Self::block_chain`], which refuses a step that leaves its
+    /// block. A delete writes its tombstone under [`TOMBSTONE_BLOCK_ID`] and a
+    /// replacement writes under [`OP_BLOCK_ID`], and both carry a live
+    /// predecessor, so a walk that refused them would stop at the first deleted
+    /// generation and look like an answer. Filter on `entry.block_id` yourself;
+    /// the walk will not filter for you.
+    ///
+    /// Lazy and `&self`, exactly like `block_chain`: one offset is held, so a
+    /// key with more generations than memory is still walkable. Each step is
+    /// charged against `max_records`, and the chain must strictly decrease, so a
+    /// crafted or damaged file cannot make the walk loop.
+    ///
+    /// Refuses without `keyed_offset_chain`: without it the writer records no
+    /// predecessor at all
+    /// ([`prev_same_key_offset`](RecordIndexEntry::prev_same_key_offset) is
+    /// `None` on every record), so a walk would stop after one record rather
+    /// than report that it cannot answer. Same refusal, for the same reason,
+    /// that `block_chain` carries.
+    pub fn keyed_chain(&self, from: u64) -> Result<KeyedChain<'_>> {
+        if !self.spec.index_policy.keyed_offset_chain {
+            return Err(Error::InvalidFormatSpec(
+                "keyed_chain requires keyed_offset_chain",
+            ));
+        }
+        Ok(KeyedChain {
+            spec: self.spec,
+            snapshot: &self.snapshot,
+            next: Some(from),
+            visited: 0,
+        })
+    }
+
     /// Decodes the record at `record_offset` as `T`.
     ///
     /// The companion to [`Self::block_chain`]: the walk yields offsets and
@@ -8110,6 +8153,34 @@ impl VarveFile {
         budget.consume(logical_len)?;
         let payload = entry.read_logical_payload_snapshot(self.spec, &self.snapshot)?;
         budget.decode(&payload, T::ENDIAN.unwrap_or(self.spec.endian))
+    }
+
+    /// Frames the record at `record_offset` into its index entry.
+    ///
+    /// The other half of [`Self::read_block_at`]. That one turns an offset into
+    /// a *value* and discards the entry it framed to get there; this returns the
+    /// entry, which is what a caller following a chain of their own needs -- the
+    /// entry is where the next offset lives
+    /// ([`prev_same_key_offset`](RecordIndexEntry::prev_same_key_offset),
+    /// [`prev_same_block_offset`](RecordIndexEntry::prev_same_block_offset)).
+    /// Without it a hand-written walk reads the value at hop one and has nowhere
+    /// to go for hop two.
+    ///
+    /// It publishes no information [`Self::block_chain`] does not already hand
+    /// out; it hands out the same entries by a route the caller steers.
+    ///
+    /// Positional and `&self`: two fixed-size reads through the snapshot, no
+    /// allocation, and nothing enters the resident index -- so a walk over a
+    /// file larger than memory costs the hops and not the file.
+    ///
+    /// **The offset is not trusted.** It is the caller's, so it may name
+    /// anything; an extent outside this handle's snapshot is refused, and bytes
+    /// that do not frame a record are refused. What it cannot do is reach
+    /// outside this file, so the worst a wrong offset buys is an error or some
+    /// other record of the same file. Identical in that respect to
+    /// [`Self::read_payload_into`], which takes a whole caller-supplied entry.
+    pub fn record_entry_at(&self, record_offset: u64) -> Result<RecordIndexEntry> {
+        read_record_entry_positional(self.spec, &self.snapshot, record_offset)
     }
 
     /// Reads the stored bytes of a record the caller already holds an entry
@@ -14082,6 +14153,68 @@ impl BlockChain<'_> {
             Some(previous) if previous >= offset => {
                 return Err(Error::InvalidCanonicalEncoding(
                     "block offset chain does not decrease",
+                ));
+            }
+            previous => previous,
+        };
+        Ok(entry)
+    }
+}
+
+/// One key's records, newest first, from [`VarveFile::keyed_chain`].
+///
+/// The keyed counterpart of [`BlockChain`], and it holds what that holds: one
+/// offset. Nothing is retained, so a key with more generations than memory is
+/// still walkable.
+///
+/// It differs from `BlockChain` in one way, and that is the reason it is a
+/// separate type rather than a parameter: the keyed chain legitimately runs
+/// through [`TOMBSTONE_BLOCK_ID`] and [`OP_BLOCK_ID`], so there is no
+/// "left its block" refusal to make. The caller filters on `block_id`.
+#[derive(Debug)]
+pub struct KeyedChain<'a> {
+    spec: FormatSpec,
+    snapshot: &'a SnapshotFile,
+    next: Option<u64>,
+    visited: u64,
+}
+
+impl Iterator for KeyedChain<'_> {
+    type Item = Result<RecordIndexEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let offset = self.next?;
+        match self.step(offset) {
+            Ok(entry) => Some(Ok(entry)),
+            Err(error) => {
+                // A failed step ends the walk rather than repeating itself,
+                // identically to `BlockChain`.
+                self.next = None;
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+impl KeyedChain<'_> {
+    fn step(&mut self, offset: u64) -> Result<RecordIndexEntry> {
+        self.visited = self
+            .visited
+            .checked_add(1)
+            .ok_or(Error::ResourceArithmeticOverflow {
+                resource: "record count",
+            })?;
+        self.spec
+            .read_limits
+            .check(ReadLimitKey::Records, self.visited)?;
+        let entry = read_record_entry_positional(self.spec, self.snapshot, offset)?;
+        // Strictly decreasing, so a crafted or damaged chain cannot loop. The
+        // same defence in depth `BlockChain` carries, and for the same reason:
+        // this walk frames records that scan never looked at.
+        self.next = match entry.prev_same_key_offset {
+            Some(previous) if previous >= offset => {
+                return Err(Error::InvalidCanonicalEncoding(
+                    "keyed offset chain does not decrease",
                 ));
             }
             previous => previous,

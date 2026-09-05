@@ -5,7 +5,8 @@ and the [Changelog](../CHANGELOG.md).
 
 Sections run newest first, and the letters ascend with the release they
 describe. Section **F** is unreleased: one added `ReadLimits` field that makes
-the file-header extension ceiling declarable, with nothing to migrate.
+the file-header extension ceiling declarable, and two added `VarveFile` methods
+that make the keyed predecessor chain walkable. Nothing to migrate in either.
 Section **E** is the 0.8.0 → 0.9.0 migration: one added `FormatSpec`
 field, which breaks a struct literal and nothing else, and a corrected
 `effective_layout()` header length. Section **D** is the 0.7.0 → 0.8.0 migration: a removed
@@ -66,6 +67,42 @@ schema hash, by design — they are one open's policy, not the file's format. So
 reader whose spec leaves this at the default refuses, **at open**, a file whose
 region a declaring writer made larger, and there is no `SchemaHashMismatch` to
 explain it. Declare `header_extension` in every copy of the format declaration.
+
+### F.2 `VarveFile::record_entry_at` and `VarveFile::keyed_chain`
+
+Purely additive; nothing to migrate. Both are `&self` on `VarveFile`, which is
+what `Format::open_readonly` and `Format::open` return.
+
+| added | is |
+| --- | --- |
+| `VarveFile::record_entry_at(&self, u64) -> Result<RecordIndexEntry>` | the entry `read_block_at` frames and discards |
+| `VarveFile::keyed_chain(&self, u64) -> Result<KeyedChain<'_>>` | the walk, newest first |
+| `KeyedChain<'a>` | `Iterator<Item = Result<RecordIndexEntry>>`, re-exported from `varve` |
+
+Before this, the keyed predecessor chain was written but not readable: the
+pointer was public on `RecordIndexEntry` and `AppendInfo`, and nothing public
+turned the offset it names back into an entry, so a walk died at hop two.
+
+```rust
+let newest = file.key_tail_offsets::<Reading>()?[&sensor];
+for step in file.keyed_chain(newest)? {
+    let entry = step?;
+    if entry.block_id == Reading::ID {
+        history.push(file.read_block_at::<Reading>(entry.record_offset)?);
+    }
+}
+```
+
+**Two things to know before writing that loop.** The walk crosses block ids —
+tombstones (`TOMBSTONE_BLOCK_ID`) and replacement ops (`OP_BLOCK_ID`) are
+legitimate hops, so filter on `entry.block_id` rather than expecting the walk to
+do it. And if you build the same walk by hand from a materialised index, use
+`index_entries_into`, **not** `block_entries_into::<T>` or the `entries` half of
+`keyed_blocks_into` — both filter to `T::ID` and drop exactly those hops, so the
+history breaks at the first deleted generation.
+
+`keyed_chain` requires `index: [keyed_offset_chain]` and refuses with
+`Error::InvalidFormatSpec("keyed_chain requires keyed_offset_chain")` otherwise.
 
 ---
 

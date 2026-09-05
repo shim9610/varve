@@ -85,9 +85,9 @@ pub use disk_index::{
 pub use error::{Error, Result};
 pub use file::{
     AppendInfo, BlockChain, BlockEvent, COMMIT_BLOCK_ID, CREATION_NONCE_BLOCK_ID, DefragmentReport,
-    DirectoryRead, FileMatrixDurabilityBarrier, INDEX_BLOCK_ID, IndexEntries, KeyedMergeEstimate,
-    LazyOpenSource, MANIFEST_BLOCK_ID, MATRIX_CHUNK_BLOCK_ID, METADATA_BLOCK_ID,
-    MatrixDurabilityBarrier, MatrixNumeric, MatrixSidecarManifest, OP_BLOCK_ID,
+    DirectoryRead, FileMatrixDurabilityBarrier, INDEX_BLOCK_ID, IndexEntries, KeyedChain,
+    KeyedMergeEstimate, LazyOpenSource, MANIFEST_BLOCK_ID, MATRIX_CHUNK_BLOCK_ID,
+    METADATA_BLOCK_ID, MatrixDurabilityBarrier, MatrixNumeric, MatrixSidecarManifest, OP_BLOCK_ID,
     OPEN_DIGEST_BLOCK_ID, OpenMode, RECORD_MUTABLE_FLAG_DEAD, RecordDirectory, RecordIndexEntry,
     RecordMap, RecoveryReport, ReplacePublicationFailure, ReplacementInfo, SEGMENT_BLOCK_ID,
     SchemaBlockDescriptor, SchemaFieldDescriptor, SchemaManifest, TOMBSTONE_BLOCK_ID, VarveFile,
