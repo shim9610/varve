@@ -129,7 +129,8 @@ and materialization. Compatibility `*_with_limits` methods perform a meet, so
 `STANDARD` leaves effectively unbounded is finite: `max_records` 16,000,000,
 `max_scan_bytes` 16 GiB, `max_index_bytes` 1 GiB,
 `max_segments` 65,536, and `max_keyed_tail_bytes` 256 MiB, inheriting the
-`STANDARD` per-item caps for everything else. Use it when a resident open must not let a hostile file choose the reader's
+`STANDARD` per-item caps for everything else — including
+`max_file_header_extension_len`, which is 64 KiB in both. Use it when a resident open must not let a hostile file choose the reader's
 CPU, I/O, or memory; large trusted files should use the scalable APIs or explicit
 wider limits instead.
 
@@ -713,6 +714,38 @@ assert_eq!(file.read_header_block::<Watermark>()?, Some(watermark));
 region, so a region that could grow would move every record in the file. Writing
 into it changes no file length and invalidates no record offset — which is why
 this is a reservation rather than an append.
+
+**How large it may be: 64 KiB unless you declare otherwise.** The region shares
+the file-header extension budget with every other header block, and that budget
+is `ReadLimits::max_file_header_extension_len`, declared as `header_extension`
+in a `limits { ... }` block:
+
+```rust
+limits {
+    // ... the rest of the block ...
+    header_extension: 524_288;
+}
+header_slots {
+    capacity: 262_144;
+    integrity: rolling;
+    blocks: [Watermark];
+}
+```
+
+A capacity over the budget is refused at create with
+`Error::InvalidFormatSpec("header_slots capacity exceeds the file-header
+extension limit")`, not silently clamped. The same ceiling bounds the **read**
+path, which is what it exists for: the region's on-disk length field is a `u32`,
+so without a ceiling a hostile header could name a 4 GiB region and have open
+allocate it before a single block is parsed.
+
+Because it is a `ReadLimits` field it is a property of one open and not of the
+file — it changes no byte and is not folded into the schema hash. The practical
+consequence: **a reader that does not declare the same ceiling refuses a file
+whose region is over 64 KiB**, and it refuses it at open. That is the intended
+behaviour for a reader hardening itself against untrusted input, and it is a
+mistake waiting to happen if two crates declare the same format twice with
+different `limits { }` blocks.
 
 **A rewrite replaces rather than appends.** Writing the same block a thousand
 times costs what writing it once costs, so a fixed region absorbs an unbounded

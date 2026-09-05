@@ -422,6 +422,27 @@ let left = file.header_slots_free_bytes()?;
 
 Sizing it: `header_slots_used()` after one write of each block you intend to
 hold tells you the real cost, and `header_slots_free_bytes()` is what remains.
+
+The ceiling on `capacity` is 64 KiB unless the format raises it. The region
+shares the file-header extension budget, and that budget is the `header_extension`
+key in `limits { ... }`:
+
+```rust
+limits {
+    // ... the rest of the block ...
+    header_extension: 524_288;
+}
+header_slots {
+    capacity: 262_144;
+    integrity: rolling;
+    blocks: [Watermark];
+}
+```
+
+A capacity above the budget is refused at create, not clamped. The budget also
+bounds what a reader will accept from a header it has not parsed yet, so declare
+it in **every** copy of the format declaration: a reader left at the 64 KiB
+default refuses, at open, a file a declaring writer produced.
 A write that would not fit is refused with `Error::LimitExceeded` before any
 byte is written, so a region that is too small fails loudly at the write rather
 than quietly at the read.

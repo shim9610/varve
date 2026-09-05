@@ -1560,6 +1560,18 @@ hash, and three consequences follow that are limitations rather than details:
   moving every record in the file — which is republishing it. Size the region
   when you declare the format, using `header_slots_used()` after one write of
   each block you intend to hold.
+- **The ceiling on the capacity is a reader-side declaration, so two readers of
+  the same file can disagree about it.** The region shares the file-header
+  extension budget, `ReadLimits::max_file_header_extension_len` — 64 KiB when
+  nothing declares it, raised with `limits { header_extension: .. }`. A capacity
+  above the budget is refused at create. But `ReadLimits` are deliberately *not*
+  folded into the schema hash, so a reader that declares the default ceiling and
+  opens a file whose region is 256 KiB is refused at open with no schema
+  mismatch to explain it. The refusal is correct — an unbounded reader would let
+  a hostile `u32` length field name a 4 GiB allocation before a block is parsed
+  — but it means the ceiling has to be declared in every copy of the format
+  declaration, and nothing checks that it was. Measured in
+  `crates/varve/tests/header_extension_limit.rs`, including that case.
 - **A format declaring matrix blocks cannot declare a region.** Refused at
   validation with `Error::InvalidFormatSpec`. The matrix creation nonce and the
   matrix layout header sit at fixed offsets *after* the file header, and a
@@ -1587,7 +1599,9 @@ hash, and three consequences follow that are limitations rather than details:
   here.
 
 What has been measured: the seventeen cases in
-`crates/varve/tests/header_slots.rs`, over all three integrity policies —
+`crates/varve/tests/header_slots.rs`, plus the four in
+`crates/varve/tests/header_extension_limit.rs` for the capacity ceiling, over all
+three integrity policies —
 reserve at create, survive a reopen, rewrite without growth, removal, refusal on
 overflow, refusal on an undeclared block, refusal of a write after a seal,
 verification on read under `rolling` and under a sealed `sealed`, non-verification

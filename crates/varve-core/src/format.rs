@@ -483,6 +483,21 @@ pub struct ReadLimits {
     pub max_matrix_slot_region_len: ReadLimit,
     pub max_sidecar_len: ReadLimit,
     pub max_mmap_len: ReadLimit,
+    /// Ceiling on the file-header extension region a reader will accept, and
+    /// on the region a format may reserve.
+    ///
+    /// The region's length field on disk is a `u32`, so an undeclared ceiling
+    /// would let an untrusted header name a 4 GiB region and have open allocate
+    /// it before a single block is parsed. It is a ceiling on one open's
+    /// allocation, not a property of the file, which is why it lives here and
+    /// not on `FormatSpec`: it changes no byte and is not hashed.
+    ///
+    /// Unset resolves to 64 KiB — see
+    /// [`Self::effective_max_file_header_extension_len`]. Declare a larger one
+    /// (`limits { header_extension: .. }`) when a `header_slots` region needs
+    /// more room than that; both the reader's acceptance check and the
+    /// `header_slots`/`header_tails` reservation checks read this value.
+    pub max_file_header_extension_len: ReadLimit,
     /// Ceiling on the resident keyed-tail cache of a single keyed block id -
     /// the map that lets a keyed append resolve its predecessor in O(1)
     /// instead of rescanning the resident index (API3-02).
@@ -551,6 +566,9 @@ impl ReadLimits {
         max_matrix_slot_region_len: ReadLimit::Finite(8 * 1024 * 1024 * 1024),
         max_sidecar_len: ReadLimit::Finite(256 * 1024 * 1024),
         max_mmap_len: ReadLimit::Finite(8 * 1024 * 1024 * 1024),
+        max_file_header_extension_len: ReadLimit::Finite(
+            crate::native_layout::DEFAULT_MAX_FILE_HEADER_EXTENSION_LEN,
+        ),
         max_keyed_tail_bytes: ReadLimit::Finite(u64::MAX),
         // Deliberately `Missing` rather than a concrete policy: `STANDARD` is
         // what `resolve` overlays onto, so a concrete value here would be
@@ -599,6 +617,7 @@ impl ReadLimits {
             max_matrix_slot_region_len: value,
             max_sidecar_len: value,
             max_mmap_len: value,
+            max_file_header_extension_len: value,
             max_keyed_tail_bytes: value,
             // Every field `all` builds is the unset one, this included: `MISSING`
             // and `TRUSTED_UNBOUNDED` declare no residency and no verification
@@ -669,6 +688,29 @@ impl ReadLimits {
     pub const fn with_integrity_verification(mut self, policy: IntegrityVerification) -> Self {
         self.integrity_verification = policy;
         self
+    }
+
+    /// The file-header extension ceiling in force, in bytes.
+    ///
+    /// Unset — which is what every format that never wrote
+    /// `limits { header_extension: .. }` carries — resolves here, and only
+    /// here, to 64 KiB: the value this was a private constant for until it
+    /// became declarable, so an undeclared format reserves the same region,
+    /// accepts the same headers and refuses the same ones as before.
+    ///
+    /// [`ReadLimit::TrustedUnbounded`] resolves to `u32::MAX`, and a declared
+    /// value is clamped to it, because that is the largest length the on-disk
+    /// `u32` field can name. Above it the ceiling would be unreachable rather
+    /// than generous, and a `header_slots` capacity checked against it would be
+    /// accepted at create and then refused by the reader's own `u32`.
+    pub const fn effective_max_file_header_extension_len(self) -> u64 {
+        let ceiling = u32::MAX as u64;
+        match Self::STANDARD.overlay(self).max_file_header_extension_len {
+            ReadLimit::Finite(value) if value < ceiling => value,
+            // `Finite` at or above the field's range, and `TrustedUnbounded`,
+            // are both "as much as the format can express".
+            _ => ceiling,
+        }
     }
 
     /// The verification policy an open actually uses.
@@ -792,6 +834,7 @@ impl ReadLimits {
         (with_max_sidecar_len, max_sidecar_len),
         (with_max_mmap_len, max_mmap_len),
         (with_max_keyed_tail_bytes, max_keyed_tail_bytes),
+        (with_max_file_header_extension_len, max_file_header_extension_len),
     }
 
     pub const fn tighten(self, runtime: Self) -> Self {
@@ -841,6 +884,9 @@ impl ReadLimits {
                 .tighten(runtime.max_matrix_slot_region_len),
             max_sidecar_len: self.max_sidecar_len.tighten(runtime.max_sidecar_len),
             max_mmap_len: self.max_mmap_len.tighten(runtime.max_mmap_len),
+            max_file_header_extension_len: self
+                .max_file_header_extension_len
+                .tighten(runtime.max_file_header_extension_len),
             max_keyed_tail_bytes: self
                 .max_keyed_tail_bytes
                 .tighten(runtime.max_keyed_tail_bytes),
@@ -902,6 +948,9 @@ impl ReadLimits {
                 .overlay(runtime.max_matrix_slot_region_len),
             max_sidecar_len: self.max_sidecar_len.overlay(runtime.max_sidecar_len),
             max_mmap_len: self.max_mmap_len.overlay(runtime.max_mmap_len),
+            max_file_header_extension_len: self
+                .max_file_header_extension_len
+                .overlay(runtime.max_file_header_extension_len),
             max_keyed_tail_bytes: self
                 .max_keyed_tail_bytes
                 .overlay(runtime.max_keyed_tail_bytes),
@@ -3272,10 +3321,16 @@ impl FormatSpec {
                     "header_slots requires the varve_native layout",
                 ));
             }
-            // The region shares the 64 KiB file-header extension budget with
-            // every other block. Checked against the framed length, not the
-            // capacity, because the framing is what occupies the budget.
-            if header_slots_region_len(self) > crate::native_layout::MAX_FILE_HEADER_EXTENSION_LEN {
+            // The region shares the file-header extension budget with every
+            // other block. Checked against the framed length, not the capacity,
+            // because the framing is what occupies the budget. The budget is
+            // 64 KiB unless this format declared `limits { header_extension }`,
+            // and the *reader* enforces the same number, so a format that
+            // reserves more than it declares is refused here rather than
+            // written and then rejected at open.
+            if header_slots_region_len(self)
+                > self.read_limits.effective_max_file_header_extension_len()
+            {
                 return Err(Error::InvalidFormatSpec(
                     "header_slots capacity exceeds the file-header extension limit",
                 ));

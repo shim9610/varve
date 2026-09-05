@@ -1506,6 +1506,7 @@ const READ_LIMIT_KEYS: &[&str] = &[
     "sidecar",
     "mmap",
     "keyed_tail",
+    "header_extension",
 ];
 
 fn parse_read_limits(input: ParseStream<'_>) -> Result<Vec<LimitEntry>> {
@@ -6350,6 +6351,9 @@ fn read_limits_tokens(choice: LimitsChoice) -> TokenStream2 {
                     "sidecar" => format_ident!("with_max_sidecar_len"),
                     "mmap" => format_ident!("with_max_mmap_len"),
                     "keyed_tail" => format_ident!("with_max_keyed_tail_bytes"),
+                    "header_extension" => {
+                        format_ident!("with_max_file_header_extension_len")
+                    }
                     _ => unreachable!("read limit keys are validated while parsing"),
                 };
                 let value = entry.value;

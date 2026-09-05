@@ -4,7 +4,9 @@ Migration document. Companion to [Known Limitations](known-limitations.md)
 and the [Changelog](../CHANGELOG.md).
 
 Sections run newest first, and the letters ascend with the release they
-describe. Section **E** is the 0.8.0 → 0.9.0 migration: one added `FormatSpec`
+describe. Section **F** is unreleased: one added `ReadLimits` field that makes
+the file-header extension ceiling declarable, with nothing to migrate.
+Section **E** is the 0.8.0 → 0.9.0 migration: one added `FormatSpec`
 field, which breaks a struct literal and nothing else, and a corrected
 `effective_layout()` header length. Section **D** is the 0.7.0 → 0.8.0 migration: a removed
 replacement-strategy enum, and a `with_directory` that returns `Result` so it can
@@ -22,6 +24,48 @@ and says so in place.
 No on-disk byte changes in 0.5.0. A 0.4.0 file reads unchanged; no encoder,
 decoder, header field or version constant was touched. If you are coming from
 0.3.0 or earlier, read "Read this first" below — that guidance is unchanged.
+
+---
+
+## F. Unreleased: the file-header extension ceiling is declarable
+
+One added `ReadLimits` field. **Nothing to migrate**: `ReadLimits` is
+`#[non_exhaustive]`, so no struct literal breaks, and the undeclared value
+resolves to the 64 KiB the private constant held, so every existing format
+reserves, accepts and refuses exactly what it did.
+
+### F.1 `ReadLimits::max_file_header_extension_len`, DSL key `header_extension`
+
+| added | resolves to when unset |
+| --- | --- |
+| `ReadLimits::max_file_header_extension_len` | `Finite(64 KiB)` |
+| `ReadLimits::with_max_file_header_extension_len(u64)` | — |
+| `ReadLimits::effective_max_file_header_extension_len() -> u64` | `65_536` |
+| `limits { header_extension: .. }` | — |
+
+Declare it when a `header_slots` region needs more than 64 KiB:
+
+```rust
+limits {
+    // ... the rest of the block ...
+    header_extension: 524_288;
+}
+header_slots {
+    capacity: 262_144;
+    integrity: rolling;
+    blocks: [Watermark];
+}
+```
+
+`ReadLimit::TrustedUnbounded` resolves to `u32::MAX`, and a declared value is
+clamped to it, because that is the largest length the on-disk `u32` field can
+name.
+
+**The one thing to be careful about.** `ReadLimits` are not folded into the
+schema hash, by design — they are one open's policy, not the file's format. So a
+reader whose spec leaves this at the default refuses, **at open**, a file whose
+region a declaring writer made larger, and there is no `SchemaHashMismatch` to
+explain it. Declare `header_extension` in every copy of the format declaration.
 
 ---
 

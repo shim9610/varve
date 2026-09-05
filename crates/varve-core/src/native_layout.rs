@@ -12,13 +12,20 @@ const CONTAINER_MARKER_V1: &[u8; 6] = b"VARVE1";
 const CONTAINER_MARKER_V2: &[u8; 6] = b"VARVE2";
 const CONTAINER_MARKER_V3: &[u8; 6] = b"VARVE3";
 const FILE_HEADER_FIXED_LEN: u64 = 6 + 2 + 1 + 1 + 8;
-/// The largest extension region a reader will accept.
+/// The largest extension region a reader accepts when the format declares no
+/// ceiling of its own.
 ///
-/// The region's length field is a `u32`, so an untrusted header could otherwise
-/// name a 4 GiB region and have open allocate it before a single block is
-/// parsed. Header blocks are tens of bytes; 64 KiB is far above any use and
-/// keeps the allocation bounded, which is what open being cheap depends on.
-pub(crate) const MAX_FILE_HEADER_EXTENSION_LEN: u64 = 64 * 1024;
+/// The region's length field is a `u32`, so an unbounded reader could otherwise
+/// be told to allocate 4 GiB before a single block is parsed. Header blocks are
+/// tens of bytes, so 64 KiB is far above any undeclared use and keeps that
+/// allocation bounded, which is what open being cheap depends on.
+///
+/// It is the default rather than the rule: a format that needs a larger region
+/// declares `limits { header_extension: .. }`, and every site that used to read
+/// this constant now reads
+/// [`ReadLimits::effective_max_file_header_extension_len`], which returns this
+/// value when nothing was declared.
+pub(crate) const DEFAULT_MAX_FILE_HEADER_EXTENSION_LEN: u64 = 64 * 1024;
 const FILE_EXPLICIT_COMPRESSION_HEADER_LEN: u64 = 28;
 const INTERNAL_PREFIX_LEN: usize = 4 + 8;
 
@@ -401,7 +408,7 @@ pub(crate) fn read_native_file_header<R: Read>(
         // write: a block whose magic this build does not know is skipped, and
         // that is only possible if a longer region can be read at all. What
         // the region *contains* is judged by the block walk in `file.rs`.
-        if extension_len > MAX_FILE_HEADER_EXTENSION_LEN {
+        if extension_len > spec.read_limits.effective_max_file_header_extension_len() {
             return Err(Error::InvalidCompressionHeader);
         }
         // No writer emits a length field for an empty region — it picks

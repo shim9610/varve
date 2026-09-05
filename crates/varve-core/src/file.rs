@@ -15725,9 +15725,10 @@ fn encode_cold_header_tails_region(spec: FormatSpec) -> Result<Vec<u8>> {
     let capacity = header_tails_capacity(spec);
     let framed_len = usize::try_from(header_tails_region_len(spec))
         .map_err(|_| Error::InvalidFormatSpec("header_tails region length overflows"))?;
-    // The region shares the 64 KiB extension budget with every other block, so
-    // the check is against the whole region's framed length, not the payload.
-    if header_tails_region_len(spec) > crate::native_layout::MAX_FILE_HEADER_EXTENSION_LEN {
+    // The region shares the extension budget with every other block, so the
+    // check is against the whole region's framed length, not the payload. The
+    // budget is 64 KiB unless the format declared `limits { header_extension }`.
+    if header_tails_region_len(spec) > spec.read_limits.effective_max_file_header_extension_len() {
         return Err(Error::InvalidFormatSpec(
             "header_tails region exceeds the file-header extension limit; the format declares too many blocks",
         ));

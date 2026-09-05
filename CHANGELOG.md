@@ -4,6 +4,49 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
+## Unreleased
+
+### The file-header extension ceiling is a declaration, not a constant
+
+`header_slots` capacity was capped at 64 KiB by a private constant, so a caller
+who wanted a larger region met a refusal with no option behind it. The ceiling
+is `ReadLimits::max_file_header_extension_len` now, declared as
+`header_extension` in a `limits { ... }` block:
+
+```rust
+limits {
+    // ... the rest of the block ...
+    header_extension: 524_288;
+}
+header_slots {
+    capacity: 262_144;
+    integrity: rolling;
+    blocks: [Watermark];
+}
+```
+
+`ReadLimits::with_max_file_header_extension_len` is the builder, and
+`effective_max_file_header_extension_len()` is what resolves it.
+
+**The default is inert.** Undeclared resolves to the same 64 KiB — sourced from
+the same constant, which is still the single definition of the number — so a
+format that says nothing reserves the same region, accepts the same headers and
+refuses the same ones as 0.9.0. `ReadLimits` is `#[non_exhaustive]`, so the new
+field breaks no downstream struct literal.
+
+The ceiling bounds the **read** path as well as the reservation, which is what it
+exists for: the region's on-disk length field is a `u32`, so an unbounded reader
+could be told to allocate 4 GiB before a single block is parsed. It is a
+`ReadLimits` field, so it is a property of one open and is not folded into the
+schema hash — which means a reader left at the default refuses, at open, a file
+whose region a declaring writer made larger. Declare it in every copy of the
+format declaration; see [known limitations §6.9](docs/known-limitations.md).
+
+Measured in `crates/varve/tests/header_extension_limit.rs`: the undeclared
+ceiling is still 64 KiB, an over-budget region without a declaration is refused
+at create, a declared ceiling admits a 256 KiB region through create → write →
+reopen → read, and a default-ceiling reader refuses that file.
+
 ## 0.9.0 - 2026-09-04
 
 ### An editable fixed-size region in the file header
