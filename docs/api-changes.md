@@ -1,12 +1,14 @@
-# API Changes — 0.3.0 through 0.9.0
+# API Changes — 0.3.0 through 0.9.1
 
 Migration document. Companion to [Known Limitations](known-limitations.md)
 and the [Changelog](../CHANGELOG.md).
 
 Sections run newest first, and the letters ascend with the release they
-describe. Section **F** is unreleased: one added `ReadLimits` field that makes
-the file-header extension ceiling declarable, and two added `VarveFile` methods
-that make the keyed predecessor chain walkable. Nothing to migrate in either.
+describe. Section **F** is the 0.9.0 → 0.9.1 migration: one added `ReadLimits`
+field that makes the file-header extension ceiling declarable, and two added
+`VarveFile` methods that make the keyed predecessor chain walkable. Nothing to
+migrate in either — every change is additive, and a format that declares nothing
+new is byte-identical to 0.9.0.
 Section **E** is the 0.8.0 → 0.9.0 migration: one added `FormatSpec`
 field, which breaks a struct literal and nothing else, and a corrected
 `effective_layout()` header length. Section **D** is the 0.7.0 → 0.8.0 migration: a removed
@@ -28,7 +30,7 @@ decoder, header field or version constant was touched. If you are coming from
 
 ---
 
-## F. Unreleased: the file-header extension ceiling is declarable
+## F. From 0.9.0 to 0.9.1: two additions, nothing to migrate
 
 One added `ReadLimits` field. **Nothing to migrate**: `ReadLimits` is
 `#[non_exhaustive]`, so no struct literal breaks, and the undeclared value

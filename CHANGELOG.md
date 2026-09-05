@@ -4,7 +4,7 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
-## Unreleased
+## 0.9.1 - 2026-09-06
 
 ### Walking one key's history
 

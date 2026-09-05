@@ -257,7 +257,7 @@ the git repository and pin a tag:
 
 ```toml
 [dependencies]
-varve = { git = "https://github.com/shim9610/varve", tag = "v0.9.0" }
+varve = { git = "https://github.com/shim9610/varve", tag = "v0.9.1" }
 ```
 
 Pin the tag rather than tracking `main`: `main` moves, and this project is at a
@@ -271,7 +271,7 @@ a build that enables none is the smallest one. Enable what a format declaration
 actually asks for:
 
 ```toml
-varve = { git = "https://github.com/shim9610/varve", tag = "v0.9.0",
+varve = { git = "https://github.com/shim9610/varve", tag = "v0.9.1",
           features = ["integrity", "compression-zstd"] }
 ```
 
@@ -399,7 +399,7 @@ gate, file data, environment, or library invariant issues. See
 
 ## Status
 
-Varve 0.9.0 is usable as an alpha library for experimentation and controlled
+Varve 0.9.1 is usable as an alpha library for experimentation and controlled
 deployments. Through the **stable, released** APIs that means moderate scale —
 files whose record and key counts fit in RAM. The larger-than-RAM path exists but
 is behind `high-cardinality-dev`, has never shipped, and is the least audited code
@@ -407,11 +407,11 @@ in the tree; "far larger than RAM" in the capability table above describes that
 feature-gated family, not the default one. It includes append-log blocks, keyed
 collections, transaction/footer commit policies, schema manifests, diagnostics,
 merge and compact helpers, variable-block compression, matrix storage, mmap, and
-opt-in zero-copy. Valid native 0.1 append-log wire bytes remain readable in 0.9.0,
+opt-in zero-copy. Valid native 0.1 append-log wire bytes remain readable in 0.9.1,
 but the Rust API is still pre-1.0 and may evolve through semver-signaled minor
 releases.
 
-**Four artifact classes are not covered by that statement in 0.9.0.** They are
+**Four artifact classes are not covered by that statement in 0.9.1.** They are
 rejected with a typed error rather than misread, but two of them hold data and two
 are regenerable, and the difference is what it costs you:
 
