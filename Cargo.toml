@@ -12,7 +12,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/shim9610/varve"
 rust-version = "1.95"
-version = "0.9.1"
+version = "0.9.2"
 
 [workspace.dependencies]
 crc32fast = "1.5.0"

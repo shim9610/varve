@@ -4,7 +4,57 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
-## Unreleased
+## 0.9.2 - 2026-09-06
+
+### Thirty-one published statements that had drifted away from the code
+
+Every one of the sixteen published documents was audited against the code it
+describes. Forty findings survived adversarial verification; the six rated high
+and the two library defects are the entries above and below this one, and this
+is the rest — the medium and low findings, all applied in one pass so the
+documents agree with each other as well as with the code.
+
+The largest was a capability three documents denied. `README.md`,
+`docs/known-limitations.md` §1.8 and `docs/how-it-works.md` all said a matrix
+cannot grow — "no grow path is planned", "**A matrix cannot represent an
+indefinitely growing stream**" — while `FormatSpec::with_growing_matrix_dimension`
+has shipped, exported and ungated, since 0.6.0, and `docs/api-changes.md` §C.2
+documented it correctly the whole time. Two further copies turned up that the
+audit had not found, one in `README.md` and one in the rustdoc of
+`GrowingMatrixDimension` itself, which still said a written chunk refuses writes
+after `Error::MatrixChunkClosed` stopped being constructed.
+
+The rest, by kind:
+
+- **Stale after a later release changed the code.** `docs/spec.md` said readers
+  do not tail live writers, which `follow()` made false in 0.8.0 — and
+  `docs/api-reference.md` carried the same claim in the words 0.8.0's changelog
+  entry used as its *title*. `docs/recovery-model.md` said
+  `clear_matrix_category` never refuses; on a growing-matrix format it does, and
+  so does `rebuild_matrix_commit_from_crc`, so that quarantine has no primitive
+  that lifts it. `docs/known-limitations.md` said CI runs no fuzzing, Miri or
+  ASan, three bullets above its own statement that it does.
+- **Wrong by inspection.** `docs/format-author-guide.md` named
+  `recovery: truncate_tail` as the default; it is `strict`. It put header-slot
+  entry framing at eight bytes; it is twelve. `docs/known-limitations.md` listed
+  three `limits { }` keys of which two are not keys. `docs/api-reference.md`
+  spelled a turbofish that does not compile.
+- **Self-contradictory within one file.** `docs/scalable-io.md` said opening the
+  indexed reader does not read the native record region, and said the opposite
+  167 lines later; the open does one bounded point read of the leading record.
+- **A published sample that does not compile.** `docs/durability-model.md`
+  carried a `varve_format!` block with a `durability:` key the macro refuses and
+  two options that exist nowhere in the tree.
+
+Fourteen `doc_claims` gates run now, up from six. Five are new in this entry and
+every one was measured failing on the unpatched tree, naming every file that
+carried the claim — the growing-matrix pin catches two files, and the one for
+the record scanner's old name catches four. That pin forbids the name itself, so
+this entry does not spell it; `scan_records_range` is what the scanner is
+called.
+
+No code changed for any of it beyond three rustdoc corrections and one stale
+test comment.
 
 ### A bare filename is a usable pathname again
 
@@ -142,7 +192,7 @@ from the walk alone therefore drops every op-applied mutation, silently. The
 tombstone half of the claim was correct and stands. Pinned by
 `an_op_record_is_not_on_the_chain` in `crates/varve/tests/keyed_chain_walk.rs`.
 
-**The cross-reader ceiling refusal was not measured, though §6.9 said it was.**
+**The cross-reader ceiling refusal was not measured, though §6.10 said it was.**
 The test that reopened a large-region file used a format whose *magic* differs,
 so open was refused at the magic check before the header extension length was
 ever read — and it asserted only that the open failed, not why. It now uses a
@@ -250,7 +300,7 @@ could be told to allocate 4 GiB before a single block is parsed. It is a
 `ReadLimits` field, so it is a property of one open and is not folded into the
 schema hash — which means a reader left at the default refuses, at open, a file
 whose region a declaring writer made larger. Declare it in every copy of the
-format declaration; see [known limitations §6.9](docs/known-limitations.md).
+format declaration; see [known limitations §6.10](docs/known-limitations.md#610-the-editable-header-region-what-its-fixed-size-actually-forbids).
 
 Measured in `crates/varve/tests/header_extension_limit.rs`: the undeclared
 ceiling is still 64 KiB, an over-budget region without a declaration is refused
