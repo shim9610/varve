@@ -1070,8 +1070,16 @@ The three relaxations are source-compatible — an existing call through a `&mut
 binding still compiles — but they are what makes shared-handle concurrent reading
 possible.
 
-**Measured concurrent matrix read scaling** (wall clock, lower is better; the
-contract asserted in the tests is only `<= 1.0x`, i.e. "does not serialise"):
+**Measured concurrent matrix read scaling** (wall clock, lower is better).
+Only the second row is asserted on every run, at `<= 1.0x`, i.e. "does not
+serialise", by
+`concurrent_lazy_readers_are_not_serialised_behind_the_page_store`. The first
+row is measured and printed by `report_the_scaling_of_one_shared_handle` and
+decides nothing; its `<= 1.0x` form is an `#[ignore]`d manual benchmark,
+demoted because two `ubuntu-latest` runs of healthy code reported 2.14x and
+1.43x. What gates the eager path instead is counted, not timed: matrix reads
+issued while a commit-map page-store lock was held must be zero
+(`page_store_lock_audit_tests`).
 
 | Scenario | Run A | Run B (independent) |
 | --- | --- | --- |
@@ -1088,8 +1096,11 @@ Windows-only.** Windows `ReadFile` serialises on the kernel file object, so each
 reading thread is given a private file object derived with `ReOpenFile`
 (`MatrixReadPool`). Without it, four threads measured **1.54x slower** than one.
 That pool is `#[cfg(windows)]`; on Unix, positional `pread` does not serialise on
-the file object, so a shared handle is expected to be adequate — but **the two
-concurrent-read scaling contracts have never been executed on Unix**. See §6.
+the file object, so a shared handle is expected to be adequate. The two
+contracts that still gate — the lazy `<= 1.0x` ratio and the counted
+page-store-lock invariant — **do** run on Unix, because CI runs the suite on
+`ubuntu-latest`. What has never run there is the `#[ignore]`d eager threshold,
+and **no Unix throughput has ever been measured**. See §6.
 
 One lock does exist in the matrix read path (open item 31): `SparseBitmap` holds
 a `Mutex<PageStore>` so a demand fault-in can happen under `&self`. It is taken
@@ -1321,7 +1332,10 @@ What this section still says, unchanged: **the numbers are Windows numbers.**
 Executed on Linux is not measured on Linux. Every syscall count, residency
 figure and open cost in these documents was taken on Windows x86_64, and the
 third defect above is exactly what a different filesystem does to such a
-constant. No Linux measurement has been published.
+constant. The only Linux numbers on record are two runs of the eager 1-vs-4
+shared-handle ratio, 2.14x and 1.43x, published as the evidence that that ratio
+is dominated by the host rather than as a result; no Linux throughput, syscall
+count, residency figure or open cost has been measured.
 
 `cargo clippy --target x86_64-unknown-linux-gnu -p varve --no-default-features
 --lib -- -D warnings` previously failed with `field 'handles' is never read` at
@@ -1535,7 +1549,7 @@ it; the matrix and sidecar refusal claims still rest on inspection.**
 | Target | Status |
 | --- | --- |
 | Windows x86_64 MSVC | executed, and the platform every number in this document is from. |
-| Unix (Linux) | **executed**, including `compression-zstd`, and green: tests, Clippy and fmt run natively on `ubuntu-latest` in CI (§6.1). The first such run found three defects every Windows run had passed. **No measurement has been taken here** — the numbers above are not Linux numbers. |
+| Unix (Linux) | **executed**, including `compression-zstd`, and green: tests, Clippy and fmt run natively on `ubuntu-latest` in CI (§6.1). The first such run found three defects every Windows run had passed. **No Linux throughput, syscall count, residency figure or open cost has been measured** — the numbers above are not Linux numbers, and the only Linux figures on record are the two eager scaling ratios in §6.1. |
 | macOS / other targets | compile paths exist, nothing executed. Two behaviours differ by construction rather than by accident: no allocation map (§1.1) and no hole punch (§1.7). |
 
 ### 6.9 CI reproducibility is bounded

@@ -545,9 +545,18 @@ This section pins the P0-P2 implementation contracts so worker agents can implem
 - The payload layout is:
   - magic bytes `b"VDIG"`,
   - payload version `u16 = 1`,
-  - flags `u16`, currently `0`,
+  - flags `u16` — bit 0 (`0x0001`) says the sequence field carries a mark.
+    Every digest varve writes sets it, so the word is `1` and never `0`: both
+    writing paths always have a mark to report. A digest that sets any other
+    bit was written by something that means more by it than this version
+    defines, and open answers it with the scan rather than half-understanding
+    it,
   - sequence high-water `u64` — the newest sequence in the file as it stands
-    once this record is down, or `u64::MAX` for "no record carries one",
+    once this record is down, which counts the digest record's own sequence.
+    It is meaningful only when bit 0 is set, and is written as `0` when that
+    bit is clear. **No value is reserved**: `u64::MAX` is a mark like any
+    other, and reading it as "no record carries one" would take a file's last
+    usable sequence for an absent one,
   - block tail count `u32`,
   - `count` pairs of block id `u32` and newest record offset `u64`, **strictly
     ascending by block id**,

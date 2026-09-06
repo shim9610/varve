@@ -6,6 +6,92 @@ increment the minor version.
 
 ## Unreleased
 
+### A bare filename is a usable pathname again
+
+`Path::new("app.varve").parent()` is `Some("")`, not `None`, so the
+`unwrap_or_else(|| Path::new("."))` fallback that every parent-directory sync
+carried was dead code and `File::open("")` failed. A file created under a bare
+filename therefore could not be synced: `sync()` returned
+`PublishedButParentSyncPending { path: "app.varve", source: Io(NotFound) }`, and
+so did `replace_user`. The published quickstart uses exactly that pathname, so
+its section 3 failed as written.
+
+The same dead fallback was in **eight places across four files**, not the two the
+report named — `file.rs` (both platform arms of `sync_parent_directory`),
+`disk_index.rs`, `indexed.rs` (three) and `stream.rs` (two). All eight now filter
+the empty parent before falling back.
+
+Measured in `crates/varve/tests/bare_filename_parent_sync.rs`, which runs the
+bare-filename case in a **subprocess**: `set_current_dir` is process-global and
+would corrupt every other test sharing the binary. Reverting the fix makes it
+fail with the exact error above.
+
+### `diagnose_file` reads the file under the policy an ordinary open uses
+
+`diagnose_file` charged every record against the format's *declared*
+`ReadLimits` and never resolved them. `VarveFile::open_readonly` resolves
+internally, so the handle it returned carried a resolved spec while the local
+one did not, and the two disagreed about what a legal payload length is.
+
+The visible consequence was on healthy files. A format that declares no
+`limits { }` block — the quickstart's own `AppFormat` — leaves
+`max_record_payload_len` `Missing`, so every record of an undamaged file was
+reported as
+
+```text
+Error CallerUsage file.record.payload_invalid: record block 1 at offset 150
+failed logical payload validation: missing finite read limit for record
+payload length
+```
+
+with `passed() == false`, while `open_reader` and `self_test` on that same
+format both succeeded. Measured on a three-record file: four `Error`
+diagnostics, one per record plus the embedded manifest record.
+
+The file phase now resolves once, exactly as `FormatSpec::open_reader` does.
+Declared ceilings are untouched — resolution fills the limits a format left
+unset and does not replace the ones it set — so a file that genuinely exceeds a
+ceiling is still reported: under `materialized_bytes: 8` that same file still
+yields `file.record.payload_invalid` naming the materialization limit.
+`diagnose_spec` continues to report on the format as declared.
+
+### Four published statements that had drifted away from the code
+
+An audit of all sixteen published documents against the code they describe
+returned forty findings after adversarial verification. These are the four rated
+high that were not already fixed; the rest are recorded and not yet acted on.
+
+- **`docs/spec.md` described the open-digest (`VDIG`) payload wrongly**, in a way
+  that would produce a non-conforming parser. The flags word was published as
+  "currently `0`"; bit 0 says the sequence field carries a mark and every digest
+  varve writes sets it, so the word is `1` and a parser requiring zero refuses
+  every digest that exists. And the sequence field was published with `u64::MAX`
+  reserved for "no record carries one"; that sentinel was removed, absence is the
+  flag bit being clear, and `u64::MAX` is a mark like any other — so the
+  documented rule reads a file's last usable sequence as an absent one. The
+  `VSEG` bullet says the same words about *its* flags word and is correct, which
+  is how this survived. `crates/varve/tests/open_digest.rs` now parses a real
+  digest out of a real file the way the specification tells a reader to.
+- **`docs/quickstart.md` stated the matrix concurrency rule backwards**,
+  describing the `EagerVerified` residency removed in 0.5.0. The default resolves
+  to `Lazy`: a commit-map page is as of its first touch, not as of open, so a
+  reader that never touched a page can see commits made after it opened. Four
+  other documents already said this correctly. **A fifth did not** —
+  `docs/format-author-guide.md` carried the same retracted claim in different
+  words, and a gate written against the quickstart's wording alone would have
+  gone green with it still standing.
+- **`docs/api-reference.md` named a test that does not assert what it said.**
+  `matrix_concurrent_reads.rs` prints its scaling ratio and disclaims it as a
+  gate; the strict threshold is `#[ignore]`d, demoted because two `ubuntu-latest`
+  runs of healthy code reported 2.14x and 1.43x. What gates instead is counted,
+  not timed. Correcting this falsified four sibling sentences in
+  `docs/known-limitations.md` that said no Linux measurement existed, and those
+  are corrected in the same pass.
+
+Each is pinned in `crates/varve/tests/doc_claims.rs`, which now runs nine tests.
+Every one was measured failing on the unpatched tree — including, for the matrix
+claim, failing with only one of the two documents fixed.
+
 ### The editable header region is reachable from a writer
 
 `write_header_block` and its family lived only on `VarveFile`, and every handle

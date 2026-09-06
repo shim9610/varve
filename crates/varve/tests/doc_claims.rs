@@ -467,3 +467,178 @@ fn the_keyed_tail_charge_is_documented_against_its_own_limit_and_its_build() {
          succeed is refused.",
     );
 }
+
+/// The `VDIG` payload's flags word and its sequence field, as the code writes
+/// them.
+///
+/// Two claims in the specification's digest layout were retracted by the change
+/// that made the sequence field's presence a flag:
+///
+/// 1. The flags word was published as "currently `0`". Bit 0 is
+///    `DIGEST_FLAG_SEQUENCE`, and both writing paths always have a mark to
+///    report, so every digest varve writes sets it and the word is `1`. A
+///    parser that requires a zero flags word refuses every digest there is.
+/// 2. The sequence field was published with a reserved value meaning that no
+///    record carries a sequence. There is no reserved value: absence is the
+///    flag bit being clear, and the largest `u64` is a mark like any other, so
+///    a parser applying the retracted rule reads a file's last usable sequence
+///    as an absent one.
+///
+/// The file-observable half is measured by `crates/varve/tests/open_digest.rs`,
+/// which parses a real digest out of a real file the way this section tells a
+/// reader to; what is asserted here is that the prose says the same thing.
+#[test]
+fn the_retracted_digest_sequence_sentinel_is_not_published_anywhere() {
+    let files = normative_files();
+    let sentinel = format!("or `u64::MAX` for {}", "\"no record carries one\"");
+    assert_absent(
+        &files,
+        &sentinel,
+        "The digest's sequence field is meaningful only when flags bit 0 \
+         (`DIGEST_FLAG_SEQUENCE`, `0x0001`) is set, and is written as `0` when \
+         that bit is clear. No value is reserved: `u64::MAX` is a mark like any \
+         other, which `the_last_sequence_number_is_not_the_absence_of_one` in \
+         crates/varve-core/src/file.rs pins.",
+    );
+
+    // The flags half cannot be forbidden by its text: the `VSEG` bullet above
+    // publishes the same words truthfully, because a segment's flags word
+    // really is `0`. What is pinned instead is that the digest bullet states
+    // the flag and the absence of a reserved value.
+    for needle in [
+        "bit 0 (`0x0001`) says the sequence field carries a mark",
+        "**No value is reserved**",
+    ] {
+        assert_present(
+            &files,
+            "docs/spec.md",
+            needle,
+            "The `VDIG` flags word is `1` in every digest varve writes, and the \
+             sequence field it guards has no reserved encoding. Both must be \
+             published, or a parser written from this section refuses every \
+             digest and misreads the one number it does accept.",
+        );
+    }
+}
+
+/// No document may still say a matrix reader captures commit maps at open.
+///
+/// This is the exact failure mode this file exists for.
+/// `MatrixMetadataResidency` has two variants — `Missing` and `Lazy` — and
+/// `DEFAULT` is `Lazy`, so a commit-map page is as of the first read that
+/// faulted it in. When 0.5.0 removed the whole-live-set `EagerVerified` policy
+/// the claim was corrected in `README.md`, `docs/api-reference.md`,
+/// `docs/known-limitations.md` and `docs/durability-model.md`, and left
+/// standing in `docs/quickstart.md` and `docs/format-author-guide.md` — in the
+/// first stated as the *opposite* of the concurrency rule, in the document a
+/// new user reads first, for four minor releases.
+///
+/// Two documents, two wordings, which is why the needles below are a list and
+/// not one string: a sweep for the quickstart's sentence alone finds one of
+/// them and reports the file set clean.
+///
+/// The behaviour is asserted by `crates/varve/tests/matrix_lazy_residency.rs`,
+/// in `a_commit_map_page_is_as_of_its_first_touch_not_as_of_open`. What is
+/// asserted here is that the prose says so.
+#[test]
+fn no_document_says_a_matrix_reader_captures_commit_maps_at_open() {
+    let files = normative_files();
+    // Foldings of the two retracted sentences. `assert_absent` scans line by
+    // line, so a needle that spans the 80-column fold would never match; these
+    // are the folds each sentence admits.
+    let verb = "captured";
+    for variant in [
+        format!("commit maps are also {verb}"),
+        format!("commit maps are {verb}"),
+        format!("commit map is {verb}"),
+        format!("readers snapshot layout and commit {}", "maps"),
+        format!("snapshot layout and commit {}", "maps"),
+    ] {
+        assert_absent(
+            &files,
+            &variant,
+            "MatrixMetadataResidency::EagerVerified was removed in 0.5.0 and \
+             the unset default resolves to Lazy, so each commit-map page is as \
+             of the first read that faulted it in, not as of open. A matrix \
+             reader owns no whole-map instant; only the matrix layout is \
+             snapshotted at open.",
+        );
+    }
+
+    // These are the two documents that carried the retracted claim, and a
+    // deletion is not a correction: each has to state the rule it got wrong.
+    for document in ["docs/quickstart.md", "docs/format-author-guide.md"] {
+        assert_present(
+            &files,
+            document,
+            "first read that faulted it in",
+            "A concurrency paragraph that mentions matrix commit maps must \
+             state the first-touch rule for them. Deleting the sentence \
+             instead of correcting it leaves a reader with no statement of the \
+             one matrix rule that governs reader/writer overlap.",
+        );
+    }
+}
+
+/// The wall-clock scaling gate `matrix_concurrent_reads.rs` no longer has.
+///
+/// The ratio was demoted twice. `report_the_scaling_of_one_shared_handle`
+/// measures 1 thread against N through one handle and *prints* the result,
+/// labelled `MEASUREMENT ONLY`; the strict `ratio <= 1.0` form of it,
+/// `shared_handle_scaling_beats_one_thread_on_an_idle_host`, is `#[ignore]`d.
+/// It was demoted because it could not fail for the reason it was written: two
+/// consecutive `ubuntu-latest` runs of identical, healthy code reported 2.14x
+/// and 1.43x, and no threshold loose enough to survive that spread would still
+/// catch the 1.55x convoy it exists to find.
+///
+/// What replaced it is counted rather than timed — matrix reads issued while a
+/// commit-map page-store lock was held must be zero while reads issued at all
+/// must not be — and it is asserted by `varve-core`'s
+/// `matrix::page_store_lock_audit_tests` in every feature configuration and,
+/// through the public multi-threaded read path, by
+/// `no_read_is_issued_while_a_bitmap_page_store_lock_is_held` under
+/// `scalable-fault-injection`.
+///
+/// Publishing the ratio as an assertion is worse than publishing nothing: it
+/// offers a green run as evidence of throughput that no green run establishes.
+/// So the sweep forbids the retracted sentences, and the presence checks forbid
+/// the other half-fix — deleting them and leaving a reader unable to tell a
+/// gate from a printed number.
+#[test]
+fn the_retired_wall_clock_scaling_gate_is_not_published_as_a_contract() {
+    let files = normative_files();
+    let why = "`matrix_concurrent_reads.rs` prints its 1-vs-N ratio and disclaims it \
+               as a gate in the line it prints, and the strict `ratio <= 1.0` form \
+               of it is `#[ignore]`d. What it re-checks is the counted invariant: \
+               matrix reads issued while a commit-map page-store lock was held must \
+               be zero while reads issued at all must not be. Publish what is \
+               gated, what is only printed, and what is a manual benchmark - not a \
+               wall-clock assertion the suite no longer makes.";
+    for claim in [
+        format!("asserts the scaling in {}", "wall"),
+        format!("two {}-clock scaling contracts", "wall"),
+        format!("scaling contracts have never been executed on {}", "Unix"),
+        format!("No {} measurement has been published", "Linux"),
+        format!("No measurement has been taken {}", "here"),
+        format!("contract asserted in the tests is only `<= 1.0{}`", "x"),
+    ] {
+        assert_absent(&files, &claim, why);
+    }
+
+    for needle in [
+        "page_store_lock_audit_tests",
+        "MEASUREMENT ONLY",
+        "`#[ignore]`d manual benchmark",
+    ] {
+        assert_present(
+            &files,
+            "docs/api-reference.md",
+            needle,
+            "The matrix concurrency section must name all three: the counted gate \
+             that runs in every feature configuration, the ratio that is measured \
+             and printed and decides nothing, and the `#[ignore]`d benchmark that \
+             holds the strict threshold. A reader who cannot tell them apart reads \
+             a printed number as a passing contract.",
+        );
+    }
+}

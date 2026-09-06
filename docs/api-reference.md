@@ -1101,13 +1101,51 @@ against 256,559 on one (2.2x), matching what four separately-opened readers
 achieve. The handles are read-only (`FILE_GENERIC_READ`), never escape the
 module that owns them, and are closed when the file handle is dropped. On Unix
 `pread` does not serialise, so no extra descriptor is opened at all.
-`crates/varve/tests/matrix_concurrent_reads.rs` asserts the scaling in wall
-clock, not by counting readers.
 
-**Every number above is a Windows number, and the private-handle pool is
-`#[cfg(windows)]`.** The Unix path — a shared handle plus `pread` — is executed
-but not measured: the suite runs on Linux in CI, so the path is exercised, while
-the two wall-clock scaling contracts have no Unix numbers behind them. See
+**Those throughput figures are a recorded historical measurement, not a gate.**
+They were taken on this project's Windows development host, no test re-checks
+them, and nothing fails if they move. The rustdoc on `MatrixReadPool` records
+its own run of the same comparison — 327,037 reads/s on one thread against
+593,337 on four (1.81x) — and the two differ because wall-clock throughput on a
+shared desktop differs between runs.
+
+**What the suite gates is a counted invariant, not a wall-clock ratio.**
+`crates/varve/tests/matrix_concurrent_reads.rs` does not assert scaling in wall
+clock. It measures the 1-vs-N ratio and prints it on every run, decides nothing
+by it, and keeps the strict form of it `#[ignore]`d. Split by what a green run
+establishes:
+
+| Contract | Status | Where |
+| --- | --- | --- |
+| Matrix reads issued while a commit-map page-store lock was held is **zero**, and reads issued at all is nonzero. Single-threaded, decided by control flow rather than by the clock, so platform- and load-independent. A fifth test issues a read under the lock deliberately and requires the counter to reach 1, so the zeros are not vacuous; two more require the demand fault-in and the whole-map aggregate to read through the private-handle pool their backing already holds | gate, every run, **every feature configuration** (these counters are `cfg(test)`) | `varve-core`'s `matrix::page_store_lock_audit_tests`, five tests |
+| The same lock invariant through the public read path: N threads on one handle, a one-page demand cache against four live commit-map pages, preceded by a single-threaded warm-up that establishes that fault-in reads happened at all | gate, on runs with `scalable-fault-injection` (the public counters are behind it) | `no_read_is_issued_while_a_bitmap_page_store_lock_is_held` |
+| The five matrix read entry points compile against `&self` on `VarveReader`, `VarveFile` and `VarveWriter`, and all three are `Send + Sync` | gate, every run | `every_matrix_read_entry_point_takes_a_shared_borrow`, `the_reader_handle_is_sync_and_send` |
+| Four threads sharing one handle each read the right cell value, under `IntegrityPolicy::None` and, where the feature is on, `Crc32` | gate, every run | `threads_sharing_one_handle_read_every_cell_correctly` |
+| 1 thread against N threads through one handle, total reads held fixed at 24,000 | **measured, printed, not a gate** — the line it prints is labelled `MEASUREMENT ONLY` | `report_the_scaling_of_one_shared_handle` |
+| The same comparison asserted at `ratio <= 1.0` | **`#[ignore]`d manual benchmark**, run deliberately on an idle host: `cargo test -p varve --test matrix_concurrent_reads -- --ignored --nocapture` | `shared_handle_scaling_beats_one_thread_on_an_idle_host` |
+
+One wall-clock ratio is still asserted on every run, and it is in another file:
+`matrix_lazy_residency.rs`'s
+`concurrent_lazy_readers_are_not_serialised_behind_the_page_store` holds
+`ratio <= 1.0` for the lazy fault-in path.
+
+The eager ratio stopped being a gate because it could not fail for the reason it
+was written. It measures between 0.31x and 0.34x on the Windows development
+host, and the round that added the private per-thread handles recorded 1.55x
+with them disabled — but two consecutive `ubuntu-latest` runs of identical,
+healthy code reported 2.14x and 1.43x, and no threshold loose enough to survive
+that spread would still catch the 1.55x convoy it exists to find. The counted
+invariant replaced it because a read issued inside the critical section is a
+property of one thread's control flow: decidable with no second thread, no
+contention, and no quiet machine.
+
+**Every throughput number above is a Windows number, and the private-handle pool
+is `#[cfg(windows)]`.** The Unix path — a shared handle plus `pread` — is
+executed but not measured: CI runs the suite on `ubuntu-latest` as well as
+`windows-latest`, so the path runs there and the counted lock invariant is
+enforced there. The only Unix figures on record are the two ratios above, 2.14x
+and 1.43x; no Unix throughput has ever been published, and the `#[ignore]`d
+threshold has never been run on Unix. See
 [Known Limitations §6.1](known-limitations.md#61-the-unix-code-paths-and-what-the-first-linux-run-found).
 
 There is one lock in the read path, stated because its absence used to be the

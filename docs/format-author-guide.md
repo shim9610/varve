@@ -151,9 +151,10 @@ blocks may coexist after the preallocated matrix regions.
 Same-size overwrite is fail-safe within one writer: Varve clears the old commit
 and CRC-valid evidence before writing slot bytes, and a later explicit commit is
 the final visibility step. Partial matrix I/O poisons the writer and leaves the
-cell uncommitted. Matrix readers snapshot layout and commit maps, not immutable
-copies of every slot. Applications must not overlap a reader with in-place
-writes to slots it may read; use external read leases or a higher-level
+cell uncommitted. Matrix readers snapshot the layout, not commit maps and not
+immutable copies of every slot: since 0.5.0 each commit-map page is as of the
+first read that faulted it in. Applications must not overlap a reader with
+in-place writes to slots it may read; use external read leases or a higher-level
 generation/version scheme when concurrent immutable snapshots are required.
 
 Rules to keep stable:

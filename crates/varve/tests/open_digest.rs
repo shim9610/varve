@@ -752,3 +752,71 @@ fn a_reader_that_does_not_declare_the_digest_still_reads_the_file() -> varve::Re
     assert_eq!(lines.get(119)?, Some(Line { value: 119 }));
     Ok(())
 }
+
+/// The digest's flags word is `1`, and a parser told it is `0` refuses every
+/// digest there is.
+///
+/// Bit 0 says the sequence field carries a mark, and both writing paths always
+/// have one: `write_open_digest_record` maps `SequenceState` to `Some(next)` or
+/// `Some(u64::MAX)`, and `rebuilt_open_digest_payload` takes a `max` over an
+/// iterator chained with the record's own sequence, which is never empty. The
+/// word is therefore never `0` in a file varve wrote — and the value has no
+/// reserved encoding, `u64::MAX` being a mark like any other, which is exactly
+/// what makes the flag necessary.
+///
+/// This reads the bytes the way `docs/spec.md` tells a reader to, so a
+/// specification describing a record varve does not write fails here.
+#[test]
+fn a_real_digest_sets_the_sequence_flag_and_carries_its_own_sequence() -> varve::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("flags.varve");
+    let spec = digest_spec();
+    write_lines(spec, &path, 120, 40)?;
+
+    // The digest is the last record; a record is a 32-byte header, its payload,
+    // and a 32-byte footer; and the payload's last eight bytes are the record's
+    // own start offset. That is the whole of what the specification gives a
+    // reader arriving at EOF.
+    let bytes = std::fs::read(&path)?;
+    let trailer_at = bytes.len() - 32 - 8;
+    let record_offset = u64::from_le_bytes(
+        bytes[trailer_at..trailer_at + 8]
+            .try_into()
+            .expect("eight bytes"),
+    ) as usize;
+    let payload = &bytes[record_offset + 32..trailer_at + 8];
+    assert_eq!(&payload[..4], b"VDIG", "the last record is the digest");
+    assert_eq!(
+        u16::from_le_bytes(payload[4..6].try_into().expect("two bytes")),
+        1,
+        "digest payload version"
+    );
+
+    let flags = u16::from_le_bytes(payload[6..8].try_into().expect("two bytes"));
+    assert_eq!(
+        flags, 1,
+        "bit 0 (sequence present) is set in every digest varve writes, so a \
+         parser that requires a zero flags word refuses all of them"
+    );
+
+    // The mark counts the digest's own sequence, so it is the maximum a scan of
+    // the same file reports — not one below it.
+    let sequence = u64::from_le_bytes(payload[8..16].try_into().expect("eight bytes"));
+    let scanned = VarveFile::open_readonly(spec, &path)?;
+    let highest = scanned
+        .index_entries()
+        .iter()
+        .map(|entry| entry.sequence)
+        .max()
+        .expect("the file holds records");
+    assert_eq!(
+        sequence, highest,
+        "the mark counts the digest's own sequence"
+    );
+
+    // And the payload is the prefix, twelve bytes per tail, and the trailer, so
+    // the fields above were read from where the layout puts them.
+    let tails = u32::from_le_bytes(payload[16..20].try_into().expect("four bytes"));
+    assert_eq!(payload.len(), 20 + 12 * tails as usize + 8);
+    Ok(())
+}
