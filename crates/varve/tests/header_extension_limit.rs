@@ -142,6 +142,43 @@ varve_format! {
     }
 }
 
+// Shares magic, version and endian with `Declared`, and declares a region small
+// enough to validate -- but leaves the ceiling at the default. This is the
+// reader in the cross-reader case: it must get far enough into the header for
+// the ceiling to be what refuses it.
+varve_format! {
+    pub struct Peer {
+        magic: b"HEXTDECL";
+        version: 1;
+        limits {
+            file_len: 8_589_934_592;
+            records: 4_000_000;
+            index_bytes: 536_870_912;
+            scan_bytes: 8_589_934_592;
+            record_payload: 67_108_864;
+            logical_payload: 268_435_456;
+            materialized_bytes: 1_073_741_824;
+            segments: 4_000_000;
+            matrix_dimension: 16_000_000;
+            matrix_cells: 16_000_000;
+            matrix_bitmap: 64_000_000;
+            matrix_crc: 128_000_000;
+            matrix_metadata: 268_435_456;
+            matrix_slot_region: 8_589_934_592;
+            sidecar: 268_435_456;
+            mmap: 8_589_934_592;
+        }
+        endian: little;
+        schema_hash: computed;
+        header_slots {
+            capacity: 256;
+            integrity: rolling;
+            blocks: [Wide];
+        }
+        blocks: [Sample, Wide];
+    }
+}
+
 fn wide(label: &str) -> Wide {
     Wide {
         label: label.to_string(),
@@ -232,7 +269,25 @@ fn the_reader_enforces_the_declared_ceiling() {
 
     // A reader whose ceiling is the default refuses the very file the declaring
     // writer produced: the ceiling travels with the spec, not with the file.
-    if Undeclared::open_readonly(&path).is_ok() {
-        panic!("a reader with the default ceiling must not accept the larger region");
+    //
+    // `Peer`, not `Undeclared`, and the difference is the whole assertion.
+    // `Undeclared` has a different magic, so it is refused at the magic check
+    // before the header extension length is ever read -- which would have made
+    // this case pass while measuring nothing.
+    match Peer::open_readonly(&path) {
+        Err(Error::InvalidCompressionHeader) => {}
+        other => panic!(
+            "a reader with the default ceiling must be refused by the ceiling, got {other:?}"
+        ),
     }
+
+    // And the refusal really does come before the schema-hash comparison, which
+    // is what makes "no schema mismatch to explain it" literal: `Peer` declares
+    // a different `header_slots` capacity, so its schema hash differs too, and
+    // the error is still the ceiling's.
+    assert_ne!(
+        Peer::spec().computed_schema_hash(),
+        Declared::spec().computed_schema_hash(),
+        "the two specs really do disagree, so the ceiling refusal came first",
+    );
 }

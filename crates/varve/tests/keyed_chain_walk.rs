@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 
-use varve::{Error, VarveBlock, VarveFile, varve_format};
+use varve::{Error, VarveBlock, VarveFile, VarveMerge, varve_format};
 
 varve_format! {
     pub format Keyed {
@@ -46,7 +46,19 @@ varve_format! {
             fixed Noise(id = 20) {
                 value: u64,
             }
+            variable ReadingOp(id = 30) {
+                value: u64,
+            }
         }
+    }
+}
+
+impl VarveMerge for Reading {
+    type Op = ReadingOp;
+
+    fn apply_op(&mut self, op: Self::Op) -> varve::Result<()> {
+        self.value = op.value;
+        Ok(())
     }
 }
 
@@ -323,4 +335,65 @@ fn a_chain_that_does_not_decrease_is_refused() {
     };
     let steps = file.keyed_chain(oldest).expect("chain").count();
     assert_eq!(steps, 1, "the oldest generation ends the walk by itself");
+}
+
+#[test]
+fn an_op_record_is_not_on_the_chain() {
+    // The claim this file shipped with -- that the walk crosses `OP_BLOCK_ID`
+    // the way it crosses `TOMBSTONE_BLOCK_ID` -- was wrong, and wrong in the
+    // direction that loses data silently: a caller folding a key's history from
+    // the walk alone would drop every op-applied mutation with no error.
+    //
+    // `push_op` goes through `write_record`, which passes `None` for the keyed
+    // predecessor, and only `T::ID` and `TOMBSTONE_BLOCK_ID` move a keyed tail.
+    // So an op record is neither *on* the chain nor pointed *at* by it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("k.varve");
+    build(&path, 0);
+
+    let mut writer = Keyed::open_writer(&path).expect("reopen writer");
+    writer
+        .inner_mut()
+        .push_op::<Reading>(&SENSORS[0], &ReadingOp { value: 12_345 })
+        .expect("append an op");
+    drop(writer);
+
+    // `push_op` returns a sequence, not an `AppendInfo`, so find the record it
+    // wrote the way anything else would: it is the only one under OP_BLOCK_ID.
+    let file = Keyed::open_readonly(&path).expect("open");
+    let mut all = Vec::new();
+    file.index_entries_into(&mut all).expect("index");
+    let op_entries: Vec<_> = all
+        .iter()
+        .filter(|entry| entry.block_id == varve::OP_BLOCK_ID)
+        .collect();
+    assert_eq!(op_entries.len(), 1, "exactly one op record was written");
+    let op = op_entries[0];
+
+    assert_eq!(
+        op.prev_same_key_offset, None,
+        "an op record records no keyed predecessor",
+    );
+
+    let newest = newest_offset(&file, SENSORS[0]);
+    assert_ne!(
+        newest, op.record_offset,
+        "and it does not become the key's tail",
+    );
+
+    let mut walked = Vec::new();
+    for step in file.keyed_chain(newest).expect("chain") {
+        walked.push(step.expect("step"));
+    }
+    assert!(
+        walked
+            .iter()
+            .all(|entry| entry.record_offset != op.record_offset),
+        "the op record is not reachable from the walk",
+    );
+    assert_eq!(
+        walked.len() as u64,
+        HOPS,
+        "the walk still reaches every generation, and gains nothing from the op",
+    );
 }

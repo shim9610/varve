@@ -4273,6 +4273,40 @@ impl VarveReader {
         self.file.path()
     }
 
+    /// The open file this reader holds, borrowed rather than consumed.
+    pub fn file(&self) -> &VarveFile {
+        &self.file
+    }
+
+    /// Reads a block out of the editable header region.
+    /// See [`VarveFile::read_header_block`].
+    ///
+    /// `&self` and no I/O: the region is part of the header this handle already
+    /// read at open, which is what makes it usable as a seed for a walk.
+    pub fn read_header_block<T: VarveBlock>(&self) -> Result<Option<T>> {
+        self.file.read_header_block::<T>()
+    }
+
+    /// The declared size of the editable header region; `0` when undeclared.
+    pub fn header_slots_capacity(&self) -> usize {
+        self.file.header_slots_capacity()
+    }
+
+    /// How much of the region the current blocks occupy.
+    pub fn header_slots_used(&self) -> Result<usize> {
+        self.file.header_slots_used()
+    }
+
+    /// How much of the region is left.
+    pub fn header_slots_free_bytes(&self) -> Result<usize> {
+        self.file.header_slots_free_bytes()
+    }
+
+    /// Whether the region's seal is down.
+    pub fn header_slots_sealed(&self) -> Result<bool> {
+        self.file.header_slots_sealed()
+    }
+
     pub fn mode(&self) -> OpenMode {
         self.file.mode()
     }
@@ -4713,6 +4747,73 @@ impl VarveWriter {
     /// Verifies every record's stored checksum. See [`VarveFile::verify_all`].
     pub fn verify_all(&self) -> Result<usize> {
         self.file.verify_all()
+    }
+
+    /// The open file this writer holds, borrowed rather than consumed.
+    ///
+    /// `into_inner` is the only other route to it and it takes `self`, which
+    /// makes every `&mut self` entry point on [`VarveFile`] unreachable from a
+    /// writer that is still being written through. Reaching one is what a
+    /// caller wants when the capability has no forwarding method here yet;
+    /// the header-slot family below is forwarded precisely so that this is not
+    /// needed for it.
+    pub fn file_mut(&mut self) -> &mut VarveFile {
+        &mut self.file
+    }
+
+    /// The open file this writer holds, borrowed for reading.
+    pub fn file(&self) -> &VarveFile {
+        &self.file
+    }
+
+    /// Reads a block out of the editable header region.
+    /// See [`VarveFile::read_header_block`].
+    ///
+    /// Forwarded because the writer is the handle that knows what to record
+    /// there: an append returns its own `record_offset`, and writing that
+    /// offset into the region is what lets a later reader seed a walk without
+    /// rebuilding an index. Reaching `write_header_block` used to mean
+    /// `into_inner`, which ends the writer.
+    pub fn read_header_block<T: VarveBlock>(&self) -> Result<Option<T>> {
+        self.file.read_header_block::<T>()
+    }
+
+    /// Writes a block into the editable header region, replacing any earlier
+    /// value for the same block id. See [`VarveFile::write_header_block`].
+    pub fn write_header_block<T: VarveBlock>(&mut self, block: &T) -> Result<()> {
+        self.file.write_header_block(block)
+    }
+
+    /// Removes a block from the editable header region, freeing its bytes.
+    /// See [`VarveFile::remove_header_block`].
+    pub fn remove_header_block<T: VarveBlock>(&mut self) -> Result<()> {
+        self.file.remove_header_block::<T>()
+    }
+
+    /// Fixes the region's checksum and refuses every later write.
+    /// See [`VarveFile::seal_header_slots`].
+    pub fn seal_header_slots(&mut self) -> Result<()> {
+        self.file.seal_header_slots()
+    }
+
+    /// The declared size of the editable header region; `0` when undeclared.
+    pub fn header_slots_capacity(&self) -> usize {
+        self.file.header_slots_capacity()
+    }
+
+    /// How much of the region the current blocks occupy.
+    pub fn header_slots_used(&self) -> Result<usize> {
+        self.file.header_slots_used()
+    }
+
+    /// How much of the region is left.
+    pub fn header_slots_free_bytes(&self) -> Result<usize> {
+        self.file.header_slots_free_bytes()
+    }
+
+    /// Whether the region's seal is down.
+    pub fn header_slots_sealed(&self) -> Result<bool> {
+        self.file.header_slots_sealed()
     }
 
     pub fn index_entries(&self) -> IndexEntries {
@@ -8099,11 +8200,19 @@ impl VarveFile {
     ///
     /// **It crosses block ids, and that is deliberate** -- the one way it
     /// differs from [`Self::block_chain`], which refuses a step that leaves its
-    /// block. A delete writes its tombstone under [`TOMBSTONE_BLOCK_ID`] and a
-    /// replacement writes under [`OP_BLOCK_ID`], and both carry a live
-    /// predecessor, so a walk that refused them would stop at the first deleted
-    /// generation and look like an answer. Filter on `entry.block_id` yourself;
-    /// the walk will not filter for you.
+    /// block. A delete writes its tombstone under [`TOMBSTONE_BLOCK_ID`], and
+    /// that tombstone carries a live predecessor and becomes the key's tail, so
+    /// a walk that refused it would stop at the first deleted generation and
+    /// look like an answer. Filter on `entry.block_id` yourself; the walk will
+    /// not filter for you.
+    ///
+    /// **Merge ops are not on this chain.** [`Self::push_op`] appends under
+    /// [`OP_BLOCK_ID`] with `prev_same_key_offset` set to `None` and does not
+    /// move the key's tail, so this walk never surfaces one. A history
+    /// reconstructed from it alone omits every op-applied mutation; a caller
+    /// using [`VarveMerge`] has to fold the ops in by another route.
+    /// Measured by `an_op_record_is_not_on_the_chain` in
+    /// `crates/varve/tests/keyed_chain_walk.rs`.
     ///
     /// Lazy and `&self`, exactly like `block_chain`: one offset is held, so a
     /// key with more generations than memory is still walkable. Each step is
@@ -14169,8 +14278,10 @@ impl BlockChain<'_> {
 ///
 /// It differs from `BlockChain` in one way, and that is the reason it is a
 /// separate type rather than a parameter: the keyed chain legitimately runs
-/// through [`TOMBSTONE_BLOCK_ID`] and [`OP_BLOCK_ID`], so there is no
-/// "left its block" refusal to make. The caller filters on `block_id`.
+/// through [`TOMBSTONE_BLOCK_ID`], so there is no "left its block" refusal to
+/// make. The caller filters on `block_id`. Records under [`OP_BLOCK_ID`] are
+/// *not* on the chain -- `push_op` writes no keyed predecessor and moves no
+/// tail.
 #[derive(Debug)]
 pub struct KeyedChain<'a> {
     spec: FormatSpec,

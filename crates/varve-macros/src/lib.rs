@@ -5503,6 +5503,68 @@ fn typed_api_tokens(
                 self.inner.sync()
             }
 
+            /// The `VarveWriter` this wrapper holds, borrowed rather than
+            /// consumed. `into_inner` takes `self` and ends the wrapper, which
+            /// makes every `&mut self` entry point below it unreachable from a
+            /// writer still being written through.
+            pub fn inner_mut(&mut self) -> &mut ::varve::__core::VarveWriter {
+                &mut self.inner
+            }
+
+            /// The `VarveWriter` this wrapper holds, borrowed for reading.
+            pub fn inner(&self) -> &::varve::__core::VarveWriter {
+                &self.inner
+            }
+
+            /// Reads a block out of the editable header region.
+            pub fn read_header_block<T: ::varve::__core::VarveBlock>(
+                &self,
+            ) -> ::varve::__core::Result<::core::option::Option<T>> {
+                self.inner.read_header_block::<T>()
+            }
+
+            /// Writes a block into the editable header region, replacing any
+            /// earlier value for the same block id.
+            pub fn write_header_block<T: ::varve::__core::VarveBlock>(
+                &mut self,
+                block: &T,
+            ) -> ::varve::__core::Result<()> {
+                self.inner.write_header_block(block)
+            }
+
+            /// Removes a block from the editable header region.
+            pub fn remove_header_block<T: ::varve::__core::VarveBlock>(
+                &mut self,
+            ) -> ::varve::__core::Result<()> {
+                self.inner.remove_header_block::<T>()
+            }
+
+            /// Fixes the region's checksum and refuses every later write.
+            pub fn seal_header_slots(&mut self) -> ::varve::__core::Result<()> {
+                self.inner.seal_header_slots()
+            }
+
+            /// The declared size of the editable header region; `0` when
+            /// undeclared.
+            pub fn header_slots_capacity(&self) -> usize {
+                self.inner.header_slots_capacity()
+            }
+
+            /// How much of the region the current blocks occupy.
+            pub fn header_slots_used(&self) -> ::varve::__core::Result<usize> {
+                self.inner.header_slots_used()
+            }
+
+            /// How much of the region is left.
+            pub fn header_slots_free_bytes(&self) -> ::varve::__core::Result<usize> {
+                self.inner.header_slots_free_bytes()
+            }
+
+            /// Whether the region's seal is down.
+            pub fn header_slots_sealed(&self) -> ::varve::__core::Result<bool> {
+                self.inner.header_slots_sealed()
+            }
+
             #(#writer_inherent_methods)*
             #matrix_writer_inherent_methods
             #matrix_writer_aux_inherent_methods
