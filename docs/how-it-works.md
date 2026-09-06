@@ -157,7 +157,7 @@ two facts about a record that are not in the record. Everything else an index
 entry carries is rebuilt from the record's own header and footer when a read
 asks.
 
-By default open builds that directory by framing every record in the file. Two
+By default open builds that directory by framing every record in the file. Three
 opt-in policies change it, and they change different things:
 
 ```mermaid
@@ -166,9 +166,11 @@ flowchart TD
     B -->|default| C["frame every record"]
     B -->|segment_on_flush| D["walk the segment chain<br/>one record per commit point"]
     B -->|open_digest_on_flush<br/>+ open_readonly_lazy| E["read the digest<br/>one record, no directory"]
+    B -->|header_tails<br/>+ open_readonly_lazy| H["read the header table<br/>a handful of records, no directory"]
     C --> F["16 B per record resident"]
     D --> F
     E --> G["nothing resident;<br/>record_map builds what you ask for"]
+    H --> G
 ```
 
 - A **segment** record carries the index entries for the records one commit
@@ -182,10 +184,20 @@ flowchart TD
   record, and builds **no directory at all** — the caller builds whatever part of
   the index its question needs with `record_map`. It costs twelve bytes per
   distinct block id on disk, whatever the record count.
+- A **header tail table** (`index: header_tails`) holds the same three facts in
+  a fixed region of the *file header*, rewritten in place at the end of every
+  commit point. It is not a record, so nothing appended can move it or bury it —
+  the one limit the digest has that is not a cost. An open that takes it frames
+  the commit marker the table names, whatever closes the same commit point, and
+  one record per block tail, and builds no directory either. It costs a fixed
+  region in every file — 360 bytes for a two-block format — whatever the record
+  count, and it is refused alongside `open_digest_on_flush`: declare one.
 
-Both are found by probing the end of the file, so both are appended last at a
-commit point and both need the writing session to end with `flush` or `commit`.
-Both fall back to the full scan for a file they cannot account for, and produce
+The segment chain and the digest are both found by probing the end of the file,
+so both are appended last at a commit point; the header table sits at a fixed
+offset instead. All three need the writing session to end with `flush` or
+`commit`, because each corroborates itself against the end of the file, and all
+three fall back to the full scan for a file they cannot account for and produce
 the identical answer when they do.
 
 A **checkpoint** record (`checkpoint_on_flush`) is a third internal record and is
@@ -269,8 +281,16 @@ This is deliberate: applications choose their own durability/performance trade.
 
 ## Matrix Storage
 
-Matrix blocks are separate from append-log records. They are for bounded grids
-whose dimensions are known when the file is created.
+Matrix blocks are separate from append-log records, and they are for grids whose
+dimensions are fixed at create — with one exception. A format may declare one
+growing dimension with `with_growing_matrix_dimension(name, rows_per_chunk)`.
+The dimension's value at create must then equal `rows_per_chunk` — refused
+otherwise with `MatrixSizeMismatch` — so the matrix region *is* chunk 0 and
+every later chunk is an append-log internal record carrying the region's
+byte-for-byte layout. One chunk is buffered at a time, which is what bounds
+memory; addressing a row in an already-written chunk writes the open one out and
+reads that one back, and the rewrite lands where the record already sits, so the
+file does not grow. Off by default and byte-identical when not declared.
 
 ```mermaid
 flowchart TD

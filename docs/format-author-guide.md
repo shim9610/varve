@@ -407,9 +407,10 @@ blocks can hold nothing, and a capacity picked by the macro would be a size you
 discover from a failure rather than choose.
 
 `capacity` is the whole region's entry area in bytes. Each block costs its
-canonical encoded length plus eight bytes of entry framing, and a rewrite of a
-block already there reclaims its bytes first — so the budget is against the set
-of blocks held at once, not against how many times you write them.
+canonical encoded length plus twelve bytes of entry framing (`block_id u32 |
+block_version u16 | reserved u16 | len u32`), and a rewrite of a block already
+there reclaims its bytes first — so the budget is against the set of blocks held
+at once, not against how many times you write them.
 
 Then:
 
@@ -753,11 +754,14 @@ dropping those would drop the records that say where the commit boundary is.
 
 ### `recovery: mark_tail`
 
-varve's default answer to a crash is `recovery: truncate_tail`: at the next
-read-write open, every record past the last commit marker is deleted. It is
-correct and cheap, and it is also the only operation in varve that destroys data
-you might have wanted — those records framed, they are structurally complete,
-and the writer simply never got to say so.
+varve's default answer to a crash is `recovery: strict`: at the next read-write
+open, every record past the last commit marker is deleted. (`recovery:
+truncate_tail` deletes the same tail; they differ in what `open_recover` does
+with a half-written record — it truncates one, where `strict` returns
+`Error::CorruptTail`.) It is correct and cheap, and it is also the only
+operation in varve that destroys data you might have wanted — those records
+framed, they are structurally complete, and the writer simply never got to say
+so.
 
 ```rust
         liveness: footer_flags;

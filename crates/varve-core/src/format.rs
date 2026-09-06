@@ -1817,10 +1817,15 @@ pub struct BlockResidencyDescriptor {
 /// equal `rows_per_chunk`, so the matrix region *is* the first chunk and every
 /// later chunk has its byte-for-byte layout. Nothing about the region changes.
 ///
-/// Only the newest chunk accepts writes. A write addressing a written chunk is
-/// refused rather than dropped, and a cell that never received a value keeps
-/// its clear commit bit and reads as `MatrixNotCommitted` — writing the chunk asks no
-/// question about completeness.
+/// One chunk is buffered at a time, which is what bounds memory, but *which*
+/// chunk is not fixed: a write addressing an already-written chunk writes the
+/// open one out and loads that chunk back, and the rewrite lands where the
+/// record already sits. The two format options that make that rewrite
+/// impossible — `chunk_compression` and `segment_on_flush`, both off by
+/// default — refuse by name through [`Error::MatrixChunkNotReopenable`]
+/// instead. A cell that never received a value keeps its clear commit bit and
+/// reads as `MatrixNotCommitted` — writing the chunk asks no question about
+/// completeness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GrowingMatrixDimension {
     /// The dimension that grows. Must be `dimensions[0]` of every matrix block.

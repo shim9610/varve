@@ -1,6 +1,6 @@
 # Known Limitations
 
-Status as of 0.5.0. Numbers measured 2026-07-22, re-measured 2026-07-25, and
+Status as of 0.9.2. Numbers measured 2026-07-22, re-measured 2026-07-25, and
 re-measured again on 2026-07-26 against the residency/verification split described
 below; every entry was checked against the code in this repository. Where an earlier
 document and the code disagreed, the code won and the document was corrected.
@@ -488,12 +488,12 @@ policy has no "tighter" direction to meet. What changed in 0.5.0 is that a
 *silence* no longer outranks anything, in either function, for either policy.
 
 **What remains a limitation.** There is **no `varve_format!` DSL key** for either
-policy. `limits { }` accepts `key_index`, `disk_index_plan` and `keyed_tail`, but
-not these two, and no key was added: the grammar is `key: <integer literal>;` over
-a fixed key list, which cannot express a variant, with or without a payload. Both
-are reachable two ways — from a spec, through `FormatSpec::with_read_limits` /
-`with_resource_defaults`, or at a call site by passing them in the same
-`ReadLimits` value you hand to the entry point:
+policy. `limits { }` accepts eighteen integer keys, `file_len` through
+`header_extension`, but not these two, and no key was added: the grammar is
+`key: <integer literal>;` over a fixed key list, which cannot express a variant,
+with or without a payload. Both are reachable two ways — from a spec, through
+`FormatSpec::with_read_limits` / `with_resource_defaults`, or at a call site by
+passing them in the same `ReadLimits` value you hand to the entry point:
 
 ```rust
 let limits = ReadLimits::STANDARD
@@ -553,17 +553,39 @@ in full — `O(1)` where `punch_zero_range_native` succeeds, `Theta(declared cel
 / 8)` bytes written everywhere else — because this file is the one organised by
 what a user hits.
 
-### 1.8 Matrix dimensions are fixed at create time, with no grow path
+### 1.8 Matrix dimensions are fixed at create, unless one is declared growing
+
+> **This section used to say the opposite.** It said there was no grow path and
+> that none was planned. One dimension may be declared growing as of 0.6.0, and
+> rows past its declared extent land in chunk records in the append log — see
+> [API Changes §C.2](api-changes.md#c2-a-written-matrix-chunk-can-now-be-edited-and-errormatrixchunknotreopenable-is-new)
+> for what a written chunk costs. Everything below about over-provisioning a
+> *fixed* dimension still holds, and it is still the cheaper answer wherever you
+> can name a ceiling.
 
 **What it is.** A matrix's dimensions are supplied to
 `create_with_dims` / `create_new_with_dims` and are part of the created layout.
 There is no `grow`, `resize`, or `extend` operation anywhere in the public API.
-A matrix that runs out of rows cannot be enlarged; it must be recreated and its
-contents copied.
+A fixed dimension that runs out of rows cannot be enlarged; the file must be
+recreated and its contents copied.
+
+**The one exception is declared at create.**
+`FormatSpec::with_growing_matrix_dimension(name, rows_per_chunk)` makes
+rows past the declared extent land in *chunks*: ordinary internal records in the
+append log, each covering `rows_per_chunk` rows of every matrix block. `name`
+must be dimension 0 of every matrix block, and its declared value at create must
+equal `rows_per_chunk` — the matrix region *is* chunk 0 — refused with
+`Error::MatrixSizeMismatch` otherwise. One chunk is buffered at a time, which is
+what bounds memory; a write addressing an already-written chunk writes the open
+one out and reads that one back, and the rewrite lands where the record already
+sits, so the file does not grow. The declaration is folded into the schema hash
+only when it is made, so a format that declares none is byte-identical to one
+written before the option existed.
 
 **Who it affects.** Anyone modelling an open-ended stream — a growing acquisition,
 an append-only log of scans, anything whose extent is not known when the file is
-created. **A matrix cannot represent an indefinitely growing stream.**
+created — who wants it in a matrix with no growing dimension declared. **A fixed
+dimension cannot model an unbounded stream; a declared growing one can.**
 
 **Workaround.** Use the append-log APIs for unbounded growth:
 
@@ -608,12 +630,15 @@ Three things still bound it, and only the second is likely to stop you:
 
 **What over-provisioning still cannot do** is represent a stream with no ceiling
 at all. Some number has to be named. If there genuinely is not one, that is the
-append log's job, not the matrix's.
+job of a declared growing dimension — or of the append log itself — not of a
+matrix dimension that stays fixed.
 
-**Planned.** No grow path is planned. A matrix cell's address is arithmetic —
-`slot_region_off + ordinal * stride` — with no indirection to update, and that is
-what makes it random-access; a growable dimension would need exactly the
-indirection layer the append log and its index already are.
+**Planned.** No second grow path is planned. A matrix cell's address within its
+chunk is arithmetic — `slot_region_off + ordinal * stride` — with no indirection
+to update, and that is what makes it random-access; the growing dimension buys
+growth by adding exactly one indirection layer *outside* that arithmetic — a
+chunk directory, built on the first chunked read — which is why it is declared
+rather than always on.
 
 ---
 
@@ -781,7 +806,7 @@ because the previous version of this document offered a mitigation that does not
 exist:
 
 - `IndexPolicy::CheckpointOnFlush` does **not** seed an open from a checkpoint.
-  Every open path calls `load_index`, which calls `scan_records_from` for any
+  Every open path calls `load_index`, which calls `scan_records_range` for any
   format without the segment chain, and that walks from `header_len` to the end
   of the file unconditionally. A checkpoint met during that walk is *validated*
   (`inspect_index_checkpoint`) and its decoded entries are discarded. There is no public checkpoint-seeded open. What the policy actually
@@ -970,7 +995,7 @@ deliberate and both silent:
   file length back to the end of the last commit marker. Records appended after
   the last `flush()`/`commit()` in a previous session are **deleted from the file
   on the next write open**, not merely hidden.
-- **A file with no marker at all reads as empty.** `scan_records_from` returns an
+- **A file with no marker at all reads as empty.** `scan_records_range` returns an
   empty index when it finds no marker, whatever the file contains. A process that
   appended 10,000 records and exited without flushing reopens to zero records, and
   a write open then truncates them away.
@@ -1010,10 +1035,11 @@ serve.
 **Workaround.** None. Enable the feature and accept that the surface may change
 before it loses the `dev` suffix.
 
-**Planned.** Stabilisation is intended but not scheduled. Also note that the
-round-1/2 module set — `disk_index.rs`, `stream.rs`, `indexed.rs`,
-`scan_control.rs` — has **not** been walked against the project's five internal
-invariants (open item 7). The matrix and resident paths have been; these have not.
+**Planned.** Stabilisation is intended but not scheduled. The round-1/2 module
+set — `disk_index.rs`, `stream.rs`, `indexed.rs`, `scan_control.rs` — **has**
+been walked against the project's five internal invariants, as the matrix and
+resident paths were, and the walk found no defect. That is a statement about
+review, not about use, and it does not move the `dev` flag.
 
 Operational notes for users who enable it anyway:
 
@@ -1366,10 +1392,11 @@ on tests at far smaller scales, not on a demonstration at one petabyte.
 - The one-million-key RSS/allocator stress probe
   (`crates/varve/tests/high_cardinality.rs`) is `#[ignore]`d.
 
-### 6.4 No fuzz, Miri or ASan run covers this release
+### 6.4 The fuzz, Miri and ASan runs are a weekly smoke, not a campaign
 
-- CI runs **no fuzzing**. The supply-chain job does `cargo audit`, `cargo deny`,
-  `cargo metadata`/`check` and a lockfile drift check.
+- `ci.yml`'s `fuzz-supply-chain` job is not fuzzing despite its name: it does
+  `cargo audit`, `cargo deny`, `cargo metadata`/`check` and a lockfile drift
+  check. The fuzzing is in `sanitizers.yml`, below.
 - The most recent recorded fuzz evidence for this project is dated
   2026-07-11 (four core targets) and 2026-07-18 (three sidecar targets). Both
   predate several rounds of change to `matrix.rs`, `file.rs`, `codec.rs` and
@@ -1562,11 +1589,11 @@ optional feature alone, all-features — so a defect requiring a specific *pair*
 
 ---
 
-## 6.9 The editable header region: what its fixed size actually forbids
+## 6.10 The editable header region: what its fixed size actually forbids
 
 `header_slots` reserves a run of bytes in the file header that a caller can
 rewrite for the life of the file. Its size is fixed and folded into the schema
-hash, and three consequences follow that are limitations rather than details:
+hash, and five consequences follow that are limitations rather than details:
 
 - **The capacity cannot be changed for an existing file.** Reopening under a
   different capacity is a `SchemaHashMismatch`. There is no grow path and no
@@ -1690,19 +1717,20 @@ source rather than hidden. **A downstream crate cannot express any of them**, so
 they are not user-facing limitations and are listed separately for that reason.
 
 Three enforcement bypasses still compile *inside* `varve-core`. The catalogues are
-at `crates/varve-core/src/matrix.rs:9022-9207`
-("What still compiles from inside this file"),
-`crates/varve-core/src/file.rs:12349-12447`, and
-`crates/varve-core/src/writer_permit.rs:301`.
+the doc comments on `mod bypass_catalogue` in `crates/varve-core/src/matrix.rs`
+("What still compiles from inside this file") and in
+`crates/varve-core/src/file.rs`, and the one on
+`a_static_decoy_flag_cannot_be_declared` in
+`crates/varve-core/src/writer_permit.rs`.
 
 1. **`SparseBitmap` and its prepared values are declared at file scope**
-   (`matrix.rs:1895`). `BitmapByteUpdate`, `CommitBitUpdate`, `PreparedByteWrite`
+   in `matrix.rs`. `BitmapByteUpdate`, `CommitBitUpdate`, `PreparedByteWrite`
    and `PreparedWriteBit` are constructible by literal from anywhere in
    `matrix.rs`; a fabricated `PreparedByteWrite { fresh: None, .. }` reaches
    `commit_byte_write` for a non-resident page. Open item 26. The fix is a
    `mod sparse_bitmap`, which is a large refactor of the hot bitmap path.
 2. **Commit maps are not behind an evidence type.** `MatrixCommitLayout::bits`
-   (`matrix.rs:3488`) is a plain `SparseBitmap` field of a file-scope struct, so
+   is a plain `SparseBitmap` field of a file-scope struct, so
    `layout.commits[i].bits = attacker_bits;` compiles from anywhere in
    `matrix.rs` and publishes a commit view nothing committed. Open items 25 and
    28. This is the one with teeth: it is the same class as F-04 — a fact a reader
@@ -1716,7 +1744,7 @@ at `crates/varve-core/src/matrix.rs:9022-9207`
 
 **Why these are unreachable from outside the crate**, verified: `SparseBitmap` and
 `MatrixCommitLayout` are private (`struct`, no `pub`). `MatrixLayout` is
-`pub struct` at `matrix.rs:3440` but is **not** in `lib.rs`'s
+declared `pub struct` in `matrix.rs` but is **not** in `lib.rs`'s
 `pub use matrix::{...}` list, so it has no external path. `PoisonFlag` is `pub`
 inside the private `mod writer_permit` and escapes only via the `#[doc(hidden)]`,
 `scalable-fault-injection`-gated `enforcement_probe` — whose own rustdoc says

@@ -8,7 +8,7 @@ The resident `create_writer`, `open_reader`, `blocks`, and `keyed_blocks`
 APIs remain useful for bounded files. By default they scan the file and retain a
 16-byte directory slot per record at open, and are not the petabyte-scale path.
 
-Two opt-in policies narrow that gap without closing it. `segment_on_flush` makes
+Opt-in policies narrow that gap without closing it. `segment_on_flush` makes
 open frame one record per commit point instead of one per record;
 `open_digest_on_flush` plus `VarveFile::open_readonly_lazy` makes open frame one
 record and retain **nothing**, leaving the caller to build only the part of the
@@ -123,9 +123,12 @@ let verified = reader.verify_all()?; // explicit eager full validation
 ```
 
 `get_frame` performs one B-tree lookup and one bounded positional native
-record read. Opening the reader does not read the native record region.
-Calling `runs`, `frames`, `events`, or `verify_all` explicitly creates a native
-scanner; their cost is linear in the selected snapshot.
+record read. Opening the reader does not *scan* the native record region, but it
+does read a bounded prefix of it: the primary-generation witness digests the
+leading window of the file — at most 4 KiB from offset 0 — and takes one point
+read of the leading record for the creation nonce. No scanner is created at
+open. Calling `runs`, `frames`, `events`, or `verify_all` explicitly creates a
+native scanner; their cost is linear in the selected snapshot.
 
 ## Stream Write And Read
 
@@ -298,11 +301,12 @@ is fail-closed: a primary that *was* created with one recorded a witness that
 folds it in, so answering "none" can only produce a different witness and refuse
 the sidecar.
 
-Sidecar metadata is at record version 3. A version 2 sidecar is refused with the
-typed `DiskIndexError::MetadataVersion`, and the disk-index plan digest domain
-was bumped alongside it, so plan digests published before this change are
-refused as stale. Both are rebuild-and-regenerate conditions under the pre-1.0
-wire policy; neither is migrated in place.
+Sidecar metadata is at record version 3. A version 2 sidecar is 260 bytes where
+the v3 record is 300, so it is refused with the typed
+`DiskIndexError::MetadataLength` before the version field is read, and the
+disk-index plan digest domain was bumped alongside it, so plan digests published
+before this change are refused as stale. Both are rebuild-and-regenerate
+conditions under the pre-1.0 wire policy; neither is migrated in place.
 
 ### Disk-Index Descriptor Identity
 

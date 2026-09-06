@@ -152,11 +152,11 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Read-only open never truncates. Recovery truncation is explicit through `open_recover` or `open_recover_with_report`.
 - Read-write open for `CommitPolicy::TransactionMarker` truncates uncommitted tail after the latest valid marker so appends cannot accidentally commit stale tail data.
 - `IntegrityPolicy::Crc32` and `IntegrityPolicy::Crc32WithHeader` are feature-gated behind `integrity` and reject corrupted covered bytes.
-- `IndexPolicy` is a bitset-style policy with `scan_on_open`, `checkpoint_on_flush`, `block_offset_chain`, `keyed_offset_chain`, and `segment_on_flush`. Offset-chain policies are written automatically in `VARVE3` footers.
+- `IndexPolicy` is a bitset-style policy with `scan_on_open`, `checkpoint_on_flush`, `block_offset_chain`, `keyed_offset_chain`, `segment_on_flush`, `open_digest_on_flush`, and `header_tails`. Offset-chain policies are written automatically in `VARVE3` footers.
 - `CommitPolicy::RecordFooter` treats valid record footers as the commit flag for each record.
 - `CommitPolicy::TransactionMarker(on_flush|explicit)` appends internal `COMMIT_BLOCK_ID` marker records. Readers expose the latest marker-covered snapshot; writer open truncates uncommitted tail after the latest marker.
 - `IndexPolicy::segment_on_flush` makes every commit point append an internal segment record covering exactly the records that commit point added. See [Internal Segments](#internal-segments).
-- `IndexPolicy::CheckpointOnFlush` writes an internal checkpoint record, spaced geometrically so cumulative checkpoint bytes stay bounded. **Checkpoint-seeded open is specified but not implemented**: as of 0.5.0 every open scans the full record region (`load_index` -> `scan_records_from`), validates any checkpoint it meets, and discards the checkpoint's decoded entries. See the design target below and `docs/known-limitations.md` §2.1.
+- `IndexPolicy::CheckpointOnFlush` writes an internal checkpoint record, spaced geometrically so cumulative checkpoint bytes stay bounded. **Checkpoint-seeded open is specified but not implemented**: as of 0.5.0 every open scans the full record region (`load_index` -> `scan_records_range`), validates any checkpoint it meets, and discards the checkpoint's decoded entries. See the design target below and `docs/known-limitations.md` §2.1.
 - `CompressionPolicy::VariableBlocks` and block-specific compression descriptors are feature-gated by the selected backend. The first backend is optional `compression-zstd`; compressed records are rejected when the backend is not enabled.
 
 ## Update And Merge
@@ -769,7 +769,9 @@ CRC integrity is a corruption-detection aid, not an authenticity or tamper-proof
 - Compact is single keyed block type per call. Non-keyed blocks and unrelated block ids are not copied in this first API.
 - Scale contract: `merge_keyed_files`, `compact_keyed_file`, and
   `compact_keyed_files` are resident operations and are explicitly not PB-scale.
-  Time is `Theta(records + decoded bytes) + O(K-live log K-live)`; memory is
+  Time is `Theta(records + decoded bytes) + O(N log N) + O(K-live log K-live)`,
+  where the `O(N log N)` term is the per-input open's sequence-uniqueness sort
+  over that input's `N` records; memory is
   `O(K-ever + largest resident input index + retained live values)`, where
   `K-ever` counts every distinct key ever seen including tombstoned keys.
   Nothing spills to disk and no bounded-memory external merge/compact is
@@ -791,7 +793,13 @@ CRC integrity is a corruption-detection aid, not an authenticity or tamper-proof
 - `BreakIfOlderThan` is timestamp based; `BreakIfProcessAbsent` is best-effort and conservative when process liveness cannot be determined.
 - Malformed locks are never automatically broken in 0.2.
 - Atomic rewrite/compact output uses same-directory temp files, flushes and syncs temp contents, then replaces or renames into place.
-- Reader behavior remains snapshot-on-open; readers do not tail live writers.
+- Reader behavior is snapshot-on-open by default: a handle fixes its snapshot
+  length at open and reads positionally against it. Since 0.8.0
+  `VarveFile::follow`/`VarveReader::follow` is an explicit `&mut self` advance
+  that frames only the bytes past the end the handle holds and adopts them to
+  the same commit boundary an open would stop at. It never crosses a generation
+  — a republished pathname answers `0` forever, and the pair for that is
+  `is_current()` then `reopen_readonly()` — and a read-write handle answers `0`.
 
 ### Unknown Fields
 

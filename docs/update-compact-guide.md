@@ -109,7 +109,10 @@ inputs as whole `VarveFile` values and hold one map entry per distinct key ever
 seen - including keys whose latest record is a tombstone - plus the live values
 that reach the output:
 
-- time: `Theta(records + decoded bytes) + O(K-live log K-live)`
+- time: `Theta(records + decoded bytes) + O(N log N) + O(K-live log K-live)`,
+  where the `O(N log N)` term is the per-input open's sequence-uniqueness sort
+  over that input's `N` records; it degrades to `Theta(N)` for a file a Varve
+  writer produced
 - memory: `O(K-ever + largest resident input index + retained live values)`
 
 Nothing spills to disk, so `K-ever` must fit in memory. Varve exports no
@@ -128,8 +131,10 @@ let estimate = estimate_keyed_merge::<User, _>(
     &["delta-1.varve"],
 )?;
 // estimate.max_distinct_keys is an upper bound on K-ever;
-// estimate.max_state_bytes is the structural size of the state that key count
-// implies; it is not a bound on the map.
+// estimate.peak_resident_structural_bytes() sums the four terms resident at the
+// peak: the merge state, the reserved output vector, the largest input's
+// resident index, and the transient that input's open holds beside it. Every
+// byte field is a structural estimate, not a bound on the map.
 ```
 
 `estimate_keyed_merge` decodes no values, but it does open each input as a
@@ -223,7 +228,7 @@ declaration is what chooses:
 
 | the format declares | `replace` calls | why |
 | --- | --- | --- |
-| a record footer (`block_offset_chain`, `keyed_offset_chain`, or a commit marker) | `replace_block` | the only route that rebuilds the offset chains; the others would publish a file that frames perfectly and carries no chain |
+| a record footer (`block_offset_chain`, `keyed_offset_chain`, or a commit marker) | `replace_block` | the only route that rebuilds the offset chains; `replace_rewrite` writes no footer at all, so a file it produced for such a format would frame perfectly and carry no chain |
 | no footer, and `T` is a fixed block | `replace_fixed` | a fixed payload cannot change size, so the same-size copy-on-write is exactly right and is the cheapest |
 | no footer, and `T` is variable | `replace_rewrite` | the record's length changes, so every record after it moves |
 

@@ -1,10 +1,13 @@
-# API Changes — 0.3.0 through 0.9.1
+# API Changes — 0.3.0 through 0.9.2
 
 Migration document. Companion to [Known Limitations](known-limitations.md)
 and the [Changelog](../CHANGELOG.md).
 
 Sections run newest first, and the letters ascend with the release they
-describe. Section **F** is the 0.9.0 → 0.9.1 migration: one added `ReadLimits`
+describe. Section **G** is the 0.9.1 → 0.9.2 migration: nine added forwarding
+methods and four added borrowing accessors, all purely additive, plus two
+behaviour fixes that only ever made a correct call fail.
+Section **F** is the 0.9.0 → 0.9.1 migration: one added `ReadLimits`
 field that makes the file-header extension ceiling declarable, and two added
 `VarveFile` methods that make the keyed predecessor chain walkable. Nothing to
 migrate in either — every change is additive, and a format that declares nothing
@@ -27,6 +30,59 @@ and says so in place.
 No on-disk byte changes in 0.5.0. A 0.4.0 file reads unchanged; no encoder,
 decoder, header field or version constant was touched. If you are coming from
 0.3.0 or earlier, read "Read this first" below — that guidance is unchanged.
+
+---
+
+## G. From 0.9.1 to 0.9.2: the header region from a writer, and two fixes
+
+Nothing to migrate. Every API change is additive, and the two behaviour changes
+only turn a call that used to fail into one that succeeds.
+
+### G.1 The editable header region is reachable without ending the writer
+
+`write_header_block` and its family lived only on `VarveFile`, and every handle
+above it offered `into_inner(self)` and nothing else, so the only route to the
+region consumed the writer that wanted to use it. The family is forwarded now:
+
+| on | added |
+| --- | --- |
+| the generated `<Format>Writer` | `read_header_block`, `write_header_block`, `remove_header_block`, `seal_header_slots`, `header_slots_capacity` / `_used` / `_free_bytes` / `_sealed`, plus `inner()` and `inner_mut()` |
+| `VarveWriter` | the same eight, plus `file()` and `file_mut()` |
+| `VarveReader` | `read_header_block`, the four accessors, and `file()` |
+
+```rust
+let mut writer = MyFormat::create_writer(&path)?;
+let info = writer.inner_mut().push_info(&block)?;   // AppendInfo, hence the offset
+writer.write_header_block(&Index { offsets: vec![info.record_offset] })?;
+writer.push_block(&next)?;                          // the writer is still live
+```
+
+`inner_mut()` is not decoration: the generated writer has no
+`push_<block>_info`, so `AppendInfo` — and therefore `record_offset` — is only
+reachable through the layer below. Any capability that is not forwarded stays
+reachable the same way, without ending the handle.
+
+### G.2 A bare filename is a usable pathname
+
+`Path::new("app.varve").parent()` is `Some("")`, not `None`, so the `"."`
+fallback in every parent-directory sync was dead code. `sync()` and
+`replace_user` returned `PublishedButParentSyncPending { source: Io(NotFound) }`
+for a file created under a bare filename. Eight sites across four modules are
+fixed. If you worked around this by always passing a path with a directory
+component, nothing changes for you; the workaround is simply no longer needed.
+
+### G.3 `diagnose_file` resolves limits the way an ordinary open does
+
+It charged records against the format's *declared* `ReadLimits` and never
+resolved them, so a format with no `limits { }` block reported
+`file.record.payload_invalid` for every record of a healthy file and
+`passed() == false`, while `self_test` and `open_reader` on the same format
+succeeded. It resolves once now, where `FormatSpec::open_reader` does.
+
+**This changes what a passing self-check means for such a format**, in the
+direction the documentation always claimed. A format that declares a `limits { }`
+block sees no change, and a payload over a format-declared ceiling is still
+reported.
 
 ---
 
@@ -1151,8 +1207,9 @@ using variable field ids **above 63**, must add 8 bytes per such distinct id.
 | `Encoder::encode_nested_to_vec` | caps a child encoder at the parent's remaining logical-payload budget |
 | `MatrixSidecarManifest::matrix_creation_nonce` | 16-byte per-create nonce binding a sidecar to one logical matrix creation |
 
-New `varve_format!` DSL keys: `key_index = disk | memory`, `disk_index_plan`, and
-`keyed_tail` inside `limits { }`.
+New `varve_format!` DSL keys: `key_index = disk | memory` as a block attribute,
+and `keyed_tail` inside `limits { }`. (`disk_index_plan` is a generated
+associated function, not a DSL key.)
 
 ### 4.2 Behind `high-cardinality-dev`
 
@@ -1372,8 +1429,8 @@ let limits = ReadLimits::STANDARD
     .with_max_matrix_bitmap_bytes(n);
 ```
 
-There is no `varve_format!` DSL key for residency (`limits { }` takes
-`key_index`, `disk_index_plan` and `keyed_tail`), so this is the only route to
+There is no `varve_format!` DSL key for residency (`limits { }` takes a fixed
+list of integer keys and nothing else), so this is the only route to
 `Lazy` at an entry point that also takes limits. See
 [Known Limitations §1.6](known-limitations.md#16-the-matrix-residency-and-verification-policies-have-no-varve_format-dsl-key).
 

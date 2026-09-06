@@ -13712,7 +13712,7 @@ impl VarveFile {
         }
     }
 
-    /// How many bytes remain. A write needs its payload plus eight bytes of
+    /// How many bytes remain. A write needs its payload plus twelve bytes of
     /// entry framing to fit in this, unless it replaces a block already there.
     pub fn header_slots_free_bytes(&self) -> Result<usize> {
         Ok(self
@@ -18880,7 +18880,7 @@ fn load_index(
     // does not describe it. The scan below starts from nothing.
     out.clear();
     // Sequence uniqueness is validated exactly once, inside
-    // `scan_records_from`, on the complete scanned entry list *before* any
+    // `scan_records_range`, on the complete scanned entry list *before* any
     // commit-boundary truncation; a truncated prefix of a duplicate-free list
     // is still duplicate-free, so revalidating here would only repeat the
     // N-element copy+sort on every open (PERF2-07).

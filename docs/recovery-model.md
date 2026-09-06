@@ -39,8 +39,8 @@ Commit map rebuild requires per-entry CRC or equivalent stronger evidence. A
 CRC-free file can clear damaged commit maps or categories, but it cannot prove
 slot validity during rebuild.
 
-Each corruption report names the region, byte range when known, severity,
-recoverability, and suggested actions.
+Each corruption report names the region, severity, recoverability, and
+suggested actions.
 
 ## Classification
 
@@ -122,16 +122,25 @@ and value reads return `MatrixCommitQuarantined(category)` rather than
 progress figure is an answer like any other. Only an explicit whole-category
 recovery action lifts it. Cell categories may use typed CRC rebuild; single and
 per-channel categories have no per-entry reconstruction evidence and therefore
-recommend `ClearCategory`.
+recommend `ClearCategory`. Neither route exists for a format that declares a
+growing matrix dimension: `clear_matrix_category` refuses a quarantined category
+before it touches anything (`Error::MatrixCommitQuarantined`), and
+`rebuild_matrix_commit_from_crc` refuses such a format outright
+(`Error::InvalidFormatSpec`, "a growing matrix's chunks carry no per-cell
+checksum table"), so a growing-matrix quarantine has no primitive that lifts it.
+Both refusals are measured in `crates/varve/tests/matrix_chunks.rs`, by
+`a_quarantined_category_refuses_the_category_clear` and
+`the_entry_points_that_do_not_apply_say_so_by_name`.
 
 > **Changed in 0.5.0, and it is why the resume signals refuse.** Quarantine used
 > to retain the damaged map as "recovery evidence" and substitute an all-clear
 > internal map, and a few answers came from that substitute — a resume query on a
 > quarantined category reported `Clean`, i.e. "nothing in progress" for a map known
 > to be damaged. Verification retains nothing now, so there is no map to answer
-> from. `clear_matrix_category` remains the recovery path and still does not refuse;
-> it reports 0 cells cleared, because it cannot count bits it is discarding when
-> every count authenticates what it reads. See
+> from. `clear_matrix_category` remains the recovery path and, for a format with
+> no growing matrix dimension, still does not refuse; it reports 0 cells cleared,
+> because it cannot count bits it is discarding when every count authenticates
+> what it reads. See
 > [API Changes §A.5](api-changes.md#a5-changed-behaviour-at-an-unchanged-signature-in-050).
 
 ## Rebuild Commit Map
@@ -228,7 +237,7 @@ caller.
 Sidecar support exposes signals, not domain policy:
 
 ```rust
-pub enum ResumeSignal {
+pub enum MatrixResumeSignal {
     Clean,
     Partial { committed: u64, total: u64 },
     ResumeAvailable { committed: u64, total: u64 },

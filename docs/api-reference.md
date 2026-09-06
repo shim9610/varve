@@ -395,10 +395,22 @@ do not.**
   an index at all. See [An open that reads no
   record](#an-open-that-reads-no-record) below: `open_readonly_lazy` frames one
   record, the digest, and the caller builds whatever index it needs with
-  `record_map`. This is the only one of the three whose on-disk cost does not
-  grow with the record count.
+  `record_map`. Its on-disk cost does not grow with the record count;
+  `segment_on_flush` is the only one of the three whose does.
+- `IndexPolicy::header_tails` avoids it too, from the file header rather than
+  from a record: the same three facts, in a fixed region of the header that is
+  rewritten in place at the end of every commit point, so nothing appended can
+  move it or bury it. `open_readonly_lazy` tries it before the digest and
+  reports `LazyOpenSource::HeaderTails`; the handle keeps no directory either,
+  and the open frames the commit marker the table names, whatever closes the
+  same commit point, and one record per block tail. The region is sized by the
+  block count alone — 360 bytes for a two-block format. It requires
+  `block_offset_chain` (which it turns on for you), `integrity: crc32` and a
+  `transaction_marker` commit policy, and is refused both alongside
+  `open_digest_on_flush` and on a format declaring matrix blocks. See [Format
+  Author Guide](format-author-guide.md#when-a-later-append-must-not-be-able-to-hide-the-answer).
 - `IndexPolicy::CheckpointOnFlush` does **not** seed an open from a checkpoint.
-  Every open without the segment chain calls `load_index` → `scan_records_from`,
+  Every open without the segment chain calls `load_index` → `scan_records_range`,
   which walks from the header to the file length; a checkpoint met on the way is
   validated and its decoded entries are discarded. What the policy bounds is
   writer-side checkpoint bytes (it spaces full checkpoints geometrically), not
@@ -417,7 +429,8 @@ see [Known Limitations](known-limitations.md).
 The petabyte-scale path is [Scalable Stream And Indexed
 Handles](#scalable-stream-and-indexed-handles) below, behind
 `high-cardinality-dev`. `VarveReader` is a snapshot as of its own open: records
-another handle appends afterwards are not visible without reopening. See
+another handle appends afterwards are not visible until it advances with
+`follow()` or is reopened. See
 [Known Limitations §2.1](known-limitations.md#21-varvefile-scans-the-whole-file-at-open-and-holds-a-record-index).
 
 ### Reads that fill a buffer you own
@@ -1556,7 +1569,7 @@ per-chunk CRC creation/verification.
 | --- | --- |
 | `push_op::<T>(&key, &op)` | append user-defined operation |
 | `delete::<T>(&key)` | append tombstone |
-| `merge_keyed_files::<T>(spec, base, deltas, output)` | materialize ordered shards |
+| `merge_keyed_files::<T, P>(spec, base, deltas, output)` | materialize ordered shards |
 | `compact_keyed_file::<T, P>(spec, input, output)` | compact one file's final keyed state |
 | `compact_keyed_files::<T, P>(spec, base, deltas, output)` | compact base plus deltas directly |
 | `estimate_keyed_merge::<T, P>(spec, base, deltas)` | pre-flight `KeyedMergeEstimate`, decodes no values |

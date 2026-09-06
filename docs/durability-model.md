@@ -103,9 +103,12 @@ former path-derived `.lock` scheme allowed.
 
 The `<file>.lock` marker is retained only as diagnostic and break-policy
 metadata (content is written below the reserved lock range). It is never the
-authority for exclusion. `clear_stale_writer_lock` acquires the native-object
-lock before it inspects or clears marker metadata regardless of the break
-policy, so an active object lock can never be displaced by recovery. A
+authority for exclusion. `clear_stale_writer_lock` locks the marker object
+first, then inspects it, and probes the target's native-object lock after that;
+under the default `WriterLockBreakPolicy::Refuse` a marker that is present
+refuses before the probe is reached at all. An active object lock still cannot
+be displaced by recovery, because the marker is cleared only after the probe
+succeeds and a live writer's hold makes the probe fail. A
 zero-length `.lock` file may persist as a stable filesystem identity for future
 guard acquisition; `inspect_writer_lock()` reports it as neither active nor
 stale.
@@ -262,15 +265,15 @@ the P1 ordered barrier.
 
 ## Ordered Barrier Policy
 
-The ordered barrier policy is opt-in and intended for workflows that emit live
-progress only after durable commit.
-
-```rust
-durability: ordered_barrier {
-    phases = [data: sync_data, index: sync_data, commit: sync_all];
-    post_commit_hook = true;
-}
-```
+The ordered barrier is opt-in per call rather than a format declaration, and is
+intended for workflows that emit live progress only after durable commit.
+`VarveFile::write_matrix_cell_durable(key, value, hook)` runs the sequence with
+file-handle `sync_data`/`sync_all`;
+`write_matrix_cell_durable_with_barrier(key, value, &mut barrier, hook)`
+substitutes a caller-supplied `MatrixDurabilityBarrier` for the two sync phases.
+There is no `durability:` key in `varve_format!` — the macro refuses one with
+`unsupported varve_format key` — and the hook is a closure argument rather than a
+declared option.
 
 The required order for a committed cell write is:
 
@@ -412,8 +415,9 @@ for portability. Later implementations can add platform-specific range syncs
 without changing the logical barrier.
 
 The current `write_matrix_cell_durable` helper uses that portable file-handle
-ordering: write slot bytes, `sync_data`, commit the cell, update enabled CRC
-metadata, `sync_all`, then invoke the hook.
+ordering: write slot bytes, `sync_data`, then commit the cell — which writes any
+enabled CRC and CRC-valid metadata and publishes the commit bit last — then
+`sync_all`, then invoke the hook.
 `write_matrix_cell_durable_with_barrier` exposes the same sequence through an
 injectable `MatrixDurabilityBarrier`, which lets tests and policy adapters
 record or replace the sync phases. Sidecar-aware barriers remain future

@@ -21,11 +21,10 @@ is covered in **[API Changes](docs/api-changes.md)**.
 
 - Declaring a custom binary format and getting typed readers and writers for it.
 - Append-log files whose record count and distinct-key count fit comfortably in
-  RAM alongside the application. This is the default path, and the only part of
-  the library with an executed test history behind it. Budget **16 bytes of
+  RAM alongside the application. This is the default path. Budget **16 bytes of
   resident directory per record** — the record's offset and its committed bit;
   everything else is rebuilt from the record when a read asks. By default open
-  scans the whole file to build it, and two opt-in policies change that:
+  scans the whole file to build it, and opt-in policies change that:
   `segment_on_flush` makes the open walk one record per commit point, and
   `open_digest_on_flush` plus `open_readonly_lazy` makes it frame one record and
   build no directory at all, leaving the caller to build only the part it needs
@@ -76,9 +75,13 @@ is covered in **[API Changes](docs/api-changes.md)**.
   proportional to the *declared* cell count, and `clear_category` writes
   `cells / 8` bytes instead of punching a hole. There is no error — only slowness.
 
-- **Matrices that grow.** Dimensions are fixed at create time and there is no
-  grow path, so a matrix cannot represent an indefinitely growing stream. Use the
-  stream/indexed APIs for that.
+- **Matrices that grow in more than one dimension.** One may be declared
+  growing: `with_growing_matrix_dimension(name, rows_per_chunk)` puts rows past
+  the declared extent in chunk records in the append log, one chunk buffered at
+  a time. It is one dimension — dimension 0 of every matrix block — with its
+  declared value at create pinned to `rows_per_chunk`; every other dimension is
+  fixed at create. The chunk rewrite that late writes go through is also not
+  crash-atomic, so under `IntegrityPolicy::None` a torn one is served as values.
 - **Frequent matrix opens.** Opening a matrix is not `O(1)`, because by default
   opening it *verifies* it. Open is independent of file size but proportional to
   the candidate page set: a matrix with **one live page** still reads about
@@ -201,7 +204,10 @@ faulted in is authenticated against its stored digest first, so this is a choice
 about *when damage is announced*, not about whether bytes are checked. Full table
 in [Known Limitations §1.4](docs/known-limitations.md#14-lazy-is-the-default-verification-is-what-still-happens-at-open).
 
-Matrix dimensions are fixed at create time; there is no grow path.
+Matrix dimensions are fixed at create, with one exception: a format may declare
+one of them growing with `with_growing_matrix_dimension(name, rows_per_chunk)`,
+after which rows past the declared extent land in chunk records in the append
+log. Off by default, and byte-identical when not declared.
 
 **Platform support, since it changes the matrix cost model rather than only the
 confidence in it:**
@@ -257,7 +263,7 @@ the git repository and pin a tag:
 
 ```toml
 [dependencies]
-varve = { git = "https://github.com/shim9610/varve", tag = "v0.9.1" }
+varve = { git = "https://github.com/shim9610/varve", tag = "v0.9.2" }
 ```
 
 Pin the tag rather than tracking `main`: `main` moves, and this project is at a
@@ -271,7 +277,7 @@ a build that enables none is the smallest one. Enable what a format declaration
 actually asks for:
 
 ```toml
-varve = { git = "https://github.com/shim9610/varve", tag = "v0.9.1",
+varve = { git = "https://github.com/shim9610/varve", tag = "v0.9.2",
           features = ["integrity", "compression-zstd"] }
 ```
 
@@ -334,20 +340,22 @@ legacy `*_with_limits` methods when only fieldwise tightening is desired. An
 optional, partial `limits { ... }` declaration can provide format defaults but
 never becomes a permanent wire-format ceiling.
 
-Two fields on `ReadLimits` are *declarations* rather than ceilings:
-`matrix_metadata_residency` and `matrix_metadata_verification`. Neither has a
-"tighter" direction to meet, so both compose by precedence instead — and, as of
-0.5.0, a **silence never overwrites a declaration**. A `*_with_resource_limits`
-call that does not mention a policy leaves the spec's alone; one that does mention
-it wins. `*_with_limits` keeps the spec's and now also takes a runtime one where
-the spec declared none. Through 0.4.0 this was broken in both directions: raising
+Three fields on `ReadLimits` are *declarations* rather than ceilings:
+`matrix_metadata_residency`, `matrix_metadata_verification` and, since 0.6.0,
+`integrity_verification`. None has a "tighter" direction to meet, so all three
+compose by precedence instead — and, as of 0.5.0, a **silence never overwrites a
+declaration**. A `*_with_resource_limits` call that does not mention a policy
+leaves the spec's alone; one that does mention it wins. `*_with_limits` keeps the
+spec's and now also takes a runtime one where the spec declared none. Through
+0.4.0 this was broken in both directions: raising
 `max_matrix_bitmap_bytes` alone silently reverted a declared
 `Lazy { cache_bytes }` to the eager policy, discarding the only bound on matrix
 metadata memory and often failing the open on the very admission limit you were
 raising. **If you wrote a workaround for that, it is no longer needed.** There is
-still no `varve_format!` DSL key for either policy; declare them on the spec with
-`FormatSpec::with_read_limits` or pass them in a `ReadLimits` value. See
-[Known Limitations §1.6](docs/known-limitations.md#16-the-matrix-residency-and-verification-policies-have-no-varve_format-dsl-key).
+still no `varve_format!` DSL key for any of the three; declare them on the spec
+with `FormatSpec::with_read_limits` or pass them in a `ReadLimits` value. See
+[Known Limitations §1.6](docs/known-limitations.md#16-the-matrix-residency-and-verification-policies-have-no-varve_format-dsl-key)
+for the two matrix policies.
 
 ## Examples
 
@@ -399,7 +407,7 @@ gate, file data, environment, or library invariant issues. See
 
 ## Status
 
-Varve 0.9.1 is usable as an alpha library for experimentation and controlled
+Varve 0.9.2 is usable as an alpha library for experimentation and controlled
 deployments. Through the **stable, released** APIs that means moderate scale —
 files whose record and key counts fit in RAM. The larger-than-RAM path exists but
 is behind `high-cardinality-dev`, has never shipped, and is the least audited code
@@ -407,11 +415,11 @@ in the tree; "far larger than RAM" in the capability table above describes that
 feature-gated family, not the default one. It includes append-log blocks, keyed
 collections, transaction/footer commit policies, schema manifests, diagnostics,
 merge and compact helpers, variable-block compression, matrix storage, mmap, and
-opt-in zero-copy. Valid native 0.1 append-log wire bytes remain readable in 0.9.1,
+opt-in zero-copy. Valid native 0.1 append-log wire bytes remain readable in 0.9.2,
 but the Rust API is still pre-1.0 and may evolve through semver-signaled minor
 releases.
 
-**Four artifact classes are not covered by that statement in 0.9.1.** They are
+**Four artifact classes are not covered by that statement in 0.9.2.** They are
 rejected with a typed error rather than misread, but two of them hold data and two
 are regenerable, and the difference is what it costs you:
 

@@ -29,8 +29,9 @@ const DEFAULT_BATCH_RECORDS: usize = 16_384;
 const DEFAULT_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
 const META_MAGIC: [u8; 8] = *b"VARVEVKI";
-// v3 adds the primary generation witness (STO-01). A v2 sidecar is refused
-// with the typed `MetadataVersion` error and is stale-regenerable by rebuild.
+// v3 adds the primary generation witness (STO-01). A v2 sidecar is 260 bytes
+// where this record is 300, so it is refused with the typed `MetadataLength`
+// error before the version field is read, and is stale-regenerable by rebuild.
 const META_VERSION: u16 = 3;
 const META_LEN: usize = 300;
 const LATEST_LEN: usize = 52;
