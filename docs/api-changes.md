@@ -96,12 +96,17 @@ for step in file.keyed_chain(newest)? {
 ```
 
 **Two things to know before writing that loop.** The walk crosses block ids —
-tombstones (`TOMBSTONE_BLOCK_ID`) and replacement ops (`OP_BLOCK_ID`) are
-legitimate hops, so filter on `entry.block_id` rather than expecting the walk to
-do it. And if you build the same walk by hand from a materialised index, use
+a delete's tombstone (`TOMBSTONE_BLOCK_ID`) is a legitimate hop and becomes the
+key's tail, so filter on `entry.block_id` rather than expecting the walk to do
+it. And if you build the same walk by hand from a materialised index, use
 `index_entries_into`, **not** `block_entries_into::<T>` or the `entries` half of
-`keyed_blocks_into` — both filter to `T::ID` and drop exactly those hops, so the
-history breaks at the first deleted generation.
+`keyed_blocks_into` — both filter to `T::ID` and drop exactly those tombstone
+hops, so the history breaks at the first deleted generation.
+
+Merge ops are **not** on this chain. `push_op` appends under `OP_BLOCK_ID` with
+`prev_same_key_offset` set to `None` and does not move the key's tail, so
+`keyed_chain` never surfaces one — a history reconstructed from the walk alone
+omits every op-applied mutation.
 
 `keyed_chain` requires `index: [keyed_offset_chain]` and refuses with
 `Error::InvalidFormatSpec("keyed_chain requires keyed_offset_chain")` otherwise.

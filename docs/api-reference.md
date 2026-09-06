@@ -152,10 +152,15 @@ for step in file.keyed_chain(newest)? {
 
 **`keyed_chain` crosses block ids; `block_chain` does not.** That is the one
 behavioural difference and the reason they are separate types. A delete writes
-its tombstone under `TOMBSTONE_BLOCK_ID` and a replacement under `OP_BLOCK_ID`,
-and both carry a live keyed predecessor, so a keyed walk that refused them would
+its tombstone under `TOMBSTONE_BLOCK_ID`, and that tombstone carries a live keyed
+predecessor and becomes the key's new tail, so a keyed walk that refused it would
 stop at the first deleted generation and look like an answer. Filter on
 `entry.block_id` yourself.
+
+Merge ops are **not** on this chain. `push_op` appends under `OP_BLOCK_ID` with
+`prev_same_key_offset` set to `None` and does not move the key's tail, so
+`keyed_chain` never surfaces one — a history reconstructed from the walk alone
+omits every op-applied mutation.
 
 If you build the walk by hand from a materialised index instead, take it with
 `index_entries_into` — **not** `block_entries_into::<T>`, and not the `entries`

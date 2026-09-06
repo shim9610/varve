@@ -1571,7 +1571,13 @@ hash, and three consequences follow that are limitations rather than details:
   a hostile `u32` length field name a 4 GiB allocation before a block is parsed
   — but it means the ceiling has to be declared in every copy of the format
   declaration, and nothing checks that it was. Measured in
-  `crates/varve/tests/header_extension_limit.rs`, including that case.
+  `crates/varve/tests/header_extension_limit.rs`: the undeclared ceiling is
+  still 64 KiB, an over-budget region without a declaration is refused at
+  create, a declared ceiling carries a 256 KiB region through create, write,
+  reopen and read, and a reader that declares the default ceiling is refused at
+  open by the larger region with `Error::InvalidCompressionHeader` — before the
+  schema-hash comparison, which is what makes "no schema mismatch to explain it"
+  literal rather than figurative.
 - **A format declaring matrix blocks cannot declare a region.** Refused at
   validation with `Error::InvalidFormatSpec`. The matrix creation nonce and the
   matrix layout header sit at fixed offsets *after* the file header, and a

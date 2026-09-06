@@ -4,6 +4,67 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
+## Unreleased
+
+### The editable header region is reachable from a writer
+
+`write_header_block` and its family lived only on `VarveFile`, and every handle
+above it offered `into_inner(self)` and nothing else — so the only route to the
+region ended the writer that wanted to use it:
+
+```text
+<Format>Writer   -- into_inner(self) -> VarveWriter
+  VarveWriter    -- into_inner(self) -> VarveFile
+    VarveFile    -- write_header_block(&mut self)
+```
+
+That is backwards for what the region is for. The writer is the handle that
+knows what belongs there: an append returns its own `record_offset`, and
+recording that offset in the header is what lets a later reader seed a walk
+instead of rebuilding an index to find the same number. The read side had no
+such problem — `<Format>::open_readonly` hands back a bare `VarveFile` — which is
+why the gap was easy to miss.
+
+The whole family is forwarded now, at both layers, plus borrowing accessors so a
+capability that is *not* forwarded is still reachable without ending the handle:
+
+| on | added |
+| --- | --- |
+| `VarveWriter` | `read_header_block`, `write_header_block`, `remove_header_block`, `seal_header_slots`, `header_slots_capacity` / `_used` / `_free_bytes` / `_sealed`, `file()`, `file_mut()` |
+| `VarveReader` | `read_header_block`, the four accessors, `file()` |
+| the generated `<Format>Writer` | the same eight, plus `inner()` and `inner_mut()` |
+
+Purely additive; nothing changes for a caller who does not call them.
+
+Measured in `crates/varve/tests/header_slots_from_writer.rs`: a generated writer
+writes and reads the region with no `into_inner` anywhere; it keeps appending
+afterwards; offsets returned by `push_info` are recorded in the header and a
+fresh reader reads every record positionally from them; and the four accessors
+agree across all three layers.
+
+### Corrections to the 0.9.1 notes
+
+Two statements shipped in 0.9.1 that were wrong. Both are corrected here and
+both now have a regression test, because neither had one.
+
+**`keyed_chain` does not cross `OP_BLOCK_ID`.** The 0.9.1 notes, the API
+reference, the migration section and the rustdoc all said a merge op was a
+legitimate hop alongside a tombstone. It is not: `push_op` appends through
+`write_record`, which passes `None` for the keyed predecessor, and only `T::ID`
+and `TOMBSTONE_BLOCK_ID` move a keyed tail. A caller folding a key's history
+from the walk alone therefore drops every op-applied mutation, silently. The
+tombstone half of the claim was correct and stands. Pinned by
+`an_op_record_is_not_on_the_chain` in `crates/varve/tests/keyed_chain_walk.rs`.
+
+**The cross-reader ceiling refusal was not measured, though §6.9 said it was.**
+The test that reopened a large-region file used a format whose *magic* differs,
+so open was refused at the magic check before the header extension length was
+ever read — and it asserted only that the open failed, not why. It now uses a
+peer format sharing magic, version and endian, asserts
+`Error::InvalidCompressionHeader`, and asserts the two schema hashes differ,
+which is what makes "with no schema mismatch to explain it" literal rather than
+figurative.
+
 ## 0.9.1 - 2026-09-06
 
 ### Walking one key's history
@@ -47,11 +108,15 @@ decrease, so a crafted or damaged file cannot make the walk loop.
 
 **It crosses block ids, and that is the one way it differs from `block_chain`**,
 which refuses a step that leaves its block. A delete writes its tombstone under
-`TOMBSTONE_BLOCK_ID` and a replacement under `OP_BLOCK_ID`, and both carry a
-live predecessor — so a walk that refused them would stop at the first deleted
+`TOMBSTONE_BLOCK_ID`, and that tombstone carries a live predecessor and becomes
+the key's tail — so a walk that refused it would stop at the first deleted
 generation and look like an answer. Filter on `entry.block_id` yourself. This is
 also why `block_entries_into::<T>` is the wrong way to build such a walk by
 hand: it filters to `T::ID` and drops exactly those hops.
+
+Merge ops are **not** on this chain. `push_op` appends under `OP_BLOCK_ID` with
+`prev_same_key_offset` set to `None` and does not move the key's tail, so a
+history reconstructed from the walk alone omits every op-applied mutation.
 
 `keyed_chain` is refused with `Error::InvalidFormatSpec` on a format that does
 not declare `index: [keyed_offset_chain]`, because without it the writer records
