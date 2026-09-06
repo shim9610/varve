@@ -1762,7 +1762,11 @@ fn canonical_write_path(path: &Path) -> Result<PathBuf> {
     if path.exists() {
         return Ok(std::fs::canonicalize(path)?);
     }
-    let parent = std::fs::canonicalize(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    let parent = std::fs::canonicalize(
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    )?;
     let name = path
         .file_name()
         .ok_or(Error::InvalidFormatSpec("file path has no name"))?;
@@ -1953,7 +1957,10 @@ fn create_state_store(
     tails: &[DiskIndexTail],
 ) -> Result<DiskIndexStore> {
     let sidecar = state_sidecar_path(native_path);
-    let parent = sidecar.parent().unwrap_or_else(|| Path::new("."));
+    let parent = sidecar
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let temporary = tempfile::Builder::new()
         .prefix(".varve-state-")
         .suffix(".vks.tmp")

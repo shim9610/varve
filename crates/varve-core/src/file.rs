@@ -21738,7 +21738,14 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
     record_parent_directory_sync();
     #[cfg(test)]
     fail_parent_sync_if_requested()?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // `parent()` of a single-component relative path is an empty path, not
+    // `None`, so the fallback below is unreachable without the filter and the
+    // open lands on "" — a pathname with no directory component made every
+    // `sync` report `PublishedButParentSyncPending`.
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     crate::scalable_fault_point("replace.parent_sync");
     #[cfg(feature = "scalable-fault-injection")]
     take_injected_parent_sync_failure()?;
@@ -21759,7 +21766,12 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
     record_parent_directory_sync();
     #[cfg(test)]
     fail_parent_sync_if_requested()?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // See the unix arm: an empty parent is what a bare filename yields, and it
+    // is not `None`.
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     // DUR2-02: FlushFileBuffers requires GENERIC_WRITE on the handle
     // (https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers),
     // so the directory must be opened with write access; a read-only directory

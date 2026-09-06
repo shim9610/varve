@@ -617,6 +617,15 @@ pub fn diagnose_file<P: AsRef<Path>>(spec: FormatSpec, path: P) -> FormatDiagnos
     if !report.passed() {
         return report;
     }
+    // `diagnose_spec` above reports on the format *as declared*; everything
+    // below reads a real file, so it must use the policy a real read would.
+    // `VarveFile::open_readonly` resolves internally and the handle it returns
+    // carries the resolved spec, but the local one did not: the record loop
+    // charged payloads against unresolved limits, so a format that declares no
+    // `limits { }` block reported `MissingResourceLimit` for every record of a
+    // healthy file while `open_reader` on the same format succeeded. Resolve
+    // once, here, exactly as `FormatSpec::open_reader` does.
+    let spec = spec.ordinary_read();
 
     match VarveFile::inspect_writer_lock(path) {
         Ok(Some(lock)) => report.push(

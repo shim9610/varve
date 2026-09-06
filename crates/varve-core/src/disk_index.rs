@@ -2890,7 +2890,10 @@ fn validate_restored_root(
 }
 
 fn canonical_sidecar_path(path: &Path) -> DiskIndexResult<PathBuf> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let parent = fs::canonicalize(parent)?;
     let name = path.file_name().ok_or(DiskIndexError::MetadataInvariant(
         "sidecar path has no file name",
