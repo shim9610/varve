@@ -1689,8 +1689,8 @@ survives.
 Generation-store page and checkpoint checksums remain active in every build.
 All optional features are off by default. Resident, matrix, stream/indexed,
 disk-key and scan-control APIs require no Cargo feature, even when using
-`default-features = false`. `high-cardinality-dev` was removed in the 0.10.0
-development tree; delete that entry from dependency feature lists.
+`default-features = false`. `high-cardinality-dev` was removed in 0.10.0;
+delete that entry from dependency feature lists.
 `scalable-fault-injection` remains test infrastructure, outside normal API
 stability expectations. The storage APIs themselves follow the same pre-1.0
 minor-version policy as the rest of the library.

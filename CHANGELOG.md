@@ -4,7 +4,7 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
-## Unreleased — 0.10.0
+## 0.10.0 - 2026-10-03
 
 - Promote streaming, indexed lookup, disk-index plans, finite keys and scan
   control to the default public API, including `--no-default-features`. Remove
@@ -13,8 +13,8 @@ increment the minor version.
   gate. Manual
   `VarveBlock` implementations must always declare `IS_KEYED`. Keep fault
   injection opt-in. Update feature-matrix CI and downstream API fixtures.
-  This prepares a pre-1.0 minor release; it does not publish a release or run a
-  new deep-load qualification campaign.
+  This pre-1.0 minor release changes reader auto-traits and the manual trait
+  contract. Long-duration qualification is tracked separately from API release.
 
 - Replace the generated layout reader's ordinal-cache `OnceLock` with a local
   `OnceCell`. Preserve lazy indexing and `&self` reads; generated layout readers

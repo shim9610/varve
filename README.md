@@ -37,7 +37,7 @@ is covered in **[API Changes](docs/api-changes.md)**.
   at open, 516, and 20.**
 - Bounded-memory ingest and indexed point lookup through `VarveStreamReader`,
   `VarveStreamWriter`, `VarveIndexedReader` and `VarveIndexedWriter`. These are
-  part of the default public API in the 0.10.0 development tree, including with
+  part of the default public API since 0.10.0, including with
   `--no-default-features`. Choose these constructors explicitly for large logs;
   `create_writer` and `open_reader` keep their existing resident behavior.
   See [Scalable I/O](docs/scalable-io.md) for costs and supported operations.
@@ -261,12 +261,12 @@ the assurance those notes record — together with its limits — is summarised 
 
 ## Add It To Your Project
 
-The 0.10.0 API described here is an **unreleased development version**. Use a
-local checkout; no 0.10.0 registry release or tag is implied:
+For the 0.10.0 repository release, depend on the versioned Git tag. This
+repository release does not imply that 0.10.0 is available on crates.io:
 
 ```toml
 [dependencies]
-varve = { path = "../varve-dev/crates/varve" }
+varve = { git = "https://github.com/shim9610/varve", tag = "v0.10.0" }
 ```
 
 Requires Rust **1.95** or newer. Resident, matrix, streaming and indexed APIs
@@ -275,7 +275,7 @@ are included even with `default-features = false`. The removed
 Cargo manifests. Optional capabilities remain opt-in:
 
 ```toml
-varve = { path = "../varve-dev/crates/varve",
+varve = { git = "https://github.com/shim9610/varve", tag = "v0.10.0",
           features = ["integrity", "compression-zstd"] }
 ```
 
@@ -404,12 +404,14 @@ gate, file data, environment, or library invariant issues. See
 
 ## Status
 
-Varve 0.10.0 is being prepared with the stream/indexed family in the default,
-supported public API. The former development-only Cargo gate is removed. API
+Varve 0.10.0 includes the stream/indexed family in the default, supported
+public API. The former development-only Cargo gate is removed. API
 changes follow the same pre-1.0 minor-version policy as the resident and matrix
 families. Promotion changes API availability; it does not assert completion of
-new endurance, power-loss or device-throughput qualification. The next deep-test
-campaign is separate from this API/documentation change.
+new endurance, power-loss or device-throughput qualification. As of
+2026-10-03, a 24-hour matrix endurance run is in progress; no completed
+24-hour result is claimed. Long-duration validation is separate from this
+repository release.
 
 The project includes append-log blocks, keyed collections, transaction/footer
 commit policies, schema manifests, diagnostics, merge and compact helpers,
@@ -452,9 +454,9 @@ for reproducible commands and the limits of these checks.
 
 Earlier 20 GiB load testing found that opening new indexed readers could
 interrupt the sole writer. Reader open now uses read-only confirmed checkpoints
-without writer admission, and the runtime uses Varve's own index storage. Regression tests
-cover concurrent opens; a new deep-load campaign against the final source is
-separate from this API promotion.
+without writer admission, and the runtime uses Varve's own index storage.
+Regression tests cover concurrent opens; timed campaigns qualify the exact
+source and binary recorded by their reports, independently of release tags.
 
 The performance checks are in the same position. They are regression guards
 rather than product benchmarks, and **they run in no job**:

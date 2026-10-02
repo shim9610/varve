@@ -21,10 +21,11 @@ is still a forward walk of the record chain — `O(records before the answer)`,
 not a keyed lookup. Choose this family when key cardinality is the problem;
 choose the digest when open cost is.
 
-> **Status (0.10.0 development tree).** Stream/indexed handles, disk-index
+> **Status (0.10.0).** Stream/indexed handles, disk-index
 > plans, finite keys and scan control are part of the default public API, also
 > with `--no-default-features`. Remove `high-cardinality-dev` from Cargo manifests.
-> This is an API promotion, not a new load-test result or a published release.
+> Repository release and long-duration load qualification are tracked separately.
+> A release tag does not establish a completed endurance test.
 > Explicit `compact_index()` reclaims obsolete companion pages; whole-native-log
 > keyed merge/compact still uses resident key maps. The historical load and
 > sparse-offset measurements apply to their recorded revisions and filesystems.

@@ -1,9 +1,9 @@
-# API Changes — 0.3.0 through 0.10.0 (unreleased)
+# API Changes — 0.3.0 through 0.10.0
 
 Migration document. Companion to [Known Limitations](known-limitations.md)
 and the [Changelog](../CHANGELOG.md).
 
-## H. 0.9.2 → 0.10.0: default storage APIs (unreleased)
+## H. 0.9.2 → 0.10.0: default storage APIs
 
 Streaming, indexed lookup, disk-index plans, finite keys and scan control are now
 part of the default public API, including with `--no-default-features`.
@@ -26,9 +26,8 @@ part of the default public API, including with `--no-default-features`.
 - Constructor selection is unchanged: `open_reader` opens the resident family;
   `open_stream_reader` and `open_indexed_reader` select the scalable families.
 
-The version is prepared as a pre-1.0 minor release because this changes the
-manual trait contract and reader auto-traits. No release or tag has been
-published by this change. The existing generation work also requires matrix
+This is a pre-1.0 minor release because it changes the manual trait contract
+and reader auto-traits. The generation work also requires matrix
 `.vmg` companions and rebuilt/bootstraped older disk-index sidecars; see the
 [durability model](durability-model.md) and [Scalable I/O](scalable-io.md).
 This API promotion adds no claim about new endurance or device-load testing.
