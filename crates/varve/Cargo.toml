@@ -31,8 +31,8 @@ scalable-fault-injection = [
 ]
 
 [dependencies]
-varve-core = { path = "../varve-core", version = "0.10.0" }
-varve-macros = { path = "../varve-macros", version = "0.10.0" }
+varve-core = { path = "../varve-core", version = "0.10.1" }
+varve-macros = { path = "../varve-macros", version = "0.10.1" }
 
 [dev-dependencies]
 redb = { version = "4.3.0", path = "../../vendor/redb" }

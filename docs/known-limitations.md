@@ -1,6 +1,6 @@
 # Known Limitations
 
-Status as of 0.10.0. Historical numbers measured 2026-07-22, re-measured 2026-07-25, and
+Status as of 0.10.1. Historical numbers measured 2026-07-22, re-measured 2026-07-25, and
 re-measured again on 2026-07-26 against the residency/verification split described
 below; every entry was checked against the code in this repository. Where an earlier
 document and the code disagreed, the code won and the document was corrected.

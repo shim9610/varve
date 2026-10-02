@@ -261,12 +261,12 @@ the assurance those notes record — together with its limits — is summarised 
 
 ## Add It To Your Project
 
-For the 0.10.0 repository release, depend on the versioned Git tag. This
-repository release does not imply that 0.10.0 is available on crates.io:
+For the 0.10.1 repository release, depend on the versioned Git tag. This
+repository release does not imply that 0.10.1 is available on crates.io:
 
 ```toml
 [dependencies]
-varve = { git = "https://github.com/shim9610/varve", tag = "v0.10.0" }
+varve = { git = "https://github.com/shim9610/varve", tag = "v0.10.1" }
 ```
 
 Requires Rust **1.95** or newer. Resident, matrix, streaming and indexed APIs
@@ -275,7 +275,7 @@ are included even with `default-features = false`. The removed
 Cargo manifests. Optional capabilities remain opt-in:
 
 ```toml
-varve = { git = "https://github.com/shim9610/varve", tag = "v0.10.0",
+varve = { git = "https://github.com/shim9610/varve", tag = "v0.10.1",
           features = ["integrity", "compression-zstd"] }
 ```
 

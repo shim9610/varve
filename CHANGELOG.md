@@ -4,7 +4,7 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
-## Unreleased
+## 0.10.1 - 2026-10-03
 
 - Publish compacted matrix and disk-index companions on Windows while keeping
   replacement handles open. Old readers keep their original file; following

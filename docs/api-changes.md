@@ -1,7 +1,14 @@
-# API Changes — 0.3.0 through 0.10.0
+# API Changes — 0.3.0 through 0.10.1
 
 Migration document. Companion to [Known Limitations](known-limitations.md)
 and the [Changelog](../CHANGELOG.md).
+
+## I. 0.10.0 → 0.10.1: publication and toolchain fixes
+
+No public API or wire-format changes. Windows matrix and disk-index compaction
+can replace companion files while readers keep their original handles. The
+public API fixture calls `sync()` before reopening a matrix reader. Warnings-denied
+builds remain compatible with Rust 1.99 while preserving the Rust 1.95 minimum.
 
 ## H. 0.9.2 → 0.10.0: default storage APIs
 
