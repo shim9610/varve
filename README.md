@@ -5,6 +5,11 @@ binary formats from typed block definitions. It is not one fixed file format.
 The main workflow is format-first: declare a file contract with
 `varve_format!`, then use the generated typed reader and writer APIs.
 
+For a small, schema-defined keyspace, declare `key_values` or `key_domain`.
+Varve compiles the permitted value combinations into a two-byte enum, with at
+most 4,096 combinations per block; growing log records remain identified by
+offsets. See [finite schema keys](docs/scalable-io.md#finite-schema-keys).
+
 The workspace contains:
 
 - `varve`: public facade crate
@@ -30,15 +35,12 @@ is covered in **[API Changes](docs/api-changes.md)**.
   build no directory at all, leaving the caller to build only the part it needs
   with `record_map`. Measured on a 50,000-record file: **100,316 read syscalls
   at open, 516, and 20.**
-- Bounded-memory ingest and point lookup over data far larger than RAM — with two
-  caveats that a reader should weigh before choosing Varve for this workload.
-  It is behind the `high-cardinality-dev` feature, has never shipped in a released
-  version, and its API may still change. Its four modules (`disk_index.rs`,
-  `stream.rs`, `indexed.rs`, `scan_control.rs`) **have now been walked against the
-  project's five internal invariants**, as the matrix and resident paths were, and
-  the walk found no defect. That is a statement about review, not about use: the
-  feature is still `dev`, still unreleased, and the flag is still the honest
-  signal.
+- Bounded-memory ingest and indexed point lookup through `VarveStreamReader`,
+  `VarveStreamWriter`, `VarveIndexedReader` and `VarveIndexedWriter`. These are
+  part of the default public API in the 0.10.0 development tree, including with
+  `--no-default-features`. Choose these constructors explicitly for large logs;
+  `create_writer` and `open_reader` keep their existing resident behavior.
+  See [Scalable I/O](docs/scalable-io.md) for costs and supported operations.
 - Preallocated matrix storage with **fixed dimensions**, a live page count whose
   page-index mirror (~96 bytes per live page) fits the process memory budget — the
   commit-map payload itself is demand-cached and bounded, so it does not have to —
@@ -107,10 +109,10 @@ is covered in **[API Changes](docs/api-changes.md)**.
   about it is callable. One conclusion from that design holds regardless, because
   it is a property of the current on-disk layout: an interleaved payload cannot be
   read channel-selectively below full block I/O without re-emitting the payload.
-- **Live views of a file another handle is writing.** Resident readers are
-  snapshots as of open. Matrix readers are not snapshots at all: each commit-map
-  page is as of the first read that faulted it in, and since 0.5.0 no policy pins
-  a whole-map instant. A reader that needs one must coordinate it.
+- **Implicit live views of a file another handle is writing.** Each reader
+  captures a snapshot and advances explicitly with `follow(&mut self)`. Matrix
+  payloads, bitmaps, CRCs and aux data share one confirmed generation; `sync()`
+  publishes it. Matrix storage requires the primary and its `.vmg` companion.
 - **Anything depending on a long fuzz campaign.** Fuzz, Miri and ASan do run
   now — weekly, in CI — and the Unix code paths are executed rather than merely
   compiled, which is a change from every release before 0.7.0. What has *not*
@@ -142,7 +144,7 @@ Varve has two API families with different scale contracts. Pick deliberately.
 | Family | Entry points | State | Suited to |
 | --- | --- | --- | --- |
 | Resident | `VarveFile`, generated typed readers/writers, keyed collections, `merge_keyed_files`, `compact_keyed_file(s)` | index and merge state live in memory, sized by record and key counts | files that fit comfortably in RAM alongside the application |
-| Scalable (`high-cardinality-dev`) | `VarveStreamWriter`, `VarveIndexedWriter`, their readers, and `.vks`/`.vki` sidecars | bounded resident state, sized by declared blocks and bounded buffers | high-rate append and point lookup over data far larger than RAM |
+| Stream/indexed (default API) | `VarveStreamWriter`, `VarveIndexedWriter`, their readers, and `.vks`/`.vki` sidecars | bounded resident state, sized by declared blocks and bounded buffers | high-rate append and point lookup over data far larger than RAM |
 
 The scalable family covers bounded ingest and lookup only. **Keyed merge and
 compact are resident-only and explicitly not petabyte-scale**: they retain one
@@ -237,7 +239,8 @@ remain caller code.
 | [Format Author Guide](docs/format-author-guide.md) | policy choices, compression, commit modes, matrix blocks |
 | [Custom Codec Guide](docs/custom-codec-guide.md) | writing `VarveEncode`/`VarveDecode` for a field type with its own stable wire meaning |
 | [Update And Compact Guide](docs/update-compact-guide.md) | keyed put/op/tombstone/compact workflows, and when direct replacement is the right tool instead |
-| [Scalable I/O](docs/scalable-io.md) | the experimental `high-cardinality-dev` stream/indexed APIs, batching, sidecars, recovery, and exact cost model |
+| [Scalable I/O](docs/scalable-io.md) | the default stream/indexed APIs, batching, sidecars, recovery, and exact cost model |
+| [Immediate policy](docs/immediate-policy.md) | block and value declarations, automatic durability conditions, and explicit `immediate()` |
 | [Durability Model](docs/durability-model.md) | flush, sync, transaction-marker, matrix, and replacement ordering |
 | [Recovery Model](docs/recovery-model.md) | matrix corruption classification, findings, and the primitive recovery actions a caller may apply |
 | [Self-Check Guide](docs/self-check-guide.md) | deciding whether a failure is format, caller, data, feature, environment, or library |
@@ -258,37 +261,31 @@ the assurance those notes record — together with its limits — is summarised 
 
 ## Add It To Your Project
 
-Varve is **not on crates.io**, so `cargo add varve` will not find it. Depend on
-the git repository and pin a tag:
+The 0.10.0 API described here is an **unreleased development version**. Use a
+local checkout; no 0.10.0 registry release or tag is implied:
 
 ```toml
 [dependencies]
-varve = { git = "https://github.com/shim9610/varve", tag = "v0.9.2" }
+varve = { path = "../varve-dev/crates/varve" }
 ```
 
-Pin the tag rather than tracking `main`: `main` moves, and this project is at a
-stage where it moves in ways that change behaviour at an unchanged signature —
-see [API Changes](docs/api-changes.md).
-
-Requires Rust **1.95** or newer (`rust-version = "1.95"`).
-
-Every capability beyond the base format is an optional feature, off by default;
-a build that enables none is the smallest one. Enable what a format declaration
-actually asks for:
+Requires Rust **1.95** or newer. Resident, matrix, streaming and indexed APIs
+are included even with `default-features = false`. The removed
+`high-cardinality-dev` feature is no longer accepted; remove it from existing
+Cargo manifests. Optional capabilities remain opt-in:
 
 ```toml
-varve = { git = "https://github.com/shim9610/varve", tag = "v0.9.2",
+varve = { path = "../varve-dev/crates/varve",
           features = ["integrity", "compression-zstd"] }
 ```
 
 | Feature | Turns on |
 | --- | --- |
-| `integrity` | per-record and per-page checksum verification |
+| `integrity` | record and matrix cell/commit-map checksum verification |
 | `compression-zstd` | the zstd codec for compressed blocks |
 | `mmap` | memory-mapped reads |
 | `zero-copy` | borrowed reads that avoid a copy out of the page cache — also enables `mmap` |
-| `high-cardinality-dev` | the experimental stream/indexed APIs — see [Scalable I/O](docs/scalable-io.md) |
-| `scalable-fault-injection` | test-only fault injection; also enables `high-cardinality-dev`, and is not for production builds |
+| `scalable-fault-injection` | test-only fault injection; not for production builds |
 
 [Format Author Guide](docs/format-author-guide.md) says which declaration
 choices require which feature, and what each costs.
@@ -407,17 +404,20 @@ gate, file data, environment, or library invariant issues. See
 
 ## Status
 
-Varve 0.9.2 is usable as an alpha library for experimentation and controlled
-deployments. Through the **stable, released** APIs that means moderate scale —
-files whose record and key counts fit in RAM. The larger-than-RAM path exists but
-is behind `high-cardinality-dev`, has never shipped, and is the least audited code
-in the tree; "far larger than RAM" in the capability table above describes that
-feature-gated family, not the default one. It includes append-log blocks, keyed
-collections, transaction/footer commit policies, schema manifests, diagnostics,
-merge and compact helpers, variable-block compression, matrix storage, mmap, and
-opt-in zero-copy. Valid native 0.1 append-log wire bytes remain readable in 0.9.2,
-but the Rust API is still pre-1.0 and may evolve through semver-signaled minor
-releases.
+Varve 0.10.0 is being prepared with the stream/indexed family in the default,
+supported public API. The former development-only Cargo gate is removed. API
+changes follow the same pre-1.0 minor-version policy as the resident and matrix
+families. Promotion changes API availability; it does not assert completion of
+new endurance, power-loss or device-throughput qualification. The next deep-test
+campaign is separate from this API/documentation change.
+
+The project includes append-log blocks, keyed collections, transaction/footer
+commit policies, schema manifests, diagnostics, merge and compact helpers,
+variable-block compression, matrix storage, mmap, and opt-in zero-copy.
+The historical compatibility evidence below remains limited to the revisions it
+names. Current matrix generations require the primary and its `.vmg` companion;
+older matrix files without that companion need recreation. Older disk-index
+sidecars require explicit rebuild/bootstrap. See the migration guide for limits.
 
 **Four artifact classes are not covered by that statement in 0.9.2.** They are
 rejected with a typed error rather than misread, but two of them hold data and two
@@ -440,22 +440,30 @@ intact, and a 0.3.0 computed-hash-pinned file was refused as documented — but 
 was a single manual run over a two-field format, and the matrix and sidecar refusal
 rows rest on source inspection alone. See
 [Known Limitations §6.7](docs/known-limitations.md#67-the-backward-compatibility-table-what-is-now-executed-and-what-still-is-not).
-The petabyte-scale stream/disk-index API remains behind
-`high-cardinality-dev` and has never shipped in a released version.
+The stream/disk-index API is included in default builds.
 Progress/cancellation, process-interruption recovery, and sidecar robustness
-gates are implemented and executed. The scale gates are not: both positional-I/O
-probes (`real_file_positional_io_at_one_pib` and its 1 TiB smoke sibling) are
-`#[ignore]`d and have never been executed on any host, and the 1 TiB probe has no
-required-mode escape at all. Varve's petabyte-scale claims rest on the cost model
-and on tests at far smaller scales, not on a demonstration at that scale.
+gates are implemented and executed. On 2026-10-01 the explicit qualification
+campaign also passed on Linux x86_64: four 64-epoch model histories, 64 external
+kill/recovery cycles, and the 10k/100k/1m-key heap budgets. Both sparse positional
+probes ran on tmpfs; the workspace overlay accepted 1 TiB but refused 1 PiB with
+`File too large`. These are sparse address-space checks, not petabyte storage or
+endurance measurements. See the [self-check guide](docs/self-check-guide.md#scalable-io-validation)
+for reproducible commands and the limits of these checks.
+
+Earlier 20 GiB load testing found that opening new indexed readers could
+interrupt the sole writer. Reader open now uses read-only confirmed checkpoints
+without writer admission, and the runtime uses Varve's own index storage. Regression tests
+cover concurrent opens; a new deep-load campaign against the final source is
+separate from this API promotion.
 
 The performance checks are in the same position. They are regression guards
 rather than product benchmarks, and **they run in no job**:
 `crates/varve/tests/perf_smoke.rs` is entirely `#[ignore]`d, as is the
-one-million-key RSS/allocator stress probe in
+one-million-key allocator stress probe in
 `crates/varve/tests/high_cardinality.rs`. Every performance number in this
-documentation therefore comes from a manual run on a named date and host, on
-Windows x86_64; none of it is continuously enforced.
+documentation therefore comes from a manual run on a named date and host.
+The qualification runner explicitly enforces heap budgets when invoked, but
+the long campaigns are not automatically scheduled in CI.
 
 On security assurance specifically: an adversarial hostile-input review was
 performed on 2026-07-10 against the pre-0.2 hardening implementation. It treated
@@ -492,7 +500,7 @@ reusable and are not treated as test data.
 CI (`.github/workflows/ci.yml`) runs on Ubuntu and Windows: `cargo fmt --all
 -- --check`; a per-feature Clippy matrix with `-D warnings` and `--locked`
 covering no-default-features, default, each optional feature alone
-(`integrity`, `mmap`, `zero-copy`, `compression-zstd`, `high-cardinality-dev`,
+(`integrity`, `mmap`, `zero-copy`, `compression-zstd`,
 `scalable-fault-injection`), and the all-feature workspace union; default and
 all-feature test runs through `varve-test-runner` so a leaked test artifact
 fails the build; test runs for the two singleton feature configurations that own
@@ -548,7 +556,8 @@ crates with warnings denied.
 Job results block merges only where branch protection lists them as required
 status checks; adding a job to the workflow does not by itself make it a gate.
 
-Optional compatibility harnesses use Python reference libraries:
+Optional compatibility harnesses use Python reference libraries and require
+Python 3.12 or newer (NumPy 2.5):
 
 ```powershell
 .\.venv-tdms\Scripts\python.exe scripts\verify_tdms_with_nptdms.py
@@ -564,3 +573,8 @@ Varve is licensed under either of:
 - [Apache License, Version 2.0](LICENSE-APACHE)
 
 at your option. See [LICENSE](LICENSE) for the short dual-license notice.
+
+See [Scalable I/O](docs/scalable-io.md) for native index storage and
+[validation](docs/self-check-guide.md#scalable-io-validation) for comparison commands. Runtime redb is removed;
+reader caches are private, confirmed generations work across processes, and
+`compact_index()` explicitly reclaims old index pages after a caller-requested sync.

@@ -140,7 +140,6 @@ fn bare_filename_child() {
 
 /// The scalable writer resolves its write path with `canonicalize`, which
 /// fails on the empty parent one step before any parent sync.
-#[cfg(feature = "high-cardinality-dev")]
 fn bare_filename_stream() {
     use varve::{StreamOptions, VarveStreamReader, VarveStreamWriter};
 
@@ -171,6 +170,3 @@ fn bare_filename_stream() {
         .expect("collect stream readings");
     assert_eq!(readings, [Reading { at: 2, value: 9 }]);
 }
-
-#[cfg(not(feature = "high-cardinality-dev"))]
-fn bare_filename_stream() {}

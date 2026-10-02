@@ -22,6 +22,8 @@
 
 use std::path::{Path, PathBuf};
 
+#[path = "common/matrix_image.rs"]
+mod matrix_image;
 use varve::{
     BlockDescriptor, BlockKind, Endian, Error, FormatSpec, IndexPolicy, IntegrityPolicy,
     LazyOpenSource, MatrixBlockDescriptor, MatrixCellStatus, MatrixCommitDescriptor,
@@ -178,6 +180,7 @@ fn a_format_without_the_declaration_writes_no_chunk_record() -> varve::Result<()
         writer.commit_matrix_cell::<Sample>(key(row, 0))?;
     }
     writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     let reader = base_spec().open_reader(path.path())?;
@@ -223,6 +226,7 @@ fn rows_past_the_declared_extent_are_written_and_read_back() -> varve::Result<()
             }
         }
         writer.flush()?;
+        writer.sync()?;
     }
 
     let reader = growing_spec().open_reader(path.path())?;
@@ -250,6 +254,7 @@ fn one_chunk_record_is_written_per_chunk_that_holds_a_value() -> varve::Result<(
             writer.commit_matrix_cell::<Sample>(key(row, 0))?;
         }
         writer.flush()?;
+        writer.sync()?;
     }
     let reader = growing_spec().open_reader(path.path())?;
     let chunks = reader
@@ -268,11 +273,13 @@ fn a_chunk_nothing_committed_is_not_written() -> varve::Result<()> {
     writer.write_matrix_cell(key(ROWS_PER_CHUNK, 0), &Sample { value: 9 })?;
     writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0))?;
     writer.flush()?;
+    writer.sync()?;
     let after_first = std::fs::metadata(path.path())?.len();
     // The failure this guards is the one an empty segment record once had: an
     // idle flush that grows the file every time it runs.
     for _ in 0..8 {
         writer.flush()?;
+        writer.sync()?;
     }
     assert_eq!(std::fs::metadata(path.path())?.len(), after_first);
     Ok(())
@@ -296,6 +303,7 @@ fn a_block_that_never_arrived_reads_as_absent_across_a_write() -> varve::Result<
         writer.write_matrix_cell(key(ROWS_PER_CHUNK * 2, 0), &Sample { value: 1 })?;
         writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK * 2, 0))?;
         writer.flush()?;
+        writer.sync()?;
     }
 
     let reader = growing_spec().open_reader(path.path())?;
@@ -324,6 +332,7 @@ fn an_uncommitted_cell_in_a_written_chunk_stays_uncommitted() -> varve::Result<(
         writer.write_matrix_cell(written, &Sample { value: 3 })?;
         writer.commit_matrix_cell::<Sample>(written)?;
         writer.flush()?;
+        writer.sync()?;
     }
     let reader = growing_spec().open_reader(path.path())?;
     assert_eq!(
@@ -338,26 +347,13 @@ fn an_uncommitted_cell_in_a_written_chunk_stays_uncommitted() -> varve::Result<(
 }
 
 // ---------------------------------------------------------------------------
-// §6.4 A late write into a written chunk edits it where it already sits
+// §6.4 A late write appends a new immutable chunk version
 // ---------------------------------------------------------------------------
 
-/// A write to a row of an already-written chunk lands, and does not grow the
-/// file.
-///
-/// **This test asserted the opposite refusal until 2026-08-09, and the refusal
-/// was the defect.** A writer that can edit a written row of the matrix
-/// *region* could not edit a written row of a *chunk*, for no reason in the
-/// format: a chunk record is an ordinary record, and rewriting one of those in
-/// place is a route `RecordFile` has had since round 12. What the refusal cost
-/// was not a corner case — it was every read-modify-write of a growing matrix.
-///
-/// The file length is the assertion that the edit went back over the original
-/// record instead of appending a second one for the same chunk index. A
-/// duplicate would not merely waste space: `build_chunk_directory` refuses a
-/// file carrying two records for one chunk, so the append would have made the
-/// file unopenable.
+/// A generation selects the newest record for each chunk; an older reader
+/// retains the version inside its confirmed EOF.
 #[test]
-fn a_write_into_a_written_chunk_edits_it_in_place() -> varve::Result<()> {
+fn a_write_into_a_written_chunk_appends_a_generation() -> varve::Result<()> {
     let path = temp_path("closed_refusal");
     let first = key(ROWS_PER_CHUNK, 0);
     let late = key(ROWS_PER_CHUNK, 1);
@@ -368,15 +364,16 @@ fn a_write_into_a_written_chunk_edits_it_in_place() -> varve::Result<()> {
     writer.write_matrix_cell(key(ROWS_PER_CHUNK * 2, 0), &Sample { value: 2 })?;
     writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK * 2, 0))?;
     writer.flush()?;
+    writer.sync()?;
     let before = std::fs::metadata(path.path())?.len();
 
     writer.write_matrix_cell(late, &Sample { value: 3 })?;
     writer.commit_matrix_cell::<Sample>(late)?;
     writer.flush()?;
-    assert_eq!(
-        std::fs::metadata(path.path())?.len(),
-        before,
-        "the edit must rewrite chunk 1's record, not append a second one",
+    writer.sync()?;
+    assert!(
+        std::fs::metadata(path.path())?.len() > before,
+        "updating a published chunk must append a new immutable version"
     );
     drop(writer);
 
@@ -415,10 +412,12 @@ fn a_written_chunk_cell_can_be_overwritten_with_a_new_value() -> varve::Result<(
     writer.write_matrix_cell(key(ROWS_PER_CHUNK * 2, 0), &Sample { value: 2 })?;
     writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK * 2, 0))?;
     writer.flush()?;
+    writer.sync()?;
 
     writer.write_matrix_cell(cell, &Sample { value: 22 })?;
     writer.commit_matrix_cell::<Sample>(cell)?;
     writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     let reader = growing_spec().open_reader(path.path())?;
@@ -447,10 +446,12 @@ fn a_skipped_chunk_can_be_filled_in_after_a_later_one_was_written() -> varve::Re
         writer.write_matrix_cell(late, &Sample { value: 33 })?;
         writer.commit_matrix_cell::<Sample>(late)?;
         writer.flush()?;
+        writer.sync()?;
         // Chunk 1 was never opened, so no record for it exists.
         writer.write_matrix_cell(skipped, &Sample { value: 11 })?;
         writer.commit_matrix_cell::<Sample>(skipped)?;
         writer.flush()?;
+        writer.sync()?;
     }
     let reader = growing_spec().open_reader(path.path())?;
     assert_eq!(
@@ -492,6 +493,7 @@ fn reading_one_cell_does_not_read_the_chunk() -> varve::Result<()> {
         writer.write_matrix_cell(key(WIDE_ROWS * 2, 0), &Sample { value: 1 })?;
         writer.commit_matrix_cell::<Sample>(key(WIDE_ROWS * 2, 0))?;
         writer.flush()?;
+        writer.sync()?;
     }
 
     let reader = spec.open_reader(path.path())?;
@@ -593,6 +595,7 @@ fn the_segment_chain_still_frames_commit_points_not_chunks() -> varve::Result<()
                 writer.commit_matrix_cell::<Sample>(key(row, 0))?;
             }
             writer.flush()?;
+            writer.sync()?;
         }
     }
 
@@ -651,6 +654,7 @@ fn a_writer_reads_back_what_it_just_wrote_into_the_open_chunk() -> varve::Result
 
     // And the same three answers after the write, from the same handle.
     writer.flush()?;
+    writer.sync()?;
     assert_eq!(
         writer.read_matrix_cell::<Sample>(cell)?,
         Sample { value: 5 }
@@ -692,6 +696,7 @@ fn the_payload_write_entry_point_routes_like_the_typed_one() -> varve::Result<()
     writer.write_matrix_cell_payload::<Sample>(cell, &7u32.to_le_bytes())?;
     writer.commit_matrix_cell::<Sample>(cell)?;
     writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     let reader = growing_spec().open_reader(path.path())?;
@@ -728,10 +733,12 @@ fn both_spellings_of_a_cell_clear_reach_a_written_chunk() -> varve::Result<()> {
     writer.write_matrix_cell(far, &Sample { value: 5 })?;
     writer.commit_matrix_cell::<Sample>(far)?;
     writer.flush()?;
+    writer.sync()?;
 
     writer.clear_matrix_cell::<Sample>(typed)?;
     writer.clear_matrix_cell_by_category(Sample::CATEGORY, by_category)?;
     writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     let reader = growing_spec().open_reader(path.path())?;
@@ -780,6 +787,7 @@ fn clearing_a_cell_works_in_a_written_chunk_as_in_the_open_one() -> varve::Resul
         MatrixCellStatus::NotCommitted,
     );
     writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     // Written out, not just cleared in the buffer: the record on disk still
@@ -834,6 +842,7 @@ fn a_reopened_writer_edits_a_chunk_written_by_the_previous_handle() -> varve::Re
         writer.write_matrix_cell(first, &Sample { value: 5 })?;
         writer.commit_matrix_cell::<Sample>(first)?;
         writer.flush()?;
+        writer.sync()?;
     }
     let mut writer = growing_spec().open_writer(path.path())?;
     // Cold: nothing is open, so chunk 1 must come back from its record.
@@ -845,6 +854,7 @@ fn a_reopened_writer_edits_a_chunk_written_by_the_previous_handle() -> varve::Re
     writer.write_matrix_cell(second, &Sample { value: 7 })?;
     writer.commit_matrix_cell::<Sample>(second)?;
     writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     let reader = growing_spec().open_reader(path.path())?;
@@ -868,131 +878,58 @@ fn a_reopened_writer_edits_a_chunk_written_by_the_previous_handle() -> varve::Re
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_truncated_file_loses_no_committed_cell_and_shows_no_half_chunk() -> varve::Result<()> {
-    // Cut the file at every 64th offset. At each cut: a read-only open must
-    // never show a cell it cannot fully back, and a writer reopen — which
-    // truncates the uncommitted tail — must then read back exactly the chunks
-    // that survived, and must still refuse to reopen one of them.
-    // Transaction markers, because without them there is no commit point to cut
-    // back to and a writer reopen answers `CorruptTail` instead of truncating —
-    // 144 of 150 cuts, measuring the commit policy rather than the chunk code.
-    // The guard at the end of this test caught two versions of that mistake:
-    // sweeping from byte 64 (3 of 70 cuts opened, most landing in the matrix
-    // region) and sweeping under `CommitPolicy::None`.
-    let spec = growing_spec()
-        .with_commit_policy(varve::CommitPolicy::TransactionMarker(
-            varve::TransactionMarkerMode::OnFlush,
-        ))
-        .with_recovery_policy(varve::RecoveryPolicy::TruncateTail);
-    let path = temp_path("crash_sweep_source");
-    let chunks = 6u64;
-    {
-        let mut writer = spec.create_writer_with_dims(path.path(), dims())?;
-        for chunk in 1..=chunks {
-            let cell = key(chunk * ROWS_PER_CHUNK, 0);
-            writer.write_matrix_cell(
-                cell,
-                &Sample {
-                    value: chunk as u32,
-                },
-            )?;
-            writer.commit_matrix_cell::<Sample>(cell)?;
-            // A commit point per chunk, so a cut has something to fall back to
-            // rather than destroying the only one.
-            writer.flush()?;
-        }
-    }
-    let source = std::fs::read(path.path())?;
-
-    // Sweep the append log, not the whole file. A cut inside the matrix region
-    // truncates the header's own structures, so the file does not open at all
-    // and the cut proves nothing — the first version of this swept from byte 64
-    // and opened 3 files out of ~70, which the guard at the end caught.
-    let append_start = {
-        let reader = spec.open_readonly(path.path())?;
-        let first = reader
-            .index_entries()
-            .first()
-            .expect("the file holds records")
-            .record_offset;
-        usize::try_from(first).expect("offset")
-    };
-
-    let mut opened = 0usize;
-    for cut in (append_start..source.len()).step_by(16) {
-        let cut_path = temp_path("crash_sweep_cut");
-        std::fs::write(cut_path.path(), &source[..cut])?;
-
-        // Read-only: whatever it shows must be internally consistent. A cell it
-        // reports as committed must decode. This half opens only when the cut
-        // lands on a record boundary — a read-only handle never truncates — so
-        // it is not what the guard below counts.
-        if let Ok(reader) = spec.open_readonly(cut_path.path()) {
-            for chunk in 1..=chunks {
-                let cell = key(chunk * ROWS_PER_CHUNK, 0);
-                if reader.matrix_cell_status::<Sample>(cell)? == MatrixCellStatus::Committed {
-                    assert_eq!(
-                        reader.read_matrix_cell::<Sample>(cell)?,
-                        Sample {
-                            value: chunk as u32
-                        },
-                        "cut {cut}: chunk {chunk} reported committed but did not read back",
-                    );
-                }
-            }
-            drop(reader);
-        }
-
-        // Writer reopen truncates the uncommitted tail. What it then reports
-        // must survive a further append and another reopen.
-        let Ok(mut writer) = spec.open_writer(cut_path.path()) else {
-            continue;
-        };
-        opened += 1;
-        let mut survived = Vec::new();
-        for chunk in 1..=chunks {
-            let cell = key(chunk * ROWS_PER_CHUNK, 0);
-            if writer.matrix_cell_status::<Sample>(cell)? == MatrixCellStatus::Committed {
-                survived.push(chunk);
-            }
-        }
-        // A surviving chunk is written, and a written chunk is editable: the
-        // record is loaded back and rewritten where it sits, never duplicated.
-        // The duplicate is what the sweep is watching for here — it would make
-        // the file unopenable at the *next* open, several statements below,
-        // rather than at the write.
-        if let Some(newest) = survived.last() {
-            let touched = key(newest * ROWS_PER_CHUNK, 1);
-            writer.write_matrix_cell(touched, &Sample { value: 0xABC })?;
-            writer.commit_matrix_cell::<Sample>(touched)?;
-        }
-        let fresh = key((chunks + 4) * ROWS_PER_CHUNK, 0);
-        writer.write_matrix_cell(fresh, &Sample { value: 99 })?;
-        writer.commit_matrix_cell::<Sample>(fresh)?;
-        writer.flush()?;
-        drop(writer);
-
-        let reader = spec.open_readonly(cut_path.path())?;
-        for chunk in &survived {
-            assert_eq!(
-                reader.read_matrix_cell::<Sample>(key(chunk * ROWS_PER_CHUNK, 0))?,
-                Sample {
-                    value: *chunk as u32
-                },
-                "cut {cut}: chunk {chunk} survived the reopen but not the append",
-            );
-        }
+fn a_truncated_dirty_tail_preserves_the_confirmed_chunk_generation() -> varve::Result<()> {
+    let spec = growing_spec();
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("source.varve");
+    let mut writer = spec.create_writer_with_dims(&path, dims())?;
+    let old = key(ROWS_PER_CHUNK, 0);
+    let dirty = key(2 * ROWS_PER_CHUNK, 0);
+    writer.write_matrix_cell(old, &Sample { value: 1 })?;
+    writer.commit_matrix_cell::<Sample>(old)?;
+    writer.sync()?;
+    let confirmed = std::fs::metadata(&path)?.len() as usize;
+    writer.write_matrix_cell(old, &Sample { value: 2 })?;
+    writer.commit_matrix_cell::<Sample>(old)?;
+    writer.write_matrix_cell(dirty, &Sample { value: 3 })?;
+    writer.commit_matrix_cell::<Sample>(dirty)?;
+    writer.flush()?;
+    drop(writer);
+    let source = std::fs::read(&path)?;
+    let log = std::fs::read_dir(dir.path())?
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "vmg"))
+        .unwrap();
+    let suffix = log
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .strip_prefix("source.varve")
+        .unwrap();
+    for cut in (confirmed..=source.len()).step_by(16) {
+        let copy = dir.path().join(format!("cut-{cut}.varve"));
+        std::fs::write(&copy, &source[..cut])?;
+        std::fs::copy(&log, dir.path().join(format!("cut-{cut}.varve{suffix}")))?;
+        let reader = spec.open_reader(&copy)?;
+        assert_eq!(reader.read_matrix_cell::<Sample>(old)?.value, 1);
         assert_eq!(
-            reader.read_matrix_cell::<Sample>(fresh)?,
-            Sample { value: 99 }
+            reader.matrix_cell_status::<Sample>(dirty)?,
+            MatrixCellStatus::NotCommitted
+        );
+        let mut recovered = spec.open_writer(&copy)?;
+        assert_eq!(std::fs::metadata(&copy)?.len(), confirmed as u64);
+        recovered.write_matrix_cell(old, &Sample { value: 4 })?;
+        recovered.commit_matrix_cell::<Sample>(old)?;
+        recovered.sync()?;
+        assert_eq!(reader.read_matrix_cell::<Sample>(old)?.value, 1);
+        assert_eq!(
+            spec.open_reader(&copy)?
+                .read_matrix_cell::<Sample>(old)?
+                .value,
+            4
         );
     }
-    let cuts = (source.len() - append_start).div_ceil(16);
-    assert!(
-        opened * 2 > cuts,
-        "the writer reopen must succeed on most cuts, not skip them: \
-         {opened} of {cuts}",
-    );
     Ok(())
 }
 
@@ -1017,6 +954,7 @@ fn a_zero_valued_cell_can_be_committed() -> varve::Result<()> {
         writer.write_matrix_cell(chunked, &Sample { value: 0 })?;
         writer.commit_matrix_cell::<Sample>(chunked)?;
         writer.flush()?;
+        writer.sync()?;
     }
     let reader = growing_spec().open_reader(path.path())?;
     assert_eq!(
@@ -1056,8 +994,10 @@ fn write_then_flush_then_commit_keeps_the_write() -> varve::Result<()> {
         let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
         writer.write_matrix_cell(cell, &Sample { value: 33 })?;
         writer.flush()?;
+        writer.sync()?;
         writer.commit_matrix_cell::<Sample>(cell)?;
         writer.flush()?;
+        writer.sync()?;
     }
     let reader = growing_spec().open_reader(path.path())?;
     assert_eq!(
@@ -1091,12 +1031,15 @@ fn a_zero_valued_chunk_cell_commits_after_a_flush() -> varve::Result<()> {
 
     writer.write_matrix_cell(region, &Sample { value: 0 })?;
     writer.flush()?;
+    writer.sync()?;
     writer.commit_matrix_cell::<Sample>(region)?;
 
     writer.write_matrix_cell(chunked, &Sample { value: 0 })?;
     writer.flush()?;
+    writer.sync()?;
     writer.commit_matrix_cell::<Sample>(chunked)?;
     writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     let reader = growing_spec().open_reader(path.path())?;
@@ -1114,7 +1057,7 @@ fn a_zero_valued_chunk_cell_commits_after_a_flush() -> varve::Result<()> {
 }
 
 #[test]
-fn dropping_a_writer_writes_the_open_chunk() -> varve::Result<()> {
+fn dropping_a_writer_does_not_publish_the_open_chunk() -> varve::Result<()> {
     // Every other byte a writer accepts is on disk before the call returns; a
     // chunked cell was the one exception, and dropping the writer lost every
     // committed cell in the open chunk. Best effort — `drop` cannot report a
@@ -1129,8 +1072,8 @@ fn dropping_a_writer_writes_the_open_chunk() -> varve::Result<()> {
     }
     let reader = growing_spec().open_reader(path.path())?;
     assert_eq!(
-        reader.read_matrix_cell::<Sample>(cell)?,
-        Sample { value: 21 }
+        reader.matrix_cell_status::<Sample>(cell)?,
+        MatrixCellStatus::NotCommitted
     );
     Ok(())
 }
@@ -1145,6 +1088,7 @@ fn sync_makes_a_committed_chunked_cell_durable() -> varve::Result<()> {
     let mut writer = growing_spec().create_writer_with_dims(path.path(), dims())?;
     writer.write_matrix_cell(cell, &Sample { value: 12 })?;
     writer.commit_matrix_cell::<Sample>(cell)?;
+    writer.flush()?;
     writer.sync()?;
 
     let reader = growing_spec().open_readonly(path.path())?;
@@ -1216,6 +1160,7 @@ fn clearing_a_category_counts_the_open_chunk_and_refuses_a_written_one() -> varv
     writer.write_matrix_cell(chunked, &Sample { value: 3 })?;
     writer.commit_matrix_cell::<Sample>(chunked)?;
     writer.flush()?;
+    writer.sync()?;
     assert_eq!(writer.clear_matrix_category(Sample::CATEGORY)?, 1);
     assert_eq!(
         writer.matrix_cell_status::<Sample>(chunked)?,
@@ -1261,10 +1206,12 @@ fn the_bulk_clear_reaches_every_written_chunk_and_reaches_the_file() -> varve::R
         writer.write_matrix_cell(far, &Sample { value: 9 })?;
         writer.commit_matrix_cell::<Sample>(far)?;
         writer.flush()?;
+        writer.sync()?;
 
         // Three chunked cells plus the one that opened chunk 9.
         assert_eq!(writer.clear_matrix_category(Sample::CATEGORY)?, 4);
         writer.flush()?;
+        writer.sync()?;
     }
     let reader = growing_spec().open_reader(path.path())?;
     for cell in cells {
@@ -1295,6 +1242,7 @@ fn the_resume_signal_is_not_clean_over_an_open_chunk() -> varve::Result<()> {
         "an open chunk is unfinished work",
     );
     writer.flush()?;
+    writer.sync()?;
     assert_eq!(
         writer.matrix_resume_signal(Sample::CATEGORY)?,
         varve::MatrixResumeSignal::Clean,
@@ -1348,6 +1296,7 @@ fn an_unfilled_chunk_costs_its_whole_size() -> varve::Result<()> {
                 writer.commit_matrix_cell::<Sample>(cell)?;
             }
             writer.flush()?;
+            writer.sync()?;
         }
         sizes.push(std::fs::metadata(path.path())?.len());
     }
@@ -1374,6 +1323,7 @@ fn a_smaller_chunk_height_bounds_the_waste() -> varve::Result<()> {
             writer.write_matrix_cell(cell, &Sample { value: 1 })?;
             writer.commit_matrix_cell::<Sample>(cell)?;
             writer.flush()?;
+            writer.sync()?;
         }
         Ok(std::fs::metadata(path.path())?.len())
     }
@@ -1419,6 +1369,7 @@ fn a_chunked_read_does_not_pay_for_records_it_does_not_touch() -> varve::Result<
             writer.commit_matrix_cell::<Sample>(cell)?;
         }
         writer.flush()?;
+        writer.sync()?;
         Ok(())
     }
 
@@ -1518,6 +1469,7 @@ fn compressed_chunks_read_back_every_cell() -> varve::Result<()> {
             }
         }
         writer.flush()?;
+        writer.sync()?;
     }
     let reader = compressed_spec().open_reader(path.path())?;
     for row in 0..rows {
@@ -1556,6 +1508,7 @@ fn a_partly_filled_chunk_costs_less_when_compressed() -> varve::Result<()> {
                 }
             }
             writer.flush()?;
+            writer.sync()?;
         }
         Ok(std::fs::metadata(path)?.len())
     }
@@ -1598,6 +1551,7 @@ fn a_corrupted_compressed_sub_block_is_refused() -> varve::Result<()> {
             writer.commit_matrix_cell::<Sample>(at)?;
         }
         writer.flush()?;
+        writer.sync()?;
     }
     // Corrupt a byte inside the first compressed sub-block. zstd frames start
     // with the magic 0x28 0xB5 0x2F 0xFD, and the first one after the chunk
@@ -1651,6 +1605,7 @@ fn a_compressed_read_costs_one_sub_block_not_the_chunk() -> varve::Result<()> {
             writer.write_matrix_cell(MatrixKey::new(rows * 2, 0), &Sample { value: 1 })?;
             writer.commit_matrix_cell::<Sample>(MatrixKey::new(rows * 2, 0))?;
             writer.flush()?;
+            writer.sync()?;
         }
         let reader = spec.open_reader(path)?;
         reader.read_matrix_cell::<Sample>(cell)?;
@@ -1696,7 +1651,7 @@ fn a_compressed_read_costs_one_sub_block_not_the_chunk() -> varve::Result<()> {
 /// Overwrites `count` bytes at the byte offset `at` inside the file.
 fn patch(path: &Path, at: usize, bytes: &[u8]) -> varve::Result<()> {
     use std::io::{Seek, SeekFrom, Write};
-    let mut file = std::fs::OpenOptions::new()
+    let mut file = matrix_image::OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)?;
@@ -1723,6 +1678,7 @@ fn two_chunk_file(path: &Path) -> varve::Result<()> {
     writer.write_matrix_cell(key(ROWS_PER_CHUNK * 2, 0), &Sample { value: 6 })?;
     writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK * 2, 0))?;
     writer.flush()?;
+    writer.sync()?;
     Ok(())
 }
 
@@ -1745,6 +1701,7 @@ fn a_flipped_bit_in_a_written_chunk_is_refused_not_returned() -> varve::Result<(
         writer.write_matrix_cell(cell, &Sample { value: 0x1234_5678 })?;
         writer.commit_matrix_cell::<Sample>(cell)?;
         writer.flush()?;
+        writer.sync()?;
     }
     // Find the value in the written chunk and corrupt it in place.
     let bytes = std::fs::read(path.path())?;
@@ -1781,6 +1738,7 @@ fn a_format_without_integrity_stores_no_chunk_checksums() -> varve::Result<()> {
         writer.write_matrix_cell(key(ROWS_PER_CHUNK, 0), &Sample { value: 1 })?;
         writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0))?;
         writer.flush()?;
+        writer.sync()?;
     }
     let crc_len = std::fs::metadata(with_crc.path())?.len();
     let plain_len = std::fs::metadata(without.path())?.len();
@@ -1876,6 +1834,7 @@ fn a_chunk_written_under_a_different_rows_per_chunk_is_refused() -> varve::Resul
         writer.write_matrix_cell(key(ROWS_PER_CHUNK, 0), &Sample { value: 5 })?;
         writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0))?;
         writer.flush()?;
+        writer.sync()?;
     }
     // Same format, different chunk height. Opening is fine — the header does
     // not carry it — but reading a chunk must not reinterpret it. The key is
@@ -2012,6 +1971,7 @@ fn a_type_that_disagrees_with_the_schema_is_refused_on_a_chunked_row() -> varve:
         writer.commit_matrix_cell::<Sample>(key(row, 0))?;
     }
     writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     let reader = growing_spec().open_reader(path.path())?;
@@ -2053,6 +2013,7 @@ fn a_quarantined_category_refuses_a_chunked_row_as_it_refuses_a_region_row() -> 
         writer.commit_matrix_cell::<Marker>(key(row, 1))?;
     }
     writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     // Damage the commit map so the recovery pass quarantines the category. This
@@ -2117,6 +2078,7 @@ fn a_quarantined_category_refuses_the_category_clear() -> varve::Result<()> {
     writer.write_matrix_cell(key(0, 0), &Sample { value: 5 })?;
     writer.commit_matrix_cell::<Sample>(key(0, 0))?;
     writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     let map_off = commit_map_offset(path.path());
@@ -2146,6 +2108,7 @@ fn clearing_a_category_does_not_write_a_dead_chunk() -> varve::Result<()> {
     let cleared = writer.clear_matrix_category(Sample::CATEGORY)?;
     assert_eq!(cleared, 1, "the clear did not account for the chunked row");
     writer.flush()?;
+    writer.sync()?;
 
     // `dirty` used to survive the clear, so the flush written an
     // all-uncommitted chunk record -- and a written chunk refuses every later
@@ -2153,6 +2116,7 @@ fn clearing_a_category_does_not_write_a_dead_chunk() -> varve::Result<()> {
     writer.write_matrix_cell(key(ROWS_PER_CHUNK, 1), &Sample { value: 4 })?;
     writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 1))?;
     writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     let reader = growing_spec().open_reader(path.path())?;
@@ -2185,7 +2149,7 @@ fn commit_map_offset(path: &Path) -> u64 {
 
 fn patch_byte(path: &Path, offset: u64, value: u8) {
     use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
+    let mut file = matrix_image::OpenOptions::new()
         .write(true)
         .open(path)
         .expect("open matrix for mutation");
@@ -2228,6 +2192,7 @@ fn a_lazy_writer_refuses_a_chunked_row_instead_of_duplicating_its_record() -> va
         writer.write_matrix_cell(key(ROWS_PER_CHUNK * 2, 0), &Sample { value: 6 })?;
         writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK * 2, 0))?;
         writer.flush()?;
+        writer.sync()?;
     }
     {
         let (mut lazy, source) = VarveWriter::open_lazy_with_report(spec, path.path())?;
@@ -2273,11 +2238,13 @@ fn sync_after_a_chunk_write_leaves_the_digest_usable() -> varve::Result<()> {
     writer.write_matrix_cell(key(0, 0), &Sample { value: 1 })?;
     writer.commit_matrix_cell::<Sample>(key(0, 0))?;
     writer.flush()?;
+    writer.sync()?;
 
     // A committed chunked cell lives in RAM until its chunk is written, and
     // `sync` is what writes out it here.
     writer.write_matrix_cell(key(ROWS_PER_CHUNK, 0), &Sample { value: 2 })?;
     writer.commit_matrix_cell::<Sample>(key(ROWS_PER_CHUNK, 0))?;
+    writer.flush()?;
     writer.sync()?;
     drop(writer);
 

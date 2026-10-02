@@ -62,6 +62,18 @@ Implement the first stable core of Varve: a Rust workspace that can define typed
 - Files whose static spec contains matrix blocks store a 24-byte `VMNC`
   creation-nonce region and then a `VMAT` layout region immediately after the
   normal Varve file header.
+- Matrix offsets are logical offsets. The primary contains the immutable base
+  layout; changes are stored in the required `<primary>.<nonce>.vmg` companion
+  (`VARVEMG1`). A root maps 4096-byte logical pages through a fixed-radix directory
+  to immutable physical pages. Checksummed alternating heads publish a generation,
+  root and confirmed native-log EOF. Head offsets 8, 16, 24, 32 and 40 contain
+  little-endian u64 generation, root, companion end, native EOF and compaction
+  epoch respectively; the head CRC covers them all. The epoch starts at zero,
+  increments only on explicit companion compaction, and survives subsequent
+  normal publications. Readers diff roots within one epoch and rebuild metadata
+  only when the epoch changes. `flush()` does not publish; `sync()` does.
+  All matrix reads use the captured root until explicit `follow()`. The companion
+  is persistent data and must accompany the primary in backups and moves.
 - `VMAT` layout version 4 stores runtime dimensions, matrix block layout,
   commit bitmap offsets, slot region offsets, derived static aux region
   placement, optional offset-table metadata, region CRC metadata,

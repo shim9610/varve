@@ -1,4 +1,3 @@
-#![cfg(feature = "high-cardinality-dev")]
 //! F-12 — asking a record "is this your key?" built the key to answer.
 //!
 //! `VarveKeyedBlock::key` clones every key field, and the disk-index verify

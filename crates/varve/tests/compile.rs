@@ -52,7 +52,10 @@ fn macro_compile_contracts() {
     tests.pass("tests/ui/pass_policies.rs");
     tests.pass("tests/ui/pass_format_dsl.rs");
     tests.pass("tests/ui/pass_matrix_aux.rs");
+    tests.compile_fail("tests/ui/fail_share_matrix_reader.rs");
+    tests.compile_fail("tests/ui/fail_share_generated_matrix_reader.rs");
     tests.pass("tests/ui/pass_layout.rs");
+    tests.compile_fail("tests/ui/fail_share_generated_layout_reader.rs");
     tests.pass("tests/ui/pass_macro_hygiene.rs");
     tests.pass("tests/ui/pass_read_limits.rs");
     tests.pass("tests/ui/pass_optional_partial_limits.rs");
@@ -97,11 +100,8 @@ fn macro_compile_contracts() {
     tests.compile_fail("tests/ui/fail_container_codec_missing_schema_id.rs");
     tests.compile_fail("tests/ui/fail_keyed_contradiction.rs");
     tests.compile_fail("tests/ui/fail_keyed_contradiction_merge.rs");
-    #[cfg(not(feature = "high-cardinality-dev"))]
-    tests.compile_fail("tests/ui/fail_key_index_requires_feature.rs");
 }
 
-#[cfg(feature = "high-cardinality-dev")]
 #[test]
 fn high_cardinality_compile_contracts() {
     if ui_snapshots_skipped() {
@@ -110,6 +110,10 @@ fn high_cardinality_compile_contracts() {
     }
     let tests = trybuild::TestCases::new();
     tests.pass("tests/ui/pass_high_cardinality_macro.rs");
+    tests.compile_fail("tests/ui/fail_send_stream_cursors.rs");
+    tests.compile_fail("tests/ui/fail_share_stream_reader.rs");
+    tests.compile_fail("tests/ui/fail_share_indexed_reader.rs");
+    tests.compile_fail("tests/ui/fail_share_generated_readers.rs");
     tests.pass("tests/ui/pass_petabyte_plan_batch.rs");
     tests.compile_fail("tests/ui/fail_key_index_matrix.rs");
     tests.compile_fail("tests/ui/fail_key_index_value.rs");

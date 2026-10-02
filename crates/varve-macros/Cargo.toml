@@ -12,24 +12,9 @@ documentation = "https://docs.rs/varve-macros"
 # directory because `include` cannot reference paths outside the package.
 readme = "../../README.md"
 
-# F-06: see the note in `crates/varve-core/Cargo.toml`. This crate's only
-# optional feature changes what the macros GENERATE rather than what they
-# export, so the documented surface is the same either way; the setting is
-# declared anyway so all three published crates state their docs.rs surface
-# explicitly instead of two of them stating it and one inheriting a default.
+# Keep the documented facade surface consistent across the published crates.
 [package.metadata.docs.rs]
 all-features = true
-
-[features]
-default = []
-# The dev-dependency edge keeps the doctests consistent with the code this
-# feature makes the macro GENERATE: with `high-cardinality-dev` on, every
-# expanded format emits scalable stream/indexed APIs, which only exist in the
-# facade when its matching feature is on too. Without this the `varve_format!`
-# doctest fails under `-p varve-macros --all-features`. It adds nothing to a
-# normal build — `varve` is a dev-dependency, so this cannot pull the facade
-# into the published dependency graph.
-high-cardinality-dev = ["varve/high-cardinality-dev"]
 
 [lib]
 proc-macro = true
@@ -54,7 +39,7 @@ proc-macro = true
 varve = { path = "../varve" }
 
 [dependencies]
-proc-macro-crate = "3.4.0"
+proc-macro-crate = "3.5.0"
 proc-macro2.workspace = true
 quote.workspace = true
 syn.workspace = true

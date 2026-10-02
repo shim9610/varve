@@ -1,0 +1,417 @@
+error[E0277]: `std::cell::Cell<()>` cannot be shared between threads safely
+  --> tests/ui/fail_share_generated_readers.rs:15:24
+   |
+15 |       std::thread::spawn(move || {
+   |  _____------------------_^
+   | |     |
+   | |     required by a bound introduced by this call
+16 | |         let _ = reader.events();
+17 | |     });
+   | |_____^ `std::cell::Cell<()>` cannot be shared between threads safely
+   |
+   = help: within `ThreadOwnedStreamReader`, the trait `Sync` is not implemented for `std::cell::Cell<()>`
+   = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
+note: required because it appears within the type `PhantomData<std::cell::Cell<()>>`
+  --> $RUST/core/src/marker.rs
+note: required because it appears within the type `VarveStreamReader`
+  --> $WORKSPACE/crates/varve-core/src/stream.rs
+   |
+   | pub struct VarveStreamReader {
+   |            ^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `ThreadOwnedStreamReader`
+  --> tests/ui/fail_share_generated_readers.rs:5:16
+   |
+ 5 |     pub format ThreadOwned {
+   |                ^^^^^^^^^^^
+   = note: required for `Arc<ThreadOwnedStreamReader>` to implement `Send`
+note: required because it's used within this closure
+  --> tests/ui/fail_share_generated_readers.rs:15:24
+   |
+15 |     std::thread::spawn(move || {
+   |                        ^^^^^^^
+note: required by a bound in `spawn`
+  --> $RUST/std/src/thread/functions.rs
+
+error[E0277]: `RefCell<varve_core::disk_index::tree::Cache>` cannot be shared between threads safely
+  --> tests/ui/fail_share_generated_readers.rs:15:24
+   |
+15 |       std::thread::spawn(move || {
+   |  _____------------------_^
+   | |     |
+   | |     required by a bound introduced by this call
+16 | |         let _ = reader.events();
+17 | |     });
+   | |_____^ `RefCell<varve_core::disk_index::tree::Cache>` cannot be shared between threads safely
+   |
+   = help: within `ThreadOwnedStreamReader`, the trait `Sync` is not implemented for `RefCell<varve_core::disk_index::tree::Cache>`
+   = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` instead
+note: required because it appears within the type `varve_core::disk_index::tree::Reader`
+  --> $WORKSPACE/crates/varve-core/src/disk_index/tree.rs
+   |
+   | pub(super) struct Reader {
+   |                   ^^^^^^
+note: required because it appears within the type `varve_core::disk_index::storage::Reader`
+  --> $WORKSPACE/crates/varve-core/src/disk_index/storage.rs
+   |
+   | pub(super) struct Reader {
+   |                   ^^^^^^
+note: required because it appears within the type `varve_core::disk_index::SnapshotPin`
+  --> $WORKSPACE/crates/varve-core/src/disk_index.rs
+   |
+   | struct SnapshotPin {
+   |        ^^^^^^^^^^^
+note: required because it appears within the type `Option<varve_core::disk_index::SnapshotPin>`
+  --> $RUST/core/src/option.rs
+note: required because it appears within the type `varve_core::disk_index::DiskIndexSnapshot`
+  --> $WORKSPACE/crates/varve-core/src/disk_index.rs
+   |
+   | pub struct DiskIndexSnapshot {
+   |            ^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `varve_core::stream::StreamReaderState`
+  --> $WORKSPACE/crates/varve-core/src/stream.rs
+   |
+   | struct StreamReaderState {
+   |        ^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `Option<varve_core::stream::StreamReaderState>`
+  --> $RUST/core/src/option.rs
+note: required because it appears within the type `VarveStreamReader`
+  --> $WORKSPACE/crates/varve-core/src/stream.rs
+   |
+   | pub struct VarveStreamReader {
+   |            ^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `ThreadOwnedStreamReader`
+  --> tests/ui/fail_share_generated_readers.rs:5:16
+   |
+ 5 |     pub format ThreadOwned {
+   |                ^^^^^^^^^^^
+   = note: required for `Arc<ThreadOwnedStreamReader>` to implement `Send`
+note: required because it's used within this closure
+  --> tests/ui/fail_share_generated_readers.rs:15:24
+   |
+15 |     std::thread::spawn(move || {
+   |                        ^^^^^^^
+note: required by a bound in `spawn`
+  --> $RUST/std/src/thread/functions.rs
+
+error[E0277]: `RefCell<Option<varve_core::disk_index::slots::Directory>>` cannot be shared between threads safely
+  --> tests/ui/fail_share_generated_readers.rs:15:24
+   |
+15 |       std::thread::spawn(move || {
+   |  _____------------------_^
+   | |     |
+   | |     required by a bound introduced by this call
+16 | |         let _ = reader.events();
+17 | |     });
+   | |_____^ `RefCell<Option<varve_core::disk_index::slots::Directory>>` cannot be shared between threads safely
+   |
+   = help: within `ThreadOwnedStreamReader`, the trait `Sync` is not implemented for `RefCell<Option<varve_core::disk_index::slots::Directory>>`
+   = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` instead
+note: required because it appears within the type `varve_core::disk_index::slots::Reader`
+  --> $WORKSPACE/crates/varve-core/src/disk_index/slots.rs
+   |
+   | pub(super) struct Reader {
+   |                   ^^^^^^
+note: required because it appears within the type `varve_core::disk_index::storage::Reader`
+  --> $WORKSPACE/crates/varve-core/src/disk_index/storage.rs
+   |
+   | pub(super) struct Reader {
+   |                   ^^^^^^
+note: required because it appears within the type `varve_core::disk_index::SnapshotPin`
+  --> $WORKSPACE/crates/varve-core/src/disk_index.rs
+   |
+   | struct SnapshotPin {
+   |        ^^^^^^^^^^^
+note: required because it appears within the type `Option<varve_core::disk_index::SnapshotPin>`
+  --> $RUST/core/src/option.rs
+note: required because it appears within the type `varve_core::disk_index::DiskIndexSnapshot`
+  --> $WORKSPACE/crates/varve-core/src/disk_index.rs
+   |
+   | pub struct DiskIndexSnapshot {
+   |            ^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `varve_core::stream::StreamReaderState`
+  --> $WORKSPACE/crates/varve-core/src/stream.rs
+   |
+   | struct StreamReaderState {
+   |        ^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `Option<varve_core::stream::StreamReaderState>`
+  --> $RUST/core/src/option.rs
+note: required because it appears within the type `VarveStreamReader`
+  --> $WORKSPACE/crates/varve-core/src/stream.rs
+   |
+   | pub struct VarveStreamReader {
+   |            ^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `ThreadOwnedStreamReader`
+  --> tests/ui/fail_share_generated_readers.rs:5:16
+   |
+ 5 |     pub format ThreadOwned {
+   |                ^^^^^^^^^^^
+   = note: required for `Arc<ThreadOwnedStreamReader>` to implement `Send`
+note: required because it's used within this closure
+  --> tests/ui/fail_share_generated_readers.rs:15:24
+   |
+15 |     std::thread::spawn(move || {
+   |                        ^^^^^^^
+note: required by a bound in `spawn`
+  --> $RUST/std/src/thread/functions.rs
+
+error[E0277]: `RefCell<varve_core::disk_index::slots::Cache>` cannot be shared between threads safely
+  --> tests/ui/fail_share_generated_readers.rs:15:24
+   |
+15 |       std::thread::spawn(move || {
+   |  _____------------------_^
+   | |     |
+   | |     required by a bound introduced by this call
+16 | |         let _ = reader.events();
+17 | |     });
+   | |_____^ `RefCell<varve_core::disk_index::slots::Cache>` cannot be shared between threads safely
+   |
+   = help: within `ThreadOwnedStreamReader`, the trait `Sync` is not implemented for `RefCell<varve_core::disk_index::slots::Cache>`
+   = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` instead
+note: required because it appears within the type `varve_core::disk_index::slots::Reader`
+  --> $WORKSPACE/crates/varve-core/src/disk_index/slots.rs
+   |
+   | pub(super) struct Reader {
+   |                   ^^^^^^
+note: required because it appears within the type `varve_core::disk_index::storage::Reader`
+  --> $WORKSPACE/crates/varve-core/src/disk_index/storage.rs
+   |
+   | pub(super) struct Reader {
+   |                   ^^^^^^
+note: required because it appears within the type `varve_core::disk_index::SnapshotPin`
+  --> $WORKSPACE/crates/varve-core/src/disk_index.rs
+   |
+   | struct SnapshotPin {
+   |        ^^^^^^^^^^^
+note: required because it appears within the type `Option<varve_core::disk_index::SnapshotPin>`
+  --> $RUST/core/src/option.rs
+note: required because it appears within the type `varve_core::disk_index::DiskIndexSnapshot`
+  --> $WORKSPACE/crates/varve-core/src/disk_index.rs
+   |
+   | pub struct DiskIndexSnapshot {
+   |            ^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `varve_core::stream::StreamReaderState`
+  --> $WORKSPACE/crates/varve-core/src/stream.rs
+   |
+   | struct StreamReaderState {
+   |        ^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `Option<varve_core::stream::StreamReaderState>`
+  --> $RUST/core/src/option.rs
+note: required because it appears within the type `VarveStreamReader`
+  --> $WORKSPACE/crates/varve-core/src/stream.rs
+   |
+   | pub struct VarveStreamReader {
+   |            ^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `ThreadOwnedStreamReader`
+  --> tests/ui/fail_share_generated_readers.rs:5:16
+   |
+ 5 |     pub format ThreadOwned {
+   |                ^^^^^^^^^^^
+   = note: required for `Arc<ThreadOwnedStreamReader>` to implement `Send`
+note: required because it's used within this closure
+  --> tests/ui/fail_share_generated_readers.rs:15:24
+   |
+15 |     std::thread::spawn(move || {
+   |                        ^^^^^^^
+note: required by a bound in `spawn`
+  --> $RUST/std/src/thread/functions.rs
+
+error[E0277]: `std::cell::Cell<()>` cannot be shared between threads safely
+  --> tests/ui/fail_share_generated_readers.rs:21:24
+   |
+21 |       std::thread::spawn(move || {
+   |  _____------------------_^
+   | |     |
+   | |     required by a bound introduced by this call
+22 | |         let _ = reader.get_item(&0);
+23 | |     });
+   | |_____^ `std::cell::Cell<()>` cannot be shared between threads safely
+   |
+   = help: within `ThreadOwnedIndexedReader`, the trait `Sync` is not implemented for `std::cell::Cell<()>`
+   = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
+note: required because it appears within the type `PhantomData<std::cell::Cell<()>>`
+  --> $RUST/core/src/marker.rs
+note: required because it appears within the type `VarveStreamReader`
+  --> $WORKSPACE/crates/varve-core/src/stream.rs
+   |
+   | pub struct VarveStreamReader {
+   |            ^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `VarveIndexedReader`
+  --> $WORKSPACE/crates/varve-core/src/indexed.rs
+   |
+   | pub struct VarveIndexedReader {
+   |            ^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `ThreadOwnedIndexedReader`
+  --> tests/ui/fail_share_generated_readers.rs:5:16
+   |
+ 5 |     pub format ThreadOwned {
+   |                ^^^^^^^^^^^
+   = note: required for `Arc<ThreadOwnedIndexedReader>` to implement `Send`
+note: required because it's used within this closure
+  --> tests/ui/fail_share_generated_readers.rs:21:24
+   |
+21 |     std::thread::spawn(move || {
+   |                        ^^^^^^^
+note: required by a bound in `spawn`
+  --> $RUST/std/src/thread/functions.rs
+
+error[E0277]: `RefCell<varve_core::disk_index::tree::Cache>` cannot be shared between threads safely
+  --> tests/ui/fail_share_generated_readers.rs:21:24
+   |
+21 |       std::thread::spawn(move || {
+   |  _____------------------_^
+   | |     |
+   | |     required by a bound introduced by this call
+22 | |         let _ = reader.get_item(&0);
+23 | |     });
+   | |_____^ `RefCell<varve_core::disk_index::tree::Cache>` cannot be shared between threads safely
+   |
+   = help: within `ThreadOwnedIndexedReader`, the trait `Sync` is not implemented for `RefCell<varve_core::disk_index::tree::Cache>`
+   = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` instead
+note: required because it appears within the type `varve_core::disk_index::tree::Reader`
+  --> $WORKSPACE/crates/varve-core/src/disk_index/tree.rs
+   |
+   | pub(super) struct Reader {
+   |                   ^^^^^^
+note: required because it appears within the type `varve_core::disk_index::storage::Reader`
+  --> $WORKSPACE/crates/varve-core/src/disk_index/storage.rs
+   |
+   | pub(super) struct Reader {
+   |                   ^^^^^^
+note: required because it appears within the type `varve_core::disk_index::SnapshotPin`
+  --> $WORKSPACE/crates/varve-core/src/disk_index.rs
+   |
+   | struct SnapshotPin {
+   |        ^^^^^^^^^^^
+note: required because it appears within the type `Option<varve_core::disk_index::SnapshotPin>`
+  --> $RUST/core/src/option.rs
+note: required because it appears within the type `varve_core::disk_index::DiskIndexSnapshot`
+  --> $WORKSPACE/crates/varve-core/src/disk_index.rs
+   |
+   | pub struct DiskIndexSnapshot {
+   |            ^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `VarveIndexedReader`
+  --> $WORKSPACE/crates/varve-core/src/indexed.rs
+   |
+   | pub struct VarveIndexedReader {
+   |            ^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `ThreadOwnedIndexedReader`
+  --> tests/ui/fail_share_generated_readers.rs:5:16
+   |
+ 5 |     pub format ThreadOwned {
+   |                ^^^^^^^^^^^
+   = note: required for `Arc<ThreadOwnedIndexedReader>` to implement `Send`
+note: required because it's used within this closure
+  --> tests/ui/fail_share_generated_readers.rs:21:24
+   |
+21 |     std::thread::spawn(move || {
+   |                        ^^^^^^^
+note: required by a bound in `spawn`
+  --> $RUST/std/src/thread/functions.rs
+
+error[E0277]: `RefCell<Option<varve_core::disk_index::slots::Directory>>` cannot be shared between threads safely
+  --> tests/ui/fail_share_generated_readers.rs:21:24
+   |
+21 |       std::thread::spawn(move || {
+   |  _____------------------_^
+   | |     |
+   | |     required by a bound introduced by this call
+22 | |         let _ = reader.get_item(&0);
+23 | |     });
+   | |_____^ `RefCell<Option<varve_core::disk_index::slots::Directory>>` cannot be shared between threads safely
+   |
+   = help: within `ThreadOwnedIndexedReader`, the trait `Sync` is not implemented for `RefCell<Option<varve_core::disk_index::slots::Directory>>`
+   = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` instead
+note: required because it appears within the type `varve_core::disk_index::slots::Reader`
+  --> $WORKSPACE/crates/varve-core/src/disk_index/slots.rs
+   |
+   | pub(super) struct Reader {
+   |                   ^^^^^^
+note: required because it appears within the type `varve_core::disk_index::storage::Reader`
+  --> $WORKSPACE/crates/varve-core/src/disk_index/storage.rs
+   |
+   | pub(super) struct Reader {
+   |                   ^^^^^^
+note: required because it appears within the type `varve_core::disk_index::SnapshotPin`
+  --> $WORKSPACE/crates/varve-core/src/disk_index.rs
+   |
+   | struct SnapshotPin {
+   |        ^^^^^^^^^^^
+note: required because it appears within the type `Option<varve_core::disk_index::SnapshotPin>`
+  --> $RUST/core/src/option.rs
+note: required because it appears within the type `varve_core::disk_index::DiskIndexSnapshot`
+  --> $WORKSPACE/crates/varve-core/src/disk_index.rs
+   |
+   | pub struct DiskIndexSnapshot {
+   |            ^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `VarveIndexedReader`
+  --> $WORKSPACE/crates/varve-core/src/indexed.rs
+   |
+   | pub struct VarveIndexedReader {
+   |            ^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `ThreadOwnedIndexedReader`
+  --> tests/ui/fail_share_generated_readers.rs:5:16
+   |
+ 5 |     pub format ThreadOwned {
+   |                ^^^^^^^^^^^
+   = note: required for `Arc<ThreadOwnedIndexedReader>` to implement `Send`
+note: required because it's used within this closure
+  --> tests/ui/fail_share_generated_readers.rs:21:24
+   |
+21 |     std::thread::spawn(move || {
+   |                        ^^^^^^^
+note: required by a bound in `spawn`
+  --> $RUST/std/src/thread/functions.rs
+
+error[E0277]: `RefCell<varve_core::disk_index::slots::Cache>` cannot be shared between threads safely
+  --> tests/ui/fail_share_generated_readers.rs:21:24
+   |
+21 |       std::thread::spawn(move || {
+   |  _____------------------_^
+   | |     |
+   | |     required by a bound introduced by this call
+22 | |         let _ = reader.get_item(&0);
+23 | |     });
+   | |_____^ `RefCell<varve_core::disk_index::slots::Cache>` cannot be shared between threads safely
+   |
+   = help: within `ThreadOwnedIndexedReader`, the trait `Sync` is not implemented for `RefCell<varve_core::disk_index::slots::Cache>`
+   = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` instead
+note: required because it appears within the type `varve_core::disk_index::slots::Reader`
+  --> $WORKSPACE/crates/varve-core/src/disk_index/slots.rs
+   |
+   | pub(super) struct Reader {
+   |                   ^^^^^^
+note: required because it appears within the type `varve_core::disk_index::storage::Reader`
+  --> $WORKSPACE/crates/varve-core/src/disk_index/storage.rs
+   |
+   | pub(super) struct Reader {
+   |                   ^^^^^^
+note: required because it appears within the type `varve_core::disk_index::SnapshotPin`
+  --> $WORKSPACE/crates/varve-core/src/disk_index.rs
+   |
+   | struct SnapshotPin {
+   |        ^^^^^^^^^^^
+note: required because it appears within the type `Option<varve_core::disk_index::SnapshotPin>`
+  --> $RUST/core/src/option.rs
+note: required because it appears within the type `varve_core::disk_index::DiskIndexSnapshot`
+  --> $WORKSPACE/crates/varve-core/src/disk_index.rs
+   |
+   | pub struct DiskIndexSnapshot {
+   |            ^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `VarveIndexedReader`
+  --> $WORKSPACE/crates/varve-core/src/indexed.rs
+   |
+   | pub struct VarveIndexedReader {
+   |            ^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `ThreadOwnedIndexedReader`
+  --> tests/ui/fail_share_generated_readers.rs:5:16
+   |
+ 5 |     pub format ThreadOwned {
+   |                ^^^^^^^^^^^
+   = note: required for `Arc<ThreadOwnedIndexedReader>` to implement `Send`
+note: required because it's used within this closure
+  --> tests/ui/fail_share_generated_readers.rs:21:24
+   |
+21 |     std::thread::spawn(move || {
+   |                        ^^^^^^^
+note: required by a bound in `spawn`
+  --> $RUST/std/src/thread/functions.rs

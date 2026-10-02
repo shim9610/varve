@@ -9,17 +9,19 @@ license = "MIT OR Apache-2.0"
 cargo-fuzz = true
 
 [dependencies]
+redb = { version = "4.3.0", path = "../vendor/redb" }
 libfuzzer-sys = "0.4"
 tempfile = "3"
 
 [dependencies.varve]
 path = "../crates/varve"
-version = "0.9.2"
-features = ["integrity", "mmap", "zero-copy", "compression-zstd", "high-cardinality-dev"]
+version = "0.10.0"
+features = ["integrity", "mmap", "zero-copy", "compression-zstd"]
 
 # Use independent workspace for fuzzers
 [workspace]
 members = ["."]
+
 
 [[bin]]
 name = "native_arbitrary"
@@ -80,6 +82,20 @@ bench = false
 [[bin]]
 name = "sidecar_state_machine"
 path = "fuzz_targets/sidecar_state_machine.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_redb_differential"
+path = "fuzz_targets/native_redb_differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "matrix_state_machine"
+path = "fuzz_targets/matrix_state_machine.rs"
 test = false
 doc = false
 bench = false

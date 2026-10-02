@@ -237,11 +237,8 @@ Three consequences are part of the residency declaration:
   open and is authoritative for which pages hold state, so "not cached" and "not
   published" stay distinct. An index that cannot be enumerated in full is a fatal
   finding at open.
-* A page's contents are as of the first touch that faulted it in, not as of
-  open, so pages not yet faulted in have no snapshot pinned. A reader that needs
-  one consistent instant across a whole map must coordinate that itself; no
-  residency bound provides it, because one that pinned the whole live set would be
-  the eager load this design removed.
+* Cache misses and evictions preserve the captured confirmed generation.
+  Only `follow(&mut self)` adopts later published pages.
 
 ### MatrixMetadataVerification
 
@@ -427,8 +424,7 @@ resident index size; use `ReadLimits::UNTRUSTED` for input you did not produce.
 see [Known Limitations](known-limitations.md).
 
 The petabyte-scale path is [Scalable Stream And Indexed
-Handles](#scalable-stream-and-indexed-handles) below, behind
-`high-cardinality-dev`. `VarveReader` is a snapshot as of its own open: records
+Handles](#scalable-stream-and-indexed-handles) below, available by default. `VarveReader` is a snapshot as of its own open: records
 another handle appends afterwards are not visible until it advances with
 `follow()` or is reopened. See
 [Known Limitations §2.1](known-limitations.md#21-varvefile-scans-the-whole-file-at-open-and-holds-a-record-index).
@@ -840,9 +836,11 @@ region would move.
 
 ## Scalable Stream And Indexed Handles
 
-The experimental `high-cardinality-dev` feature generates a second handle
+The default `varve_format!` expansion generates a stream/indexed handle
 family for files whose open/append memory and I/O cost must be independent of
-total file bytes, record count, and key cardinality.
+total file bytes, record count, and key cardinality. Generated indexed handles
+require at least one block declaring `key_index = disk`; this is a schema
+condition, not a Cargo feature.
 
 | Generated API | Meaning |
 | --- | --- |
@@ -952,7 +950,7 @@ equal-length primary of the same format is refused at open with
 `VarveFile` carries no nonce and is protected only by the weaker
 content-window witness over its leading bytes.
 
-With `high-cardinality-dev`, manual `VarveBlock` implementations must state
+Manual `VarveBlock` implementations must state
 `IS_KEYED` explicitly. This is a compile-time chain-safety requirement; macro
 generated blocks already provide the exact value.
 
@@ -1082,7 +1080,7 @@ self-test keyed case — evaluates `KeyedBlockContract::<T>::OK`, turning an
 `impl VarveKeyedBlock` with `IS_KEYED = false` into a post-monomorphization
 compile error. First-seen registration remains the runtime backstop and also
 rejects a keyedness disagreement for the same block id
-(`Error::BlockKeyednessMismatch`). Under `high-cardinality-dev` manual
+(`Error::BlockKeyednessMismatch`). Manual
 implementations must state `IS_KEYED` explicitly (no chain-unsafe default).
 
 ## Matrix API
@@ -1161,21 +1159,18 @@ and 1.43x; no Unix throughput has ever been published, and the `#[ignore]`d
 threshold has never been run on Unix. See
 [Known Limitations §6.1](known-limitations.md#61-the-unix-code-paths-and-what-the-first-linux-run-found).
 
-There is one lock in the read path, stated because its absence used to be the
-claim: each commit bitmap holds a `Mutex` over its page map, so that a demand
-fault-in (see `MatrixMetadataResidency` above) can happen under `&self`. It is
-taken only for `O(1)` map operations and **never held across I/O** — a fault-in
-releases it for the read, so two threads faulting the same page duplicate a
-4 KiB read rather than queueing. Session-only maps (a writer's current-write map,
-a rebuilt map) have no backing to fault from, so there the lock only ever guards a
-hash lookup.
+Matrix readers are `Send + !Sync`, with one reader and private caches per
+thread. Bitmap caches use owner-local `RefCell`; there is no bitmap mutex or
+shared Windows handle registry. Queries take `&self`. Each query reads the
+captured confirmed generation, including cache misses. `follow(&mut self)` adopts
+a later generation explicitly. Old readers never delay publication or compaction.
 
-Visibility follows the demand path: a page's contents are as of the first touch
-that faulted it in, not as of open. Before 0.5.0 the `EagerVerified` residency
-policy snapshotted every published page at open and a reader saw the commit state
-as of its own open; that policy is gone, and with it that guarantee — a reader
-needing one consistent instant across a whole map must coordinate it, because the
-only mechanism that provided it was whole-live-set residency.
+The generation page cache defaults to 2 MiB and is configured at open with
+`ReadLimits::with_matrix_generation_cache_bytes(bytes)` (zero disables it).
+It is separate from the per-bitmap residency budget. `matrix_generation()` exposes
+the captured generation and `matrix_generation_path()` names the required `.vmg`
+companion. `compact_matrix()` on a synced writer reclaims obsolete matrix pages
+without invalidating existing readers. See [durability](durability-model.md).
 
 | API | Meaning |
 | --- | --- |
@@ -1278,14 +1273,11 @@ of conflating unavailable evidence with `NotCommitted`; writes reject the catego
 until recovery; and `matrix_resume_signal` / `matrix_sidecar_resume_signal` refuse
 it as well, where before 0.5.0 they answered `Clean` from the replacement map.
 
-An overwrite withdraws the old commit and CRC-valid evidence before touching
-slot bytes. A partial I/O failure therefore leaves the slot uncommitted and
-poisons the writer; successful replacement becomes readable only after a new
-commit. The matrix *layout* is snapshotted on open; commit maps are **not** — since
-0.5.0 each commit-map page is as of the first read that faulted it in — and slot
-bytes are in-place storage. Do not overlap a reader with writes to slots it may read.
-Immutable concurrent matrix snapshots require a future generation/version or
-read-lease design and are not promised by VMAT v4.
+An overwrite withdraws evidence only in the writer's working pages. Published
+payloads and metadata remain immutable. Partial writes poison the writer;
+readers retain their confirmed generation. `sync()` and explicit Immediate
+publish the new pages; `flush()` or dropping the writer does not. Readers may
+safely overlap writes to the same cells, using a separate reader per thread.
 
 When recovery finds a `Fatal` matrix finding (for example a metadata CRC
 mismatch), default matrix access is fail-closed: every default read, write, aux,
@@ -1688,19 +1680,20 @@ survives.
 
 | Feature | Enables | Stability |
 | --- | --- | --- |
-| `integrity` | CRC32 integrity and matrix/sidecar CRC checks | stable |
+| `integrity` | record and matrix cell/commit-map CRC checks | stable |
 | `compression-zstd` | zstd record compression | stable |
 | `mmap` | mmap payload/matrix views | stable, `unsafe` entry points |
 | `zero-copy` | raw mmap views; implies `mmap` | stable, `unsafe` entry points |
-| `high-cardinality-dev` | disk-backed index, streaming and indexed handles, scan-control | **experimental**: the surface and the sidecar layout may change without a major version |
-| `scalable-fault-injection` | fault-injection counters and hooks for the scalable-path tests; implies `high-cardinality-dev` | **test infrastructure**: not a production feature; the counters it exposes are `#[doc(hidden)]` |
+| `scalable-fault-injection` | fault-injection counters and hooks for the scalable-path tests | **test infrastructure**: not a production feature; the counters it exposes are `#[doc(hidden)]` |
 
-All features are off by default. `high-cardinality-dev` and
-`scalable-fault-injection` are listed because they are exported and therefore
-reachable, not because they are recommended: the first is explicitly
-experimental and the second exists to let the test suite inject faults and read
-counters. Neither is covered by the stability expectations the rest of this
-document assumes.
+Generation-store page and checkpoint checksums remain active in every build.
+All optional features are off by default. Resident, matrix, stream/indexed,
+disk-key and scan-control APIs require no Cargo feature, even when using
+`default-features = false`. `high-cardinality-dev` was removed in the 0.10.0
+development tree; delete that entry from dependency feature lists.
+`scalable-fault-injection` remains test infrastructure, outside normal API
+stability expectations. The storage APIs themselves follow the same pre-1.0
+minor-version policy as the rest of the library.
 
 ## Common Error Interpretation
 

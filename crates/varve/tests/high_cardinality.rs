@@ -1,5 +1,3 @@
-#![cfg(feature = "high-cardinality-dev")]
-
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -370,10 +368,33 @@ fn cancelled_bootstrap_and_rebuild_publish_nothing() -> varve::Result<()> {
 }
 
 #[test]
-#[ignore = "one-million-key RSS/allocator stress probe"]
+#[ignore = "one-million-key allocator stress probe; run alone with --test-threads=1"]
 fn million_unique_keys_keep_varve_resident_maps_empty() -> varve::Result<()> {
+    cardinality_profile(1_000_000).map(|_| ())
+}
+
+#[test]
+#[ignore = "10k/100k/1m memory growth gate; run alone with --test-threads=1"]
+fn cardinality_growth_respects_memory_budget() -> varve::Result<()> {
+    let small = cardinality_profile(10_000)?;
+    let medium = cardinality_profile(100_000)?;
+    let large = cardinality_profile(1_000_000)?;
+    // A finite acceptance budget, not a proof of asymptotic complexity. Each
+    // profile includes database creation, ingestion, sync, reopen and lookups.
+    // Fixed cache (8 MiB) and batch limits must not mask per-key resident maps.
+    for peak in [medium, large] {
+        assert!(
+            peak <= small + 16 * 1024 * 1024,
+            "heap peak grew by more than 16 MiB from 10k keys: small={small}, larger={peak}"
+        );
+    }
+    Ok(())
+}
+
+fn cardinality_profile(records: u32) -> varve::Result<usize> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("million.varve");
+    let baseline = begin_allocation_window();
     let mut writer = CardinalityFormat::create_indexed_writer(
         &path,
         DiskIndexOptions {
@@ -381,20 +402,19 @@ fn million_unique_keys_keep_varve_resident_maps_empty() -> varve::Result<()> {
             ..DiskIndexOptions::default()
         },
     )?;
-    let baseline = begin_allocation_window();
     let append_started = Instant::now();
     let report = writer
         .push_frames(
-            (0..1_000_000u32).map(|key| Frame {
+            (0..records).map(|key| Frame {
                 scan: key / 1000,
                 frame: key,
-                payload: Vec::new(),
+                payload: key.to_le_bytes().to_vec(),
             }),
             BatchOptions::default(),
         )
         .map_err(|error| error.source)?;
-    assert_eq!(report.records, 1_000_000);
-    assert!(report.write_calls <= 62);
+    assert_eq!(report.records, u64::from(records));
+    assert!(report.write_calls <= u64::from(records.div_ceil(16_384)));
     let append_elapsed = append_started.elapsed();
     assert_eq!(writer.resident_state().retained_key_entries, 0);
     let sync_started = Instant::now();
@@ -414,18 +434,29 @@ fn million_unique_keys_keep_varve_resident_maps_empty() -> varve::Result<()> {
     )?;
     let open_elapsed = open_started.elapsed();
     let lookup_started = Instant::now();
-    for key in (0..1_000_000u32).step_by(100) {
-        assert!(reader.get_frame(&(key / 1000, key))?.is_some());
+    for key in (0..records).step_by((records / 10_000).max(1) as usize) {
+        let value = reader
+            .get_frame(&(key / 1000, key))?
+            .expect("persisted key");
+        assert_eq!(value.payload, key.to_le_bytes());
     }
+    assert!(reader.get_frame(&(records / 1000, records))?.is_none());
+    assert_eq!(reader.resident_state().retained_key_entries, 0);
     let lookup_elapsed = lookup_started.elapsed();
-
+    let peak = peak_delta(baseline);
     eprintln!(
-        "million-key: append={append_elapsed:?} sync={sync_elapsed:?} open={open_elapsed:?} \
-         lookups_10k={lookup_elapsed:?} writes={} native={native_bytes} sidecar={sidecar_bytes} peak={} bytes",
+        "QUAL_MEMORY {{\"keys\":{records},\"peak_heap_bytes\":{peak},\"cache_bytes\":8388608,\"native_bytes\":{native_bytes},\"sidecar_bytes\":{sidecar_bytes},\"append_ms\":{},\"sync_ms\":{},\"open_ms\":{},\"lookup_ms\":{},\"write_calls\":{}}}",
+        append_elapsed.as_millis(),
+        sync_elapsed.as_millis(),
+        open_elapsed.as_millis(),
+        lookup_elapsed.as_millis(),
         report.write_calls,
-        peak_delta(baseline),
     );
-    Ok(())
+    assert!(
+        peak <= 64 * 1024 * 1024,
+        "allocator peak exceeds 64 MiB budget: {peak}"
+    );
+    Ok(peak)
 }
 
 // PERF2-03 (report finding PERF-03): the resident keyed merge/compact family

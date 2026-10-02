@@ -1,31 +1,35 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+extern crate alloc;
+
 mod adapter;
 mod chunks;
 mod codec;
 mod collections;
 mod diagnostics;
-#[cfg(feature = "high-cardinality-dev")]
+
 mod disk_index;
 mod error;
 mod file;
 mod format;
-#[cfg(feature = "high-cardinality-dev")]
+mod immediate;
+
 mod indexed;
 mod layout;
 mod matrix;
+mod matrix_generation;
 mod merge;
 mod native_layout;
-#[cfg(all(test, feature = "high-cardinality-dev"))]
+#[cfg(test)]
 mod pib_probe;
 mod scalable_extent;
 #[cfg(feature = "scalable-fault-injection")]
 #[doc(hidden)]
 pub mod scalable_fault;
-#[cfg(feature = "high-cardinality-dev")]
+
 mod scan_control;
 mod snapshot;
-#[cfg(feature = "high-cardinality-dev")]
+
 mod stream;
 mod traits;
 mod writer_permit;
@@ -76,10 +80,11 @@ pub use diagnostics::{
     FormatSelfTestReport, SelfTestStepReport, SelfTestStepStatus, classify_error, diagnose_file,
     diagnose_spec, error_hint,
 };
-#[cfg(feature = "high-cardinality-dev")]
+
 pub use disk_index::{
     DiskIndexBatchOptions, DiskIndexDescriptor as DiskIndexedBlock, DiskIndexDigest,
-    DiskIndexEntry, DiskIndexError, DiskIndexMode, DiskIndexOptions, DiskIndexPlan, VarveDiskKey,
+    DiskIndexEntry, DiskIndexError, DiskIndexKeyTag, DiskIndexMode, DiskIndexOptions,
+    DiskIndexPlan, IndexCompaction, SnapshotRetention, SnapshotStatus, VarveDiskKey,
     sidecar_path as disk_index_sidecar_path,
 };
 pub use error::{Error, Result};
@@ -114,7 +119,8 @@ pub use format::{
     RecoveryPolicy, ResourceLimits, SegmentDescriptor, SegmentRepeat, TransactionMarkerMode,
     VariableCompression,
 };
-#[cfg(feature = "high-cardinality-dev")]
+pub use immediate::{ImmediateEvent, ImmediateOperation, ImmediatePolicy};
+
 pub use indexed::{
     DiskIndexRebuildReport, VarveIndexedReader, VarveIndexedWriter, rebuild_disk_index,
     rebuild_disk_index_with_progress,
@@ -132,13 +138,13 @@ pub use merge::{
     MergeAction, SequencedMergeAction, VarveMerge, compact_keyed_file,
     compact_keyed_file_with_key_limit,
 };
-#[cfg(feature = "high-cardinality-dev")]
+
 pub use scan_control::{
     ScanCancellationToken, ScanOptions, ScanProgress, ScanProgressOptions, ScanProgressPhase,
 };
 #[allow(unused_imports)]
 pub(crate) use snapshot::SnapshotFile;
-#[cfg(feature = "high-cardinality-dev")]
+
 pub use stream::{
     BatchAppendError, BatchAppendInfo, BatchOptions, StreamBootstrapReport, StreamEvents,
     StreamOptions, StreamResidentState, StreamingBlocks, VarveStreamReader, VarveStreamWriter,

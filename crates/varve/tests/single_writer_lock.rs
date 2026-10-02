@@ -10,7 +10,6 @@ use varve::{
     Result, SegmentWrite, VarveBlock, VarveDecode, VarveEncode, VarveFile, WireType, varve_format,
 };
 
-#[cfg(feature = "high-cardinality-dev")]
 use varve::{CommitPolicy, StreamOptions, VarveStreamReader, VarveStreamWriter};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,7 +192,6 @@ fn create_new_refuses_existing_path() -> Result<()> {
 
 /// Streaming spec: `BlockOffsetChain` never checkpoints on flush and uses a
 /// record footer, both of which the scalable stream writer accepts.
-#[cfg(feature = "high-cardinality-dev")]
 fn stream_spec() -> FormatSpec {
     FormatSpec::new(
         b"VSWSK",
@@ -212,7 +210,6 @@ fn stream_spec() -> FormatSpec {
 
 /// Path of the stream writer's state sidecar (`.vks`), so the alias can be a
 /// faithful second name for both the native file and its sidecar.
-#[cfg(feature = "high-cardinality-dev")]
 fn stream_sidecar(path: &std::path::Path) -> std::path::PathBuf {
     let mut value = path.as_os_str().to_owned();
     value.push(".vks");
@@ -222,7 +219,6 @@ fn stream_sidecar(path: &std::path::Path) -> std::path::PathBuf {
 /// DUR-02 on the scalable path the review specifically called out: a freshly
 /// created stream writer must bind the object lock onto the file it just
 /// created, or a hard-link alias opened afterwards wins a second writer role.
-#[cfg(feature = "high-cardinality-dev")]
 #[test]
 fn stream_create_binds_object_lock_against_hard_link_alias() -> Result<()> {
     let directory = tempfile::tempdir()?;
@@ -268,7 +264,6 @@ fn stream_create_binds_object_lock_against_hard_link_alias() -> Result<()> {
 /// `VarveStreamWriter::create_unmanaged` opened with `.truncate(true)` ahead
 /// of `bind_native`, so a losing creator could clear the winner's freshly
 /// initialized object before its own bind failed.
-#[cfg(feature = "high-cardinality-dev")]
 #[test]
 fn stream_create_over_live_alias_is_refused_before_truncation() -> Result<()> {
     let directory = tempfile::tempdir()?;
@@ -304,7 +299,6 @@ fn stream_create_over_live_alias_is_refused_before_truncation() -> Result<()> {
 /// replaced by an explicit `set_len(0)` after the lock bind, creating over a
 /// stale unlocked file must still clear every stale byte. The recreated file
 /// must be byte-length identical to a control file created fresh.
-#[cfg(feature = "high-cardinality-dev")]
 #[test]
 fn stream_create_over_stale_file_truncates_through_bound_handle() -> Result<()> {
     let directory = tempfile::tempdir()?;

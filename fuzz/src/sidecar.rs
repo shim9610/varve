@@ -9,7 +9,8 @@ use crate::{DiskItem, FuzzSidecarFormat, SidecarEvent, StreamItem};
 
 const MAX_BYTES: usize = 1_048_576;
 const MAX_OPERATIONS: usize = 64;
-const MAX_RECORDS: usize = 256;
+// The format permits 256 physical records, including its creation nonce.
+const MAX_RECORDS: usize = 255;
 
 #[derive(Clone, Default)]
 struct Model {
@@ -222,9 +223,8 @@ fn mutate_companion(path: &Path, control: u8, mutations: &[u8]) -> bool {
 }
 
 fn run_stream_machine(path: &Path, operations: &[[u8; 4]]) {
-    let Ok(writer) = FuzzSidecarFormat::create_stream_writer(path, stream_options()) else {
-        return;
-    };
+    let writer = FuzzSidecarFormat::create_stream_writer(path, stream_options())
+        .expect("valid stream state-machine fixture");
     let mut writer = Some(writer);
     let mut working = Model::default();
     let mut committed = Model::default();
@@ -311,9 +311,8 @@ fn run_stream_machine(path: &Path, operations: &[[u8; 4]]) {
 }
 
 fn run_indexed_machine(path: &Path, operations: &[[u8; 4]]) {
-    let Ok(writer) = FuzzSidecarFormat::create_indexed_writer(path, disk_options()) else {
-        return;
-    };
+    let writer = FuzzSidecarFormat::create_indexed_writer(path, disk_options())
+        .expect("valid indexed state-machine fixture");
     let mut writer = Some(writer);
     let mut working = Model::default();
     let mut committed = Model::default();
@@ -460,26 +459,31 @@ fn exercise_indexed_strict(path: &Path, committed: &Model, should_be_clean: bool
     );
 }
 
-fn probe_stream(path: &Path, committed: &Model, should_be_clean: bool, permit_rejection: bool) {
+fn probe_stream(path: &Path, committed: &Model, _should_be_clean: bool, permit_rejection: bool) {
     match FuzzSidecarFormat::open_stream_reader(path, stream_options()) {
         Ok(reader) => {
-            assert!(should_be_clean, "dirty stream companion opened as clean");
-            assert_eq!(reader.verify_all().ok(), Some(committed.records));
+            assert_eq!(reader.verify_all().ok(), Some(committed.records + 1));
         }
         Err(_typed_error) => assert!(
-            permit_rejection || !should_be_clean,
-            "valid clean stream companion was rejected"
+            permit_rejection,
+            "valid committed stream snapshot was rejected"
         ),
     }
 }
 
-fn probe_indexed(path: &Path, committed: &Model, should_be_clean: bool, permit_rejection: bool) {
+fn probe_indexed(path: &Path, committed: &Model, _should_be_clean: bool, permit_rejection: bool) {
     match FuzzSidecarFormat::open_indexed_reader(path, disk_options()) {
         Ok(reader) => {
-            assert!(should_be_clean, "dirty disk index opened as clean");
-            assert_eq!(reader.verify_all().ok(), Some(committed.records));
+            assert_eq!(reader.verify_all().ok(), Some(committed.records + 1));
             for key in 0..16 {
-                let actual = reader.get_disk_item(&key).expect("accepted index lookup");
+                let actual = match reader.get_disk_item(&key) {
+                    Ok(value) => value,
+                    // Index pages are validated lazily; corrupt input may be
+                    // rejected at the first affected lookup, never return a
+                    // wrong successful value or silently lose committed data.
+                    Err(_) if permit_rejection => return,
+                    Err(error) => panic!("valid index lookup failed: {error}"),
+                };
                 match (actual, committed.disk.get(&key)) {
                     (None, None) => {}
                     (Some(actual), Some(expected)) => {
@@ -492,8 +496,8 @@ fn probe_indexed(path: &Path, committed: &Model, should_be_clean: bool, permit_r
             }
         }
         Err(_typed_error) => assert!(
-            permit_rejection || !should_be_clean,
-            "valid clean disk index was rejected"
+            permit_rejection,
+            "valid committed index snapshot was rejected"
         ),
     }
 }
@@ -506,6 +510,7 @@ fn companion_path(path: &Path, suffix: &str) -> PathBuf {
 
 fn disk_options() -> DiskIndexOptions {
     DiskIndexOptions {
+        max_key_bytes: 1024,
         batch: DiskIndexBatchOptions {
             max_records: 2,
             max_bytes: 64 * 1024,

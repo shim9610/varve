@@ -1,0 +1,21 @@
+error[E0560]: struct `Frame` has no field named `scan`
+  --> tests/ui/fail_finite_key_raw_fields.rs:12:21
+   |
+12 |     let _ = Frame { scan: 999, frame: 999 };
+   |                     ^^^^ `Frame` does not have this field
+   |
+   = note: available fields are: `key`
+
+error[E0560]: struct `Frame` has no field named `frame`
+  --> tests/ui/fail_finite_key_raw_fields.rs:12:32
+   |
+12 |     let _ = Frame { scan: 999, frame: 999 };
+   |                                ^^^^^ `Frame` does not have this field
+   |
+   = note: available fields are: `key`
+
+error[E0308]: mismatched types
+  --> tests/ui/fail_finite_key_raw_fields.rs:13:26
+   |
+13 |     let _ = Frame { key: 999 };
+   |                          ^^^ expected `FrameKey`, found integer

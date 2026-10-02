@@ -464,7 +464,7 @@ fn create_matrix_fixture(path: &Path) -> varve::Result<()> {
     let mut writer = InvariantMatrixFormat::spec().create_writer_with_dims(path, dims)?;
     writer.write_matrix_cell(MatrixKey::new(0, 0), &MatrixGenCell { value: 41 })?;
     writer.commit_matrix_cell::<MatrixGenCell>(MatrixKey::new(0, 0))?;
-    writer.flush()?;
+    writer.sync()?;
     Ok(())
 }
 

@@ -8,15 +8,21 @@ pub trait VarveBlock: VarveEncode + VarveDecode {
     const VERSION: u16;
     const KIND: BlockKind;
     const ENDIAN: Option<Endian>;
+    /// Require a durable boundary after each append or deletion of this type.
+    /// This is a writer policy, not part of the on-disk schema identity.
+    const IMMEDIATE: bool = false;
+
+    /// An optional value-dependent Immediate condition, ORed with `IMMEDIATE`.
+    /// Called before publication; implementations should be pure.
+    fn immediate_if(&self) -> bool {
+        false
+    }
     /// Whether this block has a generated logical key.
     ///
-    /// Generated blocks set this exactly. The scalable I/O feature makes the
-    /// fact mandatory for manual implementations so keyedness cannot silently
+    /// Generated blocks set this exactly. Manual implementations must declare
+    /// it explicitly so keyedness cannot silently
     /// default to the chain-unsafe value.
-    #[cfg(feature = "high-cardinality-dev")]
     const IS_KEYED: bool;
-    #[cfg(not(feature = "high-cardinality-dev"))]
-    const IS_KEYED: bool = false;
     /// Process-local identity of this block's declared schema.
     ///
     /// `#[derive(VarveBlock)]` computes this deterministically (FNV-1a 64 over

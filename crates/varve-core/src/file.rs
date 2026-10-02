@@ -639,6 +639,10 @@ impl MatrixNumeric for f64 {
     }
 }
 
+/// Optional barriers for a durable matrix cell write. The file is the physical
+/// generation store, not the logical matrix image: only synchronize it, do not
+/// seek to matrix offsets or modify it. Both callbacks precede generation-head
+/// publication. The notification hook runs only after publication and sync.
 pub trait MatrixDurabilityBarrier {
     fn sync_matrix_data(&mut self, file: &mut File) -> Result<()>;
     fn sync_matrix_commit(&mut self, file: &mut File) -> Result<()>;
@@ -947,11 +951,10 @@ mod record_file {
     #[derive(Debug)]
     pub struct RecordFile {
         file: File,
-        /// Owner of this file's per-thread private read handles. Holds only an
-        /// id and a cold-path `Mutex<Vec<Arc<File>>>`, so `RecordFile` stays
-        /// `Sync` and the read path stays lock-free; see
-        /// `matrix.rs`'s `mod region_reader`.
+        /// This reader's private Windows read handle, initialized without a
+        /// mutex. Its local cache makes the owner Send + !Sync.
         matrix_read_pool: crate::matrix::MatrixReadPool,
+        matrix_pages: Option<crate::matrix_generation::MatrixFile>,
     }
 
     impl RecordFile {
@@ -959,9 +962,45 @@ mod record_file {
             Self {
                 file,
                 matrix_read_pool: crate::matrix::MatrixReadPool::new(),
+                matrix_pages: None,
             }
         }
 
+        pub(super) fn with_matrix(
+            mut self,
+            pages: Option<crate::matrix_generation::MatrixFile>,
+        ) -> Self {
+            self.matrix_pages = pages;
+            self
+        }
+        pub(super) fn adopt_matrix(&mut self, mut pages: crate::matrix_generation::MatrixFile) {
+            if let Some(old) = &mut self.matrix_pages {
+                pages.inherit_cache(old);
+            }
+            self.matrix_pages = Some(pages);
+        }
+        pub(super) fn matrix_pages(&self) -> Option<&crate::matrix_generation::MatrixFile> {
+            self.matrix_pages.as_ref()
+        }
+        pub(super) fn compact_matrix(&mut self) -> Result<()> {
+            self.matrix_pages
+                .as_mut()
+                .ok_or(Error::MatrixLayoutMissing)?
+                .compact()
+        }
+        pub(super) fn publish_matrix(&mut self, len: u64) -> Result<()> {
+            if let Some(pages) = &mut self.matrix_pages {
+                pages.publish(len)?;
+            }
+            Ok(())
+        }
+        pub(super) fn matrix_barrier_file(&mut self) -> Result<&mut File> {
+            Ok(self
+                .matrix_pages
+                .as_mut()
+                .ok_or(Error::MatrixLayoutMissing)?
+                .barrier_file()?)
+        }
         pub(super) fn metadata(&self) -> std::io::Result<Metadata> {
             count_metadata_call();
             self.file.metadata()
@@ -1016,28 +1055,22 @@ mod record_file {
         /// shape-A enforcement is `matrix.rs`'s `mod page_index`. Every call
         /// site of this accessor must be an argument to a `crate::matrix::`
         /// call, which `enforcement_gates.rs` asserts.
-        pub(super) fn matrix_region(&mut self) -> &mut File {
-            &mut self.file
+        pub(super) fn matrix_region(&mut self) -> &mut crate::matrix_generation::MatrixFile {
+            self.matrix_pages
+                .as_mut()
+                .expect("matrix generation attached")
         }
 
-        /// The read-only half of the same exception, over a **shared** borrow.
-        ///
-        /// This is what lets every matrix read entry point take `&self`: the
-        /// returned value reads positionally (`pread`/`seek_read`) and moves no
-        /// cursor, so it needs no exclusive borrow and two threads may use two
-        /// of them against this handle at once. Unlike `matrix_region` it does
-        /// not lend out the `&File` — `MatrixRegionReader`'s field is private to
-        /// its own module, so the `impl Write for &File` route is unreachable
-        /// through it. It is therefore a strictly narrower escape than the one
-        /// above, and needs no source gate of its own.
-        ///
-        /// It also carries this file's [`crate::matrix::MatrixReadPool`], which
-        /// is what makes the shared borrow worth having on Windows: without it
-        /// N threads sharing one handle are measurably *slower* than one thread,
-        /// because `ReadFile` serialises on the file object. The pool hands each
-        /// reading thread its own file object derived from this handle.
+        /// Positional matrix reads through `&self`, without exposing `&File`
+        /// or its `Write` implementation. The owner is Send + !Sync; each
+        /// thread opens its own reader and owns its Windows handle cache.
         pub(super) fn matrix_region_reader(&self) -> crate::matrix::MatrixRegionReader<'_> {
-            crate::matrix::MatrixRegionReader::with_pool(&self.file, &self.matrix_read_pool)
+            crate::matrix::MatrixRegionReader::with_io(
+                self.matrix_pages
+                    .as_ref()
+                    .expect("matrix generation attached"),
+                &self.matrix_read_pool,
+            )
         }
 
         /// Appends one record at the current end of file.
@@ -2954,6 +2987,7 @@ struct ChunkLocator {
 #[derive(Debug, Default)]
 struct ChunkDirectory {
     chunks: Vec<ChunkLocator>,
+    next_ordinal: usize,
 }
 
 impl ChunkDirectory {
@@ -2978,14 +3012,23 @@ impl ChunkDirectory {
         let position = self
             .chunks
             .partition_point(|filed| filed.index < locator.index);
-        self.chunks.insert(position, locator);
+        self.next_ordinal = self.next_ordinal.max(locator.ordinal.saturating_add(1));
+        if self
+            .chunks
+            .get(position)
+            .is_some_and(|old| old.index == locator.index)
+        {
+            self.chunks[position] = locator;
+        } else {
+            self.chunks.insert(position, locator);
+        }
     }
 
     /// The ordinal an appended chunk record would carry: one past the last,
     /// because a record is appended at the end of the file and the ordinals
     /// count file order.
     fn next_ordinal(&self) -> usize {
-        self.chunks.len()
+        self.next_ordinal
     }
 }
 
@@ -4102,6 +4145,8 @@ impl Drop for VarveFile {
     }
 }
 
+/// A file handle with owner-local caches. Send + !Sync, including when the
+/// selected format contains only records. Each thread opens its own reader.
 #[derive(Debug)]
 pub struct VarveFile {
     spec: FormatSpec,
@@ -4139,10 +4184,10 @@ pub struct VarveFile {
     // first chunked access, so a handle that never touches a chunk builds
     // nothing. See `ChunkDirectory` for why this is not derived per read.
     //
-    // `OnceLock` rather than `Option`, because building it happens on a read
+    // `OnceCell` rather than `Option`, because building it happens on a read
     // path and every read entry point takes `&self` — that is a standing design
     // policy, not a convenience.
-    chunk_directory: std::sync::OnceLock<ChunkDirectory>,
+    chunk_directory: std::cell::OnceCell<ChunkDirectory>,
     // O(1) commit-point state for the internal segment chain; must equal
     // `SegmentCursor::from_index(&index)` at all times.
     segment_cursor: SegmentCursor,
@@ -4162,6 +4207,7 @@ pub struct VarveFile {
     /// two payload-proportional ones the allocation-contract test records as
     /// outstanding.
     record_buffer: Vec<u8>,
+    immediate_state: crate::immediate::ImmediateState,
     /// Whether any record has been appended since the last digest was written.
     ///
     /// `needs_open_digest` used to answer this with `last_resident_block_id`,
@@ -4202,12 +4248,22 @@ pub struct VarveFile {
     _lock: Option<WriterLock>,
 }
 
+/// A reader with private caches: Send + !Sync. Move ownership to a worker
+/// or open a separate reader for each thread; ordinary reads take `&self`.
 #[derive(Debug)]
 pub struct VarveReader {
     file: VarveFile,
 }
 
 impl VarveReader {
+    pub fn matrix_generation(&self) -> Option<u64> {
+        self.file.matrix_generation()
+    }
+    /// Required companion file for matrix storage; copy/rename it with the primary.
+    pub fn matrix_generation_path(&self) -> Option<&Path> {
+        self.file.matrix_generation_path()
+    }
+
     pub fn open<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
         Ok(Self {
             file: VarveFile::open_readonly(spec, path)?,
@@ -4231,8 +4287,7 @@ impl VarveReader {
     /// A fresh reader on whatever the pathname resolves to now. See
     /// [`VarveFile::reopen_readonly`].
     ///
-    /// `&self`, so a reader shared behind an `Arc` can produce the replacement
-    /// its owner stores without any reader having to stop.
+    /// Takes `&self` and returns a separate reader with its own caches.
     pub fn reopen(&self) -> Result<Self> {
         Ok(Self {
             file: self.file.reopen_readonly()?,
@@ -4633,6 +4688,18 @@ pub struct VarveWriter {
 }
 
 impl VarveWriter {
+    pub fn compact_matrix(&mut self) -> Result<()> {
+        self.file.compact_matrix()
+    }
+
+    pub fn matrix_generation(&self) -> Option<u64> {
+        self.file.matrix_generation()
+    }
+    /// Required companion file for matrix storage; copy/rename it with the primary.
+    pub fn matrix_generation_path(&self) -> Option<&Path> {
+        self.file.matrix_generation_path()
+    }
+
     pub fn create<P: AsRef<Path>>(spec: FormatSpec, path: P) -> Result<Self> {
         Ok(Self {
             file: VarveFile::create(spec, path)?,
@@ -5119,6 +5186,14 @@ impl VarveWriter {
         self.file.sync()
     }
 
+    pub fn immediate(&mut self) -> Result<()> {
+        self.file.immediate()
+    }
+
+    pub fn set_immediate_policy(&mut self, policy: crate::ImmediatePolicy) -> Result<()> {
+        self.file.set_immediate_policy(policy)
+    }
+
     pub fn write_matrix_cell<T: VarveMatrixBlock>(
         &mut self,
         key: MatrixKey,
@@ -5148,32 +5223,17 @@ impl VarveWriter {
         self.file.commit_matrix_cell::<To>(key)
     }
 
-    /// Writes, syncs, commits, syncs the commit, then calls `hook`.
+    /// Writes a cell, runs the barriers, publishes and syncs its generation,
+    /// then calls `hook`. Other pending matrix changes are published too.
     ///
-    /// The hook runs **after** the cell is committed and durable. If it
-    /// returns an error the write is *not* rolled back: the failure is
-    /// reported as [`Error::MatrixCommittedButHookFailed`], carrying the
-    /// [`MatrixCommitEvent`] the hook was given, so a caller can retry the
-    /// notification alone. Retrying the whole call instead repeats the durable
-    /// write and re-runs the hook.
-    ///
-    /// If the durability request that follows the commit fails, the cell is
-    /// still committed and the hook is not run; that is reported as
-    /// [`Error::MatrixCommittedButDurabilityUnproven`], also carrying the
-    /// event.
-    ///
-    /// Those two variants are the only published outcomes of this call. Every
-    /// other error variant means the cell was not committed by this call.
-    ///
-    /// That statement is about the value this call **returns** (F-06). Both
-    /// variants box their event and their source, so building either one
-    /// allocates after the cell is already authoritative; those allocations
-    /// are shape-sized rather than content-sized, and the crate allocates
-    /// shape-sized memory infallibly. If the allocator refuses one, the
-    /// process terminates rather than returning some other error, so no caller
-    /// observes a *different* outcome — the cell is committed, and a reader
-    /// that opens the file afterwards sees it. See "Allocator Failure And
-    /// Published Outcomes" in `docs/durability-model.md`.
+    /// Barrier failures are pre-publication errors and poison the writer.
+    /// [`Error::MatrixPublicationUncertain`] requires reopening and inspecting
+    /// the confirmed generation before retrying. A complete head whose final
+    /// durability request failed yields [`Error::MatrixCommittedButDurabilityUnproven`].
+    /// Both skip the hook. After successful durable publication, hook failure
+    /// yields [`Error::MatrixCommittedButHookFailed`]; retry only the notification.
+    /// Outcome boxes are fixed-size allocations and abort on allocator failure.
+    /// See "Allocator Failure And Published Outcomes" in `docs/durability-model.md`.
     pub fn write_matrix_cell_durable<T, F>(
         &mut self,
         key: MatrixKey,
@@ -5190,7 +5250,8 @@ impl VarveWriter {
     /// [`Self::write_matrix_cell_durable`] with a caller-supplied durability
     /// barrier; the same post-commit contract applies, including
     /// [`Error::MatrixCommittedButHookFailed`] and
-    /// [`Error::MatrixCommittedButDurabilityUnproven`].
+    /// [`Error::MatrixCommittedButDurabilityUnproven`]. Both barrier callbacks
+    /// precede generation publication and receive the physical generation file.
     pub fn write_matrix_cell_durable_with_barrier<T, B, F>(
         &mut self,
         key: MatrixKey,
@@ -5438,6 +5499,7 @@ impl VarveFile {
             segment_cursor: SegmentCursor::new_empty(),
             uncommitted_since_commit: false,
             record_buffer: Vec::new(),
+            immediate_state: Default::default(),
             appended_since_digest: false,
             last_resident_block_id: None,
             keyed_tails: KeyedTails::new_empty(),
@@ -5445,7 +5507,7 @@ impl VarveFile {
             // directory entry is not durable until the first durability
             // request syncs the parent directory.
             open_chunk: None,
-            chunk_directory: std::sync::OnceLock::new(),
+            chunk_directory: std::cell::OnceCell::new(),
             pending_pathname_parent_sync: true,
             opened_after_crash: false,
             poison: PoisonFlag::healthy(),
@@ -5556,11 +5618,19 @@ impl VarveFile {
         write_matrix_creation_nonce_region(&mut file, creation_nonce)?;
         let header_len = file.stream_position()?;
         let matrix = crate::matrix::create_layout(spec, &mut file, header_len, &dims)?;
+        let mut matrix_pages = crate::matrix_generation::MatrixFile::create(
+            &path,
+            &file,
+            matrix.append_log_start(),
+            creation_nonce,
+            matrix_pending_limit(spec),
+        )?;
+        matrix_pages.set_cache_bytes(spec.read_limits.matrix_generation_cache_budget());
         let snapshot = SnapshotFile::new(file.try_clone()?)?;
         let mut file = Self {
             spec,
             path,
-            file: RecordFile::new(file),
+            file: RecordFile::new(file).with_matrix(Some(matrix_pages)),
             index: ResidentIndex::empty(snapshot.clone(), spec),
             snapshot,
             mode: OpenMode::ReadWrite,
@@ -5573,6 +5643,7 @@ impl VarveFile {
             segment_cursor: SegmentCursor::new_empty(),
             uncommitted_since_commit: false,
             record_buffer: Vec::new(),
+            immediate_state: Default::default(),
             appended_since_digest: false,
             last_resident_block_id: None,
             keyed_tails: KeyedTails::new_empty(),
@@ -5580,7 +5651,7 @@ impl VarveFile {
             // directory entry is not durable until the first durability
             // request syncs the parent directory.
             open_chunk: None,
-            chunk_directory: std::sync::OnceLock::new(),
+            chunk_directory: std::cell::OnceCell::new(),
             pending_pathname_parent_sync: true,
             opened_after_crash: false,
             poison: PoisonFlag::healthy(),
@@ -5676,14 +5747,18 @@ impl VarveFile {
         lock.bind_native(&file, &path)?;
         let captured_len = check_open_file_len(spec, &file)?;
         let (header_len, header_extensions) = read_file_header_parts(spec, &mut file)?;
-        let (matrix, matrix_creation_nonce) = split_matrix_state(read_matrix_layout_if_needed(
+        let (matrix, matrix_creation_nonce, matrix_pages) = split_matrix_state(
+            read_matrix_layout_if_needed(&path, true, spec, &mut file, header_len, captured_len)?,
+        );
+        let append_start = append_log_start(header_len, matrix.as_ref());
+        let index = load_generation_index(
             spec,
             &mut file,
-            header_len,
-            captured_len,
-        )?);
-        let append_start = append_log_start(header_len, matrix.as_ref());
-        let index = load_index(spec, &mut file, append_start, ScanIntent::Writer, scratch)?;
+            append_start,
+            ScanIntent::Writer,
+            scratch,
+            matrix_pages.as_ref(),
+        )?;
         // The sequence high-water mark and the block tails come from the scan
         // rather than from the index, because the index is filtered: a
         // non-resident block's records are on disk and not in it.
@@ -5706,11 +5781,16 @@ impl VarveFile {
         let derived = derive_index_state(infallible_entries(index), false)?;
         let checkpoint_cadence = derived.checkpoint_cadence;
         let segment_cursor = derived.segment_cursor;
-        let snapshot = SnapshotFile::new(file.try_clone()?)?;
+        let snapshot = SnapshotFile::from_file_with_len(
+            file.try_clone()?,
+            matrix_pages
+                .as_ref()
+                .map_or(file.metadata()?.len(), |p| p.head().native_eof),
+        )?;
         let mut opened = Self {
             spec,
             path,
-            file: RecordFile::new(file),
+            file: RecordFile::new(file).with_matrix(matrix_pages),
             index: ResidentIndex::adopt_generation(index, snapshot.clone(), spec)?,
             snapshot,
             mode: OpenMode::ReadWrite,
@@ -5721,10 +5801,11 @@ impl VarveFile {
             checkpoint_cadence,
             block_tails,
             open_chunk: None,
-            chunk_directory: std::sync::OnceLock::new(),
+            chunk_directory: std::cell::OnceCell::new(),
             segment_cursor,
             uncommitted_since_commit: false,
             record_buffer: Vec::new(),
+            immediate_state: Default::default(),
             appended_since_digest: false,
             last_resident_block_id: index.last().map(|entry| entry.block_id),
             keyed_tails: KeyedTails::new_empty(),
@@ -5802,14 +5883,18 @@ impl VarveFile {
         let mut file = OpenOptions::new().read(true).open(&path)?;
         let captured_len = check_open_file_len(spec, &file)?;
         let (header_len, header_extensions) = read_file_header_parts(spec, &mut file)?;
-        let (matrix, matrix_creation_nonce) = split_matrix_state(read_matrix_layout_if_needed(
+        let (matrix, matrix_creation_nonce, matrix_pages) = split_matrix_state(
+            read_matrix_layout_if_needed(&path, false, spec, &mut file, header_len, captured_len)?,
+        );
+        let append_start = append_log_start(header_len, matrix.as_ref());
+        let scanned = load_generation_index(
             spec,
             &mut file,
-            header_len,
-            captured_len,
-        )?);
-        let append_start = append_log_start(header_len, matrix.as_ref());
-        let scanned = load_index(spec, &mut file, append_start, ScanIntent::ReadOnly, scratch)?;
+            append_start,
+            ScanIntent::ReadOnly,
+            scratch,
+            matrix_pages.as_ref(),
+        )?;
         let sequence_state = scanned.sequence_state();
         let block_tails = scanned.block_tails();
         // The snapshot comes from the scan, not from the resident list. The
@@ -5834,7 +5919,7 @@ impl VarveFile {
         Ok(Self {
             spec,
             path,
-            file: RecordFile::new(file),
+            file: RecordFile::new(file).with_matrix(matrix_pages),
             index: match retention {
                 // Not "built and then dropped": a caller that asked for no
                 // directory never has one allocated on its behalf. `N` slots is
@@ -5854,10 +5939,11 @@ impl VarveFile {
             checkpoint_cadence,
             block_tails,
             open_chunk: None,
-            chunk_directory: std::sync::OnceLock::new(),
+            chunk_directory: std::cell::OnceCell::new(),
             segment_cursor,
             uncommitted_since_commit: false,
             record_buffer: Vec::new(),
+            immediate_state: Default::default(),
             appended_since_digest: false,
             last_resident_block_id: index.last().map(|entry| entry.block_id),
             keyed_tails: KeyedTails::new_empty(),
@@ -6061,12 +6147,9 @@ impl VarveFile {
         lock.bind_native(&file, path)?;
         let captured_len = check_open_file_len(spec, &file)?;
         let (header_len, header_extensions) = read_file_header_parts(spec, &mut file)?;
-        let (matrix, matrix_creation_nonce) = split_matrix_state(read_matrix_layout_if_needed(
-            spec,
-            &mut file,
-            header_len,
-            captured_len,
-        )?);
+        let (matrix, matrix_creation_nonce, matrix_pages) = split_matrix_state(
+            read_matrix_layout_if_needed(path, true, spec, &mut file, header_len, captured_len)?,
+        );
         let append_start = append_log_start(header_len, matrix.as_ref());
         // No `truncate_uncommitted_tail_if_needed`, and both routes earn that
         // the same way — by requiring the thing they read to account for the
@@ -6087,6 +6170,9 @@ impl VarveFile {
         // Either way a file that reaches the line below has no uncommitted tail
         // to cut. `a_file_with_an_uncommitted_tail_is_truncated_by_the_scan`
         // is what holds that for the header route.
+        let captured_len = matrix_pages
+            .as_ref()
+            .map_or(captured_len, |pages| pages.head().native_eof);
         let digest = read_lazy_block_tails(
             spec,
             &mut file,
@@ -6100,7 +6186,7 @@ impl VarveFile {
         Ok(Self {
             spec,
             path: path.to_path_buf(),
-            file: RecordFile::new(file),
+            file: RecordFile::new(file).with_matrix(matrix_pages),
             index: ResidentIndex::none_retained(snapshot.clone(), spec),
             snapshot,
             mode: OpenMode::ReadWrite,
@@ -6118,9 +6204,10 @@ impl VarveFile {
             segment_cursor: SegmentCursor::new_empty(),
             block_tails: digest.block_tails,
             open_chunk: None,
-            chunk_directory: std::sync::OnceLock::new(),
+            chunk_directory: std::cell::OnceCell::new(),
             uncommitted_since_commit: false,
             record_buffer: Vec::new(),
+            immediate_state: Default::default(),
             // The file ends with a digest describing everything before it, so
             // there is nothing to describe until something is appended. Both
             // terms of `needs_open_digest` are false here, which is right.
@@ -6142,13 +6229,13 @@ impl VarveFile {
         let mut file = OpenOptions::new().read(true).open(path)?;
         let captured_len = check_open_file_len(spec, &file)?;
         let (header_len, header_extensions) = read_file_header_parts(spec, &mut file)?;
-        let (matrix, matrix_creation_nonce) = split_matrix_state(read_matrix_layout_if_needed(
-            spec,
-            &mut file,
-            header_len,
-            captured_len,
-        )?);
+        let (matrix, matrix_creation_nonce, matrix_pages) = split_matrix_state(
+            read_matrix_layout_if_needed(path, false, spec, &mut file, header_len, captured_len)?,
+        );
         let append_start = append_log_start(header_len, matrix.as_ref());
+        let captured_len = matrix_pages
+            .as_ref()
+            .map_or(captured_len, |pages| pages.head().native_eof);
         let digest = read_lazy_block_tails(
             spec,
             &mut file,
@@ -6162,7 +6249,7 @@ impl VarveFile {
         Ok(Self {
             spec,
             path: path.to_path_buf(),
-            file: RecordFile::new(file),
+            file: RecordFile::new(file).with_matrix(matrix_pages),
             index: ResidentIndex::none_retained(snapshot.clone(), spec),
             snapshot,
             mode: OpenMode::ReadOnly,
@@ -6181,9 +6268,10 @@ impl VarveFile {
             segment_cursor: SegmentCursor::new_empty(),
             block_tails: digest.block_tails,
             open_chunk: None,
-            chunk_directory: std::sync::OnceLock::new(),
+            chunk_directory: std::cell::OnceCell::new(),
             uncommitted_since_commit: false,
             record_buffer: Vec::new(),
+            immediate_state: Default::default(),
             appended_since_digest: false,
             // No record was framed, so there is nothing to seed this from — and
             // nothing to seed it for: it is append-path state and this handle is
@@ -6237,14 +6325,18 @@ impl VarveFile {
         lock.bind_native(&file, &path)?;
         let original_len = file.metadata()?.len();
         let (header_len, header_extensions) = read_file_header_parts(spec, &mut file)?;
-        let (matrix, matrix_creation_nonce) = split_matrix_state(read_matrix_layout_if_needed(
+        let (matrix, matrix_creation_nonce, matrix_pages) = split_matrix_state(
+            read_matrix_layout_if_needed(&path, true, spec, &mut file, header_len, original_len)?,
+        );
+        let append_start = append_log_start(header_len, matrix.as_ref());
+        let index = load_generation_index(
             spec,
             &mut file,
-            header_len,
-            original_len,
-        )?);
-        let append_start = append_log_start(header_len, matrix.as_ref());
-        let index = load_index(spec, &mut file, append_start, ScanIntent::Recover, scratch)?;
+            append_start,
+            ScanIntent::Recover,
+            scratch,
+            matrix_pages.as_ref(),
+        )?;
         let sequence_state = index.sequence_state();
         let block_tails = index.block_tails();
         let index = &*scratch;
@@ -6256,12 +6348,17 @@ impl VarveFile {
         let checkpoint_cadence = derived.checkpoint_cadence;
         let segment_cursor = derived.segment_cursor;
         let records_preserved = index.len();
-        let snapshot = SnapshotFile::new(file.try_clone()?)?;
+        let snapshot = SnapshotFile::from_file_with_len(
+            file.try_clone()?,
+            matrix_pages
+                .as_ref()
+                .map_or(file.metadata()?.len(), |p| p.head().native_eof),
+        )?;
         Ok((
             Self {
                 spec,
                 path,
-                file: RecordFile::new(file),
+                file: RecordFile::new(file).with_matrix(matrix_pages),
                 index: ResidentIndex::adopt_generation(index, snapshot.clone(), spec)?,
                 snapshot,
                 mode: OpenMode::ReadWrite,
@@ -6272,10 +6369,11 @@ impl VarveFile {
                 checkpoint_cadence,
                 block_tails,
                 open_chunk: None,
-                chunk_directory: std::sync::OnceLock::new(),
+                chunk_directory: std::cell::OnceCell::new(),
                 segment_cursor,
                 uncommitted_since_commit: false,
                 record_buffer: Vec::new(),
+                immediate_state: Default::default(),
                 appended_since_digest: false,
                 last_resident_block_id: index.last().map(|entry| entry.block_id),
                 keyed_tails: KeyedTails::new_empty(),
@@ -6562,6 +6660,7 @@ impl VarveFile {
         prev_same_key_offset: Option<u64>,
     ) -> Result<AppendInfo> {
         let permit = self.ensure_write()?;
+        let mandatory = T::IMMEDIATE || block.immediate_if();
         self.ensure_user_block::<T>()?;
         if T::KIND == BlockKind::Matrix {
             return Err(Error::BlockKindMismatch {
@@ -6588,7 +6687,9 @@ impl VarveFile {
                 Err(error) => Err(error),
             };
         self.record_buffer = buffer;
-        result
+        let info = result?;
+        self.apply_immediate::<T>(info, crate::ImmediateOperation::Append, mandatory)?;
+        Ok(info)
     }
 
     /// Appends a tombstone for `key`, linking it to the previous record with
@@ -6710,7 +6811,7 @@ impl VarveFile {
         let permit = self.ensure_write()?;
         self.ensure_user_block::<T>()?;
         crate::collections::ensure_registered_block::<T>(self.spec)?;
-        self.write_record_with_prev_key(
+        let info = self.write_record_with_prev_key(
             &permit,
             TOMBSTONE_BLOCK_ID,
             1,
@@ -6718,7 +6819,9 @@ impl VarveFile {
             0,
             payload,
             prev_same_key_offset,
-        )
+        )?;
+        self.apply_immediate::<T>(info, crate::ImmediateOperation::Delete, T::IMMEDIATE)?;
+        Ok(info)
     }
 
     pub fn push_op<T>(&mut self, key: &T::Key, op: &T::Op) -> Result<u64>
@@ -7374,6 +7477,11 @@ impl VarveFile {
     /// published file. This is a format-level refusal rather than a per-block
     /// one, because the loss is of blocks the caller did not name.
     fn ensure_generation_rewrite_allowed(&self) -> Result<()> {
+        if self.matrix.is_some() {
+            return Err(Error::InvalidFormatSpec(
+                "record generation replacement is not supported for matrix storage",
+            ));
+        }
         if self.spec.has_non_resident_blocks() {
             return Err(Error::InvalidFormatSpec(
                 "a generation rewrite is not supported for a format with a non-resident block",
@@ -8043,7 +8151,10 @@ impl VarveFile {
             self.file.sync_all()?;
             // DUR3-01: a durable commit on a file this handle created must
             // also establish the pathname; this happens once, not per commit.
+            let publication = self.publish_matrix_generation();
+            self.poison_after_started_matrix_error(publication)?;
             self.sync_created_pathname_once()?;
+            self.immediate_state.reset();
             return Ok(info);
         }
         self.file.flush()?;
@@ -8073,7 +8184,10 @@ impl VarveFile {
                 source: Box::new(source),
             });
         }
+        let publication = self.publish_matrix_generation();
+        self.poison_after_started_matrix_error(publication)?;
         self.sync_created_pathname_once()?;
+        self.immediate_state.reset();
         Ok(info)
     }
 
@@ -8086,6 +8200,30 @@ impl VarveFile {
         self.file.flush()?;
         self.file.sync_all()?;
         Ok(())
+    }
+
+    fn publish_matrix_generation(&mut self) -> Result<()> {
+        let Some(pages) = self.file.matrix_pages() else {
+            return Ok(());
+        };
+        let previous_end = pages.head().native_eof;
+        let end = if self.spec.commit_policy.is_transaction_marker()
+            && self.has_uncommitted_since_last_commit()
+        {
+            // A matrix-only sync must not publish an append tail that writer
+            // recovery would later truncate. Keep at least the old confirmed
+            // EOF, including its segment/digest, and any newly written marker.
+            match self.block_tails.tail(COMMIT_BLOCK_ID) {
+                Some(offset) if offset >= previous_end => {
+                    fault_record_entry(&self.snapshot, self.spec, offset, false)?
+                        .checked_physical_end()?
+                }
+                _ => previous_end,
+            }
+        } else {
+            self.file.metadata()?.len()
+        };
+        self.file.publish_matrix(end)
     }
 
     /// Requests durable persistence of everything written so far.
@@ -8132,7 +8270,51 @@ impl VarveFile {
             self.close_commit_point();
         }
         self.file.sync_all()?;
-        self.sync_created_pathname_once()
+        if self.mode == OpenMode::ReadWrite
+            && let Err(error) = self.publish_matrix_generation()
+        {
+            self.poison.poison();
+            return Err(error);
+        }
+        self.sync_created_pathname_once()?;
+        self.immediate_state.reset();
+        Ok(())
+    }
+
+    /// Persist all preceding writes. Does not append a transaction commit marker.
+    pub fn immediate(&mut self) -> Result<()> {
+        self.sync()
+    }
+
+    /// Install OR-combined conditions for native user appends and deletions.
+    pub fn set_immediate_policy(&mut self, policy: crate::ImmediatePolicy) -> Result<()> {
+        let _permit = self.ensure_write()?;
+        self.immediate_state.policy = policy.validate()?;
+        Ok(())
+    }
+
+    fn apply_immediate<T: VarveBlock>(
+        &mut self,
+        info: AppendInfo,
+        operation: crate::ImmediateOperation,
+        mandatory: bool,
+    ) -> Result<()> {
+        let bytes = self.snapshot.len().saturating_sub(info.record_offset);
+        self.immediate_state.advance(1, bytes);
+        let event = self
+            .immediate_state
+            .event(T::ID, operation, info, bytes, 0, 0);
+        if (mandatory || self.immediate_state.policy.matches(event))
+            && let Err(error) = self.immediate()
+        {
+            // Keyed wrappers have not updated their tail caches yet.
+            self.poison.poison();
+            return Err(crate::immediate::appended_immediate_error(
+                info.sequence,
+                error,
+            ));
+        }
+        Ok(())
     }
 
     /// Makes a pathname created by this handle durable, at most once.
@@ -8572,19 +8754,9 @@ impl VarveFile {
 
     /// A fresh read-only handle on whatever the pathname resolves to now.
     ///
-    /// The other half of [`is_current`](Self::is_current), and the reason both
-    /// take `&self`: a handle shared as `Arc<VarveFile>` across readers cannot
-    /// be mutated, so moving those readers to a newer generation means
-    /// *replacing* the handle rather than advancing it. The owner reopens and
-    /// stores the new `Arc`; readers in flight finish on the old one, and the
-    /// old object is released when the last of them drops it. That is refcount
-    /// semantics doing exactly what the disk needs — the superseded generation
-    /// stays alive precisely as long as somebody is reading it.
-    ///
-    /// The alternative would be interior mutability so that `refresh(&self)`
-    /// could swap a shared handle's state in place. That is deliberately not
-    /// offered: it would put an atomic load on every read, forever, in every
-    /// format — including the ones that never republish anything.
+    /// The other half of [`is_current`](Self::is_current). The new handle has
+    /// independent caches; this reader stays usable until its owner drops it.
+    /// Each thread manages its own reader and chooses when to replace it.
     ///
     /// # Which route it takes
     ///
@@ -8606,11 +8778,43 @@ impl VarveFile {
         }
     }
 
+    /// Reclaims obsolete matrix pages without waiting for existing readers.
+    /// Requires a clean, explicitly synced writer. Existing readers retain their
+    /// old file until follow/drop; their generation remains readable.
+    pub fn compact_matrix(&mut self) -> Result<()> {
+        let _permit = self.ensure_write()?;
+        let pages = self.file.matrix_pages().ok_or(Error::MatrixLayoutMissing)?;
+        if self.open_chunk_is_unwritten()
+            || pages.is_dirty()
+            || pages.head().native_eof != self.snapshot.len()
+        {
+            return Err(Error::InvalidFormatSpec(
+                "sync matrix changes before compaction",
+            ));
+        }
+        if let Err(error) = self.file.compact_matrix() {
+            self.poison.poison();
+            return Err(error);
+        }
+        let source = crate::matrix_generation::MatrixIo::source(self.file.matrix_pages().unwrap())?;
+        crate::matrix::rebind_generation_backing(self.matrix.as_mut().unwrap(), &source);
+        Ok(())
+    }
+
+    /// Confirmed generation captured by this handle. Queries never advance it.
+    pub fn matrix_generation(&self) -> Option<u64> {
+        self.file.matrix_pages().map(|p| p.head().generation)
+    }
+    /// Required companion file; its name includes the primary's creation nonce.
+    pub fn matrix_generation_path(&self) -> Option<&Path> {
+        self.file.matrix_pages().map(|p| p.path())
+    }
+
     /// Extends this handle to records appended since it opened.
     ///
     /// A handle fixes its snapshot length when it opens, and every read is
-    /// positional against that length. That is what lets one handle serve
-    /// concurrent readers through `&self` while a writer appends: a reader can
+    /// positional against that length. Each reader queries through `&self`
+    /// while the separate writer appends: a reader can
     /// never observe a record the writer has not finished. The cost is that it
     /// never observes one the writer *has* finished either — measured on a
     /// five-record file grown to fifteen, the open handle went on reporting 6
@@ -8621,7 +8825,10 @@ impl VarveFile {
     /// `O(appended)` per call rather than `O(records)`, and charges only those
     /// bytes against [`ReadLimits::max_scan_bytes`](crate::ReadLimits).
     ///
-    /// Returns the bytes gained.
+    /// Matrix readers also adopt the confirmed page root, even if no record
+    /// bytes were appended. Compare `matrix_generation()` to observe that case.
+    /// Matrix metadata verification runs again according to the open policy.
+    /// Returns the record bytes gained.
     ///
     /// # `0` is not one answer
     ///
@@ -8665,22 +8872,17 @@ impl VarveFile {
     ///
     /// # What it deliberately does not do
     ///
-    /// **It does not cross a generation.** The replacement paths publish by
-    /// renaming a new file over the pathname, and this follows the *object*
-    /// this handle opened, not the name. That object's length never changes
-    /// again, so following a replaced handle answers `0` forever. That is the
-    /// honest answer rather than a failure: the handle is still a complete,
-    /// self-consistent view of the generation it opened, and reopening the path
-    /// is how you move to the newer one.
+    /// **Primary-file replacement requires reopening.** Follow retains the
+    /// primary file object this handle opened. Matrix companion compaction is
+    /// different: its persisted compaction epoch explicitly permits adopting
+    /// the replacement companion while retaining that same primary object.
     ///
-    /// **It follows the append log only.** A matrix file's cell region sits
-    /// ahead of the log at a fixed offset and is written in place, so it was
-    /// never bounded by the snapshot and is not what this extends. Note what
-    /// that does *not* mean: a matrix chunk record is an ordinary append-log
-    /// record, so a run can bring new chunks and this does adopt them — and
-    /// therefore has to drop the chunk directory, which is built once and
-    /// cached. Caching it for the life of a handle was sound only while a
-    /// handle's snapshot could not grow.
+    /// **Matrix generations advance atomically with their confirmed log EOF.**
+    /// Ordinary publications diff immutable roots and update only changed bitmap
+    /// index entries, verification pages and cache entries. Only a changed
+    /// compaction epoch rebuilds the whole layout. Failed preparation leaves
+    /// the captured generation intact. Matrix-only advancement returns zero
+    /// appended bytes; inspect `matrix_generation()` to distinguish it.
     ///
     /// **A read-write handle gains nothing and answers `0`.** varve admits one
     /// writer per object, and that writer's own appends already extend its
@@ -8690,16 +8892,71 @@ impl VarveFile {
         if self.mode == OpenMode::ReadWrite {
             return Ok(0);
         }
+        // One short-lived staged value; keep ordinary follow allocation-free here.
+        #[allow(clippy::large_enum_variant)]
+        enum MatrixFollow {
+            Compacted(crate::matrix::MatrixLayout),
+            Delta(crate::matrix::MatrixDelta),
+        }
+        impl MatrixFollow {
+            fn apply(self, layout: &mut Option<crate::matrix::MatrixLayout>) {
+                match self {
+                    Self::Compacted(next) => *layout = Some(next),
+                    Self::Delta(delta) => delta.apply(layout.as_mut().unwrap()),
+                }
+            }
+        }
+        let mut matrix_next = if let Some(pages) = self.file.matrix_pages() {
+            let mut next = pages.refreshed()?;
+            if next.head().generation <= pages.head().generation {
+                return Ok(0);
+            }
+            let mut base = self.snapshot.try_clone_file()?;
+            let header_len = read_file_header(self.spec, &mut base)?;
+            let layout_start = header_len
+                .checked_add(MATRIX_CREATION_NONCE_REGION_LEN as u64)
+                .ok_or(Error::InvalidMatrixLayout)?;
+            let len = next.head().native_eof;
+            let layout = if next.head().compaction_epoch != pages.head().compaction_epoch {
+                MatrixFollow::Compacted(crate::matrix::read_layout_at_len(
+                    self.spec,
+                    &mut next,
+                    layout_start,
+                    len,
+                )?)
+            } else {
+                MatrixFollow::Delta(crate::matrix::MatrixDelta::prepare(
+                    self.matrix.as_mut().ok_or(Error::InvalidMatrixLayout)?,
+                    pages,
+                    &next,
+                    layout_start,
+                )?)
+            };
+            Some((layout, next))
+        } else {
+            None
+        };
         let from = self.snapshot.len();
         // The object, not the pathname. A rename may have put a different file
         // at the path, and framing *that* file's bytes at this handle's offsets
         // is the one thing this must never do.
         let mut file = self.snapshot.try_clone_file()?;
-        if file.metadata()?.len() <= from {
+        let file_len = matrix_next
+            .as_ref()
+            .map_or(file.metadata()?.len(), |(_, p)| p.head().native_eof);
+        if file_len < from {
+            return Err(Error::InvalidMatrixLayout);
+        }
+        if file_len == from {
+            if let Some((layout, pages)) = matrix_next.take() {
+                layout.apply(&mut self.matrix);
+                self.file.adopt_matrix(pages);
+                self.chunk_directory = std::cell::OnceCell::new();
+            }
             return Ok(0);
         }
         let mut framed = Vec::new();
-        let scanned = scan_records_range(
+        let scanned = scan_records_range_at_len(
             self.spec,
             &mut file,
             from,
@@ -8712,10 +8969,16 @@ impl VarveFile {
             Some(from),
             ScanIntent::ReadOnly,
             &mut framed,
+            file_len,
         )?;
         let logical_len = scanned.physical_end(from);
         if logical_len <= from {
-            // Bytes arrived, but no commit boundary covers them yet.
+            // A matrix generation can advance without a record commit marker.
+            if let Some((layout, pages)) = matrix_next.take() {
+                layout.apply(&mut self.matrix);
+                self.file.adopt_matrix(pages);
+                self.chunk_directory = std::cell::OnceCell::new();
+            }
             return Ok(0);
         }
         // Sequences are file-global and strictly increasing, and the scan's own
@@ -8819,11 +9082,15 @@ impl VarveFile {
         self.keyed_tails.invalidate_all();
         // And a matrix chunk record is an ordinary append-log record, so a run
         // may have brought new chunks. The chunk directory is built once and
-        // cached in a `OnceLock`, which was sound to keep forever only while a
+        // cached in a `OnceCell`, which was sound to keep forever only while a
         // handle's snapshot could not grow — it can now. Measured before this
         // line existed: a followed handle answered `MatrixNotCommitted` for a
         // cell a fresh open of the same file read back.
-        self.chunk_directory = std::sync::OnceLock::new();
+        self.chunk_directory = std::cell::OnceCell::new();
+        if let Some((layout, pages)) = matrix_next.take() {
+            layout.apply(&mut self.matrix);
+            self.file.adopt_matrix(pages);
+        }
         Ok(logical_len - from)
     }
 
@@ -9372,8 +9639,8 @@ impl VarveFile {
     /// `CommitPolicy::None`: read-write `Ok(12)`, read-only
     /// `Err(SnapshotRangeOutOfBounds { offset: 1347, len: 32, snapshot_len: 27 })`.
     ///
-    /// Takes `&self` and reads positionally, so it can run on a shared handle
-    /// while other readers use it. One entry and one payload are materialised
+    /// Takes `&self` and reads positionally within the owning thread.
+    /// One entry and one payload are materialised
     /// at a time; nothing enters the resident index.
     ///
     /// Returns the number of records verified. A mismatch is
@@ -10065,7 +10332,7 @@ impl VarveFile {
     /// holding it costs a commit point nothing, and an idle flush still writes
     /// no record, which is the property this guard was for.
     fn write_open_chunk_record(&mut self) -> Result<()> {
-        let (payload, index, block_count, cell_crc, compressed_slots, backing) = {
+        let (payload, index, block_count, cell_crc, compressed_slots) = {
             let Some(chunk) = self.open_chunk.as_ref() else {
                 return Ok(());
             };
@@ -10082,7 +10349,6 @@ impl VarveFile {
                 })?,
                 chunk.blocks.iter().any(|block| !block.crc.is_empty()),
                 chunk.compression.is_some(),
-                chunk.backing,
             )
         };
         let payload_len = payload.len() as u64;
@@ -10092,13 +10358,7 @@ impl VarveFile {
         // Taken from the append itself, not from a second `metadata()` call:
         // the two would disagree if anything landed between them.
         let permit = self.ensure_write()?;
-        // A chunk that was loaded back already has a record. Appending a second
-        // one for the same chunk index would leave the file saying two
-        // different things about the same rows, which `build_chunk_directory`
-        // refuses to read at all — so the edit goes back over the original.
-        if let Some(ordinal) = backing {
-            return self.rewrite_chunk_record(&permit, ordinal, &payload, payload_len);
-        }
+        // Append a new immutable version; confirmed EOF controls its visibility.
         let info = self.write_record_with_prev_key(
             &permit,
             MATRIX_CHUNK_BLOCK_ID,
@@ -10149,14 +10409,9 @@ impl VarveFile {
         // already sets. It is released on a transition to a different chunk
         // index, which is the only point where a second buffer would be needed.
         //
-        // **Retained only with an ordinal.** A retained chunk with no `backing`
-        // would be written *again* on its next edit — appending a second record
-        // for a chunk index that already has one, which is the shape that makes
-        // a file unopenable. So the no-ordinal case releases the buffer exactly
-        // as this did before, trading the write bitmap for the guarantee that
-        // no duplicate can be produced. It is reachable only where the chunk
-        // directory was never materialised, which no chunk path does:
-        // `open_chunk_at` consults it before a chunk exists at all.
+        // The backing ordinal addresses the newest appended chunk version.
+        // Keep session-only write evidence with the buffer across flushes.
+        // Normal chunk access builds the directory before opening the buffer.
         match ordinal {
             Some(at) => {
                 if let Some(chunk) = self.open_chunk.as_mut() {
@@ -10179,147 +10434,6 @@ impl VarveFile {
         self.open_chunk
             .as_ref()
             .is_some_and(|chunk| chunk.dirty || chunk.backing.is_none())
-    }
-
-    /// Rewrites the record a reloaded chunk came from, where it already sits.
-    ///
-    /// The shape is `replace_fixed_in_place_exclusive`'s, and the addressing is
-    /// the same mechanism: the bytes of an already-indexed record are reachable
-    /// only by consuming a [`ReplacementTarget`], and this one comes from
-    /// `resolve_internal`, which performed the same stored-version refusal.
-    ///
-    /// **Two gates that path runs and this one does not, and why.**
-    /// `ensure_generation_rewrite_allowed` refuses formats with a non-resident
-    /// block, and `validate_source_generation` re-walks and re-validates the
-    /// whole generation before writing. Both belong to a *user* record
-    /// replacement, where the caller names a record by ordinal among blocks the
-    /// file's own readers resolve by ordinal, and neither is free: the second is
-    /// `O(file)`. This runs on a chunk transition, which is the write path of a
-    /// growing matrix — an `O(file)` scan there is the thing the standing
-    /// append-hot-path policy exists to refuse, and it would make a TB-scale
-    /// file's every chunk boundary cost a full pass. What replaces them is that
-    /// the target is not a user's ordinal at all: it is the record this handle
-    /// itself wrote or read this chunk from, its geometry was checked against
-    /// the spec on the way in, and the payload it is handed back is the same
-    /// length, which is asserted below rather than assumed.
-    ///
-    /// # The rewrite is not crash-atomic
-    ///
-    /// This overwrites the only copy. Neither write below is `fsync`ed here —
-    /// `RecordFile::overwrite_indexed_record` ends in `File::flush`, which for a
-    /// `File` does nothing — so until the next `sync` the new bytes are page
-    /// cache, and writeback lands per page. Three ways the file ends up holding
-    /// a mix of the old chunk and the new one: power loss or a machine crash
-    /// before that `sync`, a `write_all` that fails part-way on `ENOSPC` or
-    /// `EIO`, and a process crash (the page cache survives, so the partial write
-    /// is what reaches disk).
-    ///
-    /// **The difference from an append is recoverability, not detection.** A
-    /// torn append lands past the committed end, and open truncates the
-    /// uncommitted tail; the data that was already readable is untouched. A torn
-    /// rewrite mixes data that *was* committed and readable.
-    ///
-    /// **What detects it depends on the format, and the first version of this
-    /// comment said otherwise.** `checksum_record_bytes` returns a constant `0`
-    /// under [`IntegrityPolicy::None`], and a chunk carries the per-cell
-    /// checksum table only when the policy asks for one — so under `None`
-    /// nothing catches a torn rewrite and the mixed cells are served as values.
-    /// Under `Crc32`/`Crc32WithHeader` the per-cell checksum is stored beside
-    /// the cell and a read of a torn cell fails with `ChecksumMismatch`.
-    ///
-    /// **The blast radius is bounded to cell values inside this one chunk**,
-    /// which is worth stating next to the rest. The payload length is unchanged
-    /// — asserted above, not assumed — and the write is in place, so record
-    /// framing, every offset chain, the resident index and every other record
-    /// are untouched. A torn rewrite leaves a file that still opens and still
-    /// parses, holding some cells at their previous values.
-    ///
-    /// This is the bargain the matrix *region* has always made — an in-place
-    /// slot write with a per-cell checksum — and reopening a chunk is opting
-    /// into the region's durability model for chunked rows.
-    fn rewrite_chunk_record(
-        &mut self,
-        permit: &FileMutationPermit,
-        ordinal: usize,
-        payload: &[u8],
-        payload_len: u64,
-    ) -> Result<()> {
-        let target = ReplacementTarget::resolve_internal(
-            &self.index,
-            MATRIX_CHUNK_BLOCK_ID,
-            MATRIX_CHUNK_VERSION,
-            ordinal,
-        )?;
-        let entry = self.index.entry_at(target.position())?;
-        // The encoder is deterministic for an uncompressed chunk — the payload
-        // length is a function of the block count, the strides, the cell counts
-        // and the stored commit-map lengths, all of which came from this record
-        // — so this cannot fire from an ordinary edit. It fires if any of that
-        // stops being true, and it fires *before* a byte moves.
-        if entry.payload_len != payload_len {
-            return Err(Error::ReplaceSizeMismatch {
-                old: entry.payload_len,
-                new: payload_len,
-            });
-        }
-        let sequence = self.sequence_state.available()?;
-        let mut footer_bytes = [0; RECORD_FOOTER_LEN as usize];
-        let footer = if let Some(footer_offset) = entry.footer_offset {
-            // Carried across unchanged: the footer holds the offset chains,
-            // which describe where this record sits among its block's records,
-            // and rewriting its payload does not move it.
-            self.snapshot
-                .read_exact_at(footer_offset, &mut footer_bytes)?;
-            &footer_bytes[..]
-        } else {
-            &[]
-        };
-        let header = RecordHeaderFields {
-            block_id: entry.block_id,
-            block_version: entry.block_version,
-            flags: entry.flags,
-            sequence,
-            payload_len,
-            checksum: 0,
-            uncompressed_len_hint: entry.uncompressed_len_hint,
-        };
-        let checksum =
-            checksum_record_fields(self.spec, entry.record_offset, header, payload, footer)?;
-        let header_bytes = encode_native_record_header(
-            RecordHeaderFields { checksum, ..header },
-            entry.record_offset,
-            record_footer_len(self.spec),
-        )?;
-        if let Err(error) =
-            self.overwrite_record_bytes_in_place(permit, target, &header_bytes, payload)
-        {
-            // The record's own bytes are now of unknown state — this is the one
-            // step that cannot be rolled back by truncation — so the handle
-            // stops writing rather than carrying on over it. The chunk is left
-            // open, as in the append path: a failure must not also destroy the
-            // buffer.
-            self.poison.poison();
-            return Err(error);
-        }
-        // On disk, and the buffer stays for the same reason the append path
-        // keeps it: the write bitmap is not in the record, so releasing here
-        // would make an all-zero uncommitted cell read as never written on the
-        // next reload. It is already backed — by this very record — so only
-        // `dirty` changes.
-        if let Some(chunk) = self.open_chunk.as_mut() {
-            chunk.dirty = false;
-        }
-        // No `note_written`: the directory already carries this chunk, at this
-        // ordinal, at this offset and this length — none of which the rewrite
-        // changed.
-        //
-        // The digest does move, though. It stores the sequence high-water, and
-        // the rewrite consumed a sequence without appending a record, so the
-        // append-driven flag would leave a stale digest describing a file whose
-        // newest sequence is higher than it claims.
-        self.appended_since_digest = true;
-        self.publish_sequence(sequence);
-        Ok(())
     }
 
     fn chunk_block_slice<T: VarveMatrixBlock>(
@@ -10502,29 +10616,17 @@ impl VarveFile {
         self.commit_matrix_cell::<To>(key)
     }
 
-    /// Writes, syncs, commits, syncs the commit, then calls `hook`.
+    /// Writes a cell, runs the barriers, publishes and syncs its generation,
+    /// then calls `hook`. Other pending matrix changes are published too.
     ///
-    /// The hook runs **after** the cell is committed and durable, so its
-    /// failure cannot un-commit the cell. It is therefore reported as the
-    /// typed published outcome [`Error::MatrixCommittedButHookFailed`],
-    /// carrying the [`MatrixCommitEvent`] the hook was given.
-    ///
-    /// The commit sync is the only other step after the commit, and it is
-    /// governed the same way (round 11): if it fails the cell is committed but
-    /// its durability is unproven and the hook has not run, which is reported
-    /// as [`Error::MatrixCommittedButDurabilityUnproven`], again carrying the
-    /// event.
-    ///
-    /// Every other error variant means the cell was not committed by this
-    /// call, so a result-driven retry can distinguish "nothing happened, retry
-    /// the write" from "committed, retry only the notification" and from
-    /// "committed, re-establish durability".
-    ///
-    /// The scope of that guarantee is a process that continues to run (F-06):
-    /// both variants allocate two boxes after the commit, and a refused
-    /// shape-sized allocation aborts rather than substituting another outcome.
-    /// See "Allocator Failure And Published Outcomes" in
-    /// `docs/durability-model.md`.
+    /// Barrier failures are pre-publication errors and poison the writer.
+    /// [`Error::MatrixPublicationUncertain`] requires reopening and inspecting
+    /// the confirmed generation before retrying. A complete head whose final
+    /// durability request failed yields [`Error::MatrixCommittedButDurabilityUnproven`].
+    /// Both skip the hook. After successful durable publication, hook failure
+    /// yields [`Error::MatrixCommittedButHookFailed`]; retry only the notification.
+    /// Outcome boxes are fixed-size allocations and abort on allocator failure.
+    /// See "Allocator Failure And Published Outcomes" in `docs/durability-model.md`.
     pub fn write_matrix_cell_durable<T, F>(
         &mut self,
         key: MatrixKey,
@@ -10542,7 +10644,8 @@ impl VarveFile {
     /// [`Self::write_matrix_cell_durable`] with a caller-supplied durability
     /// barrier; the same post-commit contract applies, including
     /// [`Error::MatrixCommittedButHookFailed`] and
-    /// [`Error::MatrixCommittedButDurabilityUnproven`].
+    /// [`Error::MatrixCommittedButDurabilityUnproven`]. Both barrier callbacks
+    /// precede generation publication and receive the physical generation file.
     pub fn write_matrix_cell_durable_with_barrier<T, B, F>(
         &mut self,
         key: MatrixKey,
@@ -10579,53 +10682,27 @@ impl VarveFile {
         // Pre-publication. Nothing is committed yet, so a failure here is a
         // plain refusal: the slot bytes may be on disk but the commit bit is
         // not, and an uncommitted slot is not visible to any reader.
-        let sync_data = barrier.sync_matrix_data(self.file.matrix_region());
+        let sync_data = barrier.sync_matrix_data(self.file.matrix_barrier_file()?);
         self.poison_after_started_matrix_error(sync_data)?;
-        // THE AUTHORITATIVE COMMIT. `commit_matrix_cell` puts the commit bit in
-        // the file; from this line on the cell is committed and a reader that
-        // opens the file after a clean process exit sees it. INVARIANT 3
-        // therefore governs *every* remaining step of this function, and there
-        // are exactly two: the commit sync and the hook. Both report typed
-        // published outcomes; nothing else follows them.
+        // Commit bits are still private working pages. Both caller barriers
+        // run before the generation head is published; failure keeps readers
+        // on the preceding generation and poisons this writer.
         self.commit_matrix_cell::<T>(key)?;
-        // Step 1 of 2 after the commit (round 11). This used to return a bare
-        // `Err` (poison only), which is indistinguishable from "nothing
-        // happened" even though the cell is committed and readable - the same
-        // defect as F-04 one step earlier, and the same shape the round-10
-        // sweep fixed in `commit_durable`. It now reports the matrix twin of
-        // `CommittedButDurabilityUnproven`, carrying the committed event so
-        // the caller can issue the notification after re-establishing
-        // durability instead of repeating the write. Poisoning is retained: a
-        // refused durability request mid-publication leaves this handle unfit
-        // to continue, and the recovery is to reopen and `sync`.
-        //
-        // F-06, and the crate's one policy on allocator failure. Both post-
-        // commit variants box their event and their source, so constructing
-        // either one allocates twice after the cell is authoritative, and a
-        // harness that failed the very next allocation terminated the process
-        // at exactly this line while the reopened file held the committed
-        // value. That is deliberate and is now stated rather than implied.
-        // These are *shape-sized* allocations - 56 bytes, fixed by the type,
-        // not by any file length or caller count - and the crate allocates
-        // those infallibly, matching Rust's abort-on-OOM default; only
-        // content-sized allocations are charged and `try_reserve`d into
-        // `Error::AllocationFailed`. The consequence is the one the docs now
-        // publish: an allocator refusal here ends the process instead of
-        // returning a *different* outcome, so no caller ever observes a wrong
-        // one, and the cell is committed on disk either way. Pre-staging the
-        // boxes before the commit was considered and rejected: it cannot
-        // remove `Box::new(source)` (the source is only produced by the
-        // failure, and `Error` is recursive so it cannot be carried inline),
-        // the caller must allocate to format or propagate the outcome anyway,
-        // and it would put two allocations on the success path of every
-        // durable cell write to serve a path that ends in `abort`. See
-        // "Allocator Failure And Published Outcomes" in
-        // `docs/durability-model.md`.
-        if let Err(source) = barrier.sync_matrix_commit(self.file.matrix_region()) {
+        let sync_commit = barrier.sync_matrix_commit(self.file.matrix_barrier_file()?);
+        self.poison_after_started_matrix_error(sync_commit)?;
+        let previous_generation = self.matrix_generation();
+        if let Err(source) = self.sync() {
             self.poison.poison();
-            return Err(Error::MatrixCommittedButDurabilityUnproven {
-                event: Box::new(event),
-                source: Box::new(source),
+            return Err(if self.matrix_generation() != previous_generation {
+                Error::MatrixCommittedButDurabilityUnproven {
+                    event: Box::new(event),
+                    source: Box::new(source),
+                }
+            } else {
+                Error::MatrixPublicationUncertain {
+                    event: Box::new(event),
+                    source: Box::new(source),
+                }
             });
         }
         // Step 2 of 2. The cell is committed and durable from here on. The hook is the
@@ -10720,28 +10797,16 @@ impl VarveFile {
                 ordinal: chunks.len(),
             });
         }
-        // The binary search in `find` is only legal on a list ordered by chunk
-        // index, and file order no longer supplies that: a chunk that committed
-        // nothing is never written, so a later write to one of its rows appends
-        // its record *after* higher-indexed ones. This used to demand ascending
-        // file order and refuse anything else, which was correct while chunks
-        // could only be written in one direction and is a rejection of a
-        // perfectly readable file now.
-        //
-        // `sort_by_key` and not `sort_unstable_by_key`: with duplicate indexes
-        // the two disagree about which record survives to the `windows` check
-        // below, and refusing must not depend on that.
-        chunks.sort_by_key(|locator| locator.index);
-        // What *is* still refused, and the reason it has to be. Two records
-        // claiming one chunk index is not an ordering question — it is a file
-        // saying two different things about the same rows, with nothing in the
-        // format to say which is current. A rewrite goes back over the original
-        // record precisely so this cannot arise; a file where it has arisen was
-        // not written by this code.
-        if chunks.windows(2).any(|pair| pair[0].index == pair[1].index) {
-            return Err(Error::InvalidMatrixChunk);
-        }
-        Ok(ChunkDirectory { chunks })
+        // Chunk records are immutable versions. Within this handle's confirmed
+        // EOF the record with the greatest offset is the current version.
+        // Keep the original record count for the next append's ordinal.
+        let next_ordinal = chunks.len();
+        chunks.sort_unstable_by_key(|chunk| (chunk.index, std::cmp::Reverse(chunk.record_offset)));
+        chunks.dedup_by_key(|chunk| chunk.index);
+        Ok(ChunkDirectory {
+            chunks,
+            next_ordinal,
+        })
     }
 
     /// The written-chunk directory, built at most once per handle.
@@ -11634,39 +11699,11 @@ impl VarveFile {
         self.finish_matrix_mutation(result)
     }
 
-    /// Clears every committed cell of a category and reports how many.
-    ///
-    /// **Refused for a growing matrix with written chunks.** It cleared the
-    /// matrix region only, so a caller asking for a clean category got one
-    /// silently: chunked rows stayed committed, stayed readable, and were not
-    /// in the count. A written chunk is a written record and records are not
-    /// rewritten, so there is no clearing it — saying so is the only honest
-    /// answer. The open chunk *is* cleared, and counted.
-    /// Clears every committed cell of a category and reports how many.
-    ///
-    /// **Covers written chunks, which it refused to until 2026-08-09.** The
-    /// refusal read "a written chunk is a written record", and that stopped
-    /// being true when a chunk record became rewritable in place; the fallback
-    /// argument — that reaching them costs a reload and a rewrite per chunk — is
-    /// not an argument, because that is what clearing a category *is*. Before
-    /// the refusal existed the function cleared the matrix region only and
-    /// returned a count that omitted the chunked rows it had silently left
-    /// committed, which is the failure the refusal replaced and this replaces
-    /// properly.
-    ///
-    /// # What it costs, and what it does not promise
-    ///
-    /// One reload and one record rewrite per written chunk holding the
-    /// category, plus the region clear. Memory is one chunk at a time, as
-    /// everywhere else.
-    ///
-    /// It is **not atomic**, and cannot be: each chunk is its own record write,
-    /// so the fifth can fail after four have landed. What replaces atomicity is
-    /// idempotence — clearing an already-clear category clears nothing and
-    /// counts nothing — so the answer to a failure part-way is to call it again,
-    /// and the count from the retry plus the count from the failed attempt is
-    /// the total. A torn write inside one record still poisons the handle, as
-    /// it does on every other write path.
+    /// Clears a category in the working generation, including stored chunks.
+    /// Each affected chunk is loaded and appended as a new immutable version;
+    /// memory holds one chunk at a time. Published readers remain unchanged
+    /// until sync. A partial failure can leave partial working changes; reopen
+    /// to discard them instead of publishing an incomplete operation.
     pub fn clear_matrix_category(&mut self, category: &str) -> Result<u64> {
         let _permit = self.ensure_write()?;
         let mut cleared = 0u64;
@@ -12086,7 +12123,11 @@ impl VarveFile {
         // A private duplicate of the descriptor, so the pass needs no borrow of
         // the handle a writer holds and can run under `&self` like every other
         // matrix read.
-        let mut file = self.snapshot.try_clone_file()?;
+        let mut file = self
+            .file
+            .matrix_pages()
+            .ok_or(Error::MatrixLayoutMissing)?
+            .read_clone();
         crate::matrix::verify_matrix_metadata(matrix, &mut file)
     }
 
@@ -12539,7 +12580,17 @@ impl VarveFile {
             usize::try_from(mapped_len).map_err(|_| Error::LengthOverflow { value: mapped_len })?;
         // SAFETY: The caller guarantees that the cloned backing object remains
         // immutable and valid for the mapping's entire lifetime.
-        let mmap = unsafe { memmap2::MmapOptions::new().len(map_len).map(&file)? };
+        let pages = self.file.matrix_pages().ok_or(Error::MatrixLayoutMissing)?;
+        let changed = pages.mapped_pages()?;
+        self.spec.read_limits.check(
+            ReadLimitKey::MaterializedBytes,
+            (changed.len() as u64)
+                .checked_mul(4096)
+                .ok_or(Error::InvalidMatrixLayout)?,
+        )?;
+        let mut mapping = unsafe { memmap2::MmapOptions::new().len(map_len).map_copy(&file)? };
+        pages.patch_mapping(&mut mapping, &changed)?;
+        let mmap = mapping.make_read_only()?;
         validate_mmap_range(0, layout.append_log_start(), mapped_len)?;
         Ok(MmapMatrix {
             spec: self.spec,
@@ -12819,17 +12870,9 @@ impl VarveFile {
         result
     }
 
-    /// Poisons on *any* error from a durability barrier phase of a durable
-    /// matrix write.
-    ///
-    /// Stricter than [`Self::finish_matrix_mutation`] on purpose: these phases
-    /// bracket the authoritative commit, so an error means a durability request
-    /// was refused mid-publication and this handle is unfit to continue. Since
-    /// round 11 the only caller is the **pre**-commit data sync, whose failure
-    /// is a plain refusal (nothing is published yet). The post-commit sync
-    /// poisons at its own call site so it can return the typed published
-    /// outcome [`Error::MatrixCommittedButDurabilityUnproven`] instead of the
-    /// bare error this helper propagates; do not route it back through here.
+    /// A failed durability operation leaves the writer unfit to continue.
+    /// Barrier callbacks precede generation publication and propagate their
+    /// original errors. Publication/hook outcomes are classified by the caller.
     fn poison_after_started_matrix_error<T>(&mut self, result: Result<T>) -> Result<T> {
         if result.is_err() {
             self.poison.poison();
@@ -16436,7 +16479,6 @@ fn parse_file_header_extension_blocks(region: &[u8]) -> Result<Vec<HeaderExtensi
 ///
 /// Returns the number of bytes it blanked, so a caller can assert it did
 /// something.
-#[cfg(any(test, feature = "high-cardinality-dev"))]
 pub(crate) fn blank_mutable_header_bytes(
     prefix: &mut [u8],
     header_len: u64,
@@ -17502,7 +17544,6 @@ where
     Ok(Some(budget.decode(key, endian)?))
 }
 
-#[cfg(feature = "high-cardinality-dev")]
 pub(crate) fn decode_stream_tombstone_key<T: VarveKeyedBlock>(
     spec: FormatSpec,
     snapshot: &SnapshotFile,
@@ -17603,7 +17644,7 @@ pub(crate) fn write_file_header(spec: FormatSpec, file: &mut File) -> Result<Vec
     Ok(extensions)
 }
 
-pub(crate) fn read_file_header(spec: FormatSpec, file: &mut File) -> Result<u64> {
+pub(crate) fn read_file_header(spec: FormatSpec, file: &mut (impl Read + Seek)) -> Result<u64> {
     Ok(read_file_header_parts(spec, file)?.0)
 }
 
@@ -17613,7 +17654,10 @@ pub(crate) fn read_file_header(spec: FormatSpec, file: &mut File) -> Result<u64>
 /// unknown block is skippable rather than refused, a file's region can be
 /// longer than this build would write, and every offset derived from the header
 /// has to come from the file rather than from the spec.
-pub(crate) fn read_file_header_parts(spec: FormatSpec, file: &mut File) -> Result<(u64, Vec<u8>)> {
+pub(crate) fn read_file_header_parts(
+    spec: FormatSpec,
+    file: &mut (impl Read + Seek),
+) -> Result<(u64, Vec<u8>)> {
     file.seek(SeekFrom::Start(0))?;
     let header = read_native_file_header(file, spec)?;
     let hash = header.schema_hash;
@@ -17643,36 +17687,70 @@ pub(crate) fn read_file_header_parts(spec: FormatSpec, file: &mut File) -> Resul
     }
 }
 
+fn matrix_pending_limit(spec: FormatSpec) -> usize {
+    // Charge a conservative 128 bytes of directory metadata per dirty page.
+    spec.read_limits
+        .require(ReadLimitKey::MaterializedBytes)
+        .ok()
+        .flatten()
+        .map_or(65_536, |n| {
+            usize::try_from(n / 128).unwrap_or(usize::MAX).max(1)
+        })
+}
 fn read_matrix_layout_if_needed(
+    path: &Path,
+    writable: bool,
     spec: FormatSpec,
     file: &mut File,
     header_len: u64,
-    captured_len: u64,
-) -> Result<Option<(crate::matrix::MatrixLayout, [u8; MATRIX_CREATION_NONCE_LEN])>> {
-    if spec.has_matrix_blocks() {
-        // The creation nonce region sits between the native file header and
-        // the matrix layout header (DUR2-03).
-        let creation_nonce = read_matrix_creation_nonce_region(file, header_len)?;
-        let layout_start = header_len
-            .checked_add(MATRIX_CREATION_NONCE_REGION_LEN as u64)
-            .ok_or(Error::InvalidMatrixLayout)?;
-        let layout = crate::matrix::read_layout_at_len(spec, file, layout_start, captured_len)?;
-        Ok(Some((layout, creation_nonce)))
-    } else {
-        Ok(None)
+    _captured_len: u64,
+) -> Result<
+    Option<(
+        crate::matrix::MatrixLayout,
+        [u8; MATRIX_CREATION_NONCE_LEN],
+        crate::matrix_generation::MatrixFile,
+    )>,
+> {
+    if !spec.has_matrix_blocks() {
+        return Ok(None);
     }
+    let nonce = read_matrix_creation_nonce_region(file, header_len)?;
+    let mut pages = crate::matrix_generation::MatrixFile::open(
+        path,
+        file,
+        nonce,
+        writable,
+        matrix_pending_limit(spec),
+    )?;
+    pages.set_cache_bytes(spec.read_limits.matrix_generation_cache_budget());
+    if pages.head().native_eof > file.metadata()?.len() {
+        return Err(Error::InvalidMatrixLayout);
+    }
+    let layout_start = header_len
+        .checked_add(MATRIX_CREATION_NONCE_REGION_LEN as u64)
+        .ok_or(Error::InvalidMatrixLayout)?;
+    let confirmed_len = pages.head().native_eof;
+    let layout = crate::matrix::read_layout_at_len(spec, &mut pages, layout_start, confirmed_len)?;
+    if writable {
+        file.set_len(pages.head().native_eof)?;
+    }
+    Ok(Some((layout, nonce, pages)))
 }
-
 #[allow(clippy::type_complexity)]
 fn split_matrix_state(
-    state: Option<(crate::matrix::MatrixLayout, [u8; MATRIX_CREATION_NONCE_LEN])>,
+    state: Option<(
+        crate::matrix::MatrixLayout,
+        [u8; MATRIX_CREATION_NONCE_LEN],
+        crate::matrix_generation::MatrixFile,
+    )>,
 ) -> (
     Option<crate::matrix::MatrixLayout>,
     Option<[u8; MATRIX_CREATION_NONCE_LEN]>,
+    Option<crate::matrix_generation::MatrixFile>,
 ) {
     match state {
-        Some((layout, nonce)) => (Some(layout), Some(nonce)),
-        None => (None, None),
+        Some((layout, nonce, pages)) => (Some(layout), Some(nonce), Some(pages)),
+        None => (None, None, None),
     }
 }
 
@@ -17962,7 +18040,7 @@ fn note_replacement_predecessor_probe() {
 
 fn read_record_entry_at(
     spec: FormatSpec,
-    file: &mut File,
+    file: &mut (impl Read + Seek),
     file_len: u64,
     offset: u64,
     checks: ScanChecks,
@@ -18083,11 +18161,10 @@ fn read_record_entry_at(
     Ok(RecordRead::Entry(entry))
 }
 
-#[cfg(feature = "high-cardinality-dev")]
 #[derive(Debug)]
 pub(crate) struct NativeStreamScanner {
     spec: FormatSpec,
-    file: File,
+    file: crate::snapshot::SnapshotReader,
     snapshot: SnapshotFile,
     offset: u64,
     accounting: ScanAccounting,
@@ -18095,21 +18172,21 @@ pub(crate) struct NativeStreamScanner {
     previous_sequence: Option<u64>,
 }
 
-#[cfg(all(test, feature = "high-cardinality-dev"))]
+#[cfg(test)]
 thread_local! {
     static STREAM_SCANNER_CONSTRUCTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STREAM_SCANNER_ENTRIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STREAM_POINT_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(all(test, feature = "high-cardinality-dev"))]
+#[cfg(test)]
 pub(crate) fn reset_stream_io_counters() {
     STREAM_SCANNER_CONSTRUCTIONS.set(0);
     STREAM_SCANNER_ENTRIES.set(0);
     STREAM_POINT_READS.set(0);
 }
 
-#[cfg(all(test, feature = "high-cardinality-dev"))]
+#[cfg(test)]
 pub(crate) fn stream_io_counters() -> (u64, u64, u64) {
     (
         STREAM_SCANNER_CONSTRUCTIONS.get(),
@@ -18118,10 +18195,9 @@ pub(crate) fn stream_io_counters() -> (u64, u64, u64) {
     )
 }
 
-#[cfg(feature = "high-cardinality-dev")]
 impl NativeStreamScanner {
     pub(crate) fn from_snapshot(spec: FormatSpec, snapshot: SnapshotFile) -> Result<Self> {
-        let mut file = snapshot.try_clone_file()?;
+        let mut file = snapshot.reader();
         let header_len = read_file_header(spec, &mut file)?;
         let mut accounting = ScanAccounting::default();
         accounting.advance(spec, header_len)?;
@@ -18136,6 +18212,13 @@ impl NativeStreamScanner {
             records: 0,
             previous_sequence: None,
         })
+    }
+
+    pub(crate) fn extend_snapshot(&mut self, snapshot: SnapshotFile) {
+        debug_assert!(self.snapshot.same_file_object(&snapshot));
+        debug_assert!(self.snapshot.len() <= snapshot.len());
+        self.file.extend_snapshot(snapshot.clone());
+        self.snapshot = snapshot;
     }
 
     pub(crate) fn next_entry(&mut self) -> Result<Option<RecordIndexEntry>> {
@@ -18204,7 +18287,6 @@ impl NativeStreamScanner {
     }
 }
 
-#[cfg(feature = "high-cardinality-dev")]
 pub(crate) fn read_stream_entry_at(
     spec: FormatSpec,
     snapshot: &SnapshotFile,
@@ -18218,7 +18300,7 @@ pub(crate) fn read_stream_entry_at(
     let span = validated.span();
     #[cfg(test)]
     STREAM_POINT_READS.set(STREAM_POINT_READS.get() + 1);
-    let mut file = snapshot.try_clone_file()?;
+    let mut file = snapshot.reader();
     let entry = read_stream_entry_at_file(spec, &mut file, snapshot, offset)?;
     if entry.record_offset != span.record_offset().get()
         || entry.payload_offset != span.payload_offset().get()
@@ -18230,10 +18312,9 @@ pub(crate) fn read_stream_entry_at(
     Ok(entry)
 }
 
-#[cfg(feature = "high-cardinality-dev")]
 pub(crate) fn read_stream_entry_at_file(
     spec: FormatSpec,
-    file: &mut File,
+    file: &mut (impl Read + Seek),
     snapshot: &SnapshotFile,
     offset: u64,
 ) -> Result<RecordIndexEntry> {
@@ -18258,7 +18339,6 @@ pub(crate) fn read_stream_entry_at_file(
     }
 }
 
-#[cfg(feature = "high-cardinality-dev")]
 #[derive(Debug)]
 pub(crate) struct PreparedStreamRecord {
     pub(crate) bytes: Vec<u8>,
@@ -18269,7 +18349,6 @@ pub(crate) struct PreparedStreamRecord {
     pub(crate) checksum: u32,
 }
 
-#[cfg(feature = "high-cardinality-dev")]
 /// What [`prepare_stream_record_into`] knows about the record it just appended
 /// to the caller's buffer.
 ///
@@ -18285,7 +18364,6 @@ pub(crate) struct PreparedRecordParts {
     pub(crate) checksum: u32,
 }
 
-#[cfg(feature = "high-cardinality-dev")]
 impl PreparedStreamRecord {
     /// The same record described as [`PreparedRecordParts`], for the callers
     /// that still take the owning form.
@@ -18304,7 +18382,6 @@ impl PreparedStreamRecord {
 /// The owning form, for the callers that want a record and nothing else: the
 /// creation nonce, the manifest, a tombstone, the probe. None of them is a hot
 /// path, and each allocates exactly the buffer it hands back.
-#[cfg(feature = "high-cardinality-dev")]
 #[allow(clippy::too_many_arguments)]
 fn prepare_stream_record(
     spec: FormatSpec,
@@ -18350,7 +18427,6 @@ fn prepare_stream_record(
 /// chunk it is about to write. Both used to take a fresh `Vec` per record from
 /// the owning form below, and the batch path then copied it into the chunk
 /// buffer and dropped it.
-#[cfg(feature = "high-cardinality-dev")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_stream_user_record_into<T: VarveBlock>(
     spec: FormatSpec,
@@ -18391,7 +18467,7 @@ pub(crate) fn prepare_stream_user_record_into<T: VarveBlock>(
 /// The owning form. Only the in-crate probe and the unit tests below want a
 /// record they can hold; every production path stages through
 /// [`prepare_stream_user_record_into`].
-#[cfg(all(test, feature = "high-cardinality-dev"))]
+#[cfg(test)]
 pub(crate) fn prepare_stream_user_record<T: VarveBlock>(
     spec: FormatSpec,
     value: &T,
@@ -18426,7 +18502,6 @@ pub(crate) fn prepare_stream_user_record<T: VarveBlock>(
     )
 }
 
-#[cfg(feature = "high-cardinality-dev")]
 pub(crate) fn prepare_stream_tombstone_record<T: VarveKeyedBlock>(
     spec: FormatSpec,
     key: &T::Key,
@@ -18450,7 +18525,6 @@ pub(crate) fn prepare_stream_tombstone_record<T: VarveKeyedBlock>(
     )
 }
 
-#[cfg(feature = "high-cardinality-dev")]
 pub(crate) fn prepare_stream_manifest_record(
     spec: FormatSpec,
     sequence: u64,
@@ -18476,7 +18550,6 @@ pub(crate) fn prepare_stream_manifest_record(
 /// Same uniqueness-not-secrecy contract as the matrix creation nonce: it only
 /// has to differ between two `create` calls, including two that reuse the same
 /// OS file object.
-#[cfg(feature = "high-cardinality-dev")]
 pub(crate) fn fresh_stream_creation_nonce() -> [u8; MATRIX_CREATION_NONCE_LEN] {
     fresh_matrix_creation_nonce()
 }
@@ -18493,7 +18566,6 @@ pub(crate) fn fresh_stream_creation_nonce() -> [u8; MATRIX_CREATION_NONCE_LEN] {
 /// rather than a keyed metadata envelope. That keeps the record at the smallest
 /// possible size, so it fits inside any payload limit that admits a 16-byte
 /// user record and needs no exemption from the caller's read limits.
-#[cfg(feature = "high-cardinality-dev")]
 pub(crate) fn prepare_stream_creation_nonce_record(
     spec: FormatSpec,
     nonce: [u8; MATRIX_CREATION_NONCE_LEN],
@@ -18527,7 +18599,6 @@ pub(crate) fn prepare_stream_creation_nonce_record(
 /// answering `None` can only ever produce a *different* fingerprint and refuse
 /// the sidecar. It must never turn a damaged leading record into an open-time
 /// error on a path whose job is to compute an identity.
-#[cfg(feature = "high-cardinality-dev")]
 pub(crate) fn read_stream_creation_nonce(
     spec: FormatSpec,
     snapshot: &SnapshotFile,
@@ -18536,7 +18607,7 @@ pub(crate) fn read_stream_creation_nonce(
     if header_len >= snapshot.len() {
         return None;
     }
-    let mut file = snapshot.try_clone_file().ok()?;
+    let mut file = snapshot.reader();
     let entry = read_stream_entry_at_file(spec, &mut file, snapshot, header_len).ok()?;
     if entry.block_id != CREATION_NONCE_BLOCK_ID
         || entry.flags & RECORD_FLAG_INTERNAL == 0
@@ -18549,7 +18620,6 @@ pub(crate) fn read_stream_creation_nonce(
     <[u8; MATRIX_CREATION_NONCE_LEN]>::try_from(payload.as_slice()).ok()
 }
 
-#[cfg(feature = "high-cardinality-dev")]
 /// Appends one encoded record to `out` and returns what the writer needs to
 /// know about it.
 ///
@@ -18863,6 +18933,33 @@ fn segment_chain_open_is_allowed(spec: FormatSpec, intent: ScanIntent) -> bool {
             != IntegrityVerification::AtOpen
 }
 
+fn load_generation_index(
+    spec: FormatSpec,
+    file: &mut File,
+    header_len: u64,
+    intent: ScanIntent,
+    out: &mut Vec<RecordIndexEntry>,
+    pages: Option<&crate::matrix_generation::MatrixFile>,
+) -> Result<ScannedIndex> {
+    match pages {
+        Some(pages) => {
+            let end = pages.head().native_eof;
+            if segment_chain_open_is_allowed(spec, intent) {
+                match walk_segment_chain(spec, file, header_len, out, end) {
+                    Ok(scanned) => return Ok(scanned),
+                    Err(error @ Error::MissingResourceLimit { .. })
+                    | Err(error @ Error::TrustedUnboundedRequiresExplicitApi { .. }) => {
+                        return Err(error);
+                    }
+                    Err(_) => out.clear(),
+                }
+            }
+            scan_records_range_at_len(spec, file, header_len, header_len, None, intent, out, end)
+        }
+        None => load_index(spec, file, header_len, intent, out),
+    }
+}
+
 fn load_index(
     spec: FormatSpec,
     file: &mut File,
@@ -18921,7 +19018,7 @@ fn load_index_from_segments(
     append_start: u64,
     out: &mut Vec<RecordIndexEntry>,
 ) -> Result<Option<ScannedIndex>> {
-    match walk_segment_chain(spec, file, append_start, out) {
+    match walk_segment_chain(spec, file, append_start, out, file.metadata()?.len()) {
         Ok(scanned) => Ok(Some(scanned)),
         // Only a *spec-level* refusal propagates: the format declared no
         // ceiling, or demanded the explicit unbounded API. Those describe the
@@ -19353,8 +19450,8 @@ fn walk_segment_chain(
     file: &mut File,
     append_start: u64,
     entries: &mut Vec<RecordIndexEntry>,
+    file_len: u64,
 ) -> Result<ScannedIndex> {
-    let file_len = file.metadata()?.len();
     let mut accounting = ScanAccounting::default();
     accounting.advance(spec, append_start)?;
 
@@ -20039,8 +20136,30 @@ fn scan_records_range(
     intent: ScanIntent,
     entries: &mut Vec<RecordIndexEntry>,
 ) -> Result<ScannedIndex> {
-    let header_len = from;
     let file_len = file.metadata()?.len();
+    scan_records_range_at_len(
+        spec,
+        file,
+        from,
+        prefix_charge,
+        resume_commit_end,
+        intent,
+        entries,
+        file_len,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn scan_records_range_at_len(
+    spec: FormatSpec,
+    file: &mut File,
+    from: u64,
+    prefix_charge: u64,
+    resume_commit_end: Option<u64>,
+    intent: ScanIntent,
+    entries: &mut Vec<RecordIndexEntry>,
+    file_len: u64,
+) -> Result<ScannedIndex> {
+    let header_len = from;
     let mut offset = header_len;
     entries.clear();
     let mut scanned = ScannedIndex {
@@ -20237,7 +20356,7 @@ impl RecordIndexEntry {
     fn logical_payload_len_before_allocation(
         &self,
         spec: FormatSpec,
-        file: &mut File,
+        file: &mut (impl Read + Seek),
     ) -> Result<u64> {
         if !self.is_compressed() {
             return Ok(self.payload_len);
@@ -20613,7 +20732,11 @@ fn infallible_entries(
     entries.iter().cloned().map(Ok)
 }
 
-fn read_record_header(file: &mut File, _spec: FormatSpec, offset: u64) -> Result<RecordIndexEntry> {
+fn read_record_header(
+    file: &mut (impl Read + Seek),
+    _spec: FormatSpec,
+    offset: u64,
+) -> Result<RecordIndexEntry> {
     let decoded = read_native_record_header(file, offset)?;
     debug_assert_eq!(decoded.lead_in_len, RECORD_HEADER_LEN);
     let header = decoded.fields;
@@ -20655,9 +20778,9 @@ fn encode_record_footer(footer: RecordFooterFields) -> Result<[u8; RECORD_FOOTER
 /// Rebuilds a record's index entry from the record itself, positionally.
 ///
 /// **`&self` throughout, which is the whole point.** `read_record_entry_at`
-/// takes `&mut File` and seeks, so it cannot serve a read path that one handle
-/// shares between concurrent readers — and a demand-filled index is exactly
-/// such a path: every read of an entry the index no longer holds has to come
+/// takes `&mut File` and seeks, so it cannot serve an `&self` read path.
+/// A demand-filled index uses that path: every read of an entry the index no
+/// longer holds has to come
 /// from the file, under `&self`. This reads the two fixed-size regions through
 /// `SnapshotFile::read_exact_at` and hands them to the same decoders the
 /// scanning reader uses, so there is one decode of a record header in the
@@ -20743,7 +20866,7 @@ pub(crate) fn fault_record_entry(
 }
 
 fn read_record_footer_bytes(
-    file: &mut File,
+    file: &mut (impl Read + Seek),
     offset: u64,
 ) -> Result<[u8; RECORD_FOOTER_LEN as usize]> {
     file.seek(SeekFrom::Start(offset))?;
@@ -20803,7 +20926,7 @@ fn checksum_record_fields(
 
 fn checksum_record_file(
     spec: FormatSpec,
-    file: &mut File,
+    file: &mut (impl Read + Seek),
     entry: &RecordIndexEntry,
     footer: &[u8],
 ) -> Result<u32> {
@@ -20836,7 +20959,7 @@ fn checksum_record_file(
 
 #[cfg(feature = "integrity")]
 fn crc32_record_file(
-    file: &mut File,
+    file: &mut (impl Read + Seek),
     payload_offset: u64,
     payload_len: u64,
     header: &[u8],
@@ -20863,7 +20986,7 @@ fn crc32_record_file(
 
 #[cfg(not(feature = "integrity"))]
 fn crc32_record_file(
-    _file: &mut File,
+    _file: &mut (impl Read + Seek),
     _payload_offset: u64,
     _payload_len: u64,
     _header: &[u8],
@@ -21213,10 +21336,8 @@ fn validate_matrix_sidecar_manifest(
 /// 32-byte fingerprint.
 ///
 /// Mirrors the scalable sidecar identity machinery
-/// (`stream::primary_identity` / `opened_file_identity`), which is compiled
-/// only under `high-cardinality-dev`; the matrix module is always built, so the
-/// OS-object identity is recomputed here rather than reused across the feature
-/// boundary. Uses the CRC helper so the fingerprint honors the same
+/// (`stream::primary_identity` / `opened_file_identity`). Matrix companions
+/// retain their own fingerprint encoding. Uses the CRC helper so it honors the same
 /// `integrity` gate the rest of the sidecar envelope requires.
 fn native_object_fingerprint(spec: FormatSpec, file: &File) -> Result<[u8; 32]> {
     let object_identity = opened_file_identity(file)?;
@@ -21592,7 +21713,6 @@ pub(crate) enum ReplaceDurability {
 /// failure ??the target pathname is untouched ??so dropping the guard deletes
 /// the unpublished temp as usual; on `Ok` the rename already consumed the temp
 /// pathname and the guard's drop is a no-op.
-#[cfg(feature = "high-cardinality-dev")]
 pub(crate) fn publish_temp_path_atomically(
     temporary: tempfile::TempPath,
     target: &Path,
@@ -22070,6 +22190,78 @@ pub(crate) struct WriterLock {
     released: bool,
 }
 
+// An acquisition can fail before a WriterLock exists. Explicitly unlock on
+// every early return too: closing an fd does not release a flock inherited by
+// another process between fork and exec.
+struct AcquiredWriterFile {
+    file: Option<File>,
+    native: bool,
+}
+impl AcquiredWriterFile {
+    fn new(file: File, native: bool) -> Self {
+        Self {
+            file: Some(file),
+            native,
+        }
+    }
+    fn into_inner(mut self) -> File {
+        self.file.take().expect("owned acquisition file")
+    }
+}
+impl std::ops::Deref for AcquiredWriterFile {
+    type Target = File;
+    fn deref(&self) -> &File {
+        self.file.as_ref().expect("owned acquisition file")
+    }
+}
+impl std::ops::DerefMut for AcquiredWriterFile {
+    fn deref_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("owned acquisition file")
+    }
+}
+impl Drop for AcquiredWriterFile {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            if self.native {
+                let _ = unlock_native_guard(file);
+            } else {
+                let _ = unlock_writer_guard(file);
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn failed_acquisition_guard_releases_a_fork_style_duplicate() -> Result<()> {
+    for native in [false, true] {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("guard");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        if native {
+            try_lock_native_guard(&file)
+                .map_err(|_| Error::WriterLockHeld(path.display().to_string()))?;
+        } else {
+            try_lock_writer_guard(&file)
+                .map_err(|_| Error::WriterLockHeld(path.display().to_string()))?;
+        }
+        let admitted = AcquiredWriterFile::new(file, native);
+        // dup and fork share the same open-file description on Unix. Keep
+        // that description alive after the failed acquisition scope exits.
+        let duplicate = admitted.try_clone()?;
+        drop(admitted);
+        let contender = OpenOptions::new().read(true).write(true).open(&path)?;
+        assert!(try_lock_native_guard(&contender).is_ok());
+        unlock_native_guard(&contender)?;
+        drop(duplicate);
+    }
+    Ok(())
+}
+
 impl WriterLock {
     pub(crate) fn acquire(path: &Path) -> Result<Self> {
         Self::acquire_with_policy(path, WriterLockBreakPolicy::Refuse)
@@ -22082,7 +22274,7 @@ impl WriterLock {
         let path = lock_path(target_path);
         // F-07: acquisition truncates and rewrites this object, so it must be
         // a dedicated, unaliased regular file before anything is mutated.
-        let mut file = open_dedicated_lock_marker(&path)?;
+        let file = open_dedicated_lock_marker(&path)?;
         match try_lock_writer_guard(&file) {
             Ok(()) => {}
             Err(WriterGuardLockError::WouldBlock) => {
@@ -22096,6 +22288,7 @@ impl WriterLock {
             Err(WriterGuardLockError::Io(error)) => return Err(error.into()),
         }
 
+        let mut file = AcquiredWriterFile::new(file, false);
         let marker_present = file.metadata()?.len() != 0;
         if marker_present && policy == WriterLockBreakPolicy::Refuse {
             return Err(Error::WriterLockHeld(path.display().to_string()));
@@ -22111,7 +22304,8 @@ impl WriterLock {
         // An object lock held by a live writer can never be broken: the OS
         // releases it only when that writer's handles close, so a conflict here
         // always means an active writer, regardless of the marker break policy.
-        let native_guard = probe_native_target_lock(target_path)?;
+        let native_guard =
+            probe_native_target_lock(target_path)?.map(|file| AcquiredWriterFile::new(file, true));
 
         let info = WriterLockInfo {
             path: path.clone(),
@@ -22124,9 +22318,9 @@ impl WriterLock {
             return Err(error);
         }
         Ok(Self {
-            file,
+            file: file.into_inner(),
             marker_path: path,
-            native_guard,
+            native_guard: native_guard.map(AcquiredWriterFile::into_inner),
             released: false,
         })
     }
@@ -22219,7 +22413,7 @@ fn probe_native_target_lock(target_path: &Path) -> Result<Option<File>> {
     }
 }
 
-enum WriterGuardLockError {
+pub(crate) enum WriterGuardLockError {
     WouldBlock,
     Io(std::io::Error),
 }
@@ -22240,7 +22434,7 @@ fn try_lock_writer_guard(file: &File) -> std::result::Result<(), WriterGuardLock
 
 // Advisory whole-file lock on Unix; both native and marker guards share it.
 #[cfg(not(windows))]
-fn try_lock_native_guard(file: &File) -> std::result::Result<(), WriterGuardLockError> {
+pub(crate) fn try_lock_native_guard(file: &File) -> std::result::Result<(), WriterGuardLockError> {
     try_lock_writer_guard(file)
 }
 
@@ -22252,7 +22446,7 @@ fn try_lock_native_guard(file: &File) -> std::result::Result<(), WriterGuardLock
 const NATIVE_WRITER_GUARD_OFFSET: u64 = u64::MAX - 1;
 
 #[cfg(windows)]
-fn try_lock_native_guard(file: &File) -> std::result::Result<(), WriterGuardLockError> {
+pub(crate) fn try_lock_native_guard(file: &File) -> std::result::Result<(), WriterGuardLockError> {
     try_lock_exclusive_range(file, NATIVE_WRITER_GUARD_OFFSET)
 }
 
@@ -22294,12 +22488,12 @@ fn unlock_writer_guard(file: &File) -> std::io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn unlock_native_guard(file: &File) -> std::io::Result<()> {
+pub(crate) fn unlock_native_guard(file: &File) -> std::io::Result<()> {
     file.unlock()
 }
 
 #[cfg(windows)]
-fn unlock_native_guard(file: &File) -> std::io::Result<()> {
+pub(crate) fn unlock_native_guard(file: &File) -> std::io::Result<()> {
     unlock_exclusive_range(file, NATIVE_WRITER_GUARD_OFFSET)
 }
 

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::sync::{PoisonError, RwLock};
+use std::sync::LazyLock;
 
 use crate::traits::KeyedBlockContract;
 use crate::{
@@ -386,8 +386,8 @@ impl BlockContractKey {
 /// Block ids covered by [`FormatSpec::block_identities`] never reach this
 /// cache at all (see [`ensure_block_contract`]), so every spec `varve_format!`
 /// emits is validated straight from immutable `&'static` data with no
-/// process-global lock on the append path. The sorted vector is only appended
-/// to on the first registration of an identity-less (format, block) pair: no
+/// process-global lock on the append path. The lock-free map only inserts
+/// on the first registration of an identity-less (format, block) pair: no
 /// allocation, no syscall, no O(records) work on any later call.
 ///
 /// What two specs deliberately *do* share an entry: identity-less specs whose
@@ -403,7 +403,8 @@ impl BlockContractKey {
 /// `unsafe` code could hand a new, unrelated table the same address and length.
 /// Formats built from ordinary statics — which is every format the macros
 /// produce — cannot reach that state.
-static BLOCK_CONTRACTS: RwLock<Vec<(BlockContractKey, BlockContract)>> = RwLock::new(Vec::new());
+static BLOCK_CONTRACTS: LazyLock<crossbeam_skiplist::SkipMap<BlockContractKey, BlockContract>> =
+    LazyLock::new(crossbeam_skiplist::SkipMap::new);
 
 fn check_block_contract<T: VarveBlock>(spec: FormatSpec, recorded: BlockContract) -> Result<()> {
     if recorded.keyed != T::IS_KEYED {
@@ -468,26 +469,11 @@ fn ensure_block_contract<T: VarveBlock>(spec: FormatSpec) -> Result<()> {
     // the documented first-use escape hatch: the first type to register the id
     // defines the contract every later type must match.
     let key = BlockContractKey::new(spec, T::ID);
-    {
-        let contracts = BLOCK_CONTRACTS
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Ok(index) = contracts.binary_search_by_key(&key, |entry| entry.0) {
-            return check_block_contract::<T>(spec, contracts[index].1);
-        }
+    if let Some(entry) = BLOCK_CONTRACTS.get(&key) {
+        return check_block_contract::<T>(spec, *entry.value());
     }
-    // Cache miss. Nothing is recorded until validation succeeds, so a rejected
-    // type can never poison the id for the type that legitimately owns it.
     let contract = BlockContract::declared_by::<T>();
     check_block_contract::<T>(spec, contract)?;
-    let mut contracts = BLOCK_CONTRACTS
-        .write()
-        .unwrap_or_else(PoisonError::into_inner);
-    match contracts.binary_search_by_key(&key, |entry| entry.0) {
-        Ok(index) => check_block_contract::<T>(spec, contracts[index].1),
-        Err(index) => {
-            contracts.insert(index, (key, contract));
-            Ok(())
-        }
-    }
+    let entry = BLOCK_CONTRACTS.get_or_insert(key, contract);
+    check_block_contract::<T>(spec, *entry.value())
 }

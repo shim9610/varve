@@ -47,6 +47,8 @@ varve_format! {
 }
 
 fn main() {
+    fn assert_send<T: Send>() {}
+    assert_send::<LayoutOnlyFormatLayoutReader>();
     let spec = LayoutOnlyFormat::spec();
     assert_eq!(spec.layout.preset, LayoutPreset::None);
     assert_ne!(spec.schema_hash, 0);

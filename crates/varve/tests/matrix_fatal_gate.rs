@@ -4,7 +4,11 @@
 //! and surfaces the full recovery report.
 #![cfg(feature = "integrity")]
 
-use std::fs::{OpenOptions, read};
+#[path = "common/matrix_image.rs"]
+mod matrix_image;
+use matrix_image::OpenOptions;
+
+use std::fs::read;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -107,7 +111,7 @@ fn write_committed_cell(spec: FormatSpec, path: &Path, key: MatrixKey, value: u3
     writer
         .commit_matrix_cell::<GateCell>(key)
         .expect("commit cell");
-    writer.flush().expect("flush fixture");
+    writer.sync().expect("flush fixture");
 }
 
 fn region_crc_off(path: &Path, spec: FormatSpec) -> u64 {

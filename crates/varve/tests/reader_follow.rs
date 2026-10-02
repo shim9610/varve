@@ -840,7 +840,7 @@ fn the_reader_wrapper_exposes_the_pair() -> varve::Result<()> {
 /// The read policy, held by the compiler rather than by a comment.
 ///
 /// The standing requirement is that no read entry point needs `&mut self` —
-/// one handle serves concurrent readers through `&self`. `follow` is the one
+/// each thread owns a reader and queries it through `&self`. `follow` is the one
 /// operation that is not a read and takes `&mut self` accordingly, so the pair
 /// added beside it had to stay `&self` or the whole point of `reopen` (produce
 /// a replacement *without* anybody stopping) would be gone.
@@ -877,13 +877,9 @@ fn detecting_and_reopening_a_generation_take_a_shared_borrow() -> varve::Result<
     Ok(())
 }
 
-/// A handle across threads, which is what the `&self` policy exists for.
-///
-/// Not a stress test — a demonstration that the pair is usable in the shape the
-/// design assumes: readers hold an `Arc` and read concurrently, and the owner
-/// produces the next generation through the same shared handle.
+/// Independent readers remain usable while the owner opens a replacement.
 #[test]
-fn readers_share_a_handle_while_the_next_generation_is_produced() -> varve::Result<()> {
+fn independent_readers_remain_usable_while_a_replacement_is_opened() -> varve::Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("threads.varve");
     let mut writer = spec().create(&path)?;
@@ -893,12 +889,13 @@ fn readers_share_a_handle_while_the_next_generation_is_produced() -> varve::Resu
     writer.flush()?;
     drop(writer);
 
-    let shared = std::sync::Arc::new(varve::VarveFile::open_readonly(spec(), &path)?);
-    let expected = shared.block_tail_offset(Reading::ID);
+    let owner = varve::VarveFile::open_readonly(spec(), &path)?;
+    let expected = owner.block_tail_offset(Reading::ID);
 
     let readers: Vec<_> = (0..4)
         .map(|_| {
-            let handle = std::sync::Arc::clone(&shared);
+            let handle =
+                varve::VarveFile::open_readonly(spec(), &path).expect("independent reader");
             std::thread::spawn(move || -> varve::Result<()> {
                 for _ in 0..25 {
                     assert_eq!(handle.block_tail_offset(Reading::ID), expected);
@@ -909,9 +906,8 @@ fn readers_share_a_handle_while_the_next_generation_is_produced() -> varve::Resu
         })
         .collect();
 
-    // The owner produces the replacement through the same shared handle, with
-    // every reader still running against it.
-    let next = shared.reopen_readonly()?;
+    // Reopening the owner does not change any worker's independently owned reader.
+    let next = owner.reopen_readonly()?;
     assert_eq!(next.block_tail_offset(Reading::ID), expected);
 
     for reader in readers {

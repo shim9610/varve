@@ -1,5 +1,3 @@
-#![cfg(feature = "high-cardinality-dev")]
-
 //! Shared indexed-handle contracts (PERF-06/PERF-07).
 //!
 //! Independent in-process indexed handles must share one sidecar database per
@@ -137,7 +135,7 @@ fn independent_readers_share_one_sidecar_database() -> Result<()> {
 }
 
 #[test]
-fn uncommitted_writer_batch_is_typed_busy_for_new_handles() -> Result<()> {
+fn dirty_generation_reads_the_saved_root_without_writer_admission() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("write-admission.varve");
     let options = DiskIndexOptions::default();
@@ -152,20 +150,20 @@ fn uncommitted_writer_batch_is_typed_busy_for_new_handles() -> Result<()> {
     let reader = VarveIndexedReader::open(spec, &path, options, plan)?;
     assert_eq!(reader.get::<Item>(&1)?, Some(item(1, "one")));
 
-    // An uncommitted sidecar batch holds the write-admission gate, so a
-    // conflicting open observes a typed busy error instead of blocking
-    // inside redb behind the batch transaction.
+    // A new reader uses the saved clean root without taking write admission.
     writer.push_info(&item(2, "two"))?;
-    assert!(matches!(
-        VarveIndexedReader::open(spec, &path, options, plan),
-        Err(Error::IndexBusy)
-    ));
+    let mut following = VarveIndexedReader::open(spec, &path, options, plan)?;
+    assert_eq!(following.get::<Item>(&1)?, Some(item(1, "one")));
+    assert_eq!(following.get::<Item>(&2)?, None);
+    assert_eq!(following.follow()?, 0);
     // The pre-existing reader keeps serving its pinned snapshot.
     assert_eq!(reader.get::<Item>(&1)?, Some(item(1, "one")));
 
     writer.sync()?;
     let fresh = VarveIndexedReader::open(spec, &path, options, plan)?;
     assert_eq!(fresh.get::<Item>(&2)?, Some(item(2, "two")));
+    assert_eq!(following.follow()?, 1);
+    assert_eq!(following.get::<Item>(&2)?, Some(item(2, "two")));
     // The older reader still serves the generation it pinned at open.
     assert_eq!(reader.get::<Item>(&1)?, Some(item(1, "one")));
     Ok(())
@@ -217,10 +215,8 @@ fn rebuild_replaces_the_sidecar_for_fresh_handles() -> Result<()> {
     Ok(())
 }
 
-/// PERF2-09: the process-global registry mutex only guards the identity map;
-/// a cache-miss redb open runs under a per-identity slot, so concurrent opens
-/// of unrelated sidecars — and racing opens of the same sidecar — all succeed
-/// and same-file handles still share one database.
+/// Independent cold opens of different files succeed; hot opens of the same
+/// file share one database without a Varve registry or initialization mutex.
 #[test]
 fn concurrent_opens_of_unrelated_and_same_sidecars_all_succeed() -> Result<()> {
     let directory = tempfile::tempdir()?;
@@ -242,10 +238,9 @@ fn concurrent_opens_of_unrelated_and_same_sidecars_all_succeed() -> Result<()> {
         // One thread per identity, opening concurrently with the others:
         // distinct identities must not serialize behind one another's
         // database open. Each thread opens twice so both handles of one
-        // identity converge on the shared database. (Simultaneous opens of
-        // one identity may still fail fast with the typed busy error while
-        // the other handle's open validation holds the write gate, so
-        // same-identity opens stay sequential here.)
+        // identity converge on the shared database. Cold opens racing before
+        // registration may be refused by redb's existing file lock; concurrent
+        // hot opens are covered separately by the reader churn regression.
         for path in &paths {
             handles.push(scope.spawn(move || -> Result<()> {
                 let first = VarveIndexedReader::open(spec, path, options, plan)?;
@@ -330,14 +325,12 @@ fn crc_point_lookups_verify_payloads_and_detect_corruption() -> Result<()> {
     Ok(())
 }
 
-/// PERF-04: the process-global sidecar registry used to sweep every slot on
-/// every create/open/invalidate while holding the global mutex, so opening `S`
-/// identities accumulated `Theta(S^2)` slot checks. Reclamation is now
-/// amortized: the total slot inspections for `S` sequential opens must stay
-/// linear in `S`.
+/// No operation sweeps unrelated registry entries. The lock-free skip list
+/// performs expected O(log S) key comparisons; this counter measures database
+/// entries inspected, not the skip list's internal comparisons.
 #[cfg(feature = "scalable-fault-injection")]
 #[test]
-fn registry_cost_per_open_does_not_scale_with_live_identities() -> Result<()> {
+fn registry_does_not_sweep_live_identities_on_open() -> Result<()> {
     use varve::DiskIndexRebuildReport;
 
     fn open_identities(count: u64) -> Result<u64> {

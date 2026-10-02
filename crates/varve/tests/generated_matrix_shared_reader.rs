@@ -118,7 +118,7 @@ fn build(path: &PathBuf) -> varve::Result<()> {
             writer.commit_shared_cell(key)?;
         }
     }
-    writer.flush()?;
+    writer.sync()?;
     Ok(())
 }
 
@@ -157,21 +157,19 @@ fn generated_matrix_reads_take_shared_self() -> varve::Result<()> {
     Ok(())
 }
 
-/// (c) One generated reader shared across four threads, every thread reading
-/// every cell. This needs `&self` twice over: the borrow checker for the shared
-/// reference, and `Sync` for the handle.
+/// (c) Each thread owns a generated reader; cell and aux queries stay `&self`.
 #[test]
-fn one_generated_reader_serves_concurrent_matrix_readers() -> varve::Result<()> {
+fn independent_generated_readers_serve_concurrent_threads() -> varve::Result<()> {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("shared_matrix_threads.vrv");
     build(&path)?;
 
-    let reader = SharedMatrixFormat::open_reader(&path)?;
-    let reader_ref = &reader;
-
     std::thread::scope(|scope| {
         for _ in 0..4 {
+            let reader =
+                SharedMatrixFormat::open_reader(&path).expect("independent generated reader");
             scope.spawn(move || {
+                let reader_ref = &reader;
                 for scan in 0..SCANS {
                     for ch in 0..CHANNELS {
                         let key = SharedCellKey { scan, ch };

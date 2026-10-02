@@ -56,7 +56,7 @@ varve_format! {
                 b: u32,
             }
 
-            variable Item(id = 2, key = [id]) {
+            variable Item(id = 2, key = [id], key_index = disk) {
                 id: u64,
                 name: String,
             }
@@ -109,4 +109,14 @@ fn main() {
     }
     cleanup.unwrap();
     println!("renamed-dependency fixture OK");
+}
+
+// Check the promoted API through a renamed dependency with default features
+// explicitly disabled. These calls are type-checked, not executed by the fixture.
+#[allow(dead_code)]
+fn default_storage_apis(path: &std::path::Path) -> vv::Result<()> {
+    let _ = RenamedFormat::open_stream_reader(path, vv::StreamOptions::default())?;
+    let _ = RenamedFormat::open_indexed_reader(path, vv::DiskIndexOptions::default())?;
+    let _ = vv::ScanOptions::default();
+    Ok(())
 }

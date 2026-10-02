@@ -38,7 +38,7 @@
 //! Delete this file the day the disk index tolerates a commit marker, and
 //! restore the two end-to-end cases from 93c64c3's history.
 
-#![cfg(all(feature = "integrity", feature = "high-cardinality-dev"))]
+#![cfg(feature = "integrity")]
 
 use varve::{DiskIndexOptions, Error, IndexPolicy, varve_format};
 

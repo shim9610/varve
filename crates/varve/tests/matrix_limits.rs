@@ -1,4 +1,7 @@
-use std::fs::{OpenOptions, metadata};
+#[path = "common/matrix_image.rs"]
+mod matrix_image;
+use matrix_image::OpenOptions;
+use std::fs::metadata;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -372,6 +375,7 @@ fn cell_reads_check_materialization_limit_before_allocating_slot_bytes() -> varv
     let mut writer = spec.create_with_dims(fixture.path(), dimensions)?;
     writer.write_matrix_cell(key, &LimitedCell { value: 7 })?;
     writer.commit_matrix_cell::<LimitedCell>(key)?;
+    writer.sync()?;
     drop(writer);
 
     let runtime = high_limits().with_max_materialized_bytes(3);
@@ -494,6 +498,7 @@ fn resident_bitmap_budget_is_charged_as_pages_are_materialized() -> varve::Resul
         Err(error) => error,
     };
     expect_limit(error, "matrix bitmap bytes", 0);
+    writer.sync()?;
     drop(writer);
 
     // A budget that covers both pages admits the same write and commit, and the
@@ -506,7 +511,8 @@ fn resident_bitmap_budget_is_charged_as_pages_are_materialized() -> varve::Resul
     let mut writer = spec.create_writer_with_dims(roomy.path(), dimensions)?;
     writer.write_matrix_cell(MatrixKey::new(0, 0), &LimitedCell { value: 1 })?;
     writer.commit_matrix_cell::<LimitedCell>(MatrixKey::new(0, 0))?;
-    writer.flush()?;
+    writer.sync()?;
+    writer.sync()?;
     drop(writer);
     drop(spec.open_readonly(roomy.path())?);
 

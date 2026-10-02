@@ -98,7 +98,10 @@ enum Oracle {
 
 /// The shape a scan says the file has, as the thing every other route answers
 /// to.
-fn scanned_shape(spec: FormatSpec, path: &Path) -> Option<(Vec<(u32, u64, u64)>, Vec<Option<u64>>)> {
+fn scanned_shape(
+    spec: FormatSpec,
+    path: &Path,
+) -> Option<(Vec<(u32, u64, u64)>, Vec<Option<u64>>)> {
     let file = VarveFile::open_readonly(spec, path).ok()?;
     let entries = file
         .index_entries()

@@ -1,4 +1,8 @@
-use std::fs::{File, OpenOptions, metadata, remove_file};
+#[path = "common/matrix_image.rs"]
+mod matrix_image;
+use matrix_image::OpenOptions;
+use std::fs::{File, metadata, remove_file};
+#[cfg(feature = "integrity")]
 use std::io::Read;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -436,36 +440,33 @@ fn matrix_crc_spec() -> FormatSpec {
 
 struct RecordingMatrixBarrier {
     events: Arc<Mutex<Vec<&'static str>>>,
-    commit_map_off: u64,
+    path: PathBuf,
 }
-
 impl RecordingMatrixBarrier {
-    fn new(events: Arc<Mutex<Vec<&'static str>>>, commit_map_off: u64) -> Self {
-        Self {
-            events,
-            commit_map_off,
-        }
+    fn new(events: Arc<Mutex<Vec<&'static str>>>, path: PathBuf) -> Self {
+        Self { events, path }
     }
-
-    fn commit_byte(&self, file: &mut File) -> varve::Result<u8> {
-        let cursor = file.stream_position()?;
-        file.seek(SeekFrom::Start(self.commit_map_off))?;
-        let mut byte = [0; 1];
-        file.read_exact(&mut byte)?;
-        file.seek(SeekFrom::Start(cursor))?;
-        Ok(byte[0])
-    }
+}
+fn assert_unpublished(path: &std::path::Path) -> varve::Result<()> {
+    let reader = matrix_spec().open_reader(path)?;
+    assert_eq!(
+        reader.matrix_cell_status::<MatrixCell>(MatrixKey::new(0, 0))?,
+        MatrixCellStatus::NotCommitted
+    );
+    Ok(())
 }
 
 impl MatrixDurabilityBarrier for RecordingMatrixBarrier {
     fn sync_matrix_data(&mut self, file: &mut File) -> varve::Result<()> {
-        assert_eq!(self.commit_byte(file)? & 0b0000_0001, 0);
+        assert_unpublished(&self.path)?;
+        file.sync_data()?;
         self.events.lock().expect("event mutex").push("data_sync");
         Ok(())
     }
 
     fn sync_matrix_commit(&mut self, file: &mut File) -> varve::Result<()> {
-        assert_eq!(self.commit_byte(file)? & 0b0000_0001, 0b0000_0001);
+        assert_unpublished(&self.path)?;
+        file.sync_data()?;
         self.events.lock().expect("event mutex").push("commit_sync");
         Ok(())
     }
@@ -502,7 +503,7 @@ fn matrix_random_order_write_read_commit_and_append_log_coexist() -> varve::Resu
         writer.set_matrix_single_committed("master_grid", true)?;
         writer.set_matrix_channel_committed("threshold", 1, true)?;
         writer.push_info(&LogPoint { value: 99 })?;
-        writer.flush()?;
+        writer.sync()?;
     }
 
     let file_len = metadata(&path)?.len();
@@ -549,14 +550,14 @@ fn matrix_random_order_write_read_commit_and_append_log_coexist() -> varve::Resu
             })
         ));
         writer.clear_matrix_cell::<MatrixCell>(MatrixKey::new(0, 0))?;
-        writer.flush()?;
+        writer.sync()?;
     }
     assert_eq!(metadata(&path)?.len(), file_len);
 
     {
         let mut writer = spec.open_writer(&path)?;
         writer.commit_matrix_cell::<MatrixCell>(MatrixKey::new(0, 0))?;
-        writer.flush()?;
+        writer.sync()?;
     }
 
     {
@@ -601,7 +602,7 @@ fn matrix_write_cell_bounds_hostile_encode_at_the_slot_stride() -> varve::Result
     // The typed rejection leaves the writer usable and the slot untouched.
     writer.write_matrix_cell(MatrixKey::new(0, 0), &MatrixCell { value: 5 })?;
     writer.commit_matrix_cell::<MatrixCell>(MatrixKey::new(0, 0))?;
-    writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     let reader = spec.open_reader(&path)?;
@@ -696,7 +697,7 @@ fn format_first_matrix_dsl_generates_typed_api() -> varve::Result<()> {
         writer.commit_generated_cell(key)?;
         writer.set_master_grid_committed(true)?;
         writer.set_threshold_committed(1, true)?;
-        writer.flush()?;
+        writer.sync()?;
     }
 
     {
@@ -768,7 +769,7 @@ fn matrix_p1_p2_extension_points_are_usable() -> varve::Result<()> {
         }
         writer.write_matrix_cell(MatrixKey::new(0, 0), &MatrixCell { value: 1 })?;
         writer.commit_matrix_cell::<MatrixCell>(MatrixKey::new(0, 0))?;
-        writer.flush()?;
+        writer.sync()?;
     }
 
     assert_eq!(
@@ -836,8 +837,7 @@ fn matrix_durable_barrier_observes_data_then_commit_sync_then_hook() -> varve::R
     {
         let dims = MatrixDimensions::from_pairs([("scan", 2), ("ch", 2)]);
         let mut writer = spec.create_writer_with_dims(&path, dims)?;
-        let offsets = read_vmat_offsets(&path, spec)?;
-        let mut barrier = RecordingMatrixBarrier::new(Arc::clone(&events), offsets.commit_map_off);
+        let mut barrier = RecordingMatrixBarrier::new(Arc::clone(&events), path.clone());
         let events_for_hook = Arc::clone(&events);
         writer.write_matrix_cell_durable_with_barrier(
             MatrixKey::new(0, 0),
@@ -885,25 +885,15 @@ enum FailingBarrierPhase {
 /// raised in the wrong place.
 struct FailingMatrixBarrier {
     fail: FailingBarrierPhase,
-    commit_map_off: u64,
+    path: PathBuf,
     events: Arc<Mutex<Vec<&'static str>>>,
-}
-
-impl FailingMatrixBarrier {
-    fn commit_byte(&self, file: &mut File) -> varve::Result<u8> {
-        let cursor = file.stream_position()?;
-        file.seek(SeekFrom::Start(self.commit_map_off))?;
-        let mut byte = [0; 1];
-        file.read_exact(&mut byte)?;
-        file.seek(SeekFrom::Start(cursor))?;
-        Ok(byte[0])
-    }
 }
 
 impl MatrixDurabilityBarrier for FailingMatrixBarrier {
     fn sync_matrix_data(&mut self, file: &mut File) -> varve::Result<()> {
         // Pre-publication: the commit bit must still be clear here.
-        assert_eq!(self.commit_byte(file)? & 0b0000_0001, 0);
+        assert_unpublished(&self.path)?;
+        file.sync_data()?;
         self.events.lock().expect("event mutex").push("data_sync");
         if self.fail == FailingBarrierPhase::Data {
             return Err(Error::InvalidFormatSpec("injected data-sync failure"));
@@ -914,7 +904,8 @@ impl MatrixDurabilityBarrier for FailingMatrixBarrier {
     fn sync_matrix_commit(&mut self, file: &mut File) -> varve::Result<()> {
         // Post-publication: the commit bit is already on disk at this point,
         // which is precisely why a failure here is a published outcome.
-        assert_eq!(self.commit_byte(file)? & 0b0000_0001, 0b0000_0001);
+        assert_unpublished(&self.path)?;
+        file.sync_data()?;
         self.events.lock().expect("event mutex").push("commit_sync");
         if self.fail == FailingBarrierPhase::Commit {
             return Err(Error::InvalidFormatSpec("injected commit-sync failure"));
@@ -935,8 +926,7 @@ impl MatrixDurabilityBarrier for FailingMatrixBarrier {
 /// plain refusal with the cell left uncommitted. If the fix wrapped errors
 /// indiscriminately, that half fails.
 #[test]
-fn a_commit_sync_failure_is_reported_as_published_and_a_data_sync_failure_is_not()
--> varve::Result<()> {
+fn barrier_failures_before_generation_publication_leave_readers_unchanged() -> varve::Result<()> {
     let path = temp_path("matrix_durable_commit_sync_failure");
     cleanup(&path);
     let spec = matrix_spec();
@@ -948,10 +938,9 @@ fn a_commit_sync_failure_is_reported_as_published_and_a_data_sync_failure_is_not
     {
         let dims = MatrixDimensions::from_pairs([("scan", 2), ("ch", 2)]);
         let mut writer = spec.create_writer_with_dims(&path, dims)?;
-        let offsets = read_vmat_offsets(&path, spec)?;
         let mut barrier = FailingMatrixBarrier {
             fail: FailingBarrierPhase::Commit,
-            commit_map_off: offsets.commit_map_off,
+            path: path.clone(),
             events: Arc::clone(&events),
         };
         let hook_ran = Arc::new(Mutex::new(false));
@@ -965,21 +954,10 @@ fn a_commit_sync_failure_is_reported_as_published_and_a_data_sync_failure_is_not
                 Ok(())
             },
         );
-        match failed {
-            Err(Error::MatrixCommittedButDurabilityUnproven { event, source }) => {
-                assert_eq!(event.block_id, MatrixCell::ID);
-                assert_eq!(event.key, key);
-                assert_eq!(event.slot_len, 4);
-                assert!(
-                    matches!(
-                        *source,
-                        Error::InvalidFormatSpec("injected commit-sync failure")
-                    ),
-                    "the barrier's own error must be preserved as the source, got {source:?}"
-                );
-            }
-            other => panic!("expected MatrixCommittedButDurabilityUnproven, got {other:?}"),
-        }
+        assert!(matches!(
+            failed,
+            Err(Error::InvalidFormatSpec("injected commit-sync failure"))
+        ));
         assert!(
             !*hook_ran.lock().expect("hook mutex"),
             "the hook must not run when the commit sync failed"
@@ -996,19 +974,7 @@ fn a_commit_sync_failure_is_reported_as_published_and_a_data_sync_failure_is_not
         ));
     }
 
-    // The claim the variant makes, verified rather than asserted by shape: the
-    // cell really is committed and readable after a clean process exit.
-    {
-        let reader = spec.open_reader(&path)?;
-        assert_eq!(
-            reader.matrix_cell_status::<MatrixCell>(key)?,
-            MatrixCellStatus::Committed
-        );
-        assert_eq!(
-            reader.read_matrix_cell::<MatrixCell>(key)?,
-            MatrixCell { value: 7 }
-        );
-    }
+    assert_unpublished(&path)?;
     cleanup(&path);
 
     // NEGATIVE CONTROL: the same injection one phase earlier is pre-commit.
@@ -1018,10 +984,9 @@ fn a_commit_sync_failure_is_reported_as_published_and_a_data_sync_failure_is_not
     {
         let dims = MatrixDimensions::from_pairs([("scan", 2), ("ch", 2)]);
         let mut writer = spec.create_writer_with_dims(&path, dims)?;
-        let offsets = read_vmat_offsets(&path, spec)?;
         let mut barrier = FailingMatrixBarrier {
             fail: FailingBarrierPhase::Data,
-            commit_map_off: offsets.commit_map_off,
+            path: path.clone(),
             events: Arc::clone(&events),
         };
         let failed = writer.write_matrix_cell_durable_with_barrier(
@@ -1070,7 +1035,7 @@ fn matrix_aux_region_is_preallocated_noncommit_storage() -> varve::Result<()> {
         len_after_create = metadata(&path)?.len();
 
         writer.write_matrix_aux("thumbnail", 4, &[1, 2, 3, 4])?;
-        writer.flush()?;
+        writer.sync()?;
         assert_eq!(metadata(&path)?.len(), len_after_create);
         assert_eq!(
             writer.read_matrix_aux("thumbnail", 0, 8)?,
@@ -1082,7 +1047,7 @@ fn matrix_aux_region_is_preallocated_noncommit_storage() -> varve::Result<()> {
         ));
 
         writer.push(&LogPoint { value: 99 })?;
-        writer.flush()?;
+        writer.sync()?;
         assert!(metadata(&path)?.len() > len_after_create);
     }
 
@@ -1130,7 +1095,7 @@ fn matrix_recovery_clear_category_and_cell_actions_are_applied() -> varve::Resul
             writer.matrix_cell_status::<MatrixCell>(key)?,
             MatrixCellStatus::NotCommitted
         );
-        writer.flush()?;
+        writer.sync()?;
     }
 
     {
@@ -1160,7 +1125,7 @@ fn matrix_byte_copy_migration_scaffold_copies_compatible_committed_slot() -> var
         let mut writer = source_spec.create_writer_with_dims(&source_path, dims.clone())?;
         writer.write_matrix_cell(key, &MatrixCell { value: 123 })?;
         writer.commit_matrix_cell::<MatrixCell>(key)?;
-        writer.flush()?;
+        writer.sync()?;
     }
 
     {
@@ -1169,7 +1134,7 @@ fn matrix_byte_copy_migration_scaffold_copies_compatible_committed_slot() -> var
         let reader = source_spec.open_reader(&source_path)?;
         let mut writer = target_spec.create_writer_with_dims(&target_path, dims)?;
         writer.copy_matrix_cell_bytes_from::<MatrixCell, OtherMatrixCell>(&reader, key)?;
-        writer.flush()?;
+        writer.sync()?;
     }
 
     {
@@ -1203,7 +1168,7 @@ fn matrix_verified_sidecar_checks_parent_identity_and_payload_crc() -> varve::Re
         assert_eq!(manifest.category, "analysis");
         assert_eq!(manifest.generation, 7);
         assert_eq!(manifest.payload_len, b"resume-state-v1".len() as u64);
-        writer.flush()?;
+        writer.sync()?;
     }
 
     {
@@ -1285,7 +1250,7 @@ fn matrix_sidecar_identity_uses_computed_schema_hash() -> varve::Result<()> {
         let manifest = writer.write_matrix_sidecar("analysis", &sidecar, 1, b"resume")?;
         assert_eq!(manifest.schema_hash, computed);
         assert_ne!(manifest.schema_hash, spec.schema_hash);
-        writer.flush()?;
+        writer.sync()?;
     }
 
     {
@@ -1313,7 +1278,7 @@ fn matrix_mmap_payload_window_is_checked_and_snapshot_based() -> varve::Result<(
         writer.write_matrix_cell(MatrixKey::new(0, 0), &MatrixCell { value: 77 })?;
         writer.commit_matrix_cell::<MatrixCell>(MatrixKey::new(0, 0))?;
         writer.write_matrix_cell(MatrixKey::new(1, 1), &MatrixCell { value: 88 })?;
-        writer.flush()?;
+        writer.sync()?;
     }
 
     {
@@ -1352,7 +1317,7 @@ fn matrix_mmap_rejects_backing_file_truncated_after_open() -> varve::Result<()> 
     let dims = MatrixDimensions::from_pairs([("scan", 1), ("ch", 1)]);
     let mut writer = spec.create_writer_with_dims(&path, dims)?;
     writer.push_info(&LogPoint { value: 99 })?;
-    writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     let reader = spec.open_reader(&path)?;
@@ -1362,10 +1327,10 @@ fn matrix_mmap_rejects_backing_file_truncated_after_open() -> varve::Result<()> 
         .open(&path)?
         .set_len(append_log_start)?;
 
-    let mapped = std::panic::catch_unwind(|| {
+    let mapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: Mutation is complete before this call and no mapping is returned.
         unsafe { reader.mmap_matrix() }
-    });
+    }));
     assert!(mapped.is_ok(), "truncated matrix snapshot caused a panic");
     assert!(matches!(
         mapped.expect("checked above"),
@@ -1395,7 +1360,7 @@ fn matrix_zero_copy_raw_cell_views_committed_slot() -> varve::Result<()> {
             },
         )?;
         writer.commit_matrix_cell::<RawMatrixCell>(key)?;
-        writer.flush()?;
+        writer.sync()?;
     }
 
     {
@@ -1420,7 +1385,7 @@ fn matrix_rejects_corrupt_append_log_start() -> varve::Result<()> {
         let mut writer = spec.create_writer_with_dims(&path, dims)?;
         writer.write_matrix_cell(MatrixKey::new(0, 0), &MatrixCell { value: 1 })?;
         writer.commit_matrix_cell::<MatrixCell>(MatrixKey::new(0, 0))?;
-        writer.flush()?;
+        writer.sync()?;
     }
 
     let mut file = OpenOptions::new().write(true).open(&path)?;
@@ -1452,7 +1417,7 @@ fn matrix_commit_map_crc_corruption_reports_recoverable_region_and_rebuilds() ->
         writer.write_matrix_cell(MatrixKey::new(1, 0), &MatrixCell { value: 11 })?;
         writer.commit_matrix_cell::<MatrixCell>(MatrixKey::new(1, 0))?;
         writer.write_matrix_cell(MatrixKey::new(0, 1), &MatrixCell { value: 99 })?;
-        writer.flush()?;
+        writer.sync()?;
     }
 
     let offsets = read_vmat_offsets(&path, spec)?;
@@ -1474,7 +1439,7 @@ fn matrix_commit_map_crc_corruption_reports_recoverable_region_and_rebuilds() ->
     {
         let mut writer = spec.open_writer(&path)?;
         assert_eq!(writer.rebuild_matrix_commit_from_crc::<MatrixCell>()?, 1);
-        writer.flush()?;
+        writer.sync()?;
     }
 
     {
@@ -1509,7 +1474,7 @@ fn matrix_slot_crc_corruption_rejects_committed_cell_read() -> varve::Result<()>
         let mut writer = spec.create_writer_with_dims(&path, dims)?;
         writer.write_matrix_cell(MatrixKey::new(1, 1), &MatrixCell { value: 1234 })?;
         writer.commit_matrix_cell::<MatrixCell>(MatrixKey::new(1, 1))?;
-        writer.flush()?;
+        writer.sync()?;
     }
 
     let offsets = read_vmat_offsets(&path, spec)?;
@@ -1562,7 +1527,7 @@ fn matrix_crc_rebuild_preserves_committed_zero_payloads() -> varve::Result<()> {
         let mut writer = spec.create_writer_with_dims(&path, dims)?;
         writer.write_matrix_cell(zero_key, &MatrixCell { value: 0 })?;
         writer.commit_matrix_cell::<MatrixCell>(zero_key)?;
-        writer.flush()?;
+        writer.sync()?;
     }
 
     let offsets = read_vmat_offsets(&path, spec)?;
@@ -1575,7 +1540,7 @@ fn matrix_crc_rebuild_preserves_committed_zero_payloads() -> varve::Result<()> {
     {
         let mut writer = spec.open_writer(&path)?;
         assert_eq!(writer.rebuild_matrix_commit_from_crc::<MatrixCell>()?, 1);
-        writer.flush()?;
+        writer.sync()?;
     }
 
     {
@@ -1590,6 +1555,7 @@ fn matrix_crc_rebuild_preserves_committed_zero_payloads() -> varve::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "integrity")]
 #[derive(Debug)]
 struct VmatOffsets {
     commit_map_off: u64,
@@ -1597,6 +1563,7 @@ struct VmatOffsets {
     slot_region_off: u64,
 }
 
+#[cfg(feature = "integrity")]
 fn read_vmat_offsets(path: &PathBuf, spec: FormatSpec) -> varve::Result<VmatOffsets> {
     let mut file = OpenOptions::new().read(true).open(path)?;
     // Native file header (magic + marker + version + endian + flags + schema

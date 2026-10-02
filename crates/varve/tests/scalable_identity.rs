@@ -1,5 +1,3 @@
-#![cfg(feature = "high-cardinality-dev")]
-
 //! Scalable primary/sidecar identity contracts (STO-01, API-03).
 //!
 //! A stream or indexed sidecar must belong to the exact logical generation of

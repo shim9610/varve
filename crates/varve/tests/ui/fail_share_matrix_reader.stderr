@@ -1,0 +1,165 @@
+error[E0277]: `OnceCell<varve_core::file::ChunkDirectory>` cannot be shared between threads safely
+ --> tests/ui/fail_share_matrix_reader.rs:5:24
+  |
+5 |     std::thread::spawn(move || reader.matrix_aux_len("thumbnail"));
+  |     ------------------ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `OnceCell<varve_core::file::ChunkDirectory>` cannot be shared between threads safely
+  |     |
+  |     required by a bound introduced by this call
+  |
+  = help: within `VarveReader`, the trait `Sync` is not implemented for `OnceCell<varve_core::file::ChunkDirectory>`
+  = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::OnceLock` instead
+note: required because it appears within the type `VarveFile`
+ --> $WORKSPACE/crates/varve-core/src/file.rs
+  |
+  | pub struct VarveFile {
+  |            ^^^^^^^^^
+note: required because it appears within the type `VarveReader`
+ --> $WORKSPACE/crates/varve-core/src/file.rs
+  |
+  | pub struct VarveReader {
+  |            ^^^^^^^^^^^
+  = note: required for `Arc<VarveReader>` to implement `Send`
+note: required because it's used within this closure
+ --> tests/ui/fail_share_matrix_reader.rs:5:24
+  |
+5 |     std::thread::spawn(move || reader.matrix_aux_len("thumbnail"));
+  |                        ^^^^^^^
+note: required by a bound in `spawn`
+ --> $RUST/std/src/thread/functions.rs
+
+error[E0277]: `OnceCell<Option<Arc<File>>>` cannot be shared between threads safely
+ --> tests/ui/fail_share_matrix_reader.rs:5:24
+  |
+5 |     std::thread::spawn(move || reader.matrix_aux_len("thumbnail"));
+  |     ------------------ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `OnceCell<Option<Arc<File>>>` cannot be shared between threads safely
+  |     |
+  |     required by a bound introduced by this call
+  |
+  = help: within `VarveReader`, the trait `Sync` is not implemented for `OnceCell<Option<Arc<File>>>`
+  = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::OnceLock` instead
+note: required because it appears within the type `varve_core::matrix::region_reader::MatrixReadPool`
+ --> $WORKSPACE/crates/varve-core/src/matrix.rs
+  |
+  |     pub struct MatrixReadPool {
+  |                ^^^^^^^^^^^^^^
+note: required because it appears within the type `varve_core::file::record_file::RecordFile`
+ --> $WORKSPACE/crates/varve-core/src/file.rs
+  |
+  |     pub struct RecordFile {
+  |                ^^^^^^^^^^
+note: required because it appears within the type `VarveFile`
+ --> $WORKSPACE/crates/varve-core/src/file.rs
+  |
+  | pub struct VarveFile {
+  |            ^^^^^^^^^
+note: required because it appears within the type `VarveReader`
+ --> $WORKSPACE/crates/varve-core/src/file.rs
+  |
+  | pub struct VarveReader {
+  |            ^^^^^^^^^^^
+  = note: required for `Arc<VarveReader>` to implement `Send`
+note: required because it's used within this closure
+ --> tests/ui/fail_share_matrix_reader.rs:5:24
+  |
+5 |     std::thread::spawn(move || reader.matrix_aux_len("thumbnail"));
+  |                        ^^^^^^^
+note: required by a bound in `spawn`
+ --> $RUST/std/src/thread/functions.rs
+
+error[E0277]: `RefCell<varve_core::matrix_generation::Cache>` cannot be shared between threads safely
+ --> tests/ui/fail_share_matrix_reader.rs:5:24
+  |
+5 |     std::thread::spawn(move || reader.matrix_aux_len("thumbnail"));
+  |     ------------------ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `RefCell<varve_core::matrix_generation::Cache>` cannot be shared between threads safely
+  |     |
+  |     required by a bound introduced by this call
+  |
+  = help: within `VarveReader`, the trait `Sync` is not implemented for `RefCell<varve_core::matrix_generation::Cache>`
+  = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` instead
+note: required because it appears within the type `varve_core::matrix_generation::View`
+ --> $WORKSPACE/crates/varve-core/src/matrix_generation.rs
+  |
+  | pub(crate) struct View {
+  |                   ^^^^
+note: required because it appears within the type `varve_core::matrix_generation::MatrixFile`
+ --> $WORKSPACE/crates/varve-core/src/matrix_generation.rs
+  |
+  | pub(crate) struct MatrixFile {
+  |                   ^^^^^^^^^^
+note: required because it appears within the type `Option<varve_core::matrix_generation::MatrixFile>`
+ --> $RUST/core/src/option.rs
+note: required because it appears within the type `varve_core::file::record_file::RecordFile`
+ --> $WORKSPACE/crates/varve-core/src/file.rs
+  |
+  |     pub struct RecordFile {
+  |                ^^^^^^^^^^
+note: required because it appears within the type `VarveFile`
+ --> $WORKSPACE/crates/varve-core/src/file.rs
+  |
+  | pub struct VarveFile {
+  |            ^^^^^^^^^
+note: required because it appears within the type `VarveReader`
+ --> $WORKSPACE/crates/varve-core/src/file.rs
+  |
+  | pub struct VarveReader {
+  |            ^^^^^^^^^^^
+  = note: required for `Arc<VarveReader>` to implement `Send`
+note: required because it's used within this closure
+ --> tests/ui/fail_share_matrix_reader.rs:5:24
+  |
+5 |     std::thread::spawn(move || reader.matrix_aux_len("thumbnail"));
+  |                        ^^^^^^^
+note: required by a bound in `spawn`
+ --> $RUST/std/src/thread/functions.rs
+
+error[E0277]: `RefCell<varve_core::matrix::PageStore>` cannot be shared between threads safely
+ --> tests/ui/fail_share_matrix_reader.rs:5:24
+  |
+5 |     std::thread::spawn(move || reader.matrix_aux_len("thumbnail"));
+  |     ------------------ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `RefCell<varve_core::matrix::PageStore>` cannot be shared between threads safely
+  |     |
+  |     required by a bound introduced by this call
+  |
+  = help: within `VarveReader`, the trait `Sync` is not implemented for `RefCell<varve_core::matrix::PageStore>`
+  = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` instead
+note: required because it appears within the type `varve_core::matrix::SparseBitmap`
+ --> $WORKSPACE/crates/varve-core/src/matrix.rs
+  |
+  | struct SparseBitmap {
+  |        ^^^^^^^^^^^^
+note: required because it appears within the type `varve_core::matrix::MatrixCommitLayout`
+ --> $WORKSPACE/crates/varve-core/src/matrix.rs
+  |
+  | struct MatrixCommitLayout {
+  |        ^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `PhantomData<varve_core::matrix::MatrixCommitLayout>`
+ --> $RUST/core/src/marker.rs
+note: required because it appears within the type `alloc::raw_vec::RawVec<varve_core::matrix::MatrixCommitLayout>`
+ --> $RUST/alloc/src/raw_vec/mod.rs
+note: required because it appears within the type `Vec<varve_core::matrix::MatrixCommitLayout>`
+ --> $RUST/alloc/src/vec/mod.rs
+note: required because it appears within the type `varve_core::matrix::MatrixLayout`
+ --> $WORKSPACE/crates/varve-core/src/matrix.rs
+  |
+  | pub struct MatrixLayout {
+  |            ^^^^^^^^^^^^
+note: required because it appears within the type `Option<varve_core::matrix::MatrixLayout>`
+ --> $RUST/core/src/option.rs
+note: required because it appears within the type `VarveFile`
+ --> $WORKSPACE/crates/varve-core/src/file.rs
+  |
+  | pub struct VarveFile {
+  |            ^^^^^^^^^
+note: required because it appears within the type `VarveReader`
+ --> $WORKSPACE/crates/varve-core/src/file.rs
+  |
+  | pub struct VarveReader {
+  |            ^^^^^^^^^^^
+  = note: required for `Arc<VarveReader>` to implement `Send`
+note: required because it's used within this closure
+ --> tests/ui/fail_share_matrix_reader.rs:5:24
+  |
+5 |     std::thread::spawn(move || reader.matrix_aux_len("thumbnail"));
+  |                        ^^^^^^^
+note: required by a bound in `spawn`
+ --> $RUST/std/src/thread/functions.rs

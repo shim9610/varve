@@ -475,6 +475,7 @@ impl FormatSelfTest {
 
         if !write_failed {
             run_probe(&mut report, "flush", || writer.flush()).ok();
+            run_probe(&mut report, "sync", || writer.sync()).ok();
         }
         drop(writer);
 
@@ -842,22 +843,22 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         // directory — they just belong to different generations of it.
         | Error::DirectoryDoesNotDescribeThisFile { .. } => DiagnosticDomain::CallerUsage,
 
-        #[cfg(feature = "high-cardinality-dev")]
         Error::StreamingUnsupported => DiagnosticDomain::FeatureGate,
 
-        #[cfg(feature = "high-cardinality-dev")]
         Error::InvalidBatchOptions { .. } | Error::ScanCancelled { .. } => {
             DiagnosticDomain::CallerUsage
         }
 
-        #[cfg(feature = "high-cardinality-dev")]
         Error::IndexBusy => DiagnosticDomain::Environment,
 
         Error::IntegrityFeatureDisabled | Error::CompressionFeatureDisabled => {
             DiagnosticDomain::FeatureGate
         }
 
+        Error::InvalidFollowCursor(_) | Error::InvalidImmediatePolicy => DiagnosticDomain::CallerUsage,
+
         Error::Io(_)
+        | Error::AppendedButImmediateFailed { .. }
         | Error::AllocationFailed { .. }
         | Error::WriterLockHeld(_)
         | Error::WriterLockMalformed(_)
@@ -870,10 +871,10 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::CommittedButDurabilityUnproven { .. }
         // The commit bit is in the file; only the durability request the
         // operating system was asked for failed (round 11).
+        | Error::MatrixPublicationUncertain { .. }
         | Error::MatrixCommittedButDurabilityUnproven { .. }
         | Error::ReplacePublicationIndeterminate { .. } => DiagnosticDomain::Environment,
 
-        #[cfg(feature = "high-cardinality-dev")]
         Error::PublishedButIndexStale { .. } => DiagnosticDomain::Environment,
 
         Error::InvalidMagic
@@ -924,7 +925,6 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
         | Error::AdapterUnsupportedType { .. }
         | Error::AdapterInvalidLength { .. } => DiagnosticDomain::FileData,
 
-        #[cfg(feature = "high-cardinality-dev")]
         Error::DiskIndex(_) => DiagnosticDomain::FileData,
 
         Error::WriterLockBreakRefused(_) => DiagnosticDomain::CallerUsage,
@@ -941,7 +941,7 @@ pub fn classify_error(error: &Error) -> DiagnosticDomain {
 pub fn error_hint(error: &Error) -> &'static str {
     // A stale or foreign sidecar has one documented recovery, so it earns a
     // variant-specific hint instead of the generic file-data one (STO-01).
-    #[cfg(feature = "high-cardinality-dev")]
+
     if let Error::DiskIndex(disk_index) = error
         && matches!(
             **disk_index,

@@ -3,6 +3,10 @@
 This document defines ordered durability for matrix writes and the boundary for
 post-commit hooks.
 
+Append writers also expose [Immediate policies](immediate-policy.md): block
+attributes, automatic conditions, and an explicit `immediate()` boundary. These
+do not change the matrix ordered-barrier or transaction-marker visibility rules.
+
 ## Default Policy
 
 Without an ordered barrier policy, matrix writers follow the existing Varve
@@ -187,8 +191,8 @@ parent directory with write access, and no open or flush failure is ever
 promoted to a `Durable` result. On filesystems that refuse a directory
 write-open or flush, every publication surfaces
 `PublishedButParentSyncPending` rather than a false durability claim; the same
-honesty applies to the redb sidecar publication sites (stream/indexed sidecar
-create, stream bootstrap, disk-index rebuild), which surface the pending state
+honesty applies to the native sidecar publication sites (stream/indexed sidecar
+create, stream bootstrap, disk-index rebuild and compaction), which surface the pending state
 while preserving the already-published sidecar instead of silently discarding
 it.
 
@@ -227,22 +231,71 @@ adds no fallible step in either direction of the commit.
 Even under the default policy, readers trust only commit maps. A clear commit
 bit means `NotCommitted` regardless of slot bytes.
 
-For overwrite, Varve clears the old commit and CRC-valid evidence before the
-first slot byte is changed. A partial slot write therefore remains hidden and
-poisons the writer. Matrix readers must still be coordinated with in-place
-writes, and since 0.5.0 the coordination is entirely the caller's: a reader owns
-**no commit-map snapshot at all**.
+Matrix readers capture a confirmed generation at open. Slot payloads, commit
+maps, per-cell CRCs, CRC-valid bits, aux ranges and the append-log EOF belong to
+that same generation. A cache miss reads that generation's page, including while
+the single writer overwrites the same cell. Each reader is `Send + !Sync`, owns
+its caches, and advances only through `follow(&mut self)`.
 
-`MatrixMetadataResidency` is always the bounded demand cache, so each commit-map
-page is read at the first touch that faults it in and may be evicted and re-read
-later. Different pages can therefore reflect different instants, and a page
-faulted in after a concurrent commit reflects that commit. A reader is not a fixed
-point in time to coordinate against. The removed `EagerVerified` policy was the
-only mechanism that pinned a whole-map snapshot, and it did so by holding the
-entire live set resident for the session; there is no replacement, and a reader
-that needs one instant must coordinate it. See
-[Known Limitations §1.4](known-limitations.md#14-lazy-is-the-default-verification-is-what-still-happens-at-open)
-and [API Changes §A.3](api-changes.md#a3-matrixmetadataresidencyeagerverified-is-removed-and-default-is-now-lazy).
+The writer copies each changed 4096-byte logical page to the generation file on
+its first change in a batch. Further changes to that unpublished page reuse the
+same physical page. Published pages are never overwritten or recycled. Clearing
+or rebuilding maps changes unpublished pages too; failure or process death
+before publication preserves the previous confirmed generation.
+
+`commit_matrix_cell()` marks the cell in the writer's working generation.
+`flush()` writes buffered chunks but does not publish a matrix generation.
+`sync()`, `immediate()` and the durable cell API publish. Dropping a writer is
+not a substitute for syncing; reopening discards unconfirmed native-log bytes.
+With transaction-marker formats, `sync()` still does not manufacture a marker:
+use `commit_durable()` or `flush()` followed by `sync()` for `OnFlush` markers.
+A matrix-only sync can advance matrix pages while leaving uncommitted native
+records invisible; the published EOF excludes that tail so recovery cannot
+truncate bytes promised to a reader.
+
+Publication orders native-log persistence, new matrix pages and directory pages,
+a generation-store sync, then a checksummed head in alternating slots and a final
+sync. The head names the root and native-log EOF. Readers never take writer
+admission or wait for cache ownership. An unstable head read may return
+`Error::Io` with `WouldBlock`; retry open/follow. A failed follow leaves the
+existing reader's generation usable. Stable invalid heads or pages fail closed.
+The checksums detect accidental corruption, not malicious rewriting.
+
+Matrix storage now has **two required files**: the primary file and
+`<primary>.<creation-nonce>.vmg`, discoverable through
+`matrix_generation_path()`. The companion is durable data, not a disposable
+cache. Stop the writer while copying/renaming the pair; copying the primary
+alone is not a backup. Old files without the companion need recreation.
+
+`compact_matrix()` requires a synced writer and copies the current page tree
+into a temporary companion, syncs it, then replaces the companion pathname.
+Existing readers retain the old file object without blocking the writer. Their
+`follow()` can adopt the replacement. Old physical storage is released once all
+old file handles/maps close. Compaction covers the matrix generation store;
+obsolete growing-chunk records in the primary append log are not reclaimed.
+Primary-file replacement APIs remain refused for matrix files.
+
+Each head persists a `compaction_epoch` (u64, initially zero). Only explicit
+`compact_matrix()` increments it; every ordinary publication carries it forward.
+Thus a reader detects replacement even after skipping the compaction generation
+and several subsequent commits. Equal epochs permit comparing COW roots: equal
+subtree pointers are skipped, changed bitmap index slots are patched, and only
+changed metadata pages are reverified under the default verification policy.
+Unchanged bitmap and physical-page caches survive. Different epochs trigger the
+full layout load against the replacement file. Follow never initiates compaction.
+All fallible work precedes adoption; a refused delta leaves the old root, bitmap
+state and log EOF visible. A damaged or quarantined old mirror requires reopening
+for recovery rather than treating an incomplete mirror as a valid diff base.
+
+
+The generation page cache defaults to **2 MiB per handle**, independent of the
+existing per-bitmap cache. Configure it at open with
+`ReadLimits::with_matrix_generation_cache_bytes(bytes)`; zero disables it.
+The bound counts retained 4096-byte data/directory buffers, excluding map
+bookkeeping and temporary page buffers. Internal bitmap backings retain no
+second generation-page cache. `matrix_generation()` reports the captured
+confirmed generation; `follow()` still returns newly adopted record bytes, so
+matrix-only advancement can return zero.
 
 Append-log transaction markers follow the same explicit durability principle.
 `commit()` writes a logical visibility marker for
@@ -258,10 +311,8 @@ The durable append-log order is:
 3. write the commit marker
 4. flush and `sync_all` the marker
 
-For P0, `commit_*` is logical visibility, not a hidden fsync. It writes the
-commit bit after slot bytes have been written through the file handle. Callers
-that need crash-durable completion must call `flush`/`sync` explicitly or use
-the P1 ordered barrier.
+Matrix `commit_*` updates working visibility without a hidden fsync. A reader
+sees those changes only after explicit generation publication.
 
 ## Ordered Barrier Policy
 
@@ -275,17 +326,19 @@ There is no `durability:` key in `varve_format!` — the macro refuses one with
 `unsupported varve_format key` — and the hook is a closure argument rather than a
 declared option.
 
-The required order for a committed cell write is:
+The durable cell API runs:
 
-1. withdraw any old commit and CRC-valid evidence
-2. write data slot bytes
-3. `sync_data` the data range or portable file handle
-4. write affected CRC metadata and CRC-valid evidence if enabled
-5. write commit map CRC metadata and publish the commit bit last
-6. `sync_all` the commit map and required metadata
-7. invoke the post-commit hook
+1. withdraw old evidence in the working generation and write new slot bytes;
+2. call the data barrier;
+3. write CRC metadata and working commit bits;
+4. call the commit barrier;
+5. sync the native log and new matrix pages, publish and sync the generation head;
+6. invoke the post-commit hook.
 
-The hook must never run before the commit map sync completes successfully.
+The barrier callbacks receive the physical companion file for synchronization,
+not a logical matrix image. They must not inspect logical offsets or modify the
+file. Both callbacks precede publication; a callback failure poisons the writer
+and leaves readers on the previous generation.
 
 ## Hook Contract
 
@@ -317,40 +370,16 @@ retry used to duplicate external work. The carried event is the one the hook
 was given; it is derived from layout geometry before the commit, so producing
 it can no longer fail for a cell that is already durable.
 
-The hook is not the only step after the commit. Walking forward from the
-authoritative commit — `commit_matrix_cell`, which puts the commit bit in the
-file — there are exactly two remaining steps, and *both* are published outcomes
-(round 11):
+A failed generation publication returns `MatrixPublicationUncertain` if head
+completion was not confirmed. Reopen and inspect the confirmed generation before
+retrying the write. If the complete head was written but its final sync failed,
+the result is `MatrixCommittedButDurabilityUnproven`. Both poison the writer and
+skip the hook. A successful publication followed by a hook error returns
+`MatrixCommittedButHookFailed`; retry the notification rather than the write.
 
-1. the commit sync (`MatrixDurabilityBarrier::sync_matrix_commit`). Its failure
-   returns
-   `Error::MatrixCommittedButDurabilityUnproven { event: Box<MatrixCommitEvent>, source }`.
-   The cell **is** committed and a reader that opens the file after a clean
-   process exit sees it; what is unproven is only that the commit survives a
-   power loss. The hook does not run, so no notification was emitted. The
-   writer is poisoned, because a durability request was refused
-   mid-publication: recover by reopening the file and calling `sync`, then
-   issue the notification with the carried event. The cell does not need to be
-   rewritten. Until round 11 this returned a bare `Err`, which a caller could
-   not distinguish from "nothing happened" — the same defect as the hook one
-   step later, and the same shape as the `commit_durable` defect fixed in round
-   10;
-2. the hook, described above.
-
-The step *before* the commit — the data sync
-(`MatrixDurabilityBarrier::sync_matrix_data`) — is genuinely pre-publication:
-the slot bytes may be on disk but the commit bit is not, an uncommitted slot is
-invisible to readers, and its failure therefore stays a plain error. Both
-classifications are asserted by
-`crates/varve/tests/matrix.rs::a_commit_sync_failure_is_reported_as_published_and_a_data_sync_failure_is_not`,
-which also reads the cell back through a fresh reader to prove the published
-claim rather than only its shape.
-
-Those two variants are the only published outcomes of
-`write_matrix_cell_durable`. Every *other* error from it means the cell was not
-committed by that call, so a caller can decide between "nothing happened, retry
-the write", "committed, retry only the notification" and "committed,
-re-establish durability" from the result alone.
+`matrix_generations.rs` aborts child writers at six publication boundaries and
+checks that reopened cells and aux bytes all belong to one generation. These are
+process-crash tests, not a substitute for power-loss testing of a storage device.
 
 ## Allocator Failure And Published Outcomes
 
@@ -495,6 +524,6 @@ verified without depending on real crash behavior:
 - hook failure does not clear a committed bit
 - default policy does not perform per-cell sync
 
-The current matrix test suite includes an injectable recorder that verifies the
-commit bit is still clear during data sync and set before commit sync.
+The injectable recorder verifies that a fresh reader still sees the previous
+generation during both barrier callbacks, and sees the new generation after success.
 - verified sidecar envelopes can be rejected before resume signal publication

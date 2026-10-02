@@ -526,9 +526,8 @@ mod enabled {
         Ok(())
     }
 
-    /// The indexed batch path: `push_iter` -> `publish_prepared_chunk` ->
-    /// `commit_pending_batch`. The single-record indexed path already wrapped
-    /// this call; the batch path did not.
+    /// Native chunks are independent of index commits. A failure at the final
+    /// index publication must report every native chunk already written.
     #[test]
     fn a_restamp_failure_after_a_published_indexed_chunk_is_reported_as_published() -> Result<()> {
         let _gate = fault_gate();
@@ -556,8 +555,8 @@ mod enabled {
         // it, so it reports the chunk that reached the file even on the
         // failing path.
         assert_eq!(
-            error.written.records, 1,
-            "the published chunk must be reported to the caller"
+            error.written.records, 2,
+            "both published native chunks must be reported to the caller"
         );
         assert!(
             std::fs::metadata(&path)?.len() > published_len,

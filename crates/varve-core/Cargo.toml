@@ -27,17 +27,17 @@ all-features = true
 
 [features]
 default = []
-integrity = ["dep:crc32fast"]
+integrity = []
 mmap = ["dep:memmap2"]
 zero-copy = ["mmap", "dep:zerocopy"]
 compression-zstd = ["dep:zstd"]
-high-cardinality-dev = ["dep:crc32fast", "dep:redb"]
-scalable-fault-injection = ["high-cardinality-dev"]
+scalable-fault-injection = []
 
 [dependencies]
-crc32fast = { workspace = true, optional = true }
+crc32fast.workspace = true
+crossbeam-skiplist.workspace = true
+crossbeam-queue.workspace = true
 memmap2 = { workspace = true, optional = true }
-redb = { workspace = true, optional = true }
 tempfile.workspace = true
 thiserror.workspace = true
 zerocopy = { workspace = true, optional = true, features = ["derive"] }
@@ -48,3 +48,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Stora
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+# redb is only an independent test oracle, never a runtime dependency.
+[dev-dependencies]
+redb = { version = "4.3.0", path = "../../vendor/redb" }

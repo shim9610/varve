@@ -1,5 +1,3 @@
-#![cfg(feature = "high-cardinality-dev")]
-
 use std::path::{Path, PathBuf};
 
 use varve::{

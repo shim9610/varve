@@ -49,9 +49,9 @@ no longer true:
   each reader, so a format with `n` demand-loaded maps bounds itself at
   `n * cache_bytes`. 0.4.0's rustdoc claimed otherwise. Behaviour unchanged since
   0.4.0; only the claim was wrong. It is carried in §1.2 now.
-- **A matrix reader is no longer a snapshot** (§1.4, consequence 3, and §4.2).
-  Whole-live-set residency was the only mechanism that ever pinned one instant
-  across a whole commit map, and it was removed with no replacement.
+- **Matrix readers now capture a confirmed generation.** This supersedes the
+  first-touch behavior described in the 0.5.0 historical notes; see §4.2.
+
 
 The 2026-07-25 corrections below are kept as the record of the previous pass. Two
 of them have themselves been superseded by the split above: residency is no longer
@@ -211,8 +211,8 @@ keeps it open pays this once and does not care.
   scrub, never. Read §1.4 first: what you give up is the matrix *announcing*
   damage at open, the whole-category quarantine, and the strict-recovery writer
   gate.
-- Keep the handle open. Matrix reads take `&self` (§4), so one handle can serve
-  the whole process, including concurrent threads.
+- Keep one reader open per reading thread. Matrix reads take `&self` (§4),
+  and each reader owns its cache.
 - Nothing needs doing about memory: an open retains no commit-map payload.
 
 **Planned.** No further reduction of the verifying open is scheduled; a pass that
@@ -392,10 +392,8 @@ defects:**
    fact the file supplied, not a guess: the index is loaded in full at open and is
    authoritative. "Not cached" and "not published" stay distinct, verified across
    cache eviction.
-3. **A reader does not see one consistent instant across a whole map.** A page's
-   contents are as of the first touch that faulted it in, not as of open. The only
-   mechanism that ever provided a pinned whole-map snapshot was whole-live-set
-   residency, and it was removed; a reader that needs one must coordinate it.
+3. **Cache residency does not decide visibility.** Every fault reads the captured
+   generation, including after eviction; `follow()` explicitly adopts a new one.
 
 ### 1.5 The default limits cap a matrix at 16,000,000 cells — create fails above it
 
@@ -590,7 +588,7 @@ dimension cannot model an unbounded stream; a declared growing one can.**
 **Workaround.** Use the append-log APIs for unbounded growth:
 
 - Resident: `VarveFile` / generated typed writers, for data that fits in RAM.
-- Scalable (`high-cardinality-dev`): `VarveStreamWriter` / `VarveIndexedWriter`
+- Stream/indexed (default API): `VarveStreamWriter` / `VarveIndexedWriter`
   and their readers, for bounded-memory ingest and point lookup over data far
   larger than RAM. See [Scalable I/O](scalable-io.md).
 
@@ -841,7 +839,7 @@ where the figures in older copies of this document come from. Measured across
 | `open_readonly` / `open` | varve | 16 B |
 | `open_readonly_without_directory(spec, path, &mut index)` | you, in full | **0** |
 | `open_readonly_lazy` + `record_map` (needs `open_digest_on_flush`) | you, only the part you walked | **0** |
-| `VarveStreamReader` (`high-cardinality-dev`) | nobody — sequential walk only | 0 |
+| `VarveStreamReader` | nobody — sequential walk only | 0 |
 
 The middle row is not a reduction in capability. `blocks`, `scan`,
 `keyed_blocks`, `metadata`, `verify_all` and the rest all still work — through
@@ -907,7 +905,7 @@ keep parsing; the value is inert. A format that relied on it to refuse a large
 file must state one of the limits above instead.
 
 **This is not the petabyte-scale path.** The petabyte-scale path is the
-`high-cardinality-dev` **stream/indexed** family: `VarveStreamWriter`,
+default **stream/indexed** family: `VarveStreamWriter`,
 `VarveStreamReader`, `VarveIndexedWriter`, `VarveIndexedReader`, and their
 `.vks`/`.vki` sidecars. Those open in `O(1)` from a clean sidecar and never
 bootstrap, repair, rebuild, verify, truncate or scan on a normal open.
@@ -1019,37 +1017,33 @@ write open — is the defect this prevents.
 
 ---
 
-## 3. The scalable family is behind a feature flag named `dev`
+## 3. Stream/indexed API status
 
-**What it is.** `VarveStreamWriter`, `VarveIndexedWriter`, their readers,
-`disk_index`, `scan_control` and the `.vks`/`.vki` sidecars are all gated on the
-`high-cardinality-dev` cargo feature. **This family has never shipped in any
-released version.** Its wire artifacts are at their first public versions
-(`.vks` sidecar metadata version 3, `.vki` disk-index metadata version 3), and
-its API surface has had no external users to stabilise against.
+`VarveStreamWriter`, `VarveIndexedWriter`, their readers, disk-index plans,
+finite-key storage and scan-control APIs are included in the default 0.10.0
+development build. No feature enables them, and `--no-default-features` keeps
+these APIs available. The former `high-cardinality-dev` flag has been removed.
+Generated stream constructors are available alongside resident constructors;
+indexed constructors are generated for schemas declaring `key_index = disk`.
+The caller still chooses which storage path to open.
 
-**Who it affects.** Anyone who needs bounded-memory ingest or point lookup over
-data larger than RAM — which is to say, everyone the resident family cannot
-serve.
+This family follows the same pre-1.0 public API versioning policy as the other
+storage paths. Promotion is not publication of a crate or proof of unmeasured
+hardware behavior. The next deep-test campaign for the final native-index and
+matrix-generation implementation remains separate. Historical reports retain
+their revision-specific results, including findings since fixed.
 
-**Workaround.** None. Enable the feature and accept that the surface may change
-before it loses the `dev` suffix.
-
-**Planned.** Stabilisation is intended but not scheduled. The round-1/2 module
-set — `disk_index.rs`, `stream.rs`, `indexed.rs`, `scan_control.rs` — **has**
-been walked against the project's five internal invariants, as the matrix and
-resident paths were, and the walk found no defect. That is a statement about
-review, not about use, and it does not move the `dev` flag.
-
-Operational notes for users who enable it anyway:
-
-- `sync()`, **not** `flush()`, publishes a clean generation that can be reopened
-  normally.
-- Missing, dirty, stale and identity-mismatched sidecars are errors with named
-  recovery operations (`bootstrap_stream_checkpoint`, `rebuild_disk_index`), not
-  silent fallback scans.
+- `sync()` and explicit Immediate publish confirmed generations; `flush()` does
+  not publish them. Readers opened while the writer is Dirty serve the last
+  confirmed generation and advance explicitly with `follow()`.
+- Missing, stale and identity-mismatched sidecars have named recovery operations
+  (`bootstrap_stream_checkpoint`, `rebuild_disk_index`), not fallback scans.
 - Long scans are cancellable via `ScanCancellationToken`; cancellation returns
   `Error::ScanCancelled { progress }` and publishes no new sidecar.
+- `compact_index()` explicitly reclaims obsolete sidecar storage. Whole-native-log
+  merge/compact still retains resident key maps.
+- `scalable-fault-injection` remains opt-in test infrastructure. redb remains a
+  development-only comparison oracle and is absent from runtime dependencies.
 
 ---
 
@@ -1074,67 +1068,42 @@ Each exists on `VarveReader`, `VarveWriter` and `VarveFile`, so 18 signatures.
 x 3 handle types") by holding two shared borrows of a non-`mut` handle;
 `matrix_resume_signal` is the sixth and was already `&self`.
 
-**Three entry points relaxed, not four.** Payload and aux reads are named
-explicitly because an earlier version of this table listed only three entry
-points and omitted them, which read as though `matrix_cell_payload` and
-`read_matrix_aux` still needed exclusive access. They do not. In the same
-correction, `matrix_cell_status` moves out of the relaxed group: it was `&self`
-on all three handle types in **0.3.0** and at every commit of the 0.4.0 cycle
-(checked against the `varve-core 0.3.0` source package and against the parent of
-the round-15/16 commit), so listing it as a relaxation overstated what this
-release changed. What is true either way is the conclusion: all six are
-concurrently issuable through a shared handle.
+**Ownership contract:** matrix and resident record handles (`VarveReader`,
+`VarveFile`, `VarveWriter`, and generated wrappers) are `Send + !Sync`. Move
+ownership to a worker, or open a separate reader for each thread. Sharing one
+reader through `Arc` or a cross-thread reference fails to compile. Local reads
+still take `&self`; changing writer state requires `&mut self`.
 
-| Subsystem | Reads take | One handle, many threads |
-| --- | --- | --- |
-| Matrix — all six read entry points above, on `VarveReader`, `VarveWriter`, `VarveFile` | `&self` | yes — the handle is `Send + Sync` |
-| Resident record reads (`blocks`, `keyed_blocks`, `materialized_keyed_blocks`, `scan`, `index_entries`, `metadata`) on `VarveReader` | `&self` | yes |
-| The same reads resolved through a caller-supplied directory (`with_directory(..)`) | `&self` | yes |
-| All mutation (`push*`, `delete*`, `replace_*`, `write_matrix_cell*`, `commit_matrix_cell`, `clear_matrix_*`, `flush`, `commit`, `sync`) | `&mut self` | no |
+Matrix bitmap caches use reader-owned `RefCell<PageStore>` without mutexes.
+Cache hits, misses, clear counting and rebuild queries use local borrows;
+exclusive mutation preparation uses `get_mut()` without dynamic borrow checks.
+Windows private read handles are also cached per owner, without a shared handle
+list or thread-local registry. Cloning internal backing state starts a fresh
+handle cache; immutable file handles and page bytes can be retained by `Arc`,
+while maps, LRU state and eviction budgets remain private.
 
-The three relaxations are source-compatible — an existing call through a `&mut`
-binding still compiles — but they are what makes shared-handle concurrent reading
-possible.
+The existing `ReadLimits::with_matrix_metadata_residency(
+MatrixMetadataResidency::Lazy { cache_bytes })` controls each bitmap's cache.
+The default is **2 MiB per bitmap**, clamped by the bitmap ceiling, and allocated
+on demand. It is not a process-wide or whole-reader budget: multiple bitmap
+caches and readers add their memory footprints, alongside page indexes and other
+metadata. Each thread can open with its own limit.
 
-**Measured concurrent matrix read scaling** (wall clock, lower is better).
-Only the second row is asserted on every run, at `<= 1.0x`, i.e. "does not
-serialise", by
-`concurrent_lazy_readers_are_not_serialised_behind_the_page_store`. The first
-row is measured and printed by `report_the_scaling_of_one_shared_handle` and
-decides nothing; its `<= 1.0x` form is an `#[ignore]`d manual benchmark,
-demoted because two `ubuntu-latest` runs of healthy code reported 2.14x and
-1.43x. What gates the eager path instead is counted, not timed: matrix reads
-issued while a commit-map page-store lock was held must be zero
-(`page_store_lock_audit_tests`).
+Compile-fail cases reject shared raw and generated readers. Runtime tests check
+independent caches with different budgets, isolated eviction, warmed-reader
+transfer, concurrent payload/aux/status reads, and corruption rejection. The
+historical `matrix_region_reads_under_bitmap_lock` audit now counts local cache
+borrows across I/O; its name does not imply a remaining mutex. Writer preparation
+is checked for zero dynamic cache borrows.
 
-| Scenario | Run A | Run B (independent) |
-| --- | --- | --- |
-| 24,000 reads, one shared handle, 1 vs 4 threads | 0.138s vs 0.046s — **0.33x** | 0.076s vs 0.032s — **0.42x** |
-| Hostile lazy config (1-page cache, 32 live pages, 40,960 fault-in reads) | 3.814s vs 1.667s — **0.44x** | 2.135s vs 0.746s — **0.35x** |
+Fixed-work scaling measurements remain in `matrix_concurrent_reads.rs` and
+`matrix_lazy_residency.rs`, using one reader per worker. Strict timing thresholds
+are manual ignored benchmarks, because shared-host timing is not proof of
+ownership or cache isolation. The earlier shared-reader Windows measurements
+are not measurements of this implementation.
 
-Two runs are shown because these are wall-clock numbers on a shared desktop and
-they move by tens of percent between runs. **Treat the absolute times as
-illustrative and only the "well under 1.0x" conclusion as the result.** Anything
-sized on the exact ratio is sized on noise.
-
-**These numbers are Windows numbers, and the mechanism behind them is
-Windows-only.** Windows `ReadFile` serialises on the kernel file object, so each
-reading thread is given a private file object derived with `ReOpenFile`
-(`MatrixReadPool`). Without it, four threads measured **1.54x slower** than one.
-That pool is `#[cfg(windows)]`; on Unix, positional `pread` does not serialise on
-the file object, so a shared handle is expected to be adequate. The two
-contracts that still gate — the lazy `<= 1.0x` ratio and the counted
-page-store-lock invariant — **do** run on Unix, because CI runs the suite on
-`ubuntu-latest`. What has never run there is the `#[ignore]`d eager threshold,
-and **no Unix throughput has ever been measured**. See §6.
-
-One lock does exist in the matrix read path (open item 31): `SparseBitmap` holds
-a `Mutex<PageStore>` so a demand fault-in can happen under `&self`. It is taken
-only for O(1) map operations, is released across the fault-in read, and is never
-taken on the write path. Since 0.5.0 every persisted map is demand-filled, so this
-lock is on the path of every reader of a category on every read; session-only maps
-(a writer's current-write map, a rebuilt map) have nothing to fault in and only
-ever take it for a hash lookup.
+Matrix storage additionally uses immutable confirmed page generations. There is
+no reader mutex or shared mutable page cache in that protocol.
 
 ### 4.2 Where a reader gets a snapshot rather than live state
 
@@ -1148,29 +1117,56 @@ Within that:
   end it holds and adopts them to the same commit boundary an open would stop
   at. A handle never advances on its own — that is what keeps a `&self` read
   from observing a record mid-write.
-- **Matrix commit status is not a snapshot at all.** Each commit-map page is as
-  of the first touch that faulted it in, so different pages can reflect different
-  instants and a page faulted in late can reflect a writer's later work. This is
-  consequence 3 in §1.4. Before 0.5.0 the removed `EagerVerified` residency policy
-  materialised every published page at open and gave a reader a whole-map snapshot
-  as of its own open; nothing provides that now.
-- **Matrix cell payload bytes are read positionally at read time**, so payload
-  reads see current file contents even where the commit bitmap does not.
+- **Matrix reads capture one confirmed generation** of payloads, commit maps,
+  CRC metadata, aux bytes and growing-chunk EOF. The single writer may overwrite
+  the same cells concurrently; each reader adopts changes only on `follow()`.
+  `flush()` does not publish; `sync()` and explicit Immediate do. The generation
+  file is required alongside the primary, and grows until `compact_matrix()`.
+  That compaction does not reclaim obsolete chunk records in the native log.
+  Ordinary follow diffs immutable roots, skips equal subtrees, and updates only
+  changed bitmap indexes and verification pages, retaining unchanged caches.
+  Whole-layout rebuilding occurs only when the persisted compaction epoch changes.
+  A bitmap with duplicate index slots left by interrupted removal may require a
+  scan of that bitmap's resident slots to find surviving duplicates. A reader
+  already carrying fatal index damage or a quarantined category must reopen to
+  re-enumerate repaired metadata; incremental follow refuses without advancing.
+  Invalid changed metadata or resource-limit failures also preserve the old view;
+  they neither lock nor stop the writer. Diff staging is bounded by reader
+  limits; a large missed run may require higher limits or reopening.
 - **Stream and indexed readers open from a published sidecar generation** and see
   that generation, not the writer's in-flight state. `sync()` publishes.
+- **Stream/indexed readers use immutable confirmed generations.** Independent
+  readers open read-only across threads/processes. Dirty opens read only the last
+  confirmed root and EOF; `follow()` adopts later confirmed generations. There is
+  no reader writer-admission or shared mutable index cache. See
+  [the native protocol](scalable-io.md).
+- **Append-only sidecars retain obsolete pages until explicit compaction.**
+  `compact_index()` requires a clean writer and publishes a new file without
+  waiting for readers. Follow or close old handles to reclaim the old file's physical
+  space. Tombstones remain; native-log reclamation is separate. Snapshot counts
+  are observational, process-local, and per sidecar identity, not a global
+  reclamation gate. See [space management](scalable-io.md#explicit-sidecar-compaction).
 
 **Who it affects.** Anyone assuming a Varve handle is a live view of a file
 another handle is writing. It is not.
 
-**Workaround.** `follow()` advances a resident reader at a cost proportional to
-what was appended rather than to the file. It does not cross a generation, so
-when the pathname has been republished the pair to use is `is_current()` — which
-compares the OS object identity and costs one `open` — followed by
-`reopen_readonly()`. Both take `&self`, so a handle shared behind an `Arc` can
-be asked and replaced without any reader stopping. For a matrix there is no
-"advance": a reopen gives a fresh handle whose pages will again be as of whenever
-each one is first touched, so a reader that needs one instant across a whole map
-must coordinate that with the writer itself.
+**Usage.** Each thread owns a reader (`Send + !Sync`). `follow(&mut self)` adopts
+new confirmed work. A replaced primary requires `is_current()` and reopening;
+companion-only matrix compaction is traversed by `follow()`. A matrix-only
+advance returns zero appended bytes; compare `matrix_generation()` if needed.
+An unstable publication read may return `WouldBlock`; retry while retaining the
+current reader. The writer never waits for a reader retry.
+
+**Storage and cache bounds.** Matrix storage requires both the primary and its
+nonce-named `.vmg` companion. Coordinate backups/renames with the writer and copy
+both. The generation page cache is separately configurable through
+`with_matrix_generation_cache_bytes` (2 MiB default, zero disables). The bound
+covers page buffers, not allocator/map overhead. Compaction retains old physical
+files until old readers/mappings close. The matrix mmap view overlays changed
+pages into a private mapping, so those changed pages consume private memory.
+Generation-directory enumeration for allocation hints stops at 65,536 entries;
+if unavailable, verification uses the persisted bitmap page indexes, with the
+same limits on detecting out-of-band stray writes described in §1.7.
 
 **Planned.** No live-view mode is planned. `follow()` is an explicit advance,
 not a live view: between two calls the handle is still a fixed snapshot.
@@ -1198,7 +1194,7 @@ not:
 - **A flag or magic word in the file header.** No read a live handle performs
   goes near it. Of the eight sites that read the header, five are the opens
   themselves; the other three are a generation check on the `replace_*` paths
-  and the two disk-index sidecar windows behind `high-cardinality-dev`, and all
+  and the two disk-index sidecar windows in the default API, and all
   three re-read the file rather than consulting a handle. So a flag there would
   inform only a *new* open, which already resolves the pathname to the current
   generation anyway.
@@ -1374,23 +1370,37 @@ recorded at the declaration. That was a cross-compiled lint pass when it was
 written; Clippy now runs natively on Linux in CI, across nine feature
 configurations, and is green.
 
-### 6.2 The petabyte-scale positional-I/O probe has never run
+### 6.2 Sparse offset evidence is filesystem-specific
 
 `pib_probe::real_file_positional_io_at_one_pib` is `#[ignore]`d and additionally
 soft-passes: `ProbeError::Unsupported` prints "skipped" and returns success unless
-`VARVE_REQUIRE_PIB_SPARSE=1` is set. **The 1 PiB sparse-offset gate has never been
-executed.** Its sibling `real_file_positional_io_at_one_tib_smoke` is also
+`VARVE_REQUIRE_PIB_SPARSE=1` is set. Its sibling
+`real_file_positional_io_at_one_tib_smoke` is also
 `#[ignore]`d and has no required-mode escape at all — `Unsupported` always passes.
 
-The practical statement: Varve's petabyte-scale claims rest on the cost model and
-on tests at far smaller scales, not on a demonstration at one petabyte.
+Both probes were explicitly executed on Linux x86_64 on 2026-10-01. The 1 PiB
+required-mode probe passed on `/tmp` tmpfs. The workspace overlay passed the
+1 TiB probe, but refused a 1 PiB write with `File too large` (OS error 27).
+Successful probes allocated 4,096 bytes, not their logical file lengths.
+The `scripts/qualify_scalable.py` runner requires execution evidence
+and rejects skipped probes even when Cargo itself returns success.
+
+This establishes sparse addressability on those filesystems. It does not
+establish petabyte throughput, storage endurance, power-loss recovery, or
+support on every filesystem; deployment filesystems still need qualification.
 
 ### 6.3 Performance and scale probes do not run in any job
 
 - `crates/varve/tests/perf_smoke.rs` is entirely `#[ignore]`d. The performance
   smoke suite runs in no job.
-- The one-million-key RSS/allocator stress probe
+- The one-million-key allocator stress probe
   (`crates/varve/tests/high_cardinality.rs`) is `#[ignore]`d.
+
+The explicit qualification campaign on 2026-10-01 executed 10k/100k/1m-key
+profiles, with peak additional Rust heap of 6,289,194 / 14,962,766 / 16,170,598
+bytes. It passed the 64 MiB peak and 16 MiB growth budgets. These are allocation
+measurements, not RSS. The runner makes the campaign repeatable, but there is
+still no automatically scheduled long performance campaign.
 
 ### 6.4 The fuzz, Miri and ASan runs are a weekly smoke, not a campaign
 
@@ -1414,11 +1424,19 @@ on tests at far smaller scales, not on a demonstration at one petabyte.
   Ninety seconds per target is a smoke test, not a campaign. It proves the
   harness runs and catches what is shallow; it explores almost nothing. The
   disparity is measurable rather than theoretical: `codec_arbitrary` executes
-  about 300,000 inputs per second, while `sidecar_state_machine` -- which builds
-  a redb sidecar per input and `fsync`s it -- manages 64, so the same 90 seconds
+  about 300,000 inputs per second, while the historical redb-backed
+  `sidecar_state_machine` -- which built a sidecar per input and `fsync`ed it --
+  managed 64, so the same 90 seconds
   buys 27 million executions on one target and under 6,000 on another. **No long
   fuzz campaign has been run against this code**, and the modules that most need
   one are the slowest to fuzz.
+
+  The 2026-10-02 native-index replacement has newer bounded ASan/libFuzzer
+  evidence, including a shared redb differential oracle and a fixed checkpoint
+  corruption regression. The subsequent 2026-10-02 campaign ran three ASan fuzz
+  targets for five minutes each: 2,578 matrix-model, 151,403 matrix-corruption
+  and 2,221 native/redb differential executions, without an oracle mismatch.
+  This remains a bounded campaign, not a long production soak.
 - A libFuzzer OOM reproducer from 2026-07-20 sat unpromoted in
   `fuzz/artifacts/codec_arbitrary/` until 0.7.0, blocking
   `scripts/run-security-fuzz.ps1` (exit 2) the whole time. It is now a test --

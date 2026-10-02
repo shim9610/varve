@@ -552,7 +552,7 @@ fn the_primary_record_handle_is_only_written_through_its_four_gated_operations()
     assert!(
         gate_code.contains(
             "    pub struct RecordFile {\n        file: File,\n        matrix_read_pool: \
-             crate::matrix::MatrixReadPool,\n    }"
+             crate::matrix::MatrixReadPool,\n        matrix_pages: Option<crate::matrix_generation::MatrixFile>,\n    }"
         ),
         "the wrapped handle must stay a private field of `RecordFile`, and the one other field is \
          the one argued for here; any further one has to be argued for the same way. \
@@ -681,13 +681,10 @@ fn the_private_matrix_read_handles_are_read_only_and_never_lent_out() {
              implements `Write`, so lending one out is lending a write handle"
         );
     }
-    // The pool is owned by `RecordFile` and the thread-local cache holds only
-    // `Weak`s, so the handles close when the file does.
-    assert!(
-        module.contains("PrivateHandle::Open(Weak<File>)") || module.contains("Open(Weak<File>)"),
-        "the thread-local cache must hold `Weak`s: an `Arc` there would keep one handle per \
-         thread per file open for the life of the process, long after the `RecordFile` is gone"
-    );
+    // Ownership, rather than a thread-local weak registry, bounds handle lifetime.
+    assert!(module.contains("handle: OnceCell<Option<Arc<File>>>"));
+    assert!(!module.contains("thread_local!"));
+    assert!(!module.contains("Mutex<"));
 }
 
 /// F-01/F-02, `file.rs`. The two enforcement types keep their private fields and

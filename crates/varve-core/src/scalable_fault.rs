@@ -19,6 +19,12 @@ pub const FAULT_ENV: &str = "VARVE_SCALABLE_FAULT";
 pub const TRACE_ENV: &str = "VARVE_SCALABLE_FAULT_TRACE";
 
 pub const REQUIRED_POINTS: &[&str] = &[
+    "checkpoint.record_prefix",
+    "checkpoint.record_write",
+    "checkpoint.data_sync",
+    "checkpoint.head_prefix",
+    "checkpoint.head_write",
+    "checkpoint.head_sync",
     "generation.commit",
     "append.native_chunk_write",
     "append.sidecar_batch_commit",
@@ -142,6 +148,11 @@ pub fn arm_from_env() -> Result<ArmGuard, ArmError> {
     });
     ARMED.store(true, Ordering::Release);
     Ok(ArmGuard { _private: () })
+}
+
+/// Whether fault-only torn-write interposition is currently active.
+pub(crate) fn is_armed() -> bool {
+    ARMED.load(Ordering::Acquire)
 }
 
 /// Records one named boundary and aborts when the armed selection matches it.

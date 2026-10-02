@@ -122,6 +122,8 @@ or validation ordering defect.
 When custom physical layout behavior is in question, run the optional Python
 harnesses to compare Varve output with established readers and writers:
 
+The harness requirements need Python 3.12 or newer because they use NumPy 2.5.
+
 ```powershell
 python -m venv .venv-tdms
 .\.venv-tdms\Scripts\python.exe -m pip install -r scripts\requirements-tdms-harness.txt
@@ -138,7 +140,7 @@ floats, changed raw-data-index segments, `same-as-previous` raw-index reuse,
 mixed objects in one segment, and Varve append into an npTDMS-authored file.
 The Varve-authored direction also covers npTDMS-readable
 `SingleFloatWithUnit`/`DoubleFloatWithUnit` channel type ids; the reverse
-npTDMS-authored direction omits those two because npTDMS 1.10.0 does not author
+npTDMS-authored direction omits those two because npTDMS 1.11.0 does not author
 them correctly through its normal `ChannelObject` writer path. The BMP harness
 checks a non-TDMS layout in both directions with Pillow.
 
@@ -182,3 +184,47 @@ If `diagnostics()` passes and a self-test using your actual generated format and
 sample values passes, but your application path still fails, start by checking
 caller-owned policy: dimensions, key construction, commit timing, sidecar
 generation, migration functions, and custom codec semantics.
+
+## Scalable I/O validation
+
+The repository supplies explicit validation runners; ordinary unit-test success
+is not evidence that their ignored, large-file or timed workloads ran. On Linux,
+use Python 3 and the repository's Rust toolchain:
+
+```sh
+python3 scripts/qualify_scalable.py --profile qualification --epochs 256 --kill-cycles 128 --output /path/to/new-qualification
+cargo build --locked --release -p varve --features integrity --example scalable_load --example matrix_soak
+python3 scripts/load_scalable.py --suite large --only raw-20g --only indexed-20g --only indexed-r8-20g --read-seconds 30 --output /path/to/new-report --data-root /path/to/new-data
+```
+
+Qualification checks model histories, independent reader snapshots, indexed
+writer process-kill recovery, native/redb oracles and bounded memory. Real-file
+runs write, verify and delete owned payload files; sparse addressability probes
+are separate and do not measure storage bandwidth. Use each runner's `--help`
+for workload sizes, timeouts and comparison options.
+
+For continuous testing, first inspect the space requirement without running:
+
+```sh
+python3 scripts/endurance.py --mode matrix --hours 24 --output /path/to/new-matrix-report --data-root /path/to/new-matrix-data --plan
+python3 scripts/endurance.py --mode io --hours 24 --file-gib 20 --output /path/to/new-io-report --data-root /path/to/new-io-data --plan
+```
+
+Remove `--plan` to execute; use `--hours 72` for a longer run. Run matrix and I/O
+campaigns sequentially. Output and data directories must be new, outside the
+checkout, with existing parents. Keep source and binaries unchanged throughout.
+Matrix mode retains pinned and following readers during mutation and explicit
+compaction; I/O mode rotates raw, indexed and concurrent-reader cases, with full
+payload verification and cleanup each cycle. The requested duration is a lower
+bound: I/O finishes the current case before stopping.
+
+Monitor the top-level `report.json` (`status`, `phase`, `heartbeat_utc`, `cycles`).
+Success requires exit code zero, `status: passed`, `cleanup_verified: true` and
+all cycles passing. Preserve failed reports and data; do not automatically retry
+or reduce workload size. SIGINT/SIGTERM to the top-level runner requests orderly
+shutdown; SIGKILL or machine termination cannot guarantee cleanup.
+
+These checks do not simulate power loss or establish Windows runtime behavior.
+The default matrix hot set is 256 MiB and may fit entirely in RAM; it does not
+prove performance for a working set larger than available memory. Indexed
+process-kill tests do not cover every matrix compaction or ENOSPC boundary.

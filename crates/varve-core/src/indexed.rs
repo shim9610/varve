@@ -19,7 +19,6 @@ use crate::native_layout::{decode_native_record_footer, read_native_record_heade
 use crate::scalable_extent::UntrustedRecordPointer;
 use crate::stream::{
     StreamCheckpoint, StreamMutationPermit, StreamTail, primary_generation, primary_identity,
-    verify_primary_generation,
 };
 use crate::traits::KeyedBlockContract;
 use crate::{
@@ -144,6 +143,9 @@ where
     )
 }
 
+/// A reader owned by one reading thread (`Send`, not `Sync`). Each reader
+/// follows confirmed generations independently. Open another reader on the
+/// same path for another thread; no shared-reader lock is required.
 pub struct VarveIndexedReader {
     stream: VarveStreamReader,
     index: crate::disk_index::DiskIndexSnapshot,
@@ -161,7 +163,7 @@ impl VarveIndexedReader {
         let plan = plan.validate(spec).map_err(index_error)?;
         let blocks = plan.descriptors();
         let path = std::fs::canonicalize(path.as_ref())?;
-        let stream = VarveStreamReader::open_native(
+        let mut stream = VarveStreamReader::open_native(
             spec,
             &path,
             StreamOptions {
@@ -172,16 +174,74 @@ impl VarveIndexedReader {
         let identity = primary_identity(stream.spec(), stream.snapshot())?;
         let store = DiskIndexStore::open(sidecar_path(&path), options).map_err(index_error)?;
         let index = store
-            .begin_snapshot_with_plan(identity, plan, stream.snapshot().len())
+            .begin_committed_snapshot(identity, plan.mode())
             .map_err(index_error)?;
-        verify_primary_generation(stream.spec(), index.primary_generation(), stream.snapshot())?;
-        let stream = stream.pin_logical_len(index.committed_eof())?;
+        stream.adopt_snapshot(stream.committed_native_snapshot(&index)?);
         Ok(Self {
             stream,
             index,
             _store: store,
             indexed_blocks: blocks.iter().map(|block| block.block_id).collect(),
         })
+    }
+
+    /// Adopt the latest confirmed index root and its matching native EOF.
+    /// Dirty working generations expose their saved confirmed root. An error
+    /// leaves this handle unchanged. Existing iterators retain their old view.
+    pub fn follow(&mut self) -> Result<u64> {
+        let (store, next) = self
+            ._store
+            .followed_handle(&self.index)
+            .map_err(index_error)?;
+        let added = next.record_count() - self.index.record_count();
+        if next.generation() == self.index.generation()
+            && self.index.is_pinned()
+            && self._store.same_file(&store)
+        {
+            return Ok(0);
+        }
+        let native = self.stream.committed_native_snapshot(&next)?;
+        self.stream.adopt_snapshot(native);
+        self.index = next;
+        self._store = store;
+        Ok(added)
+    }
+
+    /// Refresh and resume this reader's event cursor at its previous offset.
+    pub fn follow_events(&mut self, events: &mut crate::StreamEvents) -> Result<u64> {
+        events.validate_follow(self.stream.snapshot())?;
+        let added = self.follow()?;
+        events.extend_snapshot(self.stream.snapshot().clone());
+        Ok(added)
+    }
+
+    /// Refresh and resume this reader's typed cursor without scanning old records.
+    pub fn follow_blocks<T: VarveBlock>(
+        &mut self,
+        blocks: &mut crate::StreamingBlocks<T>,
+    ) -> Result<u64> {
+        blocks.validate_follow(self.stream.snapshot())?;
+        let added = self.follow()?;
+        blocks.extend_snapshot(self.stream.snapshot().clone());
+        Ok(added)
+    }
+
+    /// Release the index snapshot. Key reads return `SnapshotReleased` until
+    /// `follow()` succeeds. Native scans keep their previously confirmed EOF.
+    pub fn release_snapshot(&mut self) -> bool {
+        self.index.release()
+    }
+
+    pub fn snapshot_status(&self) -> Result<crate::SnapshotStatus> {
+        self.index.status(&self._store).map_err(index_error)
+    }
+
+    pub fn snapshot_retention(&self) -> Result<crate::SnapshotRetention> {
+        self._store.snapshot_retention().map_err(index_error)
+    }
+
+    pub fn committed_len(&self) -> u64 {
+        self.index.committed_eof()
     }
 
     /// Returns the physical event stream. The scanner is created only when
@@ -403,6 +463,7 @@ pub struct VarveIndexedWriter {
     batch_records: usize,
     batch_last_sequence: Option<u64>,
     dirty: bool,
+    immediate_state: crate::immediate::ImmediateState,
 }
 
 impl VarveIndexedWriter {
@@ -446,7 +507,7 @@ impl VarveIndexedWriter {
             metadata,
             &checkpoint_disk_tails(&checkpoint),
         )?;
-        Ok(Self::new(stream, index, blocks))
+        Self::new(stream, index, blocks, plan)
     }
 
     pub fn restore_checkpoint_and_open(
@@ -469,7 +530,7 @@ impl VarveIndexedWriter {
             sidecar_path(&path),
             plan.mode(),
         )?;
-        Ok(Self::new(stream, index, blocks))
+        Self::new(stream, index, blocks, plan)
     }
 
     pub fn open(
@@ -489,8 +550,8 @@ impl VarveIndexedWriter {
                 state: options,
             },
             |identity, physical_len| {
-                let store =
-                    DiskIndexStore::open(sidecar_path(&path), options).map_err(index_error)?;
+                let store = DiskIndexStore::open_writer(sidecar_path(&path), options)
+                    .map_err(index_error)?;
                 let state = store
                     .validate_clean_writer(
                         identity,
@@ -506,11 +567,17 @@ impl VarveIndexedWriter {
                 ))
             },
         )?;
-        Ok(Self::new(stream, index, blocks))
+        Self::new(stream, index, blocks, plan)
     }
 
-    fn new(stream: VarveStreamWriter, index: DiskIndexStore, blocks: &[DiskIndexedBlock]) -> Self {
-        Self {
+    fn new(
+        stream: VarveStreamWriter,
+        mut index: DiskIndexStore,
+        blocks: &[DiskIndexedBlock],
+        plan: DiskIndexPlan,
+    ) -> Result<Self> {
+        index.configure_finite(plan).map_err(index_error)?;
+        Ok(Self {
             record_buffer: Vec::new(),
             stream,
             index,
@@ -519,7 +586,8 @@ impl VarveIndexedWriter {
             batch_records: 0,
             batch_last_sequence: None,
             dirty: false,
-        }
+            immediate_state: Default::default(),
+        })
     }
 
     pub fn push_info<T>(&mut self, value: &T) -> Result<AppendInfo>
@@ -531,6 +599,7 @@ impl VarveIndexedWriter {
         let () = KeyedBlockContract::<T>::OK;
         let _permit = self.ensure_writable::<T>()?;
         let key = value.key();
+        let mandatory = T::IMMEDIATE || value.immediate_if();
         self.ensure_batch()?;
         let canonical_key =
             DiskIndexUpdate::encode_key(&key, self.index.max_key_bytes()).map_err(index_error)?;
@@ -600,7 +669,9 @@ impl VarveIndexedWriter {
         // this call's.
         self.record_buffer = bytes;
         appended?;
-        self.publish_update(old_eof, info, update, tail, composite)
+        self.publish_update(old_eof, info, update, tail, composite)?;
+        self.apply_immediate::<T>(info, crate::ImmediateOperation::Append, mandatory)?;
+        Ok(info)
     }
 
     pub fn delete_info<T>(&mut self, key: &T::Key) -> Result<AppendInfo>
@@ -611,6 +682,7 @@ impl VarveIndexedWriter {
         // API2-03: compile-time keyedness contract at the public entry point.
         let () = KeyedBlockContract::<T>::OK;
         let _permit = self.ensure_writable::<T>()?;
+        let mandatory = T::IMMEDIATE;
         self.ensure_batch()?;
         let canonical_key =
             DiskIndexUpdate::encode_key(key, self.index.max_key_bytes()).map_err(index_error)?;
@@ -659,7 +731,9 @@ impl VarveIndexedWriter {
         let permit = self.ensure_not_poisoned()?;
         self.stream
             .append_prepared_chunk(permit, &record.bytes, &[(TOMBSTONE_BLOCK_ID, info)])?;
-        self.publish_update(old_eof, info, update, tail, composite)
+        self.publish_update(old_eof, info, update, tail, composite)?;
+        self.apply_immediate::<T>(info, crate::ImmediateOperation::Delete, mandatory)?;
+        Ok(info)
     }
 
     pub fn push_iter<T, I>(
@@ -698,11 +772,14 @@ impl VarveIndexedWriter {
                 "disk-indexed blocks cannot use the unindexed append path",
             ));
         }
+        let mandatory = T::IMMEDIATE || value.immediate_if();
         self.ensure_batch()?;
         self.ensure_coverage_capacity(self.stream.spec().index_policy.block_offset_chain)?;
         let old_eof = self.stream.snapshot().len();
         let info = self.stream.push_info(value)?;
-        self.publish_coverage::<T>(old_eof, info, false)
+        self.publish_coverage::<T>(old_eof, info, false)?;
+        self.apply_immediate::<T>(info, crate::ImmediateOperation::Append, mandatory)?;
+        Ok(info)
     }
 
     pub fn push_unindexed_iter<T, I>(
@@ -746,11 +823,14 @@ impl VarveIndexedWriter {
         if self.stream.spec().index_policy.keyed_offset_chain {
             return Err(Error::StreamingUnsupported);
         }
+        let mandatory = T::IMMEDIATE;
         self.ensure_batch()?;
         self.ensure_coverage_capacity(self.stream.spec().index_policy.block_offset_chain)?;
         let old_eof = self.stream.snapshot().len();
         let info = self.stream.delete_with_prev_key_info::<T>(key, None)?;
-        self.publish_coverage::<T>(old_eof, info, true)
+        self.publish_coverage::<T>(old_eof, info, true)?;
+        self.apply_immediate::<T>(info, crate::ImmediateOperation::Delete, mandatory)?;
+        Ok(info)
     }
 
     pub fn flush(&mut self) -> Result<()> {
@@ -762,15 +842,75 @@ impl VarveIndexedWriter {
         let _permit = self.ensure_not_poisoned()?;
         self.commit_pending_batch()?;
         self.stream.sync()?;
-        if self.dirty {
-            self.index
+        if self.dirty
+            && let Err(error) = self
+                .index
                 .publish_clean(checkpoint_frontier(&self.stream.checkpoint()))
-                .map_err(index_error)?;
+        {
+            // Publication can be visible even when its final sync failed.
+            // The writer must reopen/reconcile before another mutation.
+            self.stream.poison();
+            return Err(index_error(error));
         }
         self.batch_records = 0;
         self.batch_last_sequence = None;
         self.dirty = false;
+        self.immediate_state.reset();
         Ok(())
+    }
+
+    /// Persist all preceding records, then publish their clean disk-index root.
+    /// Success covers both the triggering record and all earlier writes.
+    pub fn immediate(&mut self) -> Result<()> {
+        self.sync()
+    }
+
+    pub fn set_immediate_policy(&mut self, policy: crate::ImmediatePolicy) -> Result<()> {
+        let _permit = self.ensure_not_poisoned()?;
+        self.immediate_state.policy = policy.validate()?;
+        Ok(())
+    }
+
+    fn apply_immediate<T: VarveBlock>(
+        &mut self,
+        info: AppendInfo,
+        operation: crate::ImmediateOperation,
+        mandatory: bool,
+    ) -> Result<()> {
+        let bytes = self
+            .stream
+            .snapshot()
+            .len()
+            .saturating_sub(info.record_offset);
+        self.immediate_state.advance(1, bytes);
+        let event = self
+            .immediate_state
+            .event(T::ID, operation, info, bytes, 0, 0);
+        if mandatory || self.immediate_state.policy.matches(event) {
+            self.immediate().map_err(|source| {
+                crate::immediate::appended_immediate_error(info.sequence, source)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Reclaim old index pages without waiting for readers. Requires a clean
+    /// writer: call `sync` first. Does not change the native file or durability policy.
+    pub fn compact_index(&mut self) -> Result<crate::IndexCompaction> {
+        let _permit = self.ensure_not_poisoned()?;
+        if self.dirty {
+            return Err(index_error(DiskIndexError::CleanStateRequired));
+        }
+        let result = self.index.compact().map_err(index_error);
+        if result.is_err() {
+            self.stream.poison();
+        }
+        result
+    }
+
+    /// Sample live reader pins and sidecar size without changing durability.
+    pub fn snapshot_retention(&self) -> Result<crate::SnapshotRetention> {
+        self.index.snapshot_retention().map_err(index_error)
     }
 
     pub fn resident_state(&self) -> crate::StreamResidentState {
@@ -811,12 +951,13 @@ impl VarveIndexedWriter {
         for value in values {
             self.ensure_batch()?;
             let value = value.borrow();
+            let mandatory = T::IMMEDIATE || value.immediate_if();
             let key = value.key();
             let canonical_key = DiskIndexUpdate::encode_key(&key, self.index.max_key_bytes())
                 .map_err(index_error)?;
-            // One composite key per record here too. It stays valid across the
-            // `publish_prepared_chunk` below that may commit this batch and
-            // start another: the bytes are `(block_id, key length, key)` and
+            // One composite key per record here too. It stays valid across an
+            // index-capacity rollover below that commits this batch and
+            // starts another: the bytes are `(key presence, schema kind, key)` and
             // `max_key_bytes` is the store's, not the batch's, so a new batch
             // stores the same row under the same key.
             let (previous_key, composite) = if self.stream.spec().index_policy.keyed_offset_chain {
@@ -888,16 +1029,17 @@ impl VarveIndexedWriter {
                 .expect("batch initialized")
                 .can_accept_update(&update, tail.is_some())
                 .map_err(index_error)?;
-            if !fits_index && !records.is_empty() {
-                // `bytes` already holds this record and `records` does not
-                // describe it, so only the prefix may go.
-                self.publish_staged_prefix(
-                    &mut bytes,
-                    &mut records,
-                    &mut record_start,
-                    record.len,
-                    written,
-                )?;
+            if !fits_index {
+                if !records.is_empty() {
+                    self.publish_staged_prefix(
+                        &mut bytes,
+                        &mut records,
+                        &mut record_start,
+                        record.len,
+                        written,
+                    )?;
+                }
+                self.commit_pending_batch()?;
                 self.ensure_batch()?;
             }
             self.batch
@@ -914,15 +1056,36 @@ impl VarveIndexedWriter {
             self.batch_records += 1;
             self.batch_last_sequence = Some(sequence);
 
-            if bytes.len() >= options.max_bytes || records.len() >= max_records {
+            let event = self.immediate_state.event(
+                T::ID,
+                crate::ImmediateOperation::Append,
+                record.info,
+                record.len as u64,
+                records.len() as u64,
+                bytes.len() as u64,
+            );
+            let immediate = mandatory || self.immediate_state.policy.matches(event);
+            if immediate
+                || bytes.len() >= options.max_bytes
+                || records.len() >= max_records
+                || self.batch_records >= INDEX_BATCH_RECORDS
+            {
                 self.publish_prepared_chunk(&bytes, &records, written)?;
                 bytes.clear();
                 records.clear();
+                if immediate {
+                    self.immediate().map_err(|source| {
+                        crate::immediate::appended_immediate_error(sequence, source)
+                    })?;
+                } else if self.batch_records >= INDEX_BATCH_RECORDS {
+                    self.commit_pending_batch()?;
+                }
             }
         }
         if !records.is_empty() {
             self.publish_prepared_chunk(&bytes, &records, written)?;
         }
+        self.commit_pending_batch()?;
         Ok(())
     }
 
@@ -959,13 +1122,15 @@ impl VarveIndexedWriter {
 
         for value in values {
             self.ensure_batch()?;
+            let value = value.borrow();
+            let mandatory = T::IMMEDIATE || value.immediate_if();
             let sequence = next_sequence.ok_or(Error::SequenceExhausted)?;
             // Straight into the chunk buffer: no per-record `Vec` to copy in
             // and drop.
             let mut record_start = bytes.len();
             let record = prepare_stream_user_record_into(
                 self.stream.spec(),
-                value.borrow(),
+                value,
                 sequence,
                 next_offset,
                 previous_block,
@@ -1001,16 +1166,17 @@ impl VarveIndexedWriter {
                 .expect("batch initialized")
                 .can_accept_coverage(tail.is_some())
                 .map_err(index_error)?;
-            if !fits_index && !records.is_empty() {
-                // `bytes` already holds this record and `records` does not
-                // describe it, so only the prefix may go.
-                self.publish_staged_prefix(
-                    &mut bytes,
-                    &mut records,
-                    &mut record_start,
-                    record.len,
-                    written,
-                )?;
+            if !fits_index {
+                if !records.is_empty() {
+                    self.publish_staged_prefix(
+                        &mut bytes,
+                        &mut records,
+                        &mut record_start,
+                        record.len,
+                        written,
+                    )?;
+                }
+                self.commit_pending_batch()?;
                 self.ensure_batch()?;
             }
             self.batch
@@ -1027,15 +1193,36 @@ impl VarveIndexedWriter {
             self.batch_records += 1;
             self.batch_last_sequence = Some(sequence);
 
-            if bytes.len() >= options.max_bytes || records.len() >= max_records {
+            let event = self.immediate_state.event(
+                T::ID,
+                crate::ImmediateOperation::Append,
+                record.info,
+                record.len as u64,
+                records.len() as u64,
+                bytes.len() as u64,
+            );
+            let immediate = mandatory || self.immediate_state.policy.matches(event);
+            if immediate
+                || bytes.len() >= options.max_bytes
+                || records.len() >= max_records
+                || self.batch_records >= INDEX_BATCH_RECORDS
+            {
                 self.publish_prepared_chunk(&bytes, &records, written)?;
                 bytes.clear();
                 records.clear();
+                if immediate {
+                    self.immediate().map_err(|source| {
+                        crate::immediate::appended_immediate_error(sequence, source)
+                    })?;
+                } else if self.batch_records >= INDEX_BATCH_RECORDS {
+                    self.commit_pending_batch()?;
+                }
             }
         }
         if !records.is_empty() {
             self.publish_prepared_chunk(&bytes, &records, written)?;
         }
+        self.commit_pending_batch()?;
         Ok(())
     }
 
@@ -1076,7 +1263,9 @@ impl VarveIndexedWriter {
         let permit = self.ensure_not_poisoned()?;
         self.stream
             .append_prepared_chunk_summarized(permit, bytes, records, written)?;
-        self.commit_pending_batch()
+        self.immediate_state
+            .advance(records.len() as u64, bytes.len() as u64);
+        Ok(())
     }
 
     /// Commits the pending sidecar transaction, classifying *every* failure
@@ -1320,8 +1509,7 @@ impl VarveIndexedWriter {
 
 impl Drop for VarveIndexedWriter {
     fn drop(&mut self) {
-        // redb waits for active write transactions while closing the database.
-        // Abort the bounded batch before field drop reaches the store owner.
+        // Discard uncommitted staging before releasing the writer file guard.
         self.batch.take();
     }
 }
@@ -1363,7 +1551,8 @@ where
         DiskIndexFrontier::empty(header_eof),
         tail_limit_for_spec(spec).map_err(index_error)?,
     );
-    let store = DiskIndexStore::create(&temporary, options, metadata).map_err(index_error)?;
+    let mut store = DiskIndexStore::create(&temporary, options, metadata).map_err(index_error)?;
+    store.configure_finite(plan).map_err(index_error)?;
     let mut batch = store.begin_write_batch().map_err(index_error)?;
     let mut batch_records = 0usize;
     let mut records = 0u64;
@@ -1472,10 +1661,6 @@ where
     if primary_identity(spec, &current)? != identity {
         return Err(index_error(DiskIndexError::IdentityMismatch));
     }
-    // Drop the process-local shared-database entry for the file being
-    // replaced so no later open can upgrade a database backed by the old
-    // file object, even if the OS reuses its native identity.
-    crate::disk_index::invalidate_shared_database(&path);
     // DUR2-01: publication takes ownership of the temp guard so an
     // indeterminate outcome preserves the replacement for out-of-band
     // reconciliation instead of the guard blind-deleting it by pathname.
@@ -1603,9 +1788,6 @@ fn create_index_store(
     crate::scalable_fault_point("create.sidecar_complete");
     let store = store?;
     drop(store);
-    // See `rebuild_index`: the replaced file's shared-database entry must not
-    // survive publication of the new sidecar object.
-    crate::disk_index::invalidate_shared_database(&sidecar);
     // DUR2-01: the temp guard is handed to publication so an indeterminate
     // outcome preserves the replacement for reconciliation.
     match publish_temp_path_atomically(temporary, &sidecar)? {
@@ -1620,7 +1802,7 @@ fn create_index_store(
             });
         }
     }
-    DiskIndexStore::open_validated(&sidecar, options, metadata.identity, metadata.mode)
+    DiskIndexStore::open_writer_validated(&sidecar, options, metadata.identity, metadata.mode)
         .map_err(index_error)
 }
 
@@ -2068,6 +2250,43 @@ mod tests {
     }
 
     #[test]
+    fn following_a_dirty_reader_only_parses_new_records() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("incremental.varve");
+        let options = DiskIndexOptions::default();
+        let mut writer = VarveIndexedWriter::create(spec(), &path, options, index_plan())?;
+        writer.push_info(&Item {
+            key: 0,
+            value: "zero".into(),
+        })?;
+        writer.sync()?;
+        writer.push_info(&Item {
+            key: 1,
+            value: "one".into(),
+        })?;
+        crate::file::reset_stream_io_counters();
+        let mut reader = VarveIndexedReader::open(spec(), &path, options, index_plan())?;
+        assert_eq!(crate::file::stream_io_counters(), (0, 0, 0));
+        let mut cursor = reader.blocks::<Item>()?;
+        assert_eq!(cursor.by_ref().collect::<Result<Vec<_>>>()?.len(), 1);
+        crate::file::reset_stream_io_counters();
+        for key in 1..=20 {
+            assert_eq!(reader.follow_blocks(&mut cursor)?, 0);
+            assert!(cursor.next().is_none());
+            writer.sync()?;
+            writer.push_info(&Item {
+                key: key + 1,
+                value: "next".into(),
+            })?;
+            assert_eq!(reader.follow_blocks(&mut cursor)?, 1);
+            assert_eq!(cursor.next().unwrap()?.key, key);
+            assert!(cursor.next().is_none());
+        }
+        assert_eq!(crate::file::stream_io_counters(), (0, 20, 0));
+        Ok(())
+    }
+
+    #[test]
     fn indexed_mutations_encode_each_sidecar_key_once() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("single-key-encoding.varve");
@@ -2106,7 +2325,47 @@ mod tests {
     }
 
     #[test]
-    fn dirty_index_restore_uses_savepoint_without_native_scan() -> Result<()> {
+    fn failed_clean_publication_stops_further_indexed_mutation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("publication-outcome.varve");
+        let options = DiskIndexOptions::default();
+        let mut writer = VarveIndexedWriter::create(spec(), &path, options, index_plan())?;
+        writer.push_info(&Item {
+            key: 1,
+            value: "published".into(),
+        })?;
+        writer.commit_pending_batch()?;
+        writer.stream.sync()?;
+        // Model a clean root becoming visible before publication returned an
+        // error: the writer still believes that generation is Dirty.
+        writer
+            .index
+            .publish_clean(checkpoint_frontier(&writer.stream.checkpoint()))
+            .map_err(index_error)?;
+        assert!(writer.sync().is_err());
+        assert!(
+            writer
+                .push_info(&Item {
+                    key: 2,
+                    value: "must not append".into()
+                })
+                .is_err()
+        );
+        drop(writer);
+        let reader = VarveIndexedReader::open(spec(), &path, options, index_plan())?;
+        assert_eq!(reader.get::<Item>(&1)?.unwrap().value, "published");
+        assert_eq!(reader.get::<Item>(&2)?, None);
+        drop(VarveIndexedWriter::open(
+            spec(),
+            &path,
+            options,
+            index_plan(),
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_index_restore_uses_checkpoint_without_native_scan() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("restore-index.varve");
         let options = DiskIndexOptions::default();
@@ -2293,16 +2552,14 @@ mod tests {
         // opens beside a synced writer and serves the committed state.
         let reader = VarveIndexedReader::open(spec(), &path, options, index_plan())?;
         assert_eq!(reader.get::<Item>(&1)?.unwrap().value, "one");
-        // A handle holding an uncommitted sidecar batch still yields a typed
-        // busy error for conflicting opens instead of blocking inside redb.
+        // Reader validation uses the saved root without entering write admission.
         writer.push_info(&Item {
             key: 2,
             value: "two".into(),
         })?;
-        assert!(matches!(
-            VarveIndexedReader::open(spec(), &path, options, index_plan()),
-            Err(Error::IndexBusy)
-        ));
+        let during = VarveIndexedReader::open(spec(), &path, options, index_plan())?;
+        assert_eq!(during.get::<Item>(&1)?.unwrap().value, "one");
+        assert!(during.get::<Item>(&2)?.is_none());
         // The pre-existing reader keeps serving its pinned snapshot.
         assert_eq!(reader.get::<Item>(&1)?.unwrap().value, "one");
         writer.sync()?;

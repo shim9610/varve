@@ -110,7 +110,7 @@ fn fill(path: &Path, count: u64) -> varve::Result<()> {
         )?;
         writer.commit_matrix_cell::<RebuildCell>(key(ordinal))?;
     }
-    writer.flush()?;
+    writer.sync()?;
     Ok(())
 }
 
@@ -120,7 +120,7 @@ fn rebuild(path: &Path) -> varve::Result<(u64, u64)> {
     MatrixRecoveryReport::reset_matrix_integrity_counters();
     let committed = writer.rebuild_matrix_commit_from_crc::<RebuildCell>()?;
     let read = MatrixRecoveryReport::matrix_rebuild_slot_bytes_read();
-    writer.flush()?;
+    writer.sync()?;
     Ok((committed, read))
 }
 

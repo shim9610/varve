@@ -115,7 +115,7 @@ fn same_spec_sibling_file_sidecar_is_rejected() -> varve::Result<()> {
         writer.write_matrix_cell(MatrixKey::new(0, 0), &IdentityCell { value: 1 })?;
         writer.commit_matrix_cell::<IdentityCell>(MatrixKey::new(0, 0))?;
         writer.write_matrix_sidecar("analysis", &sidecar, 7, b"resume-a")?;
-        writer.flush()?;
+        writer.sync()?;
     }
 
     // A reads its own sidecar back: identity matches.
@@ -133,7 +133,7 @@ fn same_spec_sibling_file_sidecar_is_rejected() -> varve::Result<()> {
         let mut writer = spec.create_writer_with_dims(&path_b, dims)?;
         writer.write_matrix_cell(MatrixKey::new(0, 0), &IdentityCell { value: 2 })?;
         writer.commit_matrix_cell::<IdentityCell>(MatrixKey::new(0, 0))?;
-        writer.flush()?;
+        writer.sync()?;
     }
     {
         let reader_b = spec.open_reader(&path_b)?;
@@ -181,7 +181,7 @@ fn same_object_matrix_recreation_rejects_stale_sidecar() -> varve::Result<()> {
         writer.write_matrix_cell(MatrixKey::new(0, 0), &IdentityCell { value: 1 })?;
         writer.commit_matrix_cell::<IdentityCell>(MatrixKey::new(0, 0))?;
         writer.write_matrix_sidecar("analysis", &sidecar, 41, b"stale-resume")?;
-        writer.flush()?;
+        writer.sync()?;
     }
 
     // Recreate the matrix at the same pathname with the same dimensions. The
@@ -192,7 +192,7 @@ fn same_object_matrix_recreation_rejects_stale_sidecar() -> varve::Result<()> {
         let mut writer = spec.create_writer_with_dims(&path, dims)?;
         writer.write_matrix_cell(MatrixKey::new(0, 0), &IdentityCell { value: 2 })?;
         writer.commit_matrix_cell::<IdentityCell>(MatrixKey::new(0, 0))?;
-        writer.flush()?;
+        writer.sync()?;
     }
     {
         let reader = spec.open_reader(&path)?;
@@ -221,7 +221,7 @@ fn same_object_matrix_recreation_rejects_stale_sidecar() -> varve::Result<()> {
     {
         let mut writer = spec.open_writer(&path)?;
         writer.write_matrix_sidecar("analysis", &sidecar, 1, b"fresh-resume")?;
-        writer.flush()?;
+        writer.sync()?;
     }
     {
         let reader = spec.open_reader(&path)?;
@@ -249,7 +249,7 @@ fn create_new_with_dims_is_exclusive_and_initializes_the_claimed_handle() -> var
         let mut writer = varve::VarveFile::create_new_with_dims(spec, &path, dims)?;
         writer.write_matrix_cell(MatrixKey::new(0, 0), &IdentityCell { value: 7 })?;
         writer.commit_matrix_cell::<IdentityCell>(MatrixKey::new(0, 0))?;
-        writer.flush()?;
+        writer.sync()?;
     }
 
     // A pre-existing target is refused instead of truncated.

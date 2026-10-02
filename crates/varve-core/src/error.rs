@@ -7,6 +7,18 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
+    #[error("invalid follow cursor: {0}")]
+    InvalidFollowCursor(&'static str),
+
+    #[error("Immediate record and byte thresholds must be nonzero")]
+    InvalidImmediatePolicy,
+
+    /// The append/deletion happened, but its requested Immediate boundary
+    /// failed. Do not append it again. Retry `immediate` if the writer remains
+    /// usable; otherwise reopen through the recovery API.
+    #[error("record {sequence} was appended but Immediate failed: {source}")]
+    AppendedButImmediateFailed { sequence: u64, source: Box<Error> },
+
     #[error("io error: {0}")]
     Io(#[from] io::Error),
 
@@ -276,15 +288,12 @@ pub enum Error {
     )]
     KeyedChainRequiresKeyedApi { block_id: u32 },
 
-    #[cfg(feature = "high-cardinality-dev")]
     #[error("the requested operation is unsupported by bounded streaming handles")]
     StreamingUnsupported,
 
-    #[cfg(feature = "high-cardinality-dev")]
     #[error("batch option {field} must be greater than zero")]
     InvalidBatchOptions { field: &'static str },
 
-    #[cfg(feature = "high-cardinality-dev")]
     #[error(
         "explicit scan cancelled after {records} records and {bytes} record-region bytes",
         records = .progress.records,
@@ -292,15 +301,12 @@ pub enum Error {
     )]
     ScanCancelled { progress: crate::ScanProgress },
 
-    #[cfg(feature = "high-cardinality-dev")]
     #[error("the derived disk index is busy")]
     IndexBusy,
 
-    #[cfg(feature = "high-cardinality-dev")]
     #[error("disk index error: {0}")]
     DiskIndex(#[source] Box<crate::disk_index::DiskIndexError>),
 
-    #[cfg(feature = "high-cardinality-dev")]
     #[error("record sequence {sequence} was published, but the disk index is stale: {source}")]
     PublishedButIndexStale {
         sequence: u64,
@@ -480,8 +486,18 @@ pub enum Error {
         source: Box<Error>,
     },
 
-    /// The matrix commit bit reached the file, but the durability request that
-    /// follows it failed (round 11, invariant 3).
+    /// The matrix generation publication failed before completion was confirmed.
+    /// Reopen and inspect the confirmed generation before deciding whether to
+    /// retry the operation. The post-publication hook did not run.
+    #[error("matrix generation publication outcome is uncertain: {source}")]
+    MatrixPublicationUncertain {
+        event: Box<crate::MatrixCommitEvent>,
+        #[source]
+        source: Box<Error>,
+    },
+
+    /// The complete matrix generation head reached the file, but its final
+    /// durability request failed.
     ///
     /// This is the matrix twin of [`Error::CommittedButDurabilityUnproven`] and
     /// sits in the same published-outcome family as

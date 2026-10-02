@@ -129,7 +129,7 @@ fn fill_pages(path: &Path, scans: u64, pages: impl IntoIterator<Item = u64>) -> 
         writer.write_matrix_cell(key(ordinal), &HotCell { value: 7 })?;
         writer.commit_matrix_cell::<HotCell>(key(ordinal))?;
     }
-    writer.flush()?;
+    writer.sync()?;
     Ok(())
 }
 
@@ -319,7 +319,7 @@ fn writing_a_fresh_cell_stores_no_bitmap_byte_and_committing_it_stores_every_one
 
         // The transitions that were skipped changed nothing, and the ones that
         // were made are visible on a fresh open of the file.
-        writer.flush()?;
+        writer.sync()?;
         drop(writer);
         let reader = default_spec(integrity).open_readonly(&path)?;
         for ordinal in 0..CELLS {
@@ -409,7 +409,7 @@ fn a_bitmap_byte_that_does_not_change_hashes_no_page() -> varve::Result<()> {
     );
 
     // The commits are durable, so the skipped hashing was not skipped work.
-    writer.flush()?;
+    writer.sync()?;
     drop(writer);
     let reader = default_spec(IntegrityPolicy::Crc32).open_readonly(&path)?;
     for ordinal in 0..CELLS {
@@ -469,7 +469,7 @@ fn committing_a_cell_reads_its_slot_back_once_per_pass_that_needs_it() -> varve:
         writer.commit_matrix_cell::<HotCell>(key(ordinal))?;
     }
     let same_session = MatrixRecoveryReport::matrix_slot_bytes_read_back();
-    writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     // A fresh handle has no session write bits, so the zero probe runs too.
@@ -548,7 +548,7 @@ fn rewriting_a_committed_cell_still_clears_its_commit_bit() -> varve::Result<()>
             "cell {ordinal} kept a commit bit the rewrite should have cleared"
         );
     }
-    writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     let reader = default_spec(IntegrityPolicy::Crc32).open_readonly(&path)?;

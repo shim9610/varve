@@ -730,6 +730,7 @@ fn write_matrix_lines(
         }
     }
     writer.flush()?;
+    writer.sync()?;
     Ok(())
 }
 

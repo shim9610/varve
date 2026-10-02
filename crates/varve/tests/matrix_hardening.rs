@@ -1,4 +1,6 @@
-use std::fs::OpenOptions;
+#[path = "common/matrix_image.rs"]
+mod matrix_image;
+use matrix_image::OpenOptions;
 #[cfg(feature = "integrity")]
 use std::fs::read;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -521,7 +523,7 @@ fn zero_sized_matrix_create_and_open_reject_cell_access_before_slot_io() {
         writer
             .set_matrix_single_committed("master_grid", true)
             .expect("commit independent single");
-        writer.flush().expect("flush zero-sized matrix");
+        writer.sync().expect("flush zero-sized matrix");
     }
 
     let reader = spec
@@ -689,7 +691,7 @@ fn corrupt_commit_maps_are_quarantined_until_whole_category_recovery() {
         writer
             .set_matrix_channel_committed("threshold", 1, true)
             .expect("set channel commit");
-        writer.flush().expect("flush fixture");
+        writer.sync().expect("flush fixture");
     }
 
     let header = read_vmat_header(fixture.path(), spec);
@@ -776,7 +778,7 @@ fn corrupt_commit_maps_are_quarantined_until_whole_category_recovery() {
         writer
             .commit_matrix_cell::<PrimaryCell>(replacement_key)
             .expect("commit after recovery");
-        writer.flush().expect("flush recovered matrix");
+        writer.sync().expect("flush recovered matrix");
     }
 
     {
@@ -831,7 +833,7 @@ fn valid_commit_visibility_and_wire_bytes_are_unchanged_by_open() {
         writer
             .set_matrix_channel_committed("threshold", 0, true)
             .expect("set channel commit");
-        writer.flush().expect("flush fixture");
+        writer.sync().expect("flush fixture");
     }
     let before = read(fixture.path()).expect("capture valid wire bytes");
 
@@ -885,7 +887,7 @@ fn damaged_page_index_occupancy_header_is_reported_fatal() {
         writer
             .commit_matrix_cell::<PrimaryCell>(key)
             .expect("commit cell");
-        writer.flush().expect("flush fixture");
+        writer.sync().expect("flush fixture");
     }
 
     let header = read_vmat_header(fixture.path(), spec);
@@ -928,7 +930,7 @@ fn damaged_page_index_blocks_cell_access_without_forensics() {
         writer
             .commit_matrix_cell::<PrimaryCell>(key)
             .expect("commit cell");
-        writer.flush().expect("flush fixture");
+        writer.sync().expect("flush fixture");
     }
 
     let header = read_vmat_header(fixture.path(), spec);
@@ -1010,7 +1012,7 @@ fn interrupted_rebuild_marker_is_reported_fatal_and_recommends_a_rebuild() {
         writer
             .commit_matrix_cell::<PrimaryCell>(key)
             .expect("commit cell");
-        writer.flush().expect("flush fixture");
+        writer.sync().expect("flush fixture");
     }
 
     let header = read_vmat_header(fixture.path(), spec);

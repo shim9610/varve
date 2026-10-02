@@ -4,7 +4,6 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(any(feature = "high-cardinality-dev", test))]
 use crate::scalable_extent::{UntrustedRecordPointer, ValidatedRecordPointer};
 use crate::{
     Error, Result,
@@ -59,6 +58,10 @@ impl SnapshotFile {
         })
     }
 
+    pub(crate) fn same_file_object(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.file, &other.file)
+    }
+
     pub(crate) const fn len(&self) -> u64 {
         self.bounds.logical_len().get()
     }
@@ -68,7 +71,7 @@ impl SnapshotFile {
     ///
     /// Two callers, and they are the two places a snapshot moves to a length
     /// nobody just wrote: the scalable family, which shrinks or re-pins one
-    /// (`stream.rs`, behind `high-cardinality-dev`), and `VarveFile::follow`,
+    /// (`stream.rs`), and `VarveFile::follow`,
     /// which extends a read-only handle to a length a *different* process
     /// wrote. The append path uses [`Self::with_written_len`] instead, which
     /// proves the same fact from the write that just returned and issues no
@@ -121,7 +124,6 @@ impl SnapshotFile {
         })
     }
 
-    #[cfg(any(feature = "high-cardinality-dev", test))]
     pub(crate) fn validate(
         &self,
         pointer: UntrustedRecordPointer,
@@ -139,6 +141,13 @@ impl SnapshotFile {
             bounds: self.bounds,
             position: offset,
         })
+    }
+
+    pub(crate) fn reader(&self) -> SnapshotReader {
+        SnapshotReader {
+            snapshot: self.clone(),
+            position: 0,
+        }
     }
 
     pub(crate) fn try_clone_file(&self) -> Result<File> {
@@ -256,6 +265,60 @@ impl SnapshotFile {
         self.bounds
             .validate_range(FileOffset::new(offset), ByteLength::new(len))?;
         Ok(())
+    }
+}
+
+/// A private seek position over positional I/O, never the shared OS file offset.
+#[derive(Debug)]
+pub(crate) struct SnapshotReader {
+    snapshot: SnapshotFile,
+    position: u64,
+}
+
+impl SnapshotReader {
+    pub(crate) fn extend_snapshot(&mut self, snapshot: SnapshotFile) {
+        self.snapshot = snapshot;
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl Read for SnapshotReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let available = self.snapshot.len().saturating_sub(self.position);
+        let len = buffer
+            .len()
+            .min(usize::try_from(available).unwrap_or(usize::MAX));
+        if len == 0 {
+            return Ok(0);
+        }
+        let read = read_at(&self.snapshot.file, &mut buffer[..len], self.position)?;
+        self.position += read as u64;
+        Ok(read)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+impl Read for SnapshotReader {
+    fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "scalable cursors require positional file reads",
+        ))
+    }
+}
+
+impl Seek for SnapshotReader {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        let next = match from {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+            SeekFrom::End(delta) => self.snapshot.len().checked_add_signed(delta),
+        }
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid snapshot seek")
+        })?;
+        self.position = next;
+        Ok(next)
     }
 }
 

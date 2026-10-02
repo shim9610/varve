@@ -1,10 +1,41 @@
-# API Changes — 0.3.0 through 0.9.2
+# API Changes — 0.3.0 through 0.10.0 (unreleased)
 
 Migration document. Companion to [Known Limitations](known-limitations.md)
 and the [Changelog](../CHANGELOG.md).
 
-Sections run newest first, and the letters ascend with the release they
-describe. Section **G** is the 0.9.1 → 0.9.2 migration: nine added forwarding
+## H. 0.9.2 → 0.10.0: default storage APIs (unreleased)
+
+Streaming, indexed lookup, disk-index plans, finite keys and scan control are now
+part of the default public API, including with `--no-default-features`.
+
+- Remove `high-cardinality-dev` from Cargo dependency feature lists. The flag is
+  deleted, not renamed; no replacement feature is needed.
+- `varve_format!` emits stream wrappers when typed APIs are enabled, and indexed
+  wrappers when the format declares `key_index = disk`. `key_index = memory | disk` and generated
+  `VarveDiskKey` implementations no longer depend on a Cargo feature.
+- Every manual `VarveBlock` implementation must declare `const IS_KEYED: bool`.
+  Use `false` for an unkeyed block and `true` with `VarveKeyedBlock`. The previous
+  default of `false` in builds without the development flag is removed. Derived
+  blocks and inline schema blocks already emit the correct value.
+- Reader ownership is one reader per reading thread. Resident, matrix,
+  stream/indexed and generated layout readers are `Send + !Sync`; reads retain
+  `&self`, and `follow()` retains `&mut self` where available. A generated layout
+  reader's ordinal cache uses local `OnceCell`.
+- `scalable-fault-injection` remains opt-in test infrastructure. `integrity`,
+  `mmap`, `zero-copy` and `compression-zstd` remain optional capabilities.
+- Constructor selection is unchanged: `open_reader` opens the resident family;
+  `open_stream_reader` and `open_indexed_reader` select the scalable families.
+
+The version is prepared as a pre-1.0 minor release because this changes the
+manual trait contract and reader auto-traits. No release or tag has been
+published by this change. The existing generation work also requires matrix
+`.vmg` companions and rebuilt/bootstraped older disk-index sidecars; see the
+[durability model](durability-model.md) and [Scalable I/O](scalable-io.md).
+This API promotion adds no claim about new endurance or device-load testing.
+
+---
+
+Historical sections below run newest first. Section **G** is the 0.9.1 → 0.9.2 migration: nine added forwarding
 methods and four added borrowing accessors, all purely additive, plus two
 behaviour fixes that only ever made a correct call fail.
 Section **F** is the 0.9.0 → 0.9.1 migration: one added `ReadLimits`
@@ -791,7 +822,7 @@ clamped to `max_matrix_bitmap_bytes` by
 | You had | Do this |
 | --- | --- |
 | `with_matrix_metadata_residency(EagerVerified)` for **detection at open** | delete it. Verification at open is the default (§A.4) |
-| `with_matrix_metadata_residency(EagerVerified)` for a **pinned snapshot** across a whole map | no replacement; coordinate it yourself. Whole-live-set residency was the only mechanism and it is gone |
+| `with_matrix_metadata_residency(EagerVerified)` for a **pinned snapshot** across a whole map | confirmed COW generations now provide the snapshot independently of cache residency; advance with `follow()` |
 | `with_matrix_metadata_residency(EagerVerified)` to make `max_matrix_bitmap_bytes` refuse a large open | no replacement. The ceiling now bounds a cache; use `max_matrix_cells` to refuse a large matrix |
 | `with_matrix_metadata_residency(Lazy { .. })` | unchanged |
 | nothing | you get the bounded cache, and verification still runs at open |
@@ -1062,8 +1093,8 @@ release.
 ### 3.1 `VarveBlock` gains two required associated constants — **every manual `impl` stops compiling**
 
 `const SCHEMA_FINGERPRINT: u64` has no default. `const IS_KEYED: bool` has no
-default under the `high-cardinality-dev` feature (and defaults to `false`
-otherwise).
+default under the former `high-cardinality-dev` feature in 0.4.0 (and defaulted
+then to `false` otherwise). Since 0.10.0 it is mandatory in every build; see §H.
 
 Blocks produced by `#[derive(VarveBlock)]` or by `varve_format!` are unaffected —
 the macros emit both constants.
@@ -1211,11 +1242,11 @@ New `varve_format!` DSL keys: `key_index = disk | memory` as a block attribute,
 and `keyed_tail` inside `limits { }`. (`disk_index_plan` is a generated
 associated function, not a DSL key.)
 
-### 4.2 Behind `high-cardinality-dev`
+### 4.2 Originally behind `high-cardinality-dev` (0.4.0; default since 0.10.0)
 
 Whole modules, none of which existed in 0.3.0: `disk_index`, `indexed`, `stream`,
 `scan_control`. See [Scalable I/O](scalable-io.md) and
-[Known Limitations §3](known-limitations.md#3-the-scalable-family-is-behind-a-feature-flag-named-dev).
+[Known Limitations §3](known-limitations.md#3-streamindexed-api-status).
 
 ### 4.3 Error variants
 

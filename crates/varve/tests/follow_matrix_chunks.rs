@@ -96,7 +96,7 @@ fn a_follow_invalidates_a_chunk_directory_built_before_it() -> varve::Result<()>
             writer.commit_matrix_cell::<Sample>(key(row, ch))?;
         }
     }
-    writer.flush()?;
+    writer.sync()?;
 
     let mut reader = spec().open_reader(&path)?;
     // Touch a chunked cell: this builds and caches the chunk directory.
@@ -121,7 +121,7 @@ fn a_follow_invalidates_a_chunk_directory_built_before_it() -> varve::Result<()>
             writer.commit_matrix_cell::<Sample>(key(row, ch))?;
         }
     }
-    writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     assert!(reader.follow()? > 0, "the new chunk record was adopted");
@@ -154,5 +154,35 @@ fn a_follow_invalidates_a_chunk_directory_built_before_it() -> varve::Result<()>
             value: (ROWS_PER_CHUNK * 10) as u32
         },
     );
+    Ok(())
+}
+
+#[test]
+fn following_an_overwritten_chunk_adopts_only_its_confirmed_version() -> varve::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("overwrite.vrv");
+    let cell = key(ROWS_PER_CHUNK, 0);
+    let mut writer = spec().create_writer_with_dims(&path, dims())?;
+    writer.write_matrix_cell(cell, &Sample { value: 1 })?;
+    writer.commit_matrix_cell::<Sample>(cell)?;
+    writer.sync()?;
+    let mut old = spec().open_reader(&path)?;
+    assert_eq!(old.read_matrix_cell::<Sample>(cell)?.value, 1);
+    writer.write_matrix_cell(cell, &Sample { value: 2 })?;
+    writer.commit_matrix_cell::<Sample>(cell)?;
+    writer.flush()?;
+    old.follow()?;
+    assert_eq!(old.read_matrix_cell::<Sample>(cell)?.value, 1);
+    assert_eq!(
+        spec()
+            .open_reader(&path)?
+            .read_matrix_cell::<Sample>(cell)?
+            .value,
+        1
+    );
+    writer.sync()?;
+    assert_eq!(old.read_matrix_cell::<Sample>(cell)?.value, 1);
+    old.follow()?;
+    assert_eq!(old.read_matrix_cell::<Sample>(cell)?.value, 2);
     Ok(())
 }

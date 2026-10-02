@@ -1,0 +1,5 @@
+error: finite key exceeds 4096 combinations per block
+ --> tests/ui/fail_finite_key_limit.rs:7:45
+  |
+7 |                 key_domain = [scan = 0..64, frame = 0..65]) {
+  |                                             ^^^^^

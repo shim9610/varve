@@ -164,5 +164,16 @@ fn typed_layout_segment_lookup_is_not_quadratic() -> varve::Result<()> {
          the miss path still walks every segment"
     );
 
+    // A warmed reader can move to a new owner thread without rebuilding its
+    // local ordinal table. Reads on the destination still need only `&self`.
+    std::thread::spawn(move || {
+        assert_eq!(
+            reader.read_data_segment_raw(SEGMENTS - 1).unwrap(),
+            ((SEGMENTS - 1) as u32).to_le_bytes()
+        );
+    })
+    .join()
+    .expect("reader owner thread");
+
     Ok(())
 }

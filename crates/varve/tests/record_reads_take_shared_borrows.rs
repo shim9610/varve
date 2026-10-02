@@ -1,34 +1,6 @@
-//! Every **record** read entry point takes `&self`, proved by the compiler.
-//!
-//! The standing policy is "all reads take `&self`; one handle serves concurrent
-//! readers". `matrix_concurrent_reads.rs` already proves it for the five matrix
-//! entry points across three handle types. Nothing proved it for the record and
-//! block side — `blocks`, `keyed_blocks`, `scan`, `metadata`, `block_chain`,
-//! `verify_all`, `index_entries` and the rest — where it held only by review.
-//!
-//! That gap became load-bearing when the record index stopped keeping its
-//! entries. `ResidentIndex` now holds 16-byte slots and rebuilds each entry from
-//! the record's own header and footer on demand, so **producing an index entry
-//! now reads the file**. The two obvious ways to make that faster are a cache
-//! and a cursor, and both want `&mut self` or a `RefCell` — which is exactly the
-//! change that would silently make one handle stop serving two readers, with no
-//! test failing.
-//!
-//! So this is a compile-time gate, in the same shape as the matrix one: two
-//! shared borrows of one handle are alive at once, and every read entry point is
-//! driven through both. A receiver that became `&mut self` fails to borrow. A
-//! field that became `!Sync` fails `assert_sync`. Neither can be argued with.
-//!
-//! It is not a behavioural test. It asserts the values it reads only enough to
-//! keep the calls from being optimised into nothing; what it is really asserting
-//! is that the file below compiles.
-//!
-//! **Proved discriminating, 2026-08-05.** Changing `VarveReader::scan` from
-//! `&self` to `&mut self` and changing nothing else fails *this test binary and
-//! only this one*: `error[E0596]: cannot borrow *reader as mutable, as it is
-//! behind a & reference`. (The same experiment on `index_entries` is not the
-//! proof, because `varve-core` has internal `&self` callers of its own and stops
-//! at the library — a gate has to fail where it is, not upstream of itself.)
+//! Record read entry points take `&self` within the reader's owning thread.
+//! Multiple local borrows remain valid. Concurrent threads open separate readers;
+//! ownership can move because handles are Send, while sharing is rejected by !Sync.
 
 use varve::{VarveBlock, varve_format};
 
@@ -167,18 +139,10 @@ fn every_record_read_entry_point_takes_a_shared_borrow() -> varve::Result<()> {
     Ok(())
 }
 
-/// A shared borrow is worthless if `&Handle` cannot cross a thread boundary, so
-/// pin that too — and then actually cross one, because `Sync` is a claim about
-/// the type and this is the claim about the code.
-///
-/// The threads read through **one** handle. Each faults its own index entries
-/// out of the same file, which is the path the store swap created: two
-/// positional reads per entry, no cursor, nothing shared but an `Arc<File>`.
+/// Each thread owns a reader and independently rebuilds index entries on demand.
 #[test]
-fn one_handle_serves_two_threads_reading_records() -> varve::Result<()> {
-    fn assert_sync<T: Sync>() {}
+fn independent_handles_serve_threads_reading_records() -> varve::Result<()> {
     fn assert_send<T: Send>() {}
-    assert_sync::<varve::VarveFile>();
     assert_send::<varve::VarveFile>();
 
     let directory = tempfile::tempdir()?;
@@ -190,8 +154,8 @@ fn one_handle_serves_two_threads_reading_records() -> varve::Result<()> {
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..4)
             .map(|_| {
-                let shared = &file;
-                scope.spawn(move || read_everything(shared))
+                let reader = SharedBorrowFormat::open_readonly(&path).expect("independent reader");
+                scope.spawn(move || read_everything(&reader))
             })
             .collect();
         for handle in handles {
@@ -201,7 +165,7 @@ fn one_handle_serves_two_threads_reading_records() -> varve::Result<()> {
                     .expect("thread panicked")
                     .expect("read failed"),
                 expected,
-                "a thread sharing the handle read a different file"
+                "an independent reader returned different records"
             );
         }
     });

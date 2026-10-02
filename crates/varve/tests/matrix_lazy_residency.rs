@@ -22,7 +22,9 @@
 //! extents, so a nominally 1 MiB-commit-map matrix costs a few pages on disk.
 #![cfg(all(feature = "integrity", feature = "scalable-fault-injection"))]
 
-use std::fs::OpenOptions;
+#[path = "common/matrix_image.rs"]
+mod matrix_image;
+use matrix_image::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -148,7 +150,7 @@ fn fill_pages(path: &Path, scans: u64, pages: &[u64]) -> varve::Result<()> {
         writer.write_matrix_cell(key(ordinal), &LazyCell { value: 7 })?;
         writer.commit_matrix_cell::<LazyCell>(key(ordinal))?;
     }
-    writer.flush()?;
+    writer.sync()?;
     Ok(())
 }
 
@@ -398,6 +400,85 @@ fn b_resident_bytes_track_the_working_set_and_stop_at_the_ceiling() -> varve::Re
         MatrixRecoveryReport::matrix_lazy_fault_bytes_read() >= PAGE_BYTES,
         "an evicted page was answered without reading it back"
     );
+    Ok(())
+}
+
+/// Independent cache budgets and LRU state must not affect another reader.
+#[test]
+fn readers_have_independent_cache_contents_eviction_and_budgets() -> varve::Result<()> {
+    let dir = temp_dir("private-caches");
+    let path = dir.path().join("matrix.varve");
+    fill_pages(&path, LARGE_WIDE_SCANS, &[0, 1, 2, 3])?;
+    let small = lazy_spec(PAGE_BYTES).open_readonly(&path)?;
+    let large = lazy_spec(2 * PAGE_BYTES).open_readonly(&path)?;
+    let read = |reader: &varve::VarveFile, page: u64| -> varve::Result<u64> {
+        MatrixRecoveryReport::reset_matrix_lazy_counters();
+        assert_eq!(
+            reader.matrix_cell_status::<LazyCell>(key(page * CELLS_PER_PAGE))?,
+            MatrixCellStatus::Committed
+        );
+        Ok(MatrixRecoveryReport::matrix_lazy_fault_bytes_read())
+    };
+    assert!(read(&small, 0)? >= PAGE_BYTES);
+    assert!(
+        read(&large, 0)? >= PAGE_BYTES,
+        "another reader must start cold"
+    );
+    assert_eq!(read(&small, 0)?, 0);
+    assert!(read(&large, 1)? >= PAGE_BYTES);
+    assert_eq!(
+        MatrixRecoveryReport::matrix_lazy_cached_bitmap_bytes(),
+        2 * PAGE_BYTES
+    );
+    assert_eq!(read(&large, 0)?, 0, "two pages fit the larger cache");
+    for page in [2, 3, 1] {
+        assert!(read(&large, page)? >= PAGE_BYTES);
+        assert_eq!(
+            MatrixRecoveryReport::matrix_lazy_cached_bitmap_bytes(),
+            2 * PAGE_BYTES
+        );
+    }
+    assert_eq!(
+        read(&small, 0)?,
+        0,
+        "another reader's eviction cannot evict this page"
+    );
+    assert!(read(&small, 1)? >= PAGE_BYTES);
+    assert_eq!(
+        MatrixRecoveryReport::matrix_lazy_cached_bitmap_bytes(),
+        PAGE_BYTES
+    );
+    assert!(
+        read(&small, 0)? >= PAGE_BYTES,
+        "the smaller budget must evict"
+    );
+    assert_eq!(
+        read(&large, 1)?,
+        0,
+        "small-cache churn cannot evict the larger cache"
+    );
+    Ok(())
+}
+
+/// Send moves the already populated cache with the reader; it is not thread-local.
+#[test]
+fn moving_a_warmed_reader_to_another_thread_preserves_its_cache() -> varve::Result<()> {
+    let dir = temp_dir("move-reader");
+    let path = dir.path().join("matrix.varve");
+    fill_pages(&path, LARGE_WIDE_SCANS, &[0])?;
+    let reader = lazy_spec(PAGE_BYTES).open_readonly(&path)?;
+    reader.matrix_cell_status::<LazyCell>(key(0))?;
+    std::thread::spawn(move || -> varve::Result<()> {
+        MatrixRecoveryReport::reset_matrix_lazy_counters();
+        assert_eq!(
+            reader.matrix_cell_status::<LazyCell>(key(0))?,
+            MatrixCellStatus::Committed
+        );
+        assert_eq!(MatrixRecoveryReport::matrix_lazy_fault_bytes_read(), 0);
+        Ok(())
+    })
+    .join()
+    .expect("reader thread")?;
     Ok(())
 }
 
@@ -710,7 +791,7 @@ fn writes_through_a_lazy_handle_match_writes_through_a_verified_one() -> varve::
             for ordinal in ordinals.iter().step_by(2) {
                 writer.clear_matrix_cell::<LazyCell>(key(*ordinal))?;
             }
-            writer.flush()?;
+            writer.sync()?;
         }
         let reader = verified_spec().open_readonly(&path)?;
         let mut row = Vec::new();
@@ -1209,22 +1290,11 @@ fn commit_map_off(path: &Path) -> u64 {
     header_u64(path, 6)
 }
 
-/// Criterion (C), under the new option: demand loading must not put back the
-/// read convoy round 16 removed.
-///
-/// The lazy path introduced the first lock the matrix read path has ever had —
-/// a `Mutex` over each bitmap's page map, so a fault-in can happen under
-/// `&self`. A first cut held it across the fault-in `pread`, which would have
-/// serialised every reader of a category behind whichever one missed the cache.
-/// The contract asserted here is the observable one, in wall clock and with the
-/// total work held fixed. `matrix_concurrent_reads.rs` once asserted the same
-/// shape for the eager path; that threshold is an `#[ignore]`d manual benchmark
-/// now, so this is the wall-clock ratio the suite still gates on: N threads must
-/// not take *longer* than one.
-///
-/// The configuration is the hostile one on purpose — a one-page cache against a
-/// many-page live set, so nearly every read is a miss that also evicts.
+/// Private one-page caches over a wider live set: fixed-work scaling on an idle host.
+/// Timing is retained as a manual benchmark; deterministic cache isolation and
+/// actual result checks run in the ordinary suite.
 #[test]
+#[ignore = "wall-clock scaling requires an idle host; cache isolation is tested deterministically"]
 fn concurrent_lazy_readers_are_not_serialised_behind_the_page_store() -> varve::Result<()> {
     let threads = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
@@ -1243,14 +1313,15 @@ fn concurrent_lazy_readers_are_not_serialised_behind_the_page_store() -> varve::
     fill_pages(&path, LARGE_WIDE_SCANS, &pages)?;
 
     // One page of cache for 32 live pages: every read misses and evicts.
-    let reader = lazy_spec(PAGE_BYTES).open_readonly(&path)?;
-    let reader = &reader;
 
     let run = |workers: u64| -> std::time::Duration {
         let each = READS / workers;
         let started = std::time::Instant::now();
         std::thread::scope(|scope| {
             for worker in 0..workers {
+                let reader = lazy_spec(PAGE_BYTES)
+                    .open_readonly(&path)
+                    .expect("independent lazy reader");
                 scope.spawn(move || {
                     for step in 0..each {
                         let page = (step + worker * 7) % LIVE;
@@ -1264,7 +1335,7 @@ fn concurrent_lazy_readers_are_not_serialised_behind_the_page_store() -> varve::
         started.elapsed()
     };
 
-    // Warm the page cache of the OS, so the comparison is about our locking.
+    // Warm the OS page cache before measuring independent reader scaling.
     run(1);
     let one = run(1);
     let many = run(threads as u64);
@@ -1341,7 +1412,7 @@ fn an_emptied_commit_page_releases_its_persisted_index_entry() -> varve::Result<
     for page in &live {
         writer.write_matrix_cell(key(page * CELLS_PER_PAGE), &LazyCell { value: 9 })?;
     }
-    writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     drop(lazy_spec(PAGES * PAGE_BYTES).open_readonly(&path)?);
@@ -1381,22 +1452,10 @@ fn patch_byte(path: &Path, offset: u64, value: u8) {
     file.seek(SeekFrom::Start(offset)).expect("seek");
     file.write_all(&[value]).expect("patch byte");
 }
-/// A commit-map page is as of the *first touch that faulted it in*, not as of
-/// open — measured in both directions on one handle.
-///
-/// This is the visibility half of `Lazy`, and nothing asserted it before. Every
-/// other test in this file measures what a lazy open *costs*; the consequence a
-/// caller has to act on is that a reader owns no whole-map instant, and
-/// `docs/quickstart.md` published the opposite of that for four minor releases
-/// after `EagerVerified` was removed in 0.5.0.
-///
-/// Both pages are live at open, so the persisted page index names both and
-/// neither answer below can come from the index alone —
-/// `an_unpublished_page_is_not_the_same_as_an_uncached_one` covers that arm.
-/// The cache holds four pages against a live set of two, so eviction produces
-/// neither answer either.
+/// Cached and cold commit-map pages must both belong to the captured root.
+/// Only an explicit follow may expose the writer's newly confirmed bits.
 #[test]
-fn a_commit_map_page_is_as_of_its_first_touch_not_as_of_open() -> varve::Result<()> {
+fn cached_and_cold_pages_belong_to_the_captured_generation() -> varve::Result<()> {
     let dir = temp_dir("first-touch");
     let path = dir.path().join("first-touch.varve");
     fill_pages(&path, LARGE_WIDE_SCANS, &[0, 1])?;
@@ -1405,7 +1464,7 @@ fn a_commit_map_page_is_as_of_its_first_touch_not_as_of_open() -> varve::Result<
     let touched = key(1);
     let untouched = key(CELLS_PER_PAGE + 1);
 
-    let reader = lazy_spec(4 * PAGE_BYTES).open_readonly(&path)?;
+    let mut reader = lazy_spec(4 * PAGE_BYTES).open_readonly(&path)?;
 
     // Fault page 0 in. Page 1 is deliberately never addressed on this handle.
     assert_eq!(
@@ -1426,7 +1485,7 @@ fn a_commit_map_page_is_as_of_its_first_touch_not_as_of_open() -> varve::Result<
             writer.write_matrix_cell(cell, &LazyCell { value: 9 })?;
             writer.commit_matrix_cell::<LazyCell>(cell)?;
         }
-        writer.flush()?;
+        writer.sync()?;
     }
 
     let after_touched = reader.matrix_cell_status::<LazyCell>(touched)?;
@@ -1440,16 +1499,15 @@ fn a_commit_map_page_is_as_of_its_first_touch_not_as_of_open() -> varve::Result<
         MatrixCellStatus::NotCommitted,
         "a page already cached reflected a commit made after it was faulted in"
     );
-    assert_eq!(
-        after_untouched,
-        MatrixCellStatus::Committed,
-        "a page this handle had never touched did not reflect a commit made \
-         after open, so something is pinning a whole-map instant — that is what \
-         EagerVerified did and what 0.5.0 removed"
-    );
+    assert_eq!(after_untouched, MatrixCellStatus::NotCommitted);
+    reader.follow()?;
+    for cell in [touched, untouched] {
+        assert_eq!(
+            reader.matrix_cell_status::<LazyCell>(cell)?,
+            MatrixCellStatus::Committed
+        );
+    }
 
-    // The control: both commits really are on disk, so the `NotCommitted` above
-    // is the cache answering and not a write that never landed.
     let fresh = verified_spec().open_readonly(&path)?;
     for cell in [touched, untouched] {
         assert_eq!(

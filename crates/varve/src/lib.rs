@@ -86,16 +86,17 @@
 //! # Cargo features
 //!
 //! All features are off by default; the default build is the pure-Rust core
-//! with no optional dependencies.
+//! with no optional dependencies. Streaming, indexed lookup, disk-index plans,
+//! finite keys and scan control are part of this default API; no Cargo feature
+//! is required. The former `high-cardinality-dev` feature has been removed.
 //!
 //! | Feature | Adds | Stability |
 //! | --- | --- | --- |
-//! | `integrity` | CRC32 record integrity, matrix and sidecar CRC evidence | stable |
+//! | `integrity` | record and matrix cell/commit-map CRC evidence | stable |
 //! | `compression-zstd` | zstd compression of variable-block payloads and of [`ChunkedBytes`] | stable |
 //! | `mmap` | read-only memory-mapped payload and matrix windows | stable, `unsafe` entry points |
 //! | `zero-copy` | raw typed views over mapped bytes; implies `mmap` | stable, `unsafe` entry points |
-//! | `high-cardinality-dev` | the disk-backed index, streaming, and indexed handles | **experimental**: the surface and the sidecar layout may change without a major version |
-//! | `scalable-fault-injection` | fault-injection counters and hooks used by the scalable-path tests; implies `high-cardinality-dev` | **test infrastructure**: not a production feature, and the counters it exposes are `#[doc(hidden)]` |
+//! | `scalable-fault-injection` | fault-injection counters and hooks used by the scalable-path tests | **test infrastructure**: not a production feature, and the counters it exposes are `#[doc(hidden)]` |
 //!
 //! Requesting a feature-gated operation without its feature is a typed error
 //! ([`Error::CompressionFeatureDisabled`], [`Error::IntegrityFeatureDisabled`])
@@ -117,7 +118,7 @@
 //! | `custom-codec-guide.md` | writing a codec, and the mandatory `SCHEMA_ID` identity contract |
 //! | `durability-model.md` | what `flush`, `sync`, and `commit_durable` promise |
 //! | `recovery-model.md` | how damaged files are classified and what may be rebuilt |
-//! | `scalable-io.md` | the `high-cardinality-dev` streaming and disk-index path |
+//! | `scalable-io.md` | the default streaming and disk-index path |
 //! | `known-limitations.md` | the scale contracts, their measured bounds, and what is not verified |
 //! | `migration-guide.md` | version-to-version behaviour changes |
 //!

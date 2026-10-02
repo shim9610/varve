@@ -1,9 +1,8 @@
-#![cfg(feature = "high-cardinality-dev")]
 //! One composite disk-index key per ingested record, not two.
 //!
 //! With `index: keyed_offset_chain` the indexed writer looks the previous
 //! record for a key up before appending, so it can write the back-pointer. That
-//! lookup builds the composite key `(block_id, key length, canonical key)`;
+//! lookup builds the composite key `(key presence, schema kind, canonical key)`;
 //! staging the new row then built the identical bytes a second time and the
 //! first copy was dropped. This is on the per-record append path, so it is a
 //! per-record allocation — the thing policy 3 names.

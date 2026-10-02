@@ -8,6 +8,8 @@ use syn::{
     Visibility, braced, bracketed, parenthesized, parse_macro_input,
 };
 
+mod finite_key;
+
 /// Derives [`VarveBlock`] — and the codec impls it needs — for one stored
 /// record type.
 ///
@@ -25,6 +27,8 @@ use syn::{
 /// | `kind = "fixed" \| "variable" \| "matrix"` | encoding shape |
 /// | `key = "<field>"` | marks the block keyed and names the key field |
 /// | `endian = "little" \| "big"` | per-block byte-order override; otherwise the format's byte order applies |
+/// | `durability = "immediate" \| "deferred"` | append/delete durability boundary; defaults to deferred |
+/// | `immediate_if = "path::predicate"` | pure `fn(&Self) -> bool` condition on appended values |
 ///
 /// Fields of a `variable` block take `#[varve(field_id = <u32>)]`, which is the
 /// wire identity that lets readers skip unknown fields. `fixed` blocks are
@@ -322,6 +326,9 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
     let mut variable_block = false;
     let mut endian = quote!(::core::option::Option::None);
     let mut endian_name = "default";
+    let mut immediate = false;
+    let mut immediate_seen = false;
+    let mut immediate_if: Option<syn::Path> = None;
     let mut key_fields: Vec<Ident> = Vec::new();
 
     for attr in &input.attrs {
@@ -382,6 +389,21 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
                     }
                 };
                 Ok(())
+            } else if meta.path.is_ident("durability") {
+                if immediate_seen { return Err(meta.error("duplicate durability")); }
+                immediate_seen = true;
+                let value: LitStr = meta.value()?.parse()?;
+                immediate = match value.value().as_str() {
+                    "immediate" => true,
+                    "deferred" => false,
+                    _ => return Err(meta.error("expected immediate or deferred")),
+                };
+                Ok(())
+            } else if meta.path.is_ident("immediate_if") {
+                if immediate_if.is_some() { return Err(meta.error("duplicate immediate_if")); }
+                let value: LitStr = meta.value()?.parse()?;
+                immediate_if = Some(value.parse()?);
+                Ok(())
             } else if meta.path.is_ident("key") {
                 let value: LitStr = meta.value()?.parse()?;
                 key_fields = parse_key_fields(&value)?;
@@ -391,6 +413,18 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
             }
         })?;
     }
+
+    if kind_name == "matrix" && (immediate_seen || immediate_if.is_some()) {
+        return Err(syn::Error::new_spanned(
+            &ident,
+            "block Immediate policies require an append block; use the ordered matrix durability API",
+        ));
+    }
+    let immediate_method = immediate_if.map(|condition| {
+        quote! {
+            fn immediate_if(&self) -> bool { #condition(self) }
+        }
+    });
 
     let block_id =
         block_id.ok_or_else(|| syn::Error::new_spanned(&ident, "missing #[varve(id = ...)]"))?;
@@ -722,6 +756,8 @@ fn expand_varve_block(input: DeriveInput) -> Result<TokenStream2> {
             const KIND: ::varve::__core::BlockKind = #kind;
             const ENDIAN: ::core::option::Option<::varve::__core::Endian> = #endian;
             const IS_KEYED: bool = #is_keyed;
+            const IMMEDIATE: bool = #immediate;
+            #immediate_method
             const SCHEMA_FINGERPRINT: u64 = #schema_fingerprint;
             const FIELDS: &'static [::varve::__core::FieldDescriptor] = &[
                 #(#field_descriptors,)*
@@ -1170,7 +1206,10 @@ struct InlineBlock {
     id: u32,
     version: u16,
     key_fields: Vec<Ident>,
+    finite_key: Option<finite_key::FiniteKey>,
     key_index: KeyIndexChoice,
+    durability: Option<LitStr>,
+    immediate_if: Option<LitStr>,
     fields: Vec<InlineField>,
 }
 
@@ -1448,6 +1487,11 @@ impl Parse for FormatInput {
         let matrix_aux = matrix_aux.unwrap_or_default();
         let registry_blocks = registry_blocks.unwrap_or_default();
         let inline_blocks = inline_blocks.unwrap_or_default();
+        if inline_blocks.iter().any(|block| block.finite_key.is_some())
+            && !matches!(schema_hash, SchemaHashChoice::Computed)
+        {
+            return Err(content.error("finite keys require schema_hash: computed so value/code changes cannot silently reinterpret a file"));
+        }
         let layout_segments = layout_segments.unwrap_or_default();
         let limits = limits.unwrap_or_else(|| LimitsChoice::Finite(Vec::new()));
         if typed_api && inline_blocks.is_empty() && layout_segments.is_empty() {
@@ -2024,6 +2068,9 @@ fn parse_inline_block(input: ParseStream<'_>) -> Result<InlineBlock> {
     let mut key_fields = Vec::new();
     let mut key_index = KeyIndexChoice::Memory;
     let mut key_index_span = None;
+    let mut finite_key_decl = None;
+    let mut durability = None;
+    let mut immediate_if = None;
     while !meta.is_empty() {
         let key: Ident = meta.parse()?;
         meta.parse::<Token![=]>()?;
@@ -2044,6 +2091,39 @@ fn parse_inline_block(input: ParseStream<'_>) -> Result<InlineBlock> {
                     return Err(syn::Error::new_spanned(key, "key list must not be empty"));
                 }
                 key_fields = parsed.into_iter().collect();
+            }
+            "key_values" | "key_domain" => {
+                if finite_key_decl.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        key,
+                        "declare key_values or key_domain exactly once",
+                    ));
+                }
+                finite_key_decl = Some(if key == "key_values" {
+                    finite_key::parse_values(&meta)?
+                } else {
+                    finite_key::parse_domain(&meta)?
+                });
+            }
+            "durability" => {
+                if durability.is_some() {
+                    return Err(syn::Error::new_spanned(key, "duplicate durability"));
+                }
+                let value: Ident = meta.parse()?;
+                if value != "immediate" && value != "deferred" {
+                    return Err(syn::Error::new_spanned(
+                        value,
+                        "expected immediate or deferred",
+                    ));
+                }
+                durability = Some(LitStr::new(&value.to_string(), value.span()));
+            }
+            "immediate_if" => {
+                if immediate_if.is_some() {
+                    return Err(syn::Error::new_spanned(key, "duplicate immediate_if"));
+                }
+                let value: syn::Path = meta.parse()?;
+                immediate_if = Some(LitStr::new(&quote!(#value).to_string(), key.span()));
             }
             "key_index" => {
                 if key_index_span.is_some() {
@@ -2074,7 +2154,7 @@ fn parse_inline_block(input: ParseStream<'_>) -> Result<InlineBlock> {
             _ => {
                 return Err(syn::Error::new_spanned(
                     key,
-                    "expected id, version, key, key_index, dims, or category",
+                    "expected id, version, key, key_values, key_domain, key_index, durability, immediate_if, dims, or category",
                 ));
             }
         }
@@ -2115,19 +2195,13 @@ fn parse_inline_block(input: ParseStream<'_>) -> Result<InlineBlock> {
         }
         kind
     };
-    if let Some(span) = key_index_span {
-        if key_fields.is_empty() {
-            return Err(syn::Error::new(
-                span,
-                "key_index requires a keyed fixed or variable block",
-            ));
-        }
-        if !cfg!(feature = "high-cardinality-dev") {
-            return Err(syn::Error::new(
-                span,
-                "key_index requires the `high-cardinality-dev` feature",
-            ));
-        }
+    if let Some(span) = key_index_span
+        && key_fields.is_empty()
+    {
+        return Err(syn::Error::new(
+            span,
+            "key_index requires a keyed fixed or variable block",
+        ));
     }
     let body;
     braced!(body in input);
@@ -2190,13 +2264,49 @@ fn parse_inline_block(input: ParseStream<'_>) -> Result<InlineBlock> {
             }
         }
     }
+    let finite_key = if let Some(decl) = finite_key_decl {
+        let finite = finite_key::FiniteKey::build(decl, &key_fields, &fields, name.span())?;
+        if fields
+            .iter()
+            .any(|field| field.name == "key" && !key_fields.contains(&field.name))
+        {
+            return Err(syn::Error::new_spanned(
+                &name,
+                "finite keys reserve the generated field name `key`",
+            ));
+        }
+        let position = fields
+            .iter()
+            .position(|field| key_fields.contains(&field.name))
+            .unwrap();
+        let field_id = fields[position].field_id;
+        fields.retain(|field| !key_fields.contains(&field.name));
+        let enum_name = format_ident!("{name}Key");
+        let key_name = Ident::new("key", name.span());
+        fields.insert(
+            position,
+            InlineField {
+                name: key_name.clone(),
+                ty: syn::parse_quote!(#enum_name),
+                field_id,
+                default: false,
+            },
+        );
+        key_fields = vec![key_name];
+        Some(finite)
+    } else {
+        None
+    };
     Ok(InlineBlock {
         kind,
         name,
         id,
         version,
         key_fields,
+        finite_key,
         key_index,
+        durability,
+        immediate_if,
         fields,
     })
 }
@@ -2715,12 +2825,11 @@ fn expand_format(input: FormatInput) -> TokenStream2 {
     } else {
         quote!()
     };
-    let (high_cardinality_constructors, high_cardinality_api) =
-        if typed_api_enabled && cfg!(feature = "high-cardinality-dev") {
-            high_cardinality_api_tokens(&vis, &name, &inline_blocks, keyed_offset_chain)
-        } else {
-            (quote!(), quote!())
-        };
+    let (high_cardinality_constructors, high_cardinality_api) = if typed_api_enabled {
+        high_cardinality_api_tokens(&vis, &name, &inline_blocks, keyed_offset_chain)
+    } else {
+        (quote!(), quote!())
+    };
     let layout_typed_api = if typed_api_enabled && !layout_segments.is_empty() {
         layout_typed_api_tokens(&vis, &name, layout_file_header.as_ref(), &layout_segments)
     } else {
@@ -4005,6 +4114,10 @@ fn create_writer_with_dims_tokens(
 
 fn inline_block_tokens(vis: &Visibility, block: &InlineBlock, dims: &[MatrixDim]) -> TokenStream2 {
     let name = &block.name;
+    let finite_key = block
+        .finite_key
+        .as_ref()
+        .map(|finite| finite.tokens(vis, name));
     let id = block.id;
     let version = block.version;
     let kind = match &block.kind {
@@ -4012,6 +4125,14 @@ fn inline_block_tokens(vis: &Visibility, block: &InlineBlock, dims: &[MatrixDim]
         InlineBlockKind::Variable => LitStr::new("variable", name.span()),
         InlineBlockKind::Matrix(_) => LitStr::new("matrix", name.span()),
     };
+    let durability_attr = block
+        .durability
+        .as_ref()
+        .map(|value| quote!(#[varve(durability = #value)]));
+    let immediate_if_attr = block
+        .immediate_if
+        .as_ref()
+        .map(|value| quote!(#[varve(immediate_if = #value)]));
     let key_attr = if block.key_fields.is_empty() {
         quote!()
     } else {
@@ -4057,9 +4178,12 @@ fn inline_block_tokens(vis: &Visibility, block: &InlineBlock, dims: &[MatrixDim]
         quote!()
     };
     quote! {
+        #finite_key
         #[derive(Clone, Debug, PartialEq, ::varve::VarveBlock)]
         #[varve(id = #id, version = #version, kind = #kind)]
         #key_attr
+        #durability_attr
+        #immediate_if_attr
         #vis struct #name {
             #(#fields)*
         }
@@ -4110,9 +4234,10 @@ fn layout_typed_api_tokens(
             /// Built on first typed access rather than at open: `LayoutReader`
             /// exposes no `&mut self` method, so `segments()` cannot change
             /// after open, and an open that never reaches a typed accessor pays
-            /// nothing. `OnceLock` is reached through `&self`, so every read
-            /// entry point keeps its `&self` receiver.
-            segment_ordinals: ::std::sync::OnceLock<
+            /// nothing. Reader-local `OnceCell` needs no synchronization and
+            /// keeps reads as `&self`. The wrapper is Send + !Sync: move it to
+            /// another thread, or open a separate reader for that thread.
+            segment_ordinals: ::std::cell::OnceCell<
                 ::std::vec::Vec<(&'static str, ::std::vec::Vec<usize>)>,
             >,
         }
@@ -4121,7 +4246,7 @@ fn layout_typed_api_tokens(
             pub fn from_inner(inner: ::varve::__core::LayoutReader) -> Self {
                 Self {
                     inner,
-                    segment_ordinals: ::std::sync::OnceLock::new(),
+                    segment_ordinals: ::std::cell::OnceCell::new(),
                 }
             }
 
@@ -4881,6 +5006,28 @@ fn high_cardinality_api_tokens(
                 self.inner
             }
 
+            pub fn follow(&mut self) -> ::varve::__core::Result<u64> {
+                self.inner.follow()
+            }
+
+            pub fn committed_len(&self) -> u64 { self.inner.committed_len() }
+
+            pub fn release_snapshot(&mut self) -> bool { self.inner.release_snapshot() }
+
+            pub fn snapshot_status(&self) -> ::varve::__core::Result<::varve::__core::SnapshotStatus> {
+                self.inner.snapshot_status()
+            }
+
+
+            pub fn follow_events(&mut self, events: &mut ::varve::__core::StreamEvents) -> ::varve::__core::Result<u64> {
+                self.inner.follow_events(events)
+            }
+
+            pub fn follow_blocks<T: ::varve::__core::VarveBlock>(&mut self, blocks: &mut ::varve::__core::StreamingBlocks<T>) -> ::varve::__core::Result<u64> {
+                self.inner.follow_blocks(blocks)
+            }
+
+
             pub fn events(&self) -> ::varve::__core::Result<::varve::__core::StreamEvents> {
                 self.inner.events()
             }
@@ -4898,6 +5045,10 @@ fn high_cardinality_api_tokens(
                 F: ::core::ops::FnMut(::varve::__core::ScanProgress),
             {
                 self.inner.verify_all_with_progress(scan, observer)
+            }
+
+            pub fn snapshot_retention(&self) -> ::varve::__core::Result<::varve::__core::SnapshotRetention> {
+                self.inner.snapshot_retention()
             }
 
             pub fn resident_state(&self) -> ::varve::__core::StreamResidentState {
@@ -4928,6 +5079,23 @@ fn high_cardinality_api_tokens(
                 self.inner.sync()
             }
 
+            pub fn immediate(&mut self) -> ::varve::__core::Result<()> {
+                self.inner.immediate()
+            }
+
+            pub fn set_immediate_policy(&mut self, policy: ::varve::__core::ImmediatePolicy) -> ::varve::__core::Result<()> {
+                self.inner.set_immediate_policy(policy)
+            }
+
+            pub fn snapshot_retention(&self) -> ::varve::__core::Result<::varve::__core::SnapshotRetention> {
+                self.inner.snapshot_retention()
+            }
+            /// Reclaim sidecar pages after an explicit sync; readers do not block it.
+            pub fn compact_index(&mut self) -> ::varve::__core::Result<::varve::__core::IndexCompaction> {
+                self.inner.compact_index()
+            }
+
+
             pub fn resident_state(&self) -> ::varve::__core::StreamResidentState {
                 self.inner.resident_state()
             }
@@ -4937,7 +5105,7 @@ fn high_cardinality_api_tokens(
     };
 
     if disk_blocks.is_empty() {
-        return (stream_constructors, stream_api);
+        return (stream_constructors, quote!(#stream_api));
     }
 
     let indexed_reader_methods = disk_blocks.iter().map(|block| {
@@ -5170,9 +5338,35 @@ fn high_cardinality_api_tokens(
                 self.inner
             }
 
+            pub fn snapshot_retention(&self) -> ::varve::__core::Result<::varve::__core::SnapshotRetention> {
+                self.inner.snapshot_retention()
+            }
+
             pub fn resident_state(&self) -> ::varve::__core::StreamResidentState {
                 self.inner.resident_state()
             }
+
+            pub fn follow(&mut self) -> ::varve::__core::Result<u64> {
+                self.inner.follow()
+            }
+
+            pub fn committed_len(&self) -> u64 { self.inner.committed_len() }
+
+            pub fn release_snapshot(&mut self) -> bool { self.inner.release_snapshot() }
+
+            pub fn snapshot_status(&self) -> ::varve::__core::Result<::varve::__core::SnapshotStatus> {
+                self.inner.snapshot_status()
+            }
+
+
+            pub fn follow_events(&mut self, events: &mut ::varve::__core::StreamEvents) -> ::varve::__core::Result<u64> {
+                self.inner.follow_events(events)
+            }
+
+            pub fn follow_blocks<T: ::varve::__core::VarveBlock>(&mut self, blocks: &mut ::varve::__core::StreamingBlocks<T>) -> ::varve::__core::Result<u64> {
+                self.inner.follow_blocks(blocks)
+            }
+
 
             pub fn events(&self) -> ::varve::__core::Result<::varve::__core::StreamEvents> {
                 self.inner.events()
@@ -5217,6 +5411,23 @@ fn high_cardinality_api_tokens(
             pub fn sync(&mut self) -> ::varve::__core::Result<()> {
                 self.inner.sync()
             }
+
+            pub fn immediate(&mut self) -> ::varve::__core::Result<()> {
+                self.inner.immediate()
+            }
+
+            pub fn set_immediate_policy(&mut self, policy: ::varve::__core::ImmediatePolicy) -> ::varve::__core::Result<()> {
+                self.inner.set_immediate_policy(policy)
+            }
+
+            pub fn snapshot_retention(&self) -> ::varve::__core::Result<::varve::__core::SnapshotRetention> {
+                self.inner.snapshot_retention()
+            }
+            /// Reclaim sidecar pages after an explicit sync; readers do not block it.
+            pub fn compact_index(&mut self) -> ::varve::__core::Result<::varve::__core::IndexCompaction> {
+                self.inner.compact_index()
+            }
+
 
             pub fn resident_state(&self) -> ::varve::__core::StreamResidentState {
                 self.inner.resident_state()
@@ -5437,6 +5648,10 @@ fn typed_api_tokens(
                 Self { inner }
             }
 
+            pub fn follow(&mut self) -> ::varve::__core::Result<u64> { self.inner.follow() }
+            pub fn matrix_generation(&self) -> Option<u64> { self.inner.matrix_generation() }
+            pub fn matrix_generation_path(&self) -> Option<&::std::path::Path> {self.inner.matrix_generation_path()}
+
             pub fn into_inner(self) -> ::varve::__core::VarveReader {
                 self.inner
             }
@@ -5475,6 +5690,10 @@ fn typed_api_tokens(
                 ::core::result::Result::Ok(Self { inner })
             }
 
+            pub fn compact_matrix(&mut self) -> ::varve::__core::Result<()> { self.inner.compact_matrix() }
+            pub fn matrix_generation(&self) -> Option<u64> {self.inner.matrix_generation()}
+            pub fn matrix_generation_path(&self) -> Option<&::std::path::Path> {self.inner.matrix_generation_path()}
+
             pub fn into_inner(self) -> ::varve::__core::VarveWriter {
                 self.inner
             }
@@ -5502,6 +5721,15 @@ fn typed_api_tokens(
             pub fn sync(&mut self) -> ::varve::__core::Result<()> {
                 self.inner.sync()
             }
+
+            pub fn immediate(&mut self) -> ::varve::__core::Result<()> {
+                self.inner.immediate()
+            }
+
+            pub fn set_immediate_policy(&mut self, policy: ::varve::__core::ImmediatePolicy) -> ::varve::__core::Result<()> {
+                self.inner.set_immediate_policy(policy)
+            }
+
 
             /// The `VarveWriter` this wrapper holds, borrowed rather than
             /// consumed. `into_inner` takes `self` and ends the wrapper, which
@@ -6449,6 +6677,24 @@ mod tests {
         syn::parse::Parser::parse2(parser, block)
     }
 
+    #[test]
+    fn immediate_declarations_reject_invalid_or_ambiguous_policies() {
+        for tokens in [
+            quote! { fixed B(id = 1, durability = eventually) { value: u64 } },
+            quote! { fixed B(id = 1, durability = immediate, durability = deferred) { value: u64 } },
+            quote! { fixed B(id = 1, immediate_if = first, immediate_if = second) { value: u64 } },
+        ] {
+            assert!(parse_inline_test_block(tokens).is_err());
+        }
+        for tokens in [
+            quote! { #[varve(id = 1, durability = "eventually")] struct B { value: u64 } },
+            quote! { #[varve(id = 1, durability = "immediate", durability = "deferred")] struct B { value: u64 } },
+            quote! { #[varve(id = 1, kind = "matrix", durability = "immediate")] struct B { value: u64 } },
+        ] {
+            assert!(expand_varve_block(syn::parse2(tokens).unwrap()).is_err());
+        }
+    }
+
     fn expand_format_source(tokens: TokenStream2) -> String {
         let input: FormatInput = syn::parse2(tokens).expect("format input parses");
         expand_format(input).to_string()
@@ -6725,25 +6971,12 @@ mod tests {
         assert_eq!(error.to_string(), "expected memory or disk");
     }
 
-    #[cfg(not(feature = "high-cardinality-dev"))]
-    #[test]
-    fn explicit_key_index_requires_feature() {
-        let error = parse_inline_test_block(quote! {
-            variable Item(id = 1, key = [id], key_index = disk) { id: u64 }
-        })
-        .err()
-        .expect("key_index without the feature should fail");
-
-        assert!(error.to_string().contains("high-cardinality-dev"));
-    }
-
-    #[cfg(feature = "high-cardinality-dev")]
     #[test]
     fn disk_key_index_generates_indexed_api() {
         let block = parse_inline_test_block(quote! {
             variable Item(id = 1, key = [id], key_index = disk) { id: u64 }
         })
-        .expect("disk key_index should parse with the feature");
+        .expect("disk key_index should parse without a feature");
         let (constructors, api) = high_cardinality_api_tokens(
             &syn::parse_quote!(pub),
             &format_ident!("Test"),
@@ -6768,7 +7001,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "high-cardinality-dev")]
     #[test]
     fn disk_index_plan_is_sorted_by_block_id() {
         let later = parse_inline_test_block(quote! {
@@ -6825,7 +7057,6 @@ mod tests {
         assert!(tokens.contains("push_iter :: < Frame , _ >"));
     }
 
-    #[cfg(feature = "high-cardinality-dev")]
     #[test]
     fn keyed_chain_exposes_only_plan_backed_keyed_mutations() {
         let account = parse_inline_test_block(quote! {

@@ -475,13 +475,45 @@ fn check_format_roundtrip(dir: &std::path::Path) {
     println!("  file ok: fixed + variable + matrix blocks round-tripped");
 }
 
+varve_format! {
+    pub format ScalableFixture {
+        magic: b"SCLF";
+        version: 1;
+        schema_hash: computed;
+        index: keyed_offset_chain;
+        blocks { fixed ScalableItem(id = 1, key = [key], key_index = disk) { key: u64, value: u64 } }
+    }
+}
+
+fn check_scalable_roundtrip(dir: &std::path::Path) {
+    let path = dir.join("scalable.varve");
+    let options = varve::DiskIndexOptions::default();
+    let mut writer = ScalableFixture::create_indexed_writer(&path, options).unwrap();
+    writer.push_scalable_item(&ScalableItem { key: 7, value: 1 }).unwrap();
+    writer.immediate().unwrap();
+    let mut reader = ScalableFixture::open_indexed_reader(&path, options).unwrap();
+    writer.push_scalable_item(&ScalableItem { key: 7, value: 2 }).unwrap();
+    let dirty = ScalableFixture::open_indexed_reader(&path, options).unwrap();
+    assert_eq!(dirty.get_scalable_item(&7).unwrap().unwrap().value, 1);
+    assert!(reader.release_snapshot());
+    writer.immediate().unwrap();
+    reader.follow().unwrap();
+    assert_eq!(reader.get_scalable_item(&7).unwrap().unwrap().value, 2);
+    assert!(reader.snapshot_status().unwrap().pinned);
+    assert_eq!(writer.snapshot_retention().unwrap().active_snapshots, 2);
+    println!("  scalable OK: embedded backend, Dirty read, release/follow, retention");
+}
+
 fn main() {
     check_every_public_codec();
     check_derived_blocks();
 
     let dir = std::env::temp_dir().join(format!("varve-public-api-fixture-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create fixture temp dir");
-    let result = std::panic::catch_unwind(|| check_format_roundtrip(&dir));
+    let result = std::panic::catch_unwind(|| {
+        check_format_roundtrip(&dir);
+        check_scalable_roundtrip(&dir);
+    });
     let cleanup = std::fs::remove_dir_all(&dir);
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);

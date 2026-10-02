@@ -82,6 +82,11 @@ fn public_index_types(digest: varve::DiskIndexDigest) -> varve::DiskIndexMode {
 }
 
 fn main() {
+    fn assert_send<T: Send>() {}
+    assert_send::<varve::VarveStreamReader>();
+    assert_send::<varve::VarveIndexedReader>();
+    assert_send::<HighCardinalityFormatStreamReader>();
+    assert_send::<HighCardinalityFormatIndexedReader>();
     let _ = (
         stream_reader_api,
         stream_writer_api,

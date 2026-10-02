@@ -260,7 +260,7 @@ where
         ));
     }
     let reader = VarveStreamReader::open_native(spec, &path, options)?;
-    let mut header_file = reader.snapshot.try_clone_file()?;
+    let mut header_file = reader.snapshot.reader();
     let header_eof = read_file_header(reader.spec, &mut header_file)?;
     let mut progress = ScanProgressDriver::new(scan, header_eof, reader.snapshot.len());
     progress.start(&mut observer).map_err(scan_cancelled)?;
@@ -429,34 +429,34 @@ impl StreamCheckpoint {
     }
 }
 
+/// A reader owned by one reading thread. It is `Send`, but deliberately not
+/// `Sync`: open a separate reader per thread instead of sharing this handle.
+/// Reads use `&self`; following only mutates this handle's snapshot and cursor.
 pub struct VarveStreamReader {
     spec: FormatSpec,
     snapshot: SnapshotFile,
     _state: Option<StreamReaderState>,
+    // Cell is Send + !Sync. This zero-sized marker adds no runtime locking.
+    _thread_owned: PhantomData<std::cell::Cell<()>>,
 }
 
 struct StreamReaderState {
-    _snapshot: DiskIndexSnapshot,
-    _store: DiskIndexStore,
+    snapshot: DiskIndexSnapshot,
+    store: DiskIndexStore,
 }
 
 impl VarveStreamReader {
     pub fn open(spec: FormatSpec, path: impl AsRef<Path>, options: StreamOptions) -> Result<Self> {
         let path = std::fs::canonicalize(path.as_ref())?;
         let mut reader = Self::open_native(spec, &path, options)?;
-        let physical_len = reader.snapshot.len();
         let identity = primary_identity(reader.spec, &reader.snapshot)?;
         let store = DiskIndexStore::open(state_sidecar_path(&path), state_options(options))
             .map_err(state_error)?;
         let snapshot = store
-            .begin_snapshot_with_mode(identity, DiskIndexMode::StateOnly, physical_len)
+            .begin_committed_snapshot(identity, DiskIndexMode::StateOnly)
             .map_err(state_error)?;
-        verify_primary_generation(reader.spec, snapshot.primary_generation(), &reader.snapshot)?;
-        reader.snapshot = reader.snapshot.with_len(snapshot.committed_eof())?;
-        reader._state = Some(StreamReaderState {
-            _snapshot: snapshot,
-            _store: store,
-        });
+        reader.snapshot = reader.committed_native_snapshot(&snapshot)?;
+        reader._state = Some(StreamReaderState { snapshot, store });
         Ok(reader)
     }
 
@@ -477,12 +477,87 @@ impl VarveStreamReader {
             spec,
             snapshot,
             _state: None,
+            _thread_owned: PhantomData,
         })
     }
 
-    pub(crate) fn pin_logical_len(mut self, logical_len: u64) -> Result<Self> {
-        self.snapshot = self.snapshot.with_len(logical_len)?;
-        Ok(self)
+    /// Adopt the latest confirmed generation on this file object. Dirty
+    /// working data remains invisible. Returns the additional native record
+    /// count; no native prefix scan or write transaction is performed.
+    pub fn follow(&mut self) -> Result<u64> {
+        let state = self._state.as_ref().ok_or(Error::StreamingUnsupported)?;
+        let (store, next) = state
+            .store
+            .followed_handle(&state.snapshot)
+            .map_err(state_error)?;
+        let added = next.record_count() - state.snapshot.record_count();
+        if next.generation() == state.snapshot.generation()
+            && state.snapshot.is_pinned()
+            && state.store.same_file(&store)
+        {
+            return Ok(0);
+        }
+        let native = self.committed_native_snapshot(&next)?;
+        self.snapshot = native;
+        let state = self._state.as_mut().expect("state checked");
+        state.snapshot = next;
+        state.store = store;
+        Ok(added)
+    }
+
+    /// Refresh and extend this handle's event cursor without rescanning its prefix.
+    pub fn follow_events(&mut self, events: &mut StreamEvents) -> Result<u64> {
+        events.validate_follow(&self.snapshot)?;
+        let added = self.follow()?;
+        events.extend_snapshot(self.snapshot.clone());
+        Ok(added)
+    }
+
+    /// Refresh and resume a typed cursor at its existing position. EOF is
+    /// resumable; a cursor that returned an error cannot be resumed.
+    pub fn follow_blocks<T: VarveBlock>(&mut self, blocks: &mut StreamingBlocks<T>) -> Result<u64> {
+        blocks.validate_follow(&self.snapshot)?;
+        let added = self.follow()?;
+        blocks.extend_snapshot(self.snapshot.clone());
+        Ok(added)
+    }
+
+    /// Release this reader's backend page pin without closing its native file.
+    /// Native cursors remain usable; `follow` pins the latest confirmed state.
+    pub fn release_snapshot(&mut self) -> bool {
+        self._state
+            .as_mut()
+            .is_some_and(|state| state.snapshot.release())
+    }
+
+    pub fn snapshot_status(&self) -> Result<crate::SnapshotStatus> {
+        let state = self._state.as_ref().ok_or(Error::StreamingUnsupported)?;
+        state.snapshot.status(&state.store).map_err(state_error)
+    }
+
+    pub fn snapshot_retention(&self) -> Result<crate::SnapshotRetention> {
+        let state = self._state.as_ref().ok_or(Error::StreamingUnsupported)?;
+        state.store.snapshot_retention().map_err(state_error)
+    }
+
+    /// The EOF of this handle's confirmed generation.
+    pub fn committed_len(&self) -> u64 {
+        self.snapshot.len()
+    }
+
+    pub(crate) fn committed_native_snapshot(
+        &self,
+        index: &DiskIndexSnapshot,
+    ) -> Result<SnapshotFile> {
+        // Sample physical length AFTER capturing the index generation, on the
+        // same retained file object. This removes the old EOF/publication race.
+        let native = self.snapshot.with_len(index.committed_eof())?;
+        verify_primary_generation(self.spec, index.primary_generation(), &native)?;
+        Ok(native)
+    }
+
+    pub(crate) fn adopt_snapshot(&mut self, snapshot: SnapshotFile) {
+        self.snapshot = snapshot;
     }
 
     pub fn verify_all(&self) -> Result<u64> {
@@ -493,7 +568,7 @@ impl VarveStreamReader {
     where
         F: FnMut(ScanProgress),
     {
-        let mut header_file = self.snapshot.try_clone_file()?;
+        let mut header_file = self.snapshot.reader();
         let header_eof = read_file_header(self.spec, &mut header_file)?;
         let mut progress = ScanProgressDriver::new(scan, header_eof, self.snapshot.len());
         progress.start(&mut observer).map_err(scan_cancelled)?;
@@ -522,6 +597,8 @@ impl VarveStreamReader {
         Ok(StreamEvents {
             scanner: NativeStreamScanner::from_snapshot(self.spec, self.snapshot.clone())?,
             finished: false,
+            failed: false,
+            _thread_owned: PhantomData,
         })
     }
 
@@ -543,6 +620,7 @@ impl VarveStreamReader {
             scanner: NativeStreamScanner::from_snapshot(scan_spec, self.snapshot.clone())?,
             spec: self.spec,
             finished: false,
+            failed: false,
             _marker: PhantomData,
         })
     }
@@ -560,10 +638,36 @@ impl VarveStreamReader {
     }
 }
 
+/// A cursor owned by its creating thread (`!Send + !Sync`).
 #[derive(Debug)]
 pub struct StreamEvents {
     scanner: NativeStreamScanner,
     finished: bool,
+    failed: bool,
+    _thread_owned: PhantomData<std::rc::Rc<()>>,
+}
+
+impl StreamEvents {
+    pub(crate) fn validate_follow(&self, snapshot: &SnapshotFile) -> Result<()> {
+        if self.failed {
+            return Err(Error::InvalidFollowCursor(
+                "cursor has already returned an error",
+            ));
+        }
+        if !self.scanner.snapshot().same_file_object(snapshot)
+            || self.scanner.snapshot().len() > snapshot.len()
+        {
+            return Err(Error::InvalidFollowCursor(
+                "cursor does not belong to this reader",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn extend_snapshot(&mut self, snapshot: SnapshotFile) {
+        self.scanner.extend_snapshot(snapshot);
+        self.finished = false;
+    }
 }
 
 impl Iterator for StreamEvents {
@@ -581,12 +685,14 @@ impl Iterator for StreamEvents {
             }
             Err(error) => {
                 self.finished = true;
+                self.failed = true;
                 Some(Err(error))
             }
         }
     }
 }
 
+/// A typed cursor owned by its creating thread (`!Send + !Sync`).
 #[derive(Debug)]
 pub struct StreamingBlocks<T> {
     scanner: NativeStreamScanner,
@@ -595,11 +701,35 @@ pub struct StreamingBlocks<T> {
     /// each decoded record's checksum against this spec instead.
     spec: FormatSpec,
     finished: bool,
+    failed: bool,
     /// Reused across steps, so a walk of `N` records allocates one payload
     /// rather than `N`. This is the scalable family's per-record read, so it is
     /// the one place on it where that difference is unbounded.
     payload: Vec<u8>,
-    _marker: PhantomData<T>,
+    _marker: PhantomData<(T, std::rc::Rc<()>)>,
+}
+
+impl<T> StreamingBlocks<T> {
+    pub(crate) fn validate_follow(&self, snapshot: &SnapshotFile) -> Result<()> {
+        if self.failed {
+            return Err(Error::InvalidFollowCursor(
+                "cursor has already returned an error",
+            ));
+        }
+        if !self.scanner.snapshot().same_file_object(snapshot)
+            || self.scanner.snapshot().len() > snapshot.len()
+        {
+            return Err(Error::InvalidFollowCursor(
+                "cursor does not belong to this reader",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn extend_snapshot(&mut self, snapshot: SnapshotFile) {
+        self.scanner.extend_snapshot(snapshot);
+        self.finished = false;
+    }
 }
 
 impl<T: VarveBlock> Iterator for StreamingBlocks<T> {
@@ -625,6 +755,7 @@ impl<T: VarveBlock> Iterator for StreamingBlocks<T> {
                 }
                 Err(error) => {
                     self.finished = true;
+                    self.failed = true;
                     return Some(Err(error));
                 }
             };
@@ -633,6 +764,7 @@ impl<T: VarveBlock> Iterator for StreamingBlocks<T> {
             }
             if entry.block_version != T::VERSION {
                 self.finished = true;
+                self.failed = true;
                 return Some(Err(Error::BlockVersionMismatch {
                     block_id: T::ID,
                     expected: T::VERSION,
@@ -653,6 +785,10 @@ impl<T: VarveBlock> Iterator for StreamingBlocks<T> {
                 )?;
                 budget.decode(&self.payload, T::ENDIAN.unwrap_or(self.spec.endian))
             })();
+            if result.is_err() {
+                self.finished = true;
+                self.failed = true;
+            }
             return Some(result);
         }
     }
@@ -675,6 +811,7 @@ pub struct VarveStreamWriter {
     /// at the start of each record and never read across calls, so nothing
     /// depends on what it last held; it is a buffer, not state.
     record_buffer: Vec<u8>,
+    immediate_state: crate::immediate::ImmediateState,
     _lock: WriterLock,
 }
 
@@ -702,8 +839,7 @@ impl StreamWriterState {
 
 impl Drop for StreamWriterState {
     fn drop(&mut self) {
-        // redb waits for active write transactions while closing the database.
-        // Abort the bounded batch before field drop reaches the store owner.
+        // Discard uncommitted staging before releasing the writer file guard.
         self.batch.take();
     }
 }
@@ -812,6 +948,7 @@ impl VarveStreamWriter {
             state: None,
             poison: PoisonFlag::healthy(),
             record_buffer: Vec::new(),
+            immediate_state: Default::default(),
             _lock: lock,
         };
         // STO-01: stamp the per-create nonce as the very first record of the
@@ -849,8 +986,9 @@ impl VarveStreamWriter {
         let path = std::fs::canonicalize(path.as_ref())?;
         let (mut writer, store) =
             Self::open_checkpointed(spec, &path, options, |identity, physical_len| {
-                let store = DiskIndexStore::open(state_sidecar_path(&path), state_options(options))
-                    .map_err(state_error)?;
+                let store =
+                    DiskIndexStore::open_writer(state_sidecar_path(&path), state_options(options))
+                        .map_err(state_error)?;
                 let state = store
                     .validate_clean_writer(
                         identity,
@@ -911,6 +1049,7 @@ impl VarveStreamWriter {
                 state: None,
                 poison: PoisonFlag::healthy(),
                 record_buffer: Vec::new(),
+                immediate_state: Default::default(),
                 _lock: lock,
             },
             loaded,
@@ -933,7 +1072,7 @@ impl VarveStreamWriter {
         let header_len = read_file_header(spec, &mut file)?;
         let physical_snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, physical_len)?;
         let identity = primary_identity(spec, &physical_snapshot)?;
-        let store = DiskIndexStore::open(sidecar, index_options).map_err(state_error)?;
+        let store = DiskIndexStore::open_writer(sidecar, index_options).map_err(state_error)?;
         let guard = store
             .stage_restore(
                 identity,
@@ -971,6 +1110,7 @@ impl VarveStreamWriter {
                 state: None,
                 poison: PoisonFlag::healthy(),
                 record_buffer: Vec::new(),
+                immediate_state: Default::default(),
                 _lock: lock,
             },
             store,
@@ -1033,6 +1173,9 @@ impl VarveStreamWriter {
         if T::KIND == BlockKind::Matrix {
             return Err(Error::StreamingUnsupported);
         }
+        // The indexed owner evaluates its own condition once and enforces it
+        // after publishing the matching index update.
+        let mandatory = self.state.is_some() && (T::IMMEDIATE || value.immediate_if());
         let sequence = self.next_sequence()?;
         let offset = self.snapshot.len();
         let previous_block = self.previous_block(T::ID);
@@ -1058,7 +1201,13 @@ impl VarveStreamWriter {
             Err(err) => Err(err),
         };
         self.record_buffer = buffer;
-        result
+        let info = result?;
+        // An unmanaged stream belongs to an indexed writer; that owner must
+        // publish its index before running the durability boundary.
+        if self.state.is_some() {
+            self.apply_immediate::<T>(info, crate::ImmediateOperation::Append, mandatory)?;
+        }
+        Ok(info)
     }
 
     pub fn delete_with_prev_key_info<T: VarveKeyedBlock>(
@@ -1085,7 +1234,11 @@ impl VarveStreamWriter {
             self.previous_block(TOMBSTONE_BLOCK_ID),
             previous,
         )?;
-        self.append_prepared(permit, TOMBSTONE_BLOCK_ID, record)
+        let info = self.append_prepared(permit, TOMBSTONE_BLOCK_ID, record)?;
+        if self.state.is_some() {
+            self.apply_immediate::<T>(info, crate::ImmediateOperation::Delete, T::IMMEDIATE)?;
+        }
+        Ok(info)
     }
 
     pub fn flush(&mut self) -> Result<()> {
@@ -1112,7 +1265,58 @@ impl VarveStreamWriter {
             }
             state.dirty = false;
         }
+        self.immediate_state.reset();
         Ok(())
+    }
+
+    /// Persist all preceding records and publish their clean sidecar root.
+    pub fn immediate(&mut self) -> Result<()> {
+        self.sync()
+    }
+
+    pub fn set_immediate_policy(&mut self, policy: crate::ImmediatePolicy) -> Result<()> {
+        let _permit = self.ensure_writable()?;
+        self.immediate_state.policy = policy.validate()?;
+        Ok(())
+    }
+
+    fn apply_immediate<T: VarveBlock>(
+        &mut self,
+        info: AppendInfo,
+        operation: crate::ImmediateOperation,
+        mandatory: bool,
+    ) -> Result<()> {
+        let bytes = self.snapshot.len().saturating_sub(info.record_offset);
+        let event = self
+            .immediate_state
+            .event(T::ID, operation, info, bytes, 0, 0);
+        if mandatory || self.immediate_state.policy.matches(event) {
+            self.immediate().map_err(|source| {
+                crate::immediate::appended_immediate_error(info.sequence, source)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Reclaim old state checkpoints after an explicit sync, without waiting
+    /// for readers or changing the native file.
+    pub fn compact_index(&mut self) -> Result<crate::IndexCompaction> {
+        let _permit = self.ensure_writable()?;
+        let state = self.state.as_mut().ok_or(Error::StreamingUnsupported)?;
+        if state.dirty {
+            return Err(state_error(DiskIndexError::CleanStateRequired));
+        }
+        let result = state.store.compact().map_err(state_error);
+        if result.is_err() {
+            self.poison.poison();
+        }
+        result
+    }
+
+    /// Observe reader-held generations without committing or waiting for readers.
+    pub fn snapshot_retention(&self) -> Result<crate::SnapshotRetention> {
+        let state = self.state.as_ref().ok_or(Error::StreamingUnsupported)?;
+        state.store.snapshot_retention().map_err(state_error)
     }
 
     pub fn resident_state(&self) -> StreamResidentState {
@@ -1172,6 +1376,8 @@ impl VarveStreamWriter {
         let mut previous_block = self.previous_block(T::ID);
 
         for value in values {
+            let value = value.borrow();
+            let mandatory = T::IMMEDIATE || value.immediate_if();
             let sequence = next_sequence.ok_or(Error::SequenceExhausted)?;
             // Straight into the chunk buffer. This used to encode into a
             // per-record `Vec`, copy it in here and drop it, so a batch of N
@@ -1179,7 +1385,7 @@ impl VarveStreamWriter {
             let before = bytes.len();
             let parts = prepare_stream_user_record_into(
                 self.spec,
-                value.borrow(),
+                value,
                 sequence,
                 next_offset,
                 previous_block,
@@ -1220,11 +1426,25 @@ impl VarveStreamWriter {
                 })?;
             records.push((T::ID, parts.info));
 
-            if bytes.len() >= options.max_bytes || records.len() >= max_records {
+            let event = self.immediate_state.event(
+                T::ID,
+                crate::ImmediateOperation::Append,
+                parts.info,
+                parts.len as u64,
+                records.len() as u64,
+                bytes.len() as u64,
+            );
+            let immediate = mandatory || self.immediate_state.policy.matches(event);
+            if immediate || bytes.len() >= options.max_bytes || records.len() >= max_records {
                 let permit = self.ensure_writable()?;
                 self.append_prepared_chunk_summarized(permit, &bytes, &records, written)?;
                 bytes.clear();
                 records.clear();
+                if immediate {
+                    self.immediate().map_err(|source| {
+                        crate::immediate::appended_immediate_error(sequence, source)
+                    })?;
+                }
             }
         }
         if !records.is_empty() {
@@ -1398,6 +1618,8 @@ impl VarveStreamWriter {
                 info.sequence,
             );
         }
+        self.immediate_state
+            .advance(records.len() as u64, bytes.len() as u64);
         // The records are published in the native file, so any sidecar failure
         // from here on must poison the writer.
         if let Err(error) = self.stage_state_records(records, new_eof) {
@@ -1987,7 +2209,7 @@ fn create_state_store(
             });
         }
     }
-    DiskIndexStore::open_validated(&sidecar, options, metadata.identity, metadata.mode)
+    DiskIndexStore::open_writer_validated(&sidecar, options, metadata.identity, metadata.mode)
         .map_err(state_error)
 }
 
@@ -2035,7 +2257,7 @@ pub(crate) fn primary_generation(
     let mut prefix =
         snapshot.read_vec_at(0, len, PRIMARY_GENERATION_WINDOW, "primary generation")?;
     let (header_len, extensions) = {
-        let mut file = snapshot.try_clone_file()?;
+        let mut file = snapshot.reader();
         read_file_header_parts(spec, &mut file)?
     };
     // STO-01a: the window is a prefix of the file, so it contains the header,
@@ -2092,7 +2314,7 @@ pub(crate) fn primary_identity(
     spec: FormatSpec,
     snapshot: &SnapshotFile,
 ) -> Result<crate::disk_index::DiskIndexIdentity> {
-    let mut file = snapshot.try_clone_file()?;
+    let mut file = snapshot.reader();
     let (header_len, extensions) = read_file_header_parts(spec, &mut file)?;
     let mut header = snapshot.read_vec_at(0, header_len, header_len, "file header")?;
     // Same reason as `primary_generation`, and here it matters more: this
@@ -2100,7 +2322,7 @@ pub(crate) fn primary_identity(
     // without the blanking one commit would make every published sidecar for
     // the file permanently unopenable.
     blank_mutable_header_bytes(&mut header, header_len, &extensions)?;
-    let object_identity = opened_file_identity(&file)?;
+    let object_identity = opened_file_identity(&snapshot.try_clone_file()?)?;
     let schema_hash = if spec.schema_hash == 0 {
         spec.computed_schema_hash()
     } else {

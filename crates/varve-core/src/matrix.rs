@@ -1,10 +1,14 @@
+use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::io::SeekFrom;
+#[cfg(test)]
+use std::io::{Seek, Write};
+use std::sync::Arc;
 
 use crate::codec::encode_to_vec_limited;
 use crate::format::ReadLimitKey;
+use crate::matrix_generation::{MatrixIo, Source};
 use crate::{
     BlockKind, Decoder, Error, FormatSpec, IntegrityPolicy, MatrixCommitKind, ReadLimits, Result,
     VarveMatrixBlock,
@@ -119,7 +123,7 @@ pub(crate) use region_reader::{MatrixReadPool, MatrixRegionReader};
 ///
 /// # Why this module exists
 ///
-/// Every matrix read used to take `file: &mut File` and do `seek` + `read_exact`.
+/// Every matrix read used to take `file: &mut impl MatrixIo` and do `seek` + `read_exact`.
 /// That is what forced `VarveFile::read_matrix_cell` and friends to take
 /// `&mut self`, which in turn made it impossible for one handle to serve two
 /// concurrent readers: the borrow checker refuses the second borrow. The cursor
@@ -127,8 +131,8 @@ pub(crate) use region_reader::{MatrixReadPool, MatrixRegionReader};
 ///
 /// `read_exact_at` here is `pread` on Unix and `seek_read` on Windows — the same
 /// primitive `SnapshotFile::read_exact_at` already uses for the record region —
-/// so it moves no cursor, needs no exclusive borrow, and two threads issuing it
-/// against the same handle do not interfere.
+/// so it needs no exclusive borrow. Each thread owns its reader; Windows
+/// may update a file cursor, but positional reads never consult it.
 ///
 /// # Why it is a module and not a bare struct
 ///
@@ -139,124 +143,48 @@ pub(crate) use region_reader::{MatrixReadPool, MatrixRegionReader};
 /// module with a private field, the borrow cannot be recovered anywhere: the
 /// type hands out bytes, never the handle.
 mod region_reader {
-    use super::{Error, Result};
+    use super::{Error, MatrixIo, Result, Source};
+    use crate::matrix_generation::View;
+    use std::cell::OnceCell;
     use std::fs::File;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex, Weak};
+    use std::sync::Arc;
+    #[cfg(test)]
+    use std::sync::Weak;
 
-    /// Ids handed to [`MatrixReadPool`]s. Monotonic and never reused, so a
-    /// thread-local entry left behind by a dropped pool can never be mistaken
-    /// for a live one.
-    static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
-
-    /// How many distinct matrix files one thread keeps a private read handle
-    /// for. Small on purpose: the handles are a per-thread resource and the
-    /// realistic working set is one or two open matrices.
-    const PER_THREAD_HANDLE_SLOTS: usize = 8;
-
-    thread_local! {
-        /// This thread's private read handles, keyed by pool id.
-        ///
-        /// A `thread_local!` static, deliberately **not** a field of any varve
-        /// type: a `RefCell` field would make `VarveReader` `!Sync` and destroy
-        /// the property this whole module exists for. Nothing here is shared
-        /// between threads, so it needs no lock and cannot convoy.
-        static PRIVATE_HANDLES: std::cell::RefCell<Vec<(u64, PrivateHandle)>> =
-            const { std::cell::RefCell::new(Vec::new()) };
-    }
-
-    #[derive(Clone, Debug)]
-    enum PrivateHandle {
-        /// A live private handle owned by the pool; `Weak` so that dropping the
-        /// `RecordFile` closes it even though this cache lives in another
-        /// thread's storage.
-        Open(Weak<File>),
-        /// This platform, or this file, refused a private handle. Remembered so
-        /// the cold path is attempted once per thread per file rather than once
-        /// per read.
-        Unavailable,
-    }
-
-    /// The owner of the private per-thread read handles for one matrix file.
-    ///
-    /// # Why this exists (the measured reason, not a plausible one)
-    ///
-    /// `read_exact_at` is `pread` on Unix and `seek_read` on Windows. `pread`
-    /// takes no per-file lock, so on Unix N threads reading through one handle
-    /// scale. `seek_read` is `ReadFile` with an `OVERLAPPED` offset against a
-    /// **synchronous** handle, and Windows serialises those on the file object
-    /// (it still maintains the shared file pointer). Measured on this repo's
-    /// own read path, 240,000 cell reads with `IntegrityPolicy::Crc32`:
-    ///
-    /// ```text
-    /// one shared handle:  1 thread 343,285 reads/s | 4 threads  91,137 reads/s (0.27x)
-    /// one handle/thread:  1 thread 327,037 reads/s | 4 threads 593,337 reads/s (1.81x)
-    /// ```
-    ///
-    /// So `&self` alone bought the *right* to share a handle and none of the
-    /// throughput. The fix is the one Windows documents: give each reading
-    /// thread its own file object. `ReOpenFile` derives a new file object from
-    /// the open handle — no path, so no re-resolution and no window in which a
-    /// different file could be opened under the same name — and each has its
-    /// own file pointer and its own lock.
-    ///
-    /// # What it costs
-    ///
-    /// One thread-local lookup over at most [`PER_THREAD_HANDLE_SLOTS`] entries
-    /// per read, and one `ReOpenFile` plus one `Mutex` acquisition the first
-    /// time a given thread reads a given file. The `Mutex` is *only* on that
-    /// cold path; no read touches it. Nothing is allocated per read.
-    ///
-    /// # Why it cannot go stale
-    ///
-    /// The pool owns the `Arc<File>`s and the thread-local cache holds `Weak`s,
-    /// so every private handle is closed when the `RecordFile` is dropped, even
-    /// though the cache entries live in other threads. A dead entry is refreshed
-    /// or evicted on next use; ids are never reused.
-    #[derive(Debug)]
+    /// One reader's lazily opened private Windows file object. No thread-local
+    /// registry or shared handle list: this owner moves with its reader and is
+    /// Send + !Sync. A clone starts with its own empty handle cache.
+    #[derive(Debug, Default)]
     pub struct MatrixReadPool {
-        id: u64,
-        /// Only Windows hands out private handles: `pread` on Unix does not
-        /// serialise on the file object, so `reopen` is `#[cfg(windows)]` and
-        /// this stays empty everywhere else. The field is still declared
-        /// unconditionally so the type is one type on every target; without
-        /// the allow, a non-Windows build with the test accessor compiled out
-        /// reports it as never read.
-        #[cfg_attr(not(any(windows, test)), allow(dead_code))]
-        handles: Mutex<Vec<Arc<File>>>,
+        handle: OnceCell<Option<Arc<File>>>,
+    }
+
+    impl Clone for MatrixReadPool {
+        fn clone(&self) -> Self {
+            Self::new()
+        }
     }
 
     impl MatrixReadPool {
         pub(crate) fn new() -> Self {
-            Self {
-                id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
-                handles: Mutex::new(Vec::new()),
-            }
+            Self::default()
         }
 
-        /// Number of private handles this pool has handed out. Test-facing
-        /// accessor; it takes the cold-path lock and is not called by reads.
         #[cfg(test)]
         pub(crate) fn private_handle_count(&self) -> usize {
-            self.handles.lock().map(|held| held.len()).unwrap_or(0)
+            usize::from(self.handle.get().is_some_and(Option::is_some))
         }
 
-        /// A `Weak` to the first private handle, for the test that proves the
-        /// handles die with the pool.
         #[cfg(test)]
         pub(crate) fn first_private_handle_weak(&self) -> Option<Weak<File>> {
-            self.handles
-                .lock()
-                .ok()
-                .and_then(|held| held.first().map(Arc::downgrade))
+            self.handle
+                .get()
+                .and_then(Option::as_ref)
+                .map(Arc::downgrade)
         }
 
-        /// Derives a fresh read-only file object from `file`.
-        ///
-        /// Returns `None` on any failure; the caller then reads through the
-        /// shared handle, which is always correct and merely slower.
         #[cfg(windows)]
-        fn reopen(&self, file: &File) -> Option<Arc<File>> {
+        fn reopen(file: &File) -> Option<Arc<File>> {
             use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
             use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
             use windows_sys::Win32::Storage::FileSystem::{
@@ -280,65 +208,37 @@ mod region_reader {
             // SAFETY: `ReOpenFile` returned a handle owned by this call and not
             // aliased anywhere else; `File` takes ownership and closes it.
             let handle = Arc::new(unsafe { File::from_raw_handle(raw as RawHandle) });
-            let mut held = self.handles.lock().ok()?;
-            held.push(Arc::clone(&handle));
-            drop(held);
             Some(handle)
         }
 
-        /// Unix `pread` does not serialise on the file object, so a private
-        /// handle would buy nothing and cost a descriptor per thread.
         #[cfg(not(windows))]
-        fn reopen(&self, _file: &File) -> Option<Arc<File>> {
+        fn reopen(_file: &File) -> Option<Arc<File>> {
             None
         }
 
-        /// This thread's private handle for this file, opening one on first use.
-        fn private_handle(&self, file: &File) -> Option<Arc<File>> {
-            PRIVATE_HANDLES.with(|cache| {
-                let mut cache = cache.borrow_mut();
-                if let Some(slot) = cache.iter().position(|(id, _)| *id == self.id) {
-                    match &cache[slot].1 {
-                        PrivateHandle::Unavailable => return None,
-                        PrivateHandle::Open(weak) => {
-                            if let Some(handle) = weak.upgrade() {
-                                return Some(handle);
-                            }
-                        }
-                    }
-                    cache.swap_remove(slot);
-                }
-                let opened = self.reopen(file);
-                if cache.len() >= PER_THREAD_HANDLE_SLOTS {
-                    cache.remove(0);
-                }
-                match opened {
-                    Some(handle) => {
-                        cache.push((self.id, PrivateHandle::Open(Arc::downgrade(&handle))));
-                        Some(handle)
-                    }
-                    None => {
-                        cache.push((self.id, PrivateHandle::Unavailable));
-                        None
-                    }
-                }
-            })
+        fn private_handle(&self, file: &File) -> Option<&Arc<File>> {
+            self.handle.get_or_init(|| Self::reopen(file)).as_ref()
         }
     }
 
     /// A positional reader over one open matrix file.
     ///
     /// `Copy`, because it is a shared borrow and callers pass it down several
-    /// levels; `Sync` and `Send` follow from `&File` being both.
+    /// levels. A borrowed reader carrying a local handle cache cannot cross threads.
     #[derive(Clone, Copy, Debug)]
     pub struct MatrixRegionReader<'a> {
         file: &'a File,
         pool: Option<&'a MatrixReadPool>,
+        view: Option<&'a View>,
     }
 
     impl<'a> MatrixRegionReader<'a> {
-        pub(crate) fn new(file: &'a File) -> Self {
-            Self { file, pool: None }
+        pub(crate) fn new(file: &'a impl MatrixIo) -> Self {
+            Self {
+                file: file.raw(),
+                pool: None,
+                view: file.paged(),
+            }
         }
 
         /// The same reader, plus the private-handle pool of the file it reads.
@@ -346,10 +246,28 @@ mod region_reader {
         /// Reads issued through this are correct byte-for-byte whether or not
         /// the pool yields a handle; the pool only decides *which* file object
         /// carries them, and therefore whether concurrent readers convoy.
+        #[cfg(test)]
         pub(crate) fn with_pool(file: &'a File, pool: &'a MatrixReadPool) -> Self {
             Self {
                 file,
                 pool: Some(pool),
+                view: None,
+            }
+        }
+
+        pub(crate) fn with_source(source: &'a Source, pool: &'a MatrixReadPool) -> Self {
+            Self {
+                file: source.raw(),
+                pool: Some(pool),
+                view: source.paged(),
+            }
+        }
+
+        pub(crate) fn with_io(file: &'a impl MatrixIo, pool: &'a MatrixReadPool) -> Self {
+            Self {
+                file: file.raw(),
+                pool: Some(pool),
+                view: file.paged(),
             }
         }
 
@@ -359,43 +277,19 @@ mod region_reader {
         /// `SnapshotFile::read_exact_at`; a zero-length read at end of data is
         /// `UnexpectedEof`, which is what the previous `read_exact` reported.
         ///
-        /// # The offset is per call, and on Windows the cursor still moves
-        ///
-        /// Every byte this returns is addressed by the `offset` argument, never
-        /// by the handle's file pointer, so two threads reading different
-        /// offsets through one handle each get their own bytes. That is the
-        /// property criterion (C) needs and it holds on both platforms.
-        ///
-        /// It is *not* true that nothing observable changes: `pread` leaves the
-        /// Unix file pointer alone, but `seek_read` is `ReadFile` with an
-        /// `OVERLAPPED` offset, and Windows updates a synchronous handle's file
-        /// pointer to the end of the transfer as a side effect. So on Windows
-        /// concurrent readers do scribble on each other's cursor — they simply
-        /// never consult it.
-        ///
-        /// Nothing else consults it either, and that is a borrow-checker fact
-        /// rather than a convention: the only writers to this region go through
-        /// `RecordFile::matrix_region`, which takes `&mut self`, so no write and
-        /// no cursor-relative read can be in flight while any
-        /// `MatrixRegionReader` derived from the same handle exists. Every
-        /// matrix write seeks to its own absolute offset first in any case.
-        /// `SnapshotFile::read_exact_at` has relied on the same reasoning for
-        /// the record region since before this round.
-        ///
-        /// # Which file object carries the read
-        ///
-        /// If this reader was built with a [`MatrixReadPool`], the bytes are
-        /// fetched through *this thread's* private file object rather than the
-        /// shared handle. That changes no byte and no offset — both are the same
-        /// file and the read is positional either way — but on Windows it is the
-        /// difference between four threads reading 91,137 cells/s through one
-        /// convoyed file object and 593,337 through four. See `MatrixReadPool`.
+        /// Every read uses an absolute offset. Unix `pread` leaves the cursor
+        /// unchanged; Windows `seek_read` may move it but never consults it.
+        /// A supplied handle cache belongs to this reader and reopens the same
+        /// file object read-only on Windows, without resolving its path again.
         pub(crate) fn read_exact_at(&self, offset: u64, buffer: &mut [u8]) -> Result<()> {
             // One count per logical read, not per retry: the subject is whether
             // a read was *issued* while a bitmap page-store lock was held.
             super::count_matrix_region_read(self.pool.is_some());
+            if let Some(view) = self.view {
+                return view.read_exact_at(offset, buffer).map_err(Error::Io);
+            }
             let private = self.pool.and_then(|pool| pool.private_handle(self.file));
-            let file: &File = private.as_deref().unwrap_or(self.file);
+            let file: &File = private.map(Arc::as_ref).unwrap_or(self.file);
             let mut consumed = 0usize;
             while consumed < buffer.len() {
                 let delta = u64::try_from(consumed)
@@ -465,7 +359,7 @@ mod region_reader {
             assert_eq!(handles, 1, "windows must hand this thread its own handle");
         }
 
-        /// Two threads reading through one pooled reader get their own file
+        /// Two threads with independent reader pools get their own file
         /// objects and their own correct bytes.
         #[test]
         fn two_threads_get_two_private_handles_and_the_right_bytes() {
@@ -477,13 +371,14 @@ mod region_reader {
                 file.write_all(&contents).expect("write");
             }
             let file = std::fs::File::open(&path).expect("open");
-            let pool = MatrixReadPool::new();
-            let reader = MatrixRegionReader::with_pool(&file, &pool);
+            let file = &file;
             let contents = &contents;
 
             std::thread::scope(|scope| {
                 for thread in 0..2u64 {
+                    let pool = MatrixReadPool::new();
                     scope.spawn(move || {
+                        let reader = MatrixRegionReader::with_pool(file, &pool);
                         for step in 0..64u64 {
                             let offset = (thread * 512 + step * 13) % 4096;
                             let mut bytes = [0u8; 32];
@@ -493,24 +388,14 @@ mod region_reader {
                             let start = offset as usize;
                             assert_eq!(&bytes[..], &contents[start..start + 32]);
                         }
+                        #[cfg(windows)]
+                        assert_eq!(pool.private_handle_count(), 1);
                     });
                 }
             });
-
-            #[cfg(windows)]
-            assert_eq!(
-                pool.private_handle_count(),
-                2,
-                "each reading thread gets its own file object"
-            );
-            #[cfg(not(windows))]
-            assert_eq!(pool.private_handle_count(), 0);
         }
 
-        /// Dropping the pool closes the private handles even though the
-        /// thread-local cache that pointed at them outlives it: the cache holds
-        /// `Weak`s. If it held `Arc`s this would leak one handle per thread per
-        /// file for the life of the process.
+        /// Dropping the reader-owned cache closes its private handle.
         #[test]
         fn dropping_the_pool_releases_the_private_handles() {
             let directory = tempfile::tempdir().expect("temp directory");
@@ -589,14 +474,17 @@ struct AllocatedExtents {
 
 impl AllocatedExtents {
     /// Queries the filesystem, restoring the file cursor before returning.
-    fn query(file: &mut File) -> Option<Self> {
+    fn query(file: &mut impl MatrixIo) -> Option<Self> {
         if allocation_map_forced_unavailable() {
             return None;
         }
-        let cursor = file.stream_position().ok()?;
-        let ranges = query_allocated_extents(file);
-        let restored = file.seek(SeekFrom::Start(cursor)).is_ok();
-        let ranges = ranges?;
+        // The COW cursor is logical; SEEK_DATA/SEEK_HOLE touch the base file's
+        // OS cursor. Restore that cursor, not the adapter's logical position.
+        let mut raw = file.raw();
+        let cursor = std::io::Seek::stream_position(&mut raw).ok()?;
+        let ranges = query_allocated_extents(raw);
+        let restored = std::io::Seek::seek(&mut raw, SeekFrom::Start(cursor)).is_ok();
+        let mut ranges = ranges?;
         if !restored {
             return None;
         }
@@ -611,6 +499,19 @@ impl AllocatedExtents {
             .is_some();
         if !ordered {
             return None;
+        }
+        if let Some(view) = file.paged() {
+            ranges.extend(view.allocated_ranges().ok()?);
+            ranges.sort_unstable();
+            let mut merged: Vec<(u64, u64)> = Vec::new();
+            for (start, end) in ranges {
+                if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+                    last.1 = last.1.max(end);
+                } else {
+                    merged.push((start, end));
+                }
+            }
+            ranges = merged;
         }
         Some(Self { ranges })
     }
@@ -685,7 +586,7 @@ fn range_may_hold_data(extents: Option<&AllocatedExtents>, offset: u64, len: u64
 }
 
 #[cfg(windows)]
-fn query_allocated_extents(file: &mut File) -> Option<Vec<(u64, u64)>> {
+fn query_allocated_extents(file: &File) -> Option<Vec<(u64, u64)>> {
     use std::os::windows::io::AsRawHandle;
     use std::ptr;
     use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
@@ -696,7 +597,7 @@ fn query_allocated_extents(file: &mut File) -> Option<Vec<(u64, u64)>> {
 
     const ENTRY_LEN: usize = std::mem::size_of::<FILE_ALLOCATED_RANGE_BUFFER>();
 
-    let file_len = i64::try_from(file.metadata().ok()?.len()).ok()?;
+    let file_len = i64::try_from(file.raw().metadata().ok()?.len()).ok()?;
     let mut ranges: Vec<(u64, u64)> = Vec::new();
     if file_len == 0 {
         return Some(ranges);
@@ -756,11 +657,11 @@ fn query_allocated_extents(file: &mut File) -> Option<Vec<(u64, u64)>> {
 }
 
 #[cfg(target_os = "linux")]
-fn query_allocated_extents(file: &mut File) -> Option<Vec<(u64, u64)>> {
+fn query_allocated_extents(file: &File) -> Option<Vec<(u64, u64)>> {
     use std::os::unix::io::AsRawFd;
 
     let fd = file.as_raw_fd();
-    let file_len = file.metadata().ok()?.len();
+    let file_len = file.raw().metadata().ok()?.len();
     let mut ranges: Vec<(u64, u64)> = Vec::new();
     let mut cursor = 0i64;
     while (cursor as u64) < file_len {
@@ -791,7 +692,7 @@ fn query_allocated_extents(file: &mut File) -> Option<Vec<(u64, u64)>> {
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-fn query_allocated_extents(_file: &mut File) -> Option<Vec<(u64, u64)>> {
+fn query_allocated_extents(_file: &File) -> Option<Vec<(u64, u64)>> {
     None
 }
 
@@ -836,15 +737,18 @@ fn mark_file_sparse(_file: &File) {}
 ///
 /// Returns `true` when the range was zeroed by a hole punch, which is `O(1)` in
 /// `len`; `false` means the caller must fall back to writing zeros.
-fn punch_zero_range(file: &mut File, offset: u64, len: u64) -> bool {
+fn punch_zero_range(file: &mut impl MatrixIo, offset: u64, len: u64) -> Result<bool> {
     if len == 0 {
-        return true;
+        return Ok(true);
     }
-    punch_zero_range_native(file, offset, len)
+    if file.zero_pages(offset, len)? {
+        return Ok(true);
+    }
+    Ok(punch_zero_range_native(file.raw(), offset, len))
 }
 
 #[cfg(windows)]
-fn punch_zero_range_native(file: &mut File, offset: u64, len: u64) -> bool {
+fn punch_zero_range_native(file: &File, offset: u64, len: u64) -> bool {
     use std::os::windows::io::AsRawHandle;
     use std::ptr;
     use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -882,7 +786,7 @@ fn punch_zero_range_native(file: &mut File, offset: u64, len: u64) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn punch_zero_range_native(file: &mut File, offset: u64, len: u64) -> bool {
+fn punch_zero_range_native(file: &File, offset: u64, len: u64) -> bool {
     use std::os::unix::io::AsRawFd;
 
     let (Ok(offset), Ok(len)) = (libc::off_t::try_from(offset), libc::off_t::try_from(len)) else {
@@ -903,7 +807,7 @@ fn punch_zero_range_native(file: &mut File, offset: u64, len: u64) -> bool {
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-fn punch_zero_range_native(_file: &mut File, _offset: u64, _len: u64) -> bool {
+fn punch_zero_range_native(_file: &File, _offset: u64, _len: u64) -> bool {
     false
 }
 
@@ -919,7 +823,7 @@ fn punch_zero_range_native(_file: &mut File, _offset: u64, _len: u64) -> bool {
 /// can *detect* the slow path with
 /// [`MatrixRecoveryReport::matrix_last_zero_range_streamed_bytes`] rather than
 /// having to infer it from the target triple.
-fn zero_range(file: &mut File, offset: u64, len: u64) -> Result<()> {
+fn zero_range(file: &mut impl MatrixIo, offset: u64, len: u64) -> Result<()> {
     #[cfg(test)]
     if FAIL_NEXT_ZERO_RANGE.replace(false) {
         return Err(Error::Io(std::io::Error::other(
@@ -927,7 +831,7 @@ fn zero_range(file: &mut File, offset: u64, len: u64) -> Result<()> {
         )));
     }
 
-    if punch_zero_range(file, offset, len) {
+    if punch_zero_range(file, offset, len)? {
         sparse_zeroing::record(0);
         return Ok(());
     }
@@ -1055,6 +959,7 @@ mod scaling_counters {
         /// Page-store locks this thread holds *right now*
         /// ([`super::PageStoreGuard`]). Not a total: it rises and falls.
         pub(super) static BITMAP_STORE_GUARDS_HELD: Cell<u64> = const { Cell::new(0) };
+        pub(super) static BITMAP_STORE_BORROWS: Cell<u64> = const { Cell::new(0) };
         /// Slot bytes the explicit CRC commit-map rebuild fed to `crc32` on
         /// this thread. The rebuild's I/O follows the CRC-validity evidence, so
         /// this measures the sweep's cost against the *set* bits rather than
@@ -1208,21 +1113,20 @@ fn count_lazy_fault_bytes_read(bytes: u64) {
 #[cfg(not(any(test, feature = "scalable-fault-injection")))]
 fn count_lazy_fault_bytes_read(_bytes: u64) {}
 
-/// Records that this thread has acquired one more page-store lock.
+/// Records that this thread has acquired one more mutable page-store borrow.
 ///
 /// Called by [`PageStoreGuard::new`] and paired with
 /// [`leave_page_store_guard`] by its `Drop`, so the depth is exact rather than
-/// approximate: a `MutexGuard` is `!Send`, so acquisition and release always
+/// approximate: a `RefMut` is `!Send`, so acquisition and release always
 /// happen on one thread and a thread-local count needs no synchronisation and
 /// cannot be attributed to the wrong reader.
 ///
-/// This exists so that the matrix read path's central concurrency invariant —
-/// **no read is issued while a page-store lock is held** — is a counted fact.
-/// It replaces a wall-clock ratio that could not distinguish a convoy from a
-/// busy machine.
+/// The retained audit checks that no matrix read crosses a mutable local
+/// cache borrow. Reader isolation itself is enforced by !Sync.
 #[cfg(any(test, feature = "scalable-fault-injection"))]
 fn enter_page_store_guard() {
     scaling_counters::add(&scaling_counters::BITMAP_STORE_GUARDS_HELD, 1);
+    scaling_counters::add(&scaling_counters::BITMAP_STORE_BORROWS, 1);
 }
 
 #[cfg(not(any(test, feature = "scalable-fault-injection")))]
@@ -1237,7 +1141,7 @@ fn leave_page_store_guard() {
 fn leave_page_store_guard() {}
 
 /// Counts one positional matrix-region read, and separately counts it as a
-/// violation when a page-store lock is held while it is issued.
+/// violation when a mutable page-store borrow is held while it is issued.
 ///
 /// The whole matrix region — cell payloads, per-cell checksums, aux ranges,
 /// bitmap pages and page digests — is read through
@@ -1381,7 +1285,7 @@ pub(crate) fn inject_zero_range_failure() {
     FAIL_NEXT_ZERO_RANGE.set(true);
 }
 
-fn write_slot_payload(file: &mut File, payload: &[u8]) -> Result<()> {
+fn write_slot_payload(file: &mut impl MatrixIo, payload: &[u8]) -> Result<()> {
     #[cfg(test)]
     if FAIL_NEXT_SLOT_WRITE.replace(false) {
         if let Some(first) = payload.first() {
@@ -1843,28 +1747,10 @@ impl MatrixRecoveryReport {
         scaling_counters::get(&scaling_counters::MATRIX_REGION_READS)
     }
 
-    /// Of those reads, the number issued while this thread held a commit-map
-    /// page-store lock. **The contract is that this is always zero.**
-    ///
-    /// This is the deterministic form of criterion (C)'s convoy check. Demand
-    /// loading gave each bitmap a `Mutex` over its page map so a fault-in can
-    /// happen under `&self`; the property that keeps concurrent readers from
-    /// serialising is not that the lock is absent but that it is never held
-    /// across I/O. A nonzero value here is precisely a reader parked on a
-    /// `pread` while holding a lock every other reader of the same category
-    /// needs.
-    ///
-    /// What it catches: any read — fault-in, aggregate, cell payload, checksum,
-    /// aux — issued inside a page-store critical section, on any platform, at
-    /// any machine load, from one thread. It needs no second thread to observe
-    /// a violation, and no quiet machine.
-    ///
-    /// What it does *not* catch: contention that is genuine but lock-free (the
-    /// Windows file-object convoy `MatrixReadPool` exists to break leaves this
-    /// at zero), a lock held across a long *computation* rather than I/O, I/O
-    /// issued through a handle other than the matrix region reader, and any
-    /// question of throughput. Scaling is still worth measuring; it is just not
-    /// assertable on a shared runner.
+    /// Reads issued while this thread held a mutable bitmap cache borrow.
+    /// The contract is zero. The historical `lock` name is retained for audit
+    /// callers; bitmap caches now use reader-local `RefCell`, not a mutex.
+    /// This checks borrow lifetime across I/O, not contention or throughput.
     pub fn matrix_region_reads_under_bitmap_lock() -> u64 {
         scaling_counters::get(&scaling_counters::MATRIX_REGION_READS_UNDER_LOCK)
     }
@@ -1882,14 +1768,14 @@ impl MatrixRecoveryReport {
     /// It is a count of issued reads, not of contention: on Unix
     /// `MatrixReadPool::reopen` returns `None` by design (`pread` does not
     /// serialise on the file object), so a pooled read there is byte-identical
-    /// and costs one thread-local lookup for a handle it will never get. This
+    /// and costs one local cache lookup for a handle it will never get. This
     /// counter is about which reader was used, and is meaningful on both
     /// platforms for that reason; the throughput it protects is Windows-only.
     pub fn matrix_region_reads_without_pool() -> u64 {
         scaling_counters::get(&scaling_counters::MATRIX_REGION_READS_WITHOUT_POOL)
     }
 
-    /// Commit-map page-store locks this thread holds at this instant.
+    /// Mutable commit-map cache borrows this thread holds at this instant.
     ///
     /// Zero at every point outside `varve-core`'s own matrix code, so a test can
     /// assert it after a run and know the depth it audited was balanced rather
@@ -2056,10 +1942,10 @@ const NO_PAGE: u64 = u64::MAX;
 /// before this option existed.
 #[derive(Clone, Debug)]
 struct LazyBacking {
-    file: Arc<File>,
+    file: Box<Source>,
     /// See [`LazyResidency::pool`]: without it, concurrent fault-ins convoy on
     /// the shared file object on Windows.
-    pool: Arc<MatrixReadPool>,
+    pool: MatrixReadPool,
     base_offset: u64,
     digest_base: Option<u64>,
     /// Ceiling on `PageStore::cached_bytes`, always a whole number of pages
@@ -2067,47 +1953,11 @@ struct LazyBacking {
     cache_limit: u64,
 }
 
-/// The pages of one bitmap, plus every total derived from them.
-///
-/// Behind a `Mutex` inside [`SparseBitmap`] so a fault-in can happen under
-/// `&self` — matrix reads take `&self` (criterion C) and demand loading has to
-/// live inside that borrow. Every `&mut self` mutator reaches it through
-/// [`SparseBitmap::store_mut`], which is `Mutex::get_mut` and takes no lock at
-/// all, so the mutation engine's F-03/F-05 prepare-then-commit discipline is
-/// untouched and no lock is taken on the write path.
-///
-/// # What the lock does and does not serialise
-///
-/// It is taken only for `O(1)` map operations and is **never held across
-/// I/O** — see [`SparseBitmap::faulted_store`], which drops it for the whole
-/// of the fault-in read, and [`SparseBitmap::ones_total`], which takes it once
-/// per page rather than once per aggregate. So concurrent readers serialise on
-/// a hash lookup, not on a `pread`. Stated because "there is no lock in the
-/// matrix read path" was true of round 16 and is no longer true of this one:
-/// there is one, and it is per-bitmap.
-///
-/// The `O(1)` in that first sentence is a claim about the *recency update*, and
-/// it was false until the demand cache's least-recently-used order stopped
-/// being a `VecDeque` beside the map. A touch scanned the deque for the page
-/// and then memmoved it, under this lock, on every cell read and every cell
-/// write — `O(cached pages)`, up to the 512-page default cache and up to 16,384
-/// at the ceiling a 64 MiB `max_matrix_bitmap_bytes` admits. The order is now an
-/// intrusive doubly-linked list threaded through [`BitmapPage`] itself
-/// ([`PageStore::note_used`]), so the critical section really is a bounded
-/// number of map probes; [`MatrixRecoveryReport::matrix_lru_touch_steps`]
-/// counts them so the sentence is measured rather than asserted.
-///
-/// That "never" is *counted*, not argued: acquiring the lock goes through
-/// [`PageStoreGuard`], every matrix read goes through
-/// [`MatrixRegionReader::read_exact_at`], and the second increments a violation
-/// counter if the first is outstanding. `page_store_lock_audit_tests` below
-/// asserts the counter is zero for the fault-in and the aggregate, and asserts
-/// separately that it is *not* zero when a read is deliberately issued under
-/// the lock, so a passing run means the detector was live. The wall-clock ratio
-/// that used to stand in for this is now a printed measurement in
-/// `crates/varve/tests/matrix_concurrent_reads.rs`, because two runs of it on
-/// identical code differ by 1.4x versus 2.1x on a shared CI runner and a
-/// threshold that survives that noise would also pass a real convoy.
+/// One reader's bitmap pages, LRU links and residency totals. `RefCell` permits
+/// demand loading through `&self` and makes the owning reader !Sync. Each
+/// thread opens its own reader; no bitmap mutex or shared mutable cache exists.
+/// Exclusive writer access uses `get_mut`, avoiding dynamic borrow checks too.
+/// Cache borrows are released before I/O, as counted by PageStoreGuard.
 #[derive(Debug)]
 struct PageStore {
     pages: HashMap<u64, BitmapPage>,
@@ -2304,32 +2154,15 @@ impl PageStore {
     }
 }
 
-/// A held page-store lock.
-///
-/// A newtype over `MutexGuard` for exactly one reason: it makes "this thread is
-/// holding a page-store lock right now" observable, which turns the read path's
-/// concurrency contract into something a test can *count* rather than time.
-/// The contract is
-///
-/// > no matrix-region read is issued while a page-store lock is held,
-///
-/// and it is what makes concurrent readers scale: they contend for `O(1)` hash
-/// lookups, never for each other's `pread`. `matrix.rs`'s own
-/// `page_store_lock_audit_tests` assert it directly, on every platform and
-/// under any machine load, which a wall-clock ratio on a shared CI runner
-/// cannot do.
-///
-/// The cost, stated exactly: one field, no extra state, and two calls whose
-/// bodies are empty without `cfg(test)` or the `scalable-fault-injection`
-/// feature. What remains in an ordinary build is a newtype with an empty `Drop`
-/// — not zero source, but zero work, and no lock is held for one instruction
-/// longer than the `MutexGuard` alone would be.
+/// A reader-local mutable cache borrow. The audit retains its historical
+/// public "lock" counter names, but now checks that RefCell borrows do not
+/// cross matrix I/O. This is not a synchronization primitive.
 struct PageStoreGuard<'a> {
-    inner: MutexGuard<'a, PageStore>,
+    inner: RefMut<'a, PageStore>,
 }
 
 impl<'a> PageStoreGuard<'a> {
-    fn new(inner: MutexGuard<'a, PageStore>) -> Self {
+    fn new(inner: RefMut<'a, PageStore>) -> Self {
         enter_page_store_guard();
         Self { inner }
     }
@@ -2358,7 +2191,7 @@ impl Drop for PageStoreGuard<'_> {
 /// One bitmap page's bytes, however they are held.
 ///
 /// Replaces the `&[u8]` `page_bytes` used to return: the pages now live behind
-/// a lock, so a borrow cannot outlive the guard. `Arc` makes the resident case
+/// a RefCell borrow, so a reference cannot outlive the guard. `Arc` makes the resident case
 /// a refcount bump rather than a copy.
 enum PagePayload {
     Resident(Arc<Vec<u8>>),
@@ -2448,7 +2281,7 @@ struct SparseBitmap {
     bit_count: u64,
     byte_len: u64,
     page_count: u64,
-    store: Mutex<PageStore>,
+    store: RefCell<PageStore>,
     /// Set only under [`MatrixMetadataResidency::Lazy`]; see [`LazyBacking`].
     backing: Option<LazyBacking>,
     /// Page named by each occupied slot of the persisted page index, in slot
@@ -2474,7 +2307,8 @@ struct SparseBitmap {
     indexed_pages: HashMap<u64, u64>,
 }
 
-/// Hand-written because [`Mutex`] is not `Clone`.
+/// Clone the cache metadata independently; immutable page bytes may be shared
+/// until writer-side copy-on-write separates them.
 ///
 /// A clone takes a snapshot of the pages the original currently holds,
 /// including its demand-cached ones, and keeps the same backing — cloning a
@@ -2487,7 +2321,7 @@ impl Clone for SparseBitmap {
             bit_count: self.bit_count,
             byte_len: self.byte_len,
             page_count: self.page_count,
-            store: Mutex::new(PageStore {
+            store: RefCell::new(PageStore {
                 pages: source.pages.clone(),
                 ones: source.ones,
                 charged_bytes: source.charged_bytes,
@@ -2506,32 +2340,33 @@ impl Clone for SparseBitmap {
 }
 
 impl SparseBitmap {
+    fn rebind_backing(&mut self, source: &Source) {
+        if let Some(backing) = &mut self.backing {
+            *backing.file = source.clone();
+            backing.pool = MatrixReadPool::new();
+        }
+    }
     fn new(bit_count: u64) -> Result<Self> {
         let byte_len = bit_bytes(bit_count)?;
         Ok(Self {
             bit_count,
             byte_len,
             page_count: page_count_for(byte_len)?,
-            store: Mutex::new(PageStore::default()),
+            store: RefCell::new(PageStore::default()),
             backing: None,
             index_slots: Vec::new(),
             indexed_pages: HashMap::new(),
         })
     }
 
-    /// Locks the page store.
-    ///
-    /// Poison-tolerant on purpose: a panic while a page was being installed
-    /// leaves the store consistent — every mutation is a completed
-    /// prepare-then-commit pair — so refusing every later read would convert a
-    /// panic elsewhere into permanent unavailability of the matrix.
+    /// Borrows the reader-local cache. This reader cannot be shared by threads.
     fn store(&self) -> PageStoreGuard<'_> {
-        PageStoreGuard::new(self.store.lock().unwrap_or_else(|err| err.into_inner()))
+        PageStoreGuard::new(self.store.borrow_mut())
     }
 
     /// The page store under an exclusive borrow, which takes no lock.
     fn store_mut(&mut self) -> &mut PageStore {
-        self.store.get_mut().unwrap_or_else(|err| err.into_inner())
+        self.store.get_mut()
     }
 
     /// Faults `page` in from the backing file if it is published, not resident,
@@ -2548,20 +2383,8 @@ impl SparseBitmap {
     /// The page store, with `page` faulted in if it is published, not cached,
     /// and this bitmap is lazily backed.
     ///
-    /// # The lock is never held across the read
-    ///
-    /// Round 16 removed the read convoy from the matrix; this must not put one
-    /// back under the new option. The store's `Mutex` is taken twice — once for
-    /// the `O(1)` "is it already here?" test and once to install — and dropped
-    /// for the whole of [`Self::load_page`], which is where the `pread` and the
-    /// digest check happen. Two threads faulting the same page therefore both
-    /// read it and one discards its copy, which costs one duplicated 4 KiB read
-    /// and never blocks either thread behind the other's I/O.
-    ///
-    /// The duplicate is harmless because a faulted page is derived state: it is
-    /// authenticated against its own stored digest before installation, and
-    /// cached pages are write-through, so two loads of one page either agree or
-    /// both fail.
+    /// Release the cache borrow before reading or authenticating a page, then
+    /// install it under a new local borrow. No mutex is acquired.
     fn faulted_store(&self, page: u64) -> Result<PageStoreGuard<'_>> {
         let Some(backing) = self.backing.as_ref() else {
             return Ok(self.store());
@@ -2579,9 +2402,26 @@ impl SparseBitmap {
         let loaded = self.load_page(backing, page)?;
         let mut store = self.store();
         if let Some((bytes, ones)) = loaded {
-            self.install_faulted_page(&mut store, backing, page, bytes, ones)?;
+            Self::install_faulted_page(&mut store, backing.cache_limit, page, bytes, ones)?;
         }
         Ok(store)
+    }
+
+    /// Writer-side fault-in under an exclusive borrow. Keep the same loading,
+    /// authentication and eviction rules without dynamic cache borrow checks.
+    fn faulted_store_mut(&mut self, page: u64) -> Result<&mut PageStore> {
+        if self.backing.is_some() {
+            if self.store_mut().pages.contains_key(&page) {
+                self.store_mut().note_used(page);
+            } else if self.indexed_pages.contains_key(&page) {
+                let backing = self.backing.as_ref().unwrap();
+                let cache_limit = backing.cache_limit;
+                if let Some((bytes, ones)) = self.load_page(backing, page)? {
+                    Self::install_faulted_page(self.store_mut(), cache_limit, page, bytes, ones)?;
+                }
+            }
+        }
+        Ok(self.store_mut())
     }
 
     /// Reads and authenticates one commit-map page. Holds no lock.
@@ -2596,7 +2436,7 @@ impl SparseBitmap {
             .checked_mul(BITMAP_PAGE_BYTES)
             .and_then(|delta| backing.base_offset.checked_add(delta))
             .ok_or(Error::InvalidMatrixLayout)?;
-        let reader = MatrixRegionReader::with_pool(backing.file.as_ref(), backing.pool.as_ref());
+        let reader = MatrixRegionReader::with_source(backing.file.as_ref(), &backing.pool);
         let mut bytes = filled_bytes_for(len, 0, ReadLimitKey::MatrixBitmapBytes.resource())?;
         reader.read_exact_at(offset, &mut bytes)?;
         count_lazy_fault_bytes_read(len);
@@ -2625,16 +2465,13 @@ impl SparseBitmap {
         Ok(Some((bytes, ones)))
     }
 
-    /// Installs a page [`Self::load_page`] read, under the store's lock.
+    /// Installs an authenticated page with exclusive access to the store,
+    /// provided by either the reader guard or the writer's mutable borrow.
     ///
-    /// Re-checks presence first: the lock was released for the read, so another
-    /// thread may have installed the same page meanwhile. Its copy wins and
-    /// this one is dropped — they are byte-identical, both having been checked
-    /// against the same stored digest.
+    /// Reusing an installed page preserves its recency and residency accounting.
     fn install_faulted_page(
-        &self,
         store: &mut PageStore,
-        backing: &LazyBacking,
+        cache_limit: u64,
         page: u64,
         bytes: Vec<u8>,
         ones: u64,
@@ -2647,7 +2484,7 @@ impl SparseBitmap {
         while store
             .cached_bytes
             .checked_add(len)
-            .is_none_or(|total| total > backing.cache_limit)
+            .is_none_or(|total| total > cache_limit)
         {
             if !store.evict_one() {
                 break;
@@ -2767,9 +2604,9 @@ impl SparseBitmap {
         Ok((self.byte_len - start).min(BITMAP_PAGE_BYTES))
     }
 
-    fn page_bytes(&self, page: u64) -> Result<PagePayload> {
+    fn page_bytes(&mut self, page: u64) -> Result<PagePayload> {
         let len = usize::try_from(self.page_len(page)?).map_err(|_| Error::InvalidMatrixLayout)?;
-        let store = self.faulted_store(page)?;
+        let store = self.faulted_store_mut(page)?;
         match store.pages.get(&page) {
             Some(held) if held.bytes.len() == len => Ok(PagePayload::Resident(held.bytes.clone())),
             Some(_) => Err(Error::InvalidMatrixLayout),
@@ -2779,8 +2616,8 @@ impl SparseBitmap {
 
     /// Whether `page` currently holds state, faulting it in if it is published
     /// but not yet cached.
-    fn page_is_materialised(&self, page: u64) -> Result<bool> {
-        Ok(self.faulted_store(page)?.pages.contains_key(&page))
+    fn page_is_materialised(&mut self, page: u64) -> Result<bool> {
+        Ok(self.faulted_store_mut(page)?.pages.contains_key(&page))
     }
 
     fn byte(&self, index: u64) -> Result<u8> {
@@ -2808,18 +2645,42 @@ impl SparseBitmap {
         Ok(self.byte(ordinal / 8)? & (1u8 << (ordinal % 8)) != 0)
     }
 
-    /// Bytes that writing `value` at `index` would newly make resident, so a
-    /// caller can charge the matrix bitmap budget before the memory is taken.
-    /// A write that changes nothing materialises nothing and costs nothing.
-    fn materialisation_cost(&self, index: u64, value: u8) -> Result<u64> {
+    fn byte_mut(&mut self, index: u64) -> Result<u8> {
         if index >= self.byte_len {
             return Err(Error::InvalidMatrixLayout);
         }
-        if self.byte(index)? == value {
+        let page = index / BITMAP_PAGE_BYTES;
+        let within =
+            usize::try_from(index % BITMAP_PAGE_BYTES).map_err(|_| Error::InvalidMatrixLayout)?;
+        match self.faulted_store_mut(page)?.pages.get(&page) {
+            Some(page) => page
+                .bytes
+                .get(within)
+                .copied()
+                .ok_or(Error::InvalidMatrixLayout),
+            None => Ok(0),
+        }
+    }
+
+    fn get_mut(&mut self, ordinal: u64) -> Result<bool> {
+        if ordinal >= self.bit_count {
+            return Err(Error::InvalidMatrixLayout);
+        }
+        Ok(self.byte_mut(ordinal / 8)? & (1u8 << (ordinal % 8)) != 0)
+    }
+
+    /// Bytes that writing `value` at `index` would newly make resident, so a
+    /// caller can charge the matrix bitmap budget before the memory is taken.
+    /// A write that changes nothing materialises nothing and costs nothing.
+    fn materialisation_cost(&mut self, index: u64, value: u8) -> Result<u64> {
+        if index >= self.byte_len {
+            return Err(Error::InvalidMatrixLayout);
+        }
+        if self.byte_mut(index)? == value {
             return Ok(0);
         }
         let page = index / BITMAP_PAGE_BYTES;
-        if self.store().pages.contains_key(&page) {
+        if self.store_mut().pages.contains_key(&page) {
             Ok(0)
         } else {
             self.page_len(page)
@@ -2832,13 +2693,13 @@ impl SparseBitmap {
     /// is scanned. A result of zero means the page would still be
     /// indistinguishable from the zero page, which is what lets a mutation skip
     /// both residency and a persisted page-index entry.
-    fn page_ones_after(&self, index: u64, value: u8) -> Result<u64> {
+    fn page_ones_after(&mut self, index: u64, value: u8) -> Result<u64> {
         if index >= self.byte_len {
             return Err(Error::InvalidMatrixLayout);
         }
-        let current = self.byte(index)?;
+        let current = self.byte_mut(index)?;
         let page_ones = self
-            .store()
+            .store_mut()
             .pages
             .get(&(index / BITMAP_PAGE_BYTES))
             .map(|page| page.ones)
@@ -2866,12 +2727,12 @@ impl SparseBitmap {
         // Faults the page in first where the map is lazily backed, so every
         // count below is derived from the published bytes rather than from an
         // absence the cache happens to be showing.
-        let current = self.byte(index)?;
+        let current = self.byte_mut(index)?;
         let page_index = index / BITMAP_PAGE_BYTES;
         let within =
             usize::try_from(index % BITMAP_PAGE_BYTES).map_err(|_| Error::InvalidMatrixLayout)?;
         if current == value {
-            let ones_after = self.store().ones;
+            let ones_after = self.store_mut().ones;
             return Ok(PreparedByteWrite {
                 page: page_index,
                 within,
@@ -3036,13 +2897,13 @@ impl SparseBitmap {
     }
 
     /// The byte value writing `value` at `ordinal` would produce.
-    fn byte_after_set(&self, ordinal: u64, value: bool) -> Result<(u64, u8)> {
+    fn byte_after_set(&mut self, ordinal: u64, value: bool) -> Result<(u64, u8)> {
         if ordinal >= self.bit_count {
             return Err(Error::InvalidMatrixLayout);
         }
         let index = ordinal / 8;
         let mask = 1u8 << (ordinal % 8);
-        let current = self.byte(index)?;
+        let current = self.byte_mut(index)?;
         Ok((
             index,
             if value {
@@ -3102,21 +2963,8 @@ impl SparseBitmap {
     /// from bytes nothing had checked — an aggregate is an answer like any other,
     /// and a damaged page must refuse rather than contribute a number.
     ///
-    /// # The lock is taken per page, not per aggregate
-    ///
-    /// This used to hold one [`PageStoreGuard`] for the whole loop, which meant
-    /// `O(live pages)` of `pread` under a lock every concurrent reader of the
-    /// same category needs for its own `O(1)` lookups — a convoy of exactly the
-    /// kind [`PageStore`] documents it does not create, reachable from a `&self`
-    /// entry point (`resume_signal`). It now takes the lock once per page and
-    /// releases it before that page's read.
-    ///
-    /// Re-acquiring per page observes the same map a single acquisition would
-    /// have: every mutator takes `&mut self`, so no mutation can be in flight
-    /// while this `&self` borrow exists. A concurrent *reader* may fault a page
-    /// in mid-loop, but each page is still counted exactly once, and from
-    /// memory or from disk it is the same authenticated value — demand-cached
-    /// pages are write-through.
+    /// Each cache borrow ends before the corresponding file read. This keeps
+    /// demand-loaded metadata local without holding a RefCell guard across I/O.
     fn ones_total(&self) -> Result<u64> {
         let Some(backing) = self.backing.as_ref() else {
             return Ok(self.ones());
@@ -3125,7 +2973,7 @@ impl SparseBitmap {
         // `load_page` does. This aggregate is reachable from the `&self` entry
         // point `resume_signal`, so two readers really can be in this loop at
         // once; the pool is what keeps them off one shared file object.
-        let reader = MatrixRegionReader::with_pool(backing.file.as_ref(), backing.pool.as_ref());
+        let reader = MatrixRegionReader::with_source(backing.file.as_ref(), &backing.pool);
         let mut total = 0u64;
         let mut buffer: Option<PageVerifyBuffer> = None;
         for page in self.indexed_pages.keys().copied() {
@@ -3702,18 +3550,40 @@ pub(crate) mod crc_valid_evidence {
         pub(super) fn clear(&mut self) {
             self.bits.clear();
         }
+        pub(super) fn rebind_backing(&mut self, source: &super::Source) {
+            self.bits.rebind_backing(source);
+        }
+
+        pub(super) fn prepare_follow(
+            &mut self,
+            index: u64,
+            changes: &super::generation_follow::Changes<'_>,
+            budget: &mut super::ResidentBitmapBudget,
+        ) -> Result<super::generation_follow::BitmapDelta> {
+            let _complete = self.complete()?;
+            super::generation_follow::BitmapDelta::prepare(
+                &mut self.bits,
+                index,
+                changes,
+                budget,
+                false,
+            )
+        }
+        pub(super) fn apply_follow(&mut self, delta: super::generation_follow::BitmapDelta) {
+            delta.apply(&mut self.bits);
+        }
 
         pub(super) fn prepare_update(
-            &self,
+            &mut self,
             bit_count: u64,
             base_offset: u64,
             ordinal: u64,
             value: bool,
         ) -> Result<BitmapByteUpdate> {
-            prepare_bitmap_update(&self.bits, bit_count, base_offset, ordinal, value)
+            prepare_bitmap_update(&mut self.bits, bit_count, base_offset, ordinal, value)
         }
 
-        pub(super) fn materialisation_cost(&self, index: u64, value: u8) -> Result<u64> {
+        pub(super) fn materialisation_cost(&mut self, index: u64, value: u8) -> Result<u64> {
             self.bits.materialisation_cost(index, value)
         }
 
@@ -3964,7 +3834,7 @@ fn read_page_digest_at(reader: MatrixRegionReader<'_>, offset: u64) -> Result<(u
 /// validity bit and the recorded per-cell checksum, so no fabricated payload is
 /// ever returned. Detecting metadata forgery requires a keyed digest, which is
 /// a format decision outside this representation.
-fn write_page_digest(file: &mut File, offset: u64, crc: u32, state: u32) -> Result<()> {
+fn write_page_digest(file: &mut impl MatrixIo, offset: u64, crc: u32, state: u32) -> Result<()> {
     #[cfg(test)]
     if FAIL_NEXT_PAGE_DIGEST_WRITE.replace(false) {
         return Err(Error::Io(std::io::Error::other(
@@ -4260,9 +4130,22 @@ impl MatrixLayout {
     }
 }
 
+#[path = "matrix_follow.rs"]
+mod generation_follow;
+pub(crate) use generation_follow::MatrixDelta;
+
+pub(crate) fn rebind_generation_backing(layout: &mut MatrixLayout, source: &Source) {
+    for commit in &mut layout.commits {
+        commit.bits.rebind_backing(source);
+    }
+    for block in &mut layout.blocks {
+        block.crc_valid_bits.rebind_backing(source);
+    }
+}
+
 pub(crate) fn create_layout(
     spec: FormatSpec,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     header_len: u64,
     dims: &MatrixDimensions,
 ) -> Result<MatrixLayout> {
@@ -4462,7 +4345,7 @@ pub(crate) fn create_layout(
     // Requested before the reserved regions are established so that `set_len`
     // leaves them as holes rather than allocated clusters; see
     // `AllocatedExtents` for why open depends on that distinction.
-    mark_file_sparse(file);
+    mark_file_sparse(file.raw());
     file.seek(SeekFrom::Start(header_len))?;
     file.write_all(&header)?;
     file.write_all(&dimension_table)?;
@@ -4486,7 +4369,7 @@ pub(crate) fn create_layout(
 
 pub(crate) fn read_layout_at_len(
     spec: FormatSpec,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     header_len: u64,
     file_len: u64,
 ) -> Result<MatrixLayout> {
@@ -4654,7 +4537,7 @@ pub(crate) fn read_layout_at_len(
 pub(crate) fn write_cell<T: VarveMatrixBlock>(
     spec: FormatSpec,
     layout: &mut MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     key: MatrixKey,
     value: &T,
 ) -> Result<()> {
@@ -4742,7 +4625,9 @@ fn prepare_current_write_bit(
     ordinal: u64,
 ) -> Result<PreparedWriteBit> {
     let index = ordinal / 8;
-    let byte = layout.blocks[block_index].current_write_bits.byte(index)?;
+    let byte = layout.blocks[block_index]
+        .current_write_bits
+        .byte_mut(index)?;
     let cost = layout.blocks[block_index]
         .current_write_bits
         .materialisation_cost(index, byte | (1u8 << (ordinal % 8)))?;
@@ -4779,7 +4664,7 @@ fn abandon_current_write_bit(layout: &mut MatrixLayout, prepared: PreparedWriteB
 pub(crate) fn write_cell_payload<T: VarveMatrixBlock>(
     spec: FormatSpec,
     layout: &mut MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     key: MatrixKey,
     payload: &[u8],
 ) -> Result<()> {
@@ -4878,14 +4763,16 @@ pub(crate) fn cell_status<T: VarveMatrixBlock>(
 pub(crate) fn commit_cell<T: VarveMatrixBlock>(
     spec: FormatSpec,
     layout: &mut MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     key: MatrixKey,
 ) -> Result<()> {
     let category = ensure_matrix_block::<T>(spec)?;
     let allowed = ensure_commit_publishable(layout, category)?;
     let block_index = layout.block_index(&allowed, T::ID)?;
     let ordinal = layout.ordinal_for_block(block_index, key)?;
-    let written_this_session = layout.blocks[block_index].current_write_bits.get(ordinal)?;
+    let written_this_session = layout.blocks[block_index]
+        .current_write_bits
+        .get_mut(ordinal)?;
     // One pass, not two. The zero probe and the checksum pass read the same
     // slot, and this used to seek and stream it once for each. `scan_slot`
     // answers both, so a cell this session did not write costs its stride once
@@ -4916,7 +4803,7 @@ pub(crate) fn commit_cell<T: VarveMatrixBlock>(
 pub(crate) fn clear_cell<T: VarveMatrixBlock>(
     spec: FormatSpec,
     layout: &mut MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     key: MatrixKey,
 ) -> Result<()> {
     let category = ensure_matrix_block::<T>(spec)?;
@@ -4931,7 +4818,7 @@ pub(crate) fn clear_cell<T: VarveMatrixBlock>(
 pub(crate) fn clear_cell_by_category(
     spec: FormatSpec,
     layout: &mut MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     category: &str,
     key: MatrixKey,
 ) -> Result<()> {
@@ -4946,7 +4833,7 @@ pub(crate) fn clear_cell_by_category(
 pub(crate) fn clear_category(
     spec: FormatSpec,
     layout: &mut MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     category: &str,
 ) -> Result<u64> {
     let allowed = layout.ensure_fatal_access_allowed()?;
@@ -5055,7 +4942,7 @@ pub(crate) fn clear_category(
         let digest_len = page_count
             .checked_mul(PAGE_DIGEST_LEN)
             .ok_or(Error::InvalidMatrixLayout)?;
-        if punch_zero_range(file, digest_offset, digest_len) {
+        if punch_zero_range(file, digest_offset, digest_len)? {
             sparse_zeroing::record(0);
         } else {
             // F-08: this range is zeroed by an explicit per-page digest loop
@@ -5170,7 +5057,7 @@ pub(crate) fn read_aux_at_len(
 
 pub(crate) fn write_aux_at_len(
     layout: &MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     logical_file_len: u64,
     name: &str,
     offset: u64,
@@ -5400,7 +5287,7 @@ fn commit_map_finding(name: &str) -> MatrixRecoveryFinding {
 /// the layout's state at all.
 pub(crate) fn verify_matrix_metadata(
     layout: &MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
 ) -> Result<MatrixRecoveryReport> {
     let extents = AllocatedExtents::query(file);
     let mut buffer = PageVerifyBuffer::new()?;
@@ -5542,7 +5429,7 @@ fn poison_interrupted_rebuild(layout: &mut MatrixLayout, commit_index: usize) {
 pub(crate) fn rebuild_commit_map_from_crc<T: VarveMatrixBlock>(
     spec: FormatSpec,
     layout: &mut MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
 ) -> Result<u64> {
     let category = ensure_matrix_block::<T>(spec)?;
     let allowed = layout.ensure_fatal_access_allowed()?;
@@ -5678,7 +5565,7 @@ pub(crate) fn is_single_committed(layout: &MatrixLayout, name: &str) -> Result<b
 
 pub(crate) fn set_single_committed(
     layout: &mut MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     name: &str,
     value: bool,
 ) -> Result<()> {
@@ -5706,7 +5593,7 @@ pub(crate) fn is_channel_committed(
 
 pub(crate) fn set_channel_committed(
     layout: &mut MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     name: &str,
     channel: u64,
     value: bool,
@@ -5806,7 +5693,7 @@ fn ensure_commit_publishable(layout: &MatrixLayout, category: &str) -> Result<Fa
 
 fn set_cell_commit(
     layout: &mut MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     category: &str,
     ordinal: u64,
     value: bool,
@@ -5816,7 +5703,7 @@ fn set_cell_commit(
 }
 
 fn prepare_cell_commit(
-    layout: &MatrixLayout,
+    layout: &mut MatrixLayout,
     category: &str,
     ordinal: u64,
     value: bool,
@@ -5832,7 +5719,7 @@ fn prepare_cell_commit(
 
 fn set_commit_bit(
     layout: &mut MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     commit_index: usize,
     ordinal: u64,
     value: bool,
@@ -5864,7 +5751,7 @@ struct CommitBitUpdate {
 }
 
 fn prepare_bitmap_update(
-    bits: &SparseBitmap,
+    bits: &mut SparseBitmap,
     bit_count: u64,
     base_offset: u64,
     ordinal: u64,
@@ -5874,7 +5761,7 @@ fn prepare_bitmap_update(
         return Err(Error::InvalidMatrixLayout);
     }
     let byte_index = ordinal / 8;
-    let current = bits.byte(byte_index)?;
+    let current = bits.byte_mut(byte_index)?;
     let mask = 1u8 << (ordinal % 8);
     let byte_value = if value {
         current | mask
@@ -5895,8 +5782,8 @@ fn prepare_bitmap_update(
 /// Stores one bitmap byte, unless the byte already holds that value.
 ///
 /// The skip is byte-identical, not merely equivalent. `current` in
-/// [`prepare_bitmap_update`] comes from [`SparseBitmap::byte`], which
-/// demand-faults the page through [`SparseBitmap::faulted_store`] and
+/// [`prepare_bitmap_update`] comes from [`SparseBitmap::byte_mut`], which
+/// demand-faults the page through [`SparseBitmap::faulted_store_mut`] and
 /// authenticates it against its stored digest before believing it, and answers
 /// `0` only for a page that is not materialised — which is a `set_len` hole and
 /// reads back as zero. So `current` *is* the durable byte, and writing
@@ -5906,7 +5793,7 @@ fn prepare_bitmap_update(
 /// received redundant writes now stays the hole `create` left, instead of being
 /// allocated to hold zeros. The file's content and length are unchanged; its
 /// `st_blocks` is smaller, and open can skip the page.
-fn write_bitmap_byte(file: &mut File, update: &BitmapByteUpdate) -> Result<()> {
+fn write_bitmap_byte(file: &mut impl MatrixIo, update: &BitmapByteUpdate) -> Result<()> {
     #[cfg(test)]
     if FAIL_NEXT_BITMAP_WRITE.replace(false) {
         return Err(Error::Io(std::io::Error::other(
@@ -5924,18 +5811,18 @@ fn write_bitmap_byte(file: &mut File, update: &BitmapByteUpdate) -> Result<()> {
 }
 
 fn prepare_commit_bit(
-    layout: &MatrixLayout,
+    layout: &mut MatrixLayout,
     commit_index: usize,
     ordinal: u64,
     value: bool,
 ) -> Result<CommitBitUpdate> {
     layout.ensure_fatal_access_allowed()?;
-    let commit = &layout.commits[commit_index];
+    let commit = &mut layout.commits[commit_index];
     if commit.quarantine_finding.is_some() {
         return Err(Error::MatrixCommitQuarantined(commit.name.clone()));
     }
     let bitmap = prepare_bitmap_update(
-        &commit.bits,
+        &mut commit.bits,
         commit.bit_count,
         commit.map_offset,
         ordinal,
@@ -6073,7 +5960,7 @@ mod page_index {
 
         /// Set bits the page holding `byte_index` would have after the pending
         /// byte write — the test for "this page still needs an entry".
-        pub(super) fn page_ones_after(&self, byte_index: u64, byte_value: u8) -> Result<u64> {
+        pub(super) fn page_ones_after(&mut self, byte_index: u64, byte_value: u8) -> Result<u64> {
             self.bits.page_ones_after(byte_index, byte_value)
         }
     }
@@ -6094,7 +5981,7 @@ mod page_index {
     /// needs, is prepared before the first byte reaches the disk and installed
     /// infallibly afterwards. There is no local ordering to get right here.
     pub(super) fn record_entry(
-        file: &mut File,
+        file: &mut impl MatrixIo,
         base: u64,
         mirror: PageIndexMirror<'_>,
         page: u64,
@@ -6120,7 +6007,7 @@ mod page_index {
     /// `O(1)`: the vacated slot is overwritten with the array's last entry and
     /// the occupancy count is decremented — two 8-byte writes, no scan.
     pub(super) fn release_entry(
-        file: &mut File,
+        file: &mut impl MatrixIo,
         base: u64,
         mirror: PageIndexMirror<'_>,
         page: u64,
@@ -6139,7 +6026,7 @@ mod page_index {
     /// that no arithmetic — and therefore no non-`Io` failure — remains at this
     /// point. A compaction rewrite is one seek and one write rather than one per
     /// entry.
-    fn write_entry_run(file: &mut File, offset: u64, bytes: &[u8]) -> Result<()> {
+    fn write_entry_run(file: &mut impl MatrixIo, offset: u64, bytes: &[u8]) -> Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -6167,7 +6054,7 @@ mod page_index {
     /// during preparation, which is what keeps [`PAGE_INDEX_REBUILD_MARKER`] —
     /// deliberately not a representable count (F-02) — expressible without
     /// exposing an unvalidated header write to the rest of the file.
-    fn write_header_bytes(file: &mut File, base: u64, bytes: [u8; 8]) -> Result<()> {
+    fn write_header_bytes(file: &mut impl MatrixIo, base: u64, bytes: [u8; 8]) -> Result<()> {
         #[cfg(any(test, feature = "scalable-fault-injection"))]
         if take_injected_failure(&scaling_counters::PAGE_INDEX_HEADER_WRITE_FAILURE) {
             return Err(Error::Io(std::io::Error::other(
@@ -6379,7 +6266,7 @@ mod page_index {
         /// keys that are already present.
         pub(super) fn commit(
             self,
-            file: &mut File,
+            file: &mut impl MatrixIo,
             bits: &mut SparseBitmap,
             budget: &mut ResidentBitmapBudget,
         ) -> Result<()> {
@@ -6394,7 +6281,7 @@ mod page_index {
             Ok(())
         }
 
-        fn persist(&self, file: &mut File) -> Result<()> {
+        fn persist(&self, file: &mut impl MatrixIo) -> Result<()> {
             if let Some(plan) = &self.compaction {
                 write_entry_run(file, plan.first_entry_offset, &plan.encoded)?;
             }
@@ -6481,7 +6368,7 @@ mod page_index {
         /// none of them can fail a second time.
         pub(super) fn commit(
             self,
-            file: &mut File,
+            file: &mut impl MatrixIo,
             bits: &mut SparseBitmap,
             budget: &mut ResidentBitmapBudget,
         ) {
@@ -6558,7 +6445,7 @@ mod page_index {
     impl PreparedRepublish {
         pub(super) fn commit(
             self,
-            file: &mut File,
+            file: &mut impl MatrixIo,
             bits: &mut SparseBitmap,
             budget: &mut ResidentBitmapBudget,
         ) -> Result<()> {
@@ -6589,7 +6476,7 @@ mod page_index {
     }
 
     impl PreparedPublication {
-        pub(super) fn commit(self, file: &mut File, base: u64) -> Result<()> {
+        pub(super) fn commit(self, file: &mut impl MatrixIo, base: u64) -> Result<()> {
             write_header_bytes(file, base, self.header)
         }
     }
@@ -6599,12 +6486,12 @@ mod page_index {
     /// This is not a mirror mutation and takes no prepared value: it destroys
     /// nothing on its own and is the step that makes everything after it
     /// fail-closed, so there is no in-memory state that could disagree with it.
-    pub(super) fn write_rebuild_marker(file: &mut File, base: u64) -> Result<()> {
+    pub(super) fn write_rebuild_marker(file: &mut impl MatrixIo, base: u64) -> Result<()> {
         write_header_bytes(file, base, PAGE_INDEX_REBUILD_MARKER.to_le_bytes())
     }
 }
 
-fn read_page_index_header(file: &mut File, base: u64) -> Result<u64> {
+fn read_page_index_header(file: &mut impl MatrixIo, base: u64) -> Result<u64> {
     file.seek(SeekFrom::Start(base))?;
     let mut bytes = [0; PAGE_INDEX_ENTRY_LEN as usize];
     file.read_exact(&mut bytes)?;
@@ -6621,7 +6508,7 @@ fn read_page_index_header(file: &mut File, base: u64) -> Result<u64> {
 /// has merely touched.
 fn record_mutated_page_index(
     layout: &mut MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     target: PageIndexTarget,
     byte_index: u64,
     byte_value: u8,
@@ -6629,7 +6516,7 @@ fn record_mutated_page_index(
     let page = byte_index / BITMAP_PAGE_BYTES;
     let mut budget = layout.budget();
     let outcome = (|| -> Result<()> {
-        let (base, mirror) = match page_index_target(layout, target) {
+        let (base, mut mirror) = match page_index_target(layout, target) {
             Some(parts) => parts,
             None => return Ok(()),
         };
@@ -6646,7 +6533,7 @@ fn record_mutated_page_index(
 /// that the page is empty (F-03).
 fn release_mutated_page_index(
     layout: &mut MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     target: PageIndexTarget,
     byte_index: u64,
 ) {
@@ -6688,7 +6575,7 @@ enum PageIndexTarget {
 
 fn apply_commit_bit(
     layout: &mut MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     commit_index: usize,
     update: CommitBitUpdate,
 ) -> Result<()> {
@@ -6791,7 +6678,7 @@ struct CommitMapRegions {
 /// the reservation is a precondition of the write rather than a consequence of
 /// it.
 fn republish_page_index_entry(
-    file: &mut File,
+    file: &mut impl MatrixIo,
     base: u64,
     bits: &mut SparseBitmap,
     page: u64,
@@ -6837,7 +6724,7 @@ fn republish_page_index_entry(
 /// than reading it. It costs two `sync_data` calls on a recovery path that
 /// already rewrites every published page, and nothing at all on the hot path.
 fn write_commit_map_pages(
-    file: &mut File,
+    file: &mut impl MatrixIo,
     regions: CommitMapRegions,
     previous: &SparseBitmap,
     bits: &mut SparseBitmap,
@@ -6936,7 +6823,7 @@ fn write_commit_map_pages(
 /// the slot for another reason pays for those bytes once.
 fn write_cell_crc(
     layout: &MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     block_index: usize,
     ordinal: u64,
     crc: u32,
@@ -6949,7 +6836,7 @@ fn write_cell_crc(
 
 fn update_cell_crc(
     layout: &MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     block_index: usize,
     ordinal: u64,
 ) -> Result<()> {
@@ -6964,7 +6851,7 @@ fn update_cell_crc(
 
 fn clear_cell_crc(
     layout: &MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     block_index: usize,
     ordinal: u64,
 ) -> Result<()> {
@@ -6977,7 +6864,7 @@ fn clear_cell_crc(
 
 fn set_cell_crc_valid(
     layout: &mut MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     block_index: usize,
     ordinal: u64,
     value: bool,
@@ -6989,12 +6876,12 @@ fn set_cell_crc_valid(
 }
 
 fn prepare_cell_crc_valid(
-    layout: &MatrixLayout,
+    layout: &mut MatrixLayout,
     block_index: usize,
     ordinal: u64,
     value: bool,
 ) -> Result<Option<BitmapByteUpdate>> {
-    let block = &layout.blocks[block_index];
+    let block = &mut layout.blocks[block_index];
     let Some(valid_offset) = block.crc_valid_offset else {
         return Ok(None);
     };
@@ -7006,7 +6893,7 @@ fn prepare_cell_crc_valid(
 
 fn apply_cell_crc_valid(
     layout: &mut MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     block_index: usize,
     update: BitmapByteUpdate,
 ) -> Result<()> {
@@ -7152,7 +7039,7 @@ struct SlotScan {
 #[cfg(feature = "integrity")]
 fn scan_slot(
     layout: &MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     block_index: usize,
     ordinal: u64,
 ) -> Result<SlotScan> {
@@ -7169,7 +7056,11 @@ fn scan_slot(
 }
 
 #[cfg(feature = "integrity")]
-fn read_slot_scan(file: &mut File, buffer: &mut [u8], mut remaining: u64) -> Result<SlotScan> {
+fn read_slot_scan(
+    file: &mut impl MatrixIo,
+    buffer: &mut [u8],
+    mut remaining: u64,
+) -> Result<SlotScan> {
     let mut hasher = crc32fast::Hasher::new();
     let mut all_zero = true;
     while remaining != 0 {
@@ -7195,7 +7086,7 @@ fn read_slot_scan(file: &mut File, buffer: &mut [u8], mut remaining: u64) -> Res
 #[cfg(not(feature = "integrity"))]
 fn scan_slot(
     layout: &MatrixLayout,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     block_index: usize,
     ordinal: u64,
 ) -> Result<SlotScan> {
@@ -7212,7 +7103,11 @@ fn scan_slot(
 }
 
 #[cfg(not(feature = "integrity"))]
-fn read_slot_scan(file: &mut File, buffer: &mut [u8], mut remaining: u64) -> Result<SlotScan> {
+fn read_slot_scan(
+    file: &mut impl MatrixIo,
+    buffer: &mut [u8],
+    mut remaining: u64,
+) -> Result<SlotScan> {
     let mut all_zero = true;
     while remaining != 0 {
         let chunk_len = usize::try_from(remaining.min(buffer.len() as u64))
@@ -7226,7 +7121,7 @@ fn read_slot_scan(file: &mut File, buffer: &mut [u8], mut remaining: u64) -> Res
 }
 
 #[cfg(feature = "integrity")]
-fn crc32_file_range(file: &mut File, offset: u64, len: u64) -> Result<u32> {
+fn crc32_file_range(file: &mut impl MatrixIo, offset: u64, len: u64) -> Result<u32> {
     file.seek(SeekFrom::Start(offset))?;
     if slot_chunk_len(len) == NARROW_SLOT_BYTES {
         let mut buffer = [0u8; NARROW_SLOT_BYTES];
@@ -7238,7 +7133,7 @@ fn crc32_file_range(file: &mut File, offset: u64, len: u64) -> Result<u32> {
 }
 
 #[cfg(feature = "integrity")]
-fn crc32_streamed(file: &mut File, buffer: &mut [u8], mut remaining: u64) -> Result<u32> {
+fn crc32_streamed(file: &mut impl MatrixIo, buffer: &mut [u8], mut remaining: u64) -> Result<u32> {
     let mut hasher = crc32fast::Hasher::new();
     while remaining != 0 {
         let chunk_len = usize::try_from(remaining.min(buffer.len() as u64))
@@ -7252,7 +7147,7 @@ fn crc32_streamed(file: &mut File, buffer: &mut [u8], mut remaining: u64) -> Res
 }
 
 #[cfg(not(feature = "integrity"))]
-fn crc32_file_range(_file: &mut File, _offset: u64, _len: u64) -> Result<u32> {
+fn crc32_file_range(_file: &mut impl MatrixIo, _offset: u64, _len: u64) -> Result<u32> {
     Err(Error::IntegrityFeatureDisabled)
 }
 
@@ -7938,7 +7833,7 @@ fn crc_layout_from_parts(
 }
 
 fn write_crc_header(
-    file: &mut File,
+    file: &mut impl MatrixIo,
     dimension_table: &[u8],
     block_table: &[u8],
     category_table: &[u8],
@@ -7954,7 +7849,7 @@ fn write_crc_header(
 }
 
 fn verify_crc_header(
-    file: &mut File,
+    file: &mut impl MatrixIo,
     crc: Option<&MatrixCrcLayout>,
     metadata_segments: &[&[u8]],
     commit_count: usize,
@@ -8036,22 +7931,15 @@ struct PageSources<'a> {
 struct LazyResidency {
     /// A second descriptor for the same file, duplicated once here so a
     /// fault-in under `&self` needs no borrow of the handle a writer holds.
-    file: Arc<File>,
-    /// Private per-thread file objects for the fault-in read.
-    ///
-    /// Without this the fault-in would go through the one duplicated
-    /// descriptor above, and on Windows `ReadFile` serialises on the kernel
-    /// file object — so four threads missing the cache would queue behind each
-    /// other's `pread` even though the lock is released for it. Measured: 1.54x
-    /// *slower* on four threads than on one, which is a convoy by the same
-    /// definition round 16 used. With the pool the same measurement is 0.43x,
-    /// and `matrix_lazy_residency.rs` fails the build if it goes back over 1.0x.
-    pool: Arc<MatrixReadPool>,
+    file: Box<Source>,
+    /// This bitmap owner's private Windows handle cache. Cloning the backing
+    /// starts an empty handle cache while retaining the same immutable File.
+    pool: MatrixReadPool,
     cache_limit: u64,
 }
 
 impl LazyResidency {
-    fn declared(limits: ReadLimits, file: &File) -> Result<Self> {
+    fn declared(limits: ReadLimits, file: &impl MatrixIo) -> Result<Self> {
         // The cache is the whole of this reader's matrix bitmap payload
         // footprint, so a *declared* one is admitted against
         // `max_matrix_bitmap_bytes` — a cache larger than the ceiling would make
@@ -8064,16 +7952,16 @@ impl LazyResidency {
             .checked_mul(BITMAP_PAGE_BYTES)
             .ok_or(Error::InvalidMatrixLayout)?;
         Ok(Self {
-            file: Arc::new(file.try_clone()?),
-            pool: Arc::new(MatrixReadPool::new()),
+            file: Box::new(file.source()?),
+            pool: MatrixReadPool::new(),
             cache_limit,
         })
     }
 
     fn backing(&self, source: &PagedBitmapSource<'_>) -> LazyBacking {
         LazyBacking {
-            file: Arc::clone(&self.file),
-            pool: Arc::clone(&self.pool),
+            file: self.file.clone(),
+            pool: self.pool.clone(),
             base_offset: source.base_offset,
             digest_base: source.digest_base,
             cache_limit: self.cache_limit,
@@ -8170,7 +8058,7 @@ pub(crate) mod page_index_enumeration {
     /// erase state it never looked at. Callers that consume a bitmap as evidence
     /// must propagate this.
     pub(super) fn load_page_index(
-        file: &mut File,
+        file: &mut impl MatrixIo,
         source: &PagedBitmapSource<'_>,
         bits: &mut SparseBitmap,
         sink: &mut PagedBitmapSink<'_>,
@@ -8474,7 +8362,7 @@ fn verify_paged_bitmap(
 /// verification to check and it is skipped — its persisted index is still
 /// enumerated, and a damaged one is still a fatal finding.
 fn load_paged_bitmap(
-    file: &mut File,
+    file: &mut impl MatrixIo,
     source: PagedBitmapSource<'_>,
     bit_count: u64,
     verifier: Option<&mut PageVerifyBuffer>,
@@ -8524,7 +8412,7 @@ struct LoadedPagedBitmap {
 }
 
 fn load_commit_bitmaps(
-    file: &mut File,
+    file: &mut impl MatrixIo,
     crc: Option<&MatrixCrcLayout>,
     page_index: &MatrixPageIndexLayout,
     commits: &[StoredCommitPlan],
@@ -8605,7 +8493,7 @@ fn load_commit_bitmaps(
 /// layout.
 fn load_crc_valid_bits(
     spec: FormatSpec,
-    file: &mut File,
+    file: &mut impl MatrixIo,
     crc: Option<&MatrixCrcLayout>,
     page_index: &MatrixPageIndexLayout,
     block_offsets: &HashMap<u32, (u64, u64, u64)>,
@@ -8718,7 +8606,7 @@ fn encode_header(fields: MatrixHeaderFields) -> Vec<u8> {
     bytes
 }
 
-fn read_header(file: &mut File, header_len: u64) -> Result<MatrixHeaderFields> {
+fn read_header(file: &mut impl MatrixIo, header_len: u64) -> Result<MatrixHeaderFields> {
     file.seek(SeekFrom::Start(header_len))?;
     let mut bytes = [0; VMAT_HEADER_LEN as usize];
     file.read_exact(&mut bytes)?;
@@ -9157,7 +9045,12 @@ fn validate_range(offset: u64, len: u64, file_len: u64) -> Result<u64> {
     Ok(end)
 }
 
-fn read_range(file: &mut File, offset: u64, len: u64, resource: &'static str) -> Result<Vec<u8>> {
+fn read_range(
+    file: &mut impl MatrixIo,
+    offset: u64,
+    len: u64,
+    resource: &'static str,
+) -> Result<Vec<u8>> {
     file.seek(SeekFrom::Start(offset))?;
     let mut bytes = filled_bytes_for(len, 0, resource)?;
     file.read_exact(&mut bytes)?;
@@ -9236,7 +9129,7 @@ fn read_crc_at(reader: MatrixRegionReader<'_>, offset: u64) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes))
 }
 
-fn write_crc_at(file: &mut File, offset: u64, crc: u32) -> Result<()> {
+fn write_crc_at(file: &mut impl MatrixIo, offset: u64, crc: u32) -> Result<()> {
     file.seek(SeekFrom::Start(offset))?;
     file.write_all(&crc.to_le_bytes())?;
     Ok(())
@@ -9309,7 +9202,7 @@ fn crc32_zeroes(_len: u64) -> Result<u32> {
     Err(Error::IntegrityFeatureDisabled)
 }
 
-fn write_zeros(file: &mut File, len: u64) -> Result<()> {
+fn write_zeros(file: &mut impl MatrixIo, len: u64) -> Result<()> {
     const ZERO_CHUNK: [u8; 8192] = [0; 8192];
     let mut remaining = len;
     while remaining > 0 {
@@ -9691,27 +9584,10 @@ mod sparse_bitmap_tests {
     }
 }
 
-/// Criterion (C), stated as a counted invariant instead of a wall clock.
-///
-/// The property that keeps concurrent matrix readers from serialising is not
-/// that there is no lock in the read path — since demand loading there is one,
-/// a `Mutex` over each bitmap's page map — but that **it is never held across
-/// I/O**. These tests assert that directly: they run the read paths that fault
-/// pages in and that aggregate over them, and require that the number of reads
-/// issued while a page-store lock was held is zero while the number of reads
-/// issued at all is not.
-///
-/// Deliberately here and not only in `crates/varve/tests/`: the counters are
-/// compiled under `cfg(test)` as well as under the `scalable-fault-injection`
-/// feature, so this module is the copy of the gate that runs in *every* feature
-/// configuration, including the default one. The integration-test copy exercises
-/// the same invariant through the public multi-threaded read path but needs the
-/// feature to see the counters.
-///
-/// These are single-threaded on purpose. A violation is a property of one
-/// thread's control flow — a read issued inside a critical section — so it is
-/// observable without a second thread, without contention, and without a quiet
-/// machine. That is the whole reason to prefer this over a ratio.
+/// Audit reader-local cache borrows across I/O and exclusive mutation access.
+/// The historic public counter names mention locks; no bitmap mutex remains.
+/// Counters compile under both tests and scalable-fault-injection so the unit
+/// gate runs in every feature configuration, alongside the integration gate.
 #[cfg(test)]
 mod page_store_lock_audit_tests {
     use super::*;
@@ -9745,7 +9621,7 @@ mod page_store_lock_audit_tests {
     /// A lazily backed bitmap over a real file, every page live with one set
     /// bit, and `cache_limit` bytes of demand cache.
     ///
-    /// `digest_base: None`: the subject is locking, and without digests this
+    /// `digest_base: None`: the subject is borrowing, and without digests this
     /// holds in builds without the `integrity` feature too.
     fn backed_bitmap(cache_limit: u64) -> (tempfile::TempDir, Arc<File>, SparseBitmap) {
         let directory = tempfile::tempdir().expect("temp directory");
@@ -9758,8 +9634,8 @@ mod page_store_lock_audit_tests {
         let file = Arc::new(File::open(&path).expect("open map"));
         let mut map = SparseBitmap::new(PAGES * BITMAP_PAGE_BYTES * 8).expect("bitmap");
         map.backing = Some(LazyBacking {
-            file: Arc::clone(&file),
-            pool: Arc::new(MatrixReadPool::new()),
+            file: Box::new(Source::Raw(Arc::clone(&file))),
+            pool: MatrixReadPool::new(),
             base_offset: 0,
             digest_base: None,
             cache_limit,
@@ -9776,7 +9652,77 @@ mod page_store_lock_audit_tests {
         page * BITMAP_PAGE_BYTES * 8
     }
 
-    /// Demand loading: `faulted_store` drops the lock for the whole of
+    #[test]
+    fn exclusive_preparation_avoids_dynamic_borrows_on_fault_hit_noop_or_eviction() {
+        let (directory, _file, mut map) = backed_bitmap(BITMAP_PAGE_BYTES);
+        let mut output = File::options()
+            .write(true)
+            .open(directory.path().join("commit-map"))
+            .unwrap();
+        // Control: the reader route must register dynamic borrows, so a zero
+        // below cannot mean the instrumentation was disabled.
+        scaling_counters::set(&scaling_counters::BITMAP_STORE_BORROWS, 0);
+        assert!(map.get(0).unwrap());
+        assert!(scaling_counters::get_always(&scaling_counters::BITMAP_STORE_BORROWS) > 0);
+        scaling_counters::set(&scaling_counters::BITMAP_STORE_BORROWS, 0);
+        reset();
+        for page in [1, 1, 0, 3, 2, 0] {
+            let index = page * BITMAP_PAGE_BYTES;
+            let prepared = map.prepare_byte_write(index, 3).unwrap();
+            // Same persistence-before-install ordering as a production write.
+            output.seek(SeekFrom::Start(index)).unwrap();
+            output.write_all(&[3]).unwrap();
+            map.commit_byte_write(prepared);
+            let noop = map.prepare_byte_write(index, 3).unwrap();
+            assert!(!noop.changes);
+            map.commit_byte_write(noop);
+            let abandoned = map.prepare_set(first_bit_of(page), false).unwrap();
+            drop(abandoned);
+            assert_eq!(map.byte_mut(index).unwrap(), 3);
+            assert!(map.store_mut().cached_bytes <= BITMAP_PAGE_BYTES);
+        }
+        assert!(reads() >= 5, "exercise real cache misses and eviction");
+        assert_eq!(
+            scaling_counters::get_always(&scaling_counters::BITMAP_STORE_BORROWS),
+            0
+        );
+        assert_eq!(reads_under_lock(), 0);
+    }
+
+    #[cfg(feature = "integrity")]
+    #[test]
+    fn exclusive_preparation_rejects_corrupt_backing_before_mutation() {
+        let (directory, _file, mut map) = backed_bitmap(BITMAP_PAGE_BYTES);
+        let mut output = File::options()
+            .write(true)
+            .open(directory.path().join("commit-map"))
+            .unwrap();
+        let digest_base = PAGES * BITMAP_PAGE_BYTES;
+        let mut page = vec![0; BITMAP_PAGE_BYTES as usize];
+        page[0] = 1;
+        write_page_digest(
+            &mut output,
+            digest_base,
+            crc32_bytes(&page).unwrap(),
+            PAGE_STATE_INITIALIZED,
+        )
+        .unwrap();
+        map.backing.as_mut().unwrap().digest_base = Some(digest_base);
+        output.seek(SeekFrom::Start(0)).unwrap();
+        output.write_all(&[2]).unwrap();
+        scaling_counters::set(&scaling_counters::BITMAP_STORE_BORROWS, 0);
+        assert!(matches!(
+            map.prepare_byte_write(0, 3),
+            Err(Error::MatrixFatalCorruption)
+        ));
+        assert!(map.store_mut().pages.is_empty());
+        assert_eq!(
+            scaling_counters::get_always(&scaling_counters::BITMAP_STORE_BORROWS),
+            0
+        );
+    }
+
+    /// Demand loading: `faulted_store` drops the local borrow for the whole of
     /// `load_page`, so a fault-in read is never issued under it.
     ///
     /// The configuration is hostile on purpose — a one-page cache against four
@@ -9802,16 +9748,12 @@ mod page_store_lock_audit_tests {
         assert_eq!(
             reads_under_lock(),
             0,
-            "a fault-in `pread` was issued while the page store was locked; every other \
-             reader of this bitmap would queue behind it"
+            "a fault-in read was issued while the local page store was borrowed"
         );
         assert_eq!(guards_held(), 0, "a page-store guard outlived its scope");
     }
 
-    /// The whole-map aggregate: `O(live pages)` of reads, so holding the lock
-    /// once for the loop would park every concurrent reader of the category for
-    /// the length of the scan. Reachable under `&self` through `resume_signal`,
-    /// which is what made it worth fixing rather than documenting.
+    /// Whole-map aggregates release local cache borrows before I/O too.
     #[test]
     fn an_aggregate_reads_without_holding_the_page_store_lock() {
         let (_directory, _file, map) = backed_bitmap(BITMAP_PAGE_BYTES * PAGES);
@@ -9949,8 +9891,8 @@ mod page_store_lru_tests {
         let file = Arc::new(File::open(&path).expect("open map"));
         let mut map = SparseBitmap::new((PAGES + 1) * BITMAP_PAGE_BYTES * 8).expect("bitmap");
         map.backing = Some(LazyBacking {
-            file,
-            pool: Arc::new(MatrixReadPool::new()),
+            file: Box::new(Source::Raw(file)),
+            pool: MatrixReadPool::new(),
             base_offset: 0,
             digest_base: None,
             cache_limit,
@@ -10280,7 +10222,7 @@ mod mutation_precharge_rollback_tests {
         (directory, file, layout)
     }
 
-    fn commit(layout: &mut MatrixLayout, file: &mut File, ordinal: u64) -> Result<()> {
+    fn commit(layout: &mut MatrixLayout, file: &mut impl MatrixIo, ordinal: u64) -> Result<()> {
         let (commit_index, update) =
             prepare_cell_commit(layout, CATEGORY, ordinal, true).expect("prepare commit bit");
         apply_commit_bit(layout, file, commit_index, update)
@@ -10291,6 +10233,43 @@ mod mutation_precharge_rollback_tests {
             layout.resident_bitmap_bytes,
             layout.resident_page_index_bytes,
         )
+    }
+
+    #[test]
+    fn cell_write_preparation_and_publication_take_no_dynamic_bitmap_borrows() {
+        let (_directory, mut file, mut layout) = fixture();
+        for round in 0..3 {
+            scaling_counters::set(&scaling_counters::BITMAP_STORE_BORROWS, 0);
+            for ordinal in [0, BITMAP_PAGE_BYTES * 8, SCANS * CHANNELS - 1] {
+                let prepared = prepare_current_write_bit(&mut layout, 0, ordinal).unwrap();
+                commit_current_write_bit(&mut layout, 0, prepared);
+                for value in [true, true, false, true] {
+                    set_cell_crc_valid(&mut layout, &mut file, 0, ordinal, value).unwrap();
+                    set_cell_commit(&mut layout, &mut file, CATEGORY, ordinal, value).unwrap();
+                }
+            }
+            assert_eq!(
+                scaling_counters::get_always(&scaling_counters::BITMAP_STORE_BORROWS),
+                0,
+                "round {round}"
+            );
+            file.sync_data().unwrap();
+            let len = file.raw().metadata().unwrap().len();
+            layout = read_layout_at_len(precharge_spec(), &mut file, 0, len).unwrap();
+            // Verify persistence, then reopen again to exercise cold write faults.
+            for ordinal in [0, BITMAP_PAGE_BYTES * 8, SCANS * CHANNELS - 1] {
+                assert!(layout.commits[0].bits.get(ordinal).unwrap());
+                assert!(
+                    layout.blocks[0]
+                        .crc_valid_bits
+                        .complete()
+                        .unwrap()
+                        .get(ordinal)
+                        .unwrap()
+                );
+            }
+            layout = read_layout_at_len(precharge_spec(), &mut file, 0, len).unwrap();
+        }
     }
 
     /// The commit-bit path, at all three fallible boundaries.
@@ -10358,7 +10337,7 @@ mod mutation_precharge_rollback_tests {
             let (_dir, mut file, mut layout) = fixture();
             let (payload_before, _) = counters(&layout);
 
-            let update = prepare_cell_crc_valid(&layout, 0, 0, true)
+            let update = prepare_cell_crc_valid(&mut layout, 0, 0, true)
                 .expect("prepare validity bit")
                 .expect("integrity is enabled, so a validity bitmap exists");
             arm.set(true);
@@ -10373,7 +10352,7 @@ mod mutation_precharge_rollback_tests {
                 "{name}: a failed validity mutation left a payload page charged"
             );
 
-            let update = prepare_cell_crc_valid(&layout, 0, 0, true)
+            let update = prepare_cell_crc_valid(&mut layout, 0, 0, true)
                 .expect("prepare validity bit")
                 .expect("validity bitmap exists");
             apply_cell_crc_valid(&mut layout, &mut file, 0, update)
@@ -10743,7 +10722,7 @@ mod bypass_catalogue {
     #[test]
     fn the_mirror_escape_lends_no_route_back_to_the_bitmap() {
         let mut evidence = CrcValidEvidence::newly_created(64).expect("fresh evidence");
-        let mirror = evidence.page_index_mirror_mut();
+        let mut mirror = evidence.page_index_mirror_mut();
         // The whole surface the escape has outside `mod page_index`: two
         // questions about the persisted index. Neither reads a validity bit,
         // and there is no third.

@@ -13,7 +13,7 @@ publish = false
 [dependencies]
 # The rename under test. There must be NO `extern crate vv as varve`
 # workaround anywhere in this crate.
-vv = { package = "varve", path = "../../crates/varve" }
+vv = { package = "varve", path = "../../crates/varve", default-features = false }
 
 # Detach from the repository workspace: this crate must resolve `varve` the
 # way an external consumer does.

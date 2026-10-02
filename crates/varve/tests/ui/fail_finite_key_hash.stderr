@@ -1,0 +1,5 @@
+error: unexpected end of input, finite keys require schema_hash: computed so value/code changes cannot silently reinterpret a file
+ --> tests/ui/fail_finite_key_hash.rs:8:5
+  |
+8 |     }
+  |     ^

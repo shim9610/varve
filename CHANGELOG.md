@@ -4,6 +4,134 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
+## Unreleased — 0.10.0
+
+- Promote streaming, indexed lookup, disk-index plans, finite keys and scan
+  control to the default public API, including `--no-default-features`. Remove
+  `high-cardinality-dev`; callers should delete it from Cargo feature lists.
+  Generate stream/indexed wrappers from schema declarations without a Cargo
+  gate. Manual
+  `VarveBlock` implementations must always declare `IS_KEYED`. Keep fault
+  injection opt-in. Update feature-matrix CI and downstream API fixtures.
+  This prepares a pre-1.0 minor release; it does not publish a release or run a
+  new deep-load qualification campaign.
+
+- Replace the generated layout reader's ordinal-cache `OnceLock` with a local
+  `OnceCell`. Preserve lazy indexing and `&self` reads; generated layout readers
+  are now `Send + !Sync`, with one reader per reading thread.
+
+- Make ordinary matrix `follow()` apply COW root differences to bitmap indexes,
+  verification and caches. Persist a compaction epoch; only a changed epoch
+  triggers a full metadata rebuild, including when intermediate generations were
+  skipped. Keep the old generation on failed validation or resource admission.
+
+- Publish matrix payloads, commit maps, CRC metadata, aux ranges and growing
+  chunks as immutable confirmed generations. `sync()`/Immediate publish;
+  `flush()` and drop do not. Readers follow explicitly without reader mutexes.
+  Add `matrix_generation()`, `matrix_generation_path()`, `compact_matrix()` and
+  an open-time generation-page cache budget (2 MiB default). Matrix storage now
+  requires the primary plus its nonce-named `.vmg` companion; old files need
+  recreation. Add concurrent overwrite, seeded model, torn-head, process-abort,
+  dirty-tail recovery and old-reader compaction tests. See the durability model.
+
+- Make resident and matrix readers and generated wrappers `Send + !Sync`, with
+  one reader per reading thread and private caches. Keep reads as `&self`;
+  remove bitmap cache mutexes and the Windows shared read-handle registry.
+  Cache budgets remain configurable per bitmap at open. Add compile-fail sharing
+  checks, cache isolation/eviction tests and warmed-reader transfer coverage.
+
+- Avoid bitmap mutex acquisition during matrix cell mutation preparation,
+  including cold-page loading, commit digests, CRC-validity bits and session
+  write tracking. Preserve checksum validation, cache budgets and mutation
+  ordering; add counted regression tests for zero dynamic cache borrows.
+- Replace the finite-enum B-tree path with fixed direct slot tables. Publish only
+  changed 64-slot chunks at explicit sync boundaries; preserve independent
+  reader snapshots, deletion verification, rebuild and compaction. Sidecars now
+  use `VARVEIX5` and require rebuild. See [finite schema keys](docs/scalable-io.md#finite-schema-keys).
+- Add finite schema value keys: `key_values` declares named combinations and
+  `key_domain` expands finite field domains, limited to 4,096 combinations per
+  block. Generate a two-byte enum key in both records and indexes; reject unknown
+  combinations/codes and require computed schema identity. Record identities
+  remain offsets. Remove the mistaken block-kind enum. See
+  [finite schema keys](docs/scalable-io.md#finite-schema-keys).
+- Compact native v2 internal index entries from 80 to 44 bytes (50 to 92 children
+  per page). Load distinct-prefix long keys on demand and coalesce adjacent
+  required key reads with individual CRC validation. Retain bounded private
+  reader caches and COW publication; prior sidecars require rebuild/bootstrap.
+  Cold reads still validate loaded pages; unrelated external key bodies are
+  checked only when needed.
+- Scalable cursors cannot move between threads; positional framing also keeps
+  existing local cursors safe when their reader is moved.
+- Reader cold-open Busy errors have bounded retry guidance; local reader startup
+  and teardown do not reject the sole writer. Added snapshot status, retention,
+  and explicit release/reacquire APIs without changing durability boundaries.
+- Replace runtime redb with a Varve-native append-only COW index and CRC-protected
+  confirmed/working checkpoints. Old sidecars require rebuild; compatibility is
+  intentionally not retained. redb remains a dev-only oracle.
+- Reader caches are private; reader open never takes writer admission. Independent
+  readers work across processes. Add explicit clean-state `compact_index()` with
+  old-file retention and follow across sidecar compaction.
+- Add shared seeded/libFuzzer differential tests against redb and BTreeMap, an
+  index-only timing oracle, partial-publication crash cases, and a reproducible
+  comparison runner for actual 20 GiB files. See [validation commands](docs/self-check-guide.md#scalable-io-validation).
+
+### Confirmed-generation readers
+
+- Make scalable stream/indexed readers and generated wrappers `Send + !Sync`:
+  each reading thread opens its own reader. Shared-reference/`Arc` cross-thread
+  use is rejected at compile time; ordinary reads still take `&self`.
+
+- Stream/indexed readers open during Dirty writes using the last confirmed index
+  and EOF. Add `follow()` and resumable `follow_events`/`follow_blocks` to core and
+  generated readers. Refresh never publishes, restores, or scans old records.
+- Published native index pages are immutable and never reused. Confirmed roots
+  remain separate from working publications; churn qualification rejects every
+  reader-open/follow failure.
+
+
+### Caller-selected Immediate boundaries
+
+- Add append-block `durability = immediate` and value-based `immediate_if`
+  declarations, runtime `ImmediatePolicy` record/byte/predicate conditions, and
+  explicit `immediate()` on native, stream, and indexed writers and generated
+  wrappers. Automatic failures report `AppendedButImmediateFailed`.
+- Use non-durable native working checkpoints for ordinary scalable sidecar batches. Separate
+  native chunk boundaries from index transaction bounds; native sync still
+  precedes durable clean publication. Keep the first-write rollback checkpoint.
+  See [semantics and recovery](docs/immediate-policy.md).
+
+### Scalable I/O qualification
+
+- Add an optimized real-byte workload and Linux resource monitor, with full
+  payload oracles, 20 GiB write/read/delete cycles, concurrent snapshot readers,
+  reader-open churn, subprocess probes and explicit recovery verification.
+- Remove Varve's sidecar registry and tail-cache mutexes. Reader validation now
+  uses metadata and a bounded savepoint summary from one read-only snapshot,
+  avoiding writer `IndexBusy` under reader-open churn. Make the reproducer a
+  normal regression test and retain it in qualification. See the
+  [publication protocol](docs/scalable-io.md).
+- Add strict seeded model histories, four-reader snapshot publication tests,
+  and repeated external process-kill/recovery tests for the default stream/indexed APIs.
+- Add explicit 64 MiB heap and 16 MiB growth budgets to 10k/100k/1m-key probes.
+- Add a portable qualification runner with source identities, per-stage logs,
+  timeout handling, negative controls and JSON reports. Sparse probes that skip
+  cannot pass the campaign. API promotion does not establish long-duration
+  qualification; see [validation commands](docs/self-check-guide.md#scalable-io-validation).
+
+### Dependency refresh
+
+- Update the pinned redb backend from 4.1.0 to 4.3.0, the format macro parser
+  from syn 2.0.118 to 3.0.6, and zstd from 0.13.3 to 0.14.0.
+- Refresh compatible runtime, macro, test, and build dependencies across the
+  root, fuzz, and downstream-fixture lockfiles. The declared Rust minimum
+  remains 1.95.
+- Allow BSD-3-Clause in both dependency policies for the updated zstd crates.
+- Update the Python compatibility harness to npTDMS 1.11.0 and NumPy 2.5.3;
+  these optional tools now require Python 3.12 or newer instead of 3.11.
+  npTDMS-authored `SingleFloatWithUnit` and `DoubleFloatWithUnit` channels remain
+  outside the harness's supported writer path; the limitation persists in 1.11.0.
+- Update the pinned GitHub Actions commits to checkout 7.0.1 and rust-cache 2.9.2.
+
 ## 0.9.2 - 2026-09-06
 
 ### Thirty-one published statements that had drifted away from the code

@@ -84,7 +84,7 @@ types can be skipped.
 ## Matrix Blocks
 
 Matrix blocks are for bounded runtime-sized grids that need direct cell access
-and in-place same-size overwrite. They are not append-log records. A matrix file
+and copy-on-write same-size overwrite. They are not append-log records. A matrix file
 stores runtime dimensions at create time, preallocates deterministic slot
 regions, and uses commit bitmaps as the only normal read-time validity source.
 
@@ -144,18 +144,16 @@ prevent. If the per-cell length is genuinely not known until create time, it is
 not a fixed array in a cell; make it a third matrix dimension, or an append-log
 variable block.
 
-The first implementation focuses on dense `(scan, ch)` addressing, bounded slot
-payloads, `NotCommitted` reads, and same-size in-place overwrites. Append-log
-blocks may coexist after the preallocated matrix regions.
+Matrix storage uses dense `(scan, ch)` addressing and bounded slot payloads.
+Append-log blocks may coexist after the preallocated logical matrix regions.
 
-Same-size overwrite is fail-safe within one writer: Varve clears the old commit
-and CRC-valid evidence before writing slot bytes, and a later explicit commit is
-the final visibility step. Partial matrix I/O poisons the writer and leaves the
-cell uncommitted. Matrix readers snapshot the layout, not commit maps and not
-immutable copies of every slot: since 0.5.0 each commit-map page is as of the
-first read that faulted it in. Applications must not overlap a reader with
-in-place writes to slots it may read; use external read leases or a higher-level
-generation/version scheme when concurrent immutable snapshots are required.
+Each reader captures one confirmed generation of slot bytes, commit maps, CRC
+metadata and aux data. The writer stages copy-on-write pages, including on
+same-cell overwrite; readers remain safe while it writes. Explicit `sync()` or
+Immediate publishes the new root; `flush()` and drop do not. Readers advance
+through `follow(&mut self)` and queries take `&self`. Use one reader per thread.
+The required `.vmg` companion and compaction rules are documented in the
+[durability model](durability-model.md).
 
 Rules to keep stable:
 

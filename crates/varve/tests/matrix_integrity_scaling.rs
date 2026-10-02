@@ -11,7 +11,9 @@
 //! allocates a large physical file.
 #![cfg(all(feature = "integrity", feature = "scalable-fault-injection"))]
 
-use std::fs::OpenOptions;
+#[path = "common/matrix_image.rs"]
+mod matrix_image;
+use matrix_image::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -19,8 +21,8 @@ use varve::{
     BlockDescriptor, BlockKind, Endian, Error, FormatSpec, IndexPolicy, IntegrityPolicy,
     MatrixBlockDescriptor, MatrixCellStatus, MatrixCommitDescriptor, MatrixCommitKind,
     MatrixCorruptionKind, MatrixCorruptionSeverity, MatrixDimensionDescriptor, MatrixDimensions,
-    MatrixKey, MatrixMetadataVerification, MatrixRecoveryAction, MatrixRecoveryReport, ReadLimits,
-    VarveBlock, VarveMatrixBlock,
+    MatrixKey, MatrixMetadataVerification, MatrixRecoveryReport, ReadLimits, VarveBlock,
+    VarveMatrixBlock,
 };
 
 /// Commit-map page size used by the paged integrity representation.
@@ -121,7 +123,7 @@ fn fill(path: &Path, scans: u64, count: u64) -> varve::Result<()> {
         )?;
         writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
     }
-    writer.flush()?;
+    writer.sync()?;
     Ok(())
 }
 
@@ -558,6 +560,7 @@ fn published_page_corruption_is_detected_without_an_allocation_map() -> varve::R
         writer.read_matrix_cell::<ScalingCell>(key(3))?,
         ScalingCell { value: 4 }
     );
+    writer.sync()?;
     drop(writer);
 
     // The rebuilt map must reopen cleanly through the index alone.
@@ -630,7 +633,7 @@ fn cleared_pages_are_evicted_and_residency_returns_to_baseline() -> varve::Resul
             "round {round} left cleared bitmap pages resident: {after} vs {baseline}"
         );
     }
-    writer.flush()?;
+    writer.sync()?;
     Ok(())
 }
 
@@ -687,7 +690,7 @@ fn page_index_residency_returns_to_baseline_across_page_churn() -> varve::Result
         peaks.iter().all(|peak| *peak == peaks[0]),
         "page-index residency grew with historical churn: {peaks:?}"
     );
-    writer.flush()?;
+    writer.sync()?;
     Ok(())
 }
 
@@ -787,7 +790,7 @@ fn category_clear_refunds_payload_and_page_index_residency_every_cycle() -> varv
         writer.clear_matrix_category(ScalingCell::CATEGORY)?,
         PAGE_ORDINALS.len() as u64
     );
-    writer.flush()?;
+    writer.sync()?;
     Ok(())
 }
 
@@ -826,7 +829,7 @@ fn repeated_populate_clear_cycles_do_not_exhaust_the_bitmap_ceiling() -> varve::
             PAGE_ORDINALS.len() as u64
         );
     }
-    writer.flush()?;
+    writer.sync()?;
     Ok(())
 }
 
@@ -851,7 +854,7 @@ fn reopen_after_churn_visits_only_live_pages() -> varve::Result<()> {
             writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
             writer.clear_matrix_cell::<ScalingCell>(key(ordinal))?;
         }
-        writer.flush()?;
+        writer.sync()?;
     }
 
     MatrixRecoveryReport::reset_matrix_integrity_counters();
@@ -907,7 +910,7 @@ fn damaged_page_index_entry_is_reported_and_later_pages_still_load() -> varve::R
             writer.write_matrix_cell(key(ordinal), &ScalingCell { value: 3 })?;
             writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
         }
-        writer.flush()?;
+        writer.sync()?;
     }
 
     let base = page_index_off(&path);
@@ -1214,7 +1217,7 @@ fn never_written_and_zero_written_pages_are_distinguishable() -> varve::Result<(
         writer.write_matrix_cell(key(0), &ScalingCell { value: 5 })?;
         writer.commit_matrix_cell::<ScalingCell>(key(0))?;
         writer.clear_matrix_cell::<ScalingCell>(key(0))?;
-        writer.flush()?;
+        writer.sync()?;
     }
     let reader = spec().open_reader(&cleared)?;
     assert!(
@@ -1233,7 +1236,7 @@ fn never_written_and_zero_written_pages_are_distinguishable() -> varve::Result<(
         let mut writer = spec().create_writer_with_dims(&hostile, dims(LARGE_SCANS))?;
         writer.write_matrix_cell(key(0), &ScalingCell { value: 5 })?;
         writer.commit_matrix_cell::<ScalingCell>(key(0))?;
-        writer.flush()?;
+        writer.sync()?;
     }
     // Byte inside the fourth commit-map page, which no write has ever touched.
     patch_byte(
@@ -1338,7 +1341,7 @@ fn fill_pages(path: &Path, scans: u64, pages: &[u64]) -> varve::Result<()> {
         writer.write_matrix_cell(key(ordinal), &ScalingCell { value: 7 })?;
         writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
     }
-    writer.flush()?;
+    writer.sync()?;
     Ok(())
 }
 
@@ -1357,33 +1360,31 @@ fn quarantine_commit_map(path: &Path) {
 /// all. The failure this guards against is neither of those: a valid short
 /// occupancy count that answers `NotCommitted` for committed cells in silence.
 fn assert_page_index_fails_closed(path: &Path, context: &str) -> varve::Result<()> {
-    {
-        let reader = open_without_allocation_map(path, true)?;
-        let report = reader.matrix_recovery_report();
-        assert!(
-            report
-                .findings
-                .iter()
-                .any(|finding| finding.kind == MatrixCorruptionKind::CommitMap
-                    && finding.severity == MatrixCorruptionSeverity::Fatal),
-            "{context}: an interrupted page-index republication produced no fatal finding: {:?}",
-            report.findings
-        );
-        assert!(
-            report
-                .recommended_actions
-                .contains(&MatrixRecoveryAction::RebuildCommitMap { category: None }),
-            "{context}: fatal page-index damage recommended no rebuild: {:?}",
-            report.recommended_actions
-        );
-    }
+    let reader = open_without_allocation_map(path, true)?;
+    let report = reader.matrix_recovery_report();
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.kind == MatrixCorruptionKind::CommitMap
+                && finding.severity == MatrixCorruptionSeverity::Recoverable),
+        "{context}: previous confirmed quarantine was lost: {:?}",
+        report.findings
+    );
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|finding| finding.severity == MatrixCorruptionSeverity::Fatal),
+        "{context}: unpublished rebuild damaged the confirmed index"
+    );
     let reader = open_without_allocation_map(path, false)?;
     assert!(
         matches!(
             reader.matrix_cell_status::<ScalingCell>(key(0)),
-            Err(Error::MatrixFatalCorruption)
+            Err(Error::MatrixCommitQuarantined(_))
         ),
-        "{context}: cell access was answered from a page index known to be incomplete"
+        "{context}: quarantine must remain until rebuilt generation is synced"
     );
     Ok(())
 }
@@ -1427,7 +1428,7 @@ fn an_interrupted_rebuild_entry_write_fails_closed_and_rebuilds() -> varve::Resu
     {
         let mut writer = spec().with_matrix_fatal_forensics().open_writer(&path)?;
         assert_eq!(writer.rebuild_matrix_commit_from_crc::<ScalingCell>()?, 3);
-        writer.flush()?;
+        writer.sync()?;
     }
     let reader = open_without_allocation_map(&path, false)?;
     for page in [0u64, 1, 2] {
@@ -1628,7 +1629,7 @@ fn assert_failed_allocation_persists_nothing(label: &str, attempt: u64) -> varve
             MatrixCellStatus::NotCommitted,
             "{label}: memory recorded a commit the mutation refused"
         );
-        writer.flush()?;
+        writer.sync()?;
     }
 
     // Disk must agree with memory: nothing was persisted for the failed page.
@@ -1657,7 +1658,7 @@ fn assert_failed_allocation_persists_nothing(label: &str, attempt: u64) -> varve
         let mut writer = spec().open_writer(&path)?;
         writer.write_matrix_cell(key(SAME_BYTE), &ScalingCell { value: 3 })?;
         writer.commit_matrix_cell::<ScalingCell>(key(SAME_BYTE))?;
-        writer.flush()?;
+        writer.sync()?;
     }
 
     let reader = open_without_allocation_map(&path, true)?;
@@ -1740,7 +1741,7 @@ fn a_refused_page_index_compaction_leaves_disk_and_mirror_in_the_same_order() ->
         MatrixRecoveryReport::inject_matrix_page_index_header_write_failure(1);
         writer.clear_matrix_cell::<ScalingCell>(key(PAGE_ORDINALS[0]))?;
         MatrixRecoveryReport::inject_matrix_page_index_header_write_failure(0);
-        writer.flush()?;
+        writer.sync()?;
     }
     let duplicate_state = page_index_state(&path, 3);
     assert_eq!(
@@ -1765,7 +1766,7 @@ fn a_refused_page_index_compaction_leaves_disk_and_mirror_in_the_same_order() ->
             "the injected mirror reservation failure did not surface as a typed \
              allocation failure: {refused:?}"
         );
-        writer.flush()?;
+        writer.sync()?;
         assert_eq!(
             page_index_state(&path, 3),
             duplicate_state,
@@ -1777,7 +1778,7 @@ fn a_refused_page_index_compaction_leaves_disk_and_mirror_in_the_same_order() ->
         // mirror from disk and hide the disagreement. Emptying page 2 releases
         // its entry through whatever slot positions the mirror believes in.
         writer.clear_matrix_cell::<ScalingCell>(key(PAGE_ORDINALS[2]))?;
-        writer.flush()?;
+        writer.sync()?;
     }
     assert_eq!(
         page_index_state(&path, 2).1[1],
@@ -1857,7 +1858,7 @@ fn crc_rebuild_refuses_an_incompletely_loaded_validity_index() -> varve::Result<
             writer.write_matrix_cell(key(ordinal), &ScalingCell { value: 5 })?;
             writer.commit_matrix_cell::<ScalingCell>(key(ordinal))?;
         }
-        writer.flush()?;
+        writer.sync()?;
     }
 
     let validity_base = validity_page_index_off(&path, LARGE_SCANS);
@@ -1919,7 +1920,7 @@ fn crc_rebuild_refuses_an_incompletely_loaded_validity_index() -> varve::Result<
         "a cell write turned incomplete validity evidence into a licence to \
          republish the commit map: {after_write:?}"
     );
-    writer.flush()?;
+    writer.sync()?;
     drop(writer);
 
     // (3) The other consumer of the validity bitmap still fails *closed*, and

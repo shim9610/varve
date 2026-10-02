@@ -133,12 +133,9 @@ pub enum MatrixMetadataResidency {
     ///   authoritative for which pages hold state; "not cached" and "not
     ///   published" are distinct states and only the second answers zero. An
     ///   index that could not be enumerated in full is a fatal finding at open.
-    /// * **A page's contents are as of the first touch that faulted it in, not
-    ///   as of open.** Pages not yet faulted in have no snapshot pinned, so a
-    ///   reader that must see one consistent instant across a whole map has to
-    ///   coordinate that itself — no residency bound provides it, because a
-    ///   bound that pinned the whole live set would be the eager load this
-    ///   design removed.
+    /// * **Cache misses retain generation identity.** Every loaded page belongs
+    ///   to the reader's captured confirmed root. Eviction changes residency,
+    ///   not visibility; only `follow(&mut self)` adopts a later generation.
     Lazy {
         /// Ceiling on the cached commit-map payload, in bytes, per bitmap.
         /// Rounded up to a whole 4096-byte page internally, with a one-page
@@ -516,6 +513,10 @@ pub struct ReadLimits {
     /// whole live set, or as a bound on a demand-filled cache — and because it
     /// is a property of one reader's open, not of the file's format.
     pub matrix_metadata_residency: MatrixMetadataResidency,
+    /// Per-reader cache for immutable matrix generation data and directory pages.
+    /// Missing resolves to 2 MiB; zero disables it. This is separate from the
+    /// bitmap cache and excludes fixed page buffers and map bookkeeping.
+    pub matrix_generation_cache_bytes: ReadLimit,
     /// Declared matrix commit-metadata verification policy.
     ///
     /// [`MatrixMetadataVerification::Missing`] unless somebody declared one,
@@ -575,6 +576,7 @@ impl ReadLimits {
         // indistinguishable from a caller's declaration and could not be
         // clamped to whatever `max_matrix_bitmap_bytes` ends up being.
         matrix_metadata_residency: MatrixMetadataResidency::Missing,
+        matrix_generation_cache_bytes: ReadLimit::Missing,
         // `Missing` for the same reason: a preset that declared a verification
         // policy would be indistinguishable from a caller who declared one, and
         // would win over a format's declaration through `overlay`.
@@ -623,10 +625,26 @@ impl ReadLimits {
             // and `TRUSTED_UNBOUNDED` declare no residency and no verification
             // policy, exactly as they declare no ceilings.
             matrix_metadata_residency: MatrixMetadataResidency::Missing,
+            matrix_generation_cache_bytes: ReadLimit::Missing,
             matrix_metadata_verification: MatrixMetadataVerification::Missing,
             integrity_verification: IntegrityVerification::Missing,
             trusted_api: false,
         }
+    }
+
+    /// Sets the private immutable generation-page cache capacity at open.
+    /// The default is 2 MiB. Zero disables caching; bytes are rounded down to
+    /// full 4096-byte buffers. Bitmap cache capacity is configured separately.
+    pub const fn with_matrix_generation_cache_bytes(mut self, bytes: u64) -> Self {
+        self.matrix_generation_cache_bytes = ReadLimit::Finite(bytes);
+        self
+    }
+    pub(crate) fn matrix_generation_cache_budget(self) -> usize {
+        let bytes = match self.matrix_generation_cache_bytes {
+            ReadLimit::Finite(n) => n,
+            _ => 2 * 1024 * 1024,
+        };
+        usize::try_from(bytes).unwrap_or(usize::MAX)
     }
 
     /// Declares the matrix commit-metadata residency policy (see
@@ -839,6 +857,9 @@ impl ReadLimits {
 
     pub const fn tighten(self, runtime: Self) -> Self {
         Self {
+            matrix_generation_cache_bytes: self
+                .matrix_generation_cache_bytes
+                .tighten(runtime.matrix_generation_cache_bytes),
             // Not a limit: a residency policy is a declaration, not a ceiling,
             // so there is nothing to meet. The format's declaration stands; a
             // runtime one is taken only where the format made none.
@@ -898,6 +919,9 @@ impl ReadLimits {
     /// values as permanent format ceilings.
     pub const fn overlay(self, runtime: Self) -> Self {
         Self {
+            matrix_generation_cache_bytes: self
+                .matrix_generation_cache_bytes
+                .overlay(runtime.matrix_generation_cache_bytes),
             // Composes like every ceiling above it: a runtime `ReadLimits` that
             // never called `with_matrix_metadata_residency` carries `Missing`
             // and leaves a format-declared policy alone. Taking the runtime

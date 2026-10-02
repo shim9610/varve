@@ -320,10 +320,11 @@ fn mmap_constructor_rejects_truncated_empty_snapshot() -> varve::Result<()> {
     assert!(reader.index_entries().is_empty());
     OpenOptions::new().write(true).open(&path)?.set_len(1)?;
 
-    let mapped = catch_unwind(|| {
+    // No state is reused after a panic; this checks rejection, not unwind recovery.
+    let mapped = catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: Mutation is complete before this call and no mapping is returned.
         unsafe { reader.mmap_payloads() }
-    });
+    }));
     assert!(mapped.is_ok(), "truncated empty snapshot caused a panic");
     assert!(matches!(
         mapped.expect("checked above"),

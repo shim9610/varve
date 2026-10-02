@@ -1,4 +1,3 @@
-#[cfg(any(feature = "high-cardinality-dev", test))]
 use crate::native_layout::{native_record_footer_len, native_record_header_len};
 use crate::{Error, Result};
 
@@ -32,7 +31,6 @@ impl FileOffset {
 pub(crate) struct ByteLength(u64);
 
 impl ByteLength {
-    #[cfg(any(feature = "high-cardinality-dev", test))]
     pub(crate) const ZERO: Self = Self(0);
 
     pub(crate) const fn new(value: u64) -> Self {
@@ -43,7 +41,6 @@ impl ByteLength {
         self.0
     }
 
-    #[cfg(any(feature = "high-cardinality-dev", test))]
     pub(crate) fn checked_add(self, other: Self) -> Result<Self> {
         self.checked_add_for(other, "byte length")
     }
@@ -52,7 +49,6 @@ impl ByteLength {
         usize::try_from(self.0).map_err(|_| Error::LengthOverflow { value: self.0 })
     }
 
-    #[cfg(any(feature = "high-cardinality-dev", test))]
     fn checked_add_for(self, other: Self, resource: &'static str) -> Result<Self> {
         self.0
             .checked_add(other.0)
@@ -87,7 +83,6 @@ impl SnapshotBounds {
         Ok(end)
     }
 
-    #[cfg(any(feature = "high-cardinality-dev", test))]
     pub(crate) fn validate_native_record(
         self,
         pointer: UntrustedRecordPointer,
@@ -104,7 +99,6 @@ impl SnapshotBounds {
         )
     }
 
-    #[cfg(any(feature = "high-cardinality-dev", test))]
     fn validate(
         self,
         pointer: UntrustedRecordPointer,
@@ -129,7 +123,6 @@ impl SnapshotBounds {
     }
 }
 
-#[cfg(any(feature = "high-cardinality-dev", test))]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct RecordSpan {
     record_offset: FileOffset,
@@ -141,7 +134,6 @@ pub(crate) struct RecordSpan {
     end: FileOffset,
 }
 
-#[cfg(any(feature = "high-cardinality-dev", test))]
 impl RecordSpan {
     fn from_physical_len(
         bounds: SnapshotBounds,
@@ -255,14 +247,12 @@ impl RecordSpan {
     }
 }
 
-#[cfg(any(feature = "high-cardinality-dev", test))]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct UntrustedRecordPointer {
     record_offset: u64,
     physical_len: u64,
 }
 
-#[cfg(any(feature = "high-cardinality-dev", test))]
 impl UntrustedRecordPointer {
     pub(crate) const fn new(record_offset: u64, physical_len: u64) -> Self {
         Self {
@@ -272,20 +262,17 @@ impl UntrustedRecordPointer {
     }
 }
 
-#[cfg(any(feature = "high-cardinality-dev", test))]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct ValidatedRecordPointer {
     span: RecordSpan,
 }
 
-#[cfg(any(feature = "high-cardinality-dev", test))]
 impl ValidatedRecordPointer {
     pub(crate) const fn span(self) -> RecordSpan {
         self.span
     }
 }
 
-#[cfg(any(feature = "high-cardinality-dev", test))]
 fn invalid_record_pointer() -> Error {
     Error::InvalidIndexCheckpoint
 }

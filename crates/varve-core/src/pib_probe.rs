@@ -1,4 +1,4 @@
-#![cfg(all(test, feature = "high-cardinality-dev"))]
+#![cfg(test)]
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -136,9 +136,7 @@ fn require_integrity() {}
 
 #[cfg(not(feature = "integrity"))]
 fn require_integrity() {
-    panic!(
-        "sparse offset probe requires --features high-cardinality-dev,integrity for CRC verification"
-    );
+    panic!("sparse offset probe requires --features integrity for CRC verification");
 }
 
 #[test]

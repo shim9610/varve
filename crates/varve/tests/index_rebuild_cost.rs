@@ -1,5 +1,3 @@
-#![cfg(feature = "high-cardinality-dev")]
-
 //! Rebuild cost contracts (PERF-04/PERF-05, PERF2-03, DUR-03, DUR2-04,
 //! DUR2-01).
 //!

@@ -1,64 +1,7 @@
-//! Criterion (C) of the matrix access model: **every matrix read entry point
-//! takes `&self`, and one handle serves several threads at once.**
-//!
-//! Before this round every matrix read took `&mut self`, because
-//! `matrix::read_cell` took `file: &mut File` and did `seek` + `read_exact`.
-//! The cursor was the only reason for the exclusive borrow, and it made the
-//! owner's first standing policy unsatisfiable: the borrow checker refuses a
-//! second borrow, so a single handle could not serve two readers even though
-//! nothing about a read mutates anything.
-//!
-//! The reads now go through `MatrixRegionReader::read_exact_at`, which is
-//! `pread` on Unix and `seek_read` on Windows. No cursor moves, so no exclusive
-//! borrow is needed and two threads issuing reads against the same open handle
-//! do not interfere.
-//!
-//! These tests are deliberately of four kinds:
-//!
-//! 1. a *compile-time* assertion that the handle is `Sync` (a `&self` signature
-//!    alone would be worthless if `&VarveReader` could not cross a thread
-//!    boundary);
-//! 2. a *behavioural* assertion that N threads sharing one handle each read the
-//!    right values;
-//! 3. a *convoy* check, stated as a counted invariant: no matrix read is issued
-//!    while a commit-map page-store lock is held. That is the property which
-//!    makes readers scale — they contend for `O(1)` hash lookups, never for each
-//!    other's `pread` — and it is decided by control flow, so one thread on a
-//!    loaded machine can observe a violation; and
-//! 4. a *measurement* of scaling, printed and not asserted.
-//!
-//! # Why (3) is counted and (4) is not asserted
-//!
-//! This has now been through three shapes. The first counted how many threads
-//! were *inside* the read path and reported a healthy 4 of 4 while the same code
-//! was ~4x slower than serial: a thread blocked in the kernel is still between
-//! the increment and the decrement, so occupancy cannot tell concurrency from a
-//! convoy.
-//!
-//! The second replaced it with wall clock — total reads held fixed, 1 thread
-//! against N through one handle, `ratio <= 1.0` — which does distinguish the two
-//! on a quiet machine. On this project's Windows development host it measures
-//! 0.31-0.34x over five consecutive runs (0.36-0.42x when the threshold was
-//! written), and the round that introduced the private per-thread handles
-//! recorded 1.55x with them disabled, so the threshold sat with margin on both
-//! sides. Then the first Linux CI runs produced 2.14x and 1.43x on *identical,
-//! healthy* code: a shared runner has fewer real cores than threads,
-//! hyperthread siblings, and a neighbour. Those two numbers differing by 50% is
-//! the proof that the measurement is dominated by the machine, and any threshold
-//! loose enough to survive it (3x, say) would also pass the recorded 1.55x
-//! convoy it exists to catch. A gate that cannot fail for the reason it was
-//! written is worse than no gate, because it reads as one.
-//!
-//! So the contract moved to where it is decidable. `varve-core` counts every
-//! positional matrix read and, separately, every such read issued while a
-//! page-store lock was held; the second must be zero. It is platform- and
-//! load-independent, it needs no second thread, and `varve-core`'s own
-//! `page_store_lock_audit_tests` additionally assert that the counter *does*
-//! rise when a read is deliberately issued under the lock — so zero means the
-//! detector was live rather than absent.
-//!
-//! What that does not measure is throughput, which is why (4) still runs the
-//! comparison and prints it on every CI run. It just does not decide the build.
+//! Matrix readers own private caches and are Send + !Sync. Each reading
+//! thread opens its own reader; regular reads remain &self. Tests cover
+//! concurrent correctness, cache eviction without I/O under a cache borrow,
+//! and separately reported throughput measurements.
 
 use std::path::{Path, PathBuf};
 use std::sync::Barrier;
@@ -171,6 +114,7 @@ fn populated(fixture: &TempMatrix, integrity: varve::IntegrityPolicy) -> varve::
         }
     }
     writer.write_matrix_aux("thumbnail", 0, &[7u8; 32])?;
+    writer.sync()?;
     drop(writer);
     Ok(spec)
 }
@@ -178,43 +122,13 @@ fn populated(fixture: &TempMatrix, integrity: varve::IntegrityPolicy) -> varve::
 /// Criterion (C), part 1: the handle crosses a thread boundary by shared
 /// reference.
 ///
-/// `VarveReader` owns a `RecordFile` (a `std::fs::File` plus a `MatrixReadPool`,
-/// which is a `Mutex`), a `SnapshotFile` (`Arc<File>` plus plain-old-data
-/// bounds), a `MatrixLayout` (`HashMap`s, `Vec`s, `String`s and integers), a
-/// `ResidentIndex` (a `Vec` of 16-byte slots plus its own `SnapshotFile` and a
-/// `Copy` `FormatSpec` — it rebuilds each entry from the file on demand, so it
-/// reads through `&self` and holds no cache), a `PoisonFlag` (two plain `bool`s
-/// behind `&mut self`), and a `OnceLock<ChunkDirectory>`.
-///
-/// Two of those are interior mutability and are `Sync` anyway: `Mutex`
-/// unconditionally, and `OnceLock<T>` when `T: Send + Sync` — `ChunkDirectory`
-/// is a `Vec` of plain data. The chunk directory is also the one that is
-/// written *on a read path*, and it does its I/O before `get_or_init` rather
-/// than inside it, so the lock is never held across a read and two racing
-/// threads each build a copy instead of one waiting on the other.
-///
-/// Nothing here is `Cell`/`RefCell`/raw-pointer shaped, so `Sync` is *derived*
-/// — there is no `unsafe impl` anywhere in the crate for these types. This
-/// assertion exists so that a future field with interior mutability (for
-/// instance a demand-loaded bitmap cache behind a `RefCell`) fails the build
-/// here rather than silently making concurrent reads impossible again. Keep
-/// this list current: it is the reasoning a later reader will trust instead of
-/// re-deriving, and it has already been wrong once — it called `PoisonFlag` an
-/// `AtomicBool` and did not mention `chunk_directory` at all.
+/// Ownership can move to a thread. Cross-thread sharing is covered by the
+/// compile-fail fixtures in compile.rs.
 #[test]
-fn the_reader_handle_is_sync_and_send() {
-    fn assert_sync<T: Sync>() {}
+fn the_reader_and_writer_handles_are_send() {
     fn assert_send<T: Send>() {}
-    assert_sync::<varve::VarveReader>();
     assert_send::<varve::VarveReader>();
-    assert_sync::<varve::VarveFile>();
     assert_send::<varve::VarveFile>();
-    // The writer too: it exposes the same matrix read entry points, and nothing
-    // else in the suite pinned it. `RecordFile` gained a `MatrixReadPool` field
-    // (a `Mutex` over the private per-thread handles); `Mutex` is `Sync`, so
-    // this still derives, but if that pool were ever reshaped into something
-    // `!Sync` — a `RefCell`, a raw pointer — this fails the build.
-    assert_sync::<varve::VarveWriter>();
     assert_send::<varve::VarveWriter>();
 }
 
@@ -305,15 +219,9 @@ fn every_matrix_read_entry_point_takes_a_shared_borrow() -> varve::Result<()> {
     Ok(())
 }
 
-/// Criterion (C), part 3: N threads share one handle and read different cells.
-///
-/// Every thread reads the whole matrix, so the threads' offsets are constantly
-/// interleaved. With the old `seek` + `read_exact` implementation this test
-/// could not be written (no second borrow), and had it been forced through an
-/// `unsafe` shared handle it would have failed: two interleaved `seek`s against
-/// one cursor read each other's slots.
+/// Each thread owns a reader and verifies every cell at interleaved offsets.
 #[test]
-fn threads_sharing_one_handle_read_every_cell_correctly() -> varve::Result<()> {
+fn independent_readers_read_every_cell_correctly() -> varve::Result<()> {
     // `Crc32` is only constructible into a working spec when the `integrity`
     // feature is on; without it every checksummed read fails closed with
     // `IntegrityFeatureDisabled`, so the default-feature run covers `None` only.
@@ -325,8 +233,6 @@ fn threads_sharing_one_handle_read_every_cell_correctly() -> varve::Result<()> {
     for &integrity in policies {
         let fixture = TempMatrix::new("concurrent-cells");
         let spec = populated(&fixture, integrity)?;
-        let reader = spec.open_reader(fixture.path())?;
-        let reader = &reader;
 
         const THREADS: usize = 4;
         let barrier = Barrier::new(THREADS);
@@ -334,6 +240,9 @@ fn threads_sharing_one_handle_read_every_cell_correctly() -> varve::Result<()> {
 
         std::thread::scope(|scope| {
             for thread in 0..THREADS {
+                let reader = spec
+                    .open_reader(fixture.path())
+                    .expect("independent reader");
                 scope.spawn(move || {
                     barrier.wait();
                     // Each thread walks the matrix from a different starting
@@ -412,6 +321,7 @@ fn paged_fixture(fixture: &TempMatrix) -> varve::Result<FormatSpec> {
         )?;
         writer.commit_matrix_cell::<SharedCell>(key)?;
     }
+    writer.sync()?;
     drop(writer);
     Ok(spec)
 }
@@ -423,35 +333,9 @@ fn lazy_limits(cache_bytes: u64) -> ReadLimits {
         .with_matrix_metadata_residency(varve::MatrixMetadataResidency::Lazy { cache_bytes })
 }
 
-/// Criterion (C), part 3: **no matrix read is issued while a commit-map
-/// page-store lock is held**, through the public read path, from N threads
-/// sharing one handle.
-///
-/// This is the gate that replaces the wall-clock ratio; the header explains why.
-/// It is the same contract, decided by control flow instead of by elapsed time:
-/// the lock exists (demand loading needs one so a fault-in can happen under
-/// `&self`), and what keeps readers from serialising is that it is dropped for
-/// the whole of the `pread`. A reader parked on I/O while holding it is a convoy
-/// whatever the clock says, and a reader that never holds it across I/O cannot
-/// be one however slow the machine is.
-///
-/// The fixture is hostile on purpose: a commit map several pages wide, one live
-/// cell per page, and a **one-page** demand cache, so nearly every status read
-/// misses, evicts, and re-enters the guarded window while the other threads are
-/// doing the same.
-///
-/// Two things are asserted, and the second matters as much as the first:
-///
-/// * no read was issued under the lock, summed over every thread; and
-/// * reads were issued at all — established deterministically by a
-///   single-threaded warm-up phase before any thread is spawned, since "zero
-///   violations" out of zero reads would be vacuous.
-///
-/// Needs `scalable-fault-injection` for the counters. The copy of this gate that
-/// runs in *every* feature configuration is
-/// `varve-core`'s `matrix::page_store_lock_audit_tests`, which pins the same
-/// invariant on the fault-in and on the whole-map aggregate, and pins that the
-/// detector itself is live.
+/// Independent readers fault and evict pages without retaining a mutable
+/// local cache borrow across I/O. The public audit counters keep their
+/// historical `lock` names; caches no longer contain mutexes.
 #[cfg(feature = "scalable-fault-injection")]
 #[test]
 fn no_read_is_issued_while_a_bitmap_page_store_lock_is_held() -> varve::Result<()> {
@@ -496,7 +380,7 @@ fn no_read_is_issued_while_a_bitmap_page_store_lock_is_held() -> varve::Result<(
         "a single-threaded fault-in read was issued while the page store was locked"
     );
 
-    // Phase 2: the same reads, concurrently, through one handle. The counters
+    // Phase 2: the same reads, concurrently, through independent readers. The counters
     // are thread-local, so each worker reports its own and the parent sums —
     // which is also why a worker's numbers cannot be attributed to the wrong
     // thread.
@@ -504,11 +388,15 @@ fn no_read_is_issued_while_a_bitmap_page_store_lock_is_held() -> varve::Result<(
     let region_reads = AtomicU64::new(0);
     let reads_under_lock = AtomicU64::new(0);
     let barrier = Barrier::new(threads);
-    let (reader, barrier) = (&reader, &barrier);
+    let barrier = &barrier;
     let (region_reads, reads_under_lock) = (&region_reads, &reads_under_lock);
 
     std::thread::scope(|scope| {
         for thread in 0..threads {
+            let reader = spec
+                .with_read_limits(lazy_limits(PAGE_BYTES))
+                .open_readonly(fixture.path())
+                .expect("independent lazy reader");
             scope.spawn(move || {
                 Report::reset_matrix_lock_audit_counters();
                 barrier.wait();
@@ -540,7 +428,7 @@ fn no_read_is_issued_while_a_bitmap_page_store_lock_is_held() -> varve::Result<(
     let total_reads = region_reads.load(Ordering::Relaxed);
     let under_lock = reads_under_lock.load(Ordering::Relaxed);
     println!(
-        "{threads} threads x {READS_PER_THREAD} status reads through ONE handle: \
+        "{threads} threads x {READS_PER_THREAD} status reads through independent handles: \
          {total_reads} matrix reads issued, {under_lock} of them under the page-store lock"
     );
     assert!(
@@ -550,46 +438,22 @@ fn no_read_is_issued_while_a_bitmap_page_store_lock_is_held() -> varve::Result<(
     assert_eq!(
         under_lock, 0,
         "{under_lock} of {total_reads} matrix reads were issued while a commit-map page-store \
-         lock was held; every concurrent reader of that category queues behind each one, which \
-         is the convoy criterion (C) forbids"
+         borrow was held across I/O"
     );
     Ok(())
 }
 
-/// Criterion (C), part 4: the scaling *measurement*. Printed, never asserted.
-///
-/// This is the wall-clock comparison that used to gate the build with
-/// `ratio <= 1.0`: total reads held fixed, 1 thread against N through one
-/// handle. It is worth having on the record — it reports 0.31-0.34x on the
-/// Windows development host, and the round that added the private per-thread
-/// handles recorded 1.55x with them disabled, so it is a real signal about a
-/// real mechanism. What it is not is assertable on shared hardware: two
-/// consecutive `ubuntu-latest` runs of this exact code reported 2.14x and 1.43x,
-/// and no threshold that survives that spread would still catch 1.55x.
-///
-/// Note also *which* mechanism it measures. The fixture is `populated` — a
-/// 16x16 matrix, one commit-map page, the default multi-MiB demand cache — so
-/// after the first read there are no fault-ins left to make and the page-store
-/// lock is taken only for `O(1)` lookups. The convoy this ratio can see is the
-/// Windows *file-object* one that `MatrixReadPool` breaks; a lock held across
-/// I/O was never in its reach, which is a second reason the counted gate above
-/// is not merely a more robust version of it.
-///
-/// So this test asserts only what is deterministic — that every read returned the
-/// right value, which `timed_reads` checks per read — and prints the ratio. The
-/// serialisation contract is asserted by
-/// `no_read_is_issued_while_a_bitmap_page_store_lock_is_held` above and by
-/// `varve-core`'s `page_store_lock_audit_tests`. For the strict threshold on a
-/// quiet machine, run the `#[ignore]`d benchmark below with `--ignored`.
+/// Fixed-work scaling with one independent reader per thread. Timing is
+/// printed rather than asserted on shared CI hardware; every value is checked.
 #[test]
-fn report_the_scaling_of_one_shared_handle() -> varve::Result<()> {
-    let Some((serial, parallel, threads)) = measure_shared_handle_scaling()? else {
+fn report_the_scaling_of_independent_handles() -> varve::Result<()> {
+    let Some((serial, parallel, threads)) = measure_independent_reader_scaling()? else {
         println!("single-core host: nothing to compare, skipping the measurement");
         return Ok(());
     };
     let ratio = parallel.as_secs_f64() / serial.as_secs_f64();
     println!(
-        "{TOTAL_READS} reads through ONE handle: 1 thread {:.3}s, {threads} threads {:.3}s \
+        "{TOTAL_READS} reads through independent handles: 1 thread {:.3}s, {threads} threads {:.3}s \
          (ratio {ratio:.2}x, lower is better; MEASUREMENT ONLY — not a gate, see the module \
          header)",
         serial.as_secs_f64(),
@@ -604,26 +468,26 @@ fn report_the_scaling_of_one_shared_handle() -> varve::Result<()> {
 /// that CI could not keep. Run it deliberately —
 /// `cargo test -p varve --test matrix_concurrent_reads -- --ignored --nocapture`
 /// — on an idle host when changing the matrix read path, and expect well under
-/// 1.0x. A number above 1.0x on an idle host means N threads sharing one handle
+/// 1.0x. A number above 1.0x on an idle host means N threads owning separate readers
 /// are slower than one thread, which is a convoy worth investigating even though
 /// it cannot be distinguished from load on a shared runner.
 #[test]
 #[ignore = "wall-clock scaling: measures the host, so it is a manual benchmark rather than a gate"]
-fn shared_handle_scaling_beats_one_thread_on_an_idle_host() -> varve::Result<()> {
-    let Some((serial, parallel, threads)) = measure_shared_handle_scaling()? else {
+fn independent_reader_scaling_beats_one_thread_on_an_idle_host() -> varve::Result<()> {
+    let Some((serial, parallel, threads)) = measure_independent_reader_scaling()? else {
         println!("single-core host: nothing to compare, skipping");
         return Ok(());
     };
     let ratio = parallel.as_secs_f64() / serial.as_secs_f64();
     println!(
-        "{TOTAL_READS} reads through ONE handle: 1 thread {:.3}s, {threads} threads {:.3}s \
+        "{TOTAL_READS} reads through independent handles: 1 thread {:.3}s, {threads} threads {:.3}s \
          (ratio {ratio:.2}x)",
         serial.as_secs_f64(),
         parallel.as_secs_f64()
     );
     assert!(
         ratio <= 1.0,
-        "{threads} threads sharing one handle took {ratio:.2}x as long as one thread for the \
+        "{threads} threads with independent readers took {ratio:.2}x as long as one thread for the \
          same {TOTAL_READS} reads. On an idle host that is a convoy; on a shared runner it may \
          only be the runner, which is why this test is `#[ignore]`d"
     );
@@ -635,7 +499,7 @@ fn shared_handle_scaling_beats_one_thread_on_an_idle_host() -> varve::Result<()>
 const TOTAL_READS: u64 = 24_000;
 
 /// `(one thread, N threads, N)`, or `None` on a single-core host.
-fn measure_shared_handle_scaling()
+fn measure_independent_reader_scaling()
 -> varve::Result<Option<(std::time::Duration, std::time::Duration, usize)>> {
     let threads = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
@@ -646,29 +510,30 @@ fn measure_shared_handle_scaling()
     }
     let fixture = TempMatrix::new("scaling");
     let spec = populated(&fixture, varve::IntegrityPolicy::None)?;
-    let reader = spec.open_reader(fixture.path())?;
     // Best-of-three on each configuration: taking the minimum removes some
     // scheduler noise without inventing statistics.
-    let serial = best_of_three(&reader, 1, TOTAL_READS);
-    let parallel = best_of_three(&reader, threads, TOTAL_READS);
+    let serial = best_of_three(spec, fixture.path(), 1, TOTAL_READS);
+    let parallel = best_of_three(spec, fixture.path(), threads, TOTAL_READS);
     Ok(Some((serial, parallel, threads)))
 }
 
 /// Wall-clock time for `total_reads` cell reads split across `threads` threads,
-/// all sharing `reader`; the fastest of three attempts.
+/// each owning its reader; the fastest of three attempts.
 fn best_of_three(
-    reader: &varve::VarveReader,
+    spec: FormatSpec,
+    path: &Path,
     threads: usize,
     total_reads: u64,
 ) -> std::time::Duration {
     (0..3)
-        .map(|_| timed_reads(reader, threads, total_reads))
+        .map(|_| timed_reads(spec, path, threads, total_reads))
         .min()
         .expect("three attempts")
 }
 
 fn timed_reads(
-    reader: &varve::VarveReader,
+    spec: FormatSpec,
+    path: &Path,
     threads: usize,
     total_reads: u64,
 ) -> std::time::Duration {
@@ -678,6 +543,7 @@ fn timed_reads(
     std::thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|thread| {
+                let reader = spec.open_reader(path).expect("independent reader");
                 scope.spawn(move || {
                     // Every thread is spawned and warm before the clock starts,
                     // so thread creation is not charged to the parallel run.

@@ -15,7 +15,7 @@ keywords = ["binary", "serialization", "storage", "format", "append"]
 categories = ["encoding", "filesystem", "data-structures"]
 
 # F-06: see the note in `crates/varve-core/Cargo.toml`. `default = []` means
-# docs.rs would otherwise publish this facade with none of its six optional
+# docs.rs would otherwise publish this facade with none of its five optional
 # features, hiding every gated re-export.
 [package.metadata.docs.rs]
 all-features = true
@@ -26,21 +26,25 @@ integrity = ["varve-core/integrity"]
 mmap = ["varve-core/mmap"]
 zero-copy = ["mmap", "varve-core/zero-copy"]
 compression-zstd = ["varve-core/compression-zstd"]
-high-cardinality-dev = [
-    "varve-core/high-cardinality-dev",
-    "varve-macros/high-cardinality-dev",
-]
 scalable-fault-injection = [
-    "high-cardinality-dev",
     "varve-core/scalable-fault-injection",
 ]
 
 [dependencies]
-varve-core = { path = "../varve-core", version = "0.9.2" }
-varve-macros = { path = "../varve-macros", version = "0.9.2" }
+varve-core = { path = "../varve-core", version = "0.10.0" }
+varve-macros = { path = "../varve-macros", version = "0.10.0" }
 
 [dev-dependencies]
+redb = { version = "4.3.0", path = "../../vendor/redb" }
 proptest.workspace = true
 tempfile.workspace = true
 trybuild.workspace = true
 zerocopy = { workspace = true, features = ["derive"] }
+
+[[example]]
+name = "scalable_load"
+required-features = ["integrity"]
+
+[[example]]
+name = "matrix_soak"
+required-features = ["integrity"]

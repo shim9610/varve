@@ -521,61 +521,36 @@ fn the_retracted_digest_sequence_sentinel_is_not_published_anywhere() {
     }
 }
 
-/// No document may still say a matrix reader captures commit maps at open.
-///
-/// This is the exact failure mode this file exists for.
-/// `MatrixMetadataResidency` has two variants — `Missing` and `Lazy` — and
-/// `DEFAULT` is `Lazy`, so a commit-map page is as of the first read that
-/// faulted it in. When 0.5.0 removed the whole-live-set `EagerVerified` policy
-/// the claim was corrected in `README.md`, `docs/api-reference.md`,
-/// `docs/known-limitations.md` and `docs/durability-model.md`, and left
-/// standing in `docs/quickstart.md` and `docs/format-author-guide.md` — in the
-/// first stated as the *opposite* of the concurrency rule, in the document a
-/// new user reads first, for four minor releases.
-///
-/// Two documents, two wordings, which is why the needles below are a list and
-/// not one string: a sweep for the quickstart's sentence alone finds one of
-/// them and reports the file set clean.
-///
-/// The behaviour is asserted by `crates/varve/tests/matrix_lazy_residency.rs`,
-/// in `a_commit_map_page_is_as_of_its_first_touch_not_as_of_open`. What is
-/// asserted here is that the prose says so.
+/// The COW storage contract supersedes the former first-touch visibility rule.
 #[test]
-fn no_document_says_a_matrix_reader_captures_commit_maps_at_open() {
+fn matrix_concurrency_docs_state_confirmed_generations_and_explicit_follow() {
     let files = normative_files();
-    // Foldings of the two retracted sentences. `assert_absent` scans line by
-    // line, so a needle that spans the 80-column fold would never match; these
-    // are the folds each sentence admits.
-    let verb = "captured";
-    for variant in [
-        format!("commit maps are also {verb}"),
-        format!("commit maps are {verb}"),
-        format!("commit map is {verb}"),
-        format!("readers snapshot layout and commit {}", "maps"),
-        format!("snapshot layout and commit {}", "maps"),
+    for document in [
+        "docs/quickstart.md",
+        "docs/format-author-guide.md",
+        "docs/durability-model.md",
     ] {
-        assert_absent(
-            &files,
-            &variant,
-            "MatrixMetadataResidency::EagerVerified was removed in 0.5.0 and \
-             the unset default resolves to Lazy, so each commit-map page is as \
-             of the first read that faulted it in, not as of open. A matrix \
-             reader owns no whole-map instant; only the matrix layout is \
-             snapshotted at open.",
-        );
-    }
-
-    // These are the two documents that carried the retracted claim, and a
-    // deletion is not a correction: each has to state the rule it got wrong.
-    for document in ["docs/quickstart.md", "docs/format-author-guide.md"] {
         assert_present(
             &files,
             document,
-            "first read that faulted it in",
-            "A concurrency paragraph that mentions matrix commit maps must \
-             state the first-touch rule for them. Deleting the sentence \
-             instead of correcting it leaves a reader with no statement of the \
-             one matrix rule that governs reader/writer overlap.",
+            "confirmed generation",
+            "Matrix readers must describe the captured confirmed generation.",
+        );
+        assert_present(
+            &files,
+            document,
+            "follow(",
+            "Readers advance explicitly; cache misses must not observe working writes.",
+        );
+    }
+    for obsolete in [
+        concat!("first read that ", "faulted it in"),
+        concat!("a reader owns no ", "whole-map instant"),
+    ] {
+        assert_absent(
+            &files,
+            obsolete,
+            "Matrix COW generations replaced the first-touch visibility rule.",
         );
     }
 }
@@ -772,13 +747,9 @@ fn the_superseded_assurance_claims_are_not_still_published() {
          - rather than what it is the only one of.",
     );
 
-    let why_walk = "The four scalable modules were walked against the project's \
-                    five internal invariants in 0.7.0 and the walk found no \
-                    defect. README.md and docs/scalable-io.md say so; a third \
-                    copy of the retracted sentence must not survive, least of \
-                    all in the section docs/scalable-io.md cites as its \
-                    detail. Deleting it is not a correction either - all three \
-                    documents have to give the same answer.";
+    let why_walk = "The historical scalable-module review took place. Do not \
+                    reinstate the old claim that it never happened; current \
+                    qualification scope must be stated separately.";
     assert_absent(
         &files,
         &format!(
@@ -800,26 +771,22 @@ fn the_superseded_assurance_claims_are_not_still_published() {
         assert_absent(&files, &claim, why_fuzz);
     }
 
-    // A deletion is not a correction: the three documents that disagreed have
-    // to agree, and the retitled section has to say what is still true.
-    assert_present(
-        &files,
+    // API promotion supersedes the old requirement to repeat a review verdict
+    // verbatim. These documents must agree on actual build availability now;
+    // historical review alone is not evidence of new load qualification.
+    for path in [
         "README.md",
-        "**have now been walked against the",
-        why_walk,
-    );
-    assert_present(
-        &files,
         "docs/scalable-io.md",
-        "**has** been walked against the project's",
-        why_walk,
-    );
-    assert_present(
-        &files,
         "docs/known-limitations.md",
-        "the walk found no defect",
-        why_walk,
-    );
+    ] {
+        assert_present(
+            &files,
+            path,
+            "--no-default-features",
+            "Stream/indexed APIs are part of the default API, also without default \
+             features. Promotion and deep-load qualification are separate claims.",
+        );
+    }
 
     for needle in ["weekly smoke, not a campaign", "sanitizers.yml"] {
         assert_present(&files, "docs/known-limitations.md", needle, why_fuzz);

@@ -206,6 +206,7 @@ mod enabled {
             "fault trace contained no wired points"
         );
 
+        let fault_cases = discovered.len();
         for (index, (scenario, event)) in discovered.into_iter().enumerate() {
             let run = root.join(format!(
                 "abort-{index:04}-{}-{}-{}",
@@ -233,6 +234,11 @@ mod enabled {
         }
 
         root_dir.close().expect("remove crash matrix root");
+        eprintln!(
+            "CRASH_MATRIX scenarios={} fault_points={} aborts={fault_cases} cleanup=verified",
+            SCENARIOS.len(),
+            REQUIRED_POINTS.len()
+        );
     }
 
     #[test]
@@ -543,87 +549,105 @@ mod enabled {
         }
     }
 
+    fn stream_needs_restore(root: &Path) -> bool {
+        match VarveStreamWriter::open(stream_spec(), native_path(root), stream_options()) {
+            Ok(writer) => {
+                drop(writer);
+                false
+            }
+            Err(varve::Error::DiskIndex(error))
+                if matches!(*error, varve::DiskIndexError::CleanStateRequired) =>
+            {
+                true
+            }
+            Err(error) => panic!("unexpected stream writer reopen failure: {error:?}"),
+        }
+    }
+
+    fn indexed_needs_restore(root: &Path) -> bool {
+        match VarveIndexedWriter::open(
+            indexed_spec(),
+            native_path(root),
+            disk_options(),
+            index_plan(),
+        ) {
+            Ok(writer) => {
+                drop(writer);
+                false
+            }
+            Err(varve::Error::DiskIndex(error))
+                if matches!(*error, varve::DiskIndexError::CleanStateRequired) =>
+            {
+                true
+            }
+            Err(error) => panic!("unexpected indexed writer reopen failure: {error:?}"),
+        }
+    }
+
     fn assert_stream_append_outcome(root: &Path, event: &TraceEvent) {
         let base_eof = read_base_eof(root);
-        match read_stream(root) {
-            Ok(values) => {
-                assert!(
-                    values == base_stream_values() || values == full_stream_values(),
-                    "clean stream is neither old nor complete at {event:?}: {values:?}"
-                );
-                if values == base_stream_values() {
-                    assert_eq!(
-                        fs::metadata(native_path(root)).unwrap().len(),
-                        base_eof,
-                        "unchanged clean stream retained a native append at {event:?}"
-                    );
-                }
-            }
-            Err(_) => {
-                let physical = fs::metadata(native_path(root))
-                    .expect("dirty stream native")
-                    .len();
-                assert!(
-                    physical >= base_eof,
-                    "dirty stream shrank below base EOF at {event:?}"
-                );
-                let writer = VarveStreamWriter::restore_checkpoint_and_open(
+        let values = read_stream(root)
+            .unwrap_or_else(|error| panic!("confirmed stream unreadable at {event:?}: {error}"));
+        assert!(
+            values == base_stream_values() || values == full_stream_values(),
+            "partial stream at {event:?}"
+        );
+        if stream_needs_restore(root) {
+            assert_eq!(
+                values,
+                base_stream_values(),
+                "Dirty stream exposed an unconfirmed suffix at {event:?}"
+            );
+            assert!(fs::metadata(native_path(root)).unwrap().len() >= base_eof);
+            drop(
+                VarveStreamWriter::restore_checkpoint_and_open(
                     stream_spec(),
                     native_path(root),
                     stream_options(),
                 )
-                .unwrap_or_else(|error| {
-                    panic!("dirty stream did not restore at {event:?}: {error}")
-                });
-                drop(writer);
-                assert_eq!(fs::metadata(native_path(root)).unwrap().len(), base_eof);
-                assert_eq!(read_stream(root).unwrap(), base_stream_values());
-            }
+                .unwrap(),
+            );
+            assert_eq!(fs::metadata(native_path(root)).unwrap().len(), base_eof);
+            assert_eq!(read_stream(root).unwrap(), base_stream_values());
+        } else if values == base_stream_values() {
+            assert_eq!(fs::metadata(native_path(root)).unwrap().len(), base_eof);
         }
     }
 
     fn assert_indexed_append_outcome(root: &Path, event: &TraceEvent) {
         let base_eof = read_base_eof(root);
-        match read_indexed(root, 0..7) {
-            Ok(values) => {
-                assert!(
-                    values == base_indexed_values() || values == full_indexed_values(),
-                    "clean index is neither old nor complete at {event:?}: {values:?}"
-                );
-                if values == base_indexed_values() {
-                    assert_eq!(
-                        fs::metadata(native_path(root)).unwrap().len(),
-                        base_eof,
-                        "unchanged clean index retained a native append at {event:?}"
-                    );
-                }
-            }
-            Err(_) => {
-                let physical = fs::metadata(native_path(root))
-                    .expect("dirty indexed native")
-                    .len();
-                assert!(
-                    physical >= base_eof,
-                    "dirty index shrank below base EOF at {event:?}"
-                );
-                let writer = VarveIndexedWriter::restore_checkpoint_and_open(
+        let values = read_indexed(root, 0..7)
+            .unwrap_or_else(|error| panic!("confirmed index unreadable at {event:?}: {error}"));
+        assert!(
+            values == base_indexed_values() || values == full_indexed_values(),
+            "partial index at {event:?}"
+        );
+        if indexed_needs_restore(root) {
+            assert_eq!(
+                values,
+                base_indexed_values(),
+                "Dirty index exposed unconfirmed keys at {event:?}"
+            );
+            assert!(fs::metadata(native_path(root)).unwrap().len() >= base_eof);
+            drop(
+                VarveIndexedWriter::restore_checkpoint_and_open(
                     indexed_spec(),
                     native_path(root),
                     disk_options(),
                     index_plan(),
                 )
-                .unwrap_or_else(|error| {
-                    panic!("dirty index did not restore at {event:?}: {error}")
-                });
-                drop(writer);
-                assert_eq!(fs::metadata(native_path(root)).unwrap().len(), base_eof);
-                assert_eq!(read_indexed(root, 0..2).unwrap(), base_indexed_values());
-            }
+                .unwrap(),
+            );
+            assert_eq!(fs::metadata(native_path(root)).unwrap().len(), base_eof);
+            assert_eq!(read_indexed(root, 0..7).unwrap(), base_indexed_values());
+        } else if values == base_indexed_values() {
+            assert_eq!(fs::metadata(native_path(root)).unwrap().len(), base_eof);
         }
     }
 
     fn assert_stream_restore_outcome(root: &Path, event: &TraceEvent) {
-        if read_stream(root).is_err() {
+        assert_eq!(read_stream(root).unwrap(), base_stream_values());
+        if stream_needs_restore(root) {
             assert!(
                 fs::metadata(native_path(root)).unwrap().len() >= read_base_eof(root),
                 "interrupted restore truncated below its base EOF at {event:?}"
@@ -644,7 +668,8 @@ mod enabled {
     }
 
     fn assert_indexed_restore_outcome(root: &Path, event: &TraceEvent) {
-        if read_indexed(root, 0..2).is_err() {
+        assert_eq!(read_indexed(root, 0..2).unwrap(), base_indexed_values());
+        if indexed_needs_restore(root) {
             assert!(
                 fs::metadata(native_path(root)).unwrap().len() >= read_base_eof(root),
                 "interrupted restore truncated below its base EOF at {event:?}"
