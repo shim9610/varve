@@ -21717,7 +21717,15 @@ pub(crate) fn publish_temp_path_atomically(
     temporary: tempfile::TempPath,
     target: &Path,
 ) -> Result<ReplaceDurability> {
-    match replace_path_atomically(&temporary, target) {
+    publish_temp_path_with(temporary, target, replace_path_atomically)
+}
+
+fn publish_temp_path_with(
+    temporary: tempfile::TempPath,
+    target: &Path,
+    replace: fn(&Path, &Path) -> Result<ReplaceDurability>,
+) -> Result<ReplaceDurability> {
+    match replace(&temporary, target) {
         Err(error) => {
             if matches!(error, Error::ReplacePublicationIndeterminate { .. }) {
                 // `keep` only forgets the guard; if it ever reports an error
@@ -21733,13 +21741,10 @@ pub(crate) fn publish_temp_path_atomically(
     }
 }
 
-/// Publishes an immutable companion generation whose replacement handles must
-/// stay open. Windows `ReplaceFileW` opens the replacement without sharing, so
-/// it cannot be used here. `TempPath::persist` uses same-directory
-/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` and clears the temporary attribute;
-/// existing handles permit delete sharing and remain pinned to their objects.
-/// Companion files use their new file permissions rather than inheriting the
-/// replaced object's attributes/ACLs. Ordinary rewrites retain `ReplaceFileW`.
+/// Publishes an immutable companion generation with pinned old/new handles.
+/// Windows needs a POSIX rename: `ReplaceFileW` exclusively opens the new file,
+/// while ordinary `MoveFileExW` refuses an open target even with delete sharing.
+/// Ordinary rewrites retain `ReplaceFileW` and its attribute/ACL inheritance.
 pub(crate) fn publish_open_temp_path_atomically(
     temporary: tempfile::TempPath,
     target: &Path,
@@ -21750,22 +21755,90 @@ pub(crate) fn publish_open_temp_path_atomically(
     }
     #[cfg(windows)]
     {
-        #[cfg(feature = "scalable-fault-injection")]
-        if let Err(error) = take_injected_replace_indeterminate(&temporary, target) {
-            // Preserve the same reconciliation obligation as ordinary rewrites.
-            if let Err(persist_error) = temporary.keep() {
-                std::mem::forget(persist_error.path);
-            }
-            return Err(error);
-        }
-        crate::scalable_fault_point("replace.atomic");
-        let publication = temporary.persist(target);
-        crate::scalable_fault_point("replace.atomic");
-        publication.map_err(|error| Error::Io(error.error))?;
-        match sync_parent_directory(target) {
-            Ok(()) => Ok(ReplaceDurability::Durable),
-            Err(error) => Ok(ReplaceDurability::ParentSyncPending(error)),
-        }
+        publish_temp_path_with(temporary, target, replace_open_path_atomically)
+    }
+}
+
+#[cfg(windows)]
+fn replace_open_path_atomically(replacement: &Path, target: &Path) -> Result<ReplaceDurability> {
+    use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ATTRIBUTE_NORMAL, FILE_RENAME_INFO, FileRenameInfoEx, SetFileAttributesW,
+        SetFileInformationByHandle,
+    };
+    use windows_sys::Win32::System::WindowsProgramming::{
+        FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
+    };
+
+    #[cfg(feature = "scalable-fault-injection")]
+    take_injected_replace_indeterminate(replacement, target)?;
+
+    let file = OpenOptions::new().access_mode(DELETE).open(replacement)?;
+    let name: Vec<u16> = std::path::absolute(target)?
+        .as_os_str()
+        .encode_wide()
+        .collect();
+    let name_bytes = name.len().checked_mul(2).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "replacement path too long",
+        )
+    })?;
+    let name_bytes = u32::try_from(name_bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "replacement path too long",
+        )
+    })?;
+    let size = (std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name_bytes as usize)
+        .max(std::mem::size_of::<FILE_RENAME_INFO>());
+    let size = u32::try_from(size).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "replacement path too long",
+        )
+    })?;
+    // u64 storage provides the alignment and initialized flexible-tail capacity
+    // required by FILE_RENAME_INFO on supported Windows targets.
+    let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: the aligned allocation covers the header plus the UTF-16 name.
+    unsafe {
+        (*info).Anonymous.Flags =
+            FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+        (*info).FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+    }
+    // Companion files inherit their new directory's permissions. Clear the
+    // NamedTempFile temporary attribute before publishing the generation.
+    let temporary_name: Vec<u16> = replacement
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: temporary_name is a live, NUL-terminated UTF-16 path.
+    if unsafe { SetFileAttributesW(temporary_name.as_ptr(), FILE_ATTRIBUTE_NORMAL) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    crate::scalable_fault_point("replace.atomic");
+    // SAFETY: file is a live DELETE-capable handle, and buffer contains a valid
+    // FILE_RENAME_INFO followed by FileNameLength bytes of UTF-16 path data.
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as _,
+            FileRenameInfoEx,
+            info.cast(),
+            size,
+        )
+    };
+    crate::scalable_fault_point("replace.atomic");
+    if ok == 0 {
+        // Do not fall back to a non-atomic remove/rename or wait for readers.
+        return Err(std::io::Error::last_os_error().into());
+    }
+    match sync_parent_directory(target) {
+        Ok(()) => Ok(ReplaceDurability::Durable),
+        Err(error) => Ok(ReplaceDurability::ParentSyncPending(error)),
     }
 }
 
