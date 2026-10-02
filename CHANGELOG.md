@@ -6,6 +6,10 @@ increment the minor version.
 
 ## Unreleased
 
+- Publish the public-API fixture's matrix generation with `sync()` before
+  reopening it. `flush()` alone continues to leave readers at the last
+  confirmed generation. The staged package consumer uses the same fixture.
+
 - Keep the Rust 1.95 minimum while building with warnings denied on Rust 1.99.
   Reserve snapshot IDs with the same checked, relaxed compare-exchange protocol
   without the newly deprecated `fetch_update` spelling. Use fixed-size array

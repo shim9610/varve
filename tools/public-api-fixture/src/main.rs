@@ -447,6 +447,7 @@ fn check_format_roundtrip(dir: &std::path::Path) {
         writer.write_cell(key, &cell).expect("write matrix cell");
         writer.commit_cell(key).expect("commit matrix cell");
         writer.flush().expect("flush");
+        writer.sync().expect("publish confirmed generation");
     }
 
     // Matrix reads take `&self`, so this binding no longer needs `mut`.
