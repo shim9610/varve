@@ -287,7 +287,9 @@ fn independent_process_reader_child() -> varve::Result<()> {
     let pinned = Managed::open_indexed_reader(&path, options)?;
     assert_eq!(reader.get_item(&0)?.unwrap().value, 1);
     std::fs::write(path.with_extension("ready"), b"ready")?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    // Bound a stalled publication, not all 256 durable commits on a busy disk.
+    let mut deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut last_value = 1;
     let mut checks = 0;
     loop {
         reader.follow()?;
@@ -295,6 +297,11 @@ fn independent_process_reader_child() -> varve::Result<()> {
         let b = reader.get_item(&1)?.unwrap().value;
         assert_eq!(a, b, "mixed confirmed generations");
         assert_eq!(pinned.get_item(&0)?.unwrap().value, 1);
+        if a != last_value {
+            assert!(a > last_value, "confirmed generation moved backwards");
+            last_value = a;
+            deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        }
         checks += 1;
         if path.with_extension("done").exists() {
             reader.follow()?;
@@ -303,7 +310,7 @@ fn independent_process_reader_child() -> varve::Result<()> {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "writer did not finish"
+            "writer made no confirmed progress for 20 seconds"
         );
         std::thread::yield_now();
     }
@@ -357,6 +364,8 @@ fn independent_process_reads_dirty_writer_and_follows_compaction() -> varve::Res
         }
     }
     std::fs::write(path.with_extension("done"), b"done")?;
+    // Startup, active publication, and final acknowledgement are distinct phases.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         if let Some(status) = child.try_wait()? {
             let output = child.wait_with_output()?;

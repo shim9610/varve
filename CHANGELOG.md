@@ -6,6 +6,10 @@ increment the minor version.
 
 ## 0.10.1 - 2026-10-03
 
+- Bound cross-process reader test stalls by confirmed progress and give final
+  acknowledgement its own deadline. Slow but advancing durable writes no longer
+  fail a single 20-second budget for the entire 256-publication workload.
+
 - Publish compacted matrix and disk-index companions on Windows while keeping
   replacement handles open, using `FileRenameInfoEx` with `POSIX_SEMANTICS`.
   Unsupported OS/filesystem combinations return an error. Old readers keep
