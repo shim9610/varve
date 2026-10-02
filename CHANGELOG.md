@@ -6,6 +6,11 @@ increment the minor version.
 
 ## Unreleased
 
+- Publish compacted matrix and disk-index companions on Windows while keeping
+  replacement handles open. Old readers keep their original file; following
+  readers and the writer use the replacement. Keep explicit sync boundaries
+  and parent-directory durability without adding reader locks.
+
 - Publish the public-API fixture's matrix generation with `sync()` before
   reopening it. `flush()` alone continues to leave readers at the last
   confirmed generation. The staged package consumer uses the same fixture.

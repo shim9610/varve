@@ -929,7 +929,8 @@ impl MatrixFile {
                 .insert(key, Entry { offset, crc: 0 });
         }
         next.publish(self.view.head.native_eof)?;
-        let outcome = crate::file::publish_temp_path_atomically(temp.into_temp_path(), &self.path)?;
+        let outcome =
+            crate::file::publish_open_temp_path_atomically(temp.into_temp_path(), &self.path)?;
         *self = next;
         match outcome {
             crate::file::ReplaceDurability::Durable => Ok(()),

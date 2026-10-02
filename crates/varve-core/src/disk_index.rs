@@ -1987,7 +1987,7 @@ impl DiskIndexStore {
         } else {
             None
         };
-        let publication = crate::file::publish_temp_path_atomically(temp, &target)
+        let publication = crate::file::publish_open_temp_path_atomically(temp, &target)
             .map_err(DiskIndexError::Primary)?;
         if let Some(working) = new_slots {
             self.slots_cache.pop();

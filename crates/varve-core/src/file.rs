@@ -21733,6 +21733,42 @@ pub(crate) fn publish_temp_path_atomically(
     }
 }
 
+/// Publishes an immutable companion generation whose replacement handles must
+/// stay open. Windows `ReplaceFileW` opens the replacement without sharing, so
+/// it cannot be used here. `TempPath::persist` uses same-directory
+/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` and clears the temporary attribute;
+/// existing handles permit delete sharing and remain pinned to their objects.
+/// Companion files use their new file permissions rather than inheriting the
+/// replaced object's attributes/ACLs. Ordinary rewrites retain `ReplaceFileW`.
+pub(crate) fn publish_open_temp_path_atomically(
+    temporary: tempfile::TempPath,
+    target: &Path,
+) -> Result<ReplaceDurability> {
+    #[cfg(not(windows))]
+    {
+        publish_temp_path_atomically(temporary, target)
+    }
+    #[cfg(windows)]
+    {
+        #[cfg(feature = "scalable-fault-injection")]
+        if let Err(error) = take_injected_replace_indeterminate(&temporary, target) {
+            // Preserve the same reconciliation obligation as ordinary rewrites.
+            if let Err(persist_error) = temporary.keep() {
+                std::mem::forget(persist_error.path);
+            }
+            return Err(error);
+        }
+        crate::scalable_fault_point("replace.atomic");
+        let publication = temporary.persist(target);
+        crate::scalable_fault_point("replace.atomic");
+        publication.map_err(|error| Error::Io(error.error))?;
+        match sync_parent_directory(target) {
+            Ok(()) => Ok(ReplaceDurability::Durable),
+            Err(error) => Ok(ReplaceDurability::ParentSyncPending(error)),
+        }
+    }
+}
+
 #[cfg(not(windows))]
 pub(crate) fn replace_path_atomically(
     replacement: &Path,
