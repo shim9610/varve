@@ -1822,11 +1822,22 @@ impl DiskIndexStore {
         let confirmed = self.storage.confirmed()?;
         let metadata = confirmed.metadata;
         validate_identity_mode(metadata, identity, mode)?;
-        let id = self
-            .shared
-            .next_snapshot
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| DiskIndexError::GenerationExhausted)?;
+        let next_snapshot = &self.shared.next_snapshot;
+        let mut id = next_snapshot.load(Ordering::Relaxed);
+        loop {
+            let next = id
+                .checked_add(1)
+                .ok_or(DiskIndexError::GenerationExhausted)?;
+            match next_snapshot.compare_exchange_weak(
+                id,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => id = current,
+            }
+        }
         self.shared.snapshots.insert(id, metadata.generation);
         Ok(DiskIndexSnapshot {
             pin: Some(SnapshotPin {

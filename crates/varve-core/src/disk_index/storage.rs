@@ -384,7 +384,7 @@ impl Store {
         bytes[348..352].copy_from_slice(&checksum.to_le_bytes());
         for (tail, into) in tails
             .iter()
-            .zip(bytes[ROOT_HEADER..].chunks_exact_mut(TAIL_LEN))
+            .zip(bytes[ROOT_HEADER..].as_chunks_mut::<TAIL_LEN>().0)
         {
             into.copy_from_slice(&encode_tail(*tail));
         }

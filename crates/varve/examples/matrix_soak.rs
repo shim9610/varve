@@ -26,7 +26,7 @@ const GROUP: u32 = 256;
 fn payload(row: u32, epoch: u64) -> [u8; 4096] {
     let mut bytes = [0; 4096];
     let mut state = epoch.wrapping_mul(0x9e3779b97f4a7c15) ^ u64::from(row);
-    for chunk in bytes.chunks_exact_mut(8) {
+    for chunk in bytes.as_chunks_mut::<8>().0 {
         state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);

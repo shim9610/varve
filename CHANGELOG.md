@@ -4,6 +4,14 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
+## Unreleased
+
+- Keep the Rust 1.95 minimum while building with warnings denied on Rust 1.99.
+  Reserve snapshot IDs with the same checked, relaxed compare-exchange protocol
+  without the newly deprecated `fetch_update` spelling. Use fixed-size array
+  chunks for checkpoint and soak payload encoding. Wire bytes and durability
+  boundaries are unchanged.
+
 ## 0.10.0 - 2026-10-03
 
 - Promote streaming, indexed lookup, disk-index plans, finite keys and scan
