@@ -1145,7 +1145,12 @@ Within that:
   waiting for readers. Follow or close old handles to reclaim the old file's physical
   space. Tombstones remain; native-log reclamation is separate. Snapshot counts
   are observational, process-local, and per sidecar identity, not a global
-  reclamation gate. See [space management](scalable-io.md#explicit-sidecar-compaction).
+  reclamation gate. On Windows, matrix/index companion replacement requires
+  `FileRenameInfoEx` with `POSIX_SEMANTICS` support from the OS/filesystem. An
+  unsupported replacement reports an OS error and poisons the writer; it does
+  not wait for readers or fall back to deleting the target first. Reopen the
+  writer after reconciling the failed operation. See
+  [space management](scalable-io.md#explicit-sidecar-compaction).
 
 **Who it affects.** Anyone assuming a Varve handle is a live view of a file
 another handle is writing. It is not.

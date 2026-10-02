@@ -7,7 +7,9 @@ increment the minor version.
 ## 0.10.1 - 2026-10-03
 
 - Publish compacted matrix and disk-index companions on Windows while keeping
-  replacement handles open. Old readers keep their original file; following
+  replacement handles open, using `FileRenameInfoEx` with `POSIX_SEMANTICS`.
+  Unsupported OS/filesystem combinations return an error. Old readers keep
+  their original file; following
   readers and the writer use the replacement. Keep explicit sync boundaries
   and parent-directory durability without adding reader locks.
 
