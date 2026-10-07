@@ -195,6 +195,12 @@ jobs:
       #     unsupported fcntl syscall (72) on 2026-10-07. Ordinary CI and ASan
       #     still run this comparison; native index tests remain in Miri.
       #
+      # A separate local probe on 2026-10-07 reproduced a Stacked Borrows
+      # violation in released crossbeam-epoch 0.9.21 (internal.rs, element_of).
+      # Upstream PR #871 fixes it on the development branch. Keep native tests
+      # enabled so this dependency issue stays visible; do not disable alias
+      # checking or change borrow models just to turn this job green.
+      #
       # `--skip` matches substrings; these names are long enough to be unique.
       - name: unit tests under Miri
         env:

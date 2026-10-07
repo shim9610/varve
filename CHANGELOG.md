@@ -16,6 +16,9 @@ increment the minor version.
   it from Miri, which does not support redb's file-locking syscall.
 - Mark Windows matrix test fixtures sparse before extending them, preserving
   32 GiB radix-boundary coverage without allocating 32 GiB of disk space.
+- Record a remaining Miri Stacked Borrows violation in `crossbeam-epoch 0.9.21`,
+  reproduced without Varve. Upstream PR #871 fixes the development source;
+  native tests remain enabled and alias checking remains active.
 
 ## 0.10.1 - 2026-10-03
 
