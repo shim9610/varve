@@ -1187,6 +1187,34 @@ mod tests {
             .create_new(true)
             .open(&path)
             .unwrap();
+        // NTFS otherwise allocates the entire logical length, including the
+        // 32 GiB radix-boundary fixture. Mark it sparse before extending it.
+        #[cfg(windows)]
+        {
+            use std::{os::windows::io::AsRawHandle, ptr};
+            use windows_sys::Win32::System::{IO::DeviceIoControl, Ioctl::FSCTL_SET_SPARSE};
+            let mut returned = 0;
+            // SAFETY: base owns a live writable handle; this control takes no
+            // input/output buffers, and returned is a valid output pointer.
+            let marked = unsafe {
+                DeviceIoControl(
+                    base.as_raw_handle() as _,
+                    FSCTL_SET_SPARSE,
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    ptr::null_mut(),
+                )
+            };
+            assert_ne!(
+                marked,
+                0,
+                "mark sparse fixture: {}",
+                io::Error::last_os_error()
+            );
+        }
         base.set_len(len).unwrap();
         let store = MatrixFile::create(&path, &base, len, [7; 16], 65536).unwrap();
         (dir, path, base, store)

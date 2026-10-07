@@ -12,6 +12,10 @@ increment the minor version.
   released dependency includes upstream's range-reference fix (PR #1217).
 - Keep the directory-cleanup safety test in ordinary CI and ASan while excluding
   it from Miri, which does not support opening directories.
+- Keep the file-backed redb comparison in ordinary CI and ASan while excluding
+  it from Miri, which does not support redb's file-locking syscall.
+- Mark Windows matrix test fixtures sparse before extending them, preserving
+  32 GiB radix-boundary coverage without allocating 32 GiB of disk space.
 
 ## 0.10.1 - 2026-10-03
 

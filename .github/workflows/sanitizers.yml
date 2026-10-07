@@ -174,7 +174,7 @@ jobs:
       # `-Zmiri-disable-isolation` because these tests do real file I/O through
       # std, which Miri shims once isolation is off.
       #
-      # Nine tests are skipped. Eight came from a per-test classification of all 107 on
+      # Ten tests are skipped. Eight came from a per-test classification of all 107 on
       # 2026-08-08 — each name below is a measurement, not a guess:
       #
       #   * four `diagnostics` tests abort on the foreign function `openat`:
@@ -190,6 +190,10 @@ jobs:
       #   * cleanup_refuses_a_shared_writable_directory opens its parent directory
       #     through std to enforce pathname cleanup safety. Miri aborted on that
       #     unsupported directory open on 2026-10-05; ASan and ordinary CI retain it.
+      #   * randomized_pages_match_redb_across_splits_and_old_roots uses redb's
+      #     real file backend as an independent I/O oracle. Miri aborted on its
+      #     unsupported fcntl syscall (72) on 2026-10-07. Ordinary CI and ASan
+      #     still run this comparison; native index tests remain in Miri.
       #
       # `--skip` matches substrings; these names are long enough to be unique.
       - name: unit tests under Miri
@@ -197,6 +201,7 @@ jobs:
           MIRIFLAGS: -Zmiri-disable-isolation
         run: |
           cargo miri test -p varve-core --no-default-features --lib -- \
+            --skip randomized_pages_match_redb_across_splits_and_old_roots \
             --skip cleanup_does_not_delete_a_file_interposed_before_the_unlink \
             --skip cleanup_leaves_a_swapped_pathname_alone \
             --skip cleanup_removes_the_verified_object \
