@@ -174,7 +174,7 @@ jobs:
       # `-Zmiri-disable-isolation` because these tests do real file I/O through
       # std, which Miri shims once isolation is off.
       #
-      # Eight tests are skipped, from a per-test classification of all 107 on
+      # Nine tests are skipped. Eight came from a per-test classification of all 107 on
       # 2026-08-08 — each name below is a measurement, not a guess:
       #
       #   * four `diagnostics` tests abort on the foreign function `openat`:
@@ -187,6 +187,9 @@ jobs:
       #     running when the cap fired — slow, not hung, and clean. They assert
       #     probe-count bounds — algorithmic cost, no `unsafe` — so skipping
       #     them costs Miri nothing it could have judged.
+      #   * cleanup_refuses_a_shared_writable_directory opens its parent directory
+      #     through std to enforce pathname cleanup safety. Miri aborted on that
+      #     unsupported directory open on 2026-10-05; ASan and ordinary CI retain it.
       #
       # `--skip` matches substrings; these names are long enough to be unique.
       - name: unit tests under Miri
@@ -197,6 +200,7 @@ jobs:
             --skip cleanup_does_not_delete_a_file_interposed_before_the_unlink \
             --skip cleanup_leaves_a_swapped_pathname_alone \
             --skip cleanup_removes_the_verified_object \
+            --skip cleanup_refuses_a_shared_writable_directory \
             --skip lock_marker_removal_leaves_a_swapped_object_alone \
             --skip replace_block_finds_predecessors_without_rescanning_the_prefix \
             --skip a_page_released_by_a_clear_leaves_the_recency_order \

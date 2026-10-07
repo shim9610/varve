@@ -4,6 +4,15 @@ All notable repository releases are documented here. Varve follows semantic
 versioning; while the crates remain below 1.0, incompatible Rust API changes
 increment the minor version.
 
+## Unreleased
+
+- Fix retained matrix working-page nodes after category clears by avoiding the
+  leaking range iterator in `crossbeam-skiplist 0.1.3`. Preserve bounded range
+  traversal and existing publication boundaries. Revisit the workaround when a
+  released dependency includes upstream's range-reference fix (PR #1217).
+- Keep the directory-cleanup safety test in ordinary CI and ASan while excluding
+  it from Miri, which does not support opening directories.
+
 ## 0.10.1 - 2026-10-03
 
 - Bound cross-process reader test stalls by confirmed progress and give final

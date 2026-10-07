@@ -967,7 +967,25 @@ impl MatrixFile {
             .working
             .as_ref()
             .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?;
-        pages.extend(working.pages.range(first..=last).map(|entry| *entry.key()));
+        // crossbeam-skiplist 0.1.3's Range retains the reference to every
+        // preceding node when it advances. Use the entry cursor, which releases
+        // that reference, while preserving the bounded range walk.
+        // Upstream fix: https://github.com/crossbeam-rs/crossbeam/pull/1217.
+        // TODO(crossbeam-skiplist upgrade): once a released dependency includes
+        // that fix, rerun the range reclamation probe and matrix ASan tests,
+        // then replace this workaround with the fixed range(first..=last).
+        if let Some(mut entry) = working.pages.lower_bound(std::ops::Bound::Included(&first)) {
+            loop {
+                let page = *entry.key();
+                if page > last {
+                    break;
+                }
+                pages.push(page);
+                if !entry.move_next() {
+                    break;
+                }
+            }
+        }
         pages.push(first);
         pages.push(last);
         pages.sort_unstable();
