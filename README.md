@@ -269,6 +269,14 @@ repository release does not imply that 0.10.1 is available on crates.io:
 varve = { git = "https://github.com/shim9610/varve", tag = "v0.10.1" }
 ```
 
+Current unreleased `main` pins Crossbeam to upstream commit
+`099d0469efcfacb32527bd9451a4fb62586ae537`, which includes the epoch/skiplist
+borrow fixes and range-reference reclamation fix. The `v0.10.1` tag predates
+these fixes; use a tested Varve commit with `rev = "<commit SHA>"` to consume
+them before the next release. The Git dependencies propagate to downstream
+projects without a root `[patch]`. crates.io publication is not currently
+supported; replacing the pin requires a released source containing these fixes.
+
 Requires Rust **1.95** or newer. Resident, matrix, streaming and indexed APIs
 are included even with `default-features = false`. The removed
 `high-cardinality-dev` feature is no longer accepted; remove it from existing
@@ -509,11 +517,10 @@ fails the build; test runs for the two singleton feature configurations that own
 `cfg`-exclusive behaviour (compression without integrity, integrity without
 compression), which the default and all-feature runs both compile out; a job
 pinned to the declared MSRV (1.95.0) that checks and tests against it and fails
-if the pin and the manifests disagree; a `package contents` job asserting that
-every published `.crate` file list contains `README.md`, `LICENSE-MIT`, and
-`LICENSE-APACHE`; a `package archives + staged consumer` job that builds and
-verifies the three real `.crate` archives and then compiles and runs a
-downstream consumer against the extracted archives; a `rustdoc (-D warnings)`
+if the pin and the manifests disagree; a `source contents` job checking the
+README and license texts; a `Git consumer + pinned dependency sources` job
+that resolves, compiles and runs an independent downstream Git consumer;
+a `rustdoc (-D warnings)`
 job over the workspace's published documentation surface; a blocking
 `cargo deny` / `cargo audit` supply-chain job; a
 blocking locked fuzz-workspace job (`cargo metadata --locked`, `cargo check
@@ -546,12 +553,12 @@ newer compiler or image is exactly what they are for. A CI run is therefore
 outcome rather than a workflow defect. `msrv (1.95.0)` is the only job that
 evaluates a fixed toolchain.
 
-Publication is gated separately from merging. `package contents` proves the file
-list of each `.crate`; `package archives + staged consumer` builds the three
-`.crate` archives for real (`cargo package --locked`, verification enabled),
-extracts them, and rebuilds the public-API fixture's source against the
-extracted trees through `[patch.crates-io]`, so the bytes a crates.io user
-downloads are compiled and run before release rather than only listed.
+Source distribution is checked by `source contents`, `clean source archive`,
+and `Git consumer + pinned dependency sources`. The consumer builds and runs
+the public-API fixture from a separate project with a Git dependency on the
+tested Varve commit and no root `[patch]`. It also checks that all four
+Crossbeam crates resolve to the intended upstream source. crates.io archive
+checks must be restored before introducing crates.io distribution.
 `rustdoc (-D warnings)` builds the published documentation surface for all three
 crates with warnings denied.
 

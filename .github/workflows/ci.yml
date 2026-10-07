@@ -495,78 +495,26 @@ jobs:
       - name: Fuzz lockfile was not rewritten
         run: git diff --exit-code -- fuzz/Cargo.lock
 
-  # DOC-01 release gate: the published `.crate` files must carry the README and
-  # the license texts, not just a license expression in metadata. `cargo package
-  # --list` is the authority on what a consumer actually receives, so the lists
-  # are printed here and the required files are asserted.
-  #
-  # Scope note (F-11): this job is about NAMES only. `--no-verify` means no
-  # archive is created and nothing is compiled, so it cannot detect an archive
-  # that does not build. `package-archives` below is the job that does that.
-  package-contents:
-    # CI runs on the public repository only. `varve-dev` is private, so runner
-    # minutes there are metered against the account; this guard means the
-    # workflow file can live in a tree that is pushed to both remotes without
-    # ever spending a paid minute. Every job carries it because GitHub has no
-    # workflow-level `if`.
+  # Distribution is by Git/source while fixed Crossbeam sources are pinned.
+  # Keep source notices and a real downstream consumer covered. crates.io
+  # archive publication is not supported by the direct Git dependencies.
+  source-contents:
     if: github.repository == 'shim9610/varve'
-    name: package contents
+    name: source contents
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: package-contents
-      - name: Packaged file lists include README and licenses
+      - name: Source distribution includes README and licenses
         run: |
           set -euo pipefail
+          git ls-files --error-unmatch README.md LICENSE-MIT LICENSE-APACHE
           for package in varve varve-core varve-macros; do
-            echo "=== ${package} ==="
-            listing="$(cargo package --locked --no-verify -p "${package}" --list)"
-            echo "${listing}"
-            for required in README.md LICENSE-MIT LICENSE-APACHE; do
-              if ! grep -qx "${required}" <<<"${listing}"; then
-                echo "::error::${package} package omits ${required}"
-                exit 1
-              fi
-            done
+            git ls-files --error-unmatch "crates/${package}/LICENSE-MIT" "crates/${package}/LICENSE-APACHE"
           done
 
-  # REL-02 (F-11) release gate: `package contents` above proves only what the
-  # file LIST says. It runs with `--no-verify`, so no `.crate` archive is ever
-  # created and nothing is ever built from one. Every other job in this workflow
-  # builds the checkout by path. The bytes a crates.io user actually downloads
-  # were therefore never compiled anywhere.
-  #
-  # This job closes that. It has two halves:
-  #
-  #   1. `cargo package --locked` WITHOUT `--no-verify` for all three crates.
-  #      Cargo writes the real `.crate` archives and then compiles each one from
-  #      a temporary registry, so an inter-crate version requirement that no
-  #      published version can satisfy, a source file excluded from the archive,
-  #      or a path-only dependency that survives into the published manifest
-  #      fails here.
-  #   2. A STAGED CONSUMER. Verification proves each archive builds; it does not
-  #      prove a downstream crate can USE the published surface. So the archives
-  #      are extracted and the public-API fixture's source is rebuilt against
-  #      the extracted trees through `[patch.crates-io]` — a crate outside this
-  #      repository, resolving `varve` by version, exercising every documented
-  #      codec and field type, and running to completion. Deliberately not
-  #      `--locked`: a real consumer resolves its own lockfile.
-  #
-  # The extracted `varve` requires `varve-core`/`varve-macros` by VERSION, so
-  # all three patch entries are required and all three are exercised.
-  package-archives:
-    # CI runs on the public repository only. `varve-dev` is private, so runner
-    # minutes there are metered against the account; this guard means the
-    # workflow file can live in a tree that is pushed to both remotes without
-    # ever spending a paid minute. Every job carries it because GitHub has no
-    # workflow-level `if`.
+  git-consumer:
     if: github.repository == 'shim9610/varve'
-    name: package archives + staged consumer
+    name: Git consumer + pinned dependency sources
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -575,50 +523,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: package-archives
-      - name: Build and verify the .crate archives
-        run: |
-          set -euo pipefail
-          cargo package --locked -p varve-core -p varve-macros -p varve
-      - name: Stage a consumer against the packaged artifacts
-        run: |
-          set -euo pipefail
-          version="$(cargo metadata --locked --no-deps --format-version 1 \
-            | tr '{,' '\n\n' | grep -o '"version":"[^"]*"' | head -n 1 \
-            | cut -d'"' -f4)"
-          echo "packaged version: ${version}"
-
-          staged="${RUNNER_TEMP}/staged"
-          consumer="${RUNNER_TEMP}/staged-consumer"
-          mkdir -p "${staged}" "${consumer}/src"
-          for package in varve-core varve-macros varve; do
-            archive="target/package/${package}-${version}.crate"
-            test -f "${archive}" || { echo "::error::missing ${archive}"; exit 1; }
-            tar -xzf "${archive}" -C "${staged}"
-          done
-
-          # Same source as the `public-api fixture` job, different resolution:
-          # that job builds the checkout by path, this one builds the archives.
-          cp tools/public-api-fixture/src/main.rs "${consumer}/src/main.rs"
-          cat > "${consumer}/Cargo.toml" <<EOF
-          [package]
-          name = "staged-consumer"
-          version = "0.0.0"
-          edition = "2024"
-          publish = false
-
-          [dependencies]
-          varve = { version = "${version}", features = ["compression-zstd", "integrity"] }
-
-          [patch.crates-io]
-          varve = { path = "${staged}/varve-${version}" }
-          varve-core = { path = "${staged}/varve-core-${version}" }
-          varve-macros = { path = "${staged}/varve-macros-${version}" }
-
-          [workspace]
-          EOF
-          cd "${consumer}"
-          cargo run
+          key: git-consumer
+      - name: Resolve and run an independent consumer without root patches
+        run: python3 scripts/check_git_consumer.py
 
   # Build the committed tree exactly as a source package consumer sees it:
   # `git archive` contains only tracked files, so a workspace member or

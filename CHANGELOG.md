@@ -6,19 +6,21 @@ increment the minor version.
 
 ## Unreleased
 
-- Fix retained matrix working-page nodes after category clears by avoiding the
-  leaking range iterator in `crossbeam-skiplist 0.1.3`. Preserve bounded range
-  traversal and existing publication boundaries. Revisit the workaround when a
-  released dependency includes upstream's range-reference fix (PR #1217).
+- Pin Crossbeam to upstream commit `099d0469efcfacb32527bd9451a4fb62586ae537`
+  containing epoch/skiplist borrow fixes (PRs #871, #1297) and the range-reference
+  reclamation fix (#1217). Direct Git dependencies carry the fixed epoch/utils
+  sources to downstream consumers. Restore bounded matrix range iteration.
+- Unlink residual marked matrix working-page nodes after clearing a published
+  batch, preventing a separate node leak during repeated zero/write/sync cycles.
 - Keep the directory-cleanup safety test in ordinary CI and ASan while excluding
   it from Miri, which does not support opening directories.
 - Keep the file-backed redb comparison in ordinary CI and ASan while excluding
   it from Miri, which does not support redb's file-locking syscall.
 - Mark Windows matrix test fixtures sparse before extending them, preserving
   32 GiB radix-boundary coverage without allocating 32 GiB of disk space.
-- Record a remaining Miri Stacked Borrows violation in `crossbeam-epoch 0.9.21`,
-  reproduced without Varve. Upstream PR #871 fixes the development source;
-  native tests remain enabled and alias checking remains active.
+- Verify source/Git consumers in CI, including their resolved dependency
+  sources. crates.io archive publication is not supported while these upstream
+  Git dependencies are required. Keep Miri's native tests and alias checks active.
 
 ## 0.10.1 - 2026-10-03
 

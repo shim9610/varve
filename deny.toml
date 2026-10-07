@@ -79,4 +79,7 @@ skip-tree = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# The direct dependencies pin one reviewed upstream revision. Reject branch
+# or tag tracking even for this allowlisted repository.
+allow-git = ["https://github.com/crossbeam-rs/crossbeam"]
+required-git-spec = "rev"

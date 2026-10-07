@@ -1,5 +1,11 @@
 # Known Limitations
 
+Current unreleased source uses a pinned upstream Crossbeam Git revision for
+epoch/skiplist borrow fixes and range-reference reclamation. Distribution is
+currently by Git/source; the historical `.crate` verification below does not
+establish crates.io support for this revision. CI checks an independent Git
+consumer and its resolved Crossbeam sources. See the README installation notes.
+
 Status as of 0.10.1. Historical numbers measured 2026-07-22, re-measured 2026-07-25, and
 re-measured again on 2026-07-26 against the residency/verification split described
 below; every entry was checked against the code in this repository. Where an earlier

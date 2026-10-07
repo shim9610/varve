@@ -839,6 +839,17 @@ impl MatrixFile {
         working.root.store(root, Ordering::Relaxed);
         working.end.store(end, Ordering::Relaxed);
         working.pages.clear();
+        // Upstream 099d046 fixes Range reclamation, but clear() can still leave
+        // marked nodes linked at upper tower levels. A full-height search of
+        // the now-empty map unlinks those references before reuse/drop. Without
+        // it, repeated zero/insert/publish cycles leak nodes even after epoch GC.
+        // Recheck this workaround when updating Crossbeam; do not remove it
+        // based on the Range fix alone. This adds no lock or durability boundary.
+        drop(
+            working
+                .pages
+                .lower_bound(std::ops::Bound::<&u64>::Unbounded),
+        );
         file.sync_all()?;
         publication_fault("head_sync");
         publication_error("head_sync")?;
@@ -967,25 +978,10 @@ impl MatrixFile {
             .working
             .as_ref()
             .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))?;
-        // crossbeam-skiplist 0.1.3's Range retains the reference to every
-        // preceding node when it advances. Use the entry cursor, which releases
-        // that reference, while preserving the bounded range walk.
-        // Upstream fix: https://github.com/crossbeam-rs/crossbeam/pull/1217.
-        // TODO(crossbeam-skiplist upgrade): once a released dependency includes
-        // that fix, rerun the range reclamation probe and matrix ASan tests,
-        // then replace this workaround with the fixed range(first..=last).
-        if let Some(mut entry) = working.pages.lower_bound(std::ops::Bound::Included(&first)) {
-            loop {
-                let page = *entry.key();
-                if page > last {
-                    break;
-                }
-                pages.push(page);
-                if !entry.move_next() {
-                    break;
-                }
-            }
-        }
+        // The pinned upstream source includes PR #1217: Range releases each
+        // preceding entry. Registry 0.1.3 does not, despite the same version
+        // string; keep the fixed source when replacing the Git pin with a release.
+        pages.extend(working.pages.range(first..=last).map(|entry| *entry.key()));
         pages.push(first);
         pages.push(last);
         pages.sort_unstable();
