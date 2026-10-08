@@ -6,6 +6,8 @@ increment the minor version.
 
 ## Unreleased
 
+## 0.11.0 - 2026-10-08
+
 - Require explicit static block identities for typed access in manually declared
   schemas; use `VarveBlock::IDENTITY` with `with_block_identities`. Remove global
   first-use type registration. Generated schemas already declare identities.

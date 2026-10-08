@@ -1,9 +1,9 @@
-# API Changes — 0.3.0 through 0.10.2
+# API Changes — 0.3.0 through 0.11.0
 
 Migration document. Companion to [Known Limitations](known-limitations.md)
 and the [Changelog](../CHANGELOG.md).
 
-## Unreleased: explicit contracts and owned index state
+## K. 0.10.2 → 0.11.0: explicit contracts and owned index state
 
 Manual schemas used with typed APIs must supply static identities:
 `.with_block_identities(&[MyBlock::IDENTITY, OtherBlock::IDENTITY])`, with

@@ -15,7 +15,7 @@ tempfile = "3"
 
 [dependencies.varve]
 path = "../crates/varve"
-version = "0.10.2"
+version = "0.11.0"
 features = ["integrity", "mmap", "zero-copy", "compression-zstd"]
 
 # Use independent workspace for fuzzers

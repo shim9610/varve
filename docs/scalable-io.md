@@ -21,7 +21,7 @@ is still a forward walk of the record chain — `O(records before the answer)`,
 not a keyed lookup. Choose this family when key cardinality is the problem;
 choose the digest when open cost is.
 
-> **Status (0.10.2).** Stream/indexed handles, disk-index
+> **Status (0.11.0).** Stream/indexed handles, disk-index
 > plans, finite keys and scan control are part of the default public API, also
 > with `--no-default-features`. Remove `high-cardinality-dev` from Cargo manifests.
 > Repository release and long-duration load qualification are tracked separately.
