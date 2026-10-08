@@ -60,6 +60,7 @@ fn spec() -> FormatSpec {
         ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[LockRecord::IDENTITY])
     .with_read_limits(ReadLimits::STANDARD)
 }
 
@@ -204,6 +205,7 @@ fn stream_spec() -> FormatSpec {
         ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[LockRecord::IDENTITY])
     .with_commit_policy(CommitPolicy::RecordFooter)
     .with_read_limits(ReadLimits::STANDARD)
 }
@@ -632,6 +634,7 @@ fn a_failed_open_on_a_version_mismatch_releases_the_writer_lock() -> Result<()> 
         ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[LockRecord::IDENTITY])
     .with_read_limits(ReadLimits::STANDARD);
 
     match VarveFile::open(future, &path) {
@@ -700,6 +703,7 @@ fn a_failed_open_on_a_schema_hash_mismatch_releases_the_writer_lock() -> Result<
         ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[LockRecord::IDENTITY])
     .with_read_limits(ReadLimits::STANDARD);
 
     match VarveFile::open(other_schema, &path) {

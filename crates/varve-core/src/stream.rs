@@ -8,8 +8,8 @@ use crate::collections::{MaterializationBudget, ensure_registered_block};
 use crate::disk_index::{
     DiskIndexBatchOptions, DiskIndexDigest, DiskIndexError, DiskIndexFrontier, DiskIndexMetadata,
     DiskIndexMode, DiskIndexOptions, DiskIndexPrimaryGeneration, DiskIndexSnapshot, DiskIndexStore,
-    DiskIndexTail, DiskIndexWriteBatch, PRIMARY_GENERATION_WINDOW, batch_item_fixed_bytes,
-    state_sidecar_path, tail_limit_for_spec,
+    DiskIndexTail, PRIMARY_GENERATION_WINDOW, batch_item_fixed_bytes, state_sidecar_path,
+    tail_limit_for_spec,
 };
 use crate::file::{
     NativeStreamScanner, PreparedStreamRecord, ReplaceDurability, WriterLock,
@@ -535,11 +535,6 @@ impl VarveStreamReader {
         state.snapshot.status(&state.store).map_err(state_error)
     }
 
-    pub fn snapshot_retention(&self) -> Result<crate::SnapshotRetention> {
-        let state = self._state.as_ref().ok_or(Error::StreamingUnsupported)?;
-        state.store.snapshot_retention().map_err(state_error)
-    }
-
     /// The EOF of this handle's confirmed generation.
     pub fn committed_len(&self) -> u64 {
         self.snapshot.len()
@@ -817,7 +812,6 @@ pub struct VarveStreamWriter {
 
 struct StreamWriterState {
     store: DiskIndexStore,
-    batch: Option<DiskIndexWriteBatch>,
     chunk_records: usize,
     batch_records: usize,
     batch_last_sequence: Option<u64>,
@@ -828,7 +822,6 @@ impl StreamWriterState {
     fn new(store: DiskIndexStore, chunk_records: usize) -> Self {
         Self {
             store,
-            batch: None,
             chunk_records,
             batch_records: 0,
             batch_last_sequence: None,
@@ -840,7 +833,7 @@ impl StreamWriterState {
 impl Drop for StreamWriterState {
     fn drop(&mut self) {
         // Discard uncommitted staging before releasing the writer file guard.
-        self.batch.take();
+        self.store.batch.take();
     }
 }
 
@@ -1072,7 +1065,7 @@ impl VarveStreamWriter {
         let header_len = read_file_header(spec, &mut file)?;
         let physical_snapshot = SnapshotFile::from_file_with_len(file.try_clone()?, physical_len)?;
         let identity = primary_identity(spec, &physical_snapshot)?;
-        let store = DiskIndexStore::open_writer(sidecar, index_options).map_err(state_error)?;
+        let mut store = DiskIndexStore::open_writer(sidecar, index_options).map_err(state_error)?;
         let guard = store
             .stage_restore(
                 identity,
@@ -1311,12 +1304,6 @@ impl VarveStreamWriter {
             self.poison.poison();
         }
         result
-    }
-
-    /// Observe reader-held generations without committing or waiting for readers.
-    pub fn snapshot_retention(&self) -> Result<crate::SnapshotRetention> {
-        let state = self.state.as_ref().ok_or(Error::StreamingUnsupported)?;
-        state.store.snapshot_retention().map_err(state_error)
     }
 
     pub fn resident_state(&self) -> StreamResidentState {
@@ -1654,15 +1641,15 @@ impl VarveStreamWriter {
             state.store.begin_generation().map_err(state_error)?;
             state.dirty = true;
         }
-        if state.batch.is_some()
+        if state.store.batch.is_some()
             && state.batch_records.saturating_add(incoming) > state.chunk_records
         {
             self.commit_state_chunk(permit)?;
         }
         if let Some(state) = self.state.as_mut()
-            && state.batch.is_none()
+            && state.store.batch.is_none()
         {
-            state.batch = Some(state.store.begin_write_batch().map_err(state_error)?);
+            state.store.begin_write_batch().map_err(state_error)?;
         }
         Ok(())
     }
@@ -1672,7 +1659,11 @@ impl VarveStreamWriter {
             return Ok(());
         };
         let chain = self.spec.index_policy.block_offset_chain;
-        let batch = state.batch.as_mut().ok_or(Error::InvalidIndexCheckpoint)?;
+        let batch = state
+            .store
+            .batch
+            .as_mut()
+            .ok_or(Error::InvalidIndexCheckpoint)?;
         for (index, (block_id, info)) in records.iter().enumerate() {
             let end = records
                 .get(index + 1)
@@ -1743,7 +1734,11 @@ impl VarveStreamWriter {
         // STO-01: re-stamp the generation witness while its window is still
         // filling. Once the window is full it is frozen for the file's life,
         // so steady-state appends pay nothing here.
-        let pending = match self.state.as_ref().and_then(|state| state.batch.as_ref()) {
+        let pending = match self
+            .state
+            .as_ref()
+            .and_then(|state| state.store.batch.as_ref())
+        {
             Some(batch) if batch.primary_generation().len < PRIMARY_GENERATION_WINDOW => {
                 take_injected_generation_restamp_failure()?;
                 Some(primary_generation(
@@ -1757,17 +1752,17 @@ impl VarveStreamWriter {
         let Some(state) = self.state.as_mut() else {
             return Ok(());
         };
-        if let (Some(generation), Some(batch)) = (pending, state.batch.as_mut()) {
+        if let (Some(generation), Some(batch)) = (pending, state.store.batch.as_mut()) {
             batch
                 .set_primary_generation(generation)
                 .map_err(state_error)?;
         }
-        let Some(batch) = state.batch.take() else {
+        let Some(_) = state.store.batch.as_ref() else {
             return Ok(());
         };
         let sequence = state.batch_last_sequence.take();
         state.batch_records = 0;
-        if let Err(error) = batch.commit() {
+        if let Err(error) = state.store.commit_batch() {
             self.poison.poison();
             return match sequence {
                 // The staged records were already published natively.
@@ -2520,6 +2515,7 @@ mod tests {
             ManifestPolicy::None,
             BLOCKS,
         )
+        .with_block_identities(&[TestBlock::IDENTITY])
         .with_commit_policy(commit_policy)
         .with_read_limits(ReadLimits::finite_all(u64::MAX))
     }
@@ -2536,6 +2532,7 @@ mod tests {
             ManifestPolicy::None,
             KEYED_BLOCKS,
         )
+        .with_block_identities(&[KeyedTestBlock::IDENTITY])
         .with_commit_policy(CommitPolicy::RecordFooter)
         .with_read_limits(ReadLimits::finite_all(u64::MAX))
     }
@@ -2552,6 +2549,7 @@ mod tests {
             ManifestPolicy::None,
             OVERSIZED_BLOCKS,
         )
+        .with_block_identities(&[OversizedBlock::IDENTITY])
         .with_read_limits(
             ReadLimits::STANDARD
                 .with_max_logical_payload_len(16)
@@ -2863,7 +2861,7 @@ mod tests {
         let native = VarveStreamReader::open_native(spec, &path, StreamOptions::default())?;
         let identity = primary_identity(spec, native.snapshot())?;
         drop(native);
-        let store = create_state_store(
+        let mut store = create_state_store(
             &path,
             DiskIndexOptions::default(),
             DiskIndexMetadata::new_state(

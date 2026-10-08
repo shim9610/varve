@@ -132,6 +132,7 @@ mod enabled {
             ManifestPolicy::None,
             BLOCKS,
         )
+        .with_block_identities(&[PubRecord::IDENTITY])
         .with_read_limits(ReadLimits::STANDARD)
     }
 
@@ -379,6 +380,11 @@ mod cross_version_and_keyed_refusals {
             ManifestPolicy::None,
             blocks,
         )
+        .with_block_identities(if blocks[0].version == 1 {
+            &[RecordV1::IDENTITY]
+        } else {
+            &[RecordV2::IDENTITY]
+        })
         .with_read_limits(ReadLimits::STANDARD)
     }
 
@@ -610,6 +616,7 @@ mod cross_version_and_keyed_refusals {
             ManifestPolicy::None,
             KEYED_BLOCKS,
         )
+        .with_block_identities(&[KeyedRecord::IDENTITY])
         .with_read_limits(ReadLimits::STANDARD)
     }
 

@@ -1,6 +1,7 @@
 //! Direct finite-domain tables. Array position is the enum code; no stored keys
 //! or comparison tree. Immutable extents are published only at explicit sync.
 use super::*;
+use std::sync::Arc;
 use std::{cell::RefCell, collections::VecDeque, fs::File};
 use tree::{read_at, write_at};
 const MAGIC: &[u8; 8] = b"VIXSLOT1";

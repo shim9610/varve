@@ -501,8 +501,7 @@ fn check_scalable_roundtrip(dir: &std::path::Path) {
     reader.follow().unwrap();
     assert_eq!(reader.get_scalable_item(&7).unwrap().unwrap().value, 2);
     assert!(reader.snapshot_status().unwrap().pinned);
-    assert_eq!(writer.snapshot_retention().unwrap().active_snapshots, 2);
-    println!("  scalable OK: embedded backend, Dirty read, release/follow, retention");
+    println!("  scalable OK: embedded backend, Dirty read, release/follow, reader-local status");
 }
 
 fn main() {

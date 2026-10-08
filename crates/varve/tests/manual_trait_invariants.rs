@@ -3,13 +3,9 @@
 //! 2026-07-20 review's API-01 (authoritative block endian) and API-02
 //! (contract-cache identity).
 //!
-//! Where a format declares block identities — every format `varve_format!`
-//! emits — that declaration is authoritative and call order is irrelevant, so
-//! those tests probe manual impls before *and* after the generated type
-//! registers. Only formats that declare no identity for a block id keep the
-//! process-local first-use contract, and the last two tests pin exactly which
-//! `(descriptor table, identity table, block id)` triples that cache treats as
-//! the same format.
+//! Typed access always requires a declared immutable block identity. These
+//! tests exercise mismatches both before and after the legitimate type is
+//! used, plus missing identities and independent manual schema declarations.
 
 use std::fs::remove_file;
 use std::path::{Path, PathBuf};
@@ -895,7 +891,7 @@ fn manual_endian_disagreement_is_rejected_and_never_byte_swaps() -> varve::Resul
 }
 
 // ---------------------------------------------------------------------------
-// API-02: the first-use contract cache must not alias two logical formats
+// Manual schemas declare their contracts independently of call order.
 // ---------------------------------------------------------------------------
 
 const CACHE_BLOCK_ID: u32 = 65;
@@ -970,9 +966,9 @@ fn hand_built_spec(
 }
 
 /// API-02: an empty view and the full view of one static identity array are
-/// different logical formats and must never share a cached contract.
+/// different declarations; a missing identity is never inferred from a type.
 #[test]
-fn empty_and_full_identity_views_do_not_share_a_cache_entry() -> varve::Result<()> {
+fn missing_identity_is_rejected_and_explicit_identity_is_authoritative() -> varve::Result<()> {
     let empty: &'static [(u32, Option<Endian>, bool, u64)] = &CACHE_IDENTITIES[..0];
     let full: &'static [(u32, Option<Endian>, bool, u64)] = &CACHE_IDENTITIES[..];
     // The precondition the old address-only key could not survive.
@@ -984,14 +980,15 @@ fn empty_and_full_identity_views_do_not_share_a_cache_entry() -> varve::Result<(
     without_identities.validate()?;
     with_identities.validate()?;
 
-    // First: register the probe through the identity-less view. No identity
-    // covers block 65 there, so the documented first-use escape hatch records
-    // the probe's own fingerprint.
+    // No first caller can define a missing schema contract.
     let first = temp_path("cache_empty_view");
     cleanup(&first);
     {
         let file = VarveFile::create(without_identities, &first)?;
-        file.blocks::<CacheProbe>()?;
+        assert!(matches!(
+            file.blocks::<CacheProbe>(),
+            Err(Error::InvalidFormatSpec(_))
+        ));
     }
     cleanup(&first);
 
@@ -1039,7 +1036,7 @@ static PREFIX_BLOCKS: &[BlockDescriptor] = &[
 ];
 
 /// Two manual types for the same block id, each legitimately owning that id in
-/// its own identity-less format.
+/// its own explicitly declared format.
 macro_rules! prefix_probe {
     ($name:ident, $fingerprint:expr) => {
         #[derive(Clone, Debug, PartialEq)]
@@ -1082,17 +1079,17 @@ prefix_probe!(PrefixProbeIntruder, 0x0033_0033_0033_0033);
 
 /// API-02, descriptor-table half: a one-block prefix view and the full
 /// two-block view of one static descriptor array share a start address but are
-/// different formats. Each keeps its own first-use contract -- and each still
+/// different formats. Each declares its own immutable contract and still
 /// enforces it against a third type.
 #[test]
-fn descriptor_prefix_views_keep_independent_cache_entries() -> varve::Result<()> {
+fn manual_schemas_use_independent_explicit_type_contracts() -> varve::Result<()> {
     let short: &'static [BlockDescriptor] = &PREFIX_BLOCKS[..1];
     let long: &'static [BlockDescriptor] = &PREFIX_BLOCKS[..2];
     assert_eq!(short.as_ptr(), long.as_ptr());
     assert_ne!(short.len(), long.len());
 
-    let short_spec = hand_built_spec(b"PFX1", short, &[]);
-    let long_spec = hand_built_spec(b"PFX2", long, &[]);
+    let short_spec = hand_built_spec(b"PFX1", short, &[PrefixProbeShort::IDENTITY]);
+    let long_spec = hand_built_spec(b"PFX2", long, &[PrefixProbeLong::IDENTITY]);
     short_spec.validate()?;
     long_spec.validate()?;
 
@@ -1105,18 +1102,26 @@ fn descriptor_prefix_views_keep_independent_cache_entries() -> varve::Result<()>
         let short_file = VarveFile::create(short_spec, &short_path)?;
         let long_file = VarveFile::create(long_spec, &long_path)?;
 
-        // Distinct formats, distinct first-use contracts: both succeed. Under
-        // an address-only key the second collided with the first.
+        // Even the first use must obey the declaration.
+        assert!(matches!(
+            short_file.blocks::<PrefixProbeIntruder>(),
+            Err(Error::BlockSchemaFingerprintMismatch { .. })
+        ));
+        assert!(matches!(
+            long_file.blocks::<PrefixProbeIntruder>(),
+            Err(Error::BlockSchemaFingerprintMismatch { .. })
+        ));
+        // The two schemas declare different contracts for the same numeric id.
         short_file.blocks::<PrefixProbeShort>()?;
         long_file.blocks::<PrefixProbeLong>()?;
 
-        // Repeating a registration is the cache-hit path and stays consistent.
+        // Repeated validation has the same result.
         short_file.blocks::<PrefixProbeShort>()?;
         short_file.blocks::<PrefixProbeShort>()?;
         long_file.blocks::<PrefixProbeLong>()?;
 
         // Each format still refuses a type that disagrees with the contract it
-        // actually recorded, so splitting the entries did not disable the gate.
+        // declares.
         for (file, registered) in [
             (&short_file, 0x0011_0011_0011_0011_u64),
             (&long_file, 0x0022_0022_0022_0022_u64),
@@ -1135,7 +1140,7 @@ fn descriptor_prefix_views_keep_independent_cache_entries() -> varve::Result<()>
             }
         }
 
-        // A rejected type must not be cached as the contract owner.
+        // Rejection never changes the schema contract.
         short_file.blocks::<PrefixProbeShort>()?;
         long_file.blocks::<PrefixProbeLong>()?;
     }

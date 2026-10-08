@@ -4,10 +4,6 @@ use std::{
     fmt, fs,
     hash::Hash,
     path::{Path, PathBuf},
-    sync::{
-        Arc, OnceLock, Weak,
-        atomic::{AtomicUsize, Ordering},
-    },
 };
 
 #[cfg(test)]
@@ -189,7 +185,7 @@ impl DiskIndexOptions {
 pub type DiskIndexResult<T> = std::result::Result<T, DiskIndexError>;
 
 /// Observability counters for the scaling contracts the release gates pin
-/// (PERF-04 registry cost, API-03 codec invocation). Thread-local and only
+/// (codec invocation and primary generation scans). Thread-local and only
 /// compiled under `scalable-fault-injection`; the release build keeps the
 /// call sites as empty inline functions.
 #[cfg(feature = "scalable-fault-injection")]
@@ -197,13 +193,8 @@ pub(crate) mod scaling_counters {
     use std::cell::Cell;
 
     thread_local! {
-        static REGISTRY_SLOTS_INSPECTED: Cell<u64> = const { Cell::new(0) };
         static DESCRIPTOR_DECODER_CALLS: Cell<u64> = const { Cell::new(0) };
         static PRIMARY_GENERATION_SCANS: Cell<u64> = const { Cell::new(0) };
-    }
-
-    pub(crate) fn add_registry_slots_inspected(slots: u64) {
-        REGISTRY_SLOTS_INSPECTED.with(|value| value.set(value.get().saturating_add(slots)));
     }
 
     pub(crate) fn add_descriptor_decoder_call() {
@@ -218,27 +209,14 @@ pub(crate) mod scaling_counters {
         PRIMARY_GENERATION_SCANS.with(Cell::get)
     }
 
-    pub fn registry_slots_inspected() -> u64 {
-        REGISTRY_SLOTS_INSPECTED.with(Cell::get)
-    }
-
     pub fn descriptor_decoder_calls() -> u64 {
         DESCRIPTOR_DECODER_CALLS.with(Cell::get)
     }
 
     pub fn reset() {
-        REGISTRY_SLOTS_INSPECTED.with(|value| value.set(0));
         DESCRIPTOR_DECODER_CALLS.with(|value| value.set(0));
         PRIMARY_GENERATION_SCANS.with(|value| value.set(0));
     }
-}
-
-#[inline(always)]
-fn registry_slots_inspected(slots: u64) {
-    #[cfg(feature = "scalable-fault-injection")]
-    scaling_counters::add_registry_slots_inspected(slots);
-    #[cfg(not(feature = "scalable-fault-injection"))]
-    let _ = slots;
 }
 
 #[inline(always)]
@@ -1424,25 +1402,6 @@ fn record_physical_descriptor(
     })
 }
 
-/// Observability only. No page cache, file publication, or reclamation depends on this registry.
-struct SharedSidecar {
-    identity: Vec<u8>,
-    file: fs::File,
-    snapshots: crossbeam_skiplist::SkipMap<usize, u64>,
-    next_snapshot: AtomicUsize,
-}
-/// Process-local snapshot retention, sampled without taking writer admission.
-/// Counts may change during sampling. Bytes are logical file size, not retained
-/// page bytes. Explicit compaction writes a new file; old open readers retain
-/// their file generation until closed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SnapshotRetention {
-    pub confirmed_generation: u64,
-    pub active_snapshots: usize,
-    pub oldest_pinned_generation: Option<u64>,
-    pub sidecar_bytes: u64,
-}
-
 /// Physical sidecar sizes around an explicit compaction. Old open readers may
 /// retain the previous file until they close; tombstones remain indexed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1462,65 +1421,15 @@ pub struct SnapshotStatus {
     pub bytes_behind: u64,
 }
 
-struct SnapshotLease {
-    shared: Arc<SharedSidecar>,
-    id: usize,
-}
-impl Drop for SnapshotLease {
-    fn drop(&mut self) {
-        self.shared.snapshots.remove(&self.id);
-    }
-}
+// Each snapshot owns its read-only file description and bounded private caches.
+// No process-wide reader registration is needed to retain an old file generation.
 struct SnapshotPin {
     reader: storage::Reader,
     root: storage::Root,
-    _lease: SnapshotLease,
-}
-impl Drop for SharedSidecar {
-    fn drop(&mut self) {
-        if let Some(entry) = shared_sidecar_registry().get(&self.identity)
-            && std::ptr::eq(entry.value().as_ptr(), self)
-        {
-            entry.remove();
-        }
-    }
-}
-fn shared_sidecar_registry() -> &'static crossbeam_skiplist::SkipMap<Vec<u8>, Weak<SharedSidecar>> {
-    static REGISTRY: OnceLock<crossbeam_skiplist::SkipMap<Vec<u8>, Weak<SharedSidecar>>> =
-        OnceLock::new();
-    REGISTRY.get_or_init(crossbeam_skiplist::SkipMap::new)
-}
-fn observe_sidecar(file: &fs::File) -> DiskIndexResult<Arc<SharedSidecar>> {
-    let identity = opened_sidecar_identity(file)?;
-    loop {
-        registry_slots_inspected(1);
-        if let Some(entry) = shared_sidecar_registry().get(&identity) {
-            if let Some(shared) = entry.value().upgrade() {
-                return Ok(shared);
-            }
-            entry.remove();
-        }
-        let candidate = Arc::new(SharedSidecar {
-            identity: identity.clone(),
-            file: file.try_clone()?,
-            snapshots: crossbeam_skiplist::SkipMap::new(),
-            next_snapshot: AtomicUsize::new(0),
-        });
-        let entry =
-            shared_sidecar_registry().get_or_insert(identity.clone(), Arc::downgrade(&candidate));
-        if let Some(shared) = entry.value().upgrade() {
-            return Ok(shared);
-        }
-        entry.remove();
-    }
-}
-#[cfg(test)]
-fn sidecar_path_identity(path: &Path) -> DiskIndexResult<Vec<u8>> {
-    opened_sidecar_identity(&fs::File::open(path)?)
 }
 
 // Mirrors the private `stream::opened_file_identity` helper; the sidecar
-// registry must key on the same native identity the sidecar fingerprint uses.
+// handle identity must match the identity the sidecar fingerprint uses.
 #[cfg(unix)]
 fn opened_sidecar_identity(file: &fs::File) -> DiskIndexResult<Vec<u8>> {
     use std::os::unix::fs::MetadataExt;
@@ -1557,34 +1466,6 @@ fn opened_sidecar_identity(file: &fs::File) -> DiskIndexResult<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Exclusive write admission for one shared sidecar database. Every write
-/// transaction holds the gate for its lifetime, so a conflicting handle
-/// observes a typed [`DiskIndexError::Busy`] immediately instead of blocking
-/// behind an unbounded batch or restore transaction.
-struct WriteGateGuard {
-    gate: Arc<AtomicUsize>,
-}
-
-impl WriteGateGuard {
-    fn acquire(gate: &Arc<AtomicUsize>) -> DiskIndexResult<Self> {
-        if gate
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(DiskIndexError::Busy);
-        }
-        Ok(Self {
-            gate: Arc::clone(gate),
-        })
-    }
-}
-
-impl Drop for WriteGateGuard {
-    fn drop(&mut self) {
-        self.gate.store(0, Ordering::Release);
-    }
-}
-
 /// Last committed tail collection of this handle, keyed by the metadata tail
 /// digest it was committed under. Lets the next write batch skip re-reading
 /// and re-validating every tail row when nothing else committed in between:
@@ -1595,25 +1476,14 @@ struct TailCache {
     tails: BTreeMap<u32, DiskIndexTail>,
 }
 
-fn store_tail_cache(
-    cache: &crossbeam_queue::ArrayQueue<TailCache>,
-    digest: DiskIndexDigest,
-    tails: BTreeMap<u32, DiskIndexTail>,
-) {
-    // This is a best-effort, single-entry optimization. A racing replacement
-    // may discard a cache entry; the next batch then reads the persisted tails.
-    cache.pop();
-    let _ = cache.push(TailCache { digest, tails });
-}
-
 /// Takes the cached tail map when it provably matches the current working
 /// root. Ownership moves into the batch; the cache is refilled on commit, so
 /// an aborted or failed batch can never leak staged tails back into it.
 fn take_tail_cache(
-    cache: &crossbeam_queue::ArrayQueue<TailCache>,
+    cache: &mut Option<TailCache>,
     metadata: DiskIndexMetadata,
 ) -> Option<BTreeMap<u32, DiskIndexTail>> {
-    let cached = cache.pop()?;
+    let cached = cache.take()?;
     if cached.digest == metadata.working_tail_digest
         && u32::try_from(cached.tails.len()).ok() == Some(metadata.working_tail_count)
     {
@@ -1625,12 +1495,12 @@ fn take_tail_cache(
 
 pub struct DiskIndexStore {
     storage: IndexStorage,
-    shared: Arc<SharedSidecar>,
+    identity: Vec<u8>,
     options: DiskIndexOptions,
-    write_gate: Arc<AtomicUsize>,
-    tail_cache: Arc<crossbeam_queue::ArrayQueue<TailCache>>,
-    slots_cache: Arc<crossbeam_queue::ArrayQueue<slots::Working>>,
-    finite_layout: Arc<Vec<(u32, u32)>>,
+    tail_cache: Option<TailCache>,
+    slots_cache: Option<slots::Working>,
+    finite_layout: Vec<(u32, u32)>,
+    pub(crate) batch: Option<DiskIndexWriteBatch>,
 }
 
 impl DiskIndexStore {
@@ -1650,20 +1520,20 @@ impl DiskIndexStore {
         let options = options.validate()?;
         let path = canonical_sidecar_path(path.as_ref())?;
         let storage = IndexStorage::open(&path, options, true, true)?;
-        let store = Self::from_storage(storage, options)?;
+        let mut store = Self::from_storage(storage, options)?;
         store.initialize(metadata, tails)?;
         Ok(store)
     }
     fn from_storage(storage: IndexStorage, options: DiskIndexOptions) -> DiskIndexResult<Self> {
-        let shared = observe_sidecar(&storage.file)?;
+        let identity = opened_sidecar_identity(&storage.file)?;
         Ok(Self {
             storage,
-            shared,
+            identity,
             options,
-            write_gate: Arc::new(AtomicUsize::new(0)),
-            tail_cache: Arc::new(crossbeam_queue::ArrayQueue::new(1)),
-            slots_cache: Arc::new(crossbeam_queue::ArrayQueue::new(1)),
-            finite_layout: Arc::new(Vec::new()),
+            tail_cache: None,
+            slots_cache: None,
+            finite_layout: Vec::new(),
+            batch: None,
         })
     }
     pub(crate) fn configure_finite(&mut self, plan: DiskIndexPlan) -> DiskIndexResult<()> {
@@ -1682,11 +1552,8 @@ impl DiskIndexStore {
             &layout,
             self.options.batch.max_bytes.max(self.options.cache_bytes),
         )?;
-        self.finite_layout = Arc::new(layout);
-        self.slots_cache.pop();
-        self.slots_cache
-            .push(working)
-            .map_err(|_| DiskIndexError::Busy)?;
+        self.finite_layout = layout;
+        self.slots_cache = Some(working);
         Ok(())
     }
     /// Opens only read-only file descriptions. Each snapshot has its own bounded cache.
@@ -1723,24 +1590,6 @@ impl DiskIndexStore {
         validate_identity_mode(store.read_metadata()?, identity, mode)?;
         Ok(store)
     }
-    pub(crate) fn snapshot_retention(&self) -> DiskIndexResult<SnapshotRetention> {
-        let confirmed_generation = self.storage.confirmed()?.metadata.generation;
-        let mut active_snapshots = 0;
-        let mut oldest_pinned_generation = None;
-        for entry in &self.shared.snapshots {
-            active_snapshots += 1;
-            oldest_pinned_generation = Some(
-                oldest_pinned_generation
-                    .map_or(*entry.value(), |oldest: u64| oldest.min(*entry.value())),
-            );
-        }
-        Ok(SnapshotRetention {
-            confirmed_generation,
-            active_snapshots,
-            oldest_pinned_generation,
-            sidecar_bytes: self.shared.file.metadata()?.len(),
-        })
-    }
     pub fn read_metadata(&self) -> DiskIndexResult<DiskIndexMetadata> {
         Ok(self.storage.current()?.metadata)
     }
@@ -1756,17 +1605,12 @@ impl DiskIndexStore {
         if !matches!(current.metadata.mode, DiskIndexMode::DiskPlan(_)) {
             return Err(DiskIndexError::KeyTableUnavailable);
         }
-        if let Some(slots) = self.slots_cache.pop() {
+        if let Some(slots) = self.slots_cache.as_ref() {
             let count = current.root.tree.count + slots.count();
-            let _ = self.slots_cache.push(slots);
             Ok(count)
         } else {
             Ok(current.root.count())
         }
-    }
-    fn write_admission(&self) -> DiskIndexResult<WriteGateGuard> {
-        self.storage.writer()?;
-        WriteGateGuard::acquire(&self.write_gate)
     }
     fn validate_checkpoint(&self, current: &IndexCheckpoint) -> DiskIndexResult<()> {
         if let Some(checkpoint) = current.metadata.checkpoint {
@@ -1822,31 +1666,10 @@ impl DiskIndexStore {
         let confirmed = self.storage.confirmed()?;
         let metadata = confirmed.metadata;
         validate_identity_mode(metadata, identity, mode)?;
-        let next_snapshot = &self.shared.next_snapshot;
-        let mut id = next_snapshot.load(Ordering::Relaxed);
-        loop {
-            let next = id
-                .checked_add(1)
-                .ok_or(DiskIndexError::GenerationExhausted)?;
-            match next_snapshot.compare_exchange_weak(
-                id,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(current) => id = current,
-            }
-        }
-        self.shared.snapshots.insert(id, metadata.generation);
         Ok(DiskIndexSnapshot {
             pin: Some(SnapshotPin {
                 reader: self.storage.reader(&confirmed),
                 root: confirmed.root,
-                _lease: SnapshotLease {
-                    shared: self.shared.clone(),
-                    id,
-                },
             }),
             metadata,
             max_key_bytes: self.options.max_key_bytes,
@@ -1859,7 +1682,7 @@ impl DiskIndexStore {
         self.followed_handle(previous).map(|(_, snapshot)| snapshot)
     }
     pub(crate) fn same_file(&self, other: &Self) -> bool {
-        self.shared.identity == other.shared.identity
+        self.identity == other.identity
     }
     pub(crate) fn followed_handle(
         &self,
@@ -1904,7 +1727,7 @@ impl DiskIndexStore {
     /// Copy the current clean tree into a new file generation. Old readers keep
     /// their open file and never delay the writer. Call sync explicitly first.
     pub(crate) fn compact(&mut self) -> DiskIndexResult<IndexCompaction> {
-        let _gate = self.write_admission()?;
+        self.storage.writer()?;
         let base = self.storage.current()?;
         if base.metadata.state != DiskIndexState::Clean {
             return Err(DiskIndexError::CleanStateRequired);
@@ -1975,7 +1798,7 @@ impl DiskIndexStore {
         replacement.publish(state.metadata, &state.tails, root, Publication::Confirmed)?;
         let after_bytes = replacement.file.metadata()?.len();
         // Construct all fallible local state before publishing the replacement.
-        let shared = observe_sidecar(&replacement.file)?;
+        let identity = opened_sidecar_identity(&replacement.file)?;
         replacement.path = target.clone();
         let new_slots = if !self.finite_layout.is_empty() {
             let checkpoint = replacement.current()?;
@@ -1989,12 +1812,9 @@ impl DiskIndexStore {
         };
         let publication = crate::file::publish_open_temp_path_atomically(temp, &target)
             .map_err(DiskIndexError::Primary)?;
-        if let Some(working) = new_slots {
-            self.slots_cache.pop();
-            let _ = self.slots_cache.push(working);
-        }
+        self.slots_cache = new_slots;
         self.storage = replacement;
-        self.shared = shared;
+        self.identity = identity;
         match publication {
             crate::file::ReplaceDurability::Durable => {}
             crate::file::ReplaceDurability::ParentSyncPending(source) => {
@@ -2012,8 +1832,8 @@ impl DiskIndexStore {
             historical_distinct_keys: root.count(),
         })
     }
-    pub fn begin_generation(&self) -> DiskIndexResult<DiskIndexMetadata> {
-        let _gate = self.write_admission()?;
+    pub fn begin_generation(&mut self) -> DiskIndexResult<DiskIndexMetadata> {
+        self.storage.writer()?;
         let clean = self.storage.current()?;
         if clean.metadata.state != DiskIndexState::Clean {
             return Err(DiskIndexError::CleanStateRequired);
@@ -2033,68 +1853,81 @@ impl DiskIndexStore {
         result?;
         Ok(dirty)
     }
-    pub fn mark_dirty(&self) -> DiskIndexResult<DiskIndexMetadata> {
+    pub fn mark_dirty(&mut self) -> DiskIndexResult<DiskIndexMetadata> {
         self.begin_generation()
     }
     #[cfg(test)]
     pub fn apply_update(
-        &self,
+        &mut self,
         expected_covered_eof: u64,
         new_covered_eof: u64,
         update: &DiskIndexUpdate,
     ) -> DiskIndexResult<DiskIndexMetadata> {
-        let mut batch = self.begin_write_batch()?;
+        let batch = self.begin_write_batch()?;
         let metadata = batch.apply_update(expected_covered_eof, new_covered_eof, update)?;
-        batch.commit()?;
+        self.commit_batch()?;
         Ok(metadata)
     }
-    pub(crate) fn begin_write_batch(&self) -> DiskIndexResult<DiskIndexWriteBatch> {
-        if self.read_metadata()?.state == DiskIndexState::Clean {
-            self.begin_generation()?;
+    pub(crate) fn begin_write_batch(&mut self) -> DiskIndexResult<&mut DiskIndexWriteBatch> {
+        // The store owns the only staged batch. It never lends a writable file
+        // capability to that batch; publication requires exclusive store access.
+        if self.batch.is_none() {
+            if self.read_metadata()?.state == DiskIndexState::Clean {
+                self.begin_generation()?;
+            }
+            self.storage.writer()?;
+            let base = self.storage.current()?;
+            self.validate_checkpoint(&base)?;
+            let metadata = base.metadata;
+            if metadata.state != DiskIndexState::Dirty {
+                return Err(DiskIndexError::DirtyStateRequired);
+            }
+            let tails = match take_tail_cache(&mut self.tail_cache, metadata) {
+                Some(tails) => tails,
+                None => self
+                    .storage
+                    .state(&base, None)?
+                    .tails
+                    .into_iter()
+                    .map(|t| (t.block_id, t))
+                    .collect(),
+            };
+            self.batch = Some(DiskIndexWriteBatch {
+                reader: self.storage.reader(&base),
+                base,
+                metadata,
+                tails,
+                changed_tails: BTreeSet::new(),
+                pending_latest: BTreeMap::new(),
+                slots: if self.finite_layout.is_empty() {
+                    None
+                } else {
+                    Some(
+                        self.slots_cache
+                            .take()
+                            .ok_or(DiskIndexError::CheckpointMismatch(
+                                "finite slot working state is unavailable",
+                            ))?,
+                    )
+                },
+                options: self.options,
+                records: 0,
+                bytes: 0,
+            });
         }
-        let gate = self.write_admission()?;
-        let base = self.storage.current()?;
-        self.validate_checkpoint(&base)?;
-        let metadata = base.metadata;
-        if metadata.state != DiskIndexState::Dirty {
-            return Err(DiskIndexError::DirtyStateRequired);
+        Ok(self.batch.as_mut().expect("batch initialized"))
+    }
+    pub(crate) fn commit_batch(&mut self) -> DiskIndexResult<()> {
+        if let Some(batch) = self.batch.take() {
+            batch.commit(self)?;
         }
-        let tails = match take_tail_cache(&self.tail_cache, metadata) {
-            Some(tails) => tails,
-            None => self
-                .storage
-                .state(&base, None)?
-                .tails
-                .into_iter()
-                .map(|t| (t.block_id, t))
-                .collect(),
-        };
-        Ok(DiskIndexWriteBatch {
-            reader: self.storage.reader(&base),
-            storage: self.storage.fork(),
-            base,
-            _gate: gate,
-            metadata,
-            tails,
-            changed_tails: BTreeSet::new(),
-            pending_latest: BTreeMap::new(),
-            slots: if self.finite_layout.is_empty() {
-                None
-            } else {
-                Some(self.slots_cache.pop().ok_or(DiskIndexError::Busy)?)
-            },
-            slots_cache: self.slots_cache.clone(),
-            tail_cache: self.tail_cache.clone(),
-            options: self.options,
-            records: 0,
-            bytes: 0,
-        })
+        Ok(())
     }
     pub(crate) fn publish_clean(
-        &self,
+        &mut self,
         expected_working: DiskIndexFrontier,
     ) -> DiskIndexResult<DiskIndexMetadata> {
-        let _gate = self.write_admission()?;
+        self.storage.writer()?;
         let current = self.storage.current()?;
         if current.metadata.state != DiskIndexState::Dirty {
             return Err(DiskIndexError::DirtyStateRequired);
@@ -2118,11 +1951,14 @@ impl DiskIndexStore {
         clean.checkpoint = None;
         let mut root = current.root;
         if !self.finite_layout.is_empty() {
-            let mut working = self.slots_cache.pop().ok_or(DiskIndexError::Busy)?;
+            let mut working = self
+                .slots_cache
+                .take()
+                .ok_or(DiskIndexError::CheckpointMismatch(
+                    "finite slot working state is unavailable",
+                ))?;
             root.slots = working.publish(self.storage.writer()?, false)?;
-            self.slots_cache
-                .push(working)
-                .map_err(|_| DiskIndexError::Busy)?;
+            self.slots_cache = Some(working);
         }
         crate::scalable_fault_point("publish.clean_commit");
         let result = self
@@ -2133,7 +1969,7 @@ impl DiskIndexStore {
         Ok(clean)
     }
     #[cfg(test)]
-    pub fn mark_clean(&self, expected_covered_eof: u64) -> DiskIndexResult<DiskIndexMetadata> {
+    pub fn mark_clean(&mut self, expected_covered_eof: u64) -> DiskIndexResult<DiskIndexMetadata> {
         let metadata = self.read_metadata()?;
         if metadata.working.eof != expected_covered_eof {
             return Err(DiskIndexError::CoverageMismatch {
@@ -2147,13 +1983,13 @@ impl DiskIndexStore {
         self.publish_clean(metadata.working)
     }
     pub fn stage_restore(
-        &self,
+        &mut self,
         expected_identity: DiskIndexIdentity,
         expected_mode: DiskIndexMode,
         physical_native_eof: u64,
         expected_tail_limit: u32,
-    ) -> DiskIndexResult<DiskIndexRestoreGuard> {
-        let gate = self.write_admission()?;
+    ) -> DiskIndexResult<DiskIndexRestoreGuard<'_>> {
+        self.storage.writer()?;
         let dirty = self.storage.current()?;
         validate_identity_mode(dirty.metadata, expected_identity, expected_mode)?;
         validate_expected_tail_limit(dirty.metadata, expected_tail_limit)?;
@@ -2178,21 +2014,20 @@ impl DiskIndexStore {
         validate_restored_root(&dirty.metadata, &staged)?;
         crate::scalable_fault_point("restore.stage");
         Ok(DiskIndexRestoreGuard {
-            storage: self.storage.fork(),
-            _gate: gate,
+            storage: &mut self.storage,
             root: base.root,
             staged,
         })
     }
     fn initialize(
-        &self,
+        &mut self,
         mut metadata: DiskIndexMetadata,
         tails: &[DiskIndexTail],
     ) -> DiskIndexResult<()> {
         if metadata.state != DiskIndexState::Clean || metadata.checkpoint.is_some() {
             return Err(DiskIndexError::CleanStateRequired);
         }
-        let _gate = self.write_admission()?;
+        self.storage.writer()?;
         let tails = canonical_tail_map(tails, metadata.tail_limit, metadata.committed)?;
         let digest = tail_digest(tails.values().copied());
         metadata.committed_tail_count = tails.len() as u32;
@@ -2206,17 +2041,14 @@ impl DiskIndexStore {
             storage::Root::default(),
             Publication::Confirmed,
         )?;
-        store_tail_cache(&self.tail_cache, digest, tails);
+        self.tail_cache = Some(TailCache { digest, tails });
         Ok(())
     }
 }
 
 pub(crate) struct DiskIndexWriteBatch {
-    storage: IndexStorage,
     base: IndexCheckpoint,
     reader: storage::Reader,
-    // Only the sole writer takes this batch admission guard.
-    _gate: WriteGateGuard,
     metadata: DiskIndexMetadata,
     tails: BTreeMap<u32, DiskIndexTail>,
     changed_tails: BTreeSet<u32>,
@@ -2227,8 +2059,6 @@ pub(crate) struct DiskIndexWriteBatch {
     /// key and encoded value.
     pending_latest: BTreeMap<Vec<u8>, [u8; LATEST_LEN]>,
     slots: Option<slots::Working>,
-    slots_cache: Arc<crossbeam_queue::ArrayQueue<slots::Working>>,
-    tail_cache: Arc<crossbeam_queue::ArrayQueue<TailCache>>,
     options: DiskIndexOptions,
     records: usize,
     bytes: usize,
@@ -2496,19 +2326,15 @@ impl DiskIndexWriteBatch {
         self.bytes
     }
 
-    pub(crate) fn commit(mut self) -> DiskIndexResult<()> {
+    fn commit(mut self, store: &mut DiskIndexStore) -> DiskIndexResult<()> {
         if self.records == 0 && self.changed_tails.is_empty() {
             debug_assert!(self.pending_latest.is_empty());
             // Nothing was staged: the map is still exactly the committed
             // collection, so hand it back for the next batch.
             let digest = self.metadata.working_tail_digest;
             let tails = std::mem::take(&mut self.tails);
-            store_tail_cache(&self.tail_cache, digest, tails);
-            if let Some(slots) = self.slots {
-                self.slots_cache
-                    .push(slots)
-                    .map_err(|_| DiskIndexError::Busy)?;
-            }
+            store.tail_cache = Some(TailCache { digest, tails });
+            store.slots_cache = self.slots;
             return Ok(());
         }
 
@@ -2537,20 +2363,19 @@ impl DiskIndexWriteBatch {
             validate_tail(*tail, self.metadata.working)?;
         }
 
-        let root = self.storage.apply(&self.base, &self.pending_latest)?;
+        let root = store.storage.apply(&self.base, &self.pending_latest)?;
         let tails: Vec<_> = self.tails.values().copied().collect();
         crate::scalable_fault_point("append.sidecar_batch_commit");
-        let commit = self
+        let commit = store
             .storage
             .publish(self.metadata, &tails, root, Publication::Working);
         crate::scalable_fault_point("append.sidecar_batch_commit");
         commit?;
-        if let Some(slots) = self.slots {
-            self.slots_cache
-                .push(slots)
-                .map_err(|_| DiskIndexError::Busy)?;
-        }
-        store_tail_cache(&self.tail_cache, digest, self.tails);
+        store.slots_cache = self.slots;
+        store.tail_cache = Some(TailCache {
+            digest,
+            tails: self.tails,
+        });
         Ok(())
     }
 
@@ -2625,13 +2450,12 @@ impl DiskIndexWriteBatch {
     }
 }
 
-pub struct DiskIndexRestoreGuard {
-    storage: IndexStorage,
-    _gate: WriteGateGuard,
+pub struct DiskIndexRestoreGuard<'a> {
+    storage: &'a mut IndexStorage,
     root: storage::Root,
     staged: DiskIndexPersistentState,
 }
-impl DiskIndexRestoreGuard {
+impl DiskIndexRestoreGuard<'_> {
     pub const fn base_eof(&self) -> u64 {
         self.staged.metadata.committed.eof
     }
@@ -2795,7 +2619,7 @@ pub fn build_replacement(
         .suffix(".vki.tmp")
         .tempfile_in(directory)?;
     let temp_path = temporary.into_temp_path();
-    let store = DiskIndexStore::create(&temp_path, options, metadata)?;
+    let mut store = DiskIndexStore::create(&temp_path, options, metadata)?;
     store.begin_generation()?;
     let mut covered_eof = metadata.committed.eof;
     while let Some(entry) = source.next_update()? {
@@ -3676,6 +3500,7 @@ mod tests {
             ManifestPolicy::None,
             BLOCKS,
         )
+        .with_block_identities(&[PlanItem::IDENTITY])
         .with_read_limits(ReadLimits::STANDARD)
     }
 
@@ -3779,6 +3604,7 @@ mod tests {
             ManifestPolicy::None,
             BLOCKS_V2,
         )
+        .with_block_identities(&[PlanItem::IDENTITY])
         .with_read_limits(ReadLimits::STANDARD);
 
         // The canonical witness only elides revalidation for the exact block
@@ -3908,14 +3734,14 @@ mod tests {
     fn begin_batch_and_clean_use_one_rollback_checkpoint() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("data.vki");
-        let store =
+        let mut store =
             DiskIndexStore::create(&path, DiskIndexOptions::default(), metadata(64)).unwrap();
 
         let dirty = store.begin_generation().unwrap();
         let checkpoint_offset = dirty.checkpoint.unwrap().checkpoint_offset;
         assert_eq!(rollback_checkpoints(&store), [checkpoint_offset]);
 
-        let mut batch = store.begin_write_batch().unwrap();
+        let batch = store.begin_write_batch().unwrap();
         batch
             .apply_update_with_tail(
                 64,
@@ -3938,7 +3764,7 @@ mod tests {
             .unwrap();
         assert_eq!(batch.records(), 1);
         assert!(batch.bytes() > 0);
-        batch.commit().unwrap();
+        store.commit_batch().unwrap();
 
         let working = DiskIndexFrontier::new(100, 1, Some(1));
         let dirty = store.read_state().unwrap();
@@ -3963,10 +3789,10 @@ mod tests {
     fn staged_restore_aborts_without_mutation_then_commits_after_native_sync() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("data.vki");
-        let store =
+        let mut store =
             DiskIndexStore::create(&path, DiskIndexOptions::default(), metadata(64)).unwrap();
         store.begin_generation().unwrap();
-        let mut batch = store.begin_write_batch().unwrap();
+        let batch = store.begin_write_batch().unwrap();
         batch
             .apply_update(
                 64,
@@ -3981,7 +3807,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        batch.commit().unwrap();
+        store.commit_batch().unwrap();
 
         let guard = store
             .stage_restore(identity(), plan().mode(), 100, 4)
@@ -4027,15 +3853,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("data.vki");
         {
-            let store =
+            let mut store =
                 DiskIndexStore::create(&path, DiskIndexOptions::default(), metadata(64)).unwrap();
             store.begin_generation().unwrap();
-            let mut batch = store.begin_write_batch().unwrap();
+            let batch = store.begin_write_batch().unwrap();
             batch.advance_coverage(64, 90, 0).unwrap();
-            batch.commit().unwrap();
+            store.commit_batch().unwrap();
         }
 
-        let store = DiskIndexStore::open_writer(&path, DiskIndexOptions::default()).unwrap();
+        let mut store = DiskIndexStore::open_writer(&path, DiskIndexOptions::default()).unwrap();
         assert_eq!(store.read_metadata().unwrap().working.eof, 90);
         store
             .stage_restore(identity(), plan().mode(), 90, 4)
@@ -4046,13 +3872,13 @@ mod tests {
     }
 
     #[test]
-    fn reader_validation_never_takes_write_admission() {
+    fn reader_validation_is_independent_of_a_pending_batch() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("read-validation.vki");
         let options = DiskIndexOptions::default();
-        let store = DiskIndexStore::create(&path, options, metadata(64)).unwrap();
-        let _gate = store.write_admission().unwrap();
-        // Readers must finish while the writer admission remains held.
+        let mut store = DiskIndexStore::create(&path, options, metadata(64)).unwrap();
+        store.begin_write_batch().unwrap();
+        // Readers must finish while the writer keeps an uncommitted batch.
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0..8)
                 .map(|_| {
@@ -4069,25 +3895,6 @@ mod tests {
                 handle.join().unwrap();
             }
         });
-    }
-
-    #[test]
-    fn registry_releases_identity_after_the_final_handle() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("registry.vki");
-        let options = DiskIndexOptions::default();
-        let store = DiskIndexStore::create(&path, options, metadata(64)).unwrap();
-        let identity = sidecar_path_identity(&path).unwrap();
-        assert!(shared_sidecar_registry().get(&identity).is_some());
-        drop(store);
-        assert!(shared_sidecar_registry().get(&identity).is_none());
-        let reopened = DiskIndexStore::open(&path, options).unwrap();
-        let second = DiskIndexStore::open(&path, options).unwrap();
-        assert!(Arc::ptr_eq(&reopened.shared, &second.shared));
-        drop(reopened);
-        second.validate_protocol().unwrap();
-        drop(second);
-        assert!(shared_sidecar_registry().get(&identity).is_none());
     }
 
     #[test]
@@ -4125,7 +3932,7 @@ mod tests {
     #[test]
     fn rollback_checkpoint_must_point_backwards() {
         let directory = tempfile::tempdir().unwrap();
-        let store = DiskIndexStore::create(
+        let mut store = DiskIndexStore::create(
             directory.path().join("data.vki"),
             DiskIndexOptions::default(),
             metadata(64),
@@ -4149,16 +3956,16 @@ mod tests {
     #[test]
     fn torn_working_head_preserves_confirmed_checkpoint() {
         let directory = tempfile::tempdir().unwrap();
-        let store = DiskIndexStore::create(
+        let mut store = DiskIndexStore::create(
             directory.path().join("data.vki"),
             DiskIndexOptions::default(),
             metadata(64),
         )
         .unwrap();
         store.begin_generation().unwrap();
-        let mut batch = store.begin_write_batch().unwrap();
+        let batch = store.begin_write_batch().unwrap();
         batch.advance_coverage(64, 80, 0).unwrap();
-        batch.commit().unwrap();
+        store.commit_batch().unwrap();
         for slot in storage::WORKING {
             tree::write_at(store.storage.writer().unwrap(), slot, &[0xA5; 64]).unwrap();
         }
@@ -4178,15 +3985,15 @@ mod tests {
     fn completed_generation_survives_one_head_loss_without_regressing() {
         for damaged in storage::CONFIRMED {
             let directory = tempfile::tempdir().unwrap();
-            let store = DiskIndexStore::create(
+            let mut store = DiskIndexStore::create(
                 directory.path().join("data.vki"),
                 DiskIndexOptions::default(),
                 metadata(64),
             )
             .unwrap();
-            let mut batch = store.begin_write_batch().unwrap();
+            let batch = store.begin_write_batch().unwrap();
             batch.advance_coverage(64, 80, 0).unwrap();
-            batch.commit().unwrap();
+            store.commit_batch().unwrap();
             store
                 .publish_clean(DiskIndexFrontier::new(80, 1, Some(1)))
                 .unwrap();
@@ -4200,15 +4007,15 @@ mod tests {
     #[test]
     fn corrupt_durable_checkpoint_never_silently_rolls_back_acknowledged_data() {
         let directory = tempfile::tempdir().unwrap();
-        let store = DiskIndexStore::create(
+        let mut store = DiskIndexStore::create(
             directory.path().join("data.vki"),
             DiskIndexOptions::default(),
             metadata(64),
         )
         .unwrap();
-        let mut batch = store.begin_write_batch().unwrap();
+        let batch = store.begin_write_batch().unwrap();
         batch.advance_coverage(64, 80, 0).unwrap();
-        batch.commit().unwrap();
+        store.commit_batch().unwrap();
         store
             .publish_clean(DiskIndexFrontier::new(80, 1, Some(1)))
             .unwrap();
@@ -4272,15 +4079,16 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("data.vks");
         let metadata = DiskIndexMetadata::new_state(identity(), DiskIndexFrontier::empty(64), 0);
-        let store = DiskIndexStore::create(&path, DiskIndexOptions::default(), metadata).unwrap();
+        let mut store =
+            DiskIndexStore::create(&path, DiskIndexOptions::default(), metadata).unwrap();
         store.begin_generation().unwrap();
-        let mut batch = store.begin_write_batch().unwrap();
+        let batch = store.begin_write_batch().unwrap();
         assert!(matches!(
             batch.lookup(10, &9u64),
             Err(DiskIndexError::KeyTableUnavailable)
         ));
         batch.advance_coverage(64, 80, 0).unwrap();
-        batch.commit().unwrap();
+        store.commit_batch().unwrap();
         store
             .publish_clean(DiskIndexFrontier::new(80, 1, Some(1)))
             .unwrap();
@@ -4305,9 +4113,9 @@ mod tests {
             max_key_bytes: 1024,
             ..DiskIndexOptions::default()
         };
-        let store = DiskIndexStore::create(&path, options, metadata(64)).unwrap();
+        let mut store = DiskIndexStore::create(&path, options, metadata(64)).unwrap();
         store.begin_generation().unwrap();
-        let mut batch = store.begin_write_batch().unwrap();
+        let batch = store.begin_write_batch().unwrap();
         batch.advance_coverage(64, 80, 0).unwrap();
         assert!(matches!(
             batch.advance_coverage(80, 96, 1),
@@ -4317,7 +4125,7 @@ mod tests {
             batch.working_frontier(),
             DiskIndexFrontier::new(80, 1, Some(1))
         );
-        batch.commit().unwrap();
+        store.commit_batch().unwrap();
     }
 
     #[test]
@@ -4395,7 +4203,8 @@ mod tests {
             generation: u64::MAX,
             ..metadata(64)
         };
-        let store = DiskIndexStore::create(&path, DiskIndexOptions::default(), metadata).unwrap();
+        let mut store =
+            DiskIndexStore::create(&path, DiskIndexOptions::default(), metadata).unwrap();
         store.begin_generation().unwrap();
         assert!(matches!(
             store.mark_clean(64),

@@ -609,10 +609,9 @@ loop {
 ```
 
 The single writer holds nonblocking native/sidecar OS writer guards. These
-exclude a second writer; readers never acquire them. An atomic per-writer gate
-rejects overlapping batch/restore operations instead of waiting. The process-local
-skip-list registry observes snapshot counts only: it owns no page cache or
-publication state. No reader is required to exit, release or acknowledge a
+exclude a second writer; readers never acquire them. The store owns its pending
+write batch and caches. Publication and restore require exclusive mutable
+access; no atomic admission gate or cache-transfer queue is involved. No reader is required to exit, release or acknowledge a
 checkpoint before the writer can append or publish.
 
 Confirmed roots carry the native EOF and immutable index offsets. Readers
@@ -661,13 +660,11 @@ cargo test --release -p varve `
 
 Stream/indexed readers expose `snapshot_status()` with the adopted and latest
 confirmed generations, record/byte lag, and whether their backend snapshot is
-pinned. Reader and writer `snapshot_retention()` returns process-local active
-snapshot count, oldest pinned generation, latest confirmed generation, and the
-logical sidecar file size. These are observational samples, not an atomic global
-view while other threads open/follow/release. Counts exclude writer checkpoints and pending batches. Counts are per open
-sidecar file identity, so after compaction old readers remain observable through
-handles of the old identity; the new writer reports the new identity. `sidecar_bytes` is not an estimate of
-bytes retained exclusively by a reader.
+pinned. Each reader owns its file snapshot; there is no process-global reader
+registry or `snapshot_retention()` API. Applications that need a reader count or
+oldest active generation track their own reader lifetimes and reported status.
+Old open files remain readable after compaction until their handles are dropped.
+`IndexCompaction` reports the old and new logical sidecar sizes.
 
 Call `release_snapshot(&mut self)` on an idle reader to drop its backend page
 reference immediately. It returns true once and false if already released.

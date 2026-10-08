@@ -134,6 +134,7 @@ fn matrix_spec() -> FormatSpec {
     )
     .with_matrix_spec(DIMS, COMMITS, MATRIX_BLOCKS)
     .with_matrix_aux(AUX)
+    .with_block_identities(&[MatrixCell::IDENTITY])
     .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }
 
@@ -442,6 +443,7 @@ fn swap_spec() -> FormatSpec {
         ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[SwapProbe::IDENTITY])
     .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }
 
@@ -531,6 +533,7 @@ fn blob_spec() -> FormatSpec {
         ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[BigBlob::IDENTITY])
     .with_read_limits(ReadLimits::finite_all(64_000))
 }
 

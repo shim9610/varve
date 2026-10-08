@@ -38,14 +38,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-queue"
-version = "0.3.14"
-source = "git+https://github.com/crossbeam-rs/crossbeam?rev=099d0469efcfacb32527bd9451a4fb62586ae537#099d0469efcfacb32527bd9451a4fb62586ae537"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-skiplist"
 version = "0.1.3"
 source = "git+https://github.com/crossbeam-rs/crossbeam?rev=099d0469efcfacb32527bd9451a4fb62586ae537#099d0469efcfacb32527bd9451a4fb62586ae537"
@@ -301,7 +293,6 @@ name = "varve-core"
 version = "0.10.2"
 dependencies = [
  "crc32fast",
- "crossbeam-queue",
  "crossbeam-skiplist",
  "libc",
  "tempfile",

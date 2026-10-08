@@ -3,6 +3,7 @@
 use super::tree::{self, read_at, write_at};
 use super::*;
 use std::fs::{File, OpenOptions};
+use std::sync::Arc;
 
 const MAGIC: &[u8; 8] = b"VARVEIX5";
 const HEAD_MAGIC: &[u8; 8] = b"VIXHEAD1";
@@ -27,7 +28,7 @@ impl Drop for WriterFile {
 
 pub(super) struct Store {
     pub file: Arc<File>,
-    writer: Option<Arc<WriterFile>>,
+    writer: Option<WriterFile>,
     pub path: PathBuf,
     options: DiskIndexOptions,
 }
@@ -97,7 +98,7 @@ impl Store {
                 }
                 Err(crate::file::WriterGuardLockError::Io(error)) => return Err(error.into()),
             }
-            Some(Arc::new(WriterFile(file)))
+            Some(WriterFile(file))
         } else {
             None
         };
@@ -138,14 +139,6 @@ impl Store {
             }
         }
         Ok(result)
-    }
-    pub fn fork(&self) -> Self {
-        Self {
-            file: self.file.clone(),
-            writer: self.writer.clone(),
-            path: self.path.clone(),
-            options: self.options,
-        }
     }
     pub fn writer(&self) -> DiskIndexResult<&File> {
         self.writer
@@ -354,7 +347,7 @@ impl Store {
         Ok(DiskIndexPersistentState { metadata, tails })
     }
     pub fn publish(
-        &self,
+        &mut self,
         metadata: DiskIndexMetadata,
         tails: &[DiskIndexTail],
         root: Root,
@@ -454,7 +447,7 @@ impl Store {
         })
     }
     pub fn apply(
-        &self,
+        &mut self,
         base: &Checkpoint,
         updates: &BTreeMap<Vec<u8>, [u8; LATEST_LEN]>,
     ) -> DiskIndexResult<Root> {

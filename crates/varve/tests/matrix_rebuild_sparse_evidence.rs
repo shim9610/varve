@@ -80,6 +80,7 @@ fn spec() -> FormatSpec {
         varve::ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[RebuildCell::IDENTITY])
     .with_read_limits(ReadLimits::STANDARD)
     .with_matrix_spec(DIMENSIONS, COMMITS, MATRIX_BLOCKS)
 }

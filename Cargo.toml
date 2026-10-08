@@ -22,7 +22,6 @@ crc32fast = "1.5.2"
 # the fixed epoch/utils sources to downstream Git consumers; a root [patch]
 # would not. Keep this immutable revision until a verified release replaces it.
 crossbeam-skiplist = { version = "=0.1.3", git = "https://github.com/crossbeam-rs/crossbeam", rev = "099d0469efcfacb32527bd9451a4fb62586ae537" }
-crossbeam-queue = { version = "=0.3.14", git = "https://github.com/crossbeam-rs/crossbeam", rev = "099d0469efcfacb32527bd9451a4fb62586ae537" }
 libc = "0.2.189"
 memmap2 = "0.9.11"
 proc-macro2 = "1.0.107"

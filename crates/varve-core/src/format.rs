@@ -2196,8 +2196,10 @@ pub struct FormatSpec {
     /// `varve_format!` fills this from the registered block types so
     /// [`FormatSpec::computed_schema_hash`] covers the per-block encoding
     /// inputs that [`BlockDescriptor`] alone does not carry (endian override,
-    /// keyedness, and the generated codec identity). Hand-built specs may
-    /// leave it empty; the computed hash then records the absence explicitly.
+    /// keyedness, and the generated codec identity). Manual schemas use a
+    /// static slice such as `&[MyBlock::IDENTITY]`. Every block used through
+    /// typed APIs must have an entry; absent identities are rejected before
+    /// encoding or decoding. Raw record access needs no Rust type contract.
     /// The fingerprint values themselves stay process-local: they are never
     /// compared against on-disk descriptors, only folded into the computed
     /// hash and checked by the in-process registration gate.
@@ -2212,10 +2214,6 @@ pub struct FormatSpec {
     /// inherit [`FormatSpec::endian`]", which is how it is both hashed
     /// (as an explicit absence marker) and compared (after resolution).
     ///
-    /// The slices supplied here and to [`FormatSpec::blocks`] are identified
-    /// by address *and* length wherever varve caches per-block validation, so
-    /// an empty or prefix view of an array is never mistaken for the full view
-    /// (API-02).
     pub block_identities: &'static [(u32, Option<Endian>, bool, u64)],
     pub layout: LayoutSpec,
     pub read_limits: ReadLimits,

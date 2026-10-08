@@ -79,6 +79,7 @@ fn spec(integrity: IntegrityPolicy) -> FormatSpec {
         ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[Item::IDENTITY])
     .with_read_limits(ReadLimits::STANDARD)
 }
 
@@ -325,48 +326,27 @@ fn crc_point_lookups_verify_payloads_and_detect_corruption() -> Result<()> {
     Ok(())
 }
 
-/// No operation sweeps unrelated registry entries. The lock-free skip list
-/// performs expected O(log S) key comparisons; this counter measures database
-/// entries inspected, not the skip list's internal comparisons.
-#[cfg(feature = "scalable-fault-injection")]
+/// Independently opened readers keep their own file identity and snapshot.
 #[test]
-fn registry_does_not_sweep_live_identities_on_open() -> Result<()> {
-    use varve::DiskIndexRebuildReport;
-
-    fn open_identities(count: u64) -> Result<u64> {
-        let directory = tempfile::tempdir()?;
-        let options = DiskIndexOptions::default();
-        let spec = spec(IntegrityPolicy::None);
-        let plan = plan(IntegrityPolicy::None);
-        let mut readers = Vec::new();
-        for index in 0..count {
-            let path = directory.path().join(format!("identity-{index}.varve"));
-            let mut writer = VarveIndexedWriter::create(spec, &path, options, plan)?;
-            writer.push_info(&item(index, "value"))?;
-            writer.sync()?;
-            drop(writer);
-            readers.push(VarveIndexedReader::open(spec, &path, options, plan)?);
-        }
-        DiskIndexRebuildReport::reset_scaling_counters();
-        // Reopen every identity while all of them are still live.
-        let mut extra = Vec::new();
-        for index in 0..count {
-            let path = directory.path().join(format!("identity-{index}.varve"));
-            extra.push(VarveIndexedReader::open(spec, &path, options, plan)?);
-        }
-        let inspected = DiskIndexRebuildReport::registry_slots_inspected();
-        drop(extra);
-        drop(readers);
-        Ok(inspected)
+fn independently_opened_files_keep_their_own_snapshots() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let options = DiskIndexOptions::default();
+    let spec = spec(IntegrityPolicy::None);
+    let plan = plan(IntegrityPolicy::None);
+    let mut readers = Vec::new();
+    for index in 0..32 {
+        let path = directory.path().join(format!("identity-{index}.varve"));
+        let mut writer = VarveIndexedWriter::create(spec, &path, options, plan)?;
+        writer.push_info(&item(index, "value"))?;
+        writer.sync()?;
+        readers.push(VarveIndexedReader::open(spec, &path, options, plan)?);
     }
-
-    let small = open_identities(8)?;
-    let large = open_identities(64)?;
-    // Quadratic sweeping would make `large` roughly 64 times `small`; the
-    // amortized bound keeps the ratio close to the identity-count ratio.
-    assert!(
-        large <= small.saturating_mul(16).max(64 * 4),
-        "registry inspections scale super-linearly: {small} for 8 identities, {large} for 64"
-    );
+    for (index, reader) in readers.iter().enumerate() {
+        assert_eq!(
+            reader.get::<Item>(&(index as u64))?,
+            Some(item(index as u64, "value"))
+        );
+        assert_eq!(reader.get::<Item>(&100)?, None);
+    }
     Ok(())
 }

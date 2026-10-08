@@ -73,6 +73,7 @@ fn matrix_spec() -> FormatSpec {
         varve::ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[GateCell::IDENTITY])
     .with_matrix_spec(DIMENSIONS, COMMITS, MATRIX_BLOCKS)
     .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }

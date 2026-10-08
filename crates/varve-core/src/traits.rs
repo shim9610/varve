@@ -35,6 +35,14 @@ pub trait VarveBlock: VarveEncode + VarveDecode {
     /// const instead of inventing a value. This is deliberately not part of
     /// the wire format or on-disk descriptors.
     const SCHEMA_FINGERPRINT: u64;
+    /// Immutable registration contract for manual `FormatSpec` declarations.
+    /// Pass a static slice of these values to `with_block_identities`.
+    const IDENTITY: (u32, Option<Endian>, bool, u64) = (
+        Self::ID,
+        Self::ENDIAN,
+        Self::IS_KEYED,
+        Self::SCHEMA_FINGERPRINT,
+    );
     const FIELDS: &'static [FieldDescriptor] = &[];
 }
 

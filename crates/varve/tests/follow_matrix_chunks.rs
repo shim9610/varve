@@ -66,6 +66,7 @@ fn spec() -> FormatSpec {
         varve::ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[Sample::IDENTITY])
     .with_read_limits(ReadLimits::finite_all(u64::MAX))
     .with_matrix_spec(DIMS, COMMITS, MATRIX_BLOCKS)
     .with_growing_matrix_dimension("scan", ROWS_PER_CHUNK)

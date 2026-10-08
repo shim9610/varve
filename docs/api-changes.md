@@ -3,6 +3,27 @@
 Migration document. Companion to [Known Limitations](known-limitations.md)
 and the [Changelog](../CHANGELOG.md).
 
+## Unreleased: explicit contracts and owned index state
+
+Manual schemas used with typed APIs must supply static identities:
+`.with_block_identities(&[MyBlock::IDENTITY, OtherBlock::IDENTITY])`, with
+`VarveBlock` in scope. Missing identities return `Error::InvalidFormatSpec` before
+codec invocation. `varve_format!` already supplies this table. Raw record access
+can still use a schema without Rust type identities. Adding identities to an old
+manual schema changes its computed schema hash; declare them before calling
+`with_computed_schema_hash()`.
+
+`SnapshotRetention`, `snapshot_retention()` and the registry inspection test
+counter are removed with the process-wide snapshot registry. Use each reader's
+`snapshot_status()` for its confirmed generation, lag and pinned state. Track
+reader lifetimes in the application if aggregate counts are needed. Release,
+follow and explicit compaction retain their behavior.
+
+Disk-index write batches and caches belong to the store. Write operations use
+exclusive mutable access instead of atomic admission or lock-free cache queues.
+No on-disk publication or durability algorithm changes. Matrix writer working
+state sharing and the OS single-writer guards remain unchanged.
+
 ## J. 0.10.1 → 0.10.2: dependency and reclamation fixes
 
 No public API or wire-format changes. Use Git tag `v0.10.2` to receive the pinned

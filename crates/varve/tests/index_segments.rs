@@ -699,6 +699,7 @@ fn matrix_segment_spec() -> FormatSpec {
         varve::ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[Cell::IDENTITY, Line::IDENTITY])
     .with_commit_policy(CommitPolicy::TransactionMarker(
         TransactionMarkerMode::OnFlush,
     ))

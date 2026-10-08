@@ -936,9 +936,8 @@ is folded into the plan digest. A descriptor that claims a declared block's
 id and version but is a different type is therefore refused with
 `Error::BlockSchemaFingerprintMismatch` with zero decoder calls, and a sidecar
 published for one block schema is refused as stale for a plan that decodes
-another. The strength of that gate follows the spec: for a block id whose
-`FormatSpec` declares no identity, registration falls back to first use and the
-check degrades to id/version/keyedness.
+another. Typed access requires an immutable identity for the block in `FormatSpec`.
+An absent identity returns `Error::InvalidFormatSpec` before codec invocation.
 
 Stream and indexed primaries carry a per-create 128-bit nonce as their first
 record (reserved block id `CREATION_NONCE_BLOCK_ID`, one record at create and
@@ -1056,20 +1055,14 @@ that is the silent byte swap this exists to catch — while two declarations tha
 resolve to the same byte order are accepted, because they genuinely produce
 identical bytes.
 
-For an identity-bearing block id the contract is a pure function of the spec's
-immutable `&'static` data, so it is validated inline and the process-global
-first-use cache is neither read nor written; registration order is provably
-irrelevant, and the append path takes no global lock for it. A hand-built spec
-with an empty identity table keeps the older first-use behaviour for the block
-ids it does not cover: the first `T` seen defines the contract and later
-disagreeing types are rejected. That residual cache is keyed by the spec's block
-table *and* identity table, each as pointer **and length**, so an empty or prefix
-view of a static array can no longer share an entry with the full view, and two
-specs that share a descriptor table but declare different identities cannot alias
-one cached contract. A failed validation is never cached as success. A manual block mirroring a generated one must reuse that block's
-fingerprint constant. The fingerprint is process-local and is deliberately not
-part of the wire format or on-disk descriptors, except where a disk-index
-descriptor records it (see below).
+Every typed block contract is validated directly against the spec's immutable
+`&'static` identity table. There is no first-use registration or process-global
+cache. Generated formats supply the table automatically. Manual formats attach
+it with `.with_block_identities(&[MyBlock::IDENTITY, OtherBlock::IDENTITY])`;
+import `VarveBlock` to use these associated constants. Missing entries return
+`Error::InvalidFormatSpec` before the codec runs. Raw record access does not
+require a typed identity. A manual implementation mirroring a generated block
+must reuse its schema fingerprint.
 
 Keyedness is an invariant, not a free-form flag. A type that implements
 `VarveKeyedBlock` must declare `VarveBlock::IS_KEYED = true`; every public

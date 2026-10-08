@@ -25,7 +25,7 @@ def main():
     pin = manifest["workspace"]["dependencies"]["crossbeam-skiplist"]
     expected_source = f"git+{pin['git']}?rev={pin['rev']}#{pin['rev']}"
     expected_crates = {
-        "crossbeam-skiplist", "crossbeam-epoch", "crossbeam-utils", "crossbeam-queue"
+        "crossbeam-skiplist", "crossbeam-epoch", "crossbeam-utils"
     }
     with tempfile.TemporaryDirectory(prefix="varve-git-consumer-") as directory:
         consumer = Path(directory)

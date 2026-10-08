@@ -84,7 +84,7 @@ pub use diagnostics::{
 pub use disk_index::{
     DiskIndexBatchOptions, DiskIndexDescriptor as DiskIndexedBlock, DiskIndexDigest,
     DiskIndexEntry, DiskIndexError, DiskIndexKeyTag, DiskIndexMode, DiskIndexOptions,
-    DiskIndexPlan, IndexCompaction, SnapshotRetention, SnapshotStatus, VarveDiskKey,
+    DiskIndexPlan, IndexCompaction, SnapshotStatus, VarveDiskKey,
     sidecar_path as disk_index_sidecar_path,
 };
 pub use error::{Error, Result};

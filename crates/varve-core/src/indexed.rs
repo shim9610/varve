@@ -7,8 +7,8 @@ use crate::disk_index::{
     CompositeKey, DiskIndexDescriptor as DiskIndexedBlock, DiskIndexEntry, DiskIndexError,
     DiskIndexFrontier, DiskIndexMetadata, DiskIndexOptions, DiskIndexPhysicalRecord, DiskIndexPlan,
     DiskIndexRecordPointer, DiskIndexState, DiskIndexStore, DiskIndexTail, DiskIndexUpdate,
-    DiskIndexWriteBatch, PRIMARY_GENERATION_WINDOW, VarveDiskKey, read_metadata_read_only,
-    sidecar_path, tail_limit_for_spec,
+    PRIMARY_GENERATION_WINDOW, VarveDiskKey, read_metadata_read_only, sidecar_path,
+    tail_limit_for_spec,
 };
 use crate::file::{
     NativeStreamScanner, RECORD_FOOTER_LEN, RECORD_HEADER_LEN, ReplaceDurability, WriterLock,
@@ -40,21 +40,9 @@ pub struct DiskIndexRebuildReport {
     pub scanned_bytes: u64,
 }
 
-/// Scaling observability for the disk-index release gates.
-///
-/// These are thread-local test counters, not runtime metrics: they exist so
-/// the suite can pin PERF-04 (registry cost per open must not scale with the
-/// number of live sidecar identities) and API-03 (no captured codec runs
-/// before schema identity is validated) as executable contracts. They are
-/// hosted here because `varve-core`'s re-export list is outside this module's
-/// ownership; see the openIssues note about moving them to a dedicated
-/// exported handle.
+/// Thread-local test counters for descriptor decoding and primary generation scans.
 #[cfg(feature = "scalable-fault-injection")]
 impl DiskIndexRebuildReport {
-    pub fn registry_slots_inspected() -> u64 {
-        crate::disk_index::scaling_counters::registry_slots_inspected()
-    }
-
     pub fn primary_generation_scans() -> u64 {
         crate::disk_index::scaling_counters::primary_generation_scans()
     }
@@ -234,10 +222,6 @@ impl VarveIndexedReader {
 
     pub fn snapshot_status(&self) -> Result<crate::SnapshotStatus> {
         self.index.status(&self._store).map_err(index_error)
-    }
-
-    pub fn snapshot_retention(&self) -> Result<crate::SnapshotRetention> {
-        self._store.snapshot_retention().map_err(index_error)
     }
 
     pub fn committed_len(&self) -> u64 {
@@ -459,7 +443,6 @@ pub struct VarveIndexedWriter {
     /// Staging buffer for the single-record put path, reused for the life of
     /// the writer. Cleared per record and never read across calls.
     record_buffer: Vec<u8>,
-    batch: Option<DiskIndexWriteBatch>,
     batch_records: usize,
     batch_last_sequence: Option<u64>,
     dirty: bool,
@@ -582,7 +565,6 @@ impl VarveIndexedWriter {
             stream,
             index,
             indexed_blocks: blocks.iter().map(|block| block.block_id).collect(),
-            batch: None,
             batch_records: 0,
             batch_last_sequence: None,
             dirty: false,
@@ -608,7 +590,7 @@ impl VarveIndexedWriter {
         // row's key is built where it always was, inside
         // `apply_update_with_tail`. Either way, one build per record.
         let (previous, composite) = if self.stream.spec().index_policy.keyed_offset_chain {
-            let batch = self.batch.as_ref().expect("batch initialized");
+            let batch = self.index.batch.as_ref().expect("batch initialized");
             let composite = batch
                 .composite_key_for(T::ID, &canonical_key)
                 .map_err(index_error)?;
@@ -689,7 +671,7 @@ impl VarveIndexedWriter {
         // As in `push_info`: one composite key per staged row, built here only
         // when the chain policy makes the lookup necessary.
         let (previous, composite) = if self.stream.spec().index_policy.keyed_offset_chain {
-            let batch = self.batch.as_ref().expect("batch initialized");
+            let batch = self.index.batch.as_ref().expect("batch initialized");
             let composite = batch
                 .composite_key_for(T::ID, &canonical_key)
                 .map_err(index_error)?;
@@ -757,7 +739,7 @@ impl VarveIndexedWriter {
         };
         let result = self.push_indexed_iter_inner::<T, I>(values, options, &mut written);
         if let Err(source) = result {
-            self.batch.take();
+            self.index.batch.take();
             self.stream.poison();
             return Err(BatchAppendError { written, source });
         }
@@ -800,7 +782,7 @@ impl VarveIndexedWriter {
         };
         let result = self.push_unindexed_iter_inner::<T, I>(values, options, &mut written);
         if let Err(source) = result {
-            self.batch.take();
+            self.index.batch.take();
             self.stream.poison();
             return Err(BatchAppendError { written, source });
         }
@@ -908,11 +890,6 @@ impl VarveIndexedWriter {
         result
     }
 
-    /// Sample live reader pins and sidecar size without changing durability.
-    pub fn snapshot_retention(&self) -> Result<crate::SnapshotRetention> {
-        self.index.snapshot_retention().map_err(index_error)
-    }
-
     pub fn resident_state(&self) -> crate::StreamResidentState {
         self.stream.resident_state()
     }
@@ -961,7 +938,7 @@ impl VarveIndexedWriter {
             // `max_key_bytes` is the store's, not the batch's, so a new batch
             // stores the same row under the same key.
             let (previous_key, composite) = if self.stream.spec().index_policy.keyed_offset_chain {
-                let batch = self.batch.as_ref().expect("batch initialized");
+                let batch = self.index.batch.as_ref().expect("batch initialized");
                 let composite = batch
                     .composite_key_for(T::ID, &canonical_key)
                     .map_err(index_error)?;
@@ -1024,6 +1001,7 @@ impl VarveIndexedWriter {
             .map_err(index_error)?;
             let tail = record_tail(self.stream.spec(), T::ID, record.info);
             let fits_index = self
+                .index
                 .batch
                 .as_ref()
                 .expect("batch initialized")
@@ -1042,7 +1020,8 @@ impl VarveIndexedWriter {
                 self.commit_pending_batch()?;
                 self.ensure_batch()?;
             }
-            self.batch
+            self.index
+                .batch
                 .as_mut()
                 .expect("batch initialized")
                 .apply_update_with_tail(old_eof, next_offset, &update, tail, composite)
@@ -1161,6 +1140,7 @@ impl VarveIndexedWriter {
             )?;
             let tail = record_tail(self.stream.spec(), T::ID, record.info);
             let fits_index = self
+                .index
                 .batch
                 .as_ref()
                 .expect("batch initialized")
@@ -1179,7 +1159,8 @@ impl VarveIndexedWriter {
                 self.commit_pending_batch()?;
                 self.ensure_batch()?;
             }
-            self.batch
+            self.index
+                .batch
                 .as_mut()
                 .expect("batch initialized")
                 .advance_coverage_with_tail(old_eof, next_offset, sequence, tail)
@@ -1303,7 +1284,7 @@ impl VarveIndexedWriter {
     fn commit_pending_batch_inner(&mut self) -> Result<()> {
         // STO-01: see VarveStreamWriter::commit_state_chunk. The witness stops
         // being recomputed once its bounded window is full.
-        if let Some(batch) = self.batch.as_ref()
+        if let Some(batch) = self.index.batch.as_ref()
             && batch.primary_generation().len < PRIMARY_GENERATION_WINDOW
         {
             crate::stream::take_injected_generation_restamp_failure()?;
@@ -1312,16 +1293,17 @@ impl VarveIndexedWriter {
                 self.stream.snapshot(),
                 self.stream.snapshot().len(),
             )?;
-            self.batch
+            self.index
+                .batch
                 .as_mut()
                 .expect("batch present")
                 .set_primary_generation(generation)
                 .map_err(index_error)?;
         }
-        let Some(batch) = self.batch.take() else {
+        let Some(_) = self.index.batch.as_ref() else {
             return Ok(());
         };
-        if let Err(error) = batch.commit() {
+        if let Err(error) = self.index.commit_batch() {
             // Classified by `commit_pending_batch`: with staged records this
             // becomes `PublishedButIndexStale`; with none there is nothing
             // published to report and the plain sidecar error is the truth.
@@ -1341,6 +1323,7 @@ impl VarveIndexedWriter {
         composite: Option<CompositeKey>,
     ) -> Result<AppendInfo> {
         if let Err(error) = self
+            .index
             .batch
             .as_mut()
             .expect("batch initialized")
@@ -1370,6 +1353,7 @@ impl VarveIndexedWriter {
     ) -> Result<AppendInfo> {
         let _expected_id = if tombstone { TOMBSTONE_BLOCK_ID } else { T::ID };
         let result = self
+            .index
             .batch
             .as_mut()
             .expect("batch initialized")
@@ -1409,6 +1393,7 @@ impl VarveIndexedWriter {
 
     fn ensure_update_capacity(&mut self, update: &DiskIndexUpdate, has_tail: bool) -> Result<()> {
         let fits = self
+            .index
             .batch
             .as_ref()
             .expect("batch initialized")
@@ -1422,6 +1407,7 @@ impl VarveIndexedWriter {
             self.ensure_batch()?;
         }
         if self
+            .index
             .batch
             .as_ref()
             .expect("batch initialized")
@@ -1438,6 +1424,7 @@ impl VarveIndexedWriter {
 
     fn ensure_coverage_capacity(&mut self, has_tail: bool) -> Result<()> {
         let fits = self
+            .index
             .batch
             .as_ref()
             .expect("batch initialized")
@@ -1451,6 +1438,7 @@ impl VarveIndexedWriter {
             self.ensure_batch()?;
         }
         if self
+            .index
             .batch
             .as_ref()
             .expect("batch initialized")
@@ -1470,8 +1458,8 @@ impl VarveIndexedWriter {
             self.index.mark_dirty().map_err(index_error)?;
             self.dirty = true;
         }
-        if self.batch.is_none() {
-            self.batch = Some(self.index.begin_write_batch().map_err(index_error)?);
+        if self.index.batch.is_none() {
+            self.index.begin_write_batch().map_err(index_error)?;
         }
         Ok(())
     }
@@ -1510,7 +1498,7 @@ impl VarveIndexedWriter {
 impl Drop for VarveIndexedWriter {
     fn drop(&mut self) {
         // Discard uncommitted staging before releasing the writer file guard.
-        self.batch.take();
+        self.index.batch.take();
     }
 }
 
@@ -1596,7 +1584,7 @@ where
             batch
                 .set_primary_generation(primary_generation(spec, snapshot, covered)?)
                 .map_err(index_error)?;
-            batch.commit().map_err(index_error)?;
+            store.commit_batch().map_err(index_error)?;
             batch = store.begin_write_batch().map_err(index_error)?;
             batch_records = 0;
         }
@@ -1638,7 +1626,7 @@ where
     batch
         .set_primary_generation(primary_generation(spec, snapshot, covered)?)
         .map_err(index_error)?;
-    batch.commit().map_err(index_error)?;
+    store.commit_batch().map_err(index_error)?;
     let working = store.read_metadata().map_err(index_error)?.working;
     if working.eof != covered || working.record_count != records {
         return Err(Error::InvalidIndexCheckpoint);
@@ -2083,6 +2071,7 @@ mod tests {
             ManifestPolicy::None,
             BLOCKS_MULTI,
         )
+        .with_block_identities(&[Item::IDENTITY, Item2::IDENTITY])
         .with_read_limits(ReadLimits::STANDARD)
     }
 
@@ -2106,6 +2095,7 @@ mod tests {
             ManifestPolicy::None,
             BLOCKS,
         )
+        .with_block_identities(&[Item::IDENTITY])
         .with_read_limits(ReadLimits::STANDARD)
     }
 
@@ -2668,6 +2658,7 @@ mod tests {
                 ManifestPolicy::None,
                 BLOCKS_CRC,
             )
+            .with_block_identities(&[Item::IDENTITY, Blob::IDENTITY])
             .with_read_limits(ReadLimits::STANDARD)
         }
         fn plan_crc() -> DiskIndexPlan {

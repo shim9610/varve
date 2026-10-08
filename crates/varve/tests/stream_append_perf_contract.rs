@@ -93,6 +93,7 @@ fn chain_spec(integrity: IntegrityPolicy) -> FormatSpec {
         ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[Value::IDENTITY, Extra::IDENTITY])
     .with_commit_policy(CommitPolicy::RecordFooter)
     .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }

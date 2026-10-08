@@ -65,6 +65,7 @@ fn spec(integrity: varve::IntegrityPolicy) -> FormatSpec {
         varve::ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[SharedCell::IDENTITY])
     .with_matrix_spec(DIMENSIONS, COMMITS, MATRIX_BLOCKS)
     .with_matrix_aux(AUX)
     .with_read_limits(ReadLimits::finite_all(u64::MAX))

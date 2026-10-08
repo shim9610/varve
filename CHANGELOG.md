@@ -6,6 +6,18 @@ increment the minor version.
 
 ## Unreleased
 
+- Require explicit static block identities for typed access in manually declared
+  schemas; use `VarveBlock::IDENTITY` with `with_block_identities`. Remove global
+  first-use type registration. Generated schemas already declare identities.
+- Remove process-global snapshot registration and `SnapshotRetention` /
+  `snapshot_retention()`. Readers retain their own file snapshots; use
+  `snapshot_status()` for generation and lag and track reader lifetimes in the
+  application if aggregate counts are needed.
+- Make disk-index batches and caches store-owned. Remove atomic write admission,
+  writable handle cloning, cache-transfer queues and the `crossbeam-queue`
+  dependency. Single-writer OS guards and matrix writer working-state sharing
+  remain in place. File publication, durability and compaction formats are unchanged.
+
 ## 0.10.2 - 2026-10-08
 
 - Pin Crossbeam to upstream commit `099d0469efcfacb32527bd9451a4fb62586ae537`

@@ -117,6 +117,7 @@ fn base_spec() -> FormatSpec {
         varve::ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[Sample::IDENTITY, Marker::IDENTITY])
     .with_read_limits(ReadLimits::finite_all(u64::MAX))
     .with_matrix_spec(DIMS, COMMITS, MATRIX_BLOCKS)
 }
@@ -157,13 +158,20 @@ fn the_option_defaults_off_and_changes_no_hash() {
 /// The hash of the plain spec, read off the build **before** this feature
 /// existed (`f1f4339`, via a scratch test that printed it and was deleted).
 ///
+/// This legacy hash predates explicit typed identities; the hash-only check
+/// omits them without opening a typed file.
 /// A literal, not a comparison against a freshly built spec: comparing the new
 /// code against itself proves the fold is consistent, not that it is absent.
 const BASE_SCHEMA_HASH: u64 = 0x2f14_5461_495b_712b;
 
 #[test]
 fn a_spec_that_declares_nothing_hashes_as_it_did_before() {
-    assert_eq!(base_spec().computed_schema_hash(), BASE_SCHEMA_HASH);
+    assert_eq!(
+        base_spec()
+            .with_block_identities(&[])
+            .computed_schema_hash(),
+        BASE_SCHEMA_HASH
+    );
 }
 
 #[test]
@@ -1428,7 +1436,12 @@ fn chunk_compression_is_inert_when_not_declared() {
     assert!(growing_spec().chunk_compression.is_none());
     // A spec that declares no growing dimension still hashes to what it hashed
     // to before either option existed.
-    assert_eq!(base_spec().computed_schema_hash(), BASE_SCHEMA_HASH);
+    assert_eq!(
+        base_spec()
+            .with_block_identities(&[])
+            .computed_schema_hash(),
+        BASE_SCHEMA_HASH
+    );
     assert_ne!(
         compressed_spec().computed_schema_hash(),
         growing_spec().computed_schema_hash(),

@@ -143,6 +143,9 @@ macro_rules! filler_blocks {
             )+
         ];
 
+        static IDENTITIES: &[(u32, Option<Endian>, bool, u64)] =
+            &[Target::IDENTITY, $($name::IDENTITY,)+];
+
         static FULL_INDEXED: &[DiskIndexedBlock] = &[
             DiskIndexedBlock::of::<Target>(),
             $(DiskIndexedBlock::of::<$name>(),)+
@@ -231,6 +234,7 @@ fn spec() -> FormatSpec {
         ManifestPolicy::None,
         SPEC_BLOCKS,
     )
+    .with_block_identities(IDENTITIES)
     .with_read_limits(ReadLimits::STANDARD)
 }
 
@@ -432,6 +436,7 @@ mod crc_single_traversal {
             ManifestPolicy::None,
             CRC_BLOCKS,
         )
+        .with_block_identities(&[Target::IDENTITY, Blob::IDENTITY])
         .with_read_limits(ReadLimits::STANDARD)
     }
 

@@ -463,6 +463,7 @@ fn block_specific_record_explicit_compression_overrides_global_none() -> varve::
         ManifestPolicy::None,
         MANUAL_COMPRESSION_BLOCKS,
     )
+    .with_block_identities(&[CompressibleBlock::IDENTITY, FixedBlock::IDENTITY])
     .with_read_limits(ReadLimits::finite_all(1 << 30))
     .with_block_compression(BLOCK_COMPRESSION);
     let path = temp_path("block_specific");
@@ -532,6 +533,7 @@ fn block_specific_compression_rejects_invalid_descriptors() {
             ManifestPolicy::None,
             MANUAL_COMPRESSION_BLOCKS,
         )
+        .with_block_identities(&[CompressibleBlock::IDENTITY, FixedBlock::IDENTITY])
         .with_block_compression(compression)
     };
 

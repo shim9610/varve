@@ -812,6 +812,7 @@ mod enabled {
             ManifestPolicy::None,
             STREAM_BLOCKS,
         )
+        .with_block_identities(&[StreamRecord::IDENTITY])
         .with_read_limits(ReadLimits::STANDARD)
     }
 
@@ -827,6 +828,7 @@ mod enabled {
             ManifestPolicy::None,
             INDEXED_BLOCKS,
         )
+        .with_block_identities(&[IndexedRecord::IDENTITY])
         .with_read_limits(ReadLimits::STANDARD)
     }
 

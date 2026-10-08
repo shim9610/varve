@@ -165,6 +165,7 @@ fn perf_matrix_spec_with_integrity(integrity: varve::IntegrityPolicy) -> FormatS
         varve::ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[PerfMatrixCell::IDENTITY])
     .with_matrix_spec(DIMS, COMMITS, MATRIX_BLOCKS)
     .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }

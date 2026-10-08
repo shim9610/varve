@@ -24132,6 +24132,7 @@ mod tests {
             ManifestPolicy::None,
             BLOCKS,
         )
+        .with_block_identities(&[MatrixTestCell::IDENTITY])
         .with_matrix_spec(DIMENSIONS, COMMITS, MATRIX_BLOCKS)
         .with_read_limits(crate::ReadLimits::finite_all(u64::MAX))
     }
@@ -24172,6 +24173,11 @@ mod tests {
             ManifestPolicy::None,
             BLOCKS,
         )
+        .with_block_identities(&[
+            ReplaceTestBlock::IDENTITY,
+            ReplaceString::IDENTITY,
+            ReplaceKeyed::IDENTITY,
+        ])
         .with_read_limits(crate::ReadLimits::finite_all(u64::MAX))
     }
 

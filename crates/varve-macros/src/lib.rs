@@ -5047,9 +5047,6 @@ fn high_cardinality_api_tokens(
                 self.inner.verify_all_with_progress(scan, observer)
             }
 
-            pub fn snapshot_retention(&self) -> ::varve::__core::Result<::varve::__core::SnapshotRetention> {
-                self.inner.snapshot_retention()
-            }
 
             pub fn resident_state(&self) -> ::varve::__core::StreamResidentState {
                 self.inner.resident_state()
@@ -5087,9 +5084,6 @@ fn high_cardinality_api_tokens(
                 self.inner.set_immediate_policy(policy)
             }
 
-            pub fn snapshot_retention(&self) -> ::varve::__core::Result<::varve::__core::SnapshotRetention> {
-                self.inner.snapshot_retention()
-            }
             /// Reclaim sidecar pages after an explicit sync; readers do not block it.
             pub fn compact_index(&mut self) -> ::varve::__core::Result<::varve::__core::IndexCompaction> {
                 self.inner.compact_index()
@@ -5338,9 +5332,6 @@ fn high_cardinality_api_tokens(
                 self.inner
             }
 
-            pub fn snapshot_retention(&self) -> ::varve::__core::Result<::varve::__core::SnapshotRetention> {
-                self.inner.snapshot_retention()
-            }
 
             pub fn resident_state(&self) -> ::varve::__core::StreamResidentState {
                 self.inner.resident_state()
@@ -5420,9 +5411,6 @@ fn high_cardinality_api_tokens(
                 self.inner.set_immediate_policy(policy)
             }
 
-            pub fn snapshot_retention(&self) -> ::varve::__core::Result<::varve::__core::SnapshotRetention> {
-                self.inner.snapshot_retention()
-            }
             /// Reclaim sidecar pages after an explicit sync; readers do not block it.
             pub fn compact_index(&mut self) -> ::varve::__core::Result<::varve::__core::IndexCompaction> {
                 self.inner.compact_index()

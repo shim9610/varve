@@ -90,6 +90,7 @@ fn spec_with(limits: ReadLimits) -> FormatSpec {
         varve::ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[LazyCell::IDENTITY])
     .with_read_limits(limits)
     .with_matrix_spec(DIMENSIONS, COMMITS, MATRIX_BLOCKS)
 }

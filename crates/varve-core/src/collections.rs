@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::sync::LazyLock;
 
 use crate::traits::KeyedBlockContract;
 use crate::{
@@ -339,73 +338,6 @@ struct BlockContract {
     endian: Option<Endian>,
 }
 
-impl BlockContract {
-    /// The contract `T` itself declares.
-    fn declared_by<T: VarveBlock>() -> Self {
-        Self {
-            fingerprint: T::SCHEMA_FINGERPRINT,
-            keyed: T::IS_KEYED,
-            endian: T::ENDIAN,
-        }
-    }
-}
-
-/// Registered block identity for the *first-use* contract cache.
-///
-/// API-02: a `&'static` slice is identified by its start address **and its
-/// length**. `FormatSpec` accepts arbitrary caller-supplied static descriptor
-/// and identity slices, so an empty or prefix view of an array starts at the
-/// same address as the full view while denoting a different logical table;
-/// keying on the address alone let those two share one cached contract. Both
-/// tables therefore contribute `(address, length)`.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct BlockContractKey {
-    blocks_ptr: usize,
-    blocks_len: usize,
-    identities_ptr: usize,
-    identities_len: usize,
-    block_id: u32,
-}
-
-impl BlockContractKey {
-    fn new(spec: FormatSpec, block_id: u32) -> Self {
-        Self {
-            blocks_ptr: spec.blocks.as_ptr() as usize,
-            blocks_len: spec.blocks.len(),
-            identities_ptr: spec.block_identities.as_ptr() as usize,
-            identities_len: spec.block_identities.len(),
-            block_id,
-        }
-    }
-}
-
-/// Process-local first-use contract cache for block ids that their format
-/// declares **no** identity for.
-///
-/// This deliberately never touches the wire format or on-disk descriptors.
-/// Block ids covered by [`FormatSpec::block_identities`] never reach this
-/// cache at all (see [`ensure_block_contract`]), so every spec `varve_format!`
-/// emits is validated straight from immutable `&'static` data with no
-/// process-global lock on the append path. The lock-free map only inserts
-/// on the first registration of an identity-less (format, block) pair: no
-/// allocation, no syscall, no O(records) work on any later call.
-///
-/// What two specs deliberately *do* share an entry: identity-less specs whose
-/// descriptor tables are the same `&'static` slice — same address and same
-/// length — even when they differ in magic, version, endian, or policies. The
-/// entry then records the same constraint either spec would impose on its own,
-/// because the entry stores the *declared* endian override and resolves it
-/// against the caller's `spec.endian` at check time rather than at insert
-/// time. Sharing here can only be redundant, never wrong.
-///
-/// The one identity this cannot see through is deallocation: a `&'static`
-/// slice obtained by leaking a heap allocation that is later reclaimed through
-/// `unsafe` code could hand a new, unrelated table the same address and length.
-/// Formats built from ordinary statics — which is every format the macros
-/// produce — cannot reach that state.
-static BLOCK_CONTRACTS: LazyLock<crossbeam_skiplist::SkipMap<BlockContractKey, BlockContract>> =
-    LazyLock::new(crossbeam_skiplist::SkipMap::new);
-
 fn check_block_contract<T: VarveBlock>(spec: FormatSpec, recorded: BlockContract) -> Result<()> {
     if recorded.keyed != T::IS_KEYED {
         return Err(crate::Error::BlockKeyednessMismatch {
@@ -465,15 +397,7 @@ fn ensure_block_contract<T: VarveBlock>(spec: FormatSpec) -> Result<()> {
             },
         );
     }
-    // Hand-built specs that carry no generated identity for this block id keep
-    // the documented first-use escape hatch: the first type to register the id
-    // defines the contract every later type must match.
-    let key = BlockContractKey::new(spec, T::ID);
-    if let Some(entry) = BLOCK_CONTRACTS.get(&key) {
-        return check_block_contract::<T>(spec, *entry.value());
-    }
-    let contract = BlockContract::declared_by::<T>();
-    check_block_contract::<T>(spec, contract)?;
-    let entry = BLOCK_CONTRACTS.get_or_insert(key, contract);
-    check_block_contract::<T>(spec, *entry.value())
+    Err(crate::Error::InvalidFormatSpec(
+        "typed block access requires a declared block identity",
+    ))
 }

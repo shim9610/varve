@@ -115,6 +115,7 @@ fn matrix_spec(integrity: varve::IntegrityPolicy) -> FormatSpec {
         varve::ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[PrimaryCell::IDENTITY])
     .with_matrix_spec(DIMENSIONS, COMMITS, MATRIX_BLOCKS)
     .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }
@@ -176,6 +177,7 @@ fn two_block_spec() -> FormatSpec {
         varve::ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[PrimaryCell::IDENTITY, SecondaryCell::IDENTITY])
     .with_matrix_spec(DIMENSIONS, COMMITS, MATRIX_BLOCKS)
     .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }

@@ -92,6 +92,7 @@ fn identity_spec() -> FormatSpec {
         ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[IdentityCell::IDENTITY])
     .with_matrix_spec(DIMS, COMMITS, MATRIX_BLOCKS)
     .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }

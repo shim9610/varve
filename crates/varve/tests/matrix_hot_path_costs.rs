@@ -91,6 +91,7 @@ fn spec_with(integrity: IntegrityPolicy, limits: ReadLimits) -> FormatSpec {
         varve::ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[HotCell::IDENTITY])
     .with_read_limits(limits)
     .with_matrix_spec(DIMENSIONS, COMMITS, MATRIX_BLOCKS)
 }

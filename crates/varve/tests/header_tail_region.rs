@@ -544,6 +544,7 @@ mod matrix_refusal {
             varve::ManifestPolicy::None,
             BLOCKS,
         )
+        .with_block_identities(&[Cell::IDENTITY])
         .with_read_limits(ReadLimits::finite_all(u64::MAX))
         .with_matrix_spec(DIMS, COMMITS, MATRIX_BLOCKS)
     }

@@ -306,6 +306,7 @@ fn other_matrix_spec() -> FormatSpec {
         varve::ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[OtherMatrixCell::IDENTITY])
     .with_matrix_spec(DIMS, COMMITS, MATRIX_BLOCKS)
     .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }
@@ -391,6 +392,7 @@ fn matrix_spec_with_integrity(integrity: varve::IntegrityPolicy) -> FormatSpec {
         varve::ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[MatrixCell::IDENTITY, LogPoint::IDENTITY])
     .with_matrix_spec(DIMS, COMMITS, MATRIX_BLOCKS)
     .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }
@@ -429,6 +431,7 @@ fn raw_matrix_spec() -> FormatSpec {
         varve::ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[RawMatrixCell::IDENTITY])
     .with_matrix_spec(DIMS, COMMITS, MATRIX_BLOCKS)
     .with_read_limits(ReadLimits::finite_all(u64::MAX))
 }
@@ -666,6 +669,7 @@ fn matrix_spec_rejects_duplicate_cell_categories() {
         varve::ManifestPolicy::None,
         BLOCKS,
     )
+    .with_block_identities(&[MatrixCell::IDENTITY, OtherMatrixCell::IDENTITY])
     .with_matrix_spec(DIMS, COMMITS, MATRIX_BLOCKS);
     assert!(matches!(
         spec.validate(),

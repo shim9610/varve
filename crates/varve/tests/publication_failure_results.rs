@@ -142,6 +142,7 @@ mod enabled {
             ManifestPolicy::None,
             BLOCKS,
         )
+        .with_block_identities(&[FaultRecord::IDENTITY])
         .with_read_limits(ReadLimits::STANDARD)
     }
 

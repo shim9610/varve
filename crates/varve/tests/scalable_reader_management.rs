@@ -94,7 +94,6 @@ fn indexed_snapshot_release_reports_lag_and_reacquires_while_dirty() -> varve::R
     let mut idle = Managed::open_indexed_reader(&path, options)?;
     let cursor = idle.items()?;
     let before = old.snapshot_status()?;
-    assert_eq!(writer.snapshot_retention()?.active_snapshots, 2);
     for value in 2..=8 {
         writer.push_item(&Item { key: 1, value })?;
         writer.immediate()?;
@@ -104,13 +103,9 @@ fn indexed_snapshot_release_reports_lag_and_reacquires_while_dirty() -> varve::R
     assert_eq!(lag.confirmed_generation - lag.generation, 7);
     assert_eq!(lag.records_behind, 7);
     assert!(lag.bytes_behind > 0);
-    let retention = writer.snapshot_retention()?;
-    assert_eq!(retention.oldest_pinned_generation, Some(before.generation));
-    assert!(retention.sidecar_bytes > 0);
     assert!(idle.release_snapshot());
     assert!(!idle.release_snapshot());
     assert!(!idle.snapshot_status()?.pinned);
-    assert_eq!(writer.snapshot_retention()?.active_snapshots, 1);
     assert!(
         matches!(idle.get_item(&1), Err(Error::DiskIndex(error)) if matches!(*error, DiskIndexError::SnapshotReleased))
     );
@@ -125,15 +120,9 @@ fn indexed_snapshot_release_reports_lag_and_reacquires_while_dirty() -> varve::R
     assert!(idle.release_snapshot());
     assert_eq!(idle.follow()?, 0); // Re-pin even without a new generation.
     assert_eq!(idle.get_item(&1)?.unwrap().value, 8);
-    assert_eq!(writer.snapshot_retention()?.active_snapshots, 2);
     assert_eq!(old.follow()?, 7);
-    assert_eq!(
-        writer.snapshot_retention()?.oldest_pinned_generation,
-        Some(lag.confirmed_generation)
-    );
     drop(old);
     drop(idle);
-    assert_eq!(writer.snapshot_retention()?.active_snapshots, 0);
     writer.immediate()?;
     Ok(())
 }
@@ -148,9 +137,7 @@ fn stream_release_preserves_cursor_and_follow_releases_old_generation() -> varve
     writer.immediate()?;
     let mut reader = Feed::open_stream_reader(&path, options)?;
     let mut cursor = reader.samples()?;
-    assert_eq!(writer.snapshot_retention()?.active_snapshots, 1);
     assert!(reader.release_snapshot());
-    assert_eq!(writer.snapshot_retention()?.active_snapshots, 0);
     assert_eq!(cursor.next().transpose()?, Some(Sample { value: 1 }));
     writer.push_sample(&Sample { value: 2 })?;
     writer.immediate()?;
@@ -250,11 +237,6 @@ fn compaction_keeps_old_readers_and_follow_adopts_new_file() -> varve::Result<()
     let mut current = Managed::open_indexed_reader(&path, options)?;
     let report = writer.compact_index()?;
     assert_eq!(current.follow()?, 0); // Same logical generation, new physical file.
-    assert_eq!(
-        current.snapshot_retention()?.sidecar_bytes,
-        report.after_bytes
-    );
-    assert_eq!(writer.snapshot_retention()?.active_snapshots, 1);
     drop(current);
     assert!(report.after_bytes < report.before_bytes);
     assert_eq!(report.historical_distinct_keys, 200);
