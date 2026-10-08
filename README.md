@@ -261,21 +261,21 @@ the assurance those notes record — together with its limits — is summarised 
 
 ## Add It To Your Project
 
-For the 0.10.1 repository release, depend on the versioned Git tag. This
-repository release does not imply that 0.10.1 is available on crates.io:
+For the 0.10.2 repository release, depend on the versioned Git tag. This
+repository release does not imply that 0.10.2 is available on crates.io:
 
 ```toml
 [dependencies]
-varve = { git = "https://github.com/shim9610/varve", tag = "v0.10.1" }
+varve = { git = "https://github.com/shim9610/varve", tag = "v0.10.2" }
 ```
 
-Current unreleased `main` pins Crossbeam to upstream commit
+The `v0.10.2` release pins Crossbeam to upstream commit
 `099d0469efcfacb32527bd9451a4fb62586ae537`, which includes the epoch/skiplist
-borrow fixes and range-reference reclamation fix. The `v0.10.1` tag predates
-these fixes; use a tested Varve commit with `rev = "<commit SHA>"` to consume
-them before the next release. The Git dependencies propagate to downstream
-projects without a root `[patch]`. crates.io publication is not currently
-supported; replacing the pin requires a released source containing these fixes.
+borrow fixes and range-reference reclamation fix. It also retains a temporary
+matrix working-map reclamation workaround; revalidate it when updating Crossbeam.
+The Git dependencies propagate to downstream projects without a root `[patch]`.
+crates.io publication is not currently supported; replacing the pin requires a
+released source containing the fixes.
 
 Requires Rust **1.95** or newer. Resident, matrix, streaming and indexed APIs
 are included even with `default-features = false`. The removed
@@ -283,7 +283,7 @@ are included even with `default-features = false`. The removed
 Cargo manifests. Optional capabilities remain opt-in:
 
 ```toml
-varve = { git = "https://github.com/shim9610/varve", tag = "v0.10.1",
+varve = { git = "https://github.com/shim9610/varve", tag = "v0.10.2",
           features = ["integrity", "compression-zstd"] }
 ```
 

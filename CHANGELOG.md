@@ -6,12 +6,15 @@ increment the minor version.
 
 ## Unreleased
 
+## 0.10.2 - 2026-10-08
+
 - Pin Crossbeam to upstream commit `099d0469efcfacb32527bd9451a4fb62586ae537`
   containing epoch/skiplist borrow fixes (PRs #871, #1297) and the range-reference
   reclamation fix (#1217). Direct Git dependencies carry the fixed epoch/utils
   sources to downstream consumers. Restore bounded matrix range iteration.
-- Unlink residual marked matrix working-page nodes after clearing a published
-  batch, preventing a separate node leak during repeated zero/write/sync cycles.
+- Work around a separately reproduced matrix working-page node leak by searching
+  the emptied map after publishing a batch. The workaround passes reclamation
+  and ASan checks; the precise upstream cause remains under investigation.
 - Keep the directory-cleanup safety test in ordinary CI and ASan while excluding
   it from Miri, which does not support opening directories.
 - Keep the file-backed redb comparison in ordinary CI and ASan while excluding

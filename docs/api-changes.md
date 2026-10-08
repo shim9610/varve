@@ -1,7 +1,15 @@
-# API Changes — 0.3.0 through 0.10.1
+# API Changes — 0.3.0 through 0.10.2
 
 Migration document. Companion to [Known Limitations](known-limitations.md)
 and the [Changelog](../CHANGELOG.md).
+
+## J. 0.10.1 → 0.10.2: dependency and reclamation fixes
+
+No public API or wire-format changes. Use Git tag `v0.10.2` to receive the pinned
+upstream Crossbeam borrow/range fixes and the temporary matrix map-clear
+reclamation workaround. Git dependencies propagate without a consumer-root
+`[patch]`; crates.io distribution is not supported for this release. The Rust
+1.95 minimum and caller-selected durability boundaries remain unchanged.
 
 ## I. 0.10.0 → 0.10.1: publication and toolchain fixes
 
